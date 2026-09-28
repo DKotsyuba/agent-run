@@ -11,7 +11,7 @@ use std::path::PathBuf;
 pub struct DeliveryView {
     /// Agent that owns this delivery record.
     pub agent_id: AgentId,
-    /// Exact execution id; absent only in historical pre-stable-id payloads.
+    /// Legacy execution identity, absent from current public projections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<AgentId>,
     /// Whether an orchestrator session is durably bound.
@@ -69,9 +69,9 @@ pub struct AgentView {
     /// Admitted MCP selections from the sealed role; omitted on historical/empty roles.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp: Vec<McpSelectionView>,
-    /// Stable logical agent id; run_id distinguishes its executions.
+    /// Stable logical agent id, unchanged across resumes.
     pub agent_id: AgentId,
-    /// Exact execution id; absent only in historical pre-stable-id payloads.
+    /// Legacy execution identity, absent from current public projections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<AgentId>,
     /// Selected runtime name.
@@ -114,7 +114,7 @@ pub struct AgentView {
     pub delivery: DeliveryView,
     /// Parent run resumed by this agent, or `null` for a fresh run.
     pub parent_agent_id: Option<AgentId>,
-    /// Exact previous execution; replaces the legacy parent_agent_id spelling.
+    /// Legacy previous execution identity, omitted by current public projections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_run_id: Option<AgentId>,
     /// First run in the lineage, or `null` for historical incomplete rows.
@@ -137,15 +137,21 @@ pub struct AgentView {
     pub runtime_outcome: Option<String>,
     /// Human/orchestrator acceptance state, distinct from runtime success.
     pub acceptance: String,
+    /// Working directory the run was admitted with, when recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
 }
 
 /// The durable start result, including the immediately committed agent snapshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartResult {
+    /// Machine receipt counter for exact admission binding; absent in legacy responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u32>,
     /// Stable logical agent id, unchanged across explicit resumes.
     pub agent_id: AgentId,
-    /// Exact execution id; absent only in historical pre-stable-id payloads.
+    /// Legacy execution identity, absent from current public projections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<AgentId>,
     /// Whether this call created rather than replayed admission.
@@ -166,7 +172,7 @@ pub struct CommandView {
     pub command_id: i64,
     /// Agent that owns the command.
     pub agent_id: AgentId,
-    /// Exact execution id; absent only in historical pre-stable-id payloads.
+    /// Legacy execution identity, absent from current public projections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<AgentId>,
     /// Command kind name.
@@ -199,7 +205,7 @@ pub struct MessageView {
 pub struct TranscriptPage {
     /// Agent whose transcript is paged.
     pub agent_id: AgentId,
-    /// Exact execution id; absent only in historical pre-stable-id payloads.
+    /// Legacy execution identity, absent from current public projections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<AgentId>,
     /// Ordered messages after the requested cursor.
@@ -220,7 +226,7 @@ pub struct TranscriptPage {
 pub struct AnswerView {
     /// Agent whose answer was requested.
     pub agent_id: AgentId,
-    /// Exact execution id; absent only in historical pre-stable-id payloads.
+    /// Legacy execution identity, absent from current public projections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<AgentId>,
     /// Current lifecycle status, independent of availability.

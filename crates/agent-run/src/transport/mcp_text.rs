@@ -5,7 +5,7 @@
 //! loaded from the filesystem or hot-reloaded). The private socket and the
 //! CLI keep their structured JSON contracts; only the MCP presentation is
 //! text. `start`/`resume` additionally keep a tiny structured
-//! `{"agent_id": ..., "run_id": ...}` so the PostToolUse binding hook can
+//! `{"agent_id": ..., "sequence": ...}` so the PostToolUse binding hook can
 //! bind the exact execution from JSON (see `hooks::bind`); no other tool
 //! mirrors its result into structured content. Failures render as one
 //! short typed line, never a JSON dump.
@@ -95,18 +95,22 @@ fn environment() -> &'static Environment<'static> {
 ///
 /// `delegation_guide` already is rendered text and passes through. Every
 /// other tool renders its compact template over a normalized projection of
-/// `value`. `start`/`resume` keep only their stable agent and exact run ids
+/// `value`. `start`/`resume` keep their stable agent ID and admission counter
 /// next to the text so automatic PostToolUse binding stays JSON-extractable
 /// without mirroring the full result. A template/projection failure yields
 /// the typed compact error line, never JSON and never a silent blank.
 pub fn success_result(tool: &str, value: &Value) -> CallToolResult {
     let identity = match tool {
         "start" | "resume" => {
-            let mut identity = json!({"agent_id": value["agent_id"]});
-            if let Some(run_id) = value.get("run_id") {
-                identity["run_id"] = run_id.clone();
-            }
-            Some(identity)
+            let sequence = value
+                .get("sequence")
+                .or_else(|| value["agent"].get("sequence"))
+                .and_then(Value::as_u64)
+                .filter(|n| *n > 0 && *n <= u32::MAX as u64);
+            let Some(sequence) = sequence else {
+                return error_result("RuntimeError", "admission has no valid binding receipt; inspect delivery status before continuing");
+            };
+            Some(json!({"agent_id": value["agent_id"], "sequence": sequence}))
         }
         _ => None,
     };
@@ -170,7 +174,6 @@ fn context(name: &str, value: &Value) -> Value {
         "cancel" => json!({"agent": agent_fields(value), "kind": "cancel"}),
         "steer" => json!({
             "agent_id": value["agent_id"], "command_id": value["command_id"],
-            "run_id": value["run_id"].as_str().unwrap_or_default(),
             "kind": value["kind"].as_str().unwrap_or("steer"),
             "state": value["state"].as_str().unwrap_or("queued"),
         }),
@@ -195,7 +198,6 @@ fn agent_fields(view: &Value) -> Value {
     let status = text("status");
     json!({
         "id": view["agent_id"], "status": status,
-        "run_id": text("run_id"),
         "terminal": matches!(status.as_str(),
             "succeeded" | "failed" | "lost" | "timed_out" | "cancelled"),
         "runtime": view["runtime"], "model": view["model"], "profile": view["profile"],
@@ -227,14 +229,7 @@ fn agent_fields(view: &Value) -> Value {
 fn start_context(value: &Value) -> Value {
     let mut fields = agent_fields(&value["agent"]);
     fields["agent_id"] = value["agent_id"].clone();
-    fields["run_id"] = json!(value["run_id"].as_str().unwrap_or_default());
     fields["created"] = value["created"].clone();
-    fields["attempt_id"] = json!(value["attempt_id"].as_str().unwrap_or_default());
-    fields["parent_agent_id"] = json!(value["agent"]["parent_run_id"]
-        .as_str()
-        .or_else(|| value["agent"]["parent_agent_id"].as_str())
-        .or_else(|| value["parent_agent_id"].as_str())
-        .unwrap_or_default());
     fields
 }
 
@@ -254,7 +249,6 @@ fn list_context(value: &Value) -> Value {
 fn transcript_context(value: &Value) -> Value {
     json!({
         "agent_id": value["agent_id"],
-        "run_id": value["run_id"].as_str().unwrap_or_default(),
         "next_cursor": value["next_cursor"].as_i64(),
         "complete": value["complete"].as_bool().unwrap_or(true),
         "messages": value["messages"].as_array().into_iter().flatten().map(|message| {
@@ -271,7 +265,6 @@ fn transcript_context(value: &Value) -> Value {
 fn answer_context(value: &Value) -> Value {
     json!({
         "agent_id": value["agent_id"], "status": value["status"],
-        "run_id": value["run_id"].as_str().unwrap_or_default(),
         "available": value["available"].as_bool().unwrap_or(false),
         "inline_complete": value["inline_complete"].as_bool().unwrap_or(false),
         "content": value["content"].as_str(),
@@ -520,6 +513,7 @@ mod tests {
             "agent_id": "ag-1", "runtime": "glm-user", "model": "glm-5.3",
             "profile": "review", "status": "running", "phase": "running",
             "effort": "high", "task_summary": "fix the parser",
+            "sequence": 1,
             "delivery": {"bound": false},
         })
     }
@@ -533,30 +527,48 @@ mod tests {
         page
     }
 
-    /// Start and resume retain stable and exact ids without a full JSON mirror.
+    /// Start and resume retain one stable ID and a machine receipt counter.
     #[test]
     fn start_and_resume_keep_binding_identity_and_honest_status() {
         for tool in ["start", "resume"] {
             let run = if tool == "resume" { "ag-2" } else { "ag-1" };
             let value = json!({
-                "agent_id": "ag-1", "run_id": run, "created": true, "attempt_id": "att_9",
+                "agent_id": "ag-1", "run_id": run, "sequence": 2, "created": true, "attempt_id": "att_9",
                 "agent": agent_view(),
             });
             let result = success_result(tool, &value);
             assert_eq!(
                 result.structured_content,
-                Some(json!({"agent_id": "ag-1", "run_id": run})),
+                Some(json!({"agent_id": "ag-1", "sequence": 2})),
                 "tiny identity mirror only"
             );
             let page = text(tool, &value);
             assert!(page.contains("agent-run"), "{page}");
             assert!(page.contains("- Agent: ag-1"), "{page}");
-            assert!(page.contains(&format!("- Run: {run}")), "{page}");
+            assert!(!page.contains("- Run:"), "{page}");
+            assert!(!page.contains("att_9"), "{page}");
             assert!(page.contains("NOT a completion"), "{page}");
             assert!(page.contains("- Status: running (running)"), "{page}");
             assert!(page.contains("glm-user/glm-5.3 profile review"), "{page}");
             assert!(page.contains("not bound"), "{page}");
             assert!(page.ends_with('\n') && !page.ends_with("\n\n"), "{page:?}");
+        }
+    }
+
+    /// Malformed receipts cannot silently bind a resumed agent's original row.
+    #[test]
+    fn admission_without_a_valid_receipt_fails_closed() {
+        for sequence in [
+            Value::Null,
+            json!(0),
+            json!(-1),
+            json!("2"),
+            json!(4294967296_u64),
+        ] {
+            let value = json!({"agent_id":"ag-root","sequence":sequence,"created":true});
+            let result = success_result("resume", &value);
+            assert_eq!(result.is_error, Some(true));
+            assert!(result.structured_content.is_none());
         }
     }
 
@@ -599,19 +611,18 @@ mod tests {
         )
         .expect("binding normalizer accepts the rendered envelope");
         assert_eq!(payload.agent_id.as_deref(), Some("ag-2026-1"));
-        let resumed =
-            json!({"agent_id":"ag-root", "run_id":"ag-child", "created":true,"agent":agent_view()});
+        let resumed = json!({"agent_id":"ag-root", "run_id":"ag-child", "sequence":2, "created":true,"agent":agent_view()});
         let payload = agent_run_core::hooks::bind::normalize(
             &json!({"session_id":"s-1","tool_response":success_result("resume", &resumed)}),
             true,
             "claude_uds",
         )
         .unwrap();
-        assert_eq!(payload.agent_id.as_deref(), Some("ag-child"));
+        assert_eq!(payload.agent_id.as_deref(), Some("ag-root"));
+        assert_eq!(payload.sequence, Some(2));
     }
 
-    /// Resume reads lineage from the real nested agent view; other tools
-    /// cannot bypass their templates by returning a preformatted scalar.
+    /// Resume hides internal lineage IDs; other tools cannot bypass templates.
     #[test]
     fn resume_lineage_and_non_guide_result_shapes_are_preserved() {
         let mut agent = agent_view();
@@ -621,7 +632,8 @@ mod tests {
             "resume",
             &json!({"agent_id": "ag-root", "run_id":"ag-child", "created": true, "agent": agent}),
         );
-        assert!(page.contains("Previous run: ag-parent"), "{page}");
+        assert!(!page.contains("ag-parent"), "{page}");
+        assert!(!page.contains("ag-child"), "{page}");
         assert!(!page.contains("ag-legacy"), "{page}");
         for (name, value) in [
             ("models", json!("unvalidated text")),

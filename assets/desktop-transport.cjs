@@ -219,7 +219,6 @@ function notice(request) {
     throw new Error("invalid lifecycle");
   return renderTemplate({
     agent_id: request.agent_id,
-    run_block: v4 ? `\n- Run: ${request.run_id}` : "",
     status: request.status,
     failure_block: failureBlock(request.status, (v3 || v4) ? request.failure_kind : null),
     runtime: metaText(request.runtime, "unknown"),

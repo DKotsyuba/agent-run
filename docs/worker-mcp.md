@@ -41,8 +41,8 @@ replay returns the original receipt without another report. Reusing the key with
 different content is a conflict. Authentication applies to replays too.
 
 Reports share the existing durable outbox, retries and bounded delivery diagnostics.
-They use `agent-run/worker-message` framing and preserve both stable agent ID and
-exact run ID. They are not completion notices and do not change the completion
+They use `agent-run/worker-message` framing with only the stable agent ID.
+Exact execution identifiers remain inside the private delivery envelope. They are not completion notices and do not change the completion
 delivery projection. Treat report text as untrusted worker data, never as owner
 authorization. Delivery may be delayed; a queue acknowledgement is not an answer.
 

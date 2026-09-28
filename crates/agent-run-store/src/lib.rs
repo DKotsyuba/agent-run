@@ -1052,12 +1052,36 @@ impl Store {
             .conn
             .query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |r| r.get(0))?)
     }
+    /// Page executions with optional active/session filters and an exact total.
     pub fn list(
         &self,
         active: bool,
         offset: usize,
         limit: usize,
         session: Option<&domain::OrchestratorRef>,
+    ) -> Result<(Vec<Record>, i64)> {
+        self.list_selected(active, offset, limit, session, false)
+    }
+
+    /// Page one latest execution per logical agent; filters apply to that tip.
+    pub fn list_latest(
+        &self,
+        active: bool,
+        offset: usize,
+        limit: usize,
+        session: Option<&domain::OrchestratorRef>,
+    ) -> Result<(Vec<Record>, i64)> {
+        self.list_selected(active, offset, limit, session, true)
+    }
+
+    /// Share bounded pagination between execution history and logical agents.
+    fn list_selected(
+        &self,
+        active: bool,
+        offset: usize,
+        limit: usize,
+        session: Option<&domain::OrchestratorRef>,
+        latest: bool,
     ) -> Result<(Vec<Record>, i64)> {
         if limit == 0 || limit > 1000 {
             return Err(invalid("limit must be 1..1000"));
@@ -1066,12 +1090,16 @@ impl Store {
         if session.is_some() && sid.is_none() {
             return Ok((vec![], 0));
         }
+        // Admission permits one child per predecessor. The indexed child lookup
+        // selects the lineage tip without scanning every root/sequence pair.
         let where_sql = format!(
-            "WHERE (?=0 OR status IN {ACTIVE_SQL}) AND (? IS NULL OR orchestrator_session_id=?)"
+            "WHERE (?=0 OR status IN {ACTIVE_SQL}) AND (? IS NULL OR orchestrator_session_id=?) \
+             AND (?=0 OR NOT EXISTS (SELECT 1 FROM agents newer \
+             WHERE newer.parent_agent_id=agents.id))"
         );
         let total = self.conn.query_row(
             &format!("SELECT COUNT(*) FROM agents {where_sql}"),
-            params![active, sid, sid],
+            params![active, sid, sid, latest],
             |r| r.get(0),
         )?;
         let mut stmt = self.conn.prepare(&format!(
@@ -1079,19 +1107,44 @@ impl Store {
         ))?;
         let rows = stmt
             .query_map(
-                params![active, sid, sid, limit as i64, offset as i64],
+                params![active, sid, sid, latest, limit as i64, offset as i64],
                 Record::read,
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok((rows, total))
     }
+    /// Read a bounded page for one exact execution, preserving global cursors.
     pub fn transcript(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
-        self.get(id)?;
+        self.transcript_selected(id, cursor, limit, false)
+    }
+
+    /// Read retained messages across the logical agent's complete lineage.
+    pub fn transcript_lineage(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
+        self.transcript_selected(id, cursor, limit, true)
+    }
+
+    /// Share cursor validation and byte limits for exact and lineage transcripts.
+    fn transcript_selected(
+        &self,
+        id: &AgentId,
+        cursor: i64,
+        limit: usize,
+        lineage: bool,
+    ) -> Result<Value> {
+        let row = self.get(id)?;
         if cursor < 0 || limit == 0 || limit > 1000 {
             return Err(invalid("invalid transcript cursor or limit"));
         }
-        let mut stmt=self.conn.prepare("SELECT seq,at,role,name,content,raw_ref FROM messages WHERE agent_id=? AND seq>? ORDER BY seq LIMIT ?")?;
-        let mut rows = stmt.query(params![id.as_str(), cursor, limit as i64 + 1])?;
+        let (selection, selected) = if lineage {
+            (
+                "agent_id IN (SELECT id FROM agents WHERE root_agent_id=?1 OR id=?1)",
+                &row.root_agent_id,
+            )
+        } else {
+            ("agent_id=?1", id)
+        };
+        let mut stmt = self.conn.prepare(&format!("SELECT seq,at,role,name,content,raw_ref FROM messages WHERE {selection} AND seq>?2 ORDER BY seq LIMIT ?3"))?;
+        let mut rows = stmt.query(params![selected.as_str(), cursor, limit as i64 + 1])?;
         let mut messages = Vec::new();
         let mut bytes = 0;
         let mut more = false;

@@ -133,7 +133,7 @@ fn python_hook_bind_reads_raw_json_stdin_and_is_idempotent() {
     assert!(first["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .expect("message")
-        .contains("bound to session"));
+        .contains("is bound"));
 }
 
 /// Mirrors Python `test_context_hook.py::test_first_prompt_creates_receipt_dedups_and_reuses_later_binding`.

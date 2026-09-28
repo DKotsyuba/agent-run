@@ -123,7 +123,7 @@ fn python_bind_hook_is_idempotent_and_activates_one_delivery() {
     let second = bind::run_hook(&mut home.store(), &payload, "codex_queue", Some(6.0))
         .expect("same target is idempotent");
     assert_eq!(first.session_id, second.session_id);
-    assert!(first.message().contains("bound to session"));
+    assert!(first.message().contains("is bound"));
     let delivery: String = home
         .store()
         .conn

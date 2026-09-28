@@ -54,7 +54,7 @@ async fn lost_reply(listener: UnixListener, supplied: Option<&str>) {
             frame::write(
                 &mut output,
                 &json!({"jsonrpc":"2.0","id":request["id"],"result":{
-                    "agent_id":AGENT,"run_id":RUN,"created":false,
+                    "agent_id":AGENT,"run_id":RUN,"sequence":2,"created":false,
                     "agent":{"agent_id":AGENT,"run_id":RUN,"status":"running"}
                 }}),
                 socket::MAX_FRAME,
@@ -117,7 +117,10 @@ async fn cli_and_mcp_resume_keep_one_intent_after_lost_acknowledgement() {
                     )
                     .unwrap();
                     assert_ne!(response["result"]["isError"], true, "{response}");
-                    assert_eq!(response["result"]["structuredContent"]["run_id"], RUN);
+                    assert_eq!(response["result"]["structuredContent"]["sequence"], 2);
+                    assert!(response["result"]["structuredContent"]
+                        .get("run_id")
+                        .is_none());
                     drop(input);
                     assert!(child.wait().await.unwrap().success());
                 } else {
@@ -132,7 +135,7 @@ async fn cli_and_mcp_resume_keep_one_intent_after_lost_acknowledgement() {
                         String::from_utf8_lossy(&result.stdout)
                     );
                     let response: Value = serde_json::from_slice(&result.stdout).unwrap();
-                    assert_eq!(response["run_id"], RUN);
+                    assert!(response.get("run_id").is_none());
                     assert_eq!(response["created"], false);
                 }
             };

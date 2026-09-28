@@ -28,6 +28,11 @@ struct Fixture {
 impl Fixture {
     /// Builds a fake runtime and the real standalone deployment helper into one sealed release.
     fn new() -> Self {
+        Self::with_tui(false)
+    }
+
+    /// Builds a legacy or bundled release from finite executable fixtures.
+    fn with_tui(bundled: bool) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path();
         let binary = root.join("runtime");
@@ -35,11 +40,17 @@ impl Fixture {
             &binary,
             "#!/bin/sh\nprintf '%s\\n' \"$AGENT_RUN_HOME\" \"$@\"\n",
         );
+        let tui = root.join("observer");
+        executable(
+            &tui,
+            "#!/bin/sh\nprintf 'tui\\n%s\\n' \"$AGENT_RUN_HOME\"\n",
+        );
         let candidate = release::build_with_installer(
             &root.join("download"),
             "1.0.0",
             &binary,
             Path::new(env!("CARGO_BIN_EXE_xtask")),
+            bundled.then_some(tui.as_path()),
         )
         .unwrap();
         let prefix = root.join("install prefix");
@@ -128,6 +139,7 @@ fn install_update_and_noop_preserve_data() {
         "1.0.1",
         &fixture.temporary.path().join("runtime"),
         Path::new(env!("CARGO_BIN_EXE_xtask")),
+        None,
     )
     .unwrap();
     installer::install(&next, &fixture.prefix, &fixture.home, &fixture.bin, "1.0.1").unwrap();
@@ -246,7 +258,7 @@ fn installed_version_is_not_rewritten_and_pending_recovery_is_preserved() {
 #[test]
 fn shell_download_and_archive_checks() {
     for downloader in ["curl", "wget"] {
-        let fixture = Fixture::new();
+        let fixture = Fixture::with_tui(true);
         let remote = fixture.archive();
         let mocks = fixture.temporary.path().join("mocks");
         fs::create_dir(&mocks).unwrap();
@@ -292,6 +304,7 @@ cp "$TEST_REMOTE/${url##*/}" "$output"
             "{}",
             String::from_utf8_lossy(&success.stderr)
         );
+        assert!(fixture.bin.join("agent-run-tui").is_file());
         let current = fs::read_link(fixture.prefix.join("current")).unwrap();
         fs::write(
             remote.join("SHA256SUMS"),
@@ -332,4 +345,87 @@ cp "$TEST_REMOTE/${url##*/}" "$output"
             .to_string_lossy()
             .starts_with("agent-run-install.")));
     }
+}
+
+/// Both bundled commands use the configured home, honor overrides and reinstall safely.
+#[test]
+fn bundled_launchers_share_version_and_home() {
+    let fixture = Fixture::with_tui(true);
+    fixture.install().unwrap();
+    fixture.install().unwrap();
+    for name in ["agent-run", "agent-run-tui"] {
+        for override_home in [None, Some("/tmp/explicit-home")] {
+            let mut command = Command::new(fixture.bin.join(name));
+            command.env_remove("AGENT_RUN_HOME");
+            if let Some(home) = override_home {
+                command.env("AGENT_RUN_HOME", home);
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{name}");
+            let default = fs::canonicalize(&fixture.home).unwrap();
+            let expected = override_home.unwrap_or(default.to_str().unwrap());
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(text.lines().any(|line| line == expected), "{name}: {text}");
+            if name == "agent-run-tui" {
+                assert!(text.starts_with("tui\n"), "wrong executable: {text}");
+            }
+        }
+    }
+    release::verify(&fixture.candidate).unwrap();
+    fs::write(fixture.candidate.join("bin/agent-run-tui"), "tampered").unwrap();
+    assert!(release::verify(&fixture.candidate).is_err());
+}
+
+/// A foreign observer command blocks upgrade before any pointer or journal change.
+#[test]
+fn foreign_tui_blocks_cutover_and_preserves_existing_release() {
+    let fixture = Fixture::with_tui(true);
+    let legacy = release::build_with_installer(
+        &fixture.temporary.path().join("download"),
+        "0.9.0",
+        &fixture.temporary.path().join("runtime"),
+        Path::new(env!("CARGO_BIN_EXE_xtask")),
+        None,
+    )
+    .unwrap();
+    installer::install(
+        &legacy,
+        &fixture.prefix,
+        &fixture.home,
+        &fixture.bin,
+        "0.9.0",
+    )
+    .unwrap();
+    let pointer = fs::read_link(fixture.prefix.join("current")).unwrap();
+    let journal = fs::read(fixture.prefix.join("deploy.json")).unwrap();
+    let foreign = fixture.bin.join("agent-run-tui");
+    fs::write(&foreign, "user-owned observer").unwrap();
+    assert!(fixture.install().unwrap_err().contains("unowned launcher"));
+    assert_eq!(
+        fs::read_link(fixture.prefix.join("current")).unwrap(),
+        pointer
+    );
+    assert_eq!(
+        fs::read(fixture.prefix.join("deploy.json")).unwrap(),
+        journal
+    );
+    assert_eq!(fs::read_to_string(foreign).unwrap(), "user-owned observer");
+    assert!(!fixture.prefix.join("releases/1.0.0").exists());
+}
+
+/// Reusing a sealed legacy version cannot silently omit a newly requested observer.
+#[test]
+fn adding_tui_to_an_existing_release_requires_a_new_version() {
+    let fixture = Fixture::new();
+    let error = release::build_with_installer(
+        &fixture.temporary.path().join("download"),
+        "1.0.0",
+        &fixture.temporary.path().join("runtime"),
+        Path::new(env!("CARGO_BIN_EXE_xtask")),
+        Some(&fixture.temporary.path().join("observer")),
+    )
+    .unwrap_err();
+    assert!(error.contains("predates the bundled TUI"), "{error}");
+    release::verify(&fixture.candidate).unwrap();
+    assert!(!fixture.candidate.join("bin/agent-run-tui").exists());
 }

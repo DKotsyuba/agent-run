@@ -186,6 +186,16 @@ The broker binds `<home>/api.sock` with mode `0600`. It accepts newline-framed
 JSON-RPC 2.0 and provides the tool methods plus `ping`, `tools`, and `wait`.
 See [docs/api.md](docs/api.md).
 
+## Observe with the terminal UI
+
+The release installer installs both `agent-run` and the separate `agent-run-tui`
+binary at the same version. Start the observer with `agent-run-tui`.
+
+`agent-run-tui` is a read-only terminal observer for the resident broker: it
+lists sessions live and shows any selected session's transcript, keyed with
+the mouse and the same JSON-RPC surface as the CLI. See
+[docs/tui.md](docs/tui.md).
+
 ## Reliability contract
 
 - SQLite admission precedes execution, so accepted jobs remain durable.

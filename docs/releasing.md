@@ -37,14 +37,14 @@ smoke.
 
 ```bash
 release_root="$(mktemp -d)"
-cargo xtask release build-native --output "$release_root" --version 0.18.2
-cargo xtask release verify --release "$release_root/releases/0.18.2"
+cargo xtask release build-native --output "$release_root" --version 0.19.0
+cargo xtask release verify --release "$release_root/releases/0.19.0"
 cargo xtask archive --revision HEAD \
-  --output "$release_root/agent-run-0.18.2-source.tar" --verify
+  --output "$release_root/agent-run-0.19.0-source.tar" --verify
 ```
 
 `build-native` seals the current host binaries. The sealed directory contains the
-runtime, `bin/agent-run-deploy` (the native xtask deployment entry point), external
+runtime, the separate `bin/agent-run-tui` observer, `bin/agent-run-deploy` (the native xtask deployment entry point), external
 quota scripts, metadata, `SHA256SUMS`, and the `COMPLETE` marker. It contains no
 interpreter, virtual environment, or package installation. Cross-platform
 release archives are built on their matching hosted runners, not by relabelling
@@ -57,8 +57,8 @@ one host's binary.
 3. Create and push an annotated tag from that accepted commit:
 
    ```bash
-   git tag -a v0.18.2 -m "agent-run 0.18.2"
-   git push origin v0.18.2
+   git tag -a v0.19.0 -m "agent-run 0.19.0"
+   git push origin v0.19.0
    ```
 
 After CI accepts the commit, the tagged `Release` workflow runs the macOS
@@ -83,7 +83,11 @@ requires an identical store schema, and checks active work before cutover.
 Explicit config/schema migrations remain separate operations. No services are
 stopped automatically; an occupied installation fails without killing processes.
 It copies into the permanent releases directory before calling the journalled
-deployer, then creates a managed launcher with the selected default home.
+deployer, then creates managed `agent-run` and `agent-run-tui` launchers with
+the selected default home. Both executable names use the same release version.
+All bundled launcher paths are checked before switching the current release;
+a foreign TUI command is never overwritten. Legacy releases without the TUI
+remain installable.
 An explicit `AGENT_RUN_HOME` or CLI `--home` still overrides that default.
 Foreign launchers, conflicting bytes at an existing version and pending
 deployment recovery are refused. An identical selected release is a no-op.

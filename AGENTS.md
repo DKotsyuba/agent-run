@@ -41,6 +41,7 @@ evidence, process ownership, and secret safety are product requirements.
 | Path | Responsibility |
 |---|---|
 | `crates/agent-run` | CLI, API daemon, MCP transport, launchd helpers |
+| `crates/agent-run-tui` | interactive terminal observer (broker client, read-only) |
 | `crates/agent-run-domain` | public contracts, tools, errors, state machine |
 | `crates/agent-run-config` | configuration, profiles, snapshots, role plans |
 | `crates/agent-run-store` | SQLite store, migrations, reconciliation |

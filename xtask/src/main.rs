@@ -93,12 +93,15 @@ fn archive_command(arguments: &[String]) {
     }
 }
 
-/// Builds the runtime and deployment helper for an installed target, returning the runtime path.
+/// Builds every sealed release binary for an installed target, returning the Cargo release directory.
 ///
 /// This is intentionally offline and locked: target support is the set installed
-/// in the invoking toolchain, dependency resolution cannot modify `Cargo.lock`,
-/// and a missing target fails before an incomplete release directory is created.
-fn native_binary(target: Option<&str>) -> Result<PathBuf, String> {
+/// in the invoking toolchain, dependency resolution cannot compose a different
+/// dependency graph, and a missing target fails before an incomplete release
+/// directory is created. One build produces each executable sealed from the
+/// single workspace version: the `agent-run` runtime, the `agent-run-tui`
+/// observer, and the `xtask` deployment helper.
+fn native_binaries(target: Option<&str>) -> Result<PathBuf, String> {
     let mut command = Command::new("cargo");
     command.args([
         "build",
@@ -107,6 +110,8 @@ fn native_binary(target: Option<&str>) -> Result<PathBuf, String> {
         "--release",
         "-p",
         "agent-run",
+        "-p",
+        "agent-run-tui",
         "-p",
         "xtask",
     ]);
@@ -126,7 +131,7 @@ fn native_binary(target: Option<&str>) -> Result<PathBuf, String> {
     let directory = target
         .map(|target| directory.join(target))
         .unwrap_or(directory);
-    Ok(directory.join("release/agent-run"))
+    Ok(directory.join("release"))
 }
 
 /// Parses the deliberately small offline release/deployment command surface.
@@ -156,13 +161,14 @@ fn release_command(arguments: &[String]) {
                 .unwrap_or_default(),
         )
         .map(|path| println!("{}", path.display())),
-        Some("build-native") => native_binary(text("--target").as_deref())
-            .and_then(|binary| {
+        Some("build-native") => native_binaries(text("--target").as_deref())
+            .and_then(|directory| {
                 release::build_with_installer(
                     &value("--output").ok_or("--output is required")?,
                     &text("--version").ok_or("--version is required")?,
-                    &binary,
-                    &binary.with_file_name("xtask"),
+                    &directory.join("agent-run"),
+                    &directory.join("xtask"),
+                    Some(&directory.join("agent-run-tui")),
                 )
             })
             .map(|path| println!("{}", path.display())),

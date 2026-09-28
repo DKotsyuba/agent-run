@@ -389,7 +389,7 @@ async fn test_resume_uses_broker_without_constructing_local_runtime() {
 async fn test_start_wait_reuses_private_socket_until_existing_agent_finishes() {
     let temp = tempdir().unwrap();
     let broker = Arc::new(FakeBroker::new(vec![
-        json!({"agent_id":AGENT_ID,"created":false}),
+        json!({"agent_id":AGENT_ID,"sequence":2,"created":false}),
         json!({"agent_id":AGENT_ID,"status":"failed","available":false}),
     ]));
     let output = Arc::new(Mutex::new(Vec::new()));
@@ -419,6 +419,10 @@ async fn test_start_wait_reuses_private_socket_until_existing_agent_finishes() {
     .await
     .unwrap();
     assert_eq!(code, 2);
+    assert_eq!(
+        broker.calls.lock().unwrap()[1].1,
+        json!({"agent_id":AGENT_ID,"sequence":2})
+    );
     assert_eq!(
         output.lock().unwrap()[0],
         json!({"agent_id":AGENT_ID,"status":"failed","available":false})

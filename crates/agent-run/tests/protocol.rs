@@ -284,13 +284,7 @@ fn start_tool_description_embeds_the_completion_contract() {
             .unwrap()
             .trim_end()
     ));
-    for field in [
-        "- ID:",
-        "- Run:",
-        "- Status:",
-        "- Runtime/model:",
-        "- Notice:",
-    ] {
+    for field in ["- ID:", "- Status:", "- Runtime/model:", "- Notice:"] {
         assert!(description.contains(field), "missing {field}");
     }
 }

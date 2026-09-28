@@ -116,7 +116,9 @@ fn copy_release(source: &Path, destination: &Path) -> Result<(), String> {
 /// The caller downloads into a disposable directory. This copies it into the
 /// permanent prefix before using the journalled deployer. Broker and SQLite
 /// writer locks stay held through backup, pointer switch and launcher placement.
-/// No schema migration, service control, model setup or credential change occurs.
+/// All bundled launchers are ownership-checked and prepared before cutover.
+/// Legacy releases without a TUI remain supported. No schema migration, service
+/// control, model setup or credential change occurs.
 pub fn install(
     candidate: &Path,
     prefix: &Path,
@@ -155,24 +157,44 @@ pub fn install(
             return Err("unfinished deployment: run release recover with this prefix and home before installing".into());
         }
     }
-    let launcher = bin.join("agent-run");
-    let target = prefix.join("current/bin/agent-run");
-    let wrapper = format!("#!/bin/sh\n# agent-run managed launcher v1\nif [ -z \"${{AGENT_RUN_HOME:-}}\" ]; then AGENT_RUN_HOME={}; fi\nexport AGENT_RUN_HOME\nexec {} \"$@\"\n", quote(&home)?, quote(&target)?);
-    match fs::symlink_metadata(&launcher) {
-        Ok(metadata)
-            if metadata.file_type().is_symlink()
-                && fs::read_link(&launcher).ok().as_ref() == Some(&target) => {}
-        Ok(metadata)
-            if metadata.is_file()
-                && fs::read(&launcher).ok().as_deref() == Some(wrapper.as_bytes()) => {}
-        Ok(_) => {
-            return Err(format!(
-                "refusing to replace an unowned launcher: {}",
-                launcher.display()
-            ))
+    let mut launchers = Vec::new();
+    for name in ["agent-run", "agent-run-tui"] {
+        // Legacy releases have no observer; leave unrelated commands untouched.
+        if name == "agent-run-tui" && !candidate.join("bin/agent-run-tui").is_file() {
+            continue;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.to_string()),
+        let launcher = bin.join(name);
+        let target = prefix.join("current/bin").join(name);
+        let wrapper = format!("#!/bin/sh\n# agent-run managed launcher v1\nif [ -z \"${{AGENT_RUN_HOME:-}}\" ]; then AGENT_RUN_HOME={}; fi\nexport AGENT_RUN_HOME\nexec {} \"$@\"\n", quote(&home)?, quote(&target)?);
+        match fs::symlink_metadata(&launcher) {
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    && fs::read_link(&launcher).ok().as_ref() == Some(&target) => {}
+            Ok(metadata)
+                if metadata.is_file()
+                    && fs::read(&launcher).ok().as_deref() == Some(wrapper.as_bytes()) => {}
+            Ok(_) => {
+                return Err(format!(
+                    "refusing to replace an unowned launcher: {}",
+                    launcher.display()
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        let mut launcher_file = tempfile::NamedTempFile::new_in(&bin).map_err(|e| e.to_string())?;
+        launcher_file
+            .write_all(wrapper.as_bytes())
+            .map_err(|e| e.to_string())?;
+        launcher_file
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o755))
+            .map_err(|e| e.to_string())?;
+        launcher_file
+            .as_file()
+            .sync_all()
+            .map_err(|e| e.to_string())?;
+        launchers.push((launcher, launcher_file));
     }
     let releases = directory(&prefix.join("releases"))?;
     let destination = releases.join(version);
@@ -195,18 +217,14 @@ pub fn install(
     }
     let already_selected = destination.exists()
         && fs::canonicalize(prefix.join("current")).ok().as_ref() == Some(&destination);
-    let mut launcher_file = tempfile::NamedTempFile::new_in(&bin).map_err(|e| e.to_string())?;
-    launcher_file
-        .write_all(wrapper.as_bytes())
-        .map_err(|e| e.to_string())?;
-    launcher_file
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(0o755))
-        .map_err(|e| e.to_string())?;
-    launcher_file
-        .as_file()
-        .sync_all()
-        .map_err(|e| e.to_string())?;
+    // Publish while the cutover branch still owns its broker and writer locks.
+    let publish_launchers = || -> Result<(), String> {
+        for (launcher, file) in launchers {
+            file.persist(&launcher).map_err(|e| e.to_string())?;
+            println!("Launcher: {}", launcher.display());
+        }
+        Ok(())
+    };
     if !already_selected {
         let _broker = lock(
             &home.join(".api.sock.lock"),
@@ -255,14 +273,13 @@ pub fn install(
             fs::rename(staging.path(), &destination).map_err(|e| e.to_string())?;
         }
         deploy::deploy(&prefix, &home, &destination, false)?;
-        launcher_file
-            .persist(&launcher)
-            .map_err(|e| e.to_string())?;
+        publish_launchers()?;
     } else {
-        launcher_file
-            .persist(&launcher)
-            .map_err(|e| e.to_string())?;
+        publish_launchers()?;
     }
-    println!("agent-run {version} selected at {}\nLauncher: {}\nStart or restart your configured services explicitly.", destination.display(), launcher.display());
+    println!(
+        "agent-run {version} selected at {}\nStart or restart your configured services explicitly.",
+        destination.display()
+    );
     Ok(())
 }

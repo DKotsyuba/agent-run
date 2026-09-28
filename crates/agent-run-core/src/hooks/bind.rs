@@ -18,6 +18,7 @@ pub struct BindResult {
     /// Stable agent identity for the bound execution's lineage.
     pub agent_id: AgentId,
     /// Exact durable execution whose receipt was bound, never a moving alias.
+    #[serde(skip_serializing)]
     pub run_id: AgentId,
     /// The opaque durable orchestrator-session primary key.
     pub session_id: String,
@@ -26,14 +27,9 @@ pub struct BindResult {
 impl BindResult {
     /// Returns the exact safe confirmation injected into the post-tool host turn.
     pub fn message(&self) -> String {
-        let execution = if self.run_id == self.agent_id {
-            String::new()
-        } else {
-            format!(" (run {})", self.run_id)
-        };
         format!(
-            "agent-run: agent {}{} is bound to session {}; its completion will be delivered to this chat.",
-            self.agent_id, execution, self.session_id
+            "agent-run: agent {} is bound; its completion will be delivered to this chat.",
+            self.agent_id
         )
     }
 }
@@ -82,8 +78,21 @@ pub fn run_hook(
     let parsed = agent_id
         .parse::<AgentId>()
         .map_err(|error| loud(&agent_id, &error))?;
-    bind(store, parsed, normalized.reference, at.unwrap_or_else(now))
-        .map_err(|error| loud(&agent_id, &error))
+    let execution = match normalized.sequence {
+        Some(sequence) => {
+            crate::agent_identity::resolve_sequence(store, &parsed, sequence)
+                .map_err(|error| loud(&agent_id, &error))?
+                .id
+        }
+        None => parsed,
+    };
+    bind(
+        store,
+        execution,
+        normalized.reference,
+        at.unwrap_or_else(now),
+    )
+    .map_err(|error| loud(&agent_id, &error))
 }
 
 /// Represents the normalized session reference and optional discovered agent id.
@@ -93,6 +102,8 @@ pub struct HookPayload {
     pub reference: OrchestratorRef,
     /// The post-tool durable agent id; user-prompt context has no agent id.
     pub agent_id: Option<String>,
+    /// Exact internal receipt counter; absent for legacy exact-id payloads.
+    pub sequence: Option<u32>,
 }
 
 /// Converts raw or normalized context/bind payloads into one strict host-neutral form.
@@ -125,20 +136,23 @@ pub fn normalize(payload: &Value, bind: bool, transport: &str) -> Result<HookPay
             external_turn_id: object.get("turn_id").map(value_string).transpose()?,
         };
         reference.validate()?;
-        let agent_id = if bind {
-            Some(raw_agent_id(object.get("tool_response"))?)
+        let (agent_id, sequence) = if bind {
+            let (id, sequence) = raw_selection(object.get("tool_response"))?;
+            (Some(id), sequence)
         } else {
-            None
+            (None, None)
         };
         return Ok(HookPayload {
             reference,
             agent_id,
+            sequence,
         });
     }
     let allowed: BTreeSet<&str> = if bind {
         BTreeSet::from([
             "agent_id",
             "run_id",
+            "sequence",
             "transport",
             "external_session_id",
             "external_turn_id",
@@ -174,7 +188,80 @@ pub fn normalize(payload: &Value, bind: bool, transport: &str) -> Result<HookPay
     Ok(HookPayload {
         reference,
         agent_id,
+        sequence: if bind && !object.contains_key("run_id") {
+            object.get("sequence").map(receipt_sequence).transpose()?
+        } else {
+            None
+        },
     })
+}
+
+/// Parses the positive bounded counter carried only by machine binding receipts.
+fn receipt_sequence(value: &Value) -> Result<u32> {
+    value
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n > 0)
+        .ok_or_else(|| invalid("binding receipt sequence must be a positive integer"))
+}
+
+/// Accepts old exact-id receipts or one stable-id/sequence pair without following a tip.
+fn raw_selection(value: Option<&Value>) -> Result<(String, Option<u32>)> {
+    let mut legacy = BTreeSet::new();
+    if let Some(value) = value {
+        collect_ids(value, "run_id", &mut legacy)?;
+    }
+    if !legacy.is_empty() {
+        return Ok((raw_agent_id(value)?, None));
+    }
+    let mut receipts = BTreeSet::new();
+    if let Some(value) = value {
+        collect_receipts(value, &mut receipts)?;
+    }
+    match receipts.len() {
+        0 => Ok((raw_agent_id(value)?, None)),
+        1 => {
+            let (id, sequence) = receipts.pop_first().expect("one receipt");
+            Ok((id, Some(sequence)))
+        }
+        _ => Err(invalid(
+            "raw PostToolUse payload has conflicting binding receipts",
+        )),
+    }
+}
+
+/// Collects receipt metadata while keeping task, answer and policy content opaque.
+fn collect_receipts(value: &Value, receipts: &mut BTreeSet<(String, u32)>) -> Result<()> {
+    match value {
+        Value::Object(object) if object.contains_key("agent_id") => {
+            let id = required_string(object.get("agent_id"), "agent_id")?;
+            if let Some(sequence) = object.get("sequence") {
+                receipts.insert((id, receipt_sequence(sequence)?));
+            }
+            for name in ["agent", "delivery"] {
+                if let Some(value) = object.get(name) {
+                    collect_receipts(value, receipts)?;
+                }
+            }
+        }
+        Value::Object(object) => {
+            for value in object.values() {
+                collect_receipts(value, receipts)?;
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_receipts(value, receipts)?;
+            }
+        }
+        Value::String(text) => {
+            if let Ok(value) = serde_json::from_str::<Value>(text) {
+                collect_receipts(&value, receipts)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Returns a mandatory string field without echoing its potentially sensitive value.

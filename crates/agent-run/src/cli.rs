@@ -93,6 +93,10 @@ pub trait CliService: Send + Sync {
     fn agent(&self, id: &AgentId) -> Result<Value>;
     /// Read one bounded page from the already pinned execution.
     fn transcript(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value>;
+    /// Read retained lineage history; store-free seams may use a single run.
+    fn transcript_public(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
+        self.transcript(id, cursor, limit)
+    }
     /// Return the configured model roster or schema-2 provider catalog.
     fn models<'a>(&'a self, query: agent_run_domain::ModelsQuery) -> CliFuture<'a>;
     /// Return the configured capacity limits.
@@ -142,6 +146,10 @@ impl CliService for Service {
     }
     fn transcript(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
         Service::transcript(self, id, cursor, limit)
+    }
+    /// Keep transcript cursors continuous across independent resume executions.
+    fn transcript_public(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
+        Service::transcript_public(self, id, cursor, limit)
     }
     fn models<'a>(&'a self, query: agent_run_domain::ModelsQuery) -> CliFuture<'a> {
         Box::pin(Service::models(self, query))
@@ -233,14 +241,14 @@ pub enum Command {
         /// Stable agent id, or a historical run alias for that agent.
         agent_id: AgentId,
         /// Pin cancellation to this exact run within the agent's history.
-        #[arg(long)]
+        #[arg(long, hide = true)]
         run_id: Option<AgentId>,
     },
     Steer {
         /// Stable agent id, or a historical run alias for that agent.
         agent_id: AgentId,
         /// Pin steering to this exact run within the agent's history.
-        #[arg(long)]
+        #[arg(long, hide = true)]
         run_id: Option<AgentId>,
         #[arg(long)]
         text: String,
@@ -250,14 +258,14 @@ pub enum Command {
         /// Stable agent id; defaults to its latest execution's answer.
         agent_id: AgentId,
         /// Retrieve this exact historical run's verified answer.
-        #[arg(long)]
+        #[arg(long, hide = true)]
         run_id: Option<AgentId>,
     },
     Transcript {
-        /// Stable agent id; the viewer pins its selected run before paging.
+        /// Stable agent id; pages include retained history across resumes.
         agent_id: AgentId,
         /// Retrieve this exact historical run's transcript.
-        #[arg(long)]
+        #[arg(long, hide = true)]
         run_id: Option<AgentId>,
         #[arg(long, default_value_t = 0)]
         cursor: i64,
@@ -469,7 +477,7 @@ pub struct Resume {
     /// Stable agent id or an old run alias; omission of run_id continues its tip.
     pub agent_id: AgentId,
     /// Pin the terminal parent rather than resolving the latest run.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub run_id: Option<AgentId>,
     #[arg(long)]
     pub task: Option<String>,
@@ -487,8 +495,8 @@ pub struct Resume {
 pub struct Bind {
     /// Stable agent whose selected execution should be bound.
     pub agent_id: AgentId,
-    /// Exact execution to bind; use the run_id returned by start or resume.
-    #[arg(long)]
+    /// Legacy execution selector, retained for older callers.
+    #[arg(long, hide = true)]
     pub run_id: Option<AgentId>,
     /// Orchestrator transport name.
     #[arg(long)]
@@ -634,7 +642,7 @@ pub enum Delivery {
         /// Stable agent id or historical alias.
         agent_id: AgentId,
         /// Exact execution whose notification should be inspected.
-        #[arg(long)]
+        #[arg(long, hide = true)]
         run_id: Option<AgentId>,
     },
     Cancel {
@@ -721,8 +729,8 @@ pub fn emit(value: &Value) -> Result<()> {
 ///
 /// Socket/MCP calls deliberately retain the full durable agent snapshot, but
 /// the shell command has historically emitted only an agent id and the replay
-/// indicator. It now also retains the exact run id for receipt binding and
-/// historical reads. A malformed broker result is treated as a typed validation
+/// indicator. Internal execution identities are omitted.
+/// A malformed broker result is treated as a typed validation
 /// failure rather than silently producing a partial acknowledgement.
 fn admission_output(result: &Value) -> Result<Value> {
     let agent_id = result
@@ -736,14 +744,7 @@ fn admission_output(result: &Value) -> Result<Value> {
     if !agent_id.is_string() || !created.is_boolean() {
         return Err(invalid("broker admission result has invalid fields"));
     }
-    let mut output = json!({"agent_id":agent_id,"created":created});
-    if let Some(run_id) = result.get("run_id") {
-        if !run_id.is_string() {
-            return Err(invalid("broker admission result has invalid run_id"));
-        }
-        output["run_id"] = run_id.clone();
-    }
-    Ok(output)
+    Ok(json!({"agent_id":agent_id,"created":created}))
 }
 fn result_code(value: &Value) -> i32 {
     match value.get("status").and_then(Value::as_str) {
@@ -1251,7 +1252,12 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             if a.wait {
                 let id: AgentId = serde_json::from_value(result["agent_id"].clone())?;
                 let mut wait = json!({"agent_id": id});
-                if let Some(run_id) = result.get("run_id") {
+                if let Some(sequence) = result
+                    .get("sequence")
+                    .or_else(|| result["agent"].get("sequence"))
+                {
+                    wait["sequence"] = sequence.clone();
+                } else if let Some(run_id) = result.get("run_id") {
                     wait["run_id"] = run_id.clone();
                 }
                 let result = dependencies.broker.call("wait", wait).await?;
@@ -1375,6 +1381,15 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             let agent_id = dependencies
                 .service
                 .resolve_run_id(&agent_id, run_id.as_ref())?;
+            let page_at = |cursor| {
+                if run_id.is_some() {
+                    dependencies.service.transcript(&agent_id, cursor, limit)
+                } else {
+                    dependencies
+                        .service
+                        .transcript_public(&agent_id, cursor, limit)
+                }
+            };
             // An explicit --format always wins; otherwise text is interactive
             // and JSON keeps piped consumers on the historical machine shape.
             let text = TranscriptFormat::effective(format) == TranscriptFormat::Text;
@@ -1383,7 +1398,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             // writes each rendered chunk immediately.
             let mut renderer = crate::transcript::Renderer::default();
             if full {
-                let page = dependencies.service.transcript(&agent_id, cursor, limit)?;
+                let page = page_at(cursor)?;
                 let mut messages = page["messages"].as_array().cloned().unwrap_or_default();
                 let mut page_cursor = cursor;
                 let mut pages = 1usize;
@@ -1396,9 +1411,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                         return Err(invalid("transcript pagination did not advance"));
                     }
                     page_cursor = next;
-                    current = dependencies
-                        .service
-                        .transcript(&agent_id, page_cursor, limit)?;
+                    current = page_at(page_cursor)?;
                     messages.extend(current["messages"].as_array().cloned().unwrap_or_default());
                     pages += 1;
                 }
@@ -1420,7 +1433,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                     })
                     .transpose()?;
                 loop {
-                    let page = dependencies.service.transcript(&agent_id, cursor, limit)?;
+                    let page = page_at(cursor)?;
                     if text {
                         renderer.page(
                             page["messages"]

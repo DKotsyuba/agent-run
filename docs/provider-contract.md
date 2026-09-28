@@ -165,10 +165,9 @@ mechanisms as before; setting either on the other harness is a
 Resume on a schema-2 home is never a remap or prompt replay. A schema-1 run
 returns `Unsupported` (`legacy_continuation_unavailable`) with its history
 intact. A terminal provider run resumes explicitly through the existing
-`resume` tool/CLI/socket with the same public `agent_id` and a new `run_id`
-(`Service::resume_public` and `Service::admit_provider_resume`). An optional
-`run_id` selects an exact predecessor in that agent's lineage; omission selects
-the latest run. Storage still records a physical child:
+`resume` tool/CLI/socket with the same public `agent_id`
+(`Service::resume_public` and `Service::admit_provider_resume`). It continues
+the latest terminal execution. Storage still records a physical child:
 
 - The child keeps the parent's provider, harness, explicit model, workdir,
   role grants, sealed assets, frozen configuration, runtime home and native

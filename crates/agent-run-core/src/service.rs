@@ -1160,7 +1160,13 @@ impl Service {
         let cancelled = Store::open(&self.home)?.cancel_delivery(delivery_id)?;
         Ok(json!({"delivery_id":delivery_id,"cancelled":cancelled}))
     }
+    /// List execution history, optionally waiting for a newer durable revision.
     pub async fn list(&self, query: Query) -> Result<Value> {
+        self.list_selected(query, false).await
+    }
+
+    /// Share revision waiting and pagination with the stable public agent list.
+    pub(crate) async fn list_selected(&self, query: Query, latest: bool) -> Result<Value> {
         query.validate()?;
         let until = tokio::time::Instant::now() + Duration::from_secs_f64(query.wait_seconds);
         loop {
@@ -1172,7 +1178,13 @@ impl Service {
                 {
                     None
                 } else {
-                    let (rows, total) = store.list(
+                    let list = if latest {
+                        Store::list_latest
+                    } else {
+                        Store::list
+                    };
+                    let (rows, total) = list(
+                        &store,
                         query.active,
                         query.offset,
                         query.limit,
@@ -1266,7 +1278,7 @@ impl Service {
             .and_then(|i| i.get("effective_policy"));
         let mut view = json!({"agent_id":row.id,"runtime":row.request.runtime,"model":row.request.model,"profile":row.request.profile,"task_summary":row.request.task.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect::<String>(),"status":row.status,
             "created_at":row.created_at,"started_at":row.started_at,"finished_at":row.finished_at,"elapsed_seconds":(row.finished_at.unwrap_or(observed)-row.started_at.unwrap_or(row.created_at)).max(0.0),"last_progress_at":progress,"silence_seconds":if row.status.terminal(){None}else{Some((observed-progress.or(row.started_at).unwrap_or(row.created_at)).max(0.0))},"warned":false,"failure_kind":row.failure_kind,"failure_text":row.failure_text,"answer_available":row.answer_path.is_some(),"answer_bytes":row.answer_bytes,"answer_sha256":row.answer_sha256,"effort":row.request.effort,
-            "delivery":store.delivery_status(&row.id)?,"parent_agent_id":row.parent_agent_id,"root_agent_id":row.root_agent_id,"sequence":row.sequence,"cleanup":store.last_event(&row.id,"process_cleanup")?,"policy":policy,"phase":phase,"phase_started_at":row.finished_at.or(row.started_at).unwrap_or(row.created_at),"process_state":process::observe(row.supervisor_pid,row.supervisor_identity.as_deref(),row.supervisor_birth_time),"observed_at":observed,"runtime_outcome":if row.status.terminal(){Some(row.status.as_str())}else{None},"acceptance":"pending"});
+            "delivery":store.delivery_status(&row.id)?,"parent_agent_id":row.parent_agent_id,"root_agent_id":row.root_agent_id,"sequence":row.sequence,"cleanup":store.last_event(&row.id,"process_cleanup")?,"policy":policy,"phase":phase,"phase_started_at":row.finished_at.or(row.started_at).unwrap_or(row.created_at),"process_state":process::observe(row.supervisor_pid,row.supervisor_identity.as_deref(),row.supervisor_birth_time),"observed_at":observed,"runtime_outcome":if row.status.terminal(){Some(row.status.as_str())}else{None},"acceptance":"pending","workdir":row.request.workdir.display().to_string()});
         let mcp = agent_run_store::projections::selected_mcp(row.identity.as_ref());
         if !mcp.is_empty() {
             view["mcp"] = serde_json::to_value(mcp)?;
