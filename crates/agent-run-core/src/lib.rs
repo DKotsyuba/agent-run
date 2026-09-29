@@ -18,6 +18,8 @@ pub mod logging;
 pub mod managed_services;
 /// Single-instance storage of Codex's unindexed native metadata caches.
 pub mod native_cache;
+/// Freeze/thaw lifecycle for native Codex directory caches in retained homes.
+pub mod native_tree_cache;
 /// Optional reuse of native plugin blocks after verified, session-owned cleanup.
 mod runtime_cache;
 /// Filesystem relocation of sealed managed trees into the shared store.
