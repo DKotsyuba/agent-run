@@ -1571,6 +1571,48 @@ fn interrupted_curated_operations_recover() {
     cleanup_store(&store_root);
 }
 
+/// A crash while a proven freeze original is being removed leaves a
+/// partial `discard` subtree beside the record; recovery removes it without
+/// re-proving, keeps the exact link, and leaves private Git state alone.
+#[test]
+fn interrupted_discard_recovers_without_reproof() {
+    let root = TempDir::new().expect("fixture root");
+    let store_root = store(root.path());
+    let home_path = root.path().join("home");
+    let private = common::curated_clone(&home_path, &common::curated_shape_small(4096), "home");
+    let home_path = home_path.canonicalize().unwrap();
+    let before = common::private_identity(&private);
+    let reference = frozen(
+        native_tree_cache::freeze(&store_root, &home_path, MIRROR, &scope()).expect("freeze"),
+    );
+    let backup = home_path.join(".agent-run-native-disc1");
+    stdfs::create_dir_all(backup.join("discard/plugin-00/level-1")).expect("partial discard");
+    stdfs::write(
+        backup.join("discard/plugin-00/level-1/leftover.md"),
+        b"half removed",
+    )
+    .expect("leftover");
+    stdfs::write(
+        backup.join("op.json"),
+        format!(
+            "{{\"op_version\":1,\"op\":\"freeze\",\"root\":\"{MIRROR}\",\"scope\":\"{}\",\"manifest_sha256\":\"{}\"}}",
+            reference.scope, reference.manifest_sha256
+        ),
+    )
+    .expect("record");
+    native_tree_cache::recover(&store_root, &home_path).expect("recover partial discard");
+    assert!(
+        !backup.exists(),
+        "the partial discard and its record are gone"
+    );
+    assert_eq!(
+        stdfs::read_link(home_path.join(MIRROR)).unwrap(),
+        shared_assets::shared_tree_root(&store_root, &reference).unwrap()
+    );
+    assert_eq!(common::private_identity(&private), before);
+    cleanup_store(&store_root);
+}
+
 /// The census pins curated links and their blobs while any home links them
 /// and drops them once the last physical home is gone.
 #[test]

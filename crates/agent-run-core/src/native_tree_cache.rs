@@ -826,10 +826,13 @@ fn finish_backup_removal(home: &Dir, backup: &str) -> Result<()> {
 ///
 /// A remote plugin parent without a valid native remote-install marker, or
 /// a curated root outside its native clone shape, is returned as
-/// [`FreezeOutcome::SkippedUnchanged`] without touching anything. Otherwise the private tree is captured with exact content and
-/// topology, a managed-snapshot staging copy is imported through the
-/// existing shared-tree publisher (after the operation record pins the
-/// intent inside the home), and — under one global [`SharedStoreLock`] hold —
+/// [`FreezeOutcome::SkippedUnchanged`] without touching anything.
+/// Otherwise the private tree is captured with exact content and topology
+/// and — after the operation record pins the intent inside the home —
+/// either the store already holds that manifest's tree and it fully
+/// verifies, or a managed-snapshot staging copy is imported through the
+/// existing shared-tree publisher and verified; then — under one global
+/// [`SharedStoreLock`] hold —
 /// the original moves into its `.agent-run-native-<uuid>` backup and the
 /// root becomes one exact whole-tree symlink, after which the backup is
 /// removed only once it still hashes to the same manifest. An
@@ -901,11 +904,25 @@ fn freeze_directory(
     // publishes anything, so a crash cannot strand an unpinned store object.
     let backup = format!("{BACKUP_PREFIX}{}", uuid::Uuid::new_v4().simple());
     write_record(home, &backup, &record("freeze", root_key, &reference))?;
-    let staged_rel = Path::new(&backup).join(STAGING).join(root_key);
-    stage_capture(home, &staged_rel, Path::new(root_key), &source, &captured)?;
-    shared_assets::import_shared_tree(root, scope, home_path, &staged_rel)?;
-    shared_assets::verify_shared_tree(root, &reference)?;
-    remove_backup_child(home, &backup, STAGING)?;
+    // A store tree already published under the captured manifest digest is
+    // the same content by construction; once it fully verifies, no staging
+    // copy or import is needed. The check holds the store lock, exactly as
+    // the publisher's own existing-destination check does, so a collection
+    // pass whose census predates the record above cannot be removing the
+    // tree meanwhile; every later pass sees the record's pin. Anything else
+    // — missing or unverifiable — goes through the publisher (which takes
+    // the lock itself), and it refuses a corrupt destination.
+    let existing = {
+        let _guard = SharedStoreLock::acquire(root)?;
+        shared_assets::verify_shared_tree(root, &reference).is_ok()
+    };
+    if !existing {
+        let staged_rel = Path::new(&backup).join(STAGING).join(root_key);
+        stage_capture(home, &staged_rel, Path::new(root_key), &source, &captured)?;
+        shared_assets::import_shared_tree(root, scope, home_path, &staged_rel)?;
+        shared_assets::verify_shared_tree(root, &reference)?;
+        remove_backup_child(home, &backup, STAGING)?;
+    }
     // The link install and original hand-off hold the global lock so store
     // guard scans and collectors never observe a half-switched home.
     let _guard = SharedStoreLock::acquire(root)?;
@@ -976,15 +993,14 @@ pub fn thaw(store_root: &Path, home_path: &Path, root_key: &str) -> Result<Optio
 ///
 /// On a cloning volume the whole hierarchy is cloned in one call, the
 /// manifest file is dropped and every manifest entry's mode is set exactly;
-/// otherwise each payload is cloned one by one, parents first. Clones share
-/// the store's already-durable data blocks, so nothing is flushed per entry
-/// and one [`Dir::sync`] barrier on the staged root commits the tree before
-/// the caller swaps it in; a crash before the swap leaves a staged clone
+/// otherwise each payload is cloned one by one, parents first. Nothing is
+/// flushed while staging; before returning, every staged file and directory
+/// is pushed with plain `fsync(2)` ([`Dir::push_tree`]) and one [`Dir::sync`]
+/// barrier (`F_FULLFSYNC` on Apple hosts, which persists everything pushed
+/// before it on the device) makes the whole staged tree durable — on any
+/// filesystem, since each object is flushed explicitly. Only then may the
+/// caller swap it in; a crash before the swap leaves a staged clone
 /// recovery proves against the record or rolls back to the link.
-///
-/// ponytail: the single barrier relies on APFS committing all pending
-/// metadata on one full flush; a non-APFS volume needing per-entry flushes
-/// would stage through the synced writers instead.
 fn clone_tree(home: &Dir, staged: &Path, store: &Dir, tree_rel: &Path) -> Result<()> {
     let tree = store.subdir(tree_rel)?;
     let payload = tree.read(Path::new(SNAPSHOT_MANIFEST), MAX_TREE_MANIFEST_BYTES)?;
@@ -1019,6 +1035,7 @@ fn clone_tree(home: &Dir, staged: &Path, store: &Dir, tree_rel: &Path) -> Result
             );
             clone.set_mode(relative, logical_mode(entry)?)?;
         }
+        clone.push_tree()?;
         return clone.sync();
     }
     home.directory(staged)?;
@@ -1036,7 +1053,9 @@ fn clone_tree(home: &Dir, staged: &Path, store: &Dir, tree_rel: &Path) -> Result
         let mode = logical_mode(entry)?;
         home.stage_snapshot_file(&staged.join(relative), &tree, relative, &bytes, mode)?;
     }
-    home.subdir(staged)?.sync()
+    let clone = home.subdir(staged)?;
+    clone.push_tree()?;
+    clone.sync()
 }
 
 /// Completes or rolls back every interrupted native-cache operation in one

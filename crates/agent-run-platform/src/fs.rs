@@ -88,9 +88,60 @@ pub fn tolerate_unsupported_sync(outcome: std::io::Result<()>) -> Result<()> {
 /// `directory` must be an open descriptor for the directory whose entries
 /// changed. Returns once those entries are durable, or immediately when the
 /// filesystem reports directory synchronization unsupported; see
-/// [`tolerate_unsupported_sync`] for the exact tolerated errors.
+/// [`tolerate_unsupported_sync`] for the exact tolerated errors. This is
+/// std's `File::sync_all`: `fcntl(F_FULLFSYNC)` on Apple hosts (fsync(2)
+/// plus a drain of the whole device write queue), `fsync(2)` elsewhere.
 fn sync_directory(directory: &File) -> Result<()> {
     tolerate_unsupported_sync(directory.sync_all())
+}
+
+/// How far one namespace mutation flushes its parent directory.
+///
+/// On Apple hosts `fsync(2)` only moves an object's data and attributes to
+/// the device, which may still reorder or lose them, while `F_FULLFSYNC`
+/// also drains the device queue so that "data that had been fsync'd on the
+/// same device before is guaranteed to be persisted when this call returns"
+/// (`fcntl(2)`). A batch may therefore apply [`Flush::Skipped`] mutations,
+/// push every changed object once with plain `fsync(2)` ([`push`],
+/// [`Dir::push`], [`Dir::push_tree`]) and make them all durable with one
+/// [`Dir::sync`] barrier on the same device. On other hosts `fsync(2)` is
+/// already the durable operation, so that ordering never weakens a
+/// non-Apple fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flush {
+    /// Durable when the call returns (`File::sync_all`, the historical
+    /// behavior of every synced primitive).
+    Durable,
+    /// Not flushed: either disposable content a crash may lose or leave
+    /// partial, which its owner's recovery must discard or re-prove, or a
+    /// batch whose caller pushes the changed directory and crosses a
+    /// [`Dir::sync`] barrier before anything depends on it.
+    Skipped,
+}
+
+/// Pushes one open file or directory to its device with plain `fsync(2)`.
+///
+/// Durable on return except on Apple hosts, where it becomes durable only
+/// once a later `F_FULLFSYNC` ([`Dir::sync`]) on the same device returns;
+/// see [`Flush`].
+/// Filesystems reporting synchronization unsupported are tolerated like
+/// [`tolerate_unsupported_sync`].
+pub fn push(file: &File) -> Result<()> {
+    // SAFETY: the descriptor is live for the duration of this call.
+    let outcome = if unsafe { libc::fsync(file.as_raw_fd()) } < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    };
+    tolerate_unsupported_sync(outcome)
+}
+
+/// Flushes one open directory descriptor to the requested [`Flush`] level.
+fn flush(file: &File, level: Flush) -> Result<()> {
+    match level {
+        Flush::Durable => sync_directory(file),
+        Flush::Skipped => Ok(()),
+    }
 }
 pub fn relative(path: &Path) -> Result<Vec<CString>> {
     let mut result = Vec::new();
@@ -368,40 +419,70 @@ impl Dir {
     /// dereferenced; the parent directory is synced like [`Dir::remove`].
     /// Fails with `ENOTEMPTY` while the directory still holds entries.
     pub fn remove_directory(&self, path: &Path) -> Result<()> {
-        self.unlink(path, libc::AT_REMOVEDIR, true)
+        self.unlink(path, libc::AT_REMOVEDIR, Flush::Durable)
     }
     /// [`Dir::remove_directory`] without the parent-directory durability
-    /// flush, for emptying a disposable tree whose removal a crash may
-    /// safely leave partial; the caller syncs once when it matters.
+    /// flush ([`Flush::Skipped`]), for emptying a disposable tree whose
+    /// removal a crash may leave partial and its owner's recovery removes
+    /// again without proof; a later durable removal of the emptied parent
+    /// is the only flush it needs.
     pub fn discard_directory(&self, path: &Path) -> Result<()> {
-        self.unlink(path, libc::AT_REMOVEDIR, false)
+        self.unlink(path, libc::AT_REMOVEDIR, Flush::Skipped)
     }
     /// [`Dir::remove`] without the parent-directory durability flush, for
     /// emptying a disposable tree; see [`Dir::discard_directory`].
     pub fn discard(&self, path: &Path) -> Result<()> {
-        self.unlink(path, 0, false)
+        self.unlink(path, 0, Flush::Skipped)
     }
     /// Unlinks one final component through its no-follow parent with
-    /// `flags`, syncing the parent directory only when `durable`.
-    fn unlink(&self, path: &Path, flags: libc::c_int, durable: bool) -> Result<()> {
+    /// `flags`, flushing the parent directory to `level`.
+    fn unlink(&self, path: &Path, flags: libc::c_int, level: Flush) -> Result<()> {
         let (parent, name) = self.parent(path, false)?;
         // SAFETY: parent is a live directory descriptor and name is NUL-terminated.
         if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) } < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        if durable {
-            sync_directory(&parent)?;
-        }
-        Ok(())
+        flush(&parent, level)
     }
-    /// Flushes this directory durably (`F_FULLFSYNC` on macOS).
+    /// Flushes this directory durably and acts as the device barrier.
     ///
-    /// The one barrier callers of the unsynced staging primitives issue
-    /// before a staged tree becomes live: on APFS the flush commits the
-    /// volume's pending metadata transaction, including every earlier
-    /// unsynced create, clone and unlink.
+    /// On Apple hosts this is `F_FULLFSYNC`, which drains the device queue so
+    /// every object earlier pushed with plain `fsync(2)` on the same device
+    /// ([`push`], [`Dir::push`], [`Dir::push_tree`]) is persisted
+    /// when it returns; elsewhere `fsync(2)`, where each push was already
+    /// durable. It persists nothing that was never pushed: objects created
+    /// with [`Flush::Skipped`] must be pushed first.
     pub fn sync(&self) -> Result<()> {
         sync_directory(&self.0)
+    }
+    /// Pushes this directory's own entries and attributes to the device
+    /// with plain `fsync(2)`; see [`push`].
+    pub fn push(&self) -> Result<()> {
+        push(&self.0)
+    }
+    /// Pushes every regular file and directory beneath this directory, and
+    /// this directory itself last, with plain `fsync(2)` through no-follow
+    /// descriptors.
+    ///
+    /// After a later [`Dir::sync`] barrier on the same device, every file's
+    /// data and attributes and every directory's entries and mode below are
+    /// persisted — the explicit per-object ordering a staged tree needs
+    /// before it may become authoritative, on any filesystem. A symlink or
+    /// special entry is refused rather than followed.
+    pub fn push_tree(&self) -> Result<()> {
+        for name in self.list(None)? {
+            let relative = PathBuf::from(&name);
+            match self.entry_type(&relative)? {
+                EntryType::Directory => self.subdir(&relative)?.push_tree()?,
+                EntryType::File => push(&self.open_file(&relative)?)?,
+                kind => {
+                    return Err(invalid(format!(
+                        "pushed tree holds an unsupported entry: {kind:?}"
+                    )))
+                }
+            }
+        }
+        self.push()
     }
     /// Classify a final path entry without following it or any parent link.
     pub fn entry_type(&self, path: &Path) -> Result<EntryType> {
@@ -570,18 +651,20 @@ impl Dir {
     /// (missing ancestors are created) and syncs its parent directory. An
     /// existing symlink or non-directory at `path` is refused.
     pub fn directory(&self, path: &Path) -> Result<()> {
-        self.make_directory(path, true)
+        self.make_directory(path, Flush::Durable)
     }
     /// [`Dir::directory`] without the parent-directory durability flush, for
-    /// a disposable staging tree built parent-first; the caller issues one
-    /// [`Dir::sync`] barrier before the tree becomes live. Missing ancestors
-    /// are still created (and synced) like [`Dir::write`].
+    /// a disposable staging tree built parent-first ([`Flush::Skipped`]);
+    /// before the tree becomes live the caller pushes it
+    /// ([`Dir::push_tree`]) and issues one [`Dir::sync`] barrier. Missing
+    /// ancestors are still created (and synced) like [`Dir::write`].
     pub fn stage_directory(&self, path: &Path) -> Result<()> {
-        self.make_directory(path, false)
+        self.make_directory(path, Flush::Skipped)
     }
-    /// Creates or validates one owned real directory, syncing its parent
-    /// only when `durable`.
-    fn make_directory(&self, path: &Path, durable: bool) -> Result<()> {
+    /// Creates, or validates an existing, owned real directory at `path`
+    /// like [`Dir::directory`], flushing its parent directory to `level`.
+    /// Missing ancestors are created and synced like [`Dir::write`].
+    pub fn make_directory(&self, path: &Path, level: Flush) -> Result<()> {
         let (parent, name) = self.parent(path, true)?;
         // SAFETY: parent and name are live, mkdirat does not retain pointers.
         let n = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
@@ -602,10 +685,7 @@ impl Dir {
         }
         // SAFETY: n is newly allocated by openat.
         let _directory = unsafe { File::from_raw_fd(n) };
-        if durable {
-            sync_directory(&parent)?;
-        }
-        Ok(())
+        flush(&parent, level)
     }
     pub fn open_file(&self, path: &Path) -> Result<File> {
         let (parent, name) = self.parent(path, false)?;
@@ -761,6 +841,17 @@ impl Dir {
     /// directories are created like [`Dir::write`], and the destination
     /// parent directory is synchronized after an accepted link.
     pub fn hardlink(&self, path: &Path, source: &Dir, source_path: &Path) -> Result<bool> {
+        self.hardlink_flushed(path, source, source_path, Flush::Durable)
+    }
+    /// [`Dir::hardlink`] flushing the destination parent directory to
+    /// `level` instead of always syncing it durably.
+    pub fn hardlink_flushed(
+        &self,
+        path: &Path,
+        source: &Dir,
+        source_path: &Path,
+        level: Flush,
+    ) -> Result<bool> {
         let (source_parent, source_name) = source.parent(source_path, false)?;
         // SAFETY: stat is a plain C output buffer; fstatat initializes it before use.
         let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
@@ -824,7 +915,7 @@ impl Dir {
             sync_directory(&parent)?;
             return Err(invalid("hardlink did not bind the verified source object"));
         }
-        sync_directory(&parent)?;
+        flush(&parent, level)?;
         Ok(true)
     }
     /// Atomically renames one entry beneath this directory without following
@@ -841,15 +932,25 @@ impl Dir {
     /// created like [`Dir::write`], and both affected parent directories are
     /// synchronized after a move.
     pub fn rename_entry_no_replace(&self, from: &Path, to: &Path) -> Result<bool> {
+        self.rename_entry_no_replace_flushed(from, to, Flush::Durable)
+    }
+    /// [`Dir::rename_entry_no_replace`] flushing both affected parent
+    /// directories to `level` instead of always syncing them durably.
+    pub fn rename_entry_no_replace_flushed(
+        &self,
+        from: &Path,
+        to: &Path,
+        level: Flush,
+    ) -> Result<bool> {
         let (from_parent, from_name) = self.parent(from, false)?;
         let (to_parent, to_name) = self.parent(to, true)?;
         match exclusive_rename(&from_parent, &from_name, &to_parent, &to_name)? {
             ExclusiveRename::Moved => {}
             ExclusiveRename::DestinationExists => return Ok(false),
         }
-        sync_directory(&from_parent)?;
+        flush(&from_parent, level)?;
         if from_parent.as_raw_fd() != to_parent.as_raw_fd() {
-            sync_directory(&to_parent)?;
+            flush(&to_parent, level)?;
         }
         Ok(true)
     }
@@ -922,7 +1023,7 @@ impl Dir {
     /// dereferences the final component, so a symlink there is removed as
     /// the link itself, matching the descriptor-anchored read/write above.
     pub fn remove(&self, path: &Path) -> Result<()> {
-        self.unlink(path, 0, true)
+        self.unlink(path, 0, Flush::Durable)
     }
 }
 /// Outcome of one kernel no-replace rename attempt between live descriptors.

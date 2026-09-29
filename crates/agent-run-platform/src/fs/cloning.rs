@@ -79,12 +79,11 @@ impl Dir {
     /// verified exact-byte clone and private mode, without the per-file and
     /// parent-directory durability flushes.
     ///
-    /// A clone shares its source's already-durable data blocks, so only the
-    /// new metadata is unsynced; the caller must issue one [`Dir::sync`]
-    /// barrier before the staged tree becomes live, and its recovery must
-    /// prove or discard a staged tree a crash interrupted. Unsupported
-    /// volumes fall back to the synced byte writer. Returns whether a clone
-    /// was published.
+    /// Nothing is flushed: before the staged tree becomes live the caller
+    /// must push every staged object ([`Dir::push_tree`]) and then issue one
+    /// [`Dir::sync`] barrier, and its recovery must prove or discard a staged
+    /// tree a crash interrupted. Unsupported volumes fall back to the synced
+    /// byte writer. Returns whether a clone was published.
     pub fn stage_snapshot_file(
         &self,
         path: &Path,
@@ -110,8 +109,9 @@ impl Dir {
     /// descriptors, and the kernel clone itself follows no link anywhere in
     /// the hierarchy. On APFS one `clonefileat` gives every entry an
     /// independent inode sharing the source's data blocks, with the source's
-    /// modes and extended attributes — callers normalize modes afterwards
-    /// and issue one [`Dir::sync`] barrier before the tree becomes live.
+    /// modes and extended attributes — callers normalize modes afterwards,
+    /// then push every cloned object ([`Dir::push_tree`]) and issue one
+    /// [`Dir::sync`] barrier before the tree becomes live.
     /// Returns `false` without creating anything when the volume or host
     /// cannot clone directories (non-macOS, non-APFS, cross-device), so the
     /// caller falls back to per-entry staging; other failures propagate and

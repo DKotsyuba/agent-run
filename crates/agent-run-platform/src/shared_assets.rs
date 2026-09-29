@@ -18,13 +18,13 @@
 //! scopes or execution modes. Source trees are verified with a bounded
 //! streaming walker (never buffering a whole tree), publication is atomic
 //! and no-replace at every layer, and an existing content-addressed object
-//! is verified and reused, never overwritten. Staging directories
-//! (`.agent-run-staging-*.tmp`) are the only recoverable orphans an
-//! interrupted publisher can leave behind; garbage collection and reference
-//! tracking are later units.
+//! is verified and reused, never overwritten. Staging directories and
+//! temporary blobs (`.agent-run-staging-*.tmp`) are the only recoverable
+//! orphans an interrupted publisher can leave behind; garbage collection and
+//! reference tracking are later units.
 
 use crate::{
-    fs::{sha256, Dir, EntryType},
+    fs::{sha256, Dir, EntryType, Flush},
     snapshot_tree::{entry_map, load_manifest_bounded, SNAPSHOT_MANIFEST},
 };
 use agent_run_domain::{canonical::hex_digest, error::invalid, Error, Result};
@@ -244,7 +244,12 @@ fn tree_rel(reference: &SharedTreeRef) -> PathBuf {
 
 /// Returns the blob path for one payload digest and normalized logical mode.
 fn blob_rel(scope: &str, sha256: &str, logical: u32) -> PathBuf {
-    blobs_scope(scope).join(format!("{sha256}-{logical:o}"))
+    blobs_scope(scope).join(blob_name(sha256, logical))
+}
+
+/// Canonical file name of one payload inside its scope's blob directory.
+fn blob_name(sha256: &str, logical: u32) -> PathBuf {
+    PathBuf::from(format!("{sha256}-{logical:o}"))
 }
 
 /// Returns the physical store mode for one normalized logical mode: readonly
@@ -493,15 +498,19 @@ fn check_source_file(file: &std::fs::File, expected_len: u64, logical: u32) -> R
 /// original manifest bytes, hash, and path topology are preserved exactly;
 /// each payload is copied once per scope/content/mode into a fresh temporary
 /// blob, streamed through a running hash compared against the manifest
-/// digest, fsynced, and atomically renamed into its content-addressed name
-/// with the kernel's no-replace rename — so an existing blob is verified and
-/// reused, never overwritten, and the tree's files are internal hardlinks to
-/// that canonical blob. Publication holds [`SharedStoreLock`] only for the
-/// staging window and renames the finished staging directory into place with
-/// the same no-replace guarantee.
+/// digest, pushed with `fsync(2)`, persisted by one device barrier, and only
+/// then atomically renamed into its content-addressed name with the
+/// kernel's no-replace rename — so a canonical blob name never refers to
+/// non-durable data, an existing blob is verified and reused, never
+/// overwritten, and the tree's files are internal hardlinks to that
+/// canonical blob. The staged tree's entries and modes are pushed and a
+/// second barrier persists them before the no-replace rename publishes it
+/// (see [`crate::fs::Flush`] for the exact flush semantics). Publication
+/// holds [`SharedStoreLock`] only for the staging window.
 ///
 /// An interrupted publisher leaves at most one recoverable
-/// `.agent-run-staging-*.tmp` orphan directory beneath `trees/<scope>`; this
+/// `.agent-run-staging-*.tmp` orphan directory beneath `trees/<scope>` and
+/// `.agent-run-staging-*.tmp` temporary blobs beneath `blobs/<scope>`; this
 /// unit performs no garbage collection. Returns the [`SharedTreeRef`] naming
 /// the tree; on error no partial tree exists under its final name (blobs are
 /// content-addressed and safe to leave for reuse or a later collector).
@@ -564,8 +573,11 @@ pub fn import_shared_tree(
         &source_dir,
         &manifest_bytes,
     );
+    // Barrier: the staged tree's data, entries and modes are all persisted
+    // before the no-replace rename makes it authoritative.
     let published = staged
         .and_then(|()| restrict_staging(&store, &staging, &entries))
+        .and_then(|()| store.sync())
         .and_then(|()| store.rename_entry_no_replace(&staging, &destination));
     match published {
         Ok(true) => Ok(reference),
@@ -585,12 +597,32 @@ pub fn import_shared_tree(
 
 /// Stages one complete shared tree beneath `staging`, manifest bytes last.
 ///
-/// Each file is opened once from `source_dir` through a no-follow
-/// descriptor, checked against the manifest, streamed into a fresh temporary
-/// blob under a running hash, and published with a no-replace rename; the
-/// staged tree file is then an internal hardlink to that blob. A source that
-/// changed since its capture is refused by the hash comparison. Nothing
-/// outside `blobs/<scope>`, `trees/<scope>`, and `staging` is touched.
+/// Publication crosses one durability barrier per authority point instead
+/// of a full device flush per object:
+///
+/// 1. every file is opened once from `source_dir` through a no-follow
+///    descriptor and checked against the manifest; each payload not yet in
+///    the store streams into an exclusive temporary blob under a running
+///    hash and is pushed to the device with plain `fsync(2)`
+///    ([`crate::fs::push`]); an existing blob is re-verified and reused;
+/// 2. one [`Dir::sync`] barrier (`F_FULLFSYNC` on Apple hosts) persists
+///    every pushed payload, and only then are the temporaries renamed to
+///    their canonical content-addressed names with the no-replace rename —
+///    so a canonical blob name can never refer to data that is not durable;
+/// 3. the staged directories and internal hardlinks are created unflushed
+///    and the manifest is written durably.
+///
+/// Each directory whose entries changed is pushed once after all of its
+/// changes rather than once per entry: every blob directory after the
+/// renames here, and every staged directory by the caller's
+/// `restrict_staging` (entries and final mode), whose barrier then persists
+/// the staged namespace before its no-replace rename makes it
+/// authoritative. A source that changed
+/// since its capture is refused by the hash comparison, and on any error
+/// every temporary this call created is removed; canonical blobs already
+/// renamed stay content-addressed and verified for reuse or collection.
+/// Nothing outside `blobs/<scope>`, `trees/<scope>`, and `staging` is
+/// touched.
 fn stage_shared_tree(
     store: &Dir,
     staging: &Path,
@@ -599,109 +631,153 @@ fn stage_shared_tree(
     source_dir: &Dir,
     manifest_bytes: &[u8],
 ) -> Result<()> {
+    // Every blob of this scope lives in one directory, resolved once so each
+    // payload operation below names a single component.
+    let blobs = store.subdir(&blobs_scope(scope))?;
+    let mut temporaries: Vec<PathBuf> = Vec::new();
+    let staged = stage_payloads(&blobs, entries, source_dir, &mut temporaries)
+        .and_then(|pending| {
+            // Barrier: every pushed payload is persisted before any
+            // canonical name can refer to it.
+            store.sync()?;
+            publish_payloads(&blobs, &pending)
+        })
+        .and_then(|()| link_staging(store, staging, &blobs, entries))
+        .and_then(|()| store.write(&staging.join(SNAPSHOT_MANIFEST), manifest_bytes, 0o400));
+    if staged.is_err() {
+        // Only the exclusive temporaries this call created are removed; a
+        // name already renamed to its canonical blob no longer exists here.
+        for temporary in &temporaries {
+            if blobs.entry_type(temporary).is_ok() {
+                let _ = blobs.discard(temporary);
+            }
+        }
+    }
+    staged
+}
+
+/// One payload streamed into an exclusive temporary blob and pushed, not yet
+/// published: `(temporary, canonical name, sha256, length, logical mode)`,
+/// both names relative to the scope's blob directory.
+type PendingBlob = (PathBuf, PathBuf, String, u64, u32);
+
+/// Phase 1 of [`stage_shared_tree`]: checks every source file and streams
+/// each payload the store lacks into a pushed exclusive temporary inside
+/// `blobs`, the scope's blob directory.
+///
+/// Every temporary created is recorded in `temporaries` before its first
+/// byte, so the caller can remove it on any error. A payload shared by
+/// several entries is streamed once; an existing canonical blob is
+/// re-verified by streaming and reused. Returns the pending publications.
+fn stage_payloads(
+    blobs: &Dir,
+    entries: &BTreeMap<String, Value>,
+    source_dir: &Dir,
+    temporaries: &mut Vec<PathBuf>,
+) -> Result<Vec<PendingBlob>> {
+    let mut pending = Vec::new();
+    let mut planned = BTreeSet::new();
     for (path, entry) in entries {
-        let relative = Path::new(path.as_str());
         if entry["type"] == "directory" {
-            store.directory(&staging.join(relative))?;
             continue;
         }
         let (sha256, logical, expected_len) = file_identity(entry)?;
-        let mut source_file = source_dir.open_file(relative)?;
+        let mut source_file = source_dir.open_file(Path::new(path.as_str()))?;
         check_source_file(&source_file, expected_len, logical)?;
-        let blob = blob_rel(scope, &sha256, logical);
-        ensure_blob(
-            store,
-            &blob,
-            &mut source_file,
-            &sha256,
-            expected_len,
-            logical,
-        )?;
-        if !store.hardlink(&staging.join(relative), store, &blob)? {
-            return Err(invalid("shared tree staging name already exists"));
+        let blob = blob_name(&sha256, logical);
+        if !planned.insert(blob.clone()) {
+            continue;
+        }
+        match blobs.entry_type(&blob) {
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                let temporary = PathBuf::from(format!(
+                    "{TEMP_PREFIX}{}{TEMP_SUFFIX}",
+                    uuid::Uuid::new_v4().simple()
+                ));
+                temporaries.push(temporary.clone());
+                stream_into_blob(
+                    blobs,
+                    &temporary,
+                    &mut source_file,
+                    &sha256,
+                    expected_len,
+                    logical,
+                )?;
+                pending.push((temporary, blob, sha256, expected_len, logical));
+            }
+            Ok(EntryType::File) => verify_blob(blobs, &blob, &sha256, expected_len, logical)?,
+            Ok(_) => return Err(invalid("shared store blob exists with an unexpected type")),
+            Err(error) => return Err(error),
         }
     }
-    store.write(&staging.join(SNAPSHOT_MANIFEST), manifest_bytes, 0o400)
+    Ok(pending)
 }
 
-/// Publishes the canonical payload for one file unless a verified blob
-/// already exists, and never overwrites an existing object.
+/// Phase 2 of [`stage_shared_tree`], after the durability barrier: renames
+/// each already-persisted temporary to its canonical name inside `blobs`
+/// with the no-replace rename, then pushes the blob directory once. When a
+/// canonical blob appeared meanwhile the temporary is removed and the
+/// existing blob is verified and reused — an existing object is never
+/// overwritten. The names are persisted by the caller's second barrier.
+fn publish_payloads(blobs: &Dir, pending: &[PendingBlob]) -> Result<()> {
+    for (temporary, blob, sha256, expected_len, logical) in pending {
+        if !blobs.rename_entry_no_replace_flushed(temporary, blob, Flush::Skipped)? {
+            blobs.discard(temporary)?;
+            verify_blob(blobs, blob, sha256, *expected_len, *logical)?;
+        }
+    }
+    blobs.push()
+}
+
+/// Phase 3 of [`stage_shared_tree`]: creates every staged directory and
+/// links every staged file to its canonical blob in `blobs`, unflushed.
 ///
-/// When the blob already exists it is re-verified by streaming against the
-/// manifest digest, size, owner, and physical mode and then reused — the
-/// source descriptor's metadata was already checked, and its bytes are not
-/// copied on this path. Otherwise [`publish_blob`] streams the captured
-/// source descriptor into a fresh temporary blob and renames it into place
-/// with the kernel's no-replace rename.
-fn ensure_blob(
+/// Directories are created parent-first in manifest order; files are then
+/// linked per parent directory, each parent resolved once, so every link
+/// names a single component on both sides. The caller's
+/// `restrict_staging` pushes each staged directory afterwards and its
+/// barrier persists them before publication.
+fn link_staging(
     store: &Dir,
-    blob: &Path,
-    source: &mut std::fs::File,
-    sha256: &str,
-    expected_len: u64,
-    logical: u32,
+    staging: &Path,
+    blobs: &Dir,
+    entries: &BTreeMap<String, Value>,
 ) -> Result<()> {
-    match store.entry_type(blob) {
-        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            publish_blob(store, blob, source, sha256, expected_len, logical)
+    let mut files: BTreeMap<PathBuf, Vec<(PathBuf, PathBuf)>> = BTreeMap::new();
+    for (path, entry) in entries {
+        let relative = Path::new(path.as_str());
+        if entry["type"] == "directory" {
+            store.make_directory(&staging.join(relative), Flush::Skipped)?;
+            continue;
         }
-        Ok(EntryType::File) => verify_blob(store, blob, sha256, expected_len, logical),
-        Ok(_) => Err(invalid("shared store blob exists with an unexpected type")),
-        Err(error) => Err(error),
+        let (sha256, logical, _) = file_identity(entry)?;
+        let name = relative
+            .file_name()
+            .ok_or_else(|| invalid("shared tree manifest path is invalid"))?;
+        files
+            .entry(staging.join(relative.parent().unwrap_or(Path::new(""))))
+            .or_default()
+            .push((PathBuf::from(name), blob_name(&sha256, logical)));
     }
-}
-
-/// Streams one captured source descriptor into a fresh temporary blob and
-/// publishes it with a no-replace rename.
-///
-/// The bytes are hashed while they are copied and compared against the
-/// manifest digest and size, so a source mutated mid-copy is refused before
-/// publication. The temporary file is created exclusively at its readonly
-/// physical mode, fsynced, then renamed into the content-addressed name
-/// without replacing anything; if a concurrent publisher won that name, this
-/// temporary is removed and the existing blob is verified and reused.
-fn publish_blob(
-    store: &Dir,
-    blob: &Path,
-    source: &mut std::fs::File,
-    sha256: &str,
-    expected_len: u64,
-    logical: u32,
-) -> Result<()> {
-    let temporary = blob
-        .parent()
-        .expect("a blob always has a scope parent")
-        .join(format!(
-            "{TEMP_PREFIX}{}{TEMP_SUFFIX}",
-            uuid::Uuid::new_v4().simple()
-        ));
-    let staged = stream_into_blob(store, &temporary, source, sha256, expected_len, logical)
-        .and_then(|()| store.rename_entry_no_replace(&temporary, blob));
-    // Removing the exclusive temporary this call created (or nothing when
-    // creation itself failed) never touches another object.
-    let discard = |temporary: &Path| {
-        if store.entry_type(temporary).is_ok() {
-            let _ = store.remove(temporary);
-        }
-    };
-    match staged {
-        Ok(true) => Ok(()),
-        Ok(false) => {
-            discard(&temporary);
-            verify_blob(store, blob, sha256, expected_len, logical)
-        }
-        Err(error) => {
-            discard(&temporary);
-            Err(error)
+    for (parent, names) in files {
+        let directory = store.subdir(&parent)?;
+        for (name, blob) in names {
+            if !directory.hardlink_flushed(&name, blobs, &blob, Flush::Skipped)? {
+                return Err(invalid("shared tree staging name already exists"));
+            }
         }
     }
+    Ok(())
 }
 
-/// Copies `source` into the exclusive `temporary` name, hashing as it goes.
+/// Copies `source` into the exclusive `temporary` name, hashing as it goes,
+/// and pushes it to the device with plain `fsync(2)`.
 ///
-/// Fails (leaving the temporary in place for [`publish_blob`]'s cleanup)
-/// when the streamed bytes exceed the payload bound or their digest and
-/// length do not match the manifest expectations.
+/// The temporary is created at its readonly physical mode. Fails (leaving
+/// the temporary for the caller's cleanup) when the streamed bytes exceed
+/// the payload bound or their digest and length do not match the manifest
+/// expectations. The pushed bytes become durable at the caller's next
+/// [`Dir::sync`] barrier, which must precede the canonical rename.
 fn stream_into_blob(
     store: &Dir,
     temporary: &Path,
@@ -730,7 +806,7 @@ fn stream_into_blob(
         Ok((hex_digest(&hasher.finalize()), length))
     })();
     let (digest, length) = written?;
-    file.sync_all()?;
+    crate::fs::push(&file)?;
     if digest != sha256 || length != expected_len {
         return Err(invalid("managed snapshot changed while it was shared"));
     }
@@ -760,16 +836,21 @@ fn verify_blob(
 }
 
 /// Drops owner write permission on every staged directory, including the
-/// staging root, leaving the tree readonly at `0o500` before its rename.
+/// staging root, leaving the tree readonly at `0o500` before its rename,
+/// and pushes each directory (entries and new mode) to the device; the
+/// caller's [`Dir::sync`] barrier then persists the whole staged namespace
+/// before the rename makes it authoritative.
 fn restrict_staging(store: &Dir, staging: &Path, entries: &BTreeMap<String, Value>) -> Result<()> {
     for (path, entry) in entries {
         if entry["type"] == "directory" {
-            store
-                .subdir(&staging.join(path.as_str()))?
-                .restrict_owner_read()?;
+            let directory = store.subdir(&staging.join(path.as_str()))?;
+            directory.restrict_owner_read()?;
+            directory.push()?;
         }
     }
-    store.subdir(staging)?.restrict_owner_read()
+    let root = store.subdir(staging)?;
+    root.restrict_owner_read()?;
+    root.push()
 }
 
 /// Removes every entry beneath one owned directory through no-follow
@@ -1337,6 +1418,79 @@ mod tests {
         fs::set_permissions(&blob, fs::Permissions::from_mode(0o400)).unwrap();
         let second = import(&root, &scope, second_home.path());
         verify_shared_tree(&root, &second).unwrap();
+    }
+
+    /// A source that drifts after its manifest was sealed fails before the
+    /// durability barrier, so nothing is published: no canonical blob, no
+    /// temporary blob and no tree — not even for the payloads that streamed
+    /// correctly before the drifted one.
+    #[test]
+    fn source_drift_before_the_barrier_publishes_nothing() {
+        let (_, home) = sealed(&[
+            ("a.txt", b"first payload\n", false),
+            ("b.txt", b"second payload\n", false),
+        ]);
+        let staged = home.path().join("assets/runtime/b.txt");
+        fs::write(&staged, b"SECOND PAYLOAD\n").unwrap();
+        let (_store, root) = store_root();
+        let scope = sha256(b"domain-drift");
+        assert!(
+            import_shared_tree(&root, &scope, home.path(), Path::new("assets/runtime")).is_err()
+        );
+        let listing = |namespace: &str| -> Vec<String> {
+            fs::read_dir(root.join(namespace).join(&scope))
+                .map(|entries| {
+                    entries
+                        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert!(listing("blobs").is_empty(), "{:?}", listing("blobs"));
+        assert!(listing("trees").is_empty(), "{:?}", listing("trees"));
+    }
+
+    /// Leftovers of a publication interrupted after its first barrier — a
+    /// canonical blob already renamed, a temporary blob and a staging tree —
+    /// never block or poison a retry: the canonical blob is verified and
+    /// reused by inode, the orphans are left for collection, and the retried
+    /// tree verifies.
+    #[test]
+    fn interrupted_publication_leftovers_are_inert() {
+        let (_, home) = sealed(&[
+            ("a.txt", b"kept payload\n", false),
+            ("b.txt", b"new payload\n", false),
+        ]);
+        let (_store, root) = store_root();
+        let scope = sha256(b"domain-crash");
+        let canonical = plain_blob(&root, &scope, b"kept payload\n");
+        fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+        fs::write(&canonical, b"kept payload\n").unwrap();
+        fs::set_permissions(&canonical, fs::Permissions::from_mode(0o400)).unwrap();
+        let temporary = root
+            .join("blobs")
+            .join(&scope)
+            .join(format!("{TEMP_PREFIX}crashed{TEMP_SUFFIX}"));
+        fs::write(&temporary, b"torn").unwrap();
+        let staging = root
+            .join("trees")
+            .join(&scope)
+            .join(format!("{TEMP_PREFIX}crashed{TEMP_SUFFIX}"));
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("a.txt"), b"partial").unwrap();
+        let reused = inode_of(&canonical);
+        let reference = import(&root, &scope, home.path());
+        verify_shared_tree(&root, &reference).unwrap();
+        let tree = shared_tree_root(&root, &reference).unwrap();
+        assert_eq!(
+            inode_of(&tree.join("a.txt")),
+            reused,
+            "the canonical blob is reused"
+        );
+        assert!(
+            temporary.is_file() && staging.is_dir(),
+            "orphans are left for collection"
+        );
     }
 
     /// A Node fixture resolves relative module imports from the shared tree

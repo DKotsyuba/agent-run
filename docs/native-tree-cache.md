@@ -100,11 +100,32 @@ Crash and reference safety:
   hardlink — and the restored native tree contains exactly the captured
   entries (the import manifest stays in the store).
 - Disposable staging copies, staged clones and proven originals are built
-  and removed without per-entry durability flushes: one full flush on the
-  staged clone is the barrier before a thaw swaps it in, and a proven freeze
-  original is first renamed to `discard` inside its backup so a crash
-  mid-removal leaves a subtree recovery removes without re-proving. The
-  store publisher keeps its own per-blob durability.
+  and removed without per-entry flushes. A staged thaw clone becomes
+  authoritative only after every staged file and directory was pushed with
+  plain `fsync(2)` (`Dir::push_tree`) and one `Dir::sync` barrier returned;
+  a proven freeze original is first renamed to `discard` inside its backup
+  so a crash mid-removal leaves a subtree recovery removes without
+  re-proving. A freeze whose captured manifest's store tree already exists
+  and fully verifies skips the staging copy and import entirely.
+
+Durability semantics (from the local std implementation and `fcntl(2)`):
+`File::sync_all` — every "durable" primitive — is `F_FULLFSYNC` on Apple
+hosts, which drains the device queue so data "fsync'd on the same device
+before is guaranteed to be persisted when this call returns"; plain
+`fsync(2)` alone may still be reordered or lost by the device. Batches
+therefore push each changed object with `fsync(2)` and cross one
+`F_FULLFSYNC` barrier before anything depends on them; a single directory
+flush never stands in for its children. On other hosts `fsync(2)` is the
+durable operation, so the same ordering keeps the prior durable behavior.
+The store publisher uses two barriers: every new payload streams into an
+exclusive temporary blob and is pushed, one barrier persists them all,
+and only then are the temporaries renamed to canonical names (so a
+canonical name never refers to non-durable data); the staged tree's
+directories, links and readonly modes are pushed per directory and a
+second barrier persists them before the no-replace rename publishes the
+tree. A failure before the first barrier publishes nothing; leftovers of a
+later crash (canonical blobs, temporary blobs, staging trees) are verified
+on reuse or collected as orphans.
 
 Shared-tree bounds (the platform store and this unit agree): 16384 manifest
 entries, 32 MiB per payload, a 4 MiB manifest read bound
@@ -116,12 +137,16 @@ unchanged.
 
 Measured on two homes with the measured curated shape (5380 files, 2352
 directories, depth 10, ~53.6 MB, plus the 24 MB pack), release build:
-unique-inode bytes 156.1 MB private → 79.1 MB idle-shared, thaw of both
-curated roots 2.2 s (≈1.5 s is the full content verification), store
-guard scan 0.14 s, refreeze of an unchanged home 6.1 s, freeze of a home
-whose trees already exist 6.5 s; the first publication of a new curated
-tree per scope is dominated by the publisher's per-blob full flushes
-(≈130 s).
+unique-inode bytes 156.1 MB private → 79.1 MB idle-shared (157.1 MB with
+one home thawed, as clones), first publication of both curated roots
+≈11 s (was ≈130–150 s with a full flush per object), freeze of a home
+whose trees already exist ≈3 s, refreeze of an unchanged home ≈3.3 s,
+thaw of both roots ≈2.4 s (≈1.5 s is the full content verification),
+store guard scan ≈0.14 s. The remainder is per-entry metadata syscalls
+(`linkat`, `openat`, `fchmodat`, `unlinkat` at ~0.1–0.5 ms each on APFS
+for 7732 entries), not flushes. Run the benchmark with
+`cargo test --release -p agent-run-core --features test-fixtures --test
+native_tree_cache measure_curated_increment -- --ignored --nocapture`.
 
 Implementation note: a no-follow directory handle's `list` is single-shot
 per handle (its duplicate shares the enumeration offset), so every walk in
