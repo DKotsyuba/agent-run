@@ -16,13 +16,15 @@ pub mod housekeeping;
 pub mod lifecycle;
 pub mod logging;
 pub mod managed_services;
+/// Single-instance storage of Codex's unindexed native metadata caches.
+pub mod native_cache;
 /// Optional reuse of native plugin blocks after verified, session-owned cleanup.
 mod runtime_cache;
 /// Filesystem relocation of sealed managed trees into the shared store.
 pub mod runtime_storage;
+pub mod service;
 /// Reference-aware collection of the shared managed-asset store.
 pub mod storage_gc;
-pub mod service;
 pub mod stream;
 pub mod supervisor;
 
