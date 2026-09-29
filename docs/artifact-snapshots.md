@@ -68,6 +68,23 @@ prepared migration can convert roots one at a time. Structural trust failures
 on the shared branch are returned as errors rather than classified
 inspection rows.
 
+One managed-root geometry carries an explicit exception: a managed Codex
+plugin version root (`plugins/cache/personal/<plugin>/<version>`, classified
+by `agent-run-platform::plugin_views::plugin_mount`) is mounted by its
+**parent**. Native Codex plugin discovery classifies version directories
+with `entry.file_type().is_dir()` and ignores a version root that is itself a
+symlink, so the coordinator moves the whole plugin parent into its
+token-bound backup and replaces the parent with one exact symlink onto a
+readonly store container — `plugin-views/<scope>/<view-id>` — holding the
+correctly named **real** version subtree with every file one internal
+hardlink of the imported shared tree. The bridge accepts that parent link
+only when its target text equals the container path derived from the same
+trusted store root, validated reference, and safe version name, and
+`plugin_views::verify_view()` proves the container's real topology, modes,
+manifest bytes, and hardlink identity. The strict
+`inspect_runtime_snapshots()` verifier is unchanged and keeps refusing the
+converted home: its no-follow walk still meets the parent symlink.
+
 `agent-run-adapters::materialize::verify_with_shared()` wraps the bridge with
 the same launch-path `Snapshot` result and revision extraction as
 `materialize::verify()`. The caller remains the trusted registry authority

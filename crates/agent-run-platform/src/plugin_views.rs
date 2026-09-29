@@ -92,10 +92,7 @@ pub fn plugin_mount(root_key: &str) -> Option<(String, String)> {
     if !safe_component(plugin) || !safe_component(version) {
         return None;
     }
-    Some((
-        format!("{PLUGIN_PREFIX}/{plugin}"),
-        version.to_owned(),
-    ))
+    Some((format!("{PLUGIN_PREFIX}/{plugin}"), version.to_owned()))
 }
 
 /// Returns the deterministic view identity digest for one mount triple.
@@ -123,7 +120,9 @@ pub fn view_identity(reference: &SharedTreeRef, version: &str) -> Result<String>
 /// Returns whether `value` is a strict 64-lowercase-hex manifest digest.
 fn is_manifest(value: &str) -> bool {
     value.len() == 64
-        && value.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Returns the container path `<store>/plugin-views/<scope>/<view-id>` after
@@ -160,7 +159,9 @@ pub fn materialize(store_root: &Path, reference: &SharedTreeRef, version: &str) 
     let root = shared_assets::validated_root(store_root)?;
     let identity = view_identity(reference, version)?;
     let tree = shared_assets::shared_tree_root(&root, reference)?;
-    let relative = Path::new(VIEW_NAMESPACE).join(&reference.scope).join(&identity);
+    let relative = Path::new(VIEW_NAMESPACE)
+        .join(&reference.scope)
+        .join(&identity);
     let store = Dir::open(&root)?;
     match store.entry_type(&relative) {
         Ok(EntryType::Directory) => {
@@ -171,22 +172,26 @@ pub fn materialize(store_root: &Path, reference: &SharedTreeRef, version: &str) 
         Ok(_) => {
             return Err(invalid(
                 "plugin view destination exists and is not a real directory",
-            ))
+            ));
         }
         Err(error) => return Err(error),
     }
     let tree_dir = Dir::open(&tree)?;
     let manifest_bytes = tree_dir.read(Path::new(SNAPSHOT_MANIFEST), MAX_METADATA)?;
     if fs::sha256(&manifest_bytes) != reference.manifest_sha256 {
-        return Err(invalid("shared tree manifest hash does not match its reference"));
+        return Err(invalid(
+            "shared tree manifest hash does not match its reference",
+        ));
     }
     let entries = entry_map(
         &load_manifest(&tree_dir)?.ok_or_else(|| invalid("shared tree manifest is missing"))?,
     )?;
-    let staging = Path::new(VIEW_NAMESPACE).join(&reference.scope).join(format!(
-        "{TEMP_PREFIX}{}{TEMP_SUFFIX}",
-        uuid::Uuid::new_v4().simple()
-    ));
+    let staging = Path::new(VIEW_NAMESPACE)
+        .join(&reference.scope)
+        .join(format!(
+            "{TEMP_PREFIX}{}{TEMP_SUFFIX}",
+            uuid::Uuid::new_v4().simple()
+        ));
     let published = {
         let _guard = SharedStoreLock::acquire(&root)?;
         store.directory(staging.parent().expect("scoped staging parent"))?;
@@ -235,9 +240,15 @@ fn stage_view(
         }
     }
     if tree_dir.read(Path::new(SNAPSHOT_MANIFEST), MAX_METADATA)? != manifest_bytes {
-        return Err(invalid("shared tree manifest changed while the view was staged"));
+        return Err(invalid(
+            "shared tree manifest changed while the view was staged",
+        ));
     }
-    if !store.hardlink(&inside.join(SNAPSHOT_MANIFEST), tree_dir, Path::new(SNAPSHOT_MANIFEST))? {
+    if !store.hardlink(
+        &inside.join(SNAPSHOT_MANIFEST),
+        tree_dir,
+        Path::new(SNAPSHOT_MANIFEST),
+    )? {
         return Err(invalid("plugin view staging manifest name already exists"));
     }
     Ok(())
@@ -292,7 +303,7 @@ fn remove_view_tree(directory: &Dir) -> Result<()> {
             kind => {
                 return Err(invalid(format!(
                     "plugin view holds an unexpected entry: {kind:?}"
-                )))
+                )));
             }
         }
     }
@@ -319,7 +330,9 @@ pub fn verify_view(store_root: &Path, reference: &SharedTreeRef, version: &str) 
     let identity = view_identity(reference, version)?;
     let tree = shared_assets::shared_tree_root(&root, reference)?;
     let store = Dir::open(&root)?;
-    let relative = Path::new(VIEW_NAMESPACE).join(&reference.scope).join(&identity);
+    let relative = Path::new(VIEW_NAMESPACE)
+        .join(&reference.scope)
+        .join(&identity);
     match store.entry_type(&relative) {
         Ok(EntryType::Directory) => {}
         Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -341,7 +354,9 @@ pub fn verify_view(store_root: &Path, reference: &SharedTreeRef, version: &str) 
     let version_entry = view.entry(Some(Path::new(version)))?;
     require_owner(&version_entry, "plugin view version")?;
     if version_entry.kind != EntryType::Directory {
-        return Err(invalid("plugin view version entry must be a real directory"));
+        return Err(invalid(
+            "plugin view version entry must be a real directory",
+        ));
     }
     check_mode(&version_entry, 0o500, "plugin view version")?;
     let version_dir = view.subdir(Path::new(version))?;
@@ -431,15 +446,17 @@ fn walk_view(
                         "plugin view entry is not a regular file: {path}"
                     )));
                 }
-                let mode = entry.get("mode").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                let mode = entry
+                    .get("mode")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
                 if !matches!(mode, 0o600 | 0o700) {
                     return Err(invalid("plugin view manifest mode is not normalized"));
                 }
                 check_mode(&identity, physical_mode(mode as u32), "plugin view file")?;
                 let tree_file = tree_dir.open_file(Path::new(&path))?;
                 let tree_metadata = tree_file.metadata()?;
-                if tree_metadata.dev() != identity.device || tree_metadata.ino() != identity.inode
-                {
+                if tree_metadata.dev() != identity.device || tree_metadata.ino() != identity.inode {
                     return Err(invalid(format!(
                         "plugin view file is not the shared tree payload hardlink: {path}"
                     )));
@@ -506,8 +523,13 @@ mod tests {
             .unwrap();
         }
         let home = tempfile::tempdir().unwrap();
-        snapshot_managed_tree(home.path(), Path::new("plugins/cache/personal/probe/1.0.0"), source.path(), None)
-            .unwrap();
+        snapshot_managed_tree(
+            home.path(),
+            Path::new("plugins/cache/personal/probe/1.0.0"),
+            source.path(),
+            None,
+        )
+        .unwrap();
         let reference = import_shared_tree(
             &root,
             &crate::fs::sha256(b"view-scope"),

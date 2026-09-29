@@ -101,7 +101,7 @@ fn entry(path: String, kind: EntryType, bytes: Option<Vec<u8>>) -> Result<Value>
             json!({"path": path, "type": "file", "mode": 0o600, "bytes": bytes.len(), "sha256": fs::sha256(&bytes)})
         }
         EntryType::Symlink | EntryType::Special => {
-            return Err(invalid(format!("snapshot entry must be regular: {path}")))
+            return Err(invalid(format!("snapshot entry must be regular: {path}")));
         }
     })
 }
@@ -181,7 +181,7 @@ fn read_tree(source: &Path, selected: Option<&[String]>, allow_special: bool) ->
                     entries.push(json!({"path": path, "type": if directory.entry_type(&relative_path)? == EntryType::Symlink { "symlink" } else { "special" }}));
                 }
                 EntryType::Symlink | EntryType::Special => {
-                    return Err(invalid(format!("snapshot entry must be regular: {path}")))
+                    return Err(invalid(format!("snapshot entry must be regular: {path}")));
                 }
             }
         }
@@ -399,7 +399,7 @@ pub fn inspect_managed_snapshot(home: &Path, relative_root: &Path) -> Result<Sna
             return Ok(SnapshotInspection {
                 referenced_missing: vec![SNAPSHOT_MANIFEST.into()],
                 ..Default::default()
-            })
+            });
         }
         Ok(EntryType::Directory) => {}
         Ok(_) => return Err(invalid("snapshot destination must be a real directory")),
@@ -591,6 +591,20 @@ pub fn inspect_runtime_snapshots(
 ///   logical paths, types, modes, and content through the physical shared
 ///   tree with bounded streaming reads.
 ///
+/// One geometry carries an explicit exception: a managed Codex plugin
+/// version root (see [`crate::plugin_views::plugin_mount`]) is verified
+/// through its **parent**. The plugin parent entry in the home must be
+/// exactly one symlink whose target text equals the readonly view container
+/// derived from the same trusted store root, validated reference, and safe
+/// version name, and [`crate::plugin_views::verify_view`] must prove that
+/// container holds the named real version subtree hardlinked from the same
+/// shared tree. The version root entry itself no longer exists in the home —
+/// it lives beneath the linked container — so the plain whole-tree check
+/// would wrongly reject it; every other guarantee, including the physical
+/// tree verification below, is unchanged. A parent link is never accepted by
+/// resolving or canonicalizing it: only its exact target text and the store
+/// object behind that derived path are trusted.
+///
 /// Unmapped indexed roots keep the original strict directory verification
 /// unchanged, so mixed original and shared homes verify. Structural trust
 /// failures on the shared branch return errors rather than a classified
@@ -705,19 +719,43 @@ fn inspect_runtime_index(
                         "shared mapping digest does not match the original index manifest",
                     ));
                 }
-                let target = shared_assets::shared_tree_root(&canonical, reference)?;
-                match directory.entry_type(Path::new(key)) {
-                    Ok(EntryType::Symlink) => {}
-                    _ => {
-                        return Err(invalid(
-                            "mapped shared managed root must be an exact whole-tree symlink",
-                        ))
+                match crate::plugin_views::plugin_mount(key) {
+                    Some((parent, version)) => {
+                        let target =
+                            crate::plugin_views::view_root(store_root, reference, &version)?;
+                        match directory.entry_type(Path::new(&parent)) {
+                            Ok(EntryType::Symlink) => {}
+                            _ => {
+                                return Err(invalid(
+                                    "mapped shared plugin root must be an exact parent symlink",
+                                ));
+                            }
+                        }
+                        if directory.read_link(Path::new(&parent))? != Some(target) {
+                            return Err(invalid(
+                                "shared plugin parent link target does not match its trusted \
+                                 reference",
+                            ));
+                        }
+                        crate::plugin_views::verify_view(store_root, reference, &version)?;
                     }
-                }
-                if directory.read_link(Path::new(key))? != Some(target) {
-                    return Err(invalid(
-                        "shared managed root link target does not match its trusted reference",
-                    ));
+                    None => {
+                        let target = shared_assets::shared_tree_root(&canonical, reference)?;
+                        match directory.entry_type(Path::new(key)) {
+                            Ok(EntryType::Symlink) => {}
+                            _ => {
+                                return Err(invalid(
+                                    "mapped shared managed root must be an exact whole-tree symlink",
+                                ));
+                            }
+                        }
+                        if directory.read_link(Path::new(key))? != Some(target) {
+                            return Err(invalid(
+                                "shared managed root link target does not match its trusted \
+                                 reference",
+                            ));
+                        }
+                    }
                 }
             }
             Some((store_root, map))

@@ -11,10 +11,21 @@
 //! the home and its recovery material; nothing is ever removed before the
 //! owning assets are proven. Frozen index bytes, native-history files,
 //! credential links, and authority digests are never rewritten.
+//!
+//! Managed Codex plugin version roots are the one geometry switched
+//! differently: native plugin discovery ignores a version directory that is
+//! itself a symlink, so [`agent_run_platform::plugin_views::plugin_mount`]
+//! roots are mounted one level higher. The whole plugin parent moves into
+//! the token-bound backup and one exact symlink replaces the parent,
+//! pointing at a readonly store container holding the correctly named real
+//! version subtree hardlinked from the imported tree. A parent holding
+//! anything but its single indexed version is refused during planning and
+//! preserved untouched.
 
 use crate::{adapters, domain::AgentId, fs, state, Result};
 use agent_run_domain::{error::invalid, Error};
 use agent_run_platform::{
+    plugin_views,
     shared_assets::{self, SharedStoreLock, SharedTreeRef},
     snapshot_tree::{self, RUNTIME_SNAPSHOT_INDEX, SNAPSHOT_MANIFEST},
 };
@@ -76,7 +87,7 @@ pub fn store_root(app_home: &Path) -> Result<PathBuf> {
             _ => {
                 return Err(invalid(
                     "existing shared store namespace must be a real directory without links",
-                ))
+                ));
             }
         }
         if root.canonicalize().map_err(|_| {
@@ -239,6 +250,7 @@ pub fn plan(
     if mapped.is_empty() {
         return Ok(None);
     }
+    validate_plugin_parents(&canonical, &mapped)?;
     let layout = state::runtime_storage::RuntimeStorageLayout {
         version: 1,
         runtime_home: key,
@@ -249,10 +261,50 @@ pub fn plan(
     Ok(Some(layout))
 }
 
+/// Validates the parent geometry every managed plugin root needs before any
+/// layout is planned or prepared.
+///
+/// A strictly verified home already guarantees each root's ancestors are real
+/// directories; this check additionally proves every plugin-classified root's
+/// parent holds exactly its one indexed version entry and nothing else — no
+/// second version, remote metadata marker, or any sibling an unmountable
+/// parent link would strand. Two indexed versions of one plugin therefore
+/// fail here together, before a registry row exists, with the whole original
+/// parent preserved for the caller. Any failure is explicit: nothing is
+/// mutated, skipped, or dropped.
+fn validate_plugin_parents(
+    home: &Path,
+    mapped: &BTreeMap<String, state::runtime_storage::SharedRootMapping>,
+) -> Result<()> {
+    let directory = fs::Dir::open(home)?;
+    for root_key in mapped.keys() {
+        let Some((parent, version)) = plugin_views::plugin_mount(root_key) else {
+            continue;
+        };
+        match directory.entry_type(Path::new(&parent)) {
+            Ok(fs::EntryType::Directory) => {}
+            _ => {
+                return Err(invalid(format!(
+                    "managed plugin parent {parent} must be a real directory"
+                )));
+            }
+        }
+        let names = directory.list(Some(Path::new(&parent)))?;
+        if names.len() != 1 || names[0].to_str() != Some(version.as_str()) {
+            return Err(invalid(format!(
+                "managed plugin parent {parent} must hold exactly its indexed version \
+                 {version}; unexpected sibling entries refuse the shared layout"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Installs one planned layout: imports every tree, swaps each private root
-/// for the exact whole-tree link, verifies the unchanged original index
-/// through the shared bridge, commits the registry row, then removes only
-/// backups proven to still hold the replaced assets.
+/// for the exact whole-tree link (or, for a managed plugin root, its whole
+/// parent for the exact plugin-view link), verifies the unchanged original
+/// index through the shared bridge, commits the registry row, then removes
+/// only backups proven to still hold the replaced assets.
 ///
 /// The caller validates the actual harness guard before calling. The layout
 /// must validate and be its own canonical encoding. An existing committed row
@@ -356,6 +408,74 @@ fn switch_home(
     home.directory(Path::new(&base))?;
     for (root_key, reference) in &refs {
         let target = shared_assets::shared_tree_root(&root, reference)?;
+        if let Some((parent, version)) = plugin_views::plugin_mount(root_key) {
+            let view = plugin_views::view_root(&root, reference, &version)?;
+            match home.entry_type(Path::new(&parent)) {
+                Ok(fs::EntryType::Directory) => {
+                    // The parent must still hold exactly the indexed version;
+                    // anything else was refused at planning and stays an
+                    // explicit failure here rather than a silent drop.
+                    let names = home.list(Some(Path::new(&parent)))?;
+                    if names.len() != 1 || names[0].to_str() != Some(version.as_str()) {
+                        return Err(invalid(format!(
+                            "managed plugin parent {parent} must hold exactly its indexed \
+                             version {version}"
+                        )));
+                    }
+                    shared_assets::import_shared_tree(
+                        &root,
+                        &reference.scope,
+                        &home_path,
+                        Path::new(root_key),
+                    )?;
+                    plugin_views::materialize(&root, reference, &version)?;
+                    fire(StorageFault::BeforeRename)?;
+                    home.rename_entry_no_replace(
+                        Path::new(&parent),
+                        &Path::new(&base).join(&parent),
+                    )?;
+                    fire(StorageFault::AfterRename)?;
+                    home.symlink(&view, Path::new(&parent))?;
+                }
+                Ok(fs::EntryType::Symlink) => {
+                    if home.read_link(Path::new(&parent))? != Some(view) {
+                        return Err(invalid(format!(
+                            "managed plugin parent {parent} is a foreign link"
+                        )));
+                    }
+                }
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // Crash between this parent's rename and link: the backup
+                    // holds the original parent and the import is already
+                    // pinned; roll forward.
+                    let backup = Path::new(&base).join(&parent);
+                    match home.entry_type(&backup) {
+                        Ok(fs::EntryType::Directory) => {}
+                        _ => {
+                            return Err(invalid(format!(
+                                "managed plugin parent {parent} is missing and has no staged \
+                                 backup"
+                            )));
+                        }
+                    }
+                    shared_assets::import_shared_tree(
+                        &root,
+                        &reference.scope,
+                        &home_path,
+                        &backup.join(&version),
+                    )?;
+                    plugin_views::materialize(&root, reference, &version)?;
+                    home.symlink(&view, Path::new(&parent))?;
+                }
+                Err(error) => return Err(error),
+                Ok(kind) => {
+                    return Err(invalid(format!(
+                        "managed plugin parent {parent} has an unexpected shape: {kind:?}"
+                    )));
+                }
+            }
+            continue;
+        }
         match home.entry_type(Path::new(root_key)) {
             Ok(fs::EntryType::Directory) => {
                 shared_assets::import_shared_tree(
@@ -388,7 +508,7 @@ fn switch_home(
                     _ => {
                         return Err(invalid(format!(
                             "managed root {root_key} is missing and has no staged backup"
-                        )))
+                        )));
                     }
                 }
                 shared_assets::import_shared_tree(&root, &reference.scope, &home_path, &backup)?;
@@ -398,7 +518,7 @@ fn switch_home(
             Ok(kind) => {
                 return Err(invalid(format!(
                     "managed root {root_key} has an unexpected shape: {kind:?}"
-                )))
+                )));
             }
         }
     }
@@ -513,6 +633,12 @@ fn recover_prepared(
 /// Removes the operation backup for every root of one record, but only after
 /// proving each staged tree still holds the exact replaced assets; an unknown
 /// or changed backup is left in place with an explicit failure.
+///
+/// A plugin-parent root stages its whole moved parent — the indexed version
+/// tree lives one component below it — so the proof reads the manifest and
+/// inspects the managed tree at that inner path while removal deletes the
+/// staged parent itself. Every other root stages and proves the same
+/// single directory, exactly as before.
 fn discard_backups(
     home_path: &Path,
     refs: &BTreeMap<String, SharedTreeRef>,
@@ -525,22 +651,33 @@ fn discard_backups(
         _ => {}
     }
     for (root_key, reference) in refs {
-        let backup = Path::new(&base).join(root_key);
-        match home.entry_type(&backup) {
+        let (staged, tree) = match plugin_views::plugin_mount(root_key) {
+            Some((parent, version)) => {
+                let staged = Path::new(&base).join(&parent);
+                let tree = staged.join(&version);
+                (staged, tree)
+            }
+            None => {
+                let staged = Path::new(&base).join(root_key);
+                let tree = staged.clone();
+                (staged, tree)
+            }
+        };
+        match home.entry_type(&staged) {
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Ok(fs::EntryType::Directory) => {}
             entry => {
                 return Err(invalid(format!(
                     "backup for {root_key} has an unexpected shape: {entry:?}"
-                )))
+                )));
             }
         }
-        let staged = home.subdir(&backup)?;
-        let proven = staged
-            .read(Path::new(SNAPSHOT_MANIFEST), MAX_INDEX_BYTES)
+        let proven = home
+            .subdir(&tree)
             .ok()
+            .and_then(|dir| dir.read(Path::new(SNAPSHOT_MANIFEST), MAX_INDEX_BYTES).ok())
             .is_some_and(|bytes| fs::sha256(&bytes) == reference.manifest_sha256)
-            && snapshot_tree::inspect_managed_snapshot(home_path, &backup)
+            && snapshot_tree::inspect_managed_snapshot(home_path, &tree)
                 .map(|inspection| inspection.verified)
                 .unwrap_or(false);
         if !proven {
@@ -548,9 +685,9 @@ fn discard_backups(
                 "backup for {root_key} cannot be proven to hold the replaced assets; left in place"
             )));
         }
-        remove_owned_tree(&staged)?;
-        home.remove_directory(&backup)?;
-        prune_empty_backup_parents(&home, &backup, Path::new(&base))?;
+        remove_owned_tree(&home.subdir(&staged)?)?;
+        home.remove_directory(&staged)?;
+        prune_empty_backup_parents(&home, &staged, Path::new(&base))?;
     }
     if home.list(Some(Path::new(&base)))?.is_empty() {
         home.remove_directory(Path::new(&base))?;
@@ -592,7 +729,7 @@ fn remove_owned_tree(directory: &fs::Dir) -> Result<()> {
             kind => {
                 return Err(invalid(format!(
                     "backup holds an unexpected entry: {kind:?}"
-                )))
+                )));
             }
         }
     }
