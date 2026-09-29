@@ -28,6 +28,7 @@ fn home() -> Home {
         .expect("fixture home");
     let path = temp.path().canonicalize().expect("canonical home");
     fs::private_dir(&path).expect("private home");
+    stdfs::write(path.join("config.toml"), "schema_version = 2\n").expect("config");
     Store::initialize(&path).expect("store");
     Home { _temp: temp, path }
 }
@@ -372,4 +373,98 @@ fn foreign_prepared_home_is_refused_not_guessed() {
     );
     permit(&runtime);
     permit(&runtime_storage::store_root(&fixture.path).expect("store root"));
+}
+
+/// Records one agent row with an explicit finish time, so a lineage's latest
+/// terminal execution is distinguishable.
+fn retained_at(
+    store: &Store,
+    id: &str,
+    runtime_home: &Path,
+    digest: &str,
+    status: &str,
+    finished: f64,
+) {
+    store
+        .conn
+        .execute(
+            r#"INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,
+         status,created_at,timeout_seconds,config_revision,root_agent_id,finished_at,identity_json)
+         VALUES(?1,'glm-user','fixture','review','task','task','/tmp',
+         '{"runtime":"glm-user","model":"fixture","profile":"review","task":"task","workdir":"/tmp","timeout_seconds":100,"read_roots":[]}',
+         ?4,1,100,'fixture',?1,?5,json_object('runtime_home',?2,'snapshot_sha256',?3))"#,
+            params![
+                id,
+                runtime_home.to_string_lossy(),
+                digest,
+                status,
+                finished.to_string()
+            ],
+        )
+        .expect("agent row");
+}
+
+/// A resume lineage of several terminal executions sharing one home is the
+/// primary legacy case: it stays eligible, is reported without internal
+/// per-run identifiers, and compaction relocates it exactly once using the
+/// latest terminal execution's authority.
+#[test]
+fn resumed_lineage_is_eligible_and_relocates_once() {
+    let fixture = home();
+    let root = fixture._temp.path();
+    let (runtime, digest, index, history) = seal(root, "lineage", b"lineage-bytes\n");
+    let store = Store::open(&fixture.path).expect("store");
+    let home = runtime.canonicalize().expect("canonical home");
+    retained_at(
+        &store,
+        "ag-20260101-000000-0000000001",
+        &home,
+        &digest,
+        "succeeded",
+        1000.0,
+    );
+    retained_at(
+        &store,
+        "ag-20260102-000000-0000000002",
+        &home,
+        &digest,
+        "succeeded",
+        2000.0,
+    );
+    retained_at(
+        &store,
+        "ag-20260103-000000-0000000003",
+        &home,
+        &digest,
+        "succeeded",
+        3000.0,
+    );
+    drop(store);
+
+    let status = storage_admin::status(&fixture.path).expect("status");
+    let entry = &status["homes"]["entries"][0];
+    assert_eq!(entry["state"], "eligible", "{entry}");
+    assert_eq!(entry["holders"], 3, "every terminal execution is counted");
+    assert!(
+        entry.get("agent_ids").is_none(),
+        "internal per-run identifiers never leave the process: {entry}"
+    );
+    assert_eq!(status["homes"]["incomplete"], false);
+
+    let result = storage_admin::compact(&fixture.path, true).expect("apply");
+    let relocations = result["relocations"].as_array().expect("relocations");
+    assert_eq!(relocations.len(), 1, "one home relocates once: {relocations:?}");
+    assert_eq!(relocations[0]["relocated"], false, "the fixture authority cannot qualify");
+    assert!(
+        !relocations[0]["reason"].as_str().unwrap_or_default().is_empty(),
+        "the single skip states its reason: {relocations:?}"
+    );
+    // The home and its proofs are untouched by the refused relocation.
+    assert_eq!(
+        stdfs::read(runtime.join(RUNTIME_SNAPSHOT_INDEX)).expect("index"),
+        index,
+        "the frozen index bytes stay byte-exact"
+    );
+    assert_eq!(stdfs::read(runtime.join("history.json")).expect("history"), history);
+    permit(&runtime);
 }

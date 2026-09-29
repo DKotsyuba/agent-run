@@ -361,6 +361,8 @@ pub struct RetainedHomeRef {
     pub status: String,
     /// Sealed runtime asset-index digest recorded by the identity, if any.
     pub index_sha256: Option<String>,
+    /// Finish time of the execution, when it already finished.
+    pub finished_at: Option<f64>,
 }
 
 /// Returns the one registered layout row for `runtime_home`, if any.
@@ -683,7 +685,7 @@ impl Store {
         let limit = limit.clamp(1, MAX_PENDING_PAGE as usize) as i64;
         let mut stmt = self.conn.prepare(
             "SELECT json_extract(identity_json,'$.runtime_home') AS home, id, status, \
-             json_extract(identity_json,'$.snapshot_sha256') \
+             json_extract(identity_json,'$.snapshot_sha256'), finished_at \
              FROM agents \
              WHERE home IS NOT NULL AND home != '' \
                AND (?1 IS NULL OR home > ?1) \
@@ -696,6 +698,7 @@ impl Store {
                     agent_id: row.get(1)?,
                     status: row.get(2)?,
                     index_sha256: row.get(3)?,
+                    finished_at: row.get(4)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

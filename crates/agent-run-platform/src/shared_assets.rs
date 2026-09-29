@@ -126,17 +126,30 @@ pub struct SharedStoreLock {
 }
 
 impl SharedStoreLock {
-    /// Opens the store-wide lock file without locking it.
-    fn open_lock(store_root: &Path) -> Result<std::fs::File> {
+    /// Opens the store-wide lock file without locking it, creating it only
+    /// when `create` is set.
+    fn open_lock(store_root: &Path, create: bool) -> Result<Option<std::fs::File>> {
         use std::os::unix::fs::OpenOptionsExt;
         let lock_path = store_root.join(LOCK_NAME);
-        Ok(std::fs::OpenOptions::new()
+        let mut options = std::fs::OpenOptions::new();
+        options
             .write(true)
-            .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&lock_path)?)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        if create {
+            options.create(true);
+        }
+        match options.open(&lock_path) {
+            Ok(file) => Ok(Some(file)),
+            // Without `create`, a missing lock file is simply nothing to take.
+            Err(error)
+                if !create && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Blocks until this process owns the shared store's publish lock.
@@ -147,7 +160,7 @@ impl SharedStoreLock {
     /// symbolic link) or locked. The guard releases the lock on drop.
     pub fn acquire(store_root: &Path) -> Result<Self> {
         let lock_path = store_root.join(LOCK_NAME);
-        let file = Self::open_lock(store_root)?;
+        let file = Self::open_lock(store_root, true)?.expect("created lock file");
         file.lock().map_err(Error::from)?;
         Ok(Self { file, lock_path })
     }
@@ -156,11 +169,15 @@ impl SharedStoreLock {
     ///
     /// Returns `Ok(None)` when another cooperating process holds it, so a
     /// maintenance caller can skip this pass instead of stalling the broker
-    /// behind an import or a native guard preflight. Any failure to open or
-    /// lock the file other than contention is an error, never a silent pass.
-    pub fn try_acquire(store_root: &Path) -> Result<Option<Self>> {
+    /// behind an import or a native guard preflight, and — with `create`
+    /// unset — when the lock file does not exist yet, so a read-only caller
+    /// never creates store state just to look at it. Any failure to open or
+    /// lock the file other than those is an error, never a silent pass.
+    pub fn try_acquire(store_root: &Path, create: bool) -> Result<Option<Self>> {
         let lock_path = store_root.join(LOCK_NAME);
-        let file = Self::open_lock(store_root)?;
+        let Some(file) = Self::open_lock(store_root, create)? else {
+            return Ok(None);
+        };
         match file.try_lock() {
             Ok(()) => Ok(Some(Self { file, lock_path })),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),

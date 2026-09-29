@@ -197,7 +197,7 @@ hardlinks move the two numbers independently.
 
 `compact --apply` holds the same broker and service-manager startup locks a
 paired config migration holds, refuses while any agent is active, relocates
-each eligible single-holder home, and then runs one collection pass. Each
+each eligible home once, and then runs one collection pass. Each
 relocation replays the supervisor's own guard preflight from the recorded
 identity, frozen configuration and recorded account — never the current
 provider, never a rewritten configuration — and a home whose workdir, binary,
@@ -211,37 +211,64 @@ Collection runs inside the existing bounded housekeeping and socket
 maintenance cycles — `housekeeping::sweep` calls one pass each cycle; there is
 no new daemon. A pass takes the store-wide publish/GC lock nonblocking (a
 busy publisher defers the pass instead of stalling the broker behind an
-import or a native preflight), and while it holds that lock it re-derives
-every reference before unlinking anything:
+import or a native preflight) and re-derives every reference while holding
+it, before unlinking anything:
 
 - every registered row — `prepared` always pins what it names; `committed`
   pins while its physical home exists;
 - the bounded storage-protection snapshot of frozen identities, frozen and
   current configuration, credentials and not-conclusively-released service
-  definitions, any of which may name a shared tree or a single payload file
-  directly;
-- the trees those paths name.
+  definitions, any of which may name a shared tree, a derived view, or a
+  single payload file directly;
+- the objects those paths name, including the tree behind a protected view,
+  derived from the view's own manifest bytes.
 
-Trees are collected first, then the blobs derived from the manifests of the
-trees that remain, so a payload is unlinked only after every tree referencing
-it is gone. Committed rows are removed only once their physical home is
-conclusively gone and no configuration, service or agent row still references
-the home — the store's own removal is the authoritative final check, and
+**A complete proof precedes any deletion.** The registry census is
+all-or-nothing: a page that fails, or a registry beyond the page bound,
+retains every candidate of every kind — rows, views, trees and blobs — and
+reports `incomplete`. A retained tree's reference proof is the store's own
+full verifier (topology, hardlink identity, content), never a bare manifest
+read: a manifest that parses but was replaced lists no payloads and would
+fabricate an empty reference set. A pinned tree missing from the scan, an
+unverifiable tree, a foreign name inside a namespace, an unresolvable home or
+an unreadable current configuration each stop destructive work for the pass.
+Blobs are collected only after one pass enumerated every remaining tree, and
+only canonical payload names (`<digest>-600`/`<700>`) are candidates — any
+other owned file in the namespace is a foreign object and is retained.
+
+Collection order is derived plugin views, then trees, then the blobs derived
+from the remaining manifests: a view file is an internal hardlink, so an
+obsolete view left behind keeps its payload's inode allocated and a stale
+view whose tree is gone would corrupt a future import's reuse of the same
+content-addressed name. Committed rows are removed only once their physical
+home is conclusively gone — a plain `NotFound` resolution, never a permission
+or I/O error — and no configuration, service or agent row still references
+the home; the store's own removal is the authoritative final check, and
 prepared rows never age out. Publisher staging orphans are removed only
 inside the owned namespaces, only for the exact staging name shape and entry
 type, and only while this process holds the publish lock; age alone never
-qualifies anything. Anything unreadable, malformed or beyond a scan bound is
-retained and retried — unknown is never classified as unreferenced — and
-passes carry a broker-local cursor so a large store drains over successive
-passes instead of re-reading the same first page forever. There are no live
-reference counts. The `.publish.lock` file itself, and everything outside
-`trees/<scope>` and `blobs/<scope>`, is never touched.
+qualifies anything, a directory whose drain cannot finish stays resumable in
+place, and only completed removals are counted.
 
-One store namespace holds derived *views* of shared trees (a real
-plugin-parent subtree whose files are internal hardlinks into the payloads).
-An obsolete view must be collected **before** the tree and payload beneath
-it — a surviving view keeps the payload's inode allocated, and a stale view
-whose tree is gone would corrupt a future import's reuse of the same
-content-addressed name — so the pass order is views, then trees, then blobs.
-That namespace is defined by the plugin-view unit; `VIEW_NAMESPACES` in
-`storage_gc` is the single place it is registered.
+Passes are bounded and converge: each namespace is streamed in fixed-size
+batches through live directory descriptors (never a whole-directory read),
+referenced objects are checked by name alone so hundreds of retained objects
+ahead of one garbage object cannot starve it, and a verified tree's reference
+set is memoized for the life of the process. A publication between passes is
+not in any memo, so it is proved and protected on the next pass. Outcomes
+carry explicit counts — removed, retained, bytes reclaimed, `lock_busy` and
+`incomplete` — and there are no live reference counts. The `.publish.lock`
+file itself, and everything outside the store's own namespaces, is never
+touched.
+
+In `Mode::Preview` a pass writes nothing anywhere: no row removal, no lock
+file creation (a store without one reports `lock_busy` rather than
+fabricating a synchronized preview), and no remembered scan state.
+
+## Operator notes
+
+A home is classified from all of its recorded holders together: a resume
+lineage legitimately leaves many terminal executions on one home, so only an
+active or lost holder protects it, and qualification uses the latest terminal
+execution's sealed authority. Internal per-run identifiers never appear in
+the public report, which prints the holder count instead.

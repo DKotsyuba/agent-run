@@ -48,8 +48,14 @@ struct Surveyed {
     home: String,
     /// `shared`, `eligible`, `prepared`, `protected`, `gone` or `unknown`.
     state: &'static str,
-    /// Agent ids whose frozen identity binds this home.
-    agents: Vec<String>,
+    /// How many recorded executions bind this home, resume lineage included.
+    holders: usize,
+    /// Statuses of holders that are still active or lost, if any.
+    active: Vec<String>,
+    /// Latest terminal execution, the one whose seal qualifies the home.
+    executor: Option<String>,
+    /// Finish time of that execution, for ordering.
+    sealed_at: f64,
     /// Sealed asset-index digest recorded for the home, when known.
     index_sha256: Option<String>,
     /// Unique inode bytes of the home's private (non-shared) content.
@@ -58,6 +64,14 @@ struct Surveyed {
     incomplete: bool,
     /// Human-readable reasons for the classification, when it is not `shared`.
     reasons: Vec<String>,
+}
+
+/// One survey's public report plus the internal executors it selected.
+struct Survey {
+    /// The operator-facing JSON report.
+    report: Value,
+    /// Latest terminal execution per eligible home, internal use only.
+    executors: Vec<(String, String)>,
 }
 
 /// Measures unique inode bytes below one directory, never following symlinks.
@@ -142,12 +156,17 @@ fn child_names(root: &Path) -> Vec<String> {
 
 /// Surveys every retained runtime home and the shared store, read-only.
 ///
-/// Homes come only from durable identities and configured run roots. A home
-/// no identity records is reported as unknown and never touched; aliases and
-/// unreadable homes keep the same treatment. An unmeasurable or partially
+/// Homes come only from durable identities and configured run roots, and all
+/// holders of one home are considered together: a resume lineage legitimately
+/// leaves many terminal executions sharing one home, so a home is protected
+/// only while some holder is active or lost, and qualification uses the
+/// latest terminal holder's sealed index. A home no identity records is
+/// reported as unknown and never touched, and so are aliases and unreadable
+/// homes; a home is `gone` only on a plain `NotFound`. Registry errors are
+/// reported, never hidden behind a fallback. An unmeasurable or partially
 /// measured home sets `incomplete` on the whole report rather than passing a
 /// partial number off as a total.
-fn survey(home: &Path, store: &Store) -> Result<Value> {
+fn survey(home: &Path, store: &Store) -> Result<Survey> {
     let store_root = runtime_storage::store_root(home)?;
     let store_present = store_root.exists();
     let mut homes: BTreeMap<String, Surveyed> = BTreeMap::new();
@@ -163,24 +182,32 @@ fn survey(home: &Path, store: &Store) -> Result<Value> {
                 Surveyed {
                     home: reference.runtime_home.clone(),
                     state: "unknown",
-                    agents: Vec::new(),
+                    holders: 0,
+                    active: Vec::new(),
+                    executor: None,
+                    sealed_at: 0.0,
                     index_sha256: None,
                     private_bytes: 0,
                     incomplete: false,
                     reasons: Vec::new(),
                 }
             });
-            entry.agents.push(reference.agent_id.clone());
-            if reference.index_sha256.is_some() {
-                entry.index_sha256 = reference.index_sha256.clone();
-            }
-            if agent_run_store::ACTIVE_SQL.contains(reference.status.as_str())
-                || reference.status == "lost"
-            {
-                entry.state = "protected";
-                entry
-                    .reasons
-                    .push(format!("agent {} is {}", reference.agent_id, reference.status));
+            entry.holders += 1;
+            let unsettled = agent_run_store::ACTIVE_SQL.contains(reference.status.as_str())
+                || reference.status == "lost";
+            if unsettled {
+                entry.active.push(reference.status.clone());
+            } else {
+                // The latest terminal execution is the one whose sealed
+                // authority and native history qualify the home.
+                let sealed = reference.finished_at.unwrap_or(0.0);
+                if entry.executor.is_none() || sealed >= entry.sealed_at {
+                    entry.sealed_at = sealed;
+                    entry.executor = Some(reference.agent_id.clone());
+                    if reference.index_sha256.is_some() {
+                        entry.index_sha256 = reference.index_sha256.clone();
+                    }
+                }
             }
         }
     }
@@ -195,7 +222,10 @@ fn survey(home: &Path, store: &Store) -> Result<Value> {
             homes.entry(key.clone()).or_insert(Surveyed {
                 home: key,
                 state: "unknown",
-                agents: Vec::new(),
+                holders: 0,
+                active: Vec::new(),
+                executor: None,
+                sealed_at: 0.0,
                 index_sha256: None,
                 private_bytes: 0,
                 incomplete: false,
@@ -209,17 +239,48 @@ fn survey(home: &Path, store: &Store) -> Result<Value> {
         let path = PathBuf::from(&entry.home);
         // The registry keys the canonical path; an identity may record an
         // unresolved spelling of the same home, so the lookup canonicalizes
-        // rather than silently missing its row.
+        // rather than silently missing its row. A row that fails its own
+        // digest check is reported, never treated as absent.
         let canonical = path
             .canonicalize()
             .map(|resolved| resolved.to_string_lossy().into_owned())
             .unwrap_or_else(|_| entry.home.clone());
-        let layout = store.runtime_storage_layout(&canonical).ok().flatten();
-        if fs::Dir::open(&path).is_err() {
-            entry.state = "gone";
-            entry.reasons.push("physical home is gone".into());
-            *counted.entry("gone").or_default() += 1;
-            continue;
+        let layout = match store.runtime_storage_layout(&canonical) {
+            Ok(layout) => layout,
+            Err(error) => {
+                entry.state = "unknown";
+                entry.incomplete = true;
+                incomplete = true;
+                entry.reasons.push(error.to_string());
+                continue;
+            }
+        };
+        if !entry.active.is_empty() {
+            entry.state = "protected";
+            entry.reasons.push(format!(
+                "{} holder(s) of this home are still active or lost",
+                entry.active.len()
+            ));
+        }
+        match fs::Dir::open(&path) {
+            Err(error)
+                if matches!(&error, agent_run_domain::Error::Io(inner)
+                    if inner.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                entry.state = "gone";
+                entry.reasons.push("physical home is gone".into());
+                *counted.entry("gone").or_default() += 1;
+                continue;
+            }
+            Err(error) => {
+                // Unreadable is not gone: the home and its row are kept.
+                entry.state = "unknown";
+                entry.incomplete = true;
+                incomplete = true;
+                entry.reasons.push(error.to_string());
+                continue;
+            }
+            Ok(_) => {}
         }
         match layout.as_ref().map(|record| record.state) {
             Some(agent_run_store::runtime_storage::LayoutState::Prepared) => {
@@ -234,12 +295,7 @@ fn survey(home: &Path, store: &Store) -> Result<Value> {
                 entry.reasons.clear();
             }
             None => {
-                if entry.agents.len() > 1 {
-                    entry.state = "protected";
-                    entry
-                        .reasons
-                        .push("several identities bind this home".into());
-                } else if entry.state != "protected" {
+                if entry.state != "protected" {
                     // Eligibility is proven only by the read-only planner: the
                     // original index must still strictly verify in place.
                     let digest = entry.index_sha256.clone().unwrap_or_default();
@@ -280,7 +336,7 @@ fn survey(home: &Path, store: &Store) -> Result<Value> {
             json!({
                 "runtime_home": entry.home,
                 "state": entry.state,
-                "agent_ids": entry.agents,
+                "holders": entry.holders,
                 "index_sha256": entry.index_sha256,
                 "private_bytes": entry.private_bytes,
                 "measured": !entry.incomplete,
@@ -294,28 +350,43 @@ fn survey(home: &Path, store: &Store) -> Result<Value> {
         totals_json[&format!("{state}_homes")] = json!(counted.get(state).copied().unwrap_or(0));
         totals_json[&format!("{state}_bytes")] = json!(totals.get(state).copied().unwrap_or(0));
     }
-    Ok(json!({
-        "state_schema_version": agent_run_store::VERSION,
-        "store_root": store_root,
-        "store_present": store_present,
-        "store_unique_bytes": store_bytes,
-        "store_measured": !store_incomplete,
-        "filesystem_free_bytes": free,
-        "homes": {
-            "total": homes.len(),
-            "gone": counted.get("gone").copied().unwrap_or(0),
+    Ok(Survey {
+        report: json!({
+            "state_schema_version": agent_run_store::VERSION,
+            "store_root": store_root,
+            "store_present": store_present,
+            "store_unique_bytes": store_bytes,
+            "store_measured": !store_incomplete,
+            "filesystem_free_bytes": free,
             "incomplete": incomplete,
-            "entries": entries,
-        },
-        "totals": totals_json,
-    }))
+            "homes": {
+                "total": homes.len(),
+                "gone": counted.get("gone").copied().unwrap_or(0),
+                "incomplete": incomplete,
+                "entries": entries,
+            },
+            "totals": totals_json,
+        }),
+        // Internal only: per-run executor ids never leave the process, so the
+        // public report carries no migrating execution identifiers.
+        executors: homes
+            .values()
+            .filter(|entry| entry.state == "eligible")
+            .filter_map(|entry| {
+                entry
+                    .executor
+                    .clone()
+                    .map(|agent| (entry.home.clone(), agent))
+            })
+            .collect(),
+    })
 }
 
 /// `agent-run storage status`: a read-only report; never a store write.
 pub fn status(home: &Path) -> Result<Value> {
     migrate::require_current_store(home)?;
     let store = Store::open(home)?;
-    survey(home, &store)
+    Ok(survey(home, &store)?.report)
 }
 
 /// Refuses while any agent is active, matching the migration boundary.
@@ -358,29 +429,16 @@ pub fn compact(home: &Path, apply: bool) -> Result<Value> {
         let collection = storage_gc::sweep(&mut store, home, storage_gc::Mode::Preview)?;
         return Ok(json!({
             "applied": false,
-            "plan": plan,
+            "plan": plan.report,
             "collect": collection_report(&collection),
         }));
     }
     let _locks = migrate::broker_exclusion(home)?;
     require_idle(&store)?;
     let plan = survey(home, &store)?;
-    let mut eligible: Vec<(String, String)> = Vec::new();
-    for entry in plan["homes"]["entries"].as_array().cloned().unwrap_or_default() {
-        if entry["state"] != json!("eligible") {
-            continue;
-        }
-        let (Some(home_path), Some(agent)) = (
-            entry["runtime_home"].as_str(),
-            entry["agent_ids"]
-                .as_array()
-                .and_then(|agents| agents.first())
-                .and_then(|agent| agent.as_str()),
-        ) else {
-            continue;
-        };
-        eligible.push((home_path.to_owned(), agent.to_owned()));
-    }
+    // Each eligible home relocates once, behind its latest terminal
+    // execution's recorded authority; internal per-run ids stay here.
+    let mut eligible = plan.executors.clone();
     eligible.sort();
     let mut relocations = Vec::new();
     for (home_path, agent) in &eligible {
@@ -426,7 +484,7 @@ pub fn compact(home: &Path, apply: bool) -> Result<Value> {
     let collection = storage_gc::sweep(&mut store, home, storage_gc::Mode::Apply)?;
     Ok(json!({
         "applied": true,
-        "plan": plan,
+        "plan": plan.report,
         "relocations": relocations,
         "collect": collection_report(&collection),
     }))

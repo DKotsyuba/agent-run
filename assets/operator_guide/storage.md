@@ -17,8 +17,7 @@ number, and one entry per retained runtime home with its classification:
 - `shared` — a committed layout row backs the home.
 - `eligible` — a private home the read-only planner can still strictly verify.
 - `prepared` — an interrupted relocation holds the home; run `storage recover`.
-- `protected` — an active or lost agent holds it, several identities bind it,
-  or it has no managed roots.
+- `protected` — an active or lost holder keeps it, or it has no managed roots.
 - `gone` — the physical home is gone; only its registry row may remain.
 - `unknown` — evidence is missing, unreadable or tampered. Never touched.
 
@@ -36,7 +35,7 @@ reclaim, writing nothing. `--apply` additionally:
    `.services.lock`) — the same exclusion `config migrate --apply` uses, so a
    resident broker or service manager cannot race it;
 2. refuses while any agent is active;
-3. relocates each eligible single-holder home behind the real supervisor guard
+3. relocates each eligible home behind the real supervisor guard
    preflight, replayed from that agent's recorded identity, frozen config and
    recorded account — never the current provider, never a rewritten config. A
    home whose workdir, binary, grants or sandbox boundary cannot be verified
@@ -61,11 +60,35 @@ maintenance cycles — no new daemon. It takes the store's publish/GC lock
 nonblocking (a busy publisher means the pass simply retries), re-derives every
 reference while holding it, and only then unlinks: a `prepared` row always
 pins what it names, a `committed` row pins while its home exists, and any
-configuration, frozen identity or unreleased service path pointing into the
-store pins the tree or blob it names. Trees are collected before the blobs
-derived from the remaining manifests. Committed rows are removed only once
+configuration, frozen identity, credential or unreleased service path pointing
+into the store pins the tree, view or blob it names — including the tree
+behind a protected view.
+
+**A complete proof precedes any deletion.** A reference census that is
+partial, unreadable, corrupt or beyond its bound retains every candidate and
+reports `incomplete` for retry; nothing is ever deleted from partial
+evidence. A retained tree is proved by the store's own full verifier, not a
+bare manifest read; an unverifiable tree, a missing pinned tree, a foreign
+name in a namespace, an unresolvable home (permission errors are **not**
+proof a home is gone) or an unreadable configuration each stop destructive
+work for the pass. Views are collected before the trees and payloads beneath
+them; blobs only after one pass enumerated every remaining tree, and only
+canonical payload names are candidates. Committed rows are removed only once
 their home is conclusively gone and unreferenced; `prepared` rows never age
-out. Anything unreadable or beyond a scan bound is retained and retried.
+out. Staging orphans need exact owned provenance, never age, and a drain that
+cannot finish stays resumable in place.
+
+Passes are bounded and converge: namespaces stream in fixed-size batches,
+referenced objects are checked by name so retained objects ahead of garbage
+cannot starve it, and a verified tree's references are remembered for the
+process. The dry run writes nothing anywhere — not even the lock file: a
+store without one reports `lock_busy` instead of a fabricated preview.
+
+Homes are classified from all their recorded holders together: a resume
+lineage of terminal executions sharing one home is eligible, only an active
+or lost holder protects it, and qualification uses the latest terminal
+execution's seal. The report prints a holder count, never per-run
+identifiers.
 
 ## Unsupported
 

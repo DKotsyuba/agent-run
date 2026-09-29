@@ -440,18 +440,26 @@ fn collect_config_paths(value: &toml::Value, proof: &mut StorageProtection) {
 ///
 /// Shared-store collection shares this evidence with retention: a service
 /// command, working directory or credential file may point directly into a
-/// shared tree, so the live configuration pins those objects exactly as the
-/// frozen identities and service definitions do. An unreadable or invalid
-/// configuration yields no paths, and the caller retains everything.
-pub(crate) fn config_paths(home: &Path) -> Vec<PathBuf> {
-    let Ok(root) = fs::Dir::open(home) else {
-        return Vec::new();
-    };
+/// shared tree or payload, so the live configuration pins those objects
+/// exactly as the frozen identities and service definitions do. A home with
+/// no configuration file has no configuration references, which is proof; a
+/// configuration that exists but cannot be read or parsed is **not** proof of
+/// an empty set — it is uncertainty, returned as an error so the caller
+/// retains everything and retries.
+pub(crate) fn config_paths(home: &Path) -> Result<Vec<PathBuf>> {
+    let root = fs::Dir::open(home)?;
+    let bytes = root
+        .optional(Path::new("config.toml"), 1024 * 1024)?
+        .ok_or_else(|| invalid("current configuration cannot prove store safety"))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| invalid("current configuration is not valid UTF-8"))?;
+    let _raw: toml::Value = toml::from_str(text)
+        .map_err(|_| invalid("current configuration cannot prove store safety"))?;
+    let config = current_config(home, &root)
+        .ok_or_else(|| invalid("current configuration cannot prove store safety"))?;
     let mut proof = agent_run_store::retention::StorageProtection::empty();
-    if let Some(config) = current_config(home, &root) {
-        collect_config_paths(&config, &mut proof);
-    }
-    proof.protected_paths().map(Path::to_path_buf).collect()
+    collect_config_paths(&config, &mut proof);
+    Ok(proof.protected_paths().map(Path::to_path_buf).collect())
 }
 
 /// Reports an exact live configuration string or path-basename reference.
