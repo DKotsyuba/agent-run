@@ -180,9 +180,7 @@ fn is_digest_name(name: &str) -> bool {
 /// foreign object, never a deletion candidate.
 fn is_blob_name(name: &str) -> bool {
     match name.split_once('-') {
-        Some((digest, mode)) => {
-            is_digest_name(digest) && (mode == "600" || mode == "700")
-        }
+        Some((digest, mode)) => is_digest_name(digest) && (mode == "600" || mode == "700"),
         None => false,
     }
 }
@@ -340,8 +338,15 @@ pub fn sweep(store: &mut Store, app_home: &Path, mode: Mode) -> Result<Outcome> 
     }
     view_pass(&root, &references, mode, &mut outcome)?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(PASS_SECONDS);
-    let trees_complete =
-        tree_pass(&root, &protected, &references, mode, &mut memo, deadline, &mut outcome)?;
+    let trees_complete = tree_pass(
+        &root,
+        &protected,
+        &references,
+        mode,
+        &mut memo,
+        deadline,
+        &mut outcome,
+    )?;
     if !trees_complete {
         // No blob can be proven unreferenced until every remaining tree was
         // enumerated in one pass; retain all blobs and retry.
@@ -469,8 +474,8 @@ fn registered_references(
     Ok(references)
 }
 
-/// Pins every derived view a protected path names, with the tree and payloads
-/// beneath it.
+/// Pins every derived view a protected path names or contains, with the tree
+/// and payloads beneath it.
 ///
 /// A configuration or service path may point straight into a view container,
 /// or at a file inside one, without any layout row left to describe it. The
@@ -486,6 +491,12 @@ fn protect_views(
 ) -> Result<()> {
     let namespace = root.join(plugin_views::VIEW_NAMESPACE);
     for path in protected {
+        // A service rooted above the namespace protects every view beneath it.
+        let path = if namespace.starts_with(path) {
+            &namespace
+        } else {
+            path
+        };
         let Ok(rest) = path.strip_prefix(&namespace) else {
             continue;
         };
@@ -759,9 +770,7 @@ fn tree_pass(
             seen.insert(key.clone());
             let absolute = root.join("trees").join(&scope).join(manifest);
             let pinned = references.pinned_trees.contains(&key)
-                || protected
-                    .iter()
-                    .any(|path| covers(path, &absolute));
+                || protected.iter().any(|path| covers(path, &absolute));
             if pinned {
                 outcome.trees_retained += 1;
                 // The payloads a retained tree references must be proved
@@ -818,11 +827,7 @@ fn tree_pass(
     }
     // A pinned tree the scan never found means the census cannot account for
     // every reference: stop destructive work rather than trust it.
-    if !references
-        .pinned_trees
-        .iter()
-        .all(|key| seen.contains(key))
-    {
+    if !references.pinned_trees.iter().all(|key| seen.contains(key)) {
         outcome.incomplete = true;
         complete = false;
     }
@@ -1007,13 +1012,11 @@ fn staging_pass(root: &Path, mode: Mode, outcome: &mut Outcome) -> Result<()> {
                     continue;
                 }
                 let size = match kind {
-                    fs::EntryType::File => {
-                        scope_dir
-                            .open_file(relative)?
-                            .metadata()
-                            .map_err(Error::from)?
-                            .len()
-                    }
+                    fs::EntryType::File => scope_dir
+                        .open_file(relative)?
+                        .metadata()
+                        .map_err(Error::from)?
+                        .len(),
                     _ => 0,
                 };
                 if mode == Mode::Apply {

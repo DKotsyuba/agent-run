@@ -9,7 +9,9 @@ use agent_run_core::{
     storage_gc::{self, Mode},
 };
 use agent_run_platform::{
-    plugin_views, shared_assets::{self, SharedStoreLock, SharedTreeRef}, snapshot_tree,
+    plugin_views,
+    shared_assets::{self, SharedStoreLock, SharedTreeRef},
+    snapshot_tree,
 };
 use std::{
     fs as stdfs,
@@ -117,7 +119,9 @@ fn converge(store: &mut Store, app_home: &Path, mode: Mode) -> Vec<storage_gc::O
 /// Returns `true` for a 64 lowercase hexadecimal digit name.
 fn is_digest_name(name: &str) -> bool {
     name.len() == 64
-        && name.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        && name
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Names one entry below a store namespace directory.
@@ -153,7 +157,10 @@ fn shared_payload_survives_until_last_reference_is_gone() {
     let second = seal(root.path(), "two", b"shared-payload\n");
     let first_key = share(&mut store, &first.home, &app_home, &first);
     share(&mut store, &second.home, &app_home, &second);
-    assert_eq!(first_key, first.home.canonicalize().unwrap().to_string_lossy());
+    assert_eq!(
+        first_key,
+        first.home.canonicalize().unwrap().to_string_lossy()
+    );
     for outcome in converge(&mut store, &app_home, Mode::Apply) {
         assert_eq!(outcome.trees_removed, 0, "referenced trees are retained");
         assert_eq!(outcome.blobs_removed, 0, "referenced blobs are retained");
@@ -169,7 +176,10 @@ fn shared_payload_survives_until_last_reference_is_gone() {
         trees_removed += outcome.trees_removed;
     }
     assert_eq!(rows_removed, 1, "only the gone home's row goes");
-    assert_eq!(trees_removed, 0, "the shared tree stays pinned by the survivor");
+    assert_eq!(
+        trees_removed, 0,
+        "the shared tree stays pinned by the survivor"
+    );
     assert!(
         runtime_storage::verify(&store, &app_home, &second.home, &second.index_sha256).is_ok(),
         "the surviving home still verifies through the bridge"
@@ -179,9 +189,17 @@ fn shared_payload_survives_until_last_reference_is_gone() {
     permit_tree(&second.home);
     stdfs::remove_dir_all(&second.home).expect("second home removed");
     let outcomes = converge(&mut store, &app_home, Mode::Apply);
-    let trees: usize = outcomes.iter().map(|outcome| outcome.trees_removed).sum::<usize>() + trees_removed;
+    let trees: usize = outcomes
+        .iter()
+        .map(|outcome| outcome.trees_removed)
+        .sum::<usize>()
+        + trees_removed;
     let blobs: usize = outcomes.iter().map(|outcome| outcome.blobs_removed).sum();
-    let rows: usize = outcomes.iter().map(|outcome| outcome.rows_removed).sum::<usize>() + rows_removed;
+    let rows: usize = outcomes
+        .iter()
+        .map(|outcome| outcome.rows_removed)
+        .sum::<usize>()
+        + rows_removed;
     assert_eq!(trees, 1, "the last tree is collected: {outcomes:?}");
     assert_eq!(blobs, 2, "both payloads are collected: {outcomes:?}");
     assert_eq!(rows, 2, "both rows are removed once their homes are gone");
@@ -223,7 +241,9 @@ fn prepared_config_and_service_references_pin_objects() {
     .expect("plan")
     .expect("managed roots");
     let fault = |_: StorageFault| -> agent_run_domain::Result<()> {
-        Err(agent_run_domain::Error::Validation("simulated crash".into()))
+        Err(agent_run_domain::Error::Validation(
+            "simulated crash".into(),
+        ))
     };
     runtime_storage::install_with_fault(&mut store, &app_home, &pending_layout, None, Some(&fault))
         .expect_err("crash before commit");
@@ -298,7 +318,10 @@ fn prepared_config_and_service_references_pin_objects() {
         .expect("released");
     let outcomes = converge(&mut store, &app_home, Mode::Apply);
     let blobs: usize = outcomes.iter().map(|outcome| outcome.blobs_removed).sum();
-    assert!(blobs >= 1, "the unreferenced blob is reclaimed: {outcomes:?}");
+    assert!(
+        blobs >= 1,
+        "the unreferenced blob is reclaimed: {outcomes:?}"
+    );
     permit_tree(&committed);
 }
 
@@ -375,8 +398,10 @@ fn staging_orphans_need_exact_provenance() {
     let scope = scope();
     let trees_scope = root_store.join("trees").join(&scope);
     let blobs_scope = root_store.join("blobs").join(&scope);
-    stdfs::create_dir_all(trees_scope.join(".agent-run-staging-0123456789abcdef0123456789abcdef.tmp"))
-        .expect("staging dir");
+    stdfs::create_dir_all(
+        trees_scope.join(".agent-run-staging-0123456789abcdef0123456789abcdef.tmp"),
+    )
+    .expect("staging dir");
     stdfs::write(
         blobs_scope.join(".agent-run-staging-0123456789abcdef0123456789abcdef.tmp"),
         b"partial",
@@ -412,13 +437,19 @@ fn collection_never_follows_symlinks_out_of_the_store() {
     let scope = scope();
     let trees_scope = root_store.join("trees").join(&scope);
     stdfs::create_dir_all(&trees_scope).expect("scope");
-    std::os::unix::fs::symlink(&outside, trees_scope.join("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"))
-        .expect("digest-named link");
+    std::os::unix::fs::symlink(
+        &outside,
+        trees_scope.join("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+    )
+    .expect("digest-named link");
     let mut retained = false;
     for _ in 0..4 {
         let outcome = storage_gc::sweep(&mut store, &app_home, Mode::Apply).expect("pass");
         retained |= outcome.incomplete;
-        assert_eq!(outcome.trees_removed, 0, "an unknown object is never deleted");
+        assert_eq!(
+            outcome.trees_removed, 0,
+            "an unknown object is never deleted"
+        );
     }
     assert!(retained, "a digest-named link reports incomplete evidence");
     assert_eq!(
@@ -497,10 +528,8 @@ fn views_collect_before_their_trees_and_only_when_unreferenced() {
     };
     // The registered mapping keeps its view alive; a view of a version no row
     // maps is obsolete even while its tree is pinned.
-    let live = plugin_views::materialize(&store_root, &reference, "1.0.0")
-        .expect("live view");
-    let stale = plugin_views::materialize(&store_root, &reference, "2.0.0")
-        .expect("stale view");
+    let live = plugin_views::materialize(&store_root, &reference, "1.0.0").expect("live view");
+    let stale = plugin_views::materialize(&store_root, &reference, "2.0.0").expect("stale view");
     assert!(live.is_dir() && stale.is_dir());
     for outcome in converge(&mut store, &app_home, Mode::Apply) {
         assert_eq!(outcome.trees_removed, 0, "the pinned tree stays");
@@ -516,7 +545,10 @@ fn views_collect_before_their_trees_and_only_when_unreferenced() {
     let views: usize = outcomes.iter().map(|pass| pass.views_removed).sum();
     let trees: usize = outcomes.iter().map(|pass| pass.trees_removed).sum();
     let blobs: usize = outcomes.iter().map(|pass| pass.blobs_removed).sum();
-    assert_eq!(views, 1, "the live view is collected once unmapped: {outcomes:?}");
+    assert_eq!(
+        views, 1,
+        "the live view is collected once unmapped: {outcomes:?}"
+    );
     assert_eq!(trees, 1, "the tree follows its view: {outcomes:?}");
     assert_eq!(blobs, 2, "the payloads follow their tree: {outcomes:?}");
     assert!(!live.exists());
@@ -576,7 +608,7 @@ fn insert_row(store: &Store, home: &Path, manifest: &str) {
                 "0".repeat(64),
                 text,
                 digest,
-                format!("rt_{}","a".repeat(30)),
+                format!("rt_{}", "a".repeat(30)),
             ],
         )
         .expect("layout row");
@@ -605,9 +637,15 @@ fn preview_is_truly_read_only() {
     assert!(!root_store.join(".publish.lock").exists());
     let before = stdfs::read(app_home.join("state.db")).expect("database");
     let outcome = storage_gc::sweep(&mut store, &app_home, Mode::Preview).expect("preview");
-    assert!(outcome.lock_busy, "no lock file means no synchronized preview");
+    assert!(
+        outcome.lock_busy,
+        "no lock file means no synchronized preview"
+    );
     assert_eq!(outcome.removed(), 0);
-    assert!(!root_store.join(".publish.lock").exists(), "no lock created");
+    assert!(
+        !root_store.join(".publish.lock").exists(),
+        "no lock created"
+    );
     assert_eq!(
         stdfs::read(app_home.join("state.db")).expect("database"),
         before,
@@ -618,7 +656,10 @@ fn preview_is_truly_read_only() {
     let outcome = storage_gc::sweep(&mut store, &app_home, Mode::Preview).expect("preview");
     assert_eq!(outcome.rows_removed, 1, "the gone row is only reported");
     assert_eq!(outcome.trees_removed, 1, "its tree is only reported");
-    assert!(root_store.join("trees").join(scope()).is_dir(), "nothing unlinked");
+    assert!(
+        root_store.join("trees").join(scope()).is_dir(),
+        "nothing unlinked"
+    );
     assert_eq!(
         stdfs::read(app_home.join("state.db")).expect("database"),
         before,
@@ -668,7 +709,11 @@ fn corrupt_or_missing_pinned_manifest_stops_blob_collection() {
             pinned_proof_broken,
             "a broken pinned manifest reports incomplete evidence"
         );
-        assert_eq!(names(&root_store, "blobs").len(), 2, "payloads are retained");
+        assert_eq!(
+            names(&root_store, "blobs").len(),
+            2,
+            "payloads are retained"
+        );
         permit_tree(&root_store);
         permit_tree(&sealed.home);
     }
@@ -728,9 +773,17 @@ fn partial_reference_census_permits_no_deletion() {
         page.len()
     };
     assert_eq!(rows_after, rows_before + 300, "every row is retained");
-    assert_eq!(names(&store_root, "trees").len(), 2, "both trees are retained");
+    assert_eq!(
+        names(&store_root, "trees").len(),
+        2,
+        "both trees are retained"
+    );
     // Both trees share one skill payload, so three distinct blobs remain.
-    assert_eq!(names(&store_root, "blobs").len(), 3, "all payloads are retained");
+    assert_eq!(
+        names(&store_root, "blobs").len(),
+        3,
+        "all payloads are retained"
+    );
     let _ = reference;
     permit_tree(&store_root);
     permit_tree(&sealed.home);
@@ -757,8 +810,13 @@ fn protected_view_pins_its_tree_and_payloads() {
     };
     let store_root = store_root(&app_home);
     ensure_store(&app_home);
-    shared_assets::import_shared_tree(&store_root, &scope(), &sealed.home, home.strip_prefix(&sealed.home).unwrap())
-        .expect("import");
+    shared_assets::import_shared_tree(
+        &store_root,
+        &scope(),
+        &sealed.home,
+        home.strip_prefix(&sealed.home).unwrap(),
+    )
+    .expect("import");
     let view = plugin_views::materialize(&store_root, &reference, "1.0.0").expect("view");
     let pinned_file = view.join("1.0.0/plugin.toml");
     assert!(pinned_file.is_file());
@@ -773,7 +831,11 @@ fn protected_view_pins_its_tree_and_payloads() {
             "INSERT INTO managed_service_generations \
              (id,service_id,revision,definition_json,state,broker_identity_json,created_at) \
              VALUES('pin','pin',?1,?2,'starting','{}',?3)",
-            ["a".repeat(64), definition, agent_run_core::domain::now().to_string()],
+            [
+                "a".repeat(64),
+                definition,
+                agent_run_core::domain::now().to_string(),
+            ],
         )
         .expect("unreleased service generation");
     permit_tree(&sealed.home);
@@ -799,7 +861,11 @@ fn many_retained_objects_before_garbage_converge() {
     // Many referenced trees, each named by one unreleased service argument.
     let mut args = Vec::new();
     for index in 0..280 {
-        let sealed = seal(root.path(), &format!("live-{index}"), format!("payload-{index}\n").as_bytes());
+        let sealed = seal(
+            root.path(),
+            &format!("live-{index}"),
+            format!("payload-{index}\n").as_bytes(),
+        );
         let relative = Path::new("skills/demo");
         let manifest = {
             let bytes = stdfs::read(sealed.home.join(relative).join(".agent-run-snapshot.json"))
@@ -836,7 +902,11 @@ fn many_retained_objects_before_garbage_converge() {
             "INSERT INTO managed_service_generations \
              (id,service_id,revision,definition_json,state,broker_identity_json,created_at) \
              VALUES('pin','pin',?1,?2,'starting','{}',?3)",
-            ["a".repeat(64), definition, agent_run_core::domain::now().to_string()],
+            [
+                "a".repeat(64),
+                definition,
+                agent_run_core::domain::now().to_string(),
+            ],
         )
         .expect("unreleased service generation");
     // One garbage tree after all of them.
@@ -973,7 +1043,11 @@ fn invalid_configuration_retains_everything() {
     let outcome = storage_gc::sweep(&mut store, &app_home, Mode::Apply).expect("pass");
     assert!(outcome.incomplete, "a broken configuration is uncertainty");
     assert_eq!(outcome.removed(), 0, "nothing may be deleted");
-    assert_eq!(names(&store_root, "trees").len(), 1, "the object is retained");
+    assert_eq!(
+        names(&store_root, "trees").len(),
+        1,
+        "the object is retained"
+    );
     permit_tree(&store_root);
 }
 
@@ -997,22 +1071,12 @@ fn oversized_garbage_tree_moves_to_staging_and_converges() {
     snapshot_tree::snapshot_managed_tree(&home, Path::new("skills/big"), &source, None)
         .expect("managed tree");
     stdfs::write(home.join("config.toml"), "k = \"v\"\n").expect("config");
-    let digest = snapshot_tree::finalize_runtime_snapshots(
-        &home,
-        "rev-big",
-        &["config.toml".into()],
-        &[],
-    )
-    .expect("index");
-    let layout = runtime_storage::plan(
-        &store,
-        &app_home,
-        &home,
-        &digest,
-        &scope(),
-    )
-    .expect("plan")
-    .expect("managed roots");
+    let digest =
+        snapshot_tree::finalize_runtime_snapshots(&home, "rev-big", &["config.toml".into()], &[])
+            .expect("index");
+    let layout = runtime_storage::plan(&store, &app_home, &home, &digest, &scope())
+        .expect("plan")
+        .expect("managed roots");
     runtime_storage::install(&mut store, &app_home, &layout, None).expect("install");
     let store_root = store_root(&app_home);
     permit_tree(&home);
@@ -1106,7 +1170,10 @@ fn ancestor_scope_reference_pins_every_object_beneath_it() {
         "{{\"command\":\"/bin/true\",\"args\":[\"{}\",\"{}\"],\"cwd\":\"/tmp\",\
          \"readiness\":{{\"command\":\"/bin/true\",\"args\":[],\"deadline_seconds\":1}}}}",
         store_root.join("trees").join(scope()).to_string_lossy(),
-        store_root.join(plugin_views::VIEW_NAMESPACE).join(scope()).to_string_lossy(),
+        store_root
+            .join(plugin_views::VIEW_NAMESPACE)
+            .join(scope())
+            .to_string_lossy(),
     );
     store
         .conn
@@ -1114,7 +1181,11 @@ fn ancestor_scope_reference_pins_every_object_beneath_it() {
             "INSERT INTO managed_service_generations \
              (id,service_id,revision,definition_json,state,broker_identity_json,created_at) \
              VALUES('pin','pin',?1,?2,'starting','{}',?3)",
-            ["a".repeat(64), definition, agent_run_core::domain::now().to_string()],
+            [
+                "a".repeat(64),
+                definition,
+                agent_run_core::domain::now().to_string(),
+            ],
         )
         .expect("unreleased service generation");
     for outcome in converge(&mut store, &app_home, Mode::Apply) {
@@ -1127,21 +1198,19 @@ fn ancestor_scope_reference_pins_every_object_beneath_it() {
     permit_tree(&store_root);
 }
 
-/// A reference to a view scope container — or the view namespace root —
+/// A reference to a view scope container, namespace root, or store ancestor
 /// protects each view in it and the tree and payloads beneath it, with no
 /// tree or blob reference of their own in the census.
 #[test]
 fn view_scope_and_namespace_references_pin_backing_trees() {
-    for (label, protected_path) in [("scope", None), ("root", Some(()))] {
+    for label in ["scope", "namespace", "store"] {
         let root = TempDir::new().expect("fixture root");
         let app_home = app(root.path());
         let mut store = Store::initialize(&app_home).expect("store");
         let store_root = store_root(&app_home);
         ensure_store(&app_home);
         let sealed = seal_plugin(root.path(), "plugins", b"view-scope\n");
-        let home = sealed
-            .home
-            .join("plugins/cache/personal/probe/1.0.0");
+        let home = sealed.home.join("plugins/cache/personal/probe/1.0.0");
         let manifest = {
             let bytes = stdfs::read(home.join(".agent-run-snapshot.json")).expect("manifest");
             fs::sha256(&bytes)
@@ -1157,17 +1226,19 @@ fn view_scope_and_namespace_references_pin_backing_trees() {
             home.strip_prefix(&sealed.home).unwrap(),
         )
         .expect("import");
-        let view =
-            plugin_views::materialize(&store_root, &reference, "1.0.0").expect("view");
+        let view = plugin_views::materialize(&store_root, &reference, "1.0.0").expect("view");
         permit_tree(&sealed.home);
         stdfs::remove_dir_all(&sealed.home).expect("home gone");
-        // The only reference names the view scope container or the namespace
-        // root — never a tree, blob or leaf path.
+        // The only reference names a view container or its ancestor,
+        // never a separate tree, blob or leaf path.
         let namespace = store_root.join(plugin_views::VIEW_NAMESPACE);
-        let pinned = match protected_path {
-            None => namespace.join(scope()).to_string_lossy().into_owned(),
-            Some(()) => namespace.to_string_lossy().into_owned(),
-        };
+        let pinned = match label {
+            "scope" => namespace.join(scope()),
+            "namespace" => namespace,
+            _ => store_root.clone(),
+        }
+        .to_string_lossy()
+        .into_owned();
         let definition = format!(
             "{{\"command\":\"/bin/true\",\"args\":[\"{pinned}\"],\"cwd\":\"/tmp\",\
              \"readiness\":{{\"command\":\"/bin/true\",\"args\":[],\"deadline_seconds\":1}}}}"
@@ -1286,6 +1357,9 @@ fn partial_staging_orphan_drains_after_restart() {
         );
     }
     assert!(!staging.exists(), "repeated passes finish the orphan");
-    assert_eq!(removed, 1, "only the completed removal is counted: {passes}");
+    assert_eq!(
+        removed, 1,
+        "only the completed removal is counted: {passes}"
+    );
     permit_tree(&store_root);
 }

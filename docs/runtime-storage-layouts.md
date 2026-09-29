@@ -222,7 +222,8 @@ it, before unlinking anything:
   single payload file directly;
 - the objects those paths name. A view reference pins that view and, read
   from the view's own manifest bytes, the tree and payloads beneath it — a
-  reference to a whole scope container, or to the view namespace root, pins
+  reference to a whole scope container, the view namespace root, or its
+  store ancestor pins
   every view it covers the same way, and a protected view whose manifest
   cannot be read stops destructive work.
 
