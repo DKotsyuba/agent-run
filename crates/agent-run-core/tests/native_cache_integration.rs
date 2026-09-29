@@ -8,6 +8,8 @@
 //! after sealing.
 #![cfg(feature = "test-fixtures")]
 
+mod common;
+
 use agent_run_core::{
     native_cache::{self},
     native_tree_cache, runtime_cache, runtime_storage,
@@ -16,6 +18,7 @@ use agent_run_core::{
 };
 use agent_run_domain::catalog::HarnessId;
 use std::{
+    collections::BTreeMap,
     fs as stdfs,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -121,9 +124,10 @@ fn fixture(account: &str, payload: &[u8]) -> Fixture {
          native_model = \"fixture\"\n\
          [[providers.codex-user.bindings]]\n\
          label = \"work\"\n\
-         account = \"acct-work\"\n",
+         account = \"{account}\"\n",
         codex_home = root.path().join("codex").display(),
         claude_home = root.path().join("claude").display(),
+        account = account,
     );
     let config = agent_run_config::provider_config::ProviderConfig::parse(&config_text, &app_home)
         .expect("provider config");
@@ -133,9 +137,9 @@ fn fixture(account: &str, payload: &[u8]) -> Fixture {
         connection: agent_run_domain::ProviderConnection::Native,
         model: "fixture".into(),
         effort: None,
-        profile: "explore".into(),
+        profile: "review".into(),
         workdir: app_home.clone(),
-        role_payload: serde_json::json!({"prompt":"fixture"}),
+        role_payload: common::role_payload(),
         assets_sha256: digest.parse().expect("asset digest"),
         eligible_accounts: vec![account.parse().expect("account id")],
     };
@@ -165,6 +169,17 @@ fn fixture(account: &str, payload: &[u8]) -> Fixture {
         account: account.parse().expect("account id"),
         payload: payload.to_vec(),
     }
+}
+
+/// Obtains the qualified store root through the real guard qualification
+/// body, with an isolated fixture harness standing in for the native one.
+fn witness(app_home: &Path) -> PathBuf {
+    agent_run_core::supervisor::qualify_shared_root(
+        app_home,
+        &common::launch_plan(Path::new("/usr/bin/true")),
+        None,
+    )
+    .expect("qualified")
 }
 
 /// Restores owner write below one fixture tree so the temporary dir can drop.
@@ -263,6 +278,7 @@ fn cache_only_home_anchor_freeze_pack_collect_lifecycle() {
         &fixture.account,
         &fixture.app_home,
         &fixture.home,
+        &witness(&fixture.app_home),
     )
     .expect("consolidation");
     assert_eq!(
@@ -311,6 +327,7 @@ fn cache_only_home_anchor_freeze_pack_collect_lifecycle() {
         &fixture.account,
         &fixture.app_home,
         &fixture.home,
+        &witness(&fixture.app_home),
     )
     .expect("second consolidation");
     assert_eq!(again.already_frozen, 2, "roots re-verify: {again:?}");
@@ -366,6 +383,7 @@ fn two_homes_share_assets_but_keep_private_state_and_domains_isolate() {
         &first.account,
         &first.app_home,
         &first.home,
+        &witness(&first.app_home),
     )
     .expect("first consolidation");
     let root = runtime_storage::store_root(&first.app_home).unwrap();
@@ -389,6 +407,7 @@ fn two_homes_share_assets_but_keep_private_state_and_domains_isolate() {
         &second.account,
         &first.app_home,
         &second_home,
+        &witness(&first.app_home),
     )
     .expect("second consolidation");
     // Each home switches its own roots; identical content converges on the
@@ -427,6 +446,7 @@ fn two_homes_share_assets_but_keep_private_state_and_domains_isolate() {
         &third.account,
         &first.app_home,
         &third_home,
+        &witness(&first.app_home),
     )
     .expect("third consolidation");
     assert_eq!(
@@ -454,6 +474,7 @@ fn prepare_native_thaws_remote_parents_and_detects_shared_links() {
         &fixture.account,
         &fixture.app_home,
         &fixture.home,
+        &witness(&fixture.app_home),
     )
     .expect("consolidation");
     let root = runtime_storage::store_root(&fixture.app_home).unwrap();
@@ -501,6 +522,7 @@ fn refresh_privatizes_and_repacks_and_journals_recover() {
         &fixture.account,
         &fixture.app_home,
         &fixture.home,
+        &witness(&fixture.app_home),
     )
     .expect("consolidation");
     let root = runtime_storage::store_root(&fixture.app_home).unwrap();
@@ -522,6 +544,7 @@ fn refresh_privatizes_and_repacks_and_journals_recover() {
         &fixture.account,
         &fixture.app_home,
         &fixture.home,
+        &witness(&fixture.app_home),
     )
     .expect("repack");
     assert!(
@@ -539,6 +562,39 @@ fn refresh_privatizes_and_repacks_and_journals_recover() {
     )
     .expect("second freeze of a frozen root verifies instead");
     native_tree_cache::recover(&root, &fixture.home).expect("recover");
+    permit(&root);
+    permit(&fixture.home);
+}
+
+/// A private or cache-only home whose managed map is empty still launches
+/// bound to the shared store whenever it exists: the plan verifies through the
+/// bridge with an empty map and carries the store guard, so the run cannot
+/// write another home's shared objects even though it maps none itself.
+#[test]
+fn private_home_launches_bound_to_the_shared_store() {
+    let fixture = fixture("acct-one", b"bound-launch\n");
+    // The store exists because another home shared its caches.
+    witness(&fixture.app_home);
+    let root = runtime_storage::store_root(&fixture.app_home).unwrap();
+    assert!(root.is_dir());
+
+    // The empty-map binding verifies the home exactly as strictly as private.
+    let assets = agent_run_adapters::provider::SharedLaunchAssets {
+        store_root: root.clone(),
+        roots: BTreeMap::new(),
+    };
+    agent_run_adapters::materialize::verify_with_shared(
+        &fixture.home,
+        fixture.identity.authority.assets_sha256.as_str(),
+        &root,
+        &assets.roots,
+    )
+    .expect("a private home verifies through the empty shared binding");
+
+    // The supervisor binds exactly this asset set whenever the store exists,
+    // so a private or cache-only run is always launched behind the store
+    // guard instead of escaping it; the binding above proves that binding
+    // cannot break a private home's verification.
     permit(&root);
     permit(&fixture.home);
 }

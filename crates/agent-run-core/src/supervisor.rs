@@ -11,7 +11,7 @@ use crate::{
     verify, Error, Result,
 };
 use agent_run_config::role_plan::ResolvedRolePlan;
-use agent_run_domain::catalog::HarnessId;
+use agent_run_domain::catalog::{AccountId, HarnessId};
 use agent_run_platform::{shared_asset_guard::SharedAssetGuard, shared_assets::SharedStoreLock};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde_json::json;
@@ -571,10 +571,31 @@ fn install_shared_assets(
     else {
         return Ok(());
     };
+    qualify_shared_root(app_home, preliminary, codex_grant)?;
+    crate::runtime_storage::install(store, app_home, &layout, Some(owner))
+}
+
+/// Proves this host's real sandbox boundary keeps the shared store read-only
+/// for one frozen launch, and returns the qualified store root as the witness
+/// every publication path must hold.
+///
+/// This is the one qualification body: a Seatbelt sentinel under the
+/// store-wide publish lock that a child can read but not write, plus the
+/// harness's own boundary — for Codex, the grant must keep the store outside
+/// every admitted writable and temporary root and the native sandbox must
+/// prove read-only against a real sentinel; for every other harness the
+/// guarded metadata probe. The returned path is the only root a caller may
+/// publish into: `consolidate` refuses any other, so an unqualified
+/// publication cannot masquerade as a qualified one.
+pub fn qualify_shared_root(
+    app_home: &Path,
+    preliminary: &adapters::provider::ProviderLaunchPlan,
+    codex_grant: Option<&crate::codex::Grant>,
+) -> Result<PathBuf> {
     let root = crate::runtime_storage::store_root(app_home)?;
     fs::private_dir(&root)?;
     // The publisher/GC lock excludes inode changes while sentinels exist and
-    // wrap scans run. Drop it before install, which acquires it internally.
+    // wrap scans run. Drop it before any later step acquires it internally.
     let publish_lock = SharedStoreLock::acquire(&root)?;
     let guard =
         SharedAssetGuard::new(&root).map_err(|error| Error::Unsupported(error.to_string()))?;
@@ -588,8 +609,9 @@ fn install_shared_assets(
             &root,
         )?;
     } else {
+        let version = vec!["--version".to_owned()];
         let argv = guard
-            .wrap(&preliminary.launch.binary, &["--version".into()])
+            .wrap(&preliminary.launch.binary, &version)
             .map_err(|error| Error::Unsupported(error.to_string()))?;
         let mut command = std::process::Command::new(&argv[0]);
         command
@@ -603,7 +625,60 @@ fn install_shared_assets(
         }
     }
     drop(publish_lock);
-    crate::runtime_storage::install(store, app_home, &layout, Some(owner))
+    Ok(root)
+}
+
+/// Qualifies the shared store for one frozen execution's native publication.
+///
+/// Builds the exact launch plan the sealed home would launch with — frozen
+/// configuration and authority, recorded account, host environment — and runs
+/// the real guard qualification against it. A failure means the home stays
+/// private: no anchor, no shared link, nothing published.
+fn qualify_for_native(
+    home: &Path,
+    identity: &ProviderLaunchIdentity,
+    account: &AccountId,
+    runtime_home: &Path,
+    request: &domain::StartRequest,
+) -> Result<PathBuf> {
+    // Native preparation precedes the qualification probes themselves: a
+    // frozen remote plugin parent must be private again before any child —
+    // including a probe child — could write to it.
+    crate::runtime_cache::prepare_native(home, runtime_home)?;
+    let config = &identity.provider_config;
+    let catalog = config.resolve_catalog(Store::open(home)?.list_accounts()?)?;
+    if !config.harnesses.contains_key(&identity.authority.harness) {
+        return Err(invalid("recorded harness is unavailable"));
+    }
+    let host: BTreeMap<String, String> = std::env::vars().collect();
+    let preliminary = adapters::provider::plan_selected_with(
+        config,
+        &catalog,
+        &identity.authority,
+        account,
+        runtime_home,
+        home,
+        &host,
+        &adapters::authorized_request::SystemCredentialReader,
+        identity.provider_request.task.as_str(),
+        None,
+        adapters::provider::LaunchOptions {
+            fast: identity.provider_request.fast,
+            output_schema: identity.provider_request.output_schema.as_ref(),
+        },
+        None,
+    )?;
+    let codex_grant = if identity.authority.harness == HarnessId::Codex {
+        Some(crate::codex::Grant::new(
+            &preliminary.runtime,
+            request,
+            &preliminary.profile,
+            home,
+        )?)
+    } else {
+        None
+    };
+    qualify_shared_root(home, &preliminary, codex_grant.as_ref())
 }
 
 /// The result of one operator-driven relocation of a retained sealed home.
@@ -754,6 +829,10 @@ pub fn consolidate_retained_native(
     let account = store
         .recorded_account(agent)
         .map_err(|error| error.to_string())?;
+    // Native caches publish only behind the same real qualification as a
+    // managed relocation, replayed from the recorded frozen authority.
+    let qualified = qualify_for_native(app_home, &identity, &account, &runtime_home, &row.request)
+        .map_err(|error| error.to_string())?;
     let report = crate::runtime_cache::consolidate(
         store,
         agent,
@@ -761,6 +840,7 @@ pub fn consolidate_retained_native(
         &account,
         app_home,
         &runtime_home,
+        &qualified,
     )
     .map_err(|error| error.to_string())?;
     serde_json::to_value(&report).map_err(|error| error.to_string())
@@ -919,6 +999,13 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         let agent_dir = home.join("agents").join(id.as_str());
         fs::private_dir(&agent_dir)?;
         store.event(id, "phase", &json!({"phase":"preparing"}))?;
+        // Native caches precede every probe and child of this attempt —
+        // including the qualification probes the seal branch runs below:
+        // recover this home's own interrupted native operations, then thaw
+        // every frozen remote plugin parent, because the native store
+        // rewrites those in place and a frozen parent must be private again
+        // before anything can write to it.
+        crate::runtime_cache::prepare_native(home, &runtime_home)?;
         if identity.runtime_home.is_none() {
             let role = ResolvedRolePlan::from_payload(&identity.authority.role_payload)?;
             let (_, digest) = adapters::provider::materialize_selected(
@@ -989,20 +1076,18 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 identity.authority.assets_sha256.as_str(),
             )?;
         }
-        // Native caches precede every child: recover this home's own
-        // interrupted native operations, then thaw every frozen remote plugin
-        // parent — the native store rewrites those in place, so they must be
-        // private again before any invocation that could write, including
-        // probes, explicit resumes and the account-switch loop.
-        crate::runtime_cache::prepare_native(home, &runtime_home)?;
         // A committed shared layout joins the launch plan itself, and its
-        // guard is proven during planning. Anything still pending was either
-        // recovered or refused by the verification above. A cache-only home
-        // maps no managed root yet still reads through its native links, so
-        // it launches behind the same guard.
+        // guard is proven during planning. The guard is global, not per-home:
+        // whenever the shared store exists, every launch is bound to it —
+        // Claude and GLM children are wrapped whole and a Codex grant must
+        // keep the store outside its writable roots — so a private or
+        // cache-only run cannot write another home's shared objects even
+        // though it maps none itself.
         let mut shared_assets = shared_launch_assets(store, home, &runtime_home)?;
-        if shared_assets.is_none() && crate::runtime_cache::holds_shared_links(home, &runtime_home)?
-        {
+        let store_exists = crate::runtime_storage::store_root(home)
+            .map(|root| root.is_dir())
+            .unwrap_or(false);
+        if shared_assets.is_none() && store_exists {
             shared_assets = Some(adapters::provider::SharedLaunchAssets {
                 store_root: crate::runtime_storage::store_root(home)?,
                 roots: BTreeMap::new(),
@@ -1391,14 +1476,22 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             // run, and never changes the model's completion verdict: a
             // failed optional cache step is reported and skipped, never
             // allowed to fail a valid answer or erase valid source data.
-            match crate::runtime_cache::consolidate(
-                store,
-                id,
-                &identity,
-                &account,
-                home,
-                &runtime_home,
-            ) {
+            // Publication happens only behind this host's real guard
+            // qualification, replayed from the frozen plan and account: an
+            // unqualified root leaves the private home exactly as it was.
+            let qualified =
+                qualify_for_native(home, &identity, &account, &runtime_home, &row.request);
+            match qualified.and_then(|root| {
+                crate::runtime_cache::consolidate(
+                    store,
+                    id,
+                    &identity,
+                    &account,
+                    home,
+                    &runtime_home,
+                    &root,
+                )
+            }) {
                 Ok(report)
                     if report.frozen + report.packed + report.already_frozen + report.skipped
                         > 0 =>

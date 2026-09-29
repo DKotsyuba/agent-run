@@ -75,23 +75,30 @@ pub fn native_domain(identity: &ProviderLaunchIdentity, account: &AccountId) -> 
             .as_str()
             .unwrap_or_default()
     );
-    if let Some(harness) = config.harnesses.get(&authority.harness) {
-        preimage.push_str(
-            &String::from_utf8(fs::canonical_json(&serde_json::to_value(
-                &harness.native_settings,
-            )?)?)
-            .map_err(|_| invalid("native settings are not canonical text"))?,
-        );
-    }
-    if let Some(provider) = config.providers.get(&authority.provider) {
-        preimage.push('\n');
-        preimage.push_str(
-            &String::from_utf8(fs::canonical_json(&serde_json::to_value(
-                &provider.connection,
-            )?)?)
-            .map_err(|_| invalid("provider connection is not canonical text"))?,
-        );
-    }
+    // Incomplete frozen evidence is a refusal, never a guessed domain: a
+    // missing harness or provider entry would silently narrow the preimage
+    // and could converge one account's cache onto another's.
+    let harness = config
+        .harnesses
+        .get(&authority.harness)
+        .ok_or_else(|| invalid("frozen harness is unavailable for the native domain"))?;
+    preimage.push_str(
+        &String::from_utf8(fs::canonical_json(&serde_json::to_value(
+            &harness.native_settings,
+        )?)?)
+        .map_err(|_| invalid("native settings are not canonical text"))?,
+    );
+    let provider = config
+        .providers
+        .get(&authority.provider)
+        .ok_or_else(|| invalid("frozen provider is unavailable for the native domain"))?;
+    preimage.push('\n');
+    preimage.push_str(
+        &String::from_utf8(fs::canonical_json(&serde_json::to_value(
+            &provider.connection,
+        )?)?)
+        .map_err(|_| invalid("provider connection is not canonical text"))?,
+    );
     preimage.push('\n');
     preimage.push_str(account.as_str());
     // SAFETY: geteuid only reads kernel credential state and retains nothing.
@@ -178,6 +185,7 @@ pub fn consolidate(
     account: &AccountId,
     app_home: &Path,
     runtime_home: &Path,
+    qualified: &Path,
 ) -> Result<CacheConsolidation> {
     let mut report = CacheConsolidation::default();
     if identity.authority.harness != HarnessId::Codex {
@@ -185,7 +193,11 @@ pub fn consolidate(
         return Ok(report);
     }
     let root = crate::runtime_storage::store_root(app_home)?;
-    fs::private_dir(&root)?;
+    if root != qualified {
+        return Err(invalid(
+            "native cache publication requires the qualified shared store root",
+        ));
+    }
     crate::native_tree_cache::recover(&root, runtime_home)?;
     // The anchor precedes any publication: from here on the registry names
     // this physical home, whatever its agent rows later become.

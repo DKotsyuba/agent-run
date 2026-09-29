@@ -133,6 +133,17 @@ row binding the same digest and refuses a `prepared` row the same way
 `install` does. `plan` still returns `None` for a home with no managed roots,
 so sealing one imposes no needless preflight.
 
+`qualify_shared_root(app_home, preliminary, codex_grant)` is the one guard
+qualification body every publication path holds: the real sentinel probes
+under the store-wide publish lock plus the harness's own boundary (a Codex
+grant keeping the store outside every writable and temporary root, with the
+native sandbox proving read-only, or a guarded metadata probe otherwise). It
+returns the qualified store root, and `runtime_cache::consolidate` publishes
+only into exactly that root — an unqualified publication cannot masquerade as
+a qualified one, and a failed qualification leaves the private home untouched
+with no anchor. Native preparation (journal recovery and remote-parent thaw)
+precedes the probes themselves.
+
 `store_root(app_home)` derives `<canonical app home>/shared-assets/v1`
 read-only. A missing namespace is derived, not created (the launch path may
 create the empty trusted root before guard validation); an existing namespace

@@ -42,10 +42,12 @@ reclaim, writing nothing. `--apply` additionally:
    home whose workdir, binary, grants or sandbox boundary cannot be verified
    is skipped with its reason and preserved byte count;
 4. consolidates each eligible home's native caches under the same locks and
-   the same latest-terminal authority: the home is anchored (cache-only homes
-   included), eligible native trees are frozen and both metadata caches are
-   packed under the compatibility domain derived from the frozen harness,
-   connection and recorded account;
+   the same latest-terminal authority, behind the same real guard
+   qualification as a managed relocation: the home is anchored (cache-only
+   homes included), eligible native trees are frozen and both metadata caches
+   are packed under the compatibility domain derived from the frozen harness,
+   connection and recorded account. A home whose sandbox boundary cannot be
+   proven is skipped with its reason and stays private;
 5. runs one reference-aware collection pass over the shared store.
 
 ## `agent-run storage recover`
