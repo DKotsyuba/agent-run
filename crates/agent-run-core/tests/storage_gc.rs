@@ -1317,6 +1317,125 @@ fn unreadable_home_parent_keeps_row_and_reports_incomplete() {
     permit_tree(&store_root);
 }
 
+/// A live home whose own directory is unreadable keeps its row, its tree,
+/// its payloads and the native object it links: an unreadable live home is
+/// uncertainty, never an unreferenced one, so the pass reports incomplete
+/// evidence and deletes nothing.
+#[test]
+fn unreadable_home_itself_keeps_row_and_all_objects() {
+    let root = TempDir::new().expect("fixture root");
+    let app_home = app(root.path());
+    let mut store = Store::initialize(&app_home).expect("store");
+    let sealed = seal(root.path(), "sealed", b"unreadable-home\n");
+    share(&mut store, &sealed.home, &app_home, &sealed);
+    let root_store = store_root(&app_home);
+    // One native cache object the home references through one exact link.
+    let bytes = b"native-object\n".to_vec();
+    let object = root_store
+        .join("native-cache")
+        .join(scope())
+        .join(fs::sha256(&bytes));
+    stdfs::create_dir_all(object.parent().expect("native scope")).expect("native scope");
+    stdfs::write(&object, &bytes).expect("native object");
+    stdfs::set_permissions(&object, stdfs::Permissions::from_mode(0o400)).expect("object mode");
+    let cache = sealed
+        .home
+        .join(agent_run_core::native_cache::TOOLS_CACHE_DIR);
+    stdfs::create_dir_all(&cache).expect("home cache dir");
+    std::os::unix::fs::symlink(&object, cache.join(format!("{:040x}.json", 7)))
+        .expect("exact native link");
+    // The home itself — not its parent — becomes unreadable.
+    stdfs::set_permissions(&sealed.home, stdfs::Permissions::from_mode(0o000)).expect("sealed");
+    let outcome = storage_gc::sweep(&mut store, &app_home, Mode::Apply).expect("pass");
+    stdfs::set_permissions(&sealed.home, stdfs::Permissions::from_mode(0o700)).expect("restored");
+    assert!(
+        outcome.incomplete,
+        "an unreadable live home is reported: {outcome:?}"
+    );
+    assert_eq!(outcome.removed(), 0, "nothing may be deleted: {outcome:?}");
+    assert_eq!(
+        outcome.rows_removed, 0,
+        "a live home keeps its row: {outcome:?}"
+    );
+    assert!(object.is_file(), "the linked native object is retained");
+    assert_eq!(
+        names(&root_store, "trees").len(),
+        1,
+        "the home's tree is retained"
+    );
+    assert_eq!(
+        names(&root_store, "blobs").len(),
+        2,
+        "the home's payloads are retained"
+    );
+    permit_tree(&root_store);
+}
+
+/// A prepared row whose physical home is missing still pins what it names:
+/// the row is kept and the imported tree and payloads stay. The pass itself
+/// completes — an absent home holds no native references — so retention is
+/// proven by the pin, not by an aborted pass.
+#[test]
+fn prepared_row_pins_even_when_physical_home_is_missing() {
+    let root = TempDir::new().expect("fixture root");
+    let app_home = app(root.path());
+    let mut store = Store::initialize(&app_home).expect("store");
+    let interrupted = seal(root.path(), "interrupted", b"prepared-pin\n");
+    let layout = runtime_storage::plan(
+        &store,
+        &app_home,
+        &interrupted.home,
+        &interrupted.index_sha256,
+        &scope(),
+    )
+    .expect("plan")
+    .expect("managed roots");
+    let manifest = layout.roots["skills/demo"].manifest_sha256.clone();
+    let fault = |_: StorageFault| -> agent_run_domain::Result<()> {
+        Err(agent_run_domain::Error::Validation(
+            "simulated crash".into(),
+        ))
+    };
+    runtime_storage::install_with_fault(&mut store, &app_home, &layout, None, Some(&fault))
+        .expect_err("crash before commit");
+    let pending_home = interrupted.home.canonicalize().expect("canonical home");
+    let state = store
+        .runtime_storage_layout(&pending_home.to_string_lossy())
+        .expect("row")
+        .expect("present")
+        .state;
+    assert_eq!(state, LayoutState::Prepared);
+    permit_tree(&pending_home);
+    stdfs::remove_dir_all(&pending_home).expect("physical home gone");
+    let root_store = store_root(&app_home);
+    let outcome = storage_gc::sweep(&mut store, &app_home, Mode::Apply).expect("pass");
+    assert!(
+        !outcome.incomplete,
+        "the pin, not an aborted pass, retains: {outcome:?}"
+    );
+    assert_eq!(
+        outcome.removed(),
+        0,
+        "a prepared row pins everything: {outcome:?}"
+    );
+    assert_eq!(
+        outcome.rows_removed, 0,
+        "the prepared row is retained: {outcome:?}"
+    );
+    assert!(
+        names(&root_store, "trees")
+            .iter()
+            .any(|name| name.ends_with(&manifest)),
+        "the pinned tree stays"
+    );
+    assert_eq!(
+        names(&root_store, "blobs").len(),
+        2,
+        "the pinned payloads stay"
+    );
+    permit_tree(&root_store);
+}
+
 /// A staging orphan a dead process left half drained is finished by a later
 /// pass on a freshly opened store; the object was already renamed out of its
 /// canonical name before the first byte was unlinked.

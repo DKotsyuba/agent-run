@@ -760,9 +760,25 @@ async fn managed_services_real_codegraph_qualification() {
 /// [`home`] plus `extra` TOML appended to the config (more bindings,
 /// providers, or core caps) and more enabled fake-token accounts.
 fn home_with(extra: &str, accounts: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
+    home_in(
+        std::env::var_os("AGENT_RUN_TEST_TMP").unwrap_or_else(|| "/tmp".into()),
+        extra,
+        accounts,
+    )
+}
+
+/// [`home_with`] below `base` instead of the temporary root. Every launch is
+/// bound to the shared store below the home, and a Codex grant refuses a
+/// store inside any temporary root its native sandbox may write, so Codex
+/// fixtures live under Cargo's per-target directory instead.
+fn home_in(
+    base: impl AsRef<Path>,
+    extra: &str,
+    accounts: &[&str],
+) -> (tempfile::TempDir, std::path::PathBuf) {
     let temp = tempfile::Builder::new()
         .prefix("ar-provider-")
-        .tempdir_in(std::env::var_os("AGENT_RUN_TEST_TMP").unwrap_or_else(|| "/tmp".into()))
+        .tempdir_in(base)
         .unwrap();
     let root = temp.path().canonicalize().unwrap();
     agent_run::fs::private_dir(&root).unwrap();
@@ -2482,7 +2498,7 @@ fn codex_home_with(auth: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
             "[[providers.codex-user.bindings]]\nlabel = \"{label}\"\naccount = \"acct-cx-{label}\"\n"
         ));
     }
-    let (temp, home) = home_with(&extra, &[]);
+    let (temp, home) = home_in(env!("CARGO_TARGET_TMPDIR"), &extra, &[]);
     let mut store = Store::open(&home).unwrap();
     for (label, content) in labels.into_iter().zip(auth.iter().copied()) {
         let account = format!("acct-cx-{label}");
@@ -4200,4 +4216,145 @@ async fn narrow_window_exhaustion_is_not_carried_into_other_models() {
         100,
     );
     assert!(candidate_accounts(&home, "fixture").contains(&"acct-work".to_owned()));
+}
+
+/// Every Claude/GLM launch is bound to the shared store even before anything
+/// was ever published: the supervisor creates the empty trusted store before
+/// the child exists, so an object another run publishes while this private
+/// run is already live stays read-only to it. The object is owner-writable,
+/// so the denial is the launch guard, never a file mode. With the store then
+/// present, a second independent start prepares its still-absent fresh home
+/// and a resume prepares its retained one.
+#[tokio::test]
+async fn private_launch_is_guarded_before_the_first_publication() {
+    use std::{io::Write, os::unix::fs::PermissionsExt};
+    let (_temp, home) = home();
+    let store_root = home.join("shared-assets/v1");
+    assert!(
+        !home.join("shared-assets").exists(),
+        "nothing is shared before the first launch"
+    );
+    let service = Service::new(home.clone());
+    let mut first = request(&home);
+    first.task = "fixture:shared-write".into();
+    let admitted = service
+        .admit_provider_trusted(first, candidates(committed(&home)))
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    let mut child = supervisor(&home, &id);
+    // The launch itself creates the store; publish only after that, while the
+    // already-running child waits for the object.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !store_root.is_dir() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the launch creates the trusted store before its child");
+    let object = store_root.join("fixture-published");
+    fs::write(&object, b"original").unwrap();
+    fs::set_permissions(&object, fs::Permissions::from_mode(0o600)).unwrap();
+    let exit = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(exit.success(), "supervisor exit: {exit}");
+    assert_eq!(
+        Store::open(&home).unwrap().get(&id).unwrap().status,
+        Status::Succeeded
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(home.join("shared-write.json")).unwrap()).unwrap();
+    assert_eq!(
+        report,
+        serde_json::json!({
+            "present": true, "write_denied": true, "chmod_denied": true, "create_denied": true,
+        }),
+        "the live private child cannot change a later publication"
+    );
+    assert_eq!(fs::read(&object).unwrap(), b"original");
+    assert_eq!(
+        fs::metadata(&object).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(!store_root.join("fixture-injected").exists());
+    // Outside the guard the same object is writable: the denial was the guard.
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&object)
+        .unwrap()
+        .write_all(b"!")
+        .unwrap();
+
+    // A second independent start with the store present: its fresh home is
+    // absent until sealed and prepares instead of failing native recovery.
+    let second = request_for(&home, "glm-user", "provider-2", Some("work"));
+    let admitted = service
+        .admit_provider_trusted(second, candidates(committed(&home)))
+        .unwrap();
+    let second_id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    run_to_end(&home, &second_id).await;
+    let second_row = Store::open(&home).unwrap().get(&second_id).unwrap();
+    assert_eq!(second_row.status, Status::Succeeded);
+
+    // A resume prepares the retained home it shares with its parent.
+    let orchestrator: agent_run::domain::OrchestratorRef = serde_json::from_value(
+        serde_json::json!({"transport":"fixture","external_session_id":"test-session"}),
+    )
+    .unwrap();
+    let resumed = service
+        .admit_provider_resume(
+            &second_row,
+            "fixture:answer".into(),
+            None,
+            Some("resume-1".into()),
+            Some(orchestrator),
+        )
+        .unwrap();
+    let resumed_id: AgentId = serde_json::from_value(resumed["agent_id"].clone()).unwrap();
+    run_to_end(&home, &resumed_id).await;
+    assert_eq!(
+        Store::open(&home).unwrap().get(&resumed_id).unwrap().status,
+        Status::Succeeded
+    );
+}
+
+/// A Codex run whose role carries a managed skill is materialized, relocated
+/// into the shared store behind the real qualification, launched through its
+/// committed registry mapping, and after cleanup still consolidates its native
+/// caches: the post-cleanup qualification plans through that same verified
+/// mapping instead of the strict private verifier, which rejects the managed
+/// link and would silently skip every managed-role home.
+#[tokio::test]
+async fn managed_codex_home_consolidates_through_its_registry_mapping() {
+    let (_temp, home) = codex_home_with(&["ok"]);
+    fs::write(home.join("profiles/review.md"),
+        "+++\nrevision = \"1\"\nwrite = false\nnetwork = false\nallow_external_read_roots = false\nskills = [\"demo\"]\nmcp = []\nrequired_constraints = []\n+++\nReview safely.\n").unwrap();
+    fs::create_dir_all(home.join("skills/demo")).unwrap();
+    fs::write(
+        home.join("skills/demo/SKILL.md"),
+        "# demo\nManaged fixture skill.\n",
+    )
+    .unwrap();
+    let id = codex_run(&home, "managed-1", None).await;
+    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    assert_eq!(row.status, Status::Succeeded, "{:?}", row.failure_text);
+    let runtime_home = std::path::PathBuf::from(
+        row.identity.as_ref().unwrap()["runtime_home"]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(
+        runtime_home.join("skills/demo").is_symlink(),
+        "the managed skill was relocated into the shared store"
+    );
+    let events = |kind: &str| {
+        count(
+            &home,
+            &format!("SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='{kind}'"),
+            &id,
+        )
+    };
+    assert_eq!(events("native_cache_consolidation_skipped"), 0);
+    assert_eq!(events("native_cache_consolidated"), 1);
 }

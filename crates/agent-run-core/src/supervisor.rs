@@ -634,7 +634,8 @@ pub fn qualify_shared_root(
 /// configuration and authority, recorded account, host environment — and runs
 /// the real guard qualification against it. A failure means the home stays
 /// private: no anchor, no shared link, nothing published.
-fn qualify_for_native(
+pub fn qualify_for_native(
+    store: &Store,
     home: &Path,
     identity: &ProviderLaunchIdentity,
     account: &AccountId,
@@ -644,12 +645,17 @@ fn qualify_for_native(
     // Native preparation precedes the qualification probes themselves: a
     // frozen remote plugin parent must be private again before any child —
     // including a probe child — could write to it.
-    crate::runtime_cache::prepare_native(home, runtime_home)?;
+    crate::runtime_cache::prepare_native(home, runtime_home, true)?;
     let config = &identity.provider_config;
-    let catalog = config.resolve_catalog(Store::open(home)?.list_accounts()?)?;
+    let catalog = config.resolve_catalog(store.list_accounts()?)?;
     if !config.harnesses.contains_key(&identity.authority.harness) {
         return Err(invalid("recorded harness is unavailable"));
     }
+    // An already-shared managed home is planned through its verified
+    // committed registry mapping, exactly as it launches: the strict private
+    // verifier would reject its managed links and silently skip every
+    // managed-role home's native consolidation.
+    let shared = shared_launch_assets(store, home, runtime_home)?;
     let host: BTreeMap<String, String> = std::env::vars().collect();
     let preliminary = adapters::provider::plan_selected_with(
         config,
@@ -666,7 +672,7 @@ fn qualify_for_native(
             fast: identity.provider_request.fast,
             output_schema: identity.provider_request.output_schema.as_ref(),
         },
-        None,
+        shared.as_ref(),
     )?;
     let codex_grant = if identity.authority.harness == HarnessId::Codex {
         Some(crate::codex::Grant::new(
@@ -831,8 +837,15 @@ pub fn consolidate_retained_native(
         .map_err(|error| error.to_string())?;
     // Native caches publish only behind the same real qualification as a
     // managed relocation, replayed from the recorded frozen authority.
-    let qualified = qualify_for_native(app_home, &identity, &account, &runtime_home, &row.request)
-        .map_err(|error| error.to_string())?;
+    let qualified = qualify_for_native(
+        store,
+        app_home,
+        &identity,
+        &account,
+        &runtime_home,
+        &row.request,
+    )
+    .map_err(|error| error.to_string())?;
     let report = crate::runtime_cache::consolidate(
         store,
         agent,
@@ -893,6 +906,31 @@ fn private_managed_bytes(home: &Path) -> u64 {
         Ok(dir) => walk(&dir, &mut BTreeMap::new(), &mut 4096),
         Err(_) => 0,
     }
+}
+
+/// Returns the shared placement every harness launch is bound to.
+///
+/// The trusted store namespace is created empty when absent, so protection
+/// exists before the first publication and creation order cannot leave a
+/// private run unguarded while another later shares objects. The roots are
+/// the home's verified committed registry mapping when one exists — a
+/// still-prepared row is an explicit refusal — and an empty map otherwise:
+/// the launch still verifies through the shared bridge and the store stays
+/// outside every writable root the child is granted.
+pub fn launch_shared_assets(
+    store: &Store,
+    app_home: &Path,
+    runtime_home: &Path,
+) -> Result<adapters::provider::SharedLaunchAssets> {
+    let root = crate::runtime_storage::store_root(app_home)?;
+    fs::private_dir(&root)?;
+    let roots = shared_launch_assets(store, app_home, runtime_home)?
+        .map(|assets| assets.roots)
+        .unwrap_or_default();
+    Ok(adapters::provider::SharedLaunchAssets {
+        store_root: root,
+        roots,
+    })
 }
 
 /// Returns the committed shared placement of one sealed home for its launch
@@ -1005,7 +1043,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         // every frozen remote plugin parent, because the native store
         // rewrites those in place and a frozen parent must be private again
         // before anything can write to it.
-        crate::runtime_cache::prepare_native(home, &runtime_home)?;
+        crate::runtime_cache::prepare_native(home, &runtime_home, identity.runtime_home.is_some())?;
         if identity.runtime_home.is_none() {
             let role = ResolvedRolePlan::from_payload(&identity.authority.role_payload)?;
             let (_, digest) = adapters::provider::materialize_selected(
@@ -1076,23 +1114,16 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 identity.authority.assets_sha256.as_str(),
             )?;
         }
-        // A committed shared layout joins the launch plan itself, and its
-        // guard is proven during planning. The guard is global, not per-home:
-        // whenever the shared store exists, every launch is bound to it —
-        // Claude and GLM children are wrapped whole and a Codex grant must
-        // keep the store outside its writable roots — so a private or
-        // cache-only run cannot write another home's shared objects even
-        // though it maps none itself.
-        let mut shared_assets = shared_launch_assets(store, home, &runtime_home)?;
-        let store_exists = crate::runtime_storage::store_root(home)
-            .map(|root| root.is_dir())
-            .unwrap_or(false);
-        if shared_assets.is_none() && store_exists {
-            shared_assets = Some(adapters::provider::SharedLaunchAssets {
-                store_root: crate::runtime_storage::store_root(home)?,
-                roots: BTreeMap::new(),
-            });
-        }
+        // The guard is global and creation-order safe, not per-home: the
+        // trusted store namespace is ensured before every harness launch and
+        // every launch is bound to it — Claude and GLM children are wrapped
+        // whole and a Codex grant must keep the store outside its writable
+        // roots — so a private run started before anything was published
+        // cannot write objects a later run shares, even though it maps none
+        // itself. A committed shared layout joins the plan through its
+        // verified registry mapping; anything still pending was recovered or
+        // refused above.
+        let shared_assets = launch_shared_assets(store, home, &runtime_home)?;
         if store.cancel_pending(id)? {
             if !store.provider_never_spawned(id)? {
                 return Err(invalid("provider attempt was already spawning"));
@@ -1128,18 +1159,16 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 fast: identity.provider_request.fast,
                 output_schema: identity.provider_request.output_schema.as_ref(),
             },
-            shared_assets.as_ref(),
+            Some(&shared_assets),
         )?;
         // Codex keeps its original managed profile and its own nested
         // sandbox, so the app-server is never wrapped: the shared store must
         // instead stay provably outside every root that profile can write and
         // outside the temporary directories the native sandbox grants. The
         // live app-server grant echo is still verified in the runner.
-        if let Some(assets) = &shared_assets {
-            if identity.authority.harness == HarnessId::Codex {
-                crate::codex::Grant::new(&planned.runtime, &row.request, &planned.profile, home)?
-                    .admits_shared_root(&assets.store_root)?;
-            }
+        if identity.authority.harness == HarnessId::Codex {
+            crate::codex::Grant::new(&planned.runtime, &row.request, &planned.profile, home)?
+                .admits_shared_root(&shared_assets.store_root)?;
         }
         if planned.role.worker_mcp {
             // This attempt-only capability is never part of the sealed home or
@@ -1469,7 +1498,9 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             domain::now(),
             verify::DEFAULT_SILENCE_THRESHOLD_SECONDS,
         )?;
-        if cleanup.confirmed {
+        // Only the Codex harness has native caches; qualifying any other
+        // harness would only probe for a no-op publication.
+        if cleanup.confirmed && identity.authority.harness == HarnessId::Codex {
             // The destination is still exclusively owned: resume admission
             // cannot observe it as terminal until the following store.finish.
             // Consolidation covers every terminal outcome and every resumed
@@ -1479,8 +1510,14 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             // Publication happens only behind this host's real guard
             // qualification, replayed from the frozen plan and account: an
             // unqualified root leaves the private home exactly as it was.
-            let qualified =
-                qualify_for_native(home, &identity, &account, &runtime_home, &row.request);
+            let qualified = qualify_for_native(
+                store,
+                home,
+                &identity,
+                &account,
+                &runtime_home,
+                &row.request,
+            );
             match qualified.and_then(|root| {
                 crate::runtime_cache::consolidate(
                     store,

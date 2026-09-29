@@ -626,6 +626,12 @@ pub fn plan_selected_with(
                 )?);
                 sealed.binary.clone()
             } else {
+                // The wrapper itself always spawns, so an absent harness is
+                // refused here, before any child exists, exactly as the
+                // unwrapped spawn would refuse it.
+                if !std::fs::metadata(&sealed.binary)?.is_file() {
+                    return Err(invalid("sealed harness binary is not a file"));
+                }
                 // Import and GC use the same lock; the whole-child wrapper
                 // scans one stable store state.
                 let _publish_lock = SharedStoreLock::acquire(&assets.store_root)?;

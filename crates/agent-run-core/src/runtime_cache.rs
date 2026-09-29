@@ -113,16 +113,38 @@ pub fn native_domain(identity: &ProviderLaunchIdentity, account: &AccountId) -> 
 /// parent must be private again before any child exists: this runs before
 /// every attempt, including probes, explicit resumes and the account-switch
 /// loop. The generated skills tree keeps its link — native discovery reads
-/// through it and a marker upgrade replaces the private link itself. A home
-/// with no store root, or no native caches yet, is a cheap no-op; a failure
-/// is returned so the caller can refuse to launch shared data unprotected
-/// rather than fall back silently.
-pub fn prepare_native(app_home: &Path, runtime_home: &Path) -> Result<usize> {
-    let root = match crate::runtime_storage::store_root(app_home) {
-        Ok(root) if root.is_dir() => root,
+/// through it and a marker upgrade replaces the private link itself.
+///
+/// `retained` distinguishes the two ways a home can be absent: a genuinely
+/// new execution whose home is not sealed yet has nothing to recover, while a
+/// home a frozen identity already recorded must exist — its absence is an
+/// error, never a silent empty pass. Only a plain `NotFound` store root means
+/// nothing was ever shared; everything else that cannot be read — a corrupt
+/// or aliased store root, permission, I/O, a foreign ancestor — propagates,
+/// so the caller refuses to launch shared data unprotected instead of falling
+/// back silently.
+pub fn prepare_native(app_home: &Path, runtime_home: &Path, retained: bool) -> Result<usize> {
+    let root = crate::runtime_storage::store_root(app_home)?;
+    match std::fs::symlink_metadata(&root) {
         // Nothing is shared yet: no native publication ever ran.
-        _ => return Ok(0),
-    };
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+        // `store_root` already proved an existing root a real directory.
+        Ok(_) => {}
+    }
+    match fs::Dir::open(runtime_home) {
+        Ok(_) => {}
+        Err(error) if not_found(&error) => {
+            if retained {
+                return Err(invalid(
+                    "a sealed runtime home is missing; recover it before launching",
+                ));
+            }
+            // A fresh execution's home does not exist until it is sealed.
+            return Ok(0);
+        }
+        Err(error) => return Err(error),
+    }
     crate::native_tree_cache::recover(&root, runtime_home)?;
     let mut thawed = 0;
     for root_key in plugin_parents(runtime_home)? {
@@ -133,34 +155,77 @@ pub fn prepare_native(app_home: &Path, runtime_home: &Path) -> Result<usize> {
     Ok(thawed)
 }
 
+/// Returns `true` only for a plain `NotFound`.
+fn not_found(error: &agent_run_domain::Error) -> bool {
+    matches!(
+        error,
+        agent_run_domain::Error::Io(inner)
+            if inner.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// Returns `true` for an entry that can never be a frozen parent or its
+/// market: a regular file such as native metadata, or a name that raced away.
+///
+/// A directory, a link or a special entry returns `false` so the caller
+/// classifies it or fails on it; any other error propagates.
+fn ordinary_file(directory: &fs::Dir, name: &Path) -> Result<bool> {
+    match directory.entry_type(name) {
+        Ok(fs::EntryType::File) => Ok(true),
+        Ok(_) => Ok(false),
+        Err(error) if not_found(&error) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
 /// Lists the home-relative remote plugin parents that exist right now.
 ///
-/// Only immediate `<market>/<plugin>` children of the native plugin cache are
-/// candidates, and the managed `personal` marketplace is never one: its
-/// parents are managed plugin views, not native caches.
+/// Only immediate `<market>/<plugin>` children of the native plugin cache
+/// that classify as remote plugin parents are candidates: an ordinary private
+/// directory this system never froze — including names outside the safe
+/// identity charset — is left untouched and never blocks a launch. The
+/// managed `personal` marketplace is never a candidate: its parents are
+/// managed plugin views, not native caches, and an ordinary regular file at
+/// either level is native metadata, never a parent. Only a plain `NotFound` means
+/// "nothing here": an unreadable home, cache, market or any other error is
+/// returned, because uncertainty about a frozen parent must not become a
+/// silent skip.
 fn plugin_parents(runtime_home: &Path) -> Result<Vec<String>> {
     let home = match fs::Dir::open(runtime_home) {
         Ok(home) => home,
-        Err(_) => return Ok(Vec::new()),
+        Err(error) if not_found(&error) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     };
     let cache = match home.subdir(Path::new(PLUGIN_CACHE)) {
         Ok(cache) => cache,
-        Err(_) => return Ok(Vec::new()),
+        Err(error) if not_found(&error) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     };
     let mut roots = Vec::new();
     for market in cache.list(None)? {
         let market = market.to_string_lossy().into_owned();
-        if market == MANAGED_MARKET {
+        if market == MANAGED_MARKET || ordinary_file(&cache, Path::new(&market))? {
             continue;
         }
-        let Some(market_dir) = cache.subdir(Path::new(&market)).ok() else {
-            continue;
+        let market_dir = match cache.subdir(Path::new(&market)) {
+            // A listed name that no longer opens as a directory raced away.
+            Err(error) if not_found(&error) => continue,
+            Err(error) => return Err(error),
+            Ok(directory) => directory,
         };
         for plugin in market_dir.list(None)? {
-            roots.push(format!(
-                "{PLUGIN_CACHE}/{market}/{}",
-                plugin.to_string_lossy()
-            ));
+            if ordinary_file(&market_dir, Path::new(&plugin))? {
+                continue;
+            }
+            let root_key = format!("{PLUGIN_CACHE}/{market}/{}", plugin.to_string_lossy());
+            // Only a proven remote-plugin parent is a thaw candidate; an
+            // unsupported or unsafe private name stays exactly as it is.
+            if matches!(
+                crate::native_tree_cache::classify(&root_key),
+                Ok(crate::native_tree_cache::NativeCacheKind::RemotePluginParent)
+            ) {
+                roots.push(root_key);
+            }
         }
     }
     Ok(roots)

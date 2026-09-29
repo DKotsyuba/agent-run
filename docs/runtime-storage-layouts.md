@@ -142,7 +142,20 @@ returns the qualified store root, and `runtime_cache::consolidate` publishes
 only into exactly that root — an unqualified publication cannot masquerade as
 a qualified one, and a failed qualification leaves the private home untouched
 with no anchor. Native preparation (journal recovery and remote-parent thaw)
-precedes the probes themselves.
+precedes the probes themselves. An already-shared managed home is planned for
+qualification through its verified committed registry mapping, exactly as it
+launches, never through the strict private verifier that rejects its links.
+
+Every harness launch — first attempt, account switch and resume, private or
+shared — is bound to the store: `launch_shared_assets` creates the empty
+trusted root when absent and plans with the home's committed mapping or an
+empty map, so Claude and GLM children are wrapped whole and a Codex grant must
+keep the store outside its writable and temporary roots. A run started before
+the first publication is therefore already guarded when another run later
+publishes. Native preparation distinguishes a fresh execution's not-yet-sealed
+home (nothing to recover) from a recorded home that is missing (a refusal);
+only a plain `NotFound` store root, home or plugin cache means empty, and an
+ordinary private plugin-cache entry that never froze is left alone.
 
 `store_root(app_home)` derives `<canonical app home>/shared-assets/v1`
 read-only. A missing namespace is derived, not created (the launch path may
@@ -236,7 +249,8 @@ busy publisher defers the pass instead of stalling the broker behind an
 import or a native preflight) and re-derives every reference while holding
 it, before unlinking anything:
 
-- every registered row — `prepared` always pins what it names; `committed`
+- every registered row — `prepared` always pins what it names, even while its
+  physical home is absent; `committed`
   pins while its physical home exists;
 - the bounded storage-protection snapshot of frozen identities, frozen and
   current configuration, credentials and not-conclusively-released service
@@ -256,7 +270,8 @@ reports `incomplete`. A retained tree's reference proof is the store's own
 full verifier (topology, hardlink identity, content), never a bare manifest
 read: a manifest that parses but was replaced lists no payloads and would
 fabricate an empty reference set. A pinned tree missing from the scan, an
-unverifiable tree, a foreign name inside a namespace, an unresolvable home or
+unverifiable tree, a foreign name inside a namespace, an unresolvable home, a
+live home whose directory cannot be opened, or
 an unreadable current configuration each stop destructive work for the pass.
 Blobs are collected only after one pass enumerated every remaining tree, and
 only canonical payload names (`<digest>-600`/`<700>`) are candidates — any

@@ -487,7 +487,8 @@ fn prepare_native_thaws_remote_parents_and_detects_shared_links() {
         "a cache-only home still reads through shared links"
     );
 
-    let thawed = runtime_cache::prepare_native(&fixture.app_home, &fixture.home).expect("prepare");
+    let thawed =
+        runtime_cache::prepare_native(&fixture.app_home, &fixture.home, true).expect("prepare");
     assert_eq!(thawed, 1, "exactly the remote parent thaws");
     let parent = fixture.home.join("plugins/cache/remote/fixture-plugin");
     assert!(!parent.is_symlink(), "the parent is private again");
@@ -501,7 +502,7 @@ fn prepare_native_thaws_remote_parents_and_detects_shared_links() {
     );
     // The second call is a no-op: nothing frozen remains to thaw.
     assert_eq!(
-        runtime_cache::prepare_native(&fixture.app_home, &fixture.home).unwrap(),
+        runtime_cache::prepare_native(&fixture.app_home, &fixture.home, true).unwrap(),
         0
     );
     permit(&root);
@@ -566,10 +567,10 @@ fn refresh_privatizes_and_repacks_and_journals_recover() {
     permit(&fixture.home);
 }
 
-/// A private or cache-only home whose managed map is empty still launches
-/// bound to the shared store whenever it exists: the plan verifies through the
-/// bridge with an empty map and carries the store guard, so the run cannot
-/// write another home's shared objects even though it maps none itself.
+/// A private or cache-only home verifies through the shared bridge with an
+/// empty map exactly as strictly as a private home, which binding every
+/// launch to the store requires. The launch-time denial itself is witnessed
+/// through the real supervisor in the `agent-run` crate's provider tests.
 #[test]
 fn private_home_launches_bound_to_the_shared_store() {
     let fixture = fixture("acct-one", b"bound-launch\n");
@@ -591,10 +592,90 @@ fn private_home_launches_bound_to_the_shared_store() {
     )
     .expect("a private home verifies through the empty shared binding");
 
-    // The supervisor binds exactly this asset set whenever the store exists,
-    // so a private or cache-only run is always launched behind the store
-    // guard instead of escaping it; the binding above proves that binding
-    // cannot break a private home's verification.
     permit(&root);
+    permit(&fixture.home);
+}
+
+/// A genuinely new execution's absent home is not an error, while a home a
+/// frozen identity already recorded must exist: only the latter refuses.
+#[test]
+fn absent_home_distinguishes_new_from_retained() {
+    let fixture = fixture("acct-one", b"absent\n");
+    let witness_root = runtime_storage::store_root(&fixture.app_home).unwrap();
+    stdfs::create_dir_all(&witness_root).expect("store exists");
+    let absent = fixture
+        .app_home
+        .join("runs")
+        .join("ag-20260101-000000-9999999999");
+    // New execution: nothing sealed yet, home not created yet.
+    assert_eq!(
+        runtime_cache::prepare_native(&fixture.app_home, &absent, false).unwrap(),
+        0,
+        "a new home has nothing to recover"
+    );
+    // Retained: a frozen identity recorded this home; its absence is an error.
+    let error = runtime_cache::prepare_native(&fixture.app_home, &absent, true).unwrap_err();
+    assert!(
+        error.to_string().contains("sealed runtime home is missing"),
+        "{error}"
+    );
+    permit(&witness_root);
+}
+
+/// Ordinary private names this system never froze never block a launch, while
+/// an unreadable or foreign ancestor is an explicit error, never a silent
+/// skip that could thaw nothing.
+#[test]
+fn unsupported_names_skip_but_uncertainty_errors() {
+    let fixture = fixture("acct-one", b"names\n");
+    let mut store = Store::initialize(&fixture.app_home).expect("store");
+    runtime_cache::consolidate(
+        &mut store,
+        &"ag-20260101-000000-0000000001".parse().unwrap(),
+        &fixture.identity,
+        &fixture.account,
+        &fixture.app_home,
+        &fixture.home,
+        &witness(&fixture.app_home),
+    )
+    .expect("consolidation");
+
+    // An ordinary private directory with a space in its name, beside the
+    // frozen parent: never a thaw candidate, never a launch failure.
+    let odd = fixture.home.join("plugins/cache/downloads/my cache dir");
+    stdfs::create_dir_all(&odd).expect("ordinary name");
+    // Ordinary metadata files at the cache and market levels are never
+    // parents and never block a launch either.
+    stdfs::write(fixture.home.join("plugins/cache/.DS_Store"), b"meta").expect("cache file");
+    stdfs::write(fixture.home.join("plugins/cache/remote/.DS_Store"), b"meta")
+        .expect("market file");
+    assert_eq!(
+        runtime_cache::prepare_native(&fixture.app_home, &fixture.home, true).unwrap(),
+        1,
+        "only the frozen remote parent thaws"
+    );
+    assert!(odd.is_dir(), "the ordinary name is untouched");
+
+    // An unreadable market directory is uncertainty: propagate, do not skip.
+    let market = fixture.home.join("plugins/cache/remote");
+    stdfs::set_permissions(&market, stdfs::Permissions::from_mode(0o000)).expect("sealed");
+    let error = runtime_cache::prepare_native(&fixture.app_home, &fixture.home, true).unwrap_err();
+    stdfs::set_permissions(&market, stdfs::Permissions::from_mode(0o755)).expect("unsealed");
+    assert!(
+        error.to_string().contains("denied") || error.to_string().contains("Permission"),
+        "the unreadable ancestor propagates: {error}"
+    );
+
+    // A foreign symlink in place of a market is never silently skipped.
+    let outside = fixture.app_home.join("outside");
+    stdfs::create_dir_all(&outside).expect("outside");
+    let symlinked = fixture.home.join("plugins/cache/linked");
+    std::os::unix::fs::symlink(&outside, &symlinked).expect("foreign market");
+    let error = runtime_cache::prepare_native(&fixture.app_home, &fixture.home, true).unwrap_err();
+    assert!(
+        error.to_string().contains("directory") || error.to_string().contains("link"),
+        "a foreign ancestor propagates: {error}"
+    );
+    permit(&runtime_storage::store_root(&fixture.app_home).unwrap());
     permit(&fixture.home);
 }

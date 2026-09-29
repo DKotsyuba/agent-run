@@ -403,15 +403,21 @@ struct References {
 /// every extant row pins, removing the committed rows whose home is
 /// conclusively gone and unreferenced.
 ///
-/// A `prepared` row always pins what it names, whatever the filesystem says.
-/// A `committed` row pins while its physical home exists; the home counts as
-/// gone only on a plain `NotFound` resolution — a permission error, an I/O
-/// error, a wrong entry type or an alias keeps the row and marks the census
-/// incomplete. The census is all-or-nothing: a page that fails, or a registry
-/// beyond the page bound, returns an error so **no** candidate of any kind is
-/// deleted from partial evidence. Rows are removed only in [`Mode::Apply`];
-/// the store's own removal additionally refuses while any agent identity
-/// still binds the home, which is authoritative.
+/// A `prepared` row always pins what it names, whatever the filesystem says,
+/// and never ages out — even while its physical home is absent. A `committed`
+/// row pins while its physical home exists; the home counts as gone only on a
+/// plain `NotFound` resolution — a permission error, an I/O error, a wrong
+/// entry type or an alias keeps the row and marks the census incomplete. A
+/// live row whose observed resolution cannot open its home is retained whole:
+/// its recorded references stay in the census, its row stays in the registry,
+/// and an error is returned so no destructive pass of any kind runs — the
+/// native and journal references inside an unreadable home are unprovable, so
+/// an unreadable live home is uncertainty, never an empty reference set. The
+/// census is all-or-nothing: a page that fails, or a registry beyond the page
+/// bound, returns an error so **no** candidate of any kind is deleted from
+/// partial evidence. Rows are removed only in [`Mode::Apply`]; the store's own
+/// removal additionally refuses while any agent identity still binds the
+/// home, which is authoritative.
 fn registered_references(
     store: &mut Store,
     protected: &[PathBuf],
@@ -425,6 +431,9 @@ fn registered_references(
         extant_homes: Vec::new(),
     };
     let mut removable = Vec::new();
+    // Set when a live home exists but cannot be opened: its native references
+    // are unprovable, so the whole census is withheld after every row pinned.
+    let mut unreadable_live_home = false;
     let mut after: Option<String> = None;
     let mut pages = 0;
     loop {
@@ -461,32 +470,40 @@ fn registered_references(
                     !home_gone || protected.iter().any(|path| path.starts_with(&home))
                 }
             };
-            if live && fs::Dir::open(&home).is_ok() {
+            if !live {
+                removable.push(record.runtime_home.clone());
+                continue;
+            }
+            // A live row pins what it records whatever its home's state; only
+            // the native census input depends on the home opening.
+            match &opened {
                 // Every extant registered home — mapped, cache-only or
                 // mid-switch — is the census input for native references.
-                references.extant_homes.push(home.clone());
-                for (root, mapping) in &layout.roots {
+                Ok(_) => references.extant_homes.push(home.clone()),
+                // An absent live home (a prepared row, or a committed one a
+                // protected path still names) holds no native references.
+                Err(error) if not_found(error) => {}
+                Err(_) => unreadable_live_home = true,
+            }
+            for (root, mapping) in &layout.roots {
+                references
+                    .pinned_trees
+                    .insert(tree_key(&mapping.scope, &mapping.manifest_sha256));
+                // A plugin version root keeps one derived view alive: its
+                // identity is deterministic from the registered mapping,
+                // so the expected set needs no mutable state.
+                if let Some((_, version)) = plugin_views::plugin_mount(root) {
+                    let identity = plugin_views::view_identity(
+                        &shared_assets::SharedTreeRef {
+                            scope: mapping.scope.clone(),
+                            manifest_sha256: mapping.manifest_sha256.clone(),
+                        },
+                        &version,
+                    )?;
                     references
-                        .pinned_trees
-                        .insert(tree_key(&mapping.scope, &mapping.manifest_sha256));
-                    // A plugin version root keeps one derived view alive: its
-                    // identity is deterministic from the registered mapping,
-                    // so the expected set needs no mutable state.
-                    if let Some((_, version)) = plugin_views::plugin_mount(root) {
-                        let identity = plugin_views::view_identity(
-                            &shared_assets::SharedTreeRef {
-                                scope: mapping.scope.clone(),
-                                manifest_sha256: mapping.manifest_sha256.clone(),
-                            },
-                            &version,
-                        )?;
-                        references
-                            .expected_views
-                            .insert(format!("{}/{}", mapping.scope, identity));
-                    }
+                        .expected_views
+                        .insert(format!("{}/{}", mapping.scope, identity));
                 }
-            } else {
-                removable.push(record.runtime_home.clone());
             }
         }
         if !more {
@@ -497,6 +514,12 @@ fn registered_references(
             // from it could delete a live reference's object.
             return Err(invalid("layout registry exceeds the census bound"));
         }
+    }
+    if unreadable_live_home {
+        // Rows stay and nothing is deleted: an unreadable live home is
+        // uncertainty, never an empty reference set.
+        outcome.incomplete = true;
+        return Err(invalid("a live registered home could not be opened"));
     }
     if mode == Mode::Apply {
         for home in &removable {
