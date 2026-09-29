@@ -161,9 +161,11 @@ impl Drop for SharedStoreLock {
 
 /// Validates the store root: an existing absolute real directory whose
 /// canonical form equals the given path, so no symlinked component can alias
-/// the trusted root. Returns the validated path for subsequent descriptor
-/// opens.
-fn validated_root(store_root: &Path) -> Result<PathBuf> {
+/// the trusted root. Returns the validated canonical path for subsequent
+/// descriptor opens and store-target derivation. Shared by this module's
+/// import/verify entry points and `snapshot_tree`'s explicit shared-bridge
+/// verifier, which derives each expected home symlink target from it.
+pub(crate) fn validated_root(store_root: &Path) -> Result<PathBuf> {
     if !store_root.is_absolute() {
         return Err(invalid("shared store root must be absolute"));
     }
@@ -224,7 +226,10 @@ fn file_identity(entry: &Value) -> Result<(String, u32, u64)> {
     if !matches!(mode, 0o600 | 0o700) {
         return Err(invalid("shared tree manifest mode is not normalized"));
     }
-    let bytes = entry.get("bytes").and_then(Value::as_u64).unwrap_or(u64::MAX);
+    let bytes = entry
+        .get("bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
     if bytes > MAX_FILE_BYTES as u64 {
         return Err(invalid("shared tree file exceeds the payload bound"));
     }
@@ -291,7 +296,9 @@ fn verify_topology(
 ) -> Result<()> {
     require_owner(root.entry(None)?.uid, label)?;
     if shape == TreeShape::Shared && root.entry(None)?.mode != 0o500 {
-        return Err(invalid(format!("shared tree {label} directory mode drifted")));
+        return Err(invalid(format!(
+            "shared tree {label} directory mode drifted"
+        )));
     }
     let mut visited = 0_usize;
     let mut seen = BTreeSet::new();
@@ -339,13 +346,17 @@ fn walk_topology(
             continue;
         }
         let entry = entries.get(&path).ok_or_else(|| {
-            invalid(format!("{label} holds an entry its manifest does not describe: {path}"))
+            invalid(format!(
+                "{label} holds an entry its manifest does not describe: {path}"
+            ))
         })?;
         seen.insert(path.clone());
         match entry["type"].as_str() {
             Some("directory") => {
                 if identity.kind != EntryType::Directory {
-                    return Err(invalid(format!("{label} entry is not a real directory: {path}")));
+                    return Err(invalid(format!(
+                        "{label} entry is not a real directory: {path}"
+                    )));
                 }
                 if shape == TreeShape::Shared && identity.mode != 0o500 {
                     return Err(invalid(format!(
@@ -407,11 +418,7 @@ fn hash_open_file(file: &mut std::fs::File) -> Result<(String, u64)> {
 /// captured-descriptor comparison that closes the race between the topology
 /// walk and payload staging: the metadata read belongs to the exact inode
 /// whose bytes are then streamed.
-fn check_source_file(
-    file: &std::fs::File,
-    expected_len: u64,
-    logical: u32,
-) -> Result<()> {
+fn check_source_file(file: &std::fs::File, expected_len: u64, logical: u32) -> Result<()> {
     let metadata = file.metadata()?;
     require_owner(metadata.uid(), "source file")?;
     if metadata.len() != expected_len {
@@ -472,7 +479,8 @@ pub fn import_shared_tree(
         manifest_sha256: sha256(&manifest_bytes),
     };
     let entries = entry_map(
-        &load_manifest(&source_dir)?.ok_or_else(|| invalid("managed snapshot manifest is missing"))?,
+        &load_manifest(&source_dir)?
+            .ok_or_else(|| invalid("managed snapshot manifest is missing"))?,
     )?;
     validate_entries(&entries)?;
     verify_topology(&source_dir, &entries, TreeShape::Source, "managed snapshot")?;
@@ -501,8 +509,16 @@ pub fn import_shared_tree(
         uuid::Uuid::new_v4().simple()
     ));
     store.directory(&staging)?;
-    let staged = stage_shared_tree(&store, &staging, scope, &entries, &source_dir, &manifest_bytes);
-    let published = staged.and_then(|()| restrict_staging(&store, &staging, &entries))
+    let staged = stage_shared_tree(
+        &store,
+        &staging,
+        scope,
+        &entries,
+        &source_dir,
+        &manifest_bytes,
+    );
+    let published = staged
+        .and_then(|()| restrict_staging(&store, &staging, &entries))
         .and_then(|()| store.rename_entry_no_replace(&staging, &destination));
     match published {
         Ok(true) => Ok(reference),
@@ -546,7 +562,14 @@ fn stage_shared_tree(
         let mut source_file = source_dir.open_file(relative)?;
         check_source_file(&source_file, expected_len, logical)?;
         let blob = blob_rel(scope, &sha256, logical);
-        ensure_blob(store, &blob, &mut source_file, &sha256, expected_len, logical)?;
+        ensure_blob(
+            store,
+            &blob,
+            &mut source_file,
+            &sha256,
+            expected_len,
+            logical,
+        )?;
         if !store.hardlink(&staging.join(relative), store, &blob)? {
             return Err(invalid("shared tree staging name already exists"));
         }
@@ -601,7 +624,10 @@ fn publish_blob(
     let temporary = blob
         .parent()
         .expect("a blob always has a scope parent")
-        .join(format!("{TEMP_PREFIX}{}{TEMP_SUFFIX}", uuid::Uuid::new_v4().simple()));
+        .join(format!(
+            "{TEMP_PREFIX}{}{TEMP_SUFFIX}",
+            uuid::Uuid::new_v4().simple()
+        ));
     let staged = stream_into_blob(store, &temporary, source, sha256, expected_len, logical)
         .and_then(|()| store.rename_entry_no_replace(&temporary, blob));
     // Removing the exclusive temporary this call created (or nothing when
@@ -688,11 +714,7 @@ fn verify_blob(
 
 /// Drops owner write permission on every staged directory, including the
 /// staging root, leaving the tree readonly at `0o500` before its rename.
-fn restrict_staging(
-    store: &Dir,
-    staging: &Path,
-    entries: &BTreeMap<String, Value>,
-) -> Result<()> {
+fn restrict_staging(store: &Dir, staging: &Path, entries: &BTreeMap<String, Value>) -> Result<()> {
     for (path, entry) in entries {
         if entry["type"] == "directory" {
             store
@@ -775,14 +797,18 @@ pub fn verify_shared_tree(store_root: &Path, reference: &SharedTreeRef) -> Resul
     let tree_dir = store.subdir(&destination)?;
     let manifest_bytes = tree_dir.read(Path::new(SNAPSHOT_MANIFEST), MAX_METADATA)?;
     if sha256(&manifest_bytes) != reference.manifest_sha256 {
-        return Err(invalid("shared tree manifest hash does not match its reference"));
+        return Err(invalid(
+            "shared tree manifest hash does not match its reference",
+        ));
     }
     let entries = entry_map(
         &load_manifest(&tree_dir)?.ok_or_else(|| invalid("shared tree manifest is missing"))?,
     )?;
     validate_entries(&entries)?;
     verify_topology(&tree_dir, &entries, TreeShape::Shared, "shared tree")?;
-    let manifest_metadata = tree_dir.open_file(Path::new(SNAPSHOT_MANIFEST))?.metadata()?;
+    let manifest_metadata = tree_dir
+        .open_file(Path::new(SNAPSHOT_MANIFEST))?
+        .metadata()?;
     require_owner(manifest_metadata.uid(), "manifest")?;
     if manifest_metadata.permissions().mode() & 0o7777 != 0o400 {
         return Err(invalid("shared tree manifest mode drifted"));
@@ -796,9 +822,7 @@ pub fn verify_shared_tree(store_root: &Path, reference: &SharedTreeRef) -> Resul
         match store.open_file(&blob) {
             Ok(file) => {
                 let blob_metadata = file.metadata()?;
-                let tree_metadata = store
-                    .open_file(&destination.join(path))?
-                    .metadata()?;
+                let tree_metadata = store.open_file(&destination.join(path))?.metadata()?;
                 require_owner(blob_metadata.uid(), "blob")?;
                 require_owner(tree_metadata.uid(), "tree file")?;
                 let physical = physical_mode(logical);
@@ -871,7 +895,6 @@ mod tests {
         import_shared_tree(store, scope, home, Path::new("assets/runtime")).unwrap()
     }
 
-
     /// One fresh shared-store root in its canonical form; the `TempDir` is
     /// RAII-cleaned and `root` is the path handed to the module.
     fn store_root() -> (tempfile::TempDir, PathBuf) {
@@ -927,9 +950,7 @@ mod tests {
         let (_store, root) = store_root();
         let scope = sha256(b"account-alpha");
         let first = import(&root, &scope, home.path());
-        let util = shared_tree_root(&root, &first)
-            .unwrap()
-            .join("lib/util.js");
+        let util = shared_tree_root(&root, &first).unwrap().join("lib/util.js");
         let shared_inode = inode_of(&util);
         let second = import(&root, &scope, home.path());
         assert_eq!(first, second);
@@ -952,9 +973,16 @@ mod tests {
         );
         verify_shared_tree(&root, &first).unwrap();
         let tree = shared_tree_root(&root, &first).unwrap();
-        assert_eq!(fs::metadata(&tree).unwrap().permissions().mode() & 0o777, 0o500);
         assert_eq!(
-            fs::metadata(tree.join("index.js")).unwrap().permissions().mode() & 0o777,
+            fs::metadata(&tree).unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+        assert_eq!(
+            fs::metadata(tree.join("index.js"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o500
         );
         assert_eq!(
@@ -966,8 +994,10 @@ mod tests {
     /// A changed tree version shares only the unchanged file's inode.
     #[test]
     fn changed_version_reuses_only_unchanged_payloads() {
-        let (source, home) =
-            sealed(&[("keep.txt", b"stable\n", false), ("change.txt", b"v1\n", false)]);
+        let (source, home) = sealed(&[
+            ("keep.txt", b"stable\n", false),
+            ("change.txt", b"v1\n", false),
+        ]);
         let (_store, root) = store_root();
         let scope = sha256(b"account-beta");
         let v1 = import(&root, &scope, home.path());
@@ -1064,21 +1094,22 @@ mod tests {
         fs::hard_link(&target, &blob).unwrap();
         verify_shared_tree(&root, &reference).unwrap();
 
-        assert!(
-            verify_shared_tree(
-                &root,
-                &SharedTreeRef {
-                    scope: "not-a-scope".into(),
-                    manifest_sha256: reference.manifest_sha256.clone(),
-                }
-            )
-            .is_err()
-        );
+        assert!(verify_shared_tree(
+            &root,
+            &SharedTreeRef {
+                scope: "not-a-scope".into(),
+                manifest_sha256: reference.manifest_sha256.clone(),
+            }
+        )
+        .is_err());
         let manifest = tree.join(SNAPSHOT_MANIFEST);
         fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600)).unwrap();
         let bytes = fs::read(&manifest).unwrap();
         let mut drifted = bytes.clone();
-        let seat = drifted.iter().position(|byte| *byte == b'p').expect("digit");
+        let seat = drifted
+            .iter()
+            .position(|byte| *byte == b'p')
+            .expect("digit");
         drifted[seat] = b'q';
         fs::write(&manifest, &drifted).unwrap();
         fs::set_permissions(&manifest, fs::Permissions::from_mode(0o400)).unwrap();
@@ -1098,18 +1129,14 @@ mod tests {
         let scope = sha256(b"domain-refused");
         let manifest =
             fs::read(home.path().join("assets/runtime").join(SNAPSHOT_MANIFEST)).unwrap();
-        let destination = root.join("trees")
-            .join(&scope)
-            .join(sha256(&manifest));
+        let destination = root.join("trees").join(&scope).join(sha256(&manifest));
         assert!(
-            import_shared_tree(&root, &scope, home.path(), Path::new("assets/absent"))
-                .is_err()
+            import_shared_tree(&root, &scope, home.path(), Path::new("assets/absent")).is_err()
         );
         assert!(!root.join("trees").exists());
         fs::write(home.path().join("assets/runtime/a.txt"), b"drifted\n").unwrap();
         assert!(
-            import_shared_tree(&root, &scope, home.path(), Path::new("assets/runtime"))
-                .is_err()
+            import_shared_tree(&root, &scope, home.path(), Path::new("assets/runtime")).is_err()
         );
         assert!(!destination.exists());
         let names: Vec<_> = match fs::read_dir(root.join("trees").join(&scope)) {
@@ -1134,26 +1161,21 @@ mod tests {
         let scope = sha256(b"domain-empty");
         let manifest =
             fs::read(home.path().join("assets/runtime").join(SNAPSHOT_MANIFEST)).unwrap();
-        let destination = root.join("trees")
-            .join(&scope)
-            .join(sha256(&manifest));
+        let destination = root.join("trees").join(&scope).join(sha256(&manifest));
         fs::create_dir_all(destination.parent().unwrap()).unwrap();
         fs::create_dir(&destination).unwrap();
         assert!(
-            import_shared_tree(&root, &scope, home.path(), Path::new("assets/runtime"))
-                .is_err()
+            import_shared_tree(&root, &scope, home.path(), Path::new("assets/runtime")).is_err()
         );
         assert!(destination.read_dir().unwrap().next().is_none());
-        assert!(
-            verify_shared_tree(
-                &root,
-                &SharedTreeRef {
-                    scope: scope.clone(),
-                    manifest_sha256: sha256(&manifest),
-                }
-            )
-            .is_err()
-        );
+        assert!(verify_shared_tree(
+            &root,
+            &SharedTreeRef {
+                scope: scope.clone(),
+                manifest_sha256: sha256(&manifest),
+            }
+        )
+        .is_err());
     }
 
     /// Concurrent publishers of one tree converge on one ref with no staging
@@ -1215,10 +1237,13 @@ mod tests {
         fs::set_permissions(&blob, fs::Permissions::from_mode(0o600)).unwrap();
         fs::write(&blob, b"drifted\n").unwrap();
         fs::set_permissions(&blob, fs::Permissions::from_mode(0o400)).unwrap();
-        assert!(
-            import_shared_tree(&root, &scope, second_home.path(), Path::new("assets/runtime"))
-                .is_err()
-        );
+        assert!(import_shared_tree(
+            &root,
+            &scope,
+            second_home.path(),
+            Path::new("assets/runtime")
+        )
+        .is_err());
         let container = root.join("trees").join(&scope);
         let names: Vec<_> = fs::read_dir(&container)
             .unwrap()

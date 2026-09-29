@@ -507,3 +507,379 @@ fn python_test_config_snapshot_binds_revision_without_secret_values() {
         first
     );
 }
+
+/// Shared-store bridge checks: one sealed home's managed tree moves into the
+/// content-addressed store and verifies through the explicit shared verifier
+/// while the original strict verifier keeps refusing symlinked roots.
+mod shared_bridge {
+    use agent_run_adapters::materialize;
+    use agent_run_platform::{
+        fs,
+        shared_assets::{self, SharedTreeRef},
+        snapshot_tree::{self, RUNTIME_SNAPSHOT_INDEX},
+    };
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs as stdfs,
+        os::unix::fs::{MetadataExt, PermissionsExt},
+        path::{Path, PathBuf},
+    };
+    use tempfile::TempDir;
+
+    /// One sealed home fixture: managed tree, flat config, credential link,
+    /// and a home-local native-history file outside the asset index.
+    struct SealedHome {
+        home: PathBuf,
+        revision: String,
+        index_bytes: Vec<u8>,
+        index_sha256: String,
+        history: Vec<u8>,
+    }
+
+    /// Seals one home whose managed tree carries `payload`; `stamp` makes the
+    /// skill manifest unique per home so distinct homes stay distinct trees.
+    fn seal(root: &Path, name: &str, stamp: &str, payload: &[u8]) -> SealedHome {
+        let source = root.join(format!("{name}-source"));
+        stdfs::create_dir_all(source.join("scripts")).expect("source tree");
+        stdfs::write(source.join("SKILL.md"), format!("# skill {stamp}\n")).expect("skill");
+        stdfs::write(source.join("scripts/payload.bin"), payload).expect("payload");
+        let home = root.join(name);
+        snapshot_tree::snapshot_managed_tree(&home, Path::new("skills/demo"), &source, None)
+            .expect("managed tree");
+        stdfs::write(home.join("config.toml"), "key = \"value\"\n").expect("flat config");
+        let credential = root.join(format!("{name}-auth.json"));
+        stdfs::write(&credential, "{}\n").expect("credential");
+        std::os::unix::fs::symlink(&credential, home.join("auth.json")).expect("credential link");
+        let revision = format!("revision-{name}");
+        let digest = snapshot_tree::finalize_runtime_snapshots(
+            &home,
+            &revision,
+            &["config.toml".into()],
+            &[(
+                "auth.json".into(),
+                credential.to_string_lossy().into_owned(),
+            )],
+        )
+        .expect("runtime index");
+        let index_bytes = stdfs::read(home.join(RUNTIME_SNAPSHOT_INDEX)).expect("index bytes");
+        let history = b"{\"sessions\":[]}\n".to_vec();
+        stdfs::write(home.join("history.json"), &history).expect("history file");
+        SealedHome {
+            home,
+            revision,
+            index_sha256: digest,
+            index_bytes,
+            history,
+        }
+    }
+
+    /// RAII shared-store fixture whose readonly published trees are made
+    /// writable again before the temporary directory is cleaned up.
+    struct StoreDir {
+        temp: TempDir,
+        root: PathBuf,
+    }
+
+    /// Creates one empty canonical shared-store root.
+    fn store() -> StoreDir {
+        let temp = TempDir::new().expect("store temporary");
+        let root = temp.path().canonicalize().expect("canonical store root");
+        StoreDir { temp, root }
+    }
+
+    /// Restores owner write permission below one fixture tree.
+    fn permit_tree(path: &Path) {
+        if let Ok(metadata) = stdfs::symlink_metadata(path) {
+            if metadata.is_dir() {
+                let _ = stdfs::set_permissions(path, stdfs::Permissions::from_mode(0o700));
+                if let Ok(children) = stdfs::read_dir(path) {
+                    for child in children.flatten() {
+                        permit_tree(&child.path());
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for StoreDir {
+        /// Makes every readonly published directory removable, then lets the
+        /// temporary directory remove itself.
+        fn drop(&mut self) {
+            permit_tree(self.temp.path());
+        }
+    }
+
+    /// Imports one home's managed tree and returns the shared reference.
+    fn import(store: &StoreDir, scope: &str, sealed: &SealedHome) -> SharedTreeRef {
+        shared_assets::import_shared_tree(
+            &store.root,
+            scope,
+            &sealed.home,
+            Path::new("skills/demo"),
+        )
+        .expect("shared import")
+    }
+
+    /// Replaces one home's managed root with the exact whole-tree symlink.
+    fn relink(sealed: &SealedHome, store: &StoreDir, reference: &SharedTreeRef) {
+        let target = shared_assets::shared_tree_root(&store.root, reference).expect("target");
+        let root = sealed.home.join("skills/demo");
+        stdfs::remove_dir_all(&root).expect("remove private copy");
+        std::os::unix::fs::symlink(&target, &root).expect("whole-tree link");
+    }
+
+    /// Runs the explicit shared verifier for one mapping.
+    fn shared_inspection(
+        sealed: &SealedHome,
+        store: &StoreDir,
+        map: &BTreeMap<String, SharedTreeRef>,
+    ) -> agent_run_domain::Result<snapshot_tree::RuntimeSnapshotInspection> {
+        snapshot_tree::inspect_runtime_snapshots_with_shared(
+            &sealed.home,
+            &sealed.revision,
+            &sealed.index_sha256,
+            &store.root,
+            map,
+        )
+    }
+
+    /// One mapping of the home's single managed root.
+    fn single(reference: &SharedTreeRef) -> BTreeMap<String, SharedTreeRef> {
+        BTreeMap::from([("skills/demo".into(), reference.clone())])
+    }
+
+    /// The shared bridge accepts one exact whole-tree symlink with identical
+    /// original index bytes and history, while the strict verifier refuses.
+    #[test]
+    fn bridge_accepts_exact_symlink_and_old_verifier_still_refuses() {
+        let root = TempDir::new().expect("fixture root");
+        let sealed = seal(root.path(), "home", "a", b"payload-bytes\n");
+        let store = store();
+        let scope = fs::sha256(b"bridge-main");
+        let reference = import(&store, &scope, &sealed);
+        assert!(
+            snapshot_tree::inspect_runtime_snapshots(
+                &sealed.home,
+                &sealed.revision,
+                &sealed.index_sha256
+            )
+            .expect("private home verifies")
+            .verified
+        );
+        relink(&sealed, &store, &reference);
+        let old = snapshot_tree::inspect_runtime_snapshots(
+            &sealed.home,
+            &sealed.revision,
+            &sealed.index_sha256,
+        )
+        .expect("strict inspection");
+        assert!(!old.verified, "a symlinked root must stay a mismatch");
+        assert!(
+            materialize::verify(&sealed.home, &sealed.index_sha256).is_err(),
+            "the public strict verify path is unchanged"
+        );
+        let map = single(&reference);
+        let inspection =
+            shared_inspection(&sealed, &store, &map).expect("shared bridge verification");
+        assert!(inspection.verified, "{inspection:?}");
+        assert!(
+            materialize::verify_with_shared(&sealed.home, &sealed.index_sha256, &store.root, &map)
+                .is_ok(),
+            "adapter verify_with_shared mirrors materialize::verify"
+        );
+        assert_eq!(
+            stdfs::read(sealed.home.join(RUNTIME_SNAPSHOT_INDEX)).unwrap(),
+            sealed.index_bytes,
+            "the original index bytes stay byte-exact"
+        );
+        // History continuity is its own seam: the asset verifier does not own
+        // it, but the sealed bytes are still exactly what was recorded.
+        assert_eq!(
+            fs::sha256(&stdfs::read(sealed.home.join("history.json")).unwrap()),
+            fs::sha256(&sealed.history)
+        );
+
+        // Tampering the flat config is not excused by sharing.
+        stdfs::write(sealed.home.join("config.toml"), "key = \"tampered\"\n").unwrap();
+        assert!(
+            !shared_inspection(&sealed, &store, &map)
+                .expect("flat drift is classified, not fatal")
+                .verified
+        );
+        stdfs::write(sealed.home.join("config.toml"), "key = \"value\"\n").unwrap();
+
+        // A wrong digest, a foreign target, a dangling target, an unknown
+        // mapping root, a restored private copy, and store drift all fail.
+        let other = seal(root.path(), "other", "b", b"different payload\n");
+        let other_reference = import(&store, &fs::sha256(b"bridge-other"), &other);
+        assert_ne!(other_reference, reference);
+        assert!(shared_inspection(&sealed, &store, &single(&other_reference)).is_err());
+
+        let link = sealed.home.join("skills/demo");
+        let target = stdfs::read_link(&link).unwrap();
+        stdfs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(root.path().join("outside"), &link).unwrap();
+        assert!(shared_inspection(&sealed, &store, &map).is_err());
+        stdfs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(
+            store.root.join("trees").join(&scope).join("deadbeef"),
+            &link,
+        )
+        .unwrap();
+        assert!(shared_inspection(&sealed, &store, &map).is_err());
+        stdfs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let unknown = BTreeMap::from([("skills/other".into(), reference.clone())]);
+        assert!(shared_inspection(&sealed, &store, &unknown).is_err());
+
+        stdfs::remove_file(&link).unwrap();
+        let source = root.path().join("home-source");
+        stdfs::create_dir_all(&source).unwrap();
+        stdfs::write(source.join("SKILL.md"), "# skill a\n").unwrap();
+        snapshot_tree::snapshot_managed_tree(&sealed.home, Path::new("skills/demo"), &source, None)
+            .unwrap();
+        // Re-sealing resets the runtime index to its pre-finalize shape;
+        // restore the exact sealed bytes so the next assertion is judged
+        // against a valid index, not a destroyed one.
+        stdfs::write(
+            sealed.home.join(RUNTIME_SNAPSHOT_INDEX),
+            &sealed.index_bytes,
+        )
+        .unwrap();
+        assert!(
+            shared_inspection(&sealed, &store, &map).is_err(),
+            "a restored private copy is not silently accepted for a mapped root"
+        );
+
+        relink(&sealed, &store, &reference);
+        let tree_file = shared_assets::shared_tree_root(&store.root, &reference)
+            .unwrap()
+            .join("scripts/payload.bin");
+        stdfs::set_permissions(&tree_file, stdfs::Permissions::from_mode(0o600)).unwrap();
+        assert!(shared_inspection(&sealed, &store, &map).is_err());
+        stdfs::set_permissions(&tree_file, stdfs::Permissions::from_mode(0o400)).unwrap();
+        assert!(
+            shared_inspection(&sealed, &store, &map)
+                .expect("restored mode verifies")
+                .verified
+        );
+    }
+
+    /// Two independently sealed homes carrying the same payload converge on
+    /// the same shared tree target and payload inode.
+    #[test]
+    fn independent_homes_converge_on_one_shared_tree() {
+        let root = TempDir::new().expect("fixture root");
+        let first = seal(root.path(), "first", "same", b"shared payload\n");
+        let second = seal(root.path(), "second", "same", b"shared payload\n");
+        let store = store();
+        let scope = fs::sha256(b"bridge-scope");
+        let first_reference = import(&store, &scope, &first);
+        let second_reference = import(&store, &scope, &second);
+        assert_eq!(first_reference, second_reference);
+        assert_eq!(
+            shared_assets::shared_tree_root(&store.root, &first_reference).unwrap(),
+            shared_assets::shared_tree_root(&store.root, &second_reference).unwrap()
+        );
+        relink(&first, &store, &first_reference);
+        relink(&second, &store, &second_reference);
+        assert_eq!(
+            stdfs::metadata(first.home.join("skills/demo/SKILL.md"))
+                .unwrap()
+                .ino(),
+            stdfs::metadata(second.home.join("skills/demo/SKILL.md"))
+                .unwrap()
+                .ino()
+        );
+        for sealed in [&first, &second] {
+            assert!(
+                shared_inspection(sealed, &store, &single(&first_reference))
+                    .expect("bridge verification")
+                    .verified
+            );
+        }
+    }
+
+    /// Sums unique regular-file inode bytes across roots, counting hardlinked
+    /// payloads and the store exactly once.
+    fn unique_file_bytes(roots: &[PathBuf]) -> u64 {
+        let mut seen: BTreeMap<(u64, u64), u64> = BTreeMap::new();
+        for root in roots {
+            collect_inodes(root, &mut seen);
+        }
+        seen.values().sum()
+    }
+
+    /// Recursively records regular-file inodes without following symlinks.
+    fn collect_inodes(path: &Path, seen: &mut BTreeMap<(u64, u64), u64>) {
+        if let Ok(metadata) = stdfs::symlink_metadata(path) {
+            if metadata.is_dir() {
+                if let Ok(children) = stdfs::read_dir(path) {
+                    for child in children.flatten() {
+                        collect_inodes(&child.path(), seen);
+                    }
+                }
+            } else if metadata.is_file() {
+                seen.entry((metadata.dev(), metadata.ino()))
+                    .or_insert(metadata.len());
+            }
+        }
+    }
+
+    /// A bounded three-home fixture measures deduplicated bytes; this is a
+    /// measured fixture saving, not a promise of physical APFS free space or
+    /// production-scale reclamation.
+    #[test]
+    fn three_home_fixture_measures_deduplicated_bytes() {
+        let payload: Vec<u8> = (0..1024 * 1024).map(|byte| (byte % 251) as u8).collect();
+        let root = TempDir::new().expect("fixture root");
+        let homes: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|stamp| seal(root.path(), &format!("home-{stamp}"), stamp, &payload))
+            .collect();
+        let store = store();
+        let scope = fs::sha256(b"measurement-scope");
+        let references: Vec<_> = homes
+            .iter()
+            .map(|home| import(&store, &scope, home))
+            .collect();
+        assert_eq!(references.len(), 3);
+        assert!(
+            references.windows(2).all(|pair| pair[0] != pair[1]),
+            "distinct skill stamps stay distinct trees"
+        );
+        let mut roots: Vec<PathBuf> = homes.iter().map(|home| home.home.clone()).collect();
+        roots.push(store.root.clone());
+        let before = unique_file_bytes(&roots);
+        for (home, reference) in homes.iter().zip(&references) {
+            relink(home, &store, reference);
+        }
+        let after = unique_file_bytes(&roots);
+        let mut one_mib: BTreeSet<(u64, u64)> = BTreeSet::new();
+        collect_exact(&store.root, payload.len() as u64, &mut one_mib);
+        assert_eq!(one_mib.len(), 1, "the 1 MiB payload inode is stored once");
+        assert!(
+            after < before,
+            "fixture bytes must shrink: {after} >= {before}"
+        );
+        println!(
+            "shared-store fixture measurement: before={before} unique bytes, after={after} unique bytes (store included once)"
+        );
+    }
+
+    /// Collects store inodes whose file length is exactly `length`.
+    fn collect_exact(path: &Path, length: u64, found: &mut BTreeSet<(u64, u64)>) {
+        if let Ok(metadata) = stdfs::symlink_metadata(path) {
+            if metadata.is_dir() {
+                if let Ok(children) = stdfs::read_dir(path) {
+                    for child in children.flatten() {
+                        collect_exact(&child.path(), length, found);
+                    }
+                }
+            } else if metadata.is_file() && metadata.len() == length {
+                found.insert((metadata.dev(), metadata.ino()));
+            }
+        }
+    }
+}

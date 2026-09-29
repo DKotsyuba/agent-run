@@ -39,6 +39,46 @@ materialization revision. Deleting a whole indexed skill directory cannot hide
 its missing manifest. The configured executable path is frozen, but the index
 does not pin the external executable's bytes or version.
 
+## Shared-tree verification bridge
+
+`agent-run-platform::shared_assets` can import an already sealed managed tree
+into an immutable content-addressed store (blobs keyed by scope, content
+digest, and normalized mode; whole trees keyed by their original manifest
+digest) without changing the on-disk Python-v1 formats. A home whose managed
+root was replaced by one exact whole-tree symlink into that store no longer
+passes `inspect_runtime_snapshots()`: the original strict verifier keeps
+requiring real directories and rejects arbitrary tree-root symlinks, and
+`materialize::verify()` keeps that behavior.
+
+`inspect_runtime_snapshots_with_shared()` is the explicit bridge. The caller
+passes a trusted canonical store root plus a mapping of indexed root paths to
+the `SharedTreeRef` values its registry recorded at import time; no platform
+or adapters code reads a database, and no home-local sidecar is trusted. The
+original index bytes, hash, revision, key shape, flat files, and credential
+links keep their exact original checks. For each mapped root the bridge
+proves the mapping key is an exact indexed root, the reference digest equals
+the original index manifest hash, the home entry is exactly one symlink whose
+target text equals the path derived from the trusted store root plus the
+validated reference, and the shared store's bounded streaming verifier proves
+unchanged logical paths, types, modes, and content through the physical tree.
+A private directory copy, missing link, foreign or dangling target, unknown
+mapping root, or wrong digest fails closed. Unmapped roots keep the original
+strict directory verification, so mixed original and shared homes verify —
+prepared migration can convert roots one at a time. Structural trust failures
+on the shared branch are returned as errors rather than classified
+inspection rows.
+
+`agent-run-adapters::materialize::verify_with_shared()` wraps the bridge with
+the same launch-path `Snapshot` result and revision extraction as
+`materialize::verify()`. The caller remains the trusted registry authority
+for the home, index, and root-to-reference binding; provider continuation
+still independently verifies through the strict path and is not wired to the
+bridge yet. A three-home fixture test (1 MiB identical payload per home)
+measures 4,197,931 unique regular-file inode bytes before replacement and
+1,051,114 after, counting the store exactly once; that is a measured fixture
+saving, not a promise of physical APFS free space or production-scale
+reclamation.
+
 The current Codex provider auth link is deliberately outside the sealed asset
 index. After immutable assets verify and previous process cleanup is proven,
 an eligible attempt can rebind `auth.json` to its selected account without

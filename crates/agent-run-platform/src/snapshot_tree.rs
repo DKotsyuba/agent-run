@@ -8,6 +8,7 @@
 use crate::{
     fs::{self, Dir, EntryType},
     publish::{self, Entry},
+    shared_assets,
 };
 use agent_run_domain::{canonical, error::invalid, Error, Result};
 use serde_json::{json, Map, Value};
@@ -554,10 +555,74 @@ pub fn finalize_runtime_snapshots(
 }
 
 /// Verify a v1 index against its recorded revision and digest without repair.
+///
+/// This is the original strict verifier: every indexed managed root must
+/// still be a real directory below `home`, so a tree root replaced by any
+/// symlink is rejected. Homes whose trees were moved into a shared store
+/// must use [`inspect_runtime_snapshots_with_shared`].
 pub fn inspect_runtime_snapshots(
     home: &Path,
     expected_revision: &str,
     expected_sha256: &str,
+) -> Result<RuntimeSnapshotInspection> {
+    inspect_runtime_index(home, expected_revision, expected_sha256, None)
+}
+
+/// Verifies the same byte-exact original index as
+/// [`inspect_runtime_snapshots`] while explicitly accepting shared trees.
+///
+/// `shared_store_root` is the trusted canonical shared-store root and
+/// `shared_roots` maps indexed managed-root paths to the
+/// [`crate::shared_assets::SharedTreeRef`] the caller's registry bound when
+/// the tree was imported. The original index bytes, hash, revision, key
+/// shape, flat-file entries, and credential links keep their exact original
+/// checks; no home-local sidecar is trusted. For each mapped root the
+/// verifier additionally proves, failing closed on any mismatch:
+///
+/// - the mapping key is an exact member of the original indexed roots;
+/// - the reference's manifest digest equals the original index's
+///   `manifests[root]`;
+/// - the current home entry is exactly one whole-tree symlink whose target
+///   text equals the path derived from the trusted canonical store root plus
+///   the validated reference — a private directory copy, a missing link, a
+///   foreign or dangling target, or a wrong digest is never silently
+///   accepted;
+/// - [`crate::shared_assets::verify_shared_tree`] proves the unchanged
+///   logical paths, types, modes, and content through the physical shared
+///   tree with bounded streaming reads.
+///
+/// Unmapped indexed roots keep the original strict directory verification
+/// unchanged, so mixed original and shared homes verify. Structural trust
+/// failures on the shared branch return errors rather than a classified
+/// inspection; drift found by the original branch is reported through the
+/// returned inspection exactly as before.
+pub fn inspect_runtime_snapshots_with_shared(
+    home: &Path,
+    expected_revision: &str,
+    expected_sha256: &str,
+    shared_store_root: &Path,
+    shared_roots: &BTreeMap<String, crate::shared_assets::SharedTreeRef>,
+) -> Result<RuntimeSnapshotInspection> {
+    inspect_runtime_index(
+        home,
+        expected_revision,
+        expected_sha256,
+        Some((shared_store_root, shared_roots)),
+    )
+}
+
+/// One implementation behind the public strict and shared-bridge verifiers;
+/// `shared` is `None` for the original behavior and otherwise carries the
+/// trusted store root plus the exact root-to-reference mapping validated
+/// against the parsed index before any per-root work.
+fn inspect_runtime_index(
+    home: &Path,
+    expected_revision: &str,
+    expected_sha256: &str,
+    shared: Option<(
+        &Path,
+        &BTreeMap<String, crate::shared_assets::SharedTreeRef>,
+    )>,
 ) -> Result<RuntimeSnapshotInspection> {
     if expected_revision.trim().is_empty() || !is_sha256(expected_sha256) {
         return Err(invalid("runtime snapshot index expectation is invalid"));
@@ -625,7 +690,47 @@ pub fn inspect_runtime_snapshots(
         return Err(invalid("runtime snapshot index manifests are malformed"));
     }
     let mut result = RuntimeSnapshotInspection::default();
+    let shared_index = match shared {
+        Some((store_root, map)) => {
+            let canonical = shared_assets::validated_root(store_root)?;
+            for (key, reference) in map {
+                if !roots.iter().any(|root| root == key) {
+                    return Err(invalid(
+                        "shared mapping names a root the original index does not describe",
+                    ));
+                }
+                let recorded = manifests.get(key).and_then(Value::as_str).unwrap_or("");
+                if recorded != reference.manifest_sha256 {
+                    return Err(invalid(
+                        "shared mapping digest does not match the original index manifest",
+                    ));
+                }
+                let target = shared_assets::shared_tree_root(&canonical, reference)?;
+                match directory.entry_type(Path::new(key)) {
+                    Ok(EntryType::Symlink) => {}
+                    _ => {
+                        return Err(invalid(
+                            "mapped shared managed root must be an exact whole-tree symlink",
+                        ))
+                    }
+                }
+                if directory.read_link(Path::new(key))? != Some(target) {
+                    return Err(invalid(
+                        "shared managed root link target does not match its trusted reference",
+                    ));
+                }
+            }
+            Some((store_root, map))
+        }
+        None => None,
+    };
     for root in roots {
+        if let Some((store_root, map)) = shared_index {
+            if let Some(reference) = map.get(&root) {
+                shared_assets::verify_shared_tree(store_root, reference)?;
+                continue;
+            }
+        }
         let manifest_path = format!("{root}/{SNAPSHOT_MANIFEST}");
         match Dir::open(&home.join(&root))
             .and_then(|dir| dir.read(Path::new(SNAPSHOT_MANIFEST), MAX_METADATA))
