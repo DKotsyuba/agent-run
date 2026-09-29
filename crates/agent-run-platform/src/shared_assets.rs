@@ -25,7 +25,7 @@
 
 use crate::{
     fs::{sha256, Dir, EntryType},
-    snapshot_tree::{entry_map, load_manifest, MAX_METADATA, SNAPSHOT_MANIFEST},
+    snapshot_tree::{entry_map, load_manifest_bounded, SNAPSHOT_MANIFEST},
 };
 use agent_run_domain::{canonical::hex_digest, error::invalid, Error, Result};
 use serde::{Deserialize, Serialize};
@@ -38,12 +38,24 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Per-file payload bound, matching `snapshot_tree`'s capture limit.
-const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
+/// Per-file payload bound. Managed snapshot capture still stops at 16 MiB;
+/// the store admits up to 32 MiB so a native Git pack (measured 24 MB)
+/// streams through the same publisher, and anything larger is refused.
+const MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
 /// Maximum manifest entries one shared tree may describe, also the walker's
 /// visited-entry bound so unexpected orphan growth cannot make a scan run
-/// away (plus one for the manifest itself).
-const MAX_TREE_ENTRIES: usize = 4096;
+/// away (plus one for the manifest itself). Sized for the native curated
+/// plugin mirror (measured 7732 entries).
+const MAX_TREE_ENTRIES: usize = 16_384;
+/// Read bound for one shared tree's manifest bytes — shared trees only.
+///
+/// A 16384-entry tree's canonical manifest needs well over the historical
+/// 64 KiB metadata bound (the measured curated mirror is ~1.3 MiB), so
+/// import, verification and census read shared-tree manifests under this
+/// bound instead. Runtime indexes, operation records, markers, plugin views
+/// and managed snapshots keep the 64 KiB bound; the manifest format, bytes
+/// and digests are unchanged.
+pub const MAX_TREE_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum aggregate payload bytes one shared tree may describe.
 const MAX_TREE_BYTES: u64 = 256 * 1024 * 1024;
 /// Streaming chunk size for hashing and copying payloads.
@@ -273,8 +285,8 @@ fn file_identity(entry: &Value) -> Result<(String, u32, u64)> {
 
 /// Validates the parsed manifest shape and returns the aggregate payload
 /// bytes, refusing trees above the entry or total-size bounds before any
-/// filesystem work. The manifest's own 64 KiB parse bound keeps this check
-/// cheap.
+/// filesystem work. The manifest's own [`MAX_TREE_MANIFEST_BYTES`] parse
+/// bound keeps this check cheap.
 fn validate_entries(entries: &BTreeMap<String, Value>) -> Result<u64> {
     if entries.len() > MAX_TREE_ENTRIES {
         return Err(invalid("shared tree exceeds the manifest entry bound"));
@@ -508,13 +520,13 @@ pub fn import_shared_tree(
         return Err(invalid("managed snapshot home must be an absolute path"));
     }
     let source_dir = Dir::open(&source_home.join(relative_root))?;
-    let manifest_bytes = source_dir.read(Path::new(SNAPSHOT_MANIFEST), MAX_METADATA)?;
+    let manifest_bytes = source_dir.read(Path::new(SNAPSHOT_MANIFEST), MAX_TREE_MANIFEST_BYTES)?;
     let reference = SharedTreeRef {
         scope: scope.to_owned(),
         manifest_sha256: sha256(&manifest_bytes),
     };
     let entries = entry_map(
-        &load_manifest(&source_dir)?
+        &load_manifest_bounded(&source_dir, MAX_TREE_MANIFEST_BYTES)?
             .ok_or_else(|| invalid("managed snapshot manifest is missing"))?,
     )?;
     validate_entries(&entries)?;
@@ -814,7 +826,8 @@ pub fn shared_tree_blob_names(
     let store = Dir::open(&root)?;
     let tree_dir = store.subdir(&tree_rel(reference))?;
     let entries = entry_map(
-        &load_manifest(&tree_dir)?.ok_or_else(|| invalid("shared tree manifest is missing"))?,
+        &load_manifest_bounded(&tree_dir, MAX_TREE_MANIFEST_BYTES)?
+            .ok_or_else(|| invalid("shared tree manifest is missing"))?,
     )?;
     validate_entries(&entries)?;
     let mut blobs = BTreeSet::new();
@@ -863,14 +876,15 @@ pub fn verify_shared_tree(store_root: &Path, reference: &SharedTreeRef) -> Resul
     }
     require_owner(store.entry(Some(&destination))?.uid, "tree")?;
     let tree_dir = store.subdir(&destination)?;
-    let manifest_bytes = tree_dir.read(Path::new(SNAPSHOT_MANIFEST), MAX_METADATA)?;
+    let manifest_bytes = tree_dir.read(Path::new(SNAPSHOT_MANIFEST), MAX_TREE_MANIFEST_BYTES)?;
     if sha256(&manifest_bytes) != reference.manifest_sha256 {
         return Err(invalid(
             "shared tree manifest hash does not match its reference",
         ));
     }
     let entries = entry_map(
-        &load_manifest(&tree_dir)?.ok_or_else(|| invalid("shared tree manifest is missing"))?,
+        &load_manifest_bounded(&tree_dir, MAX_TREE_MANIFEST_BYTES)?
+            .ok_or_else(|| invalid("shared tree manifest is missing"))?,
     )?;
     validate_entries(&entries)?;
     verify_topology(&tree_dir, &entries, TreeShape::Shared, "shared tree")?;

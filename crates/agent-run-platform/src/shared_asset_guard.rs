@@ -38,8 +38,10 @@ use std::{
 /// Absolute path of the native Seatbelt wrapper used on qualified macOS hosts.
 pub const MACOS_SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
-/// Maximum number of store entries examined before launch refuses the tree.
-const MAX_SCAN_PATHS: usize = 100_000;
+/// Maximum number of store entries examined before launch refuses the tree:
+/// the shared-tree entry bound grew fourfold for native curated mirrors, so
+/// the launch scan keeps the same headroom ratio.
+const MAX_SCAN_PATHS: usize = 400_000;
 
 /// Profile parameter naming the canonical shared root inside [`SharedAssetGuard::profile`].
 const ROOT_PARAM: &str = "ROOT";
@@ -108,7 +110,7 @@ impl fmt::Display for SharedAssetGuardError {
                 f,
                 "shared asset {path:?} has {links} hard links, including an outside alias"
             ),
-            Self::TooManyAssets => write!(f, "shared asset scan exceeds 100000 paths"),
+            Self::TooManyAssets => write!(f, "shared asset scan exceeds {MAX_SCAN_PATHS} paths"),
             Self::Io(error) => write!(f, "shared root check failed: {error}"),
         }
     }
@@ -321,7 +323,8 @@ impl SharedAssetGuard {
     /// Counts paths by `(device, inode)` without following symlinks. Internal
     /// hard links are allowed only when their count matches `nlink`; a larger
     /// count means an external writable alias could bypass path denials.
-    /// The scan is capped at 100000 entries and fails closed beyond that.
+    /// The scan is capped at [`MAX_SCAN_PATHS`] (400000) entries and fails
+    /// closed beyond that.
     /// [`Self::wrap`] runs this check before launch. An unrelated same-UID
     /// process adding an alias after the scan remains outside this guarantee.
     pub fn verify_no_hardlink_aliases(&self) -> Result<(), SharedAssetGuardError> {

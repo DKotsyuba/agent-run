@@ -2,6 +2,8 @@
 //! Gated on the crate's deterministic test-seams feature.
 #![cfg(feature = "test-fixtures")]
 
+mod common;
+
 use agent_run_core::native_tree_cache::{self, FreezeOutcome, NativeCacheKind, NativeRefScan};
 use agent_run_platform::{
     fs,
@@ -165,7 +167,25 @@ fn classify_accepts_only_native_cache_shapes() {
         native_tree_cache::classify("plugins/cache/fixture/probe").unwrap(),
         NativeCacheKind::RemotePluginParent
     );
+    assert_eq!(
+        native_tree_cache::classify(".tmp/plugins/plugins").unwrap(),
+        NativeCacheKind::CuratedMirror
+    );
+    assert_eq!(
+        native_tree_cache::classify(".tmp/plugins/.git/objects/pack").unwrap(),
+        NativeCacheKind::CuratedPacks
+    );
     for refused in [
+        ".tmp",
+        ".tmp/plugins",
+        ".tmp/plugins/.git",
+        ".tmp/plugins/.git/objects",
+        ".tmp/plugins/.git/objects/pack/pack-1.pack",
+        ".tmp/plugins/.git/refs",
+        ".tmp/plugins/.agents",
+        ".tmp/plugins/plugins/plugin-00",
+        ".tmp/plugins.sha",
+        ".tmp/plugins.sync.lock",
         "plugins/cache/personal/probe",
         "plugins/data/probe",
         "plugins/cache/fixture",
@@ -1163,5 +1183,566 @@ fn unrecognized_links_mark_census_incomplete() {
     let scan = native_tree_cache::scan_refs(&store_root, &[&home_path]);
     assert!(scan.complete);
     assert_eq!(scan.trees.len(), 1);
+    cleanup_store(&store_root);
+}
+
+/// Home-relative curated working-tree root.
+const MIRROR: &str = ".tmp/plugins/plugins";
+/// Home-relative curated Git pack root.
+const PACKS: &str = ".tmp/plugins/.git/objects/pack";
+
+/// Returns the frozen reference of one freeze outcome, panicking otherwise.
+fn frozen(outcome: FreezeOutcome) -> SharedTreeRef {
+    match outcome {
+        FreezeOutcome::Frozen(reference) | FreezeOutcome::AlreadyFrozen(reference) => reference,
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+}
+
+/// Reads one shared tree's manifest bytes and entry count.
+fn manifest_of(store_root: &Path, reference: &SharedTreeRef) -> (usize, usize) {
+    let bytes = stdfs::read(
+        shared_assets::shared_tree_root(store_root, reference)
+            .unwrap()
+            .join(SNAPSHOT_MANIFEST),
+    )
+    .expect("manifest");
+    let document: serde_json::Value = serde_json::from_slice(&bytes).expect("manifest json");
+    (bytes.len(), document["entries"].as_array().unwrap().len())
+}
+
+/// Writes the measured `data-analytics`-shaped remote plugin parent: 704
+/// files and 149 directories (853 entries), depth 7, with a valid marker.
+fn large_remote_parent(home: &Path) -> &'static str {
+    let root_key = "plugins/cache/openai-curated/data-analytics";
+    let parent = home.join(root_key);
+    let mut directories = Vec::new();
+    for branch in 0..21 {
+        let mut chain = parent.join(format!("1.0.0/branch-{branch:02}"));
+        for depth in 0..7 {
+            if depth > 0 {
+                chain = chain.join(format!("d{depth}"));
+            }
+            directories.push(chain.clone());
+        }
+    }
+    directories.push(parent.join("1.0.0/extra-a"));
+    for directory in &directories {
+        stdfs::create_dir_all(directory).expect("parent directory");
+    }
+    for index in 0..703 {
+        let directory = &directories[index % directories.len()];
+        stdfs::write(
+            directory.join(format!("asset-{index:04}.md")),
+            format!("data analytics asset {index}\n").repeat(4),
+        )
+        .expect("parent file");
+    }
+    stdfs::write(parent.join(".codex-remote-plugin-install.json"), MARKER).expect("marker");
+    root_key
+}
+
+/// Real-sized curated working tree (7732 entries, depth 10, manifest far
+/// beyond 64 KiB) and the 853-entry remote parent freeze, verify, thaw
+/// back to exact private bytes and refreeze onto the same tree identity,
+/// while every private Git, `.agents`, root and sibling file keeps its
+/// bytes, inode and modification time.
+#[test]
+fn measured_curated_mirror_and_large_parent_round_trip() {
+    let root = TempDir::new().expect("fixture root");
+    let store_root = store(root.path());
+    let home_path = root.path().join("home");
+    let private = common::curated_clone(&home_path, &common::measured_shape(48, 4096), "home-a");
+    let parent_key = large_remote_parent(&home_path);
+    let home_path = home_path.canonicalize().unwrap();
+    let before = common::private_identity(&private);
+    let sample = home_path
+        .join(MIRROR)
+        .join("plugin-07/level-1/level-2/level-3/level-4/level-5/level-6/level-7/level-8/level-9");
+    let sample_names: Vec<_> = stdfs::read_dir(&sample)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert!(
+        !sample_names.is_empty(),
+        "the depth-10 directory holds files"
+    );
+
+    let mut references = Vec::new();
+    for root_key in [MIRROR, PACKS, parent_key] {
+        let reference = frozen(
+            native_tree_cache::freeze(&store_root, &home_path, root_key, &scope())
+                .unwrap_or_else(|error| panic!("{root_key}: {error}")),
+        );
+        shared_assets::verify_shared_tree(&store_root, &reference).expect("verified");
+        assert!(home_path
+            .join(root_key)
+            .symlink_metadata()
+            .unwrap()
+            .is_symlink());
+        references.push(reference);
+    }
+    let (mirror_bytes, mirror_entries) = manifest_of(&store_root, &references[0]);
+    assert!(mirror_entries == 7732, "{mirror_entries}");
+    assert!(mirror_bytes > 64 * 1024, "{mirror_bytes}");
+    let (parent_bytes, parent_entries) = manifest_of(&store_root, &references[2]);
+    assert!(
+        parent_entries >= 853 && parent_bytes > 64 * 1024,
+        "{parent_entries} {parent_bytes}"
+    );
+    assert_eq!(
+        common::private_identity(&private),
+        before,
+        "private state untouched by freeze"
+    );
+
+    for (root_key, reference) in [MIRROR, PACKS, parent_key].into_iter().zip(&references) {
+        let thawed = native_tree_cache::thaw(&store_root, &home_path, root_key)
+            .expect("thaw")
+            .expect("was frozen");
+        assert_eq!(&thawed, reference);
+        assert!(home_path
+            .join(root_key)
+            .symlink_metadata()
+            .unwrap()
+            .is_dir());
+    }
+    let restored = home_path
+        .join(MIRROR)
+        .join("plugin-07/level-1/level-2/level-3/level-4/level-5/level-6/level-7/level-8/level-9");
+    for name in &sample_names {
+        let bytes = stdfs::read(restored.join(name)).unwrap();
+        assert!(
+            bytes.starts_with(b"curated file "),
+            "exact private bytes return"
+        );
+    }
+    assert_eq!(
+        stdfs::metadata(
+            home_path
+                .join(PACKS)
+                .join(format!("{}.pack", common::PACK_STEM))
+        )
+        .unwrap()
+        .len(),
+        4096
+    );
+    assert_eq!(
+        common::private_identity(&private),
+        before,
+        "private state untouched by thaw"
+    );
+    // The source tree identity is stable across a freeze/thaw round trip.
+    for (root_key, reference) in [MIRROR, PACKS, parent_key].into_iter().zip(&references) {
+        let again = frozen(
+            native_tree_cache::freeze(&store_root, &home_path, root_key, &scope())
+                .expect("refreeze"),
+        );
+        assert_eq!(&again, reference, "{root_key} keeps its tree identity");
+    }
+    cleanup_store(&store_root);
+}
+
+/// Two independent homes with byte-identical curated clones share one pack
+/// payload inode (24 MB, within the 32 MiB stream bound) and one working
+/// tree, while each home's private Git state keeps its own bytes, inode and
+/// time; the private duplicate of the pack is measurably gone.
+#[test]
+fn identical_curated_clones_share_packs_and_keep_git_private() {
+    let root = TempDir::new().expect("fixture root");
+    let store_root = store(root.path());
+    let shape = common::curated_shape_small(common::MEASURED_PACK_BYTES);
+    let first = root.path().join("first");
+    let second = root.path().join("second");
+    let private_first = common::curated_clone(&first, &shape, "first");
+    let private_second = common::curated_clone(&second, &shape, "second");
+    let (first, second) = (
+        first.canonicalize().unwrap(),
+        second.canonicalize().unwrap(),
+    );
+    let before_first = common::private_identity(&private_first);
+    let before_second = common::private_identity(&private_second);
+    let original = unique_inode_bytes(&[first.clone(), second.clone()]);
+
+    let mut targets = Vec::new();
+    for home_path in [&first, &second] {
+        let refs: Vec<SharedTreeRef> = [MIRROR, PACKS]
+            .into_iter()
+            .map(|root_key| {
+                frozen(
+                    native_tree_cache::freeze(&store_root, home_path, root_key, &scope())
+                        .expect("freeze"),
+                )
+            })
+            .collect();
+        targets.push(refs);
+    }
+    assert_eq!(
+        targets[0], targets[1],
+        "identical clones converge on the same trees"
+    );
+    let pack = |home: &Path| {
+        stdfs::metadata(home.join(PACKS).join(format!("{}.pack", common::PACK_STEM))).unwrap()
+    };
+    assert_eq!(
+        pack(&first).ino(),
+        pack(&second).ino(),
+        "one shared pack payload inode"
+    );
+    assert_eq!(pack(&first).len(), common::MEASURED_PACK_BYTES);
+    let idle = unique_inode_bytes(&[first.clone(), second.clone(), store_root.clone()]);
+    assert!(
+        original - idle >= common::MEASURED_PACK_BYTES,
+        "one private pack duplicate is gone: {original} -> {idle}"
+    );
+    assert_eq!(common::private_identity(&private_first), before_first);
+    assert_eq!(common::private_identity(&private_second), before_second);
+    assert_ne!(
+        before_first[1].1, before_second[1].1,
+        "private Git state stays per home"
+    );
+    cleanup_store(&store_root);
+}
+
+/// A pack beyond the 32 MiB streaming bound is refused with the original
+/// pack directory untouched and nothing published.
+#[test]
+fn curated_pack_beyond_the_stream_bound_is_refused() {
+    let root = TempDir::new().expect("fixture root");
+    let store_root = store(root.path());
+    let home_path = root.path().join("home");
+    common::curated_clone(
+        &home_path,
+        &common::curated_shape_small(32 * 1024 * 1024 + 1),
+        "big",
+    );
+    let home_path = home_path.canonicalize().unwrap();
+    let error = native_tree_cache::freeze(&store_root, &home_path, PACKS, &scope())
+        .expect_err("the stream bound refuses the pack");
+    assert!(error.to_string().contains("payload bound"), "{error}");
+    assert!(home_path.join(PACKS).symlink_metadata().unwrap().is_dir());
+    assert_eq!(
+        stdfs::metadata(
+            home_path
+                .join(PACKS)
+                .join(format!("{}.pack", common::PACK_STEM))
+        )
+        .unwrap()
+        .len(),
+        32 * 1024 * 1024 + 1
+    );
+    assert!(!store_root.join("trees").exists(), "nothing was published");
+    cleanup_store(&store_root);
+}
+
+/// One named fixture mutation applied to a fresh curated clone.
+type Case = (&'static str, fn(&Path));
+
+/// Curated roots outside the native clone shape stay private and unchanged:
+/// no `.git`, a gitfile `.git`, an empty pack directory, and a pack
+/// directory holding a multi-pack index or a temporary pack.
+#[test]
+fn curated_shapes_outside_the_native_clone_stay_private() {
+    let root = TempDir::new().expect("fixture root");
+    let store_root = store(root.path());
+    let shape = common::curated_shape_small(64);
+    let cases: [Case; 5] = [
+        ("no-git", |home| {
+            stdfs::remove_dir_all(home.join(".tmp/plugins/.git")).unwrap()
+        }),
+        ("gitfile", |home| {
+            stdfs::remove_dir_all(home.join(".tmp/plugins/.git")).unwrap();
+            stdfs::write(home.join(".tmp/plugins/.git"), "gitdir: /elsewhere\n").unwrap();
+        }),
+        ("empty-pack", |home| {
+            stdfs::remove_dir_all(home.join(PACKS)).unwrap();
+            stdfs::create_dir_all(home.join(PACKS)).unwrap();
+        }),
+        ("multi-pack-index", |home| {
+            stdfs::write(home.join(PACKS).join("multi-pack-index"), b"MIDX").unwrap()
+        }),
+        ("tmp-pack", |home| {
+            stdfs::write(home.join(PACKS).join("tmp_pack_x1"), b"x").unwrap()
+        }),
+    ];
+    for (name, mutate) in cases {
+        let home_path = root.path().join(name);
+        common::curated_clone(&home_path, &shape, name);
+        mutate(&home_path);
+        let home_path = home_path.canonicalize().unwrap();
+        for root_key in [MIRROR, PACKS] {
+            if !home_path.join(root_key).exists() {
+                continue;
+            }
+            let outcome = native_tree_cache::freeze(&store_root, &home_path, root_key, &scope())
+                .unwrap_or_else(|error| panic!("{name} {root_key}: {error}"));
+            let expect_frozen = matches!(name, "empty-pack" | "multi-pack-index" | "tmp-pack")
+                && root_key == MIRROR;
+            if expect_frozen {
+                frozen(outcome);
+                native_tree_cache::thaw(&store_root, &home_path, root_key).expect("thaw back");
+            } else {
+                assert_eq!(
+                    outcome,
+                    FreezeOutcome::SkippedUnchanged,
+                    "{name} {root_key}"
+                );
+            }
+            assert!(
+                home_path
+                    .join(root_key)
+                    .symlink_metadata()
+                    .unwrap()
+                    .is_dir(),
+                "{name}"
+            );
+        }
+    }
+    cleanup_store(&store_root);
+}
+
+/// Interrupted curated freezes and thaws recover through the same op.json
+/// records: a moved pack original relinks, and a staged mirror clone whose
+/// link was never dropped rolls back to the exact link.
+#[test]
+fn interrupted_curated_operations_recover() {
+    let root = TempDir::new().expect("fixture root");
+    let store_root = store(root.path());
+    let shape = common::curated_shape_small(8192);
+    let twin = root.path().join("twin");
+    common::curated_clone(&twin, &shape, "twin");
+    let twin = twin.canonicalize().unwrap();
+    let pack_ref =
+        frozen(native_tree_cache::freeze(&store_root, &twin, PACKS, &scope()).expect("twin packs"));
+    let mirror_ref = frozen(
+        native_tree_cache::freeze(&store_root, &twin, MIRROR, &scope()).expect("twin mirror"),
+    );
+
+    // Freeze crash between the move and the link, on the pack root.
+    let moved = root.path().join("moved");
+    let private = common::curated_clone(&moved, &shape, "moved");
+    let moved = moved.canonicalize().unwrap();
+    let before = common::private_identity(&private);
+    let backup = moved.join(".agent-run-native-cur1");
+    stdfs::create_dir_all(backup.join(".tmp/plugins/.git/objects")).expect("backup chain");
+    stdfs::rename(moved.join(PACKS), backup.join(PACKS)).expect("move original");
+    stdfs::write(
+        backup.join("op.json"),
+        format!(
+            "{{\"op_version\":1,\"op\":\"freeze\",\"root\":\"{PACKS}\",\"scope\":\"{}\",\"manifest_sha256\":\"{}\"}}",
+            pack_ref.scope, pack_ref.manifest_sha256
+        ),
+    )
+    .expect("record");
+    native_tree_cache::recover(&store_root, &moved).expect("recover moved pack");
+    assert_eq!(
+        stdfs::read_link(moved.join(PACKS)).unwrap(),
+        shared_assets::shared_tree_root(&store_root, &pack_ref).unwrap()
+    );
+    assert!(!backup.exists());
+    assert_eq!(
+        common::private_identity(&private),
+        before,
+        "recovery keeps Git state"
+    );
+
+    // Thaw crash after the clone was staged but before the link dropped.
+    let link = twin.join(MIRROR);
+    let target = stdfs::read_link(&link).unwrap();
+    let backup = twin.join(".agent-run-native-cur2");
+    stdfs::create_dir_all(backup.join("tree/plugin-00")).expect("staged clone");
+    stdfs::write(backup.join("tree/plugin-00/partial.md"), b"partial").expect("partial clone");
+    stdfs::write(
+        backup.join("op.json"),
+        format!(
+            "{{\"op_version\":1,\"op\":\"thaw\",\"root\":\"{MIRROR}\",\"scope\":\"{}\",\"manifest_sha256\":\"{}\"}}",
+            mirror_ref.scope, mirror_ref.manifest_sha256
+        ),
+    )
+    .expect("record");
+    native_tree_cache::recover(&store_root, &twin).expect("recover staged thaw");
+    assert_eq!(
+        stdfs::read_link(&link).unwrap(),
+        target,
+        "rolled back to the exact link"
+    );
+    assert!(!backup.exists());
+    cleanup_store(&store_root);
+}
+
+/// The census pins curated links and their blobs while any home links them
+/// and drops them once the last physical home is gone.
+#[test]
+fn census_pins_curated_links_until_the_last_home_goes() {
+    let root = TempDir::new().expect("fixture root");
+    let store_root = store(root.path());
+    let shape = common::curated_shape_small(4096);
+    let mut homes = Vec::new();
+    let mut references = Vec::new();
+    for name in ["first", "second"] {
+        let home_path = root.path().join(name);
+        common::curated_clone(&home_path, &shape, name);
+        let home_path = home_path.canonicalize().unwrap();
+        references = [MIRROR, PACKS]
+            .into_iter()
+            .map(|root_key| {
+                frozen(
+                    native_tree_cache::freeze(&store_root, &home_path, root_key, &scope()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        homes.push(home_path);
+    }
+    let keys: Vec<String> = references
+        .iter()
+        .map(|reference| format!("{}/{}", reference.scope, reference.manifest_sha256))
+        .collect();
+    let scan = |homes: &[&Path]| native_tree_cache::scan_refs(&store_root, homes);
+    let both = scan(&[&homes[0], &homes[1]]);
+    assert!(both.complete);
+    assert!(keys.iter().all(|key| both.trees.contains_key(key)));
+    let pack_blobs = shared_assets::shared_tree_blob_names(&store_root, &references[1]).unwrap();
+    assert!(pack_blobs.iter().all(|blob| both.blobs.contains(blob)));
+    stdfs::remove_dir_all(&homes[0]).unwrap();
+    let last = scan(&[&homes[1]]);
+    assert!(last.complete && keys.iter().all(|key| last.trees.contains_key(key)));
+    stdfs::remove_dir_all(&homes[1]).unwrap();
+    let none = scan(&[]);
+    assert!(none.complete && none.trees.is_empty() && none.blobs.is_empty());
+    cleanup_store(&store_root);
+}
+
+/// Concurrent starts over two homes with identical clones converge on one
+/// tree per root and thaw into independent private inodes.
+#[test]
+fn concurrent_curated_freezes_and_thaws_stay_independent() {
+    let root = TempDir::new().expect("fixture root");
+    let store_root = store(root.path());
+    let shape = common::curated_shape_small(8192);
+    let homes: Vec<PathBuf> = ["left", "right"]
+        .into_iter()
+        .map(|name| {
+            let home_path = root.path().join(name);
+            common::curated_clone(&home_path, &shape, name);
+            home_path.canonicalize().unwrap()
+        })
+        .collect();
+    let refs: Vec<Vec<SharedTreeRef>> = std::thread::scope(|scope_| {
+        let workers: Vec<_> = homes
+            .iter()
+            .map(|home_path| {
+                let store_root = &store_root;
+                scope_.spawn(move || {
+                    [MIRROR, PACKS]
+                        .into_iter()
+                        .map(|root_key| {
+                            frozen(
+                                native_tree_cache::freeze(
+                                    store_root,
+                                    home_path,
+                                    root_key,
+                                    &scope(),
+                                )
+                                .unwrap(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect()
+    });
+    assert_eq!(refs[0], refs[1]);
+    std::thread::scope(|scope_| {
+        for home_path in &homes {
+            let store_root = &store_root;
+            scope_.spawn(move || {
+                for root_key in [PACKS, MIRROR] {
+                    native_tree_cache::thaw(store_root, home_path, root_key).unwrap();
+                }
+            });
+        }
+    });
+    let inode = |home: &Path| {
+        stdfs::metadata(home.join(PACKS).join(format!("{}.pack", common::PACK_STEM)))
+            .unwrap()
+            .ino()
+    };
+    assert_ne!(
+        inode(&homes[0]),
+        inode(&homes[1]),
+        "thawed packs are independent"
+    );
+    for home_path in &homes {
+        assert!(home_path.join(MIRROR).symlink_metadata().unwrap().is_dir());
+        assert!(home_path.join(PACKS).symlink_metadata().unwrap().is_dir());
+    }
+    cleanup_store(&store_root);
+}
+
+/// Measures the curated increment on two homes with the measured native
+/// shape: 5380 files totalling ~53.6 MB in 2352 directories (depth 10) plus
+/// the 24,205,581-byte pack. Prints unique-inode bytes before, idle after
+/// both freezes, peak with one home thawed, and idle again after refreeze,
+/// plus first/second freeze, thaw, guard-scan and refreeze wall times.
+/// Run with `cargo test --release ... -- --ignored --nocapture`.
+#[test]
+#[ignore = "measurement; run in release with --ignored --nocapture"]
+fn measure_curated_increment() {
+    let root = TempDir::new().expect("fixture root");
+    let store_root = store(root.path());
+    let shape = common::measured_shape(53_611_752 / 5380, common::MEASURED_PACK_BYTES);
+    let homes: Vec<PathBuf> = ["first", "second"]
+        .into_iter()
+        .map(|name| {
+            let home_path = root.path().join(name);
+            common::curated_clone(&home_path, &shape, name);
+            home_path.canonicalize().unwrap()
+        })
+        .collect();
+    let bytes = |paths: &[PathBuf]| unique_inode_bytes(paths);
+    let all = [homes[0].clone(), homes[1].clone(), store_root.clone()];
+    let before = bytes(&all);
+    let timed = |label: &str, work: &mut dyn FnMut()| {
+        let started = Instant::now();
+        work();
+        let elapsed = started.elapsed();
+        eprintln!("measure {label}: {:.3}s", elapsed.as_secs_f64());
+        elapsed
+    };
+    for (index, home_path) in homes.iter().enumerate() {
+        timed(&format!("freeze home {}", index + 1), &mut || {
+            for root_key in [MIRROR, PACKS] {
+                frozen(
+                    native_tree_cache::freeze(&store_root, home_path, root_key, &scope()).unwrap(),
+                );
+            }
+        });
+    }
+    let idle = bytes(&all);
+    let thaw = timed("thaw home 1 (mirror+packs)", &mut || {
+        for root_key in [PACKS, MIRROR] {
+            native_tree_cache::thaw(&store_root, &homes[0], root_key).unwrap();
+        }
+    });
+    let peak = bytes(&all);
+    let guard = agent_run_platform::shared_asset_guard::SharedAssetGuard::new(&store_root).unwrap();
+    let scan = timed("guard hardlink scan", &mut || {
+        guard.verify_no_hardlink_aliases().unwrap()
+    });
+    timed("refreeze home 1 unchanged", &mut || {
+        for root_key in [MIRROR, PACKS] {
+            frozen(native_tree_cache::freeze(&store_root, &homes[0], root_key, &scope()).unwrap());
+        }
+    });
+    let after = bytes(&all);
+    eprintln!(
+        "measure unique-inode bytes: before={before} idle={idle} peak(one thawed)={peak} idle-after={after}"
+    );
+    eprintln!("measure thaw+guard: {:.3}s", (thaw + scan).as_secs_f64());
     cleanup_store(&store_root);
 }

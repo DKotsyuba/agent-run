@@ -368,13 +368,40 @@ impl Dir {
     /// dereferenced; the parent directory is synced like [`Dir::remove`].
     /// Fails with `ENOTEMPTY` while the directory still holds entries.
     pub fn remove_directory(&self, path: &Path) -> Result<()> {
+        self.unlink(path, libc::AT_REMOVEDIR, true)
+    }
+    /// [`Dir::remove_directory`] without the parent-directory durability
+    /// flush, for emptying a disposable tree whose removal a crash may
+    /// safely leave partial; the caller syncs once when it matters.
+    pub fn discard_directory(&self, path: &Path) -> Result<()> {
+        self.unlink(path, libc::AT_REMOVEDIR, false)
+    }
+    /// [`Dir::remove`] without the parent-directory durability flush, for
+    /// emptying a disposable tree; see [`Dir::discard_directory`].
+    pub fn discard(&self, path: &Path) -> Result<()> {
+        self.unlink(path, 0, false)
+    }
+    /// Unlinks one final component through its no-follow parent with
+    /// `flags`, syncing the parent directory only when `durable`.
+    fn unlink(&self, path: &Path, flags: libc::c_int, durable: bool) -> Result<()> {
         let (parent, name) = self.parent(path, false)?;
         // SAFETY: parent is a live directory descriptor and name is NUL-terminated.
-        if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } < 0 {
+        if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) } < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        sync_directory(&parent)?;
+        if durable {
+            sync_directory(&parent)?;
+        }
         Ok(())
+    }
+    /// Flushes this directory durably (`F_FULLFSYNC` on macOS).
+    ///
+    /// The one barrier callers of the unsynced staging primitives issue
+    /// before a staged tree becomes live: on APFS the flush commits the
+    /// volume's pending metadata transaction, including every earlier
+    /// unsynced create, clone and unlink.
+    pub fn sync(&self) -> Result<()> {
+        sync_directory(&self.0)
     }
     /// Classify a final path entry without following it or any parent link.
     pub fn entry_type(&self, path: &Path) -> Result<EntryType> {
@@ -436,6 +463,28 @@ impl Dir {
     pub fn restrict_owner_read(&self) -> Result<()> {
         self.0
             .set_permissions(std::fs::Permissions::from_mode(0o500))?;
+        Ok(())
+    }
+    /// Sets the permission bits of one owned final entry below this
+    /// directory without following it or any parent link.
+    ///
+    /// `mode` is applied exactly (`fchmodat` with `AT_SYMLINK_NOFOLLOW`
+    /// through the no-follow parent descriptor), so a symlink at `path` is
+    /// never dereferenced and nothing outside this directory changes.
+    pub fn set_mode(&self, path: &Path, mode: u32) -> Result<()> {
+        let (parent, name) = self.parent(path, false)?;
+        // SAFETY: parent is a live directory descriptor and name is NUL-terminated.
+        if unsafe {
+            libc::fchmodat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                mode as libc::mode_t,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
         Ok(())
     }
     /// Read a final symbolic-link target without following it or its parents.
@@ -517,7 +566,22 @@ impl Dir {
         }
         Ok((fd, parts.last().expect("nonempty validated path").clone()))
     }
+    /// Creates, or validates an existing, owned real directory at `path`
+    /// (missing ancestors are created) and syncs its parent directory. An
+    /// existing symlink or non-directory at `path` is refused.
     pub fn directory(&self, path: &Path) -> Result<()> {
+        self.make_directory(path, true)
+    }
+    /// [`Dir::directory`] without the parent-directory durability flush, for
+    /// a disposable staging tree built parent-first; the caller issues one
+    /// [`Dir::sync`] barrier before the tree becomes live. Missing ancestors
+    /// are still created (and synced) like [`Dir::write`].
+    pub fn stage_directory(&self, path: &Path) -> Result<()> {
+        self.make_directory(path, false)
+    }
+    /// Creates or validates one owned real directory, syncing its parent
+    /// only when `durable`.
+    fn make_directory(&self, path: &Path, durable: bool) -> Result<()> {
         let (parent, name) = self.parent(path, true)?;
         // SAFETY: parent and name are live, mkdirat does not retain pointers.
         let n = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
@@ -538,7 +602,9 @@ impl Dir {
         }
         // SAFETY: n is newly allocated by openat.
         let _directory = unsafe { File::from_raw_fd(n) };
-        sync_directory(&parent)?;
+        if durable {
+            sync_directory(&parent)?;
+        }
         Ok(())
     }
     pub fn open_file(&self, path: &Path) -> Result<File> {
@@ -856,13 +922,7 @@ impl Dir {
     /// dereferences the final component, so a symlink there is removed as
     /// the link itself, matching the descriptor-anchored read/write above.
     pub fn remove(&self, path: &Path) -> Result<()> {
-        let (parent, name) = self.parent(path, false)?;
-        // SAFETY: parent is a live directory descriptor and name is NUL-terminated.
-        if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        sync_directory(&parent)?;
-        Ok(())
+        self.unlink(path, 0, true)
     }
 }
 /// Outcome of one kernel no-replace rename attempt between live descriptors.

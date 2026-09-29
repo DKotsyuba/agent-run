@@ -221,8 +221,23 @@ fn manifest(entries: &[Value]) -> Vec<u8> {
     canonical(&json!({"snapshot_version": 1, "entries": entries}))
 }
 
+/// Loads one managed snapshot manifest under the historical 64 KiB bound.
+///
+/// Managed snapshots, plugin views and runtime-index checks keep this bound
+/// unchanged; `None` means the directory holds no manifest.
 pub(crate) fn load_manifest(dir: &Dir) -> Result<Option<Vec<Value>>> {
-    let Some(raw) = dir.optional(Path::new(SNAPSHOT_MANIFEST), MAX_METADATA)? else {
+    load_manifest_bounded(dir, MAX_METADATA)
+}
+
+/// Loads and version-checks one snapshot manifest read under `limit` bytes.
+///
+/// Returns the manifest's entry objects, `None` when no manifest exists, and
+/// an error for a manifest over `limit`, malformed JSON, a non-object entry
+/// or any `snapshot_version` other than 1. Only the read bound differs from
+/// [`load_manifest`]; the parsed shape and its validation are identical, so
+/// manifest bytes and their digests never change with the bound.
+pub(crate) fn load_manifest_bounded(dir: &Dir, limit: usize) -> Result<Option<Vec<Value>>> {
+    let Some(raw) = dir.optional(Path::new(SNAPSHOT_MANIFEST), limit)? else {
         return Ok(None);
     };
     let document: Value =

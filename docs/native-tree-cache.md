@@ -1,8 +1,10 @@
 # Native directory cache lifecycle
 
 Retained Codex homes each duplicate the same unindexed native directory
-caches: the generated `skills/.system` skills tree and the
-remote-downloaded plugin parents under `plugins/cache/<market>/<plugin>`.
+caches: the generated `skills/.system` skills tree, the
+remote-downloaded plugin parents under `plugins/cache/<market>/<plugin>`,
+and the native curated plugin marketplace clone's working tree and Git
+packs under `.tmp/plugins`.
 `agent-run-core::native_tree_cache` removes those duplicates while idle
 without changing what the native SDK sees or does.
 
@@ -20,6 +22,30 @@ without changing what the native SDK sees or does.
   store writes version updates into the parent itself, so these roots are
   thawed before every native invocation that could mutate the cache —
   resume, retry, account switch, and probes alike.
+- `.tmp/plugins/plugins` (`CuratedMirror`) — exactly the working-tree
+  plugins directory of the native curated marketplace clone, frozen only
+  while the clone's `.tmp/plugins/.git` is a real directory. The native
+  startup sync (Codex `core-plugins/src/startup_sync.rs`) fetches into the
+  existing private `.git`, stages a replacement repository and activates it
+  by renaming the whole `.tmp/plugins`, and the plugin manager copies
+  installed payloads out of this tree, so it is thawed before every native
+  invocation exactly like a remote plugin parent.
+- `.tmp/plugins/.git/objects/pack` (`CuratedPacks`) — exactly the clone's
+  Git pack directory, frozen only while it holds nothing but regular
+  `pack-<40|64 hex>.<pack|idx|rev|bitmap|keep|mtimes|promisor>` files.
+  Packs are immutable and byte-identical across homes cloned from the same
+  upstream state (measured: a 24,205,581-byte pack plus index and reverse
+  index), and are thawed before every native invocation so fetch and
+  repack keep native behavior.
+
+Only those two exact paths of the clone are ever shared. HEAD, refs,
+index, logs, config and locks under `.git`, `.agents`, the clone's root
+files and the `.tmp/plugins.sha`/`.tmp/plugins.sync.lock` siblings stay
+private and untouched (bytes, inode and modification time), so native Git
+state, the fast-path SHA check and the per-home sync lock keep exactly
+their native behavior; recovery never drops them. A clone without a real
+`.git`, an empty pack directory, a `multi-pack-index`, a temporary pack or
+any other shape is skipped unchanged.
 
 Everything else is refused or skipped unchanged: the managed `personal`
 marketplace (covered by managed parent views), `plugins/data`, shallower or
@@ -33,9 +59,11 @@ it is named like a cache.
 ## Store layout and locking
 
 There is no second content-addressed store. Freeze captures the private
-tree (bounded walk: 4096 entries, 16 MiB per file, 128 MiB aggregate,
-depth 8, 10 s), builds a managed-snapshot staging copy inside the
-operation backup using the platform's APFS-clone snapshot writer, imports
+tree (bounded walk: 16384 entries, 32 MiB per file, 128 MiB aggregate,
+depth 16, a 4 MiB canonical manifest, 10 s), builds a managed-snapshot
+staging copy inside the operation backup — one APFS directory clone with
+file modes normalized, or per-file clones where directories cannot be
+cloned — imports
 it through the existing `shared_assets::import_shared_tree` publisher — so
 trees land in the existing readonly `trees/<scope>/<manifest-sha>`
 namespace with payloads deduplicated into the existing
@@ -66,10 +94,34 @@ Crash and reference safety:
   or rolled back to the exact link. Missing or malformed records are
   explicit failures that preserve contents. History and index bytes are
   never touched.
-- `thaw` restores each payload through the platform's APFS-clone snapshot
-  writer — an independent writable inode with the manifest's logical mode,
-  never an external hardlink — and the restored native tree contains
-  exactly the captured entries (the import manifest stays in the store).
+- `thaw` restores the verified tree as one APFS directory clone (or
+  per-file clones where directories cannot be cloned) — independent
+  writable inodes with the manifest's logical modes, never an external
+  hardlink — and the restored native tree contains exactly the captured
+  entries (the import manifest stays in the store).
+- Disposable staging copies, staged clones and proven originals are built
+  and removed without per-entry durability flushes: one full flush on the
+  staged clone is the barrier before a thaw swaps it in, and a proven freeze
+  original is first renamed to `discard` inside its backup so a crash
+  mid-removal leaves a subtree recovery removes without re-proving. The
+  store publisher keeps its own per-blob durability.
+
+Shared-tree bounds (the platform store and this unit agree): 16384 manifest
+entries, 32 MiB per payload, a 4 MiB manifest read bound
+(`shared_assets::MAX_TREE_MANIFEST_BYTES`) for shared-tree manifests only,
+256 MiB aggregate per store tree; the launch guard scans at most 400 000
+store paths. Runtime indexes, `op.json`, markers, plugin views and managed
+snapshots keep their 64 KiB bounds; manifest bytes and digests are
+unchanged.
+
+Measured on two homes with the measured curated shape (5380 files, 2352
+directories, depth 10, ~53.6 MB, plus the 24 MB pack), release build:
+unique-inode bytes 156.1 MB private → 79.1 MB idle-shared, thaw of both
+curated roots 2.2 s (≈1.5 s is the full content verification), store
+guard scan 0.14 s, refreeze of an unchanged home 6.1 s, freeze of a home
+whose trees already exist 6.5 s; the first publication of a new curated
+tree per scope is dominated by the publisher's per-blob full flushes
+(≈130 s).
 
 Implementation note: a no-follow directory handle's `list` is single-shot
 per handle (its duplicate shares the enumeration offset), so every walk in

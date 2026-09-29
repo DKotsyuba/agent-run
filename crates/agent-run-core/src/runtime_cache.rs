@@ -107,10 +107,13 @@ pub fn native_domain(identity: &ProviderLaunchIdentity, account: &AccountId) -> 
 }
 
 /// Recovers this home's own interrupted native operations and thaws every
-/// frozen remote plugin parent, before a native invocation that could write.
+/// frozen remote plugin parent and curated clone root, before a native
+/// invocation that could write.
 ///
-/// The native store rewrites remote plugin parents in place, so a frozen
-/// parent must be private again before any child exists: this runs before
+/// The native store rewrites remote plugin parents in place and the native
+/// curated sync fetches into, stages and activates the curated clone, so a
+/// frozen parent, curated working tree or Git pack directory must be private
+/// again before any child exists: this runs before
 /// every attempt, including probes, explicit resumes and the account-switch
 /// loop. The generated skills tree keeps its link — native discovery reads
 /// through it and a marker upgrade replaces the private link itself.
@@ -147,12 +150,35 @@ pub fn prepare_native(app_home: &Path, runtime_home: &Path, retained: bool) -> R
     }
     crate::native_tree_cache::recover(&root, runtime_home)?;
     let mut thawed = 0;
-    for root_key in plugin_parents(runtime_home)? {
+    let mut roots = curated_roots(runtime_home)?;
+    roots.extend(plugin_parents(runtime_home)?);
+    for root_key in roots {
         if crate::native_tree_cache::thaw(&root, runtime_home, &root_key)?.is_some() {
             thawed += 1;
         }
     }
     Ok(thawed)
+}
+
+/// Lists the curated clone roots present in one home right now.
+///
+/// A plain `NotFound` anywhere on either root's path means that root is
+/// absent; any other error — an unreadable or linked ancestor — propagates,
+/// so uncertainty about a frozen root never becomes a silent skip.
+fn curated_roots(runtime_home: &Path) -> Result<Vec<String>> {
+    let home = fs::Dir::open(runtime_home)?;
+    let mut roots = Vec::new();
+    for root_key in [
+        crate::native_tree_cache::CURATED_MIRROR_ROOT,
+        crate::native_tree_cache::CURATED_PACK_ROOT,
+    ] {
+        match home.entry_type(Path::new(root_key)) {
+            Ok(_) => roots.push(root_key.to_owned()),
+            Err(error) if not_found(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(roots)
 }
 
 /// Returns `true` only for a plain `NotFound`.
@@ -238,7 +264,9 @@ fn plugin_parents(runtime_home: &Path) -> Result<Vec<String>> {
 /// all-terminal lineage — so no native process can hold these trees. The home
 /// is first anchored in the layout registry (a cache-only home has no managed
 /// roots to map; the row is what keeps it in the collector's census after its
-/// agent history expires), then eligible native trees are frozen and both
+/// agent history expires), then eligible native trees — the system skills,
+/// the curated clone's working tree and Git packs, and remote plugin
+/// parents — are frozen and both
 /// metadata caches packed under the caller-supplied compatibility domain.
 /// Every step is reported and skipped on failure: an optional cache never
 /// turns a valid answer into a failure, and a failed preparation with a
@@ -275,6 +303,7 @@ pub fn consolidate(
     )?;
     let scope = native_domain(identity, account)?;
     let mut roots = vec![SYSTEM_SKILLS.to_owned()];
+    roots.extend(curated_roots(runtime_home)?);
     roots.extend(plugin_parents(runtime_home)?);
     for root_key in roots {
         match crate::native_tree_cache::freeze(&root, runtime_home, &root_key, &scope) {

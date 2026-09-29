@@ -679,3 +679,93 @@ fn unsupported_names_skip_but_uncertainty_errors() {
     permit(&runtime_storage::store_root(&fixture.app_home).unwrap());
     permit(&fixture.home);
 }
+
+/// The curated clone joins the same lifecycle: consolidation freezes its
+/// working tree and Git packs beside the other native roots, native
+/// preparation thaws both before any launch while private Git state keeps
+/// its identity, a later consolidation refreezes onto the same trees, GC
+/// retains them while the home exists, and collects them once the last
+/// physical home is gone.
+#[test]
+fn curated_clone_lifecycle_thaws_before_launch_and_collects_after_last_home() {
+    let fixture = fixture("acct-one", b"curated-lifecycle\n");
+    let private = common::curated_clone(&fixture.home, &common::curated_shape_small(8192), "one");
+    let before = common::private_identity(&private);
+    let mut store = Store::initialize(&fixture.app_home).expect("store");
+    let id: agent_run_core::domain::AgentId = "ag-20260101-000000-0000000001".parse().unwrap();
+    let consolidate = |store: &mut Store| {
+        runtime_cache::consolidate(
+            store,
+            &id,
+            &fixture.identity,
+            &fixture.account,
+            &fixture.app_home,
+            &fixture.home,
+            &witness(&fixture.app_home),
+        )
+        .expect("consolidation")
+    };
+    let report = consolidate(&mut store);
+    assert_eq!(
+        report.frozen, 4,
+        "skills, curated tree and packs, remote parent: {report:?}"
+    );
+    let curated = [
+        native_tree_cache::CURATED_MIRROR_ROOT,
+        native_tree_cache::CURATED_PACK_ROOT,
+    ];
+    let targets: Vec<PathBuf> = curated
+        .iter()
+        .map(|root_key| stdfs::read_link(fixture.home.join(root_key)).expect("curated link"))
+        .collect();
+    assert_eq!(
+        common::private_identity(&private),
+        before,
+        "freeze keeps Git state"
+    );
+
+    let thawed =
+        runtime_cache::prepare_native(&fixture.app_home, &fixture.home, true).expect("prepare");
+    assert_eq!(thawed, 3, "both curated roots and the remote parent thaw");
+    for root_key in curated {
+        assert!(fixture
+            .home
+            .join(root_key)
+            .symlink_metadata()
+            .unwrap()
+            .is_dir());
+    }
+    assert_eq!(
+        common::private_identity(&private),
+        before,
+        "thaw keeps Git state"
+    );
+
+    let again = consolidate(&mut store);
+    assert_eq!(again.frozen, 3, "thawed roots refreeze: {again:?}");
+    for (root_key, target) in curated.iter().zip(&targets) {
+        assert_eq!(
+            &stdfs::read_link(fixture.home.join(root_key)).unwrap(),
+            target
+        );
+    }
+    let root = runtime_storage::store_root(&fixture.app_home).unwrap();
+    let objects = all_objects(&root);
+    for outcome in converge(&mut store, &fixture.app_home) {
+        assert_eq!(
+            outcome.trees_removed + outcome.blobs_removed,
+            0,
+            "the home pins"
+        );
+    }
+    assert_eq!(all_objects(&root), objects);
+    permit(&fixture.home);
+    stdfs::remove_dir_all(&fixture.home).expect("home gone");
+    converge(&mut store, &fixture.app_home);
+    assert_eq!(
+        all_objects(&root),
+        (0, 0, 0),
+        "every curated object is collected"
+    );
+    permit(&root);
+}

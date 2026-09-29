@@ -1,9 +1,14 @@
 //! Freeze/thaw lifecycle for native Codex directory caches in retained homes.
 //!
 //! Idle retained homes each hold a private duplicate of the same native
-//! directory caches — the generated `skills/.system` tree and the
+//! directory caches — the generated `skills/.system` tree, the
 //! remote-downloaded plugin parents under `plugins/cache/<market>/<plugin>`
-//! marked by the native store's `.codex-remote-plugin-install.json` record.
+//! marked by the native store's `.codex-remote-plugin-install.json` record,
+//! and the native curated plugin marketplace clone's working-tree
+//! `.tmp/plugins/plugins` plus its immutable Git pack directory
+//! `.tmp/plugins/.git/objects/pack`. The clone's other Git state (HEAD,
+//! refs, index, logs, config, locks), `.agents`, root files and the
+//! `.tmp/plugins.sha`/`.tmp/plugins.sync.lock` siblings always stay private.
 //! This unit removes those duplicates without changing what the native SDK
 //! sees or does: while a home is caller-proven idle, [`freeze`] captures the
 //! verified private tree into the shared store's existing content-addressed
@@ -42,7 +47,7 @@
 use crate::fs::{self, Dir, EntryType};
 use agent_run_domain::{canonical, error::invalid, Error, Result};
 use agent_run_platform::{
-    shared_assets::{self, is_scope, SharedStoreLock, SharedTreeRef},
+    shared_assets::{self, is_scope, SharedStoreLock, SharedTreeRef, MAX_TREE_MANIFEST_BYTES},
     snapshot_tree::{RUNTIME_SNAPSHOT_INDEX, SNAPSHOT_MANIFEST},
 };
 use serde::Serialize;
@@ -65,16 +70,32 @@ const OP_RECORD: &str = "op.json";
 const STAGING: &str = "staging";
 /// Name of the staged clone subtree inside one thaw backup.
 const CLONE: &str = "tree";
-/// Upper bound for one manifest, record, or index read.
+/// Name a proven freeze original takes inside its backup once its removal
+/// may begin, so a crash mid-removal never leaves an unprovable original.
+const DISCARD: &str = "discard";
+/// Upper bound for one operation record, marker, or runtime index read.
+/// Shared-tree manifests use [`MAX_TREE_MANIFEST_BYTES`] instead.
 const MAX_METADATA: usize = 64 * 1024;
-/// Per-file payload bound, matching the platform capture limit.
-const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
-/// Maximum manifest entries one native tree may describe.
-const MAX_TREE_ENTRIES: usize = 4096;
+/// Per-file payload bound, matching the shared store's streaming bound; it
+/// admits a native Git pack (measured 24 MB) and refuses anything larger.
+const MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum manifest entries one native tree may describe, matching the
+/// shared store (the measured curated mirror holds 7732 entries).
+const MAX_TREE_ENTRIES: usize = 16_384;
 /// Maximum aggregate payload bytes one native tree may describe.
 const MAX_TREE_BYTES: u64 = 128 * 1024 * 1024;
-/// Maximum directory depth beneath one captured root.
-const MAX_DEPTH: u8 = 8;
+/// Maximum directory depth beneath one captured root (the measured curated
+/// mirror reaches depth 10).
+const MAX_DEPTH: u8 = 16;
+/// Home-relative working-tree plugins directory of the native curated
+/// plugin marketplace clone.
+pub const CURATED_MIRROR_ROOT: &str = ".tmp/plugins/plugins";
+/// Home-relative Git pack directory of the same native curated clone.
+pub const CURATED_PACK_ROOT: &str = ".tmp/plugins/.git/objects/pack";
+/// Home-relative Git directory whose presence proves the curated clone.
+const CURATED_GIT_DIR: &str = ".tmp/plugins/.git";
+/// Git pack file extensions a frozen pack directory may hold.
+const PACK_EXTENSIONS: [&str; 7] = ["pack", "idx", "rev", "bitmap", "keep", "mtimes", "promisor"];
 /// Wall-clock budget for one capture or census pass.
 const TIME_BUDGET: Duration = Duration::from_secs(10);
 /// Upper bound for one component of a cache root path.
@@ -104,6 +125,21 @@ pub enum NativeCacheKind {
     /// version updates into the parent itself, so this root must be
     /// [`thaw`]ed into a real writable tree before every native invocation.
     RemotePluginParent,
+    /// The working-tree plugins directory [`CURATED_MIRROR_ROOT`] of the
+    /// native curated marketplace clone, frozen only when the clone's
+    /// `.git` is a real directory. The native startup sync fetches into the
+    /// private `.git`, stages a replacement repository and activates it by
+    /// renaming the whole clone, and the plugin manager copies installed
+    /// payloads out of this tree, so it is [`thaw`]ed before every native
+    /// invocation exactly like a remote plugin parent.
+    CuratedMirror,
+    /// The Git pack directory [`CURATED_PACK_ROOT`] of the same clone,
+    /// frozen only when it holds nothing but regular `pack-<hash>.<ext>`
+    /// files. Pack files are immutable and byte-identical across homes
+    /// cloned from the same upstream state; HEAD, refs, index, logs, config
+    /// and locks stay private and untouched. [`thaw`]ed before every native
+    /// invocation so fetch and repack keep native behavior.
+    CuratedPacks,
 }
 
 /// The outcome of one [`freeze`] call.
@@ -182,7 +218,10 @@ fn safe_component(value: &str) -> bool {
 
 /// Classifies one home-relative root as a managed native cache kind.
 ///
-/// `skills/.system` classifies as [`NativeCacheKind::SystemSkills`]; exactly
+/// `skills/.system` classifies as [`NativeCacheKind::SystemSkills`], exactly
+/// [`CURATED_MIRROR_ROOT`] as [`NativeCacheKind::CuratedMirror`] and exactly
+/// [`CURATED_PACK_ROOT`] as [`NativeCacheKind::CuratedPacks`] — never any
+/// other path in or around the curated clone; exactly
 /// `plugins/cache/<market>/<plugin>` with both trailing components safe and
 /// `market` not `personal` classifies as
 /// [`NativeCacheKind::RemotePluginParent`] — classification alone does not
@@ -192,8 +231,11 @@ fn safe_component(value: &str) -> bool {
 /// `plugins/data` — is refused: this unit never treats an unclassified
 /// directory as disposable cache.
 pub fn classify(root_key: &str) -> Result<NativeCacheKind> {
-    if root_key == "skills/.system" {
-        return Ok(NativeCacheKind::SystemSkills);
+    match root_key {
+        "skills/.system" => return Ok(NativeCacheKind::SystemSkills),
+        CURATED_MIRROR_ROOT => return Ok(NativeCacheKind::CuratedMirror),
+        CURATED_PACK_ROOT => return Ok(NativeCacheKind::CuratedPacks),
+        _ => {}
     }
     let rest = root_key
         .strip_prefix("plugins/cache/")
@@ -241,6 +283,52 @@ fn valid_remote_marker(home: &Dir, root_key: &str) -> Result<bool> {
     };
     let remote_id = document["remote_plugin_id"].as_str();
     Ok(schema && remote_id.is_some_and(|id| !id.is_empty()))
+}
+
+/// Returns whether one curated root has the native shape this unit freezes.
+///
+/// Both curated kinds require the clone's `.git` to be a real directory
+/// (a gitfile, link or absent `.git` is not the native curated clone). The
+/// pack kind additionally requires a nonempty directory of regular
+/// `pack-<40 or 64 hex>.<ext>` files with a known Git pack extension —
+/// a `multi-pack-index`, a temporary pack or any other shape is left
+/// private. `false` means "skip unchanged"; only unexpected I/O errors
+/// propagate.
+fn curated_shape(home: &Dir, kind: NativeCacheKind) -> Result<bool> {
+    match home.entry_type(Path::new(CURATED_GIT_DIR)) {
+        Ok(EntryType::Directory) => {}
+        Ok(_) => return Ok(false),
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    if kind != NativeCacheKind::CuratedPacks {
+        return Ok(true);
+    }
+    let names = home.list(Some(Path::new(CURATED_PACK_ROOT)))?;
+    if names.is_empty() {
+        return Ok(false);
+    }
+    for name in names {
+        let Some(text) = name.to_str() else {
+            return Ok(false);
+        };
+        let Some((hash, extension)) = text
+            .strip_prefix("pack-")
+            .and_then(|rest| rest.split_once('.'))
+        else {
+            return Ok(false);
+        };
+        let hex = hash
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+        if !matches!(hash.len(), 40 | 64) || !hex || !PACK_EXTENSIONS.contains(&extension) {
+            return Ok(false);
+        }
+        if home.entry_type(&Path::new(CURATED_PACK_ROOT).join(text))? != EntryType::File {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Returns whether `prefix` is a component-wise prefix of `path`.
@@ -346,8 +434,9 @@ fn require_owner(uid: u32, label: &str) -> Result<()> {
 /// access and the execution bit are preserved; group/other bits are not
 /// native-private state). The walk is bounded by [`MAX_TREE_ENTRIES`],
 /// [`MAX_FILE_BYTES`], [`MAX_TREE_BYTES`], [`MAX_DEPTH`], and
-/// [`TIME_BUDGET`]; each payload is streamed through a running hash without
-/// buffering the whole tree.
+/// [`TIME_BUDGET`], and its canonical manifest by [`MAX_TREE_MANIFEST_BYTES`];
+/// each payload is streamed through a running hash without buffering the
+/// whole tree.
 fn capture(directory: &Dir, deadline: Instant) -> Result<Capture> {
     let mut entries: Vec<Value> = Vec::new();
     let mut total = 0_u64;
@@ -357,8 +446,8 @@ fn capture(directory: &Dir, deadline: Instant) -> Result<Capture> {
         return Err(invalid("native cache tree exceeds the entry bound"));
     }
     let manifest = canonical_manifest(&entries);
-    if manifest.len() > MAX_METADATA {
-        return Err(invalid("native cache manifest exceeds the metadata bound"));
+    if manifest.len() > MAX_TREE_MANIFEST_BYTES {
+        return Err(invalid("native cache manifest exceeds the manifest bound"));
     }
     Ok(Capture {
         manifest_sha256: fs::sha256(&manifest),
@@ -476,16 +565,46 @@ fn hash_entry(directory: &Dir, name: &str) -> Result<(String, u64, bool)> {
 /// `staging`, using the platform's APFS-clone snapshot writer per payload so
 /// the copy is cheap and inode-independent, then writes the canonical
 /// manifest last.
-fn stage_capture(home: &Dir, staging: &Path, source: &Dir, capture: &Capture) -> Result<()> {
+///
+/// The copy is disposable input to the store publisher, which streams and
+/// durably publishes every payload itself, so it is staged without
+/// per-entry durability flushes; a crash leaves a staging subtree recovery
+/// drops unconditionally. On a cloning volume the whole `root` hierarchy is
+/// cloned in one call and only file modes are normalized to the captured
+/// logical modes (the publisher asserts no source directory mode); the
+/// publisher's topology and digest checks still refuse any drift from the
+/// capture. Otherwise entries are staged one by one, parents first.
+fn stage_capture(
+    home: &Dir,
+    staging: &Path,
+    root: &Path,
+    source: &Dir,
+    capture: &Capture,
+) -> Result<()> {
+    if home.clone_directory(staging, home, root)? {
+        let staged = home.subdir(staging)?;
+        staged.permit_owner_write()?;
+        for entry in &capture.entries {
+            if entry["type"] == "file" {
+                let relative = Path::new(entry["path"].as_str().expect("captured paths are str"));
+                staged.set_mode(
+                    relative,
+                    entry["mode"].as_u64().expect("captured mode") as u32,
+                )?;
+            }
+        }
+        return home.write(&staging.join(SNAPSHOT_MANIFEST), &capture.manifest, 0o600);
+    }
+    home.directory(staging)?;
     for entry in &capture.entries {
         let relative = Path::new(entry["path"].as_str().expect("captured paths are str"));
         if entry["type"] == "directory" {
-            home.directory(&staging.join(relative))?;
+            home.stage_directory(&staging.join(relative))?;
             continue;
         }
         let payload = source.read(relative, MAX_FILE_BYTES)?;
         let mode = entry["mode"].as_u64().expect("captured mode") as u32;
-        home.write_snapshot_file(&staging.join(relative), source, relative, &payload, mode)?;
+        home.stage_snapshot_file(&staging.join(relative), source, relative, &payload, mode)?;
     }
     home.write(&staging.join(SNAPSHOT_MANIFEST), &capture.manifest, 0o600)
 }
@@ -571,8 +690,14 @@ fn read_record(home: &Dir, backup: &str) -> Result<OpRecord> {
     Ok(record)
 }
 
-/// Empties one owned directory through live descriptors, leaving the
-/// directory itself for the caller; unexpected entry kinds abort.
+/// Empties one owned disposable directory through live descriptors, leaving
+/// the directory itself for the caller; unexpected entry kinds abort.
+///
+/// Only disposable subtrees reach here — staging copies, staged clones and
+/// proven originals already renamed to [`DISCARD`] — so entries are
+/// unlinked without per-entry durability flushes; the caller's final
+/// synced removal of the emptied directory is the barrier, and a crash
+/// mid-removal leaves a subtree recovery removes unconditionally.
 fn remove_tree(directory: &Dir) -> Result<()> {
     directory.permit_owner_write()?;
     for name in directory.list(None)? {
@@ -580,10 +705,10 @@ fn remove_tree(directory: &Dir) -> Result<()> {
         match directory.entry_type(&relative)? {
             EntryType::Directory => {
                 remove_tree(&directory.subdir(&relative)?)?;
-                directory.remove_directory(&relative)?;
+                directory.discard_directory(&relative)?;
             }
             EntryType::File => {
-                directory.remove(&relative)?;
+                directory.discard(&relative)?;
             }
             kind => {
                 return Err(invalid(format!(
@@ -635,8 +760,14 @@ fn prune_backup_parents(home: &Dir, removed: &Path, base: &Path) -> Result<()> {
 
 /// Removes one freeze backup whose moved original still hashes to the
 /// recorded manifest, plus the disposable staged capture.
+///
+/// The proven original is first renamed to [`DISCARD`] in one synced step,
+/// and only then emptied: a crash mid-removal leaves a `discard` subtree a
+/// later pass removes without re-proving, never a partial original that
+/// could no longer be proven and would block recovery.
 fn discard_freeze_backup(home: &Dir, backup: &str, record: &OpRecord) -> Result<()> {
     remove_backup_child(home, backup, STAGING)?;
+    remove_backup_child(home, backup, DISCARD)?;
     let staged = Path::new(backup).join(&record.root);
     match home.entry_type(&staged) {
         Ok(EntryType::Directory) => {
@@ -651,9 +782,10 @@ fn discard_freeze_backup(home: &Dir, backup: &str, record: &OpRecord) -> Result<
                     record.root
                 )));
             }
-            remove_tree(&home.subdir(&staged)?)?;
-            home.remove_directory(&staged)?;
+            let discard = Path::new(backup).join(DISCARD);
+            home.rename_entry_no_replace(&staged, &discard)?;
             prune_backup_parents(home, &staged, Path::new(backup))?;
+            remove_backup_child(home, backup, DISCARD)?;
         }
         Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
         entry => {
@@ -692,9 +824,9 @@ fn finish_backup_removal(home: &Dir, backup: &str) -> Result<()> {
 /// account/connection compatibility domain (64 lowercase hex). The home must
 /// be quiescent — no native process may hold or mutate the root.
 ///
-/// A remote plugin parent without a valid native remote-install marker is
-/// returned as [`FreezeOutcome::SkippedUnchanged`] without touching
-/// anything. Otherwise the private tree is captured with exact content and
+/// A remote plugin parent without a valid native remote-install marker, or
+/// a curated root outside its native clone shape, is returned as
+/// [`FreezeOutcome::SkippedUnchanged`] without touching anything. Otherwise the private tree is captured with exact content and
 /// topology, a managed-snapshot staging copy is imported through the
 /// existing shared-tree publisher (after the operation record pins the
 /// intent inside the home), and — under one global [`SharedStoreLock`] hold —
@@ -729,8 +861,14 @@ pub fn freeze(
             Ok(FreezeOutcome::AlreadyFrozen(reference))
         }
         Ok(EntryType::Directory) => {
-            if kind == NativeCacheKind::RemotePluginParent && !valid_remote_marker(&home, root_key)?
-            {
+            let eligible = match kind {
+                NativeCacheKind::SystemSkills => true,
+                NativeCacheKind::RemotePluginParent => valid_remote_marker(&home, root_key)?,
+                NativeCacheKind::CuratedMirror | NativeCacheKind::CuratedPacks => {
+                    curated_shape(&home, kind)?
+                }
+            };
+            if !eligible {
                 return Ok(FreezeOutcome::SkippedUnchanged);
             }
             freeze_directory(&root, &home_path, &home, root_key, scope)
@@ -764,7 +902,7 @@ fn freeze_directory(
     let backup = format!("{BACKUP_PREFIX}{}", uuid::Uuid::new_v4().simple());
     write_record(home, &backup, &record("freeze", root_key, &reference))?;
     let staged_rel = Path::new(&backup).join(STAGING).join(root_key);
-    stage_capture(home, &staged_rel, &source, &captured)?;
+    stage_capture(home, &staged_rel, Path::new(root_key), &source, &captured)?;
     shared_assets::import_shared_tree(root, scope, home_path, &staged_rel)?;
     shared_assets::verify_shared_tree(root, &reference)?;
     remove_backup_child(home, &backup, STAGING)?;
@@ -784,11 +922,12 @@ fn freeze_directory(
 /// Thaws one frozen native cache root into an independent writable tree.
 ///
 /// The link target is parsed and its store tree fully verified
-/// ([`shared_assets::verify_shared_tree`]) before anything is changed. Each
-/// payload is restored through the platform's APFS-clone snapshot writer —
-/// an independent inode with the manifest's logical mode, never an external
-/// hardlink — into a staged backup clone, the link is removed, and the real
-/// tree is renamed into place under one global [`SharedStoreLock`] hold. The
+/// ([`shared_assets::verify_shared_tree`]) before anything is changed. The
+/// tree is restored as APFS clones ([`clone_tree`]: one directory clone, or
+/// per-file clones where directories cannot be cloned) — independent inodes
+/// with the manifest's logical modes, never an external hardlink — into a
+/// staged backup clone, the link is removed, and the real tree is renamed
+/// into place under one global [`SharedStoreLock`] hold. The
 /// restored tree contains exactly the captured native entries; the import
 /// manifest stays in the store. A root that is already a real directory
 /// returns `Ok(None)` — already private — without touching anything. A
@@ -814,16 +953,14 @@ pub fn thaw(store_root: &Path, home_path: &Path, root_key: &str) -> Result<Optio
     };
     shared_assets::verify_shared_tree(&root, &reference)?;
     let store = Dir::open(&root)?;
-    let tree = store.subdir(
-        &Path::new("trees")
-            .join(&reference.scope)
-            .join(&reference.manifest_sha256),
-    )?;
+    let tree = Path::new("trees")
+        .join(&reference.scope)
+        .join(&reference.manifest_sha256);
     let backup = format!("{BACKUP_PREFIX}{}", uuid::Uuid::new_v4().simple());
     {
         let _guard = SharedStoreLock::acquire(&root)?;
         write_record(&home, &backup, &record("thaw", root_key, &reference))?;
-        clone_tree(&home, &Path::new(&backup).join(CLONE), &tree)?;
+        clone_tree(&home, &Path::new(&backup).join(CLONE), &store, &tree)?;
         home.remove(Path::new(root_key))?;
         home.rename_entry_no_replace(&Path::new(&backup).join(CLONE), Path::new(root_key))?;
         discard_thaw_backup(&home, &backup)?;
@@ -831,13 +968,26 @@ pub fn thaw(store_root: &Path, home_path: &Path, root_key: &str) -> Result<Optio
     Ok(Some(reference))
 }
 
-/// Clones one verified store tree's manifest entries into `staged` as
-/// independent writable real files with their logical modes. The store's own
-/// snapshot manifest is deliberately not restored: the native root never
-/// contained it.
-fn clone_tree(home: &Dir, staged: &Path, tree: &Dir) -> Result<()> {
-    home.directory(staged)?;
-    let payload = tree.read(Path::new(SNAPSHOT_MANIFEST), MAX_METADATA)?;
+/// Clones the verified store tree `tree_rel` (relative to `store`) into
+/// `staged` as independent writable real entries with their logical modes —
+/// directories `0o700`, files their manifest `0o600`/`0o700`. The store's
+/// own snapshot manifest is deliberately not restored: the native root
+/// never contained it.
+///
+/// On a cloning volume the whole hierarchy is cloned in one call, the
+/// manifest file is dropped and every manifest entry's mode is set exactly;
+/// otherwise each payload is cloned one by one, parents first. Clones share
+/// the store's already-durable data blocks, so nothing is flushed per entry
+/// and one [`Dir::sync`] barrier on the staged root commits the tree before
+/// the caller swaps it in; a crash before the swap leaves a staged clone
+/// recovery proves against the record or rolls back to the link.
+///
+/// ponytail: the single barrier relies on APFS committing all pending
+/// metadata on one full flush; a non-APFS volume needing per-entry flushes
+/// would stage through the synced writers instead.
+fn clone_tree(home: &Dir, staged: &Path, store: &Dir, tree_rel: &Path) -> Result<()> {
+    let tree = store.subdir(tree_rel)?;
+    let payload = tree.read(Path::new(SNAPSHOT_MANIFEST), MAX_TREE_MANIFEST_BYTES)?;
     let document: Value = serde_json::from_slice(&payload)
         .map_err(|_| invalid("shared tree manifest is malformed"))?;
     let entries = document
@@ -847,6 +997,31 @@ fn clone_tree(home: &Dir, staged: &Path, tree: &Dir) -> Result<()> {
     if entries.len() > MAX_TREE_ENTRIES {
         return Err(invalid("native cache tree exceeds the entry bound"));
     }
+    let logical_mode = |entry: &Value| -> Result<u32> {
+        if entry["type"] == "directory" {
+            return Ok(0o700);
+        }
+        let mode = entry.get("mode").and_then(Value::as_u64).unwrap_or(0o600) as u32;
+        if !matches!(mode, 0o600 | 0o700) {
+            return Err(invalid("shared tree manifest mode is not normalized"));
+        }
+        Ok(mode)
+    };
+    if home.clone_directory(staged, store, tree_rel)? {
+        let clone = home.subdir(staged)?;
+        clone.permit_owner_write()?;
+        clone.discard(Path::new(SNAPSHOT_MANIFEST))?;
+        for entry in entries {
+            let relative = Path::new(
+                entry["path"]
+                    .as_str()
+                    .ok_or_else(|| invalid("shared tree manifest entries are malformed"))?,
+            );
+            clone.set_mode(relative, logical_mode(entry)?)?;
+        }
+        return clone.sync();
+    }
+    home.directory(staged)?;
     for entry in entries {
         let relative = Path::new(
             entry["path"]
@@ -854,17 +1029,14 @@ fn clone_tree(home: &Dir, staged: &Path, tree: &Dir) -> Result<()> {
                 .ok_or_else(|| invalid("shared tree manifest entries are malformed"))?,
         );
         if entry["type"] == "directory" {
-            home.directory(&staged.join(relative))?;
+            home.stage_directory(&staged.join(relative))?;
             continue;
         }
         let bytes = tree.read(relative, MAX_FILE_BYTES)?;
-        let mode = entry.get("mode").and_then(Value::as_u64).unwrap_or(0o600) as u32;
-        if !matches!(mode, 0o600 | 0o700) {
-            return Err(invalid("shared tree manifest mode is not normalized"));
-        }
-        home.write_snapshot_file(&staged.join(relative), tree, relative, &bytes, mode)?;
+        let mode = logical_mode(entry)?;
+        home.stage_snapshot_file(&staged.join(relative), &tree, relative, &bytes, mode)?;
     }
-    Ok(())
+    home.subdir(staged)?.sync()
 }
 
 /// Completes or rolls back every interrupted native-cache operation in one
@@ -1081,7 +1253,11 @@ fn scan_home(store_root: &Path, home_path: &Path, scan: &mut NativeRefScan, dead
         scan.complete = false;
         return;
     };
-    let mut roots = vec!["skills/.system".to_owned()];
+    let mut roots = vec![
+        "skills/.system".to_owned(),
+        CURATED_MIRROR_ROOT.to_owned(),
+        CURATED_PACK_ROOT.to_owned(),
+    ];
     let mut parents = 0_usize;
     let markets = match home.list(Some(Path::new("plugins/cache"))) {
         Ok(markets) => markets,
