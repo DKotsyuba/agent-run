@@ -220,8 +220,11 @@ it, before unlinking anything:
   current configuration, credentials and not-conclusively-released service
   definitions, any of which may name a shared tree, a derived view, or a
   single payload file directly;
-- the objects those paths name, including the tree behind a protected view,
-  derived from the view's own manifest bytes.
+- the objects those paths name. A view reference pins that view and, read
+  from the view's own manifest bytes, the tree and payloads beneath it — a
+  reference to a whole scope container, or to the view namespace root, pins
+  every view it covers the same way, and a protected view whose manifest
+  cannot be read stops destructive work.
 
 **A complete proof precedes any deletion.** The registry census is
 all-or-nothing: a page that fails, or a registry beyond the page bound,
@@ -241,9 +244,9 @@ from the remaining manifests: a view file is an internal hardlink, so an
 obsolete view left behind keeps its payload's inode allocated and a stale
 view whose tree is gone would corrupt a future import's reuse of the same
 content-addressed name. Committed rows are removed only once their physical
-home is conclusively gone — a plain `NotFound` resolution, never a permission
-or I/O error — and no configuration, service or agent row still references
-the home; the store's own removal is the authoritative final check, and
+home is conclusively gone — a plain `NotFound` on both resolutions; any other
+failed resolution keeps the row and reports `incomplete` evidence — and no
+configuration, service or agent row still references the home; the store's own removal is the authoritative final check, and
 prepared rows never age out. Publisher staging orphans are removed only
 inside the owned namespaces, only for the exact staging name shape and entry
 type, and only while this process holds the publish lock; age alone never

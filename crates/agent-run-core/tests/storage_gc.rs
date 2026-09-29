@@ -1126,3 +1126,166 @@ fn ancestor_scope_reference_pins_every_object_beneath_it() {
     assert!(view.is_dir(), "the view stays");
     permit_tree(&store_root);
 }
+
+/// A reference to a view scope container — or the view namespace root —
+/// protects each view in it and the tree and payloads beneath it, with no
+/// tree or blob reference of their own in the census.
+#[test]
+fn view_scope_and_namespace_references_pin_backing_trees() {
+    for (label, protected_path) in [("scope", None), ("root", Some(()))] {
+        let root = TempDir::new().expect("fixture root");
+        let app_home = app(root.path());
+        let mut store = Store::initialize(&app_home).expect("store");
+        let store_root = store_root(&app_home);
+        ensure_store(&app_home);
+        let sealed = seal_plugin(root.path(), "plugins", b"view-scope\n");
+        let home = sealed
+            .home
+            .join("plugins/cache/personal/probe/1.0.0");
+        let manifest = {
+            let bytes = stdfs::read(home.join(".agent-run-snapshot.json")).expect("manifest");
+            fs::sha256(&bytes)
+        };
+        let reference = SharedTreeRef {
+            scope: scope(),
+            manifest_sha256: manifest,
+        };
+        shared_assets::import_shared_tree(
+            &store_root,
+            &scope(),
+            &sealed.home,
+            home.strip_prefix(&sealed.home).unwrap(),
+        )
+        .expect("import");
+        let view =
+            plugin_views::materialize(&store_root, &reference, "1.0.0").expect("view");
+        permit_tree(&sealed.home);
+        stdfs::remove_dir_all(&sealed.home).expect("home gone");
+        // The only reference names the view scope container or the namespace
+        // root — never a tree, blob or leaf path.
+        let namespace = store_root.join(plugin_views::VIEW_NAMESPACE);
+        let pinned = match protected_path {
+            None => namespace.join(scope()).to_string_lossy().into_owned(),
+            Some(()) => namespace.to_string_lossy().into_owned(),
+        };
+        let definition = format!(
+            "{{\"command\":\"/bin/true\",\"args\":[\"{pinned}\"],\"cwd\":\"/tmp\",\
+             \"readiness\":{{\"command\":\"/bin/true\",\"args\":[],\"deadline_seconds\":1}}}}"
+        );
+        store
+            .conn
+            .execute(
+                "INSERT INTO managed_service_generations \
+                 (id,service_id,revision,definition_json,state,broker_identity_json,created_at) \
+                 VALUES(?1,?1,?2,?3,'starting','{}',?4)",
+                [
+                    format!("pin-{label}"),
+                    "a".repeat(64),
+                    definition,
+                    agent_run_core::domain::now().to_string(),
+                ],
+            )
+            .expect("unreleased service generation");
+        for outcome in converge(&mut store, &app_home, Mode::Apply) {
+            assert_eq!(outcome.views_removed, 0, "{label}: the view stays");
+            assert_eq!(outcome.trees_removed, 0, "{label}: the backing tree stays");
+            assert_eq!(outcome.blobs_removed, 0, "{label}: the payloads stay");
+        }
+        assert!(view.is_dir(), "{label}: the view is intact");
+        assert_eq!(
+            names(&store_root, "trees").len(),
+            1,
+            "{label}: the backing tree is intact"
+        );
+        assert!(
+            !names(&store_root, "blobs").is_empty(),
+            "{label}: the payloads are intact"
+        );
+        permit_tree(&store_root);
+    }
+}
+
+/// A home whose existence cannot be determined — here a parent directory the
+/// effective user cannot search — keeps its row and reports incomplete
+/// evidence; only a plain `NotFound` on both resolutions proves absence.
+#[test]
+fn unreadable_home_parent_keeps_row_and_reports_incomplete() {
+    let root = TempDir::new().expect("fixture root");
+    let app_home = app(root.path());
+    let mut store = Store::initialize(&app_home).expect("store");
+    let base = root.path().canonicalize().expect("canonical base");
+    let secret = base.join("secret");
+    stdfs::create_dir_all(&secret).expect("secret parent");
+    let home = secret.join("runs").join("ag-20260101-000000-0000000001");
+    stdfs::create_dir_all(&home).expect("home");
+    insert_row(&store, &home, &digest(0));
+    // Garbage the pass would otherwise collect.
+    let garbage = seal(root.path(), "garbage", b"unreadable\n");
+    let store_root = store_root(&app_home);
+    ensure_store(&app_home);
+    shared_assets::import_shared_tree(
+        &store_root,
+        &scope(),
+        &garbage.home,
+        Path::new("skills/demo"),
+    )
+    .expect("import");
+    permit_tree(&garbage.home);
+    stdfs::remove_dir_all(&garbage.home).expect("garbage home gone");
+    stdfs::set_permissions(&secret, stdfs::Permissions::from_mode(0o000)).expect("sealed");
+    let outcome = storage_gc::sweep(&mut store, &app_home, Mode::Apply).expect("pass");
+    stdfs::set_permissions(&secret, stdfs::Permissions::from_mode(0o700)).expect("unsealed");
+    assert_eq!(
+        outcome.rows_removed, 0,
+        "an unreadable home keeps its row: {outcome:?}"
+    );
+    assert!(
+        outcome.incomplete,
+        "unknown existence is reported, not guessed: {outcome:?}"
+    );
+    permit_tree(&store_root);
+}
+
+/// A staging orphan a dead process left half drained is finished by a later
+/// pass on a freshly opened store; the object was already renamed out of its
+/// canonical name before the first byte was unlinked.
+#[test]
+fn partial_staging_orphan_drains_after_restart() {
+    let root = TempDir::new().expect("fixture root");
+    let app_home = app(root.path());
+    let store = Store::initialize(&app_home).expect("store");
+    let store_root = store_root(&app_home);
+    let scope_dir = store_root.join("trees").join(scope());
+    stdfs::create_dir_all(&scope_dir).expect("scope");
+    // The state an interrupted drain leaves: a staging name, already partly
+    // unlinked, and no canonical tree anywhere.
+    let staging = scope_dir.join(".agent-run-staging-fedcba9876543210fedcba9876543210.tmp");
+    stdfs::create_dir_all(&staging).expect("staging");
+    for index in 0..600 {
+        stdfs::write(staging.join(format!("f{index:04}")), b"x").expect("staged file");
+    }
+    for index in 0..300 {
+        stdfs::remove_file(staging.join(format!("f{index:04}"))).expect("half drained");
+    }
+    assert!(!scope_dir.join("0".repeat(64)).exists());
+    // A restarted process opens its own store handle and finds exactly this.
+    drop(store);
+    let mut store = Store::open(&app_home).expect("reopened store");
+    let mut removed = 0;
+    let mut passes = 0;
+    for _ in 0..8 {
+        let outcome = storage_gc::sweep(&mut store, &app_home, Mode::Apply).expect("pass");
+        passes += 1;
+        removed += outcome.staging_removed;
+        if !staging.exists() {
+            break;
+        }
+        assert!(
+            outcome.incomplete,
+            "an unfinished drain reports backlog: {outcome:?}"
+        );
+    }
+    assert!(!staging.exists(), "repeated passes finish the orphan");
+    assert_eq!(removed, 1, "only the completed removal is counted: {passes}");
+    permit_tree(&store_root);
+}

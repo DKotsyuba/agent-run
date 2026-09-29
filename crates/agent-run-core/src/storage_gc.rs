@@ -217,6 +217,11 @@ fn not_found(error: &Error) -> bool {
     matches!(error, Error::Io(inner) if inner.kind() == std::io::ErrorKind::NotFound)
 }
 
+/// Returns `true` only when a raw metadata error is a plain `NotFound`.
+fn not_found_io(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+}
+
 /// Bounded streaming reader for one directory's entry names.
 ///
 /// Names arrive in batches of at most [`SCAN_BATCH`], so a huge namespace
@@ -395,12 +400,20 @@ fn registered_references(
             after = Some(record.runtime_home.clone());
             let layout = record.layout();
             let home = PathBuf::from(&record.runtime_home);
-            // Only a plain `NotFound` on both resolutions proves the home
-            // gone; a permission error, an I/O error or an alias keeps it.
-            let home_gone = matches!(
-                (fs::Dir::open(&home), std::fs::symlink_metadata(&home)),
-                (Err(error), Err(_)) if not_found(&error)
-            );
+            // Only a plain `NotFound` on **both** resolutions proves the home
+            // gone. A resolution that fails any other way — permission, I/O,
+            // a wrong entry type — means the home's existence is unknown: the
+            // row stays live and the census reports incomplete evidence
+            // instead of presenting a silent guess as clean.
+            let (opened, metadata) = (fs::Dir::open(&home), std::fs::symlink_metadata(&home));
+            let home_gone = match (&opened, &metadata) {
+                (Err(a), Err(b)) if not_found(a) && not_found_io(b) => true,
+                (Ok(_), _) | (_, Ok(_)) => false,
+                (Err(_), Err(_)) => {
+                    outcome.incomplete = true;
+                    false
+                }
+            };
             // A prepared row is always live. A committed row is live while
             // its physical home exists, and one more time while any protected
             // path still lies inside the home.
@@ -477,47 +490,96 @@ fn protect_views(
             continue;
         };
         let mut parts = rest.iter();
-        let (Some(scope), view) = (parts.next(), parts.next()) else {
+        // A reference may name the namespace root, one scope container, one
+        // view container, or a file inside one. Every level protects whole
+        // views — and, through each view's own manifest, the tree and payload
+        // beneath it — using the same proof a leaf reference uses.
+        let scope = parts.next();
+        let view = parts.next();
+        let Some(scope) = scope else {
+            // The namespace root itself: every view in every scope.
+            let views = match fs::Dir::open(&namespace) {
+                Ok(views) => views,
+                // An explicitly protected namespace that cannot be inspected
+                // is uncertainty, never a silent empty reference set.
+                Err(error) if not_found(&error) => continue,
+                Err(_) => {
+                    outcome.incomplete = true;
+                    return Ok(());
+                }
+            };
+            for name in views.list(None)? {
+                let Some(scope) = name.to_str().map(str::to_owned) else {
+                    continue;
+                };
+                pin_whole_scope(root, &scope, references, outcome)?;
+            }
             continue;
         };
         let scope = scope.to_string_lossy().into_owned();
         if !is_digest_name(&scope) {
             continue;
         }
-        // A reference to the scope container alone protects every view in it;
-        // a leaf reference protects exactly the view it names.
-        let Some(views) = view else {
-            let scope_dir = match fs::Dir::open(&namespace.join(&scope)) {
-                Ok(directory) => directory,
-                Err(_) => continue,
-            };
-            for name in scope_dir.list(None)? {
-                let Some(identity) = name.to_str().filter(|name| is_digest_name(name)) else {
-                    continue;
-                };
-                references
-                    .expected_views
-                    .insert(format!("{scope}/{identity}"));
+        match view {
+            // A reference to the scope container protects every view in it.
+            None => pin_whole_scope(root, &scope, references, outcome)?,
+            Some(view) => {
+                let view = view.to_string_lossy().into_owned();
+                if is_digest_name(&view) {
+                    pin_view(root, &scope, &view, references, outcome)?;
+                }
             }
+        }
+    }
+    Ok(())
+}
+
+/// Pins every view of one scope container, and each one's backing tree.
+fn pin_whole_scope(
+    root: &Path,
+    scope: &str,
+    references: &mut References,
+    outcome: &mut Outcome,
+) -> Result<()> {
+    let namespace = root.join(plugin_views::VIEW_NAMESPACE);
+    let scope_dir = match fs::Dir::open(&namespace.join(scope)) {
+        Ok(directory) => directory,
+        // A scope that simply has no views yet protects nothing further.
+        Err(error) if not_found(&error) => return Ok(()),
+        // A protected scope that cannot be inspected is uncertainty.
+        Err(_) => {
+            outcome.incomplete = true;
+            return Ok(());
+        }
+    };
+    for name in scope_dir.list(None)? {
+        let Some(view) = name.to_str().filter(|name| is_digest_name(name)) else {
             continue;
         };
-        let view = views.to_string_lossy().into_owned();
-        if !is_digest_name(&view) {
-            continue;
+        pin_view(root, scope, view, references, outcome)?;
+    }
+    Ok(())
+}
+
+/// Pins one explicitly protected view and the tree whose payloads it holds.
+///
+/// The view's own manifest bytes are the proof: they hash to the backing
+/// tree's manifest digest. Without that proof no object in the store may be
+/// deleted this pass — an unreadable or malformed manifest on a protected
+/// view is missing evidence, never an empty reference set.
+fn pin_view(
+    root: &Path,
+    scope: &str,
+    view: &str,
+    references: &mut References,
+    outcome: &mut Outcome,
+) -> Result<()> {
+    references.expected_views.insert(format!("{scope}/{view}"));
+    match read_view_manifest(root, scope, view)? {
+        Some(digest) => {
+            references.pinned_trees.insert(tree_key(scope, &digest));
         }
-        references.expected_views.insert(format!("{scope}/{view}"));
-        let manifest = read_view_manifest(root, &scope, &view)?;
-        match manifest {
-            Some(digest) => {
-                references.pinned_trees.insert(tree_key(&scope, &digest));
-            }
-            // Without proof of which tree backs the protected view, nothing
-            // in the store may be deleted this pass.
-            None => {
-                outcome.incomplete = true;
-                return Ok(());
-            }
-        }
+        None => outcome.incomplete = true,
     }
     Ok(())
 }
