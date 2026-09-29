@@ -2346,7 +2346,7 @@ mod tests {
         );
         fs::remove_file(&link).unwrap();
         symlink(&relative, &link).unwrap();
-        let census = collect_native_cache_references(&root, &[home.clone()]).unwrap();
+        let census = collect_native_cache_references(&root, std::slice::from_ref(&home)).unwrap();
         assert!(
             !census.complete,
             "an unrecognized link is uncertainty, never proof of no reference"
@@ -2357,7 +2357,7 @@ mod tests {
             "the link itself is untouched"
         );
         assert!(
-            census.references.get(&object).is_none(),
+            !census.references.contains_key(&object),
             "an unrecognized link proves no live reference either"
         );
         assert!(
@@ -2368,7 +2368,7 @@ mod tests {
         // A foreign absolute target is equally conservative.
         fs::remove_file(&link).unwrap();
         symlink("/etc/passwd", &link).unwrap();
-        let census = collect_native_cache_references(&root, &[home.clone()]).unwrap();
+        let census = collect_native_cache_references(&root, std::slice::from_ref(&home)).unwrap();
         assert!(!census.complete);
         assert_eq!(census.foreign.len(), 1);
         assert!(deletion_candidates(&objects, &census).is_empty());
@@ -2376,7 +2376,7 @@ mod tests {
         // The exact controlled spelling restores complete live evidence.
         fs::remove_file(&link).unwrap();
         symlink(&exact, &link).unwrap();
-        let census = collect_native_cache_references(&root, &[home.clone()]).unwrap();
+        let census = collect_native_cache_references(&root, std::slice::from_ref(&home)).unwrap();
         assert!(census.complete);
         assert!(census.references(&object));
         assert!(deletion_candidates(&objects, &census).is_empty());
