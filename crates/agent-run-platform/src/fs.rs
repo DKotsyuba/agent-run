@@ -787,6 +787,42 @@ impl Dir {
         }
         Ok(true)
     }
+    /// Atomically renames one entry beneath this directory, replacing
+    /// whatever entry already exists at the destination.
+    ///
+    /// `from` and `to` are relative to this directory and resolved through
+    /// no-follow parent descriptors exactly like
+    /// [`Dir::rename_entry_no_replace`], but the move uses the kernel's
+    /// plain replacing `renameat`: an entry already at `to` — a regular
+    /// file or a symbolic link, never dereferenced — is atomically replaced,
+    /// so an outside observer sees either the old entry or the complete new
+    /// one, never a missing name. It is the caller's job to prove the
+    /// replaced name quiescent; the primitive itself serializes nothing.
+    /// Missing parent directories of `to` are created like [`Dir::write`],
+    /// and both affected parent directories are synchronized after the move.
+    pub fn rename_entry_replace(&self, from: &Path, to: &Path) -> Result<()> {
+        let (from_parent, from_name) = self.parent(from, false)?;
+        let (to_parent, to_name) = self.parent(to, true)?;
+        // SAFETY: live descriptors and NUL-terminated names; renameat
+        // replaces the destination entry and never follows a link at either
+        // name.
+        if unsafe {
+            libc::renameat(
+                from_parent.as_raw_fd(),
+                from_name.as_ptr(),
+                to_parent.as_raw_fd(),
+                to_name.as_ptr(),
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        sync_directory(&from_parent)?;
+        if from_parent.as_raw_fd() != to_parent.as_raw_fd() {
+            sync_directory(&to_parent)?;
+        }
+        Ok(())
+    }
     /// Creates one new exclusive file beneath this directory for streaming.
     ///
     /// `path` is relative to this directory and resolved through no-follow

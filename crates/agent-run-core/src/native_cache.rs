@@ -41,19 +41,28 @@
 //! Packing is not admission: the caller proves the home quiescent and the
 //! identity binding through the existing store checks before calling. This
 //! code refuses non-canonical homes, foreign-owned entries, and any home
-//! that aliases the store or vice versa; it skips entries whose known cache
-//! path is a symlink (the shape a converted immutable managed root would
-//! leave) and entries that are unknown, oversized, malformed, or foreign
-//! links — every skipped entry stays in place with an explicit disposition.
-//! Reference enumeration for the shared-store collector reports exact live
-//! physical references with explicit complete/incomplete evidence: a scan
-//! that meets I/O trouble, a foreign shape, or a bound is
-//! `complete == false`, never an empty success. This unit never deletes
-//! anything; collection is a later integration that consumes these censuses.
+//! that aliases the store or vice versa; it refuses a home whose finalized
+//! managed index names a root, flat file or link overlapping the cache
+//! directory (and one whose index cannot be parsed), it skips entries whose
+//! known cache path is a symlink (the shape a converted immutable managed
+//! root would leave) and entries that are unknown, oversized, malformed, or
+//! foreign links — every skipped entry stays in place with an explicit
+//! disposition, and an already-shared link is claimed only after its object
+//! is re-verified. The final switch is one complete temporary link
+//! atomically renamed over the original name, so an interrupted pack always
+//! leaves the original file or the complete shared link. Reference
+//! enumeration for the shared-store collector reports exact live physical
+//! references with explicit complete/incomplete evidence: a scan that meets
+//! I/O trouble, a bound, or a drifted or dangling in-namespace link is
+//! `complete == false` — never an empty success — and
+//! [`deletion_candidates`] returns nothing from incomplete evidence. This
+//! unit never deletes anything; collection is a later integration that
+//! consumes these censuses.
 
 use crate::{fs, Result};
 use agent_run_domain::{canonical::hex_digest, error::invalid, Error};
 use agent_run_platform::shared_assets::{is_scope, SharedStoreLock, TEMP_PREFIX, TEMP_SUFFIX};
+use agent_run_platform::snapshot_tree::RUNTIME_SNAPSHOT_INDEX;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -98,9 +107,14 @@ const MAX_VERIFIED_OBJECTS: usize = 65_536;
 const SCAN_BATCH: usize = 256;
 /// Streaming chunk for bounded reads and payload hashing.
 const STREAM_CHUNK: usize = 64 * 1024;
-/// Prefix of pack-owned backup names inside one native cache directory.
+/// Upper bound for one read of the home's managed snapshot index, matching
+/// the platform metadata bound.
+const MAX_INDEX_BYTES: usize = 64 * 1024;
+/// Prefix of pack-owned temporary link names inside one native cache
+/// directory; a fired fault or lost race can leave one recoverable orphan.
 const BACKUP_PREFIX: &str = ".agent-run-native-";
-/// Suffix of pack-owned backup names inside one native cache directory.
+/// Suffix of pack-owned temporary link names inside one native cache
+/// directory.
 const BACKUP_SUFFIX: &str = ".tmp";
 /// Physical mode every published object carries: owner-read only.
 const OBJECT_MODE: u32 = 0o400;
@@ -307,12 +321,26 @@ pub enum NativeCacheDisposition {
         /// Whether an existing object's mtime was lowered to this source's.
         lowered_mtime: bool,
     },
-    /// The entry is already one exact in-namespace link for this scope.
+    /// The entry is already one exact in-namespace link for this scope whose
+    /// object was re-verified (owner, mode and content digest) before reuse
+    /// was claimed.
     AlreadyShared,
     /// The known cache path is a symlink — the shape a converted immutable
     /// managed root would leave — so the whole directory is skipped
     /// untouched.
     ManagedRootOverlap,
+    /// The home's finalized managed index names a root, flat managed file or
+    /// managed link overlapping the cache directory, so packing — which
+    /// would rewrite indexed material — is refused for the whole directory.
+    /// `entry` names the overlapping index path.
+    ManagedIndexOverlap {
+        /// The indexed root, file or link path that overlaps the cache.
+        entry: String,
+    },
+    /// The home holds a managed index this unit cannot read and parse as the
+    /// finalized v1 schema; the whole directory is left untouched, because
+    /// overlap cannot be proven otherwise.
+    ManagedIndexUnreadable,
     /// The entry name is not the native identity shape; retained untouched.
     UnsupportedName,
     /// The entry is not a regular file (directory, socket, …); retained.
@@ -335,12 +363,10 @@ pub enum NativeCacheDisposition {
     /// An object already holds this content-addressed name but fails
     /// verification (owner, mode or content drifted); nothing was linked.
     ExistingObjectDrifted,
-    /// The native writer replaced the entry inside the switch window; its
-    /// fresh file stays live and the packed bytes remain store-published.
-    NativeRewrote,
-    /// The final link could not be installed; the original file was
-    /// restored — or, if restoration also failed, preserved under this
-    /// unit's backup name — and `detail` reports what failed.
+    /// The final link could not be installed; the original entry stays in
+    /// place — an interrupted switch leaves it plus one recoverable
+    /// `.agent-run-native-*.tmp` link orphan this unit never deletes — and
+    /// `detail` reports what failed.
     LinkFailed {
         /// Bounded description of the failure.
         detail: String,
@@ -501,8 +527,11 @@ fn publish_object(
                 let mut file = store.create_exclusive(&temporary, OBJECT_MODE)?;
                 file.set_permissions(std::fs::Permissions::from_mode(OBJECT_MODE))?;
                 file.write_all(bytes)?;
-                file.sync_all()?;
+                // The proven source mtime is stamped and flushed before the
+                // object becomes reachable under its final name, so a crash
+                // can never leave a freshly-stamped object for stale bytes.
                 file.set_times(FileTimes::new().set_modified(source_mtime))?;
+                file.sync_all()?;
                 Ok(())
             })();
             let moved =
@@ -535,7 +564,9 @@ fn publish_object(
 /// Lowers one verified existing object's mtime to `source_mtime` when that
 /// timestamp is strictly older, returning whether a change was applied.
 /// Raising is impossible by construction, so no import can fabricate
-/// freshness; content and mode are never touched.
+/// freshness; content and mode are never touched. The lowered timestamp is
+/// flushed before the caller may link any home entry onto the object, so a
+/// crash can never publish a freshly-stamped object for stale bytes.
 fn lower_object_mtime(
     store: &fs::Dir,
     object_rel: &Path,
@@ -557,6 +588,8 @@ fn lower_object_mtime(
     let file = store.open_file(object_rel).map_err(PublishFailure::Io)?;
     file.set_times(FileTimes::new().set_modified(source_mtime))
         .map_err(|error| PublishFailure::Io(Error::Io(error)))?;
+    file.sync_all()
+        .map_err(|error| PublishFailure::Io(Error::Io(error)))?;
     Ok(true)
 }
 
@@ -568,22 +601,53 @@ fn lower_object_mtime(
 /// `home` an existing canonical real directory owned by the effective user
 /// that aliases neither the store nor is aliased by it. Admission —
 /// quiescence and the account/identity binding — is the caller's; this
-/// function owns only the filesystem safety envelope. Every mutation holds
-/// the store-wide [`SharedStoreLock`]: bytes are published as immutable
-/// objects first, then the home entry is swapped by an exclusive rename
-/// into this unit's backup name followed by one exact no-replace symlink
-/// onto the object, so an interrupted or racing pack leaves either the
-/// original file or the shared link — never a partial entry. Unknown,
-/// oversized, malformed, foreign-owned or symlinked entries — including a
-/// cache path shaped like a converted managed root — are preserved
-/// untouched with explicit dispositions. The report's `complete` is `false`
-/// when the directory scan hit its entry bound or lost its stream. Nothing
-/// outside the one cache directory, this unit's own backup names, and
-/// `native-cache/<scope>/` is ever touched.
+/// function owns only the filesystem safety envelope. Before anything is
+/// touched, a finalized managed index in the home is parsed read-only and
+/// any indexed root, flat managed file or managed link overlapping the
+/// cache directory refuses the whole pack, and a symlinked cache path is
+/// refused the same way. Every mutation holds the store-wide
+/// [`SharedStoreLock`]: bytes are published as immutable objects first,
+/// then the home entry is swapped by one complete temporary symlink
+/// atomically renamed over the original name, so an interrupted or racing
+/// pack always leaves either the original file or the complete shared link
+/// under the native name — plus, at worst, one recoverable
+/// `.agent-run-native-*.tmp` link orphan this unit never deletes. Unknown,
+/// oversized, malformed, foreign-owned or foreign-linked entries are
+/// preserved untouched with explicit dispositions, and reuse of an
+/// already-shared link is claimed only after its object is re-verified.
+/// The report's `complete` is `false` when the directory scan hit its entry
+/// bound or lost its stream. Nothing outside the one cache directory, this
+/// unit's own temporary link names, and `native-cache/<scope>/` is ever
+/// touched.
 pub fn pack_native_cache(
     store_root: &Path,
     home: &Path,
     domain: &NativeCacheDomain,
+) -> Result<NativeCacheReport> {
+    pack_native_cache_with_fault(store_root, home, domain, None)
+}
+
+/// One simulated crash point inside [`pack_native_cache_with_fault`]'s link
+/// switch; production callers never pass a `fault`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeCacheFault {
+    /// After the complete temporary link exists and before it is atomically
+    /// renamed over the original name — the original entry is still intact.
+    BeforeLinkSwap,
+    /// After the atomic rename committed the shared link over the original
+    /// name.
+    AfterLinkSwap,
+}
+
+/// Test seam over [`pack_native_cache`] firing `fault` at one
+/// [`NativeCacheFault`] crash point; no production caller passes `Some`.
+/// A fired fault aborts the pack like a process death at that instruction,
+/// leaving exactly the durable state a real crash would.
+pub fn pack_native_cache_with_fault(
+    store_root: &Path,
+    home: &Path,
+    domain: &NativeCacheDomain,
+    fault: Option<&dyn Fn(NativeCacheFault) -> Result<()>>,
 ) -> Result<NativeCacheReport> {
     let root = validated_dir(store_root, "shared store root")?;
     let home = validated_dir(home, "native cache home")?;
@@ -600,14 +664,35 @@ pub fn pack_native_cache(
     if home_dir.entry(None)?.uid != euid() {
         return Err(invalid("native cache home is not owned by this user"));
     }
-    let _guard = SharedStoreLock::acquire(&root)?;
+    let cache_dir = domain.kind.cache_dir();
     let mut report = NativeCacheReport {
-        cache_dir: domain.kind.cache_dir().to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
         home: home.clone(),
         entries: Vec::new(),
         complete: true,
     };
-    let Some(cache) = open_native_cache_dir(&home_dir, domain.kind.cache_dir(), &mut report) else {
+    // An index that cannot be proven free of overlap pins the directory:
+    // nothing is mutated, because an indexed file or link beneath the cache
+    // must never be rewritten by a pack.
+    match managed_index_overlap(&home_dir, cache_dir) {
+        Ok(Some(entry)) => {
+            report.entries.push(NativeCacheEntry {
+                path: home.join(cache_dir),
+                disposition: NativeCacheDisposition::ManagedIndexOverlap { entry },
+            });
+            return Ok(report);
+        }
+        Err(_) => {
+            report.entries.push(NativeCacheEntry {
+                path: home.join(cache_dir),
+                disposition: NativeCacheDisposition::ManagedIndexUnreadable,
+            });
+            return Ok(report);
+        }
+        Ok(None) => {}
+    }
+    let _guard = SharedStoreLock::acquire(&root)?;
+    let Some(cache) = open_native_cache_dir(&home_dir, cache_dir, &mut report) else {
         return Ok(report);
     };
     let mut scan = BoundedNames::open(&cache)?;
@@ -617,15 +702,69 @@ pub fn pack_native_cache(
             break;
         }
         let disposition = match name.to_str() {
-            Some(name) => pack_entry(&root, &store, &cache, domain, name),
+            Some(name) => pack_entry(&root, &store, &cache, domain, name, fault),
             None => NativeCacheDisposition::UnsupportedName,
         };
         report.entries.push(NativeCacheEntry {
-            path: home.join(domain.kind.cache_dir()).join(&name),
+            path: home.join(cache_dir).join(&name),
             disposition,
         });
     }
     Ok(report)
+}
+
+/// Parses the home's finalized managed index read-only and returns the one
+/// indexed root, flat managed file or managed link path overlapping
+/// `cache_dir`, if any. `Ok(None)` means provably no overlap (including a
+/// home with no index at all); any read or parse failure is an `Err`, so
+/// the caller refuses the pack instead of guessing. The index bytes are
+/// never written, moved or re-hashed by this unit.
+fn managed_index_overlap(home_dir: &fs::Dir, cache_dir: &Path) -> Result<Option<String>> {
+    let Some(raw) = home_dir.optional(Path::new(RUNTIME_SNAPSHOT_INDEX), MAX_INDEX_BYTES)? else {
+        return Ok(None);
+    };
+    let document: Value =
+        serde_json::from_slice(&raw).map_err(|_| invalid("runtime snapshot index is malformed"))?;
+    if !document.as_object().is_some_and(|object| {
+        object
+            .get("snapshot_index_version")
+            .and_then(Value::as_u64)
+            .is_some_and(|version| version == 1)
+    }) {
+        return Err(invalid("runtime snapshot index is malformed"));
+    }
+    let mut indexed = Vec::new();
+    for key in ["roots", "files", "links"] {
+        let entries = document
+            .get(key)
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid("runtime snapshot index is malformed"))?;
+        for entry in entries {
+            let path = if key == "roots" {
+                entry.as_str()
+            } else {
+                entry
+                    .as_object()
+                    .and_then(|entry| entry.get("path"))
+                    .and_then(Value::as_str)
+            };
+            let path = path.ok_or_else(|| invalid("runtime snapshot index is malformed"))?;
+            indexed.push(path.to_owned());
+        }
+    }
+    let cache = cache_dir
+        .to_str()
+        .ok_or_else(|| invalid("native cache directory is not UTF-8"))?;
+    Ok(indexed.into_iter().find(|path| paths_overlap(cache, path)))
+}
+
+/// Returns whether two `/`-separated relative home paths name the same entry
+/// or one contains the other, so an indexed tree, file or link anywhere
+/// across the cache boundary counts as an overlap.
+fn paths_overlap(cache: &str, indexed: &str) -> bool {
+    cache == indexed
+        || cache.starts_with(&format!("{indexed}/"))
+        || indexed.starts_with(&format!("{cache}/"))
 }
 
 /// Opens the home's native cache directory through no-follow descriptors,
@@ -676,24 +815,41 @@ fn open_native_cache_dir(
 }
 
 /// Packs exactly one entry and returns its disposition, preserving the
-/// original on every outcome except a successful link swap.
+/// original on every outcome except a successful link swap. `fault` is the
+/// optional crash seam of [`pack_native_cache_with_fault`].
 fn pack_entry(
     root: &Path,
     store: &fs::Dir,
     cache: &fs::Dir,
     domain: &NativeCacheDomain,
     name: &str,
+    fault: Option<&dyn Fn(NativeCacheFault) -> Result<()>>,
 ) -> NativeCacheDisposition {
     let entry = match cache.entry(Some(Path::new(name))) {
         Ok(entry) => entry,
         Err(_) => return NativeCacheDisposition::UnsupportedEntry,
     };
     if entry.kind == fs::EntryType::Symlink {
-        return match cache.read_link(Path::new(name)) {
-            Ok(Some(target)) if is_own_target(root, domain, name, &target) => {
-                NativeCacheDisposition::AlreadyShared
+        let target = match cache.read_link(Path::new(name)) {
+            Ok(Some(target)) => target,
+            _ => return NativeCacheDisposition::ForeignLink,
+        };
+        // Shape alone never proves reuse: the exact target must still verify
+        // as this scope's live immutable object before AlreadyShared.
+        return match own_object_target(root, domain, name, &target) {
+            Some((scope, content)) => {
+                let relative = Path::new(NATIVE_CACHE_NAMESPACE)
+                    .join(&scope)
+                    .join(&content);
+                match verify_object(store, &relative, &content) {
+                    Ok(_) => NativeCacheDisposition::AlreadyShared,
+                    Err(Error::Io(error)) => NativeCacheDisposition::LinkFailed {
+                        detail: error.to_string().chars().take(256).collect(),
+                    },
+                    Err(_) => NativeCacheDisposition::ExistingObjectDrifted,
+                }
             }
-            _ => NativeCacheDisposition::ForeignLink,
+            None => NativeCacheDisposition::ForeignLink,
         };
     }
     if entry.kind != fs::EntryType::File {
@@ -763,45 +919,47 @@ fn pack_entry(
         captured,
         lowered_mtime,
         &content_sha256,
+        fault,
     )
 }
 
-/// Returns whether `target` is exactly the in-namespace object path this
-/// domain derives for `name` — the idempotency proof for an already-shared
-/// entry. Any other target, in-namespace or not, is foreign and is never
-/// followed.
-fn is_own_target(root: &Path, domain: &NativeCacheDomain, name: &str, target: &Path) -> bool {
-    let Some(scope) = target
+/// Parses `target` as exactly the in-namespace object path this domain
+/// derives for `name`, returning its validated `(scope, content)` digest
+/// pair for verification. Any other target, in-namespace or not, is `None`
+/// — foreign — and is never followed.
+fn own_object_target(
+    root: &Path,
+    domain: &NativeCacheDomain,
+    name: &str,
+    target: &Path,
+) -> Option<(String, String)> {
+    let scope = target
         .parent()
         .and_then(|parent| parent.file_name())
-        .and_then(|value| value.to_str())
-    else {
-        return false;
-    };
+        .and_then(|value| value.to_str())?;
+    let content = target.file_name().and_then(|value| value.to_str())?;
     let namespace = root.join(NATIVE_CACHE_NAMESPACE);
     if target.parent().and_then(Path::parent) != Some(namespace.as_path()) {
-        return false;
+        return None;
     }
-    let Ok(own_scope) = domain.scope_digest(name) else {
-        return false;
-    };
-    target
-        .file_name()
-        .and_then(|value| value.to_str())
-        .is_some_and(|content| scope == own_scope && is_scope(content))
+    let own_scope = domain.scope_digest(name).ok()?;
+    (scope == own_scope && is_scope(content)).then(|| (scope.to_owned(), content.to_owned()))
 }
 
-/// Replaces one packed entry with the exact no-replace symlink onto
-/// `object`, staging the original under this unit's backup name first.
+/// Switches one packed entry onto `object` with one atomic replace.
 ///
-/// The exclusive rename moves the verified inode out of the way; the symlink
-/// then lands under the freed name or fails without overwriting anything. A
-/// native rewrite that lands inside the window wins ([`Self::NativeRewrote`]
-/// keeps the fresh file live); any other link failure restores the original
-/// from the backup, or — only if restoration itself fails — leaves it
-/// preserved under the backup name with the failure reported. A backup
-/// removal failure after a successful swap leaves one recoverable
-/// `.agent-run-native-*.tmp` orphan, which later packs classify and retain.
+/// The complete symlink is created first under this unit's fresh
+/// `.agent-run-native-*.tmp` name and then atomically renamed over the
+/// original name, so under the caller-proven quiescence every observer —
+/// including a crash at either fault point — sees either the original file
+/// or the complete shared link, never a missing name and never a partial
+/// link. A native rewrite that lands between the captured-identity checks
+/// and the replace wins nothing: the name is re-verified to still hold the
+/// exact captured inode immediately before the move, and any mismatch keeps
+/// the native file live (`ChangedDuringCapture`) and removes this unit's
+/// temporary. A failed move removes the temporary as well; only a fired
+/// fault (a simulated death) leaves it behind as the documented recoverable
+/// orphan, which later packs classify as a foreign link and retain.
 fn swap_for_link(
     cache: &fs::Dir,
     name: &str,
@@ -809,55 +967,67 @@ fn swap_for_link(
     captured: Captured,
     lowered_mtime: bool,
     content_sha256: &str,
+    fault: Option<&dyn Fn(NativeCacheFault) -> Result<()>>,
 ) -> NativeCacheDisposition {
-    let backup = format!(
+    let temporary = format!(
         "{BACKUP_PREFIX}{}{BACKUP_SUFFIX}",
         uuid::Uuid::new_v4().simple()
     );
+    let holds_captured = |live: fs::Entry| {
+        live.kind == fs::EntryType::File
+            && live.device == captured.device
+            && live.inode == captured.inode
+    };
     let live = match cache.entry(Some(Path::new(name))) {
         Ok(live) => live,
         Err(_) => return NativeCacheDisposition::ChangedDuringCapture,
     };
-    if live.kind != fs::EntryType::File
-        || live.device != captured.device
-        || live.inode != captured.inode
-    {
+    if !holds_captured(live) {
         return NativeCacheDisposition::ChangedDuringCapture;
     }
-    if cache
-        .rename_entry_no_replace(Path::new(name), Path::new(&backup))
-        .is_err()
-    {
-        return NativeCacheDisposition::ChangedDuringCapture;
+    if cache.symlink(object, Path::new(&temporary)).is_err() {
+        return NativeCacheDisposition::LinkFailed {
+            detail: "temporary link could not be created".into(),
+        };
     }
-    match cache.symlink(object, Path::new(name)) {
-        Ok(()) => {
-            let _ = cache.remove(Path::new(&backup));
-            NativeCacheDisposition::Packed {
-                object: object.to_path_buf(),
-                content_sha256: content_sha256.to_owned(),
-                lowered_mtime,
-            }
+    // One last identity check: a native refresh that already replaced the
+    // name wins and must stay live.
+    match cache.entry(Some(Path::new(name))) {
+        Ok(live) if holds_captured(live) => {}
+        Ok(_) => {
+            let _ = cache.remove(Path::new(&temporary));
+            return NativeCacheDisposition::ChangedDuringCapture;
         }
-        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let _ = cache.remove(Path::new(&backup));
-            NativeCacheDisposition::NativeRewrote
+        Err(_) => {
+            let _ = cache.remove(Path::new(&temporary));
+            return NativeCacheDisposition::ChangedDuringCapture;
         }
-        Err(error) => {
-            if cache
-                .rename_entry_no_replace(Path::new(&backup), Path::new(name))
-                .is_err()
-            {
-                return NativeCacheDisposition::LinkFailed {
-                    detail: format!(
-                        "link failed and the original is preserved as {backup}: {error}"
-                    ),
-                };
-            }
-            NativeCacheDisposition::LinkFailed {
-                detail: error.to_string().chars().take(256).collect(),
-            }
+    }
+    let fire = |point: NativeCacheFault| -> Result<()> {
+        match fault {
+            Some(fault) => fault(point),
+            None => Ok(()),
         }
+    };
+    let interrupted = |stage: &str, error: Error| NativeCacheDisposition::LinkFailed {
+        detail: format!("{stage}: {error}").chars().take(256).collect(),
+    };
+    if let Err(error) = fire(NativeCacheFault::BeforeLinkSwap) {
+        // A simulated death here leaves the original plus the temporary
+        // link orphan exactly as a real crash would; nothing is cleaned up.
+        return interrupted("interrupted before the link swap", error);
+    }
+    if let Err(error) = cache.rename_entry_replace(Path::new(&temporary), Path::new(name)) {
+        let _ = cache.remove(Path::new(&temporary));
+        return interrupted("link swap failed", error);
+    }
+    if let Err(error) = fire(NativeCacheFault::AfterLinkSwap) {
+        return interrupted("interrupted after the link swap committed", error);
+    }
+    NativeCacheDisposition::Packed {
+        object: object.to_path_buf(),
+        content_sha256: content_sha256.to_owned(),
+        lowered_mtime,
     }
 }
 
@@ -1040,8 +1210,17 @@ fn collect_cache_references(
             }
         };
         match live {
-            None => census.dangling.push((path, target)),
-            Some(false) => census.drifted.push((path, target)),
+            // A dangling or drifted link is corrupt or missing evidence, not
+            // proof of no reference: the link still names the object, so it
+            // pins every deletion candidate until the anomaly is resolved.
+            None => {
+                census.dangling.push((path, target));
+                census.complete = false;
+            }
+            Some(false) => {
+                census.drifted.push((path, target));
+                census.complete = false;
+            }
             Some(true) => {
                 census
                     .references
@@ -1150,6 +1329,29 @@ pub fn enumerate_native_cache_objects(store_root: &Path) -> Result<NativeCacheOb
     Ok(census)
 }
 
+/// Returns the native-cache objects a collector may delete: the canonical
+/// objects of a **complete** object census that no **complete** reference
+/// census proves live. Any incompleteness — a bound, an unreadable
+/// directory, a drifted or dangling link, an unscanned home — yields the
+/// empty set, so corrupt or missing evidence pins everything instead of
+/// widening the deletion candidates. This function changes nothing; the
+/// collector owns deletion itself.
+pub fn deletion_candidates(
+    objects: &NativeCacheObjectCensus,
+    references: &NativeCacheRefCensus,
+) -> BTreeSet<PathBuf> {
+    if !objects.complete || !references.complete {
+        return BTreeSet::new();
+    }
+    let live: BTreeSet<&PathBuf> = references.references.keys().collect();
+    objects
+        .objects
+        .iter()
+        .filter(|object| !live.contains(*object))
+        .cloned()
+        .collect()
+}
+
 /// One bounded, resumable stream over a directory's entry names.
 ///
 /// Names arrive in batches of at most [`SCAN_BATCH`], so no scan loads an
@@ -1203,6 +1405,7 @@ impl BoundedNames {
 /// owned temporary fixtures only.
 mod tests {
     use super::*;
+    use agent_run_platform::snapshot_tree;
     use std::{
         fs,
         os::unix::fs::{symlink, MetadataExt, PermissionsExt},
@@ -1407,40 +1610,165 @@ mod tests {
         let _ = (store, first_home, second_home);
     }
 
-    /// The original index, config, auth, history and plugin bytes are
-    /// conserved exactly across a pack.
+    /// The finalized index, managed flat file, managed link, history and
+    /// plugin bytes are conserved exactly across a pack of a non-overlapping
+    /// cache directory.
     #[test]
     fn original_home_bytes_are_conserved() {
         let (store, root) = store_root();
         let (home_dir, house) = home();
-        let preserved = [
-            ".agent-run-snapshots.json",
-            "config.toml",
-            "auth.json",
-            "history.jsonl",
-        ];
-        for name in preserved {
-            fs::write(house.join(name), format!("original {name}\n")).unwrap();
-        }
+        fs::write(house.join("config.toml"), "managed flat config\n").unwrap();
+        fs::create_dir_all(house.join("credentials")).unwrap();
+        fs::write(house.join("credentials/store.json"), b"{}\n").unwrap();
+        symlink("credentials/store.json", house.join("auth.json")).unwrap();
+        fs::write(house.join("history.jsonl"), "original history\n").unwrap();
         fs::create_dir_all(house.join("plugins/personal/tool")).unwrap();
         fs::write(house.join("plugins/personal/tool/manifest.json"), b"{}\n").unwrap();
         entry(&house, TOOLS_CACHE_DIR, IDENTITY, &tools_json("bash"));
-        let before: Vec<_> = preserved
-            .iter()
-            .map(|name| fs::read(house.join(name)).unwrap())
-            .collect();
+        // A real finalized managed index, produced by the platform's own
+        // finalizer over the home's actual managed material.
+        snapshot_tree::finalize_runtime_snapshots(
+            &house,
+            "rev-fixture",
+            &["config.toml".to_owned()],
+            &[("auth.json".to_owned(), "credentials/store.json".to_owned())],
+        )
+        .unwrap();
+        let index_before = fs::read(house.join(".agent-run-snapshots.json")).unwrap();
+        let config_before = fs::read(house.join("config.toml")).unwrap();
         let plugin_before = fs::read(house.join("plugins/personal/tool/manifest.json")).unwrap();
+        let history_before = fs::read(house.join("history.jsonl")).unwrap();
 
-        pack(&root, &house, NativeCacheKind::Tools);
+        let report = pack(&root, &house, NativeCacheKind::Tools);
 
-        for (name, bytes) in preserved.iter().zip(&before) {
-            assert_eq!(&fs::read(house.join(name)).unwrap(), bytes);
-        }
+        assert!(matches!(
+            report.entries[0].disposition,
+            NativeCacheDisposition::Packed { .. }
+        ));
+        assert_eq!(
+            fs::read(house.join(".agent-run-snapshots.json")).unwrap(),
+            index_before,
+            "the finalized index bytes are conserved exactly"
+        );
+        assert_eq!(fs::read(house.join("config.toml")).unwrap(), config_before);
+        assert!(house.join("auth.json").is_symlink());
+        assert_eq!(
+            fs::read_link(house.join("auth.json")).unwrap(),
+            Path::new("credentials/store.json")
+        );
         assert_eq!(
             fs::read(house.join("plugins/personal/tool/manifest.json")).unwrap(),
             plugin_before
         );
+        assert_eq!(
+            fs::read(house.join("history.jsonl")).unwrap(),
+            history_before
+        );
         let _ = (store, home_dir);
+    }
+
+    /// An indexed root, flat managed file or managed link overlapping the
+    /// cache directory refuses the whole pack without mutating anything, and
+    /// a malformed index refuses the same way.
+    #[test]
+    fn managed_index_overlap_refuses_packing() {
+        let (store, root) = store_root();
+        let bytes = tools_json("bash");
+
+        // An indexed managed tree rooted exactly at the cache directory.
+        let (tree_home, tree_house) = home();
+        let source = tempfile::tempdir().unwrap();
+        fs::create_dir_all(source.path().join("inner")).unwrap();
+        fs::write(source.path().join("inner/payload.txt"), b"sealed\n").unwrap();
+        snapshot_tree::snapshot_managed_tree(
+            &tree_house,
+            Path::new(TOOLS_CACHE_DIR),
+            source.path(),
+            None,
+        )
+        .unwrap();
+        snapshot_tree::finalize_runtime_snapshots(&tree_house, "rev-tree", &[], &[]).unwrap();
+        let index = tree_house.join(".agent-run-snapshots.json");
+        let index_before = fs::read(&index).unwrap();
+        let sealed = tree_house.join(TOOLS_CACHE_DIR).join("inner/payload.txt");
+        let report = pack(&root, &tree_house, NativeCacheKind::Tools);
+        assert_eq!(
+            report.entries[0].disposition,
+            NativeCacheDisposition::ManagedIndexOverlap {
+                entry: TOOLS_CACHE_DIR.to_owned()
+            }
+        );
+        assert_eq!(fs::read(&index).unwrap(), index_before);
+        assert!(!sealed.is_symlink());
+        assert_eq!(fs::read(&sealed).unwrap(), b"sealed\n");
+        assert!(
+            !root.join(NATIVE_CACHE_NAMESPACE).exists(),
+            "nothing packed"
+        );
+
+        // An indexed flat managed file inside the cache directory.
+        let (flat_home, flat_house) = home();
+        let flat = entry(&flat_house, TOOLS_CACHE_DIR, IDENTITY, &bytes);
+        snapshot_tree::finalize_runtime_snapshots(
+            &flat_house,
+            "rev-flat",
+            &[format!("{TOOLS_CACHE_DIR}/{IDENTITY}")],
+            &[],
+        )
+        .unwrap();
+        let report = pack(&root, &flat_house, NativeCacheKind::Tools);
+        assert_eq!(
+            report.entries[0].disposition,
+            NativeCacheDisposition::ManagedIndexOverlap {
+                entry: format!("{TOOLS_CACHE_DIR}/{IDENTITY}")
+            }
+        );
+        assert!(!flat.is_symlink());
+        assert_eq!(fs::read(&flat).unwrap(), bytes);
+
+        // An indexed managed link inside the cache directory.
+        let (link_home, link_house) = home();
+        fs::create_dir_all(link_house.join("credentials")).unwrap();
+        fs::write(link_house.join("credentials/store.json"), b"{}\n").unwrap();
+        fs::create_dir_all(link_house.join(TOOLS_CACHE_DIR)).unwrap();
+        let link_path = link_house.join(TOOLS_CACHE_DIR).join(IDENTITY);
+        symlink("../../../credentials/store.json", &link_path).unwrap();
+        snapshot_tree::finalize_runtime_snapshots(
+            &link_house,
+            "rev-link",
+            &[],
+            &[(
+                format!("{TOOLS_CACHE_DIR}/{IDENTITY}"),
+                "../../../credentials/store.json".to_owned(),
+            )],
+        )
+        .unwrap();
+        let report = pack(&root, &link_house, NativeCacheKind::Tools);
+        assert!(matches!(
+            report.entries[0].disposition,
+            NativeCacheDisposition::ManagedIndexOverlap { .. }
+        ));
+        assert_eq!(
+            fs::read_link(&link_path).unwrap(),
+            Path::new("../../../credentials/store.json")
+        );
+
+        // A malformed index refuses the pack and preserves every byte.
+        let (broken_home, broken_house) = home();
+        let broken_entry = entry(&broken_house, TOOLS_CACHE_DIR, IDENTITY, &bytes);
+        fs::write(
+            broken_house.join(".agent-run-snapshots.json"),
+            b"{ not finalized",
+        )
+        .unwrap();
+        let report = pack(&root, &broken_house, NativeCacheKind::Tools);
+        assert_eq!(
+            report.entries[0].disposition,
+            NativeCacheDisposition::ManagedIndexUnreadable
+        );
+        assert!(!broken_entry.is_symlink());
+        assert_eq!(fs::read(&broken_entry).unwrap(), bytes);
+        let _ = (store, tree_home, flat_home, link_home, broken_home);
     }
 
     /// An object's mtime is the minimum proven source mtime: identical
@@ -1662,6 +1990,159 @@ mod tests {
         let _ = (store, home_dir, other_home);
     }
 
+    /// Reuse of an already-shared link is claimed only after its object is
+    /// re-verified: a tampered or mode-drifted target reports drift instead
+    /// of a silent AlreadyShared that would lose the reference.
+    #[test]
+    fn already_shared_verifies_the_object() {
+        let (store, root) = store_root();
+        let (home_dir, house) = home();
+        let entry_path = entry(&house, TOOLS_CACHE_DIR, IDENTITY, &tools_json("bash"));
+        let bytes = fs::read(&entry_path).unwrap();
+        let object = sole_object(&pack(&root, &house, NativeCacheKind::Tools));
+
+        // Tampered content under the same name: drift, never reuse.
+        fs::set_permissions(&object, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&object, b"tampered").unwrap();
+        fs::set_permissions(&object, fs::Permissions::from_mode(0o400)).unwrap();
+        let report = pack(&root, &house, NativeCacheKind::Tools);
+        assert_eq!(
+            report.entries[0].disposition,
+            NativeCacheDisposition::ExistingObjectDrifted
+        );
+        assert_eq!(fs::read_link(&entry_path).unwrap(), object);
+
+        // Mode drift alone is drift as well.
+        fs::set_permissions(&object, fs::Permissions::from_mode(0o600)).unwrap();
+        let report = pack(&root, &house, NativeCacheKind::Tools);
+        assert_eq!(
+            report.entries[0].disposition,
+            NativeCacheDisposition::ExistingObjectDrifted
+        );
+
+        // A verified object restores the idempotent reuse claim.
+        fs::write(&object, &bytes).unwrap();
+        fs::set_permissions(&object, fs::Permissions::from_mode(0o400)).unwrap();
+        let report = pack(&root, &house, NativeCacheKind::Tools);
+        assert_eq!(
+            report.entries[0].disposition,
+            NativeCacheDisposition::AlreadyShared
+        );
+        let _ = (store, home_dir);
+    }
+
+    /// An interrupted link switch always leaves the original file or the
+    /// complete shared link under the native name, a retry converges, and no
+    /// unowned or overwritten entry is ever deleted.
+    #[test]
+    fn fault_at_link_switch_preserves_old_or_new() {
+        let (store, root) = store_root();
+        let bytes = tools_json("bash");
+        let mtime = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(12_345);
+
+        // Crash before the atomic replace: the original stays live and one
+        // recoverable temporary link orphan is left behind, never deleted.
+        let (before_home, before) = home();
+        let before_entry = entry(&before, TOOLS_CACHE_DIR, IDENTITY, &bytes);
+        fs::File::options()
+            .write(true)
+            .open(&before_entry)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(mtime))
+            .unwrap();
+        let domain = NativeCacheDomain::new(NativeCacheKind::Tools, DOMAIN).unwrap();
+        let fault = |point: NativeCacheFault| -> Result<()> {
+            match point {
+                NativeCacheFault::BeforeLinkSwap => {
+                    Err(invalid("simulated crash before the link swap"))
+                }
+                NativeCacheFault::AfterLinkSwap => Ok(()),
+            }
+        };
+        let report = pack_native_cache_with_fault(&root, &before, &domain, Some(&fault)).unwrap();
+        assert!(matches!(
+            report.entries[0].disposition,
+            NativeCacheDisposition::LinkFailed { .. }
+        ));
+        assert!(!before_entry.is_symlink(), "the original file survived");
+        assert_eq!(fs::read(&before_entry).unwrap(), bytes);
+        let names: Vec<_> = fs::read_dir(before.join(TOOLS_CACHE_DIR))
+            .unwrap()
+            .map(|name| name.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let orphan = names
+            .iter()
+            .find(|name| name.starts_with(BACKUP_PREFIX))
+            .expect("the temporary link orphan survives a crash");
+        assert!(
+            before.join(TOOLS_CACHE_DIR).join(orphan).is_symlink(),
+            "the orphan is this unit's link, and it is never deleted"
+        );
+        // The retry converges: the original is packed, the orphan is
+        // classified as a foreign link and retained untouched.
+        let retry = pack(&root, &before, NativeCacheKind::Tools);
+        assert!(matches!(
+            retry
+                .entries
+                .iter()
+                .find(|entry| entry.path.file_name() == Some(std::ffi::OsStr::new(IDENTITY)))
+                .expect("the identity entry is examined")
+                .disposition,
+            NativeCacheDisposition::Packed { .. }
+        ));
+        assert!(retry.entries.iter().any(|entry| entry.path.file_name()
+            == Some(std::ffi::OsStr::new(orphan))
+            && entry.disposition == NativeCacheDisposition::ForeignLink));
+        assert!(before.join(TOOLS_CACHE_DIR).join(orphan).is_symlink());
+
+        // Crash after the atomic replace committed: the name holds the
+        // complete link, the published bytes and their proven mtime are
+        // already durable, and a retry reports the idempotent reuse.
+        let (after_home, after) = home();
+        let after_entry = entry(&after, TOOLS_CACHE_DIR, IDENTITY, &bytes);
+        fs::File::options()
+            .write(true)
+            .open(&after_entry)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(mtime))
+            .unwrap();
+        let fault = |point: NativeCacheFault| -> Result<()> {
+            match point {
+                NativeCacheFault::BeforeLinkSwap => Ok(()),
+                NativeCacheFault::AfterLinkSwap => {
+                    Err(invalid("simulated crash after the link swap"))
+                }
+            }
+        };
+        let report = pack_native_cache_with_fault(&root, &after, &domain, Some(&fault)).unwrap();
+        assert!(matches!(
+            report.entries[0].disposition,
+            NativeCacheDisposition::LinkFailed { .. }
+        ));
+        assert!(after_entry.is_symlink(), "the committed link survived");
+        let object = fs::read_link(&after_entry).unwrap();
+        assert_eq!(fs::read(&object).unwrap(), bytes);
+        assert_eq!(
+            fs::metadata(&object).unwrap().modified().unwrap(),
+            mtime,
+            "the proven source mtime was flushed before the link was published"
+        );
+        let names: Vec<_> = fs::read_dir(after.join(TOOLS_CACHE_DIR))
+            .unwrap()
+            .map(|name| name.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names.iter().any(|name| name.starts_with(BACKUP_PREFIX)),
+            "the committed switch leaves no orphan"
+        );
+        let retry = pack(&root, &after, NativeCacheKind::Tools);
+        assert_eq!(
+            retry.entries[0].disposition,
+            NativeCacheDisposition::AlreadyShared
+        );
+        let _ = (store, before_home, after_home);
+    }
+
     /// Concurrent packs of the same payload converge on one verified object
     /// and one inode.
     #[test]
@@ -1737,7 +2218,10 @@ mod tests {
 
         let homes = vec![first.clone(), second.clone()];
         let census = collect_native_cache_references(&root, &homes).unwrap();
-        assert!(census.complete);
+        assert!(
+            !census.complete,
+            "drifted and dangling links are corrupt evidence, not proof of no reference"
+        );
         assert!(census.references.is_empty(), "no live reference remains");
         assert_eq!(census.drifted.len(), 1);
         assert_eq!(census.drifted[0].0, first_link);
@@ -1745,20 +2229,32 @@ mod tests {
         assert_eq!(census.dangling.len(), 1);
         assert_eq!(census.dangling[0].0, second_link);
         assert_eq!(census.dangling[0].1, info_object);
+        // The still-present tampered object is NOT a deletion candidate:
+        // incomplete evidence pins every object, even extant ones.
+        let objects = enumerate_native_cache_objects(&root).unwrap();
+        assert!(objects.objects.contains(&tools_object));
+        assert!(
+            deletion_candidates(&objects, &census).is_empty(),
+            "corrupt evidence must pin every deletion candidate"
+        );
 
-        // A foreign link is neither a reference nor a failure.
+        // A foreign link is neither a reference nor corrupt evidence: it
+        // names nothing in this unit's store, so it cannot pin an object.
         fs::create_dir_all(second.join(TOOLS_CACHE_DIR)).unwrap();
         symlink("/etc/passwd", second.join(TOOLS_CACHE_DIR).join(IDENTITY)).unwrap();
         let census = collect_native_cache_references(&root, &homes).unwrap();
-        assert!(census.complete);
+        assert!(!census.complete, "the drifted and dangling links remain");
         assert_eq!(census.foreign.len(), 1);
         assert!(census.references.is_empty());
 
-        // A restored object plus a second live link is counted exactly.
+        // Restored objects plus a second live link are counted exactly, and
+        // with complete evidence nothing is deletable while all is live.
         fs::remove_file(second.join(TOOLS_CACHE_DIR).join(IDENTITY)).unwrap();
         fs::remove_file(&tools_object).unwrap();
         fs::write(&tools_object, &bytes).unwrap();
         fs::set_permissions(&tools_object, fs::Permissions::from_mode(0o400)).unwrap();
+        fs::write(&info_object, server_info_json()).unwrap();
+        fs::set_permissions(&info_object, fs::Permissions::from_mode(0o400)).unwrap();
         entry(&second, TOOLS_CACHE_DIR, IDENTITY, &bytes);
         pack(&root, &second, NativeCacheKind::Tools);
         let census = collect_native_cache_references(&root, &homes).unwrap();
@@ -1775,6 +2271,12 @@ mod tests {
             ),
             "every live physical reference is enumerated with its home path"
         );
+        let objects = enumerate_native_cache_objects(&root).unwrap();
+        assert_eq!(
+            deletion_candidates(&objects, &census),
+            BTreeSet::new(),
+            "every object is referenced"
+        );
 
         // An unscannable home is uncertainty: incomplete, never empty
         // success, and the evidence already gathered is kept.
@@ -1784,6 +2286,7 @@ mod tests {
         assert!(!census.complete);
         assert_eq!(census.unscanned.len(), 1);
         assert!(!census.references.is_empty());
+        assert!(deletion_candidates(&objects, &census).is_empty());
         let _ = (store, first_home, second_home);
     }
 

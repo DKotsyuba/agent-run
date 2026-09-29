@@ -62,13 +62,26 @@ envelope only:
 
 - The store root and home must be canonical absolute real directories owned
   by the effective user, aliasing neither the other nor being aliased by it.
+- Before anything is touched, a finalized managed index
+  (`.agent-run-snapshots.json`) in the home is parsed read-only through the
+  bounded v1 schema. Any indexed root, flat managed file or managed link
+  overlapping the cache directory — above it, below it or equal to it —
+  refuses the whole pack (`ManagedIndexOverlap`), because packing would
+  rewrite indexed material; an index that cannot be read or parsed refuses
+  the same way (`ManagedIndexUnreadable`). The index bytes are never
+  rewritten, and a symlinked cache path (the shape a converted managed root
+  would leave) is refused as `ManagedRootOverlap`.
 - Every mutation holds `SharedStoreLock`. Bytes publish first (exclusive
-  temporary, fsync, mode `0o400`, source mtime, no-replace rename); only
-  then does the home entry switch by an exclusive rename into a
-  `.agent-run-native-*.tmp` backup name followed by one no-replace symlink.
-  An interrupted pack leaves either the original file or the shared link —
-  never a partial entry. A native rewrite landing inside the window wins
-  and stays live (`NativeRewrote`).
+  temporary, mode `0o400`, the proven source mtime stamped and fsynced
+  before the no-replace rename); only then does the home entry switch: one
+  complete temporary symlink `.agent-run-native-*.tmp` is created and
+  atomically renamed over the original name. An interrupted switch
+  therefore always leaves either the original file or the complete shared
+  link under the native name — never a missing name, never a partial link —
+  plus, at worst, one recoverable temporary-link orphan that later packs
+  classify as a foreign link and never delete. The name is re-verified to
+  still hold the exact captured inode immediately before the replace, so a
+  native refresh that already landed stays live.
 - Eligible entries are exactly `<40 lower hex>.json` regular files owned by
   the effective user, at most 32 MiB, whose bytes parse as the kind's
   native disk schema (`schema_version` 4 or 1; other payload fields are
@@ -76,10 +89,10 @@ envelope only:
   disposition: unsupported names or kinds, oversized, malformed,
   foreign-owned, foreign links, entries that changed identity during
   capture, and objects whose existing content-addressed name fails
-  verification.
-- If a known cache path (or its `cache` parent) is itself a symlink — the
-  shape a converted immutable managed root would leave — the whole
-  directory is skipped untouched (`ManagedRootOverlap`).
+  verification. An already-shared link is claimed `AlreadyShared` only
+  after its target object is re-verified (owner, mode, content digest);
+  a drifted target reports `ExistingObjectDrifted` instead of silently
+  losing the reference.
 - A source file changing during capture keeps the original: the captured
   descriptor's `(device, inode, length, mtime)` must still hold, and the
   name must still resolve to that inode, before anything is published or
@@ -91,10 +104,14 @@ Store-object mtimes are the *minimum proven source mtime*, never the import
 wall clock:
 
 1. First publication of a payload stamps the object with the captured
-   source file's mtime.
+   source file's mtime, and that timestamp is flushed (set, then fsync)
+   **before** the object becomes reachable under its final name and before
+   any home entry links to it — a crash can never leave a freshly-stamped
+   object for stale bytes.
 2. A later pack of the same payload under the same scope from a home whose
    source mtime is **older** *lowers* the object's mtime to it, under the
-   publish lock (`Packed { lowered_mtime: true }`).
+   publish lock (`Packed { lowered_mtime: true }`), and the lowered
+   timestamp is flushed before any link is published onto the object.
 3. A newer source mtime never raises — never freshens — the object.
 
 A reader resolving its cache link therefore sees data at least as old as
@@ -120,13 +137,18 @@ This unit never deletes anything. The collector integration consumes:
   reported separately and are not references.
 
 A deletion candidate is an object the complete object census found that no
-complete reference census covers. Both censuses fail **incomplete** — never
-empty-success — on I/O failure, unreadable directories, foreign shapes or
-bounds; `complete == false` must always mean "retain everything and retry".
+complete reference census covers — and nothing else:
+`deletion_candidates(&objects, &refs)` returns the empty set unless **both**
+censuses are `complete`. Corrupt or missing evidence always pins: a drifted
+link (target object fails verification), a dangling link (target missing),
+an unscanned home, an unreadable directory, a foreign shape inside the
+namespace, or any scan bound forces `complete == false` — never an empty
+success — so a still-linked tampered object is never deletable. Out-of-
+namespace foreign links name nothing in this store and pin nothing.
 Physical references suffice: a complete reference census must include every
 retained and extant protected home, including cache-only homes registered
 in the runtime-storage layout registry. A pack's staging orphans and
-`.agent-run-native-*.tmp` backups follow the same lock-protected,
+`.agent-run-native-*.tmp` link orphans follow the same lock-protected,
 exact-name-shape cleanup rules the other namespaces use; removal is the
 collector's job, never the packer's.
 
