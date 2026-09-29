@@ -178,8 +178,9 @@ fn survey(home: &Path, store: &Store) -> Result<Survey> {
         more = remaining;
         for reference in page {
             after = Some(reference.runtime_home.clone());
-            let entry = homes.entry(reference.runtime_home.clone()).or_insert_with(|| {
-                Surveyed {
+            let entry = homes
+                .entry(reference.runtime_home.clone())
+                .or_insert_with(|| Surveyed {
                     home: reference.runtime_home.clone(),
                     state: "unknown",
                     holders: 0,
@@ -190,8 +191,7 @@ fn survey(home: &Path, store: &Store) -> Result<Survey> {
                     private_bytes: 0,
                     incomplete: false,
                     reasons: Vec::new(),
-                }
-            });
+                });
             entry.holders += 1;
             let unsettled = agent_run_store::ACTIVE_SQL.contains(reference.status.as_str())
                 || reference.status == "lost";
@@ -302,8 +302,13 @@ fn survey(home: &Path, store: &Store) -> Result<Survey> {
                     match runtime_storage::plan(store, home, &path, &digest, &shared_scope()) {
                         Ok(Some(_)) => entry.state = "eligible",
                         Ok(None) => {
-                            entry.state = "protected";
-                            entry.reasons.push("home has no managed roots".into());
+                            // A cache-only home maps no managed root: managed
+                            // relocation is a no-op, and native consolidation
+                            // still anchors it and shares its caches.
+                            entry.state = "eligible";
+                            entry
+                                .reasons
+                                .push("no managed roots; native caches only".into());
                         }
                         Err(error) => {
                             entry.state = "unknown";
@@ -453,8 +458,7 @@ pub fn compact(home: &Path, apply: bool) -> Result<Value> {
                 continue;
             }
         };
-        let outcome =
-            agent_run_core::supervisor::relocate_retained_home(&mut store, home, &agent);
+        let outcome = agent_run_core::supervisor::relocate_retained_home(&mut store, home, &agent);
         let result = match outcome {
             Ok(agent_run_core::supervisor::Relocation::Installed) => {
                 json!({"runtime_home": home_path, "relocated": true})
@@ -481,11 +485,31 @@ pub fn compact(home: &Path, apply: bool) -> Result<Value> {
         };
         relocations.push(result);
     }
+    // Native caches consolidate under the same offline locks and the same
+    // latest-terminal-executor authority, for every eligible home whether or
+    // not it maps managed roots.
+    let mut native = Vec::new();
+    for (home_path, agent) in &eligible {
+        let agent = match agent.parse() {
+            Ok(agent) => agent,
+            Err(_) => continue,
+        };
+        let result =
+            match agent_run_core::supervisor::consolidate_retained_native(&mut store, home, &agent)
+            {
+                Ok(report) => json!({"runtime_home": home_path, "consolidated": report}),
+                Err(reason) => {
+                    json!({"runtime_home": home_path, "consolidated": false, "reason": reason})
+                }
+            };
+        native.push(result);
+    }
     let collection = storage_gc::sweep(&mut store, home, storage_gc::Mode::Apply)?;
     Ok(json!({
         "applied": true,
         "plan": plan.report,
         "relocations": relocations,
+        "native": native,
         "collect": collection_report(&collection),
     }))
 }
@@ -502,6 +526,38 @@ pub fn recover(home: &Path) -> Result<Value> {
     let _locks = migrate::broker_exclusion(home)?;
     let mut store = Store::open(home)?;
     require_idle(&store)?;
+    // Interrupted native operations recover alongside the managed
+    // coordinator: every extant registered home's own journals complete or
+    // roll back from their records, before anything is reported.
+    let mut native_recovered = 0;
+    let mut native_refused = 0;
+    if let Ok(root) = runtime_storage::store_root(home) {
+        if root.is_dir() {
+            let mut after: Option<String> = None;
+            loop {
+                let Ok((page, more)) =
+                    store.runtime_storage_layouts_page(after.as_deref(), RECOVER_ROWS)
+                else {
+                    native_refused += 1;
+                    break;
+                };
+                for record in &page {
+                    after = Some(record.runtime_home.clone());
+                    let path = PathBuf::from(&record.runtime_home);
+                    if fs::Dir::open(&path).is_err() {
+                        continue;
+                    }
+                    match agent_run_core::native_tree_cache::recover(&root, &path) {
+                        Ok(()) => native_recovered += 1,
+                        Err(_) => native_refused += 1,
+                    }
+                }
+                if !more {
+                    break;
+                }
+            }
+        }
+    }
     let mut outcomes = Vec::new();
     for record in store.pending_runtime_storage_layouts(RECOVER_ROWS)? {
         let path = PathBuf::from(&record.runtime_home);
@@ -525,6 +581,8 @@ pub fn recover(home: &Path) -> Result<Value> {
             .iter()
             .filter(|entry| entry["recovered"] == json!(false))
             .count(),
+        "native_recovered": native_recovered,
+        "native_refused": native_refused,
         "outcomes": outcomes,
     }))
 }

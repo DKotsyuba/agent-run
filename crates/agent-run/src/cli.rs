@@ -637,7 +637,8 @@ pub enum StorageCommand {
 }
 
 #[derive(Subcommand, Debug)]
-pub enum Capacity {    Collect {
+pub enum Capacity {
+    Collect {
         #[arg(long, required = true)]
         once: bool,
     },
@@ -1661,9 +1662,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             }
         },
         Command::Storage { command } => match command {
-            StorageCommand::Status => {
-                (dependencies.output)(&crate::storage_admin::status(&home)?)?
-            }
+            StorageCommand::Status => (dependencies.output)(&crate::storage_admin::status(&home)?)?,
             StorageCommand::Compact { dry_run: _, apply } => {
                 (dependencies.output)(&crate::storage_admin::compact(&home, apply)?)?
             }

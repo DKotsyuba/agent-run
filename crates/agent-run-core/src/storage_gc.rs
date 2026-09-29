@@ -68,6 +68,10 @@ const REFERENCED_BLOBS_LIMIT: usize = 200_000;
 /// Cooperative wall-clock budget for one pass's proofs and scans, matching
 /// housekeeping's own pass deadline; exceeding it retains and retries.
 const PASS_SECONDS: u64 = 2;
+/// Upper bound on homes one native reference census page covers.
+const NATIVE_HOMES_PER_PAGE: usize = 64;
+/// Upper bound on native metadata objects one pass unlinks.
+const NATIVE_OBJECTS_PER_PASS: usize = 512;
 
 /// The registry census page bound, overridable only in test builds so a test
 /// can prove a partial census never permits deletion.
@@ -113,6 +117,8 @@ pub struct Outcome {
     pub trees_retained: usize,
     /// Blob candidates proved referenced and retained.
     pub blobs_retained: usize,
+    /// Native metadata-cache objects removed (or, in preview, that would go).
+    pub native_removed: usize,
     /// Another process held the publish lock, so nothing was examined.
     pub lock_busy: bool,
     /// Evidence or a scan bound was hit; every candidate was retained.
@@ -125,6 +131,7 @@ impl Outcome {
         self.trees_removed
             + self.blobs_removed
             + self.views_removed
+            + self.native_removed
             + self.staging_removed
             + self.rows_removed
     }
@@ -322,6 +329,13 @@ pub fn sweep(store: &mut Store, app_home: &Path, mode: Mode) -> Result<Outcome> 
     // A configuration or service path inside the view namespace pins that
     // view and, through its manifest, the tree and payloads beneath it.
     protect_views(&root, &protected, &mut references, &mut outcome)?;
+    // Native cache references — controlled links, operation journals and the
+    // metadata objects behind them — join the same census before anything is
+    // deleted. A partial or unreadable native census retains every candidate.
+    if !native_census(&root, &mut references, &mut outcome)? {
+        staging_pass(&root, mode, &mut outcome)?;
+        return Ok(outcome);
+    }
     let mut memo = match mode {
         Mode::Apply => memos()
             .lock()
@@ -352,8 +366,17 @@ pub fn sweep(store: &mut Store, app_home: &Path, mode: Mode) -> Result<Outcome> 
         // enumerated in one pass; retain all blobs and retry.
         outcome.incomplete = true;
     } else {
-        blob_pass(&root, &protected, mode, &memo, deadline, &mut outcome)?;
+        blob_pass(
+            &root,
+            &protected,
+            mode,
+            &references,
+            &memo,
+            deadline,
+            &mut outcome,
+        )?;
     }
+    native_cache_pass(&root, &protected, &references, mode, &mut outcome)?;
     staging_pass(&root, mode, &mut outcome)?;
     if mode == Mode::Apply {
         memos()
@@ -364,12 +387,16 @@ pub fn sweep(store: &mut Store, app_home: &Path, mode: Mode) -> Result<Outcome> 
     Ok(outcome)
 }
 
-/// The complete reference census of the layout registry.
+/// The complete reference census of the layout registry and native caches.
 struct References {
     /// Trees extant registered rows pin, by scope and manifest digest.
     pinned_trees: BTreeSet<String>,
     /// Derived views extant registered rows pin, by scope and view identity.
     expected_views: BTreeSet<String>,
+    /// Payload paths native cache roots and journals reference.
+    native_blobs: BTreeSet<PathBuf>,
+    /// Extant registered homes, the census input for native references.
+    extant_homes: Vec<PathBuf>,
 }
 
 /// Pages through the whole layout registry and returns the trees and views
@@ -394,6 +421,8 @@ fn registered_references(
     let mut references = References {
         pinned_trees: BTreeSet::new(),
         expected_views: BTreeSet::new(),
+        native_blobs: BTreeSet::new(),
+        extant_homes: Vec::new(),
     };
     let mut removable = Vec::new();
     let mut after: Option<String> = None;
@@ -414,9 +443,13 @@ fn registered_references(
             let home_gone = match (&opened, &metadata) {
                 (Err(a), Err(b)) if not_found(a) && not_found_io(b) => true,
                 (Ok(_), _) | (_, Ok(_)) => false,
+                // The home's existence is unknown, so the census is not a
+                // census: nothing of any kind may be deleted from it.
                 (Err(_), Err(_)) => {
                     outcome.incomplete = true;
-                    false
+                    return Err(invalid(
+                        "a registered home's existence could not be determined",
+                    ));
                 }
             };
             // A prepared row is always live. A committed row is live while
@@ -428,7 +461,10 @@ fn registered_references(
                     !home_gone || protected.iter().any(|path| path.starts_with(&home))
                 }
             };
-            if live {
+            if live && fs::Dir::open(&home).is_ok() {
+                // Every extant registered home — mapped, cache-only or
+                // mid-switch — is the census input for native references.
+                references.extant_homes.push(home.clone());
                 for (root, mapping) in &layout.roots {
                     references
                         .pinned_trees
@@ -623,6 +659,109 @@ fn read_view_manifest(root: &Path, scope: &str, view: &str) -> Result<Option<Str
         return Ok(is_digest_name(&digest).then_some(digest));
     }
     Ok(None)
+}
+
+/// Merges every extant registered home's native cache references into the
+/// census, under the same lock and before any destructive pass.
+///
+/// Homes are paged so one pass's work stays bounded no matter how many are
+/// registered; each page's trees and journals pin through the normal tree
+/// pass, which proves each pinned tree under this lock. A page that reports
+/// `complete == false` — an unreadable home, link, record or manifest, or a
+/// census bound — is partial evidence: `false` is returned, every candidate
+/// of every kind is retained, and the caller retries.
+fn native_census(root: &Path, references: &mut References, outcome: &mut Outcome) -> Result<bool> {
+    if references.extant_homes.is_empty() {
+        return Ok(true);
+    }
+    let mut complete = true;
+    let mut merged = crate::native_tree_cache::NativeRefScan::default();
+    for page in references.extant_homes.chunks(NATIVE_HOMES_PER_PAGE) {
+        let homes: Vec<&Path> = page.iter().map(PathBuf::as_path).collect();
+        let scan = crate::native_tree_cache::scan_refs(root, &homes);
+        complete &= scan.complete;
+        merged.merge(scan);
+        if !complete {
+            break;
+        }
+    }
+    if !complete {
+        outcome.incomplete = true;
+        return Ok(false);
+    }
+    for key in merged.trees.keys() {
+        references.pinned_trees.insert(key.clone());
+    }
+    if references.native_blobs.len() + merged.blobs.len() > REFERENCED_BLOBS_LIMIT {
+        outcome.incomplete = true;
+        return Ok(false);
+    }
+    references.native_blobs.extend(merged.blobs);
+    Ok(true)
+}
+
+/// Collects metadata-cache objects no live reference covers.
+///
+/// Both censuses — every object in the namespace, and every exact live link
+/// from the extant registered homes — must be complete before
+/// `deletion_candidates` returns anything at all; otherwise the objects are
+/// retained and the pass reports `incomplete`. Protected paths, including
+/// ancestors, pin a whole scope's objects the same way they pin trees.
+fn native_cache_pass(
+    root: &Path,
+    protected: &[PathBuf],
+    references: &References,
+    mode: Mode,
+    outcome: &mut Outcome,
+) -> Result<()> {
+    let objects = crate::native_cache::enumerate_native_cache_objects(root)?;
+    let homes: Vec<PathBuf> = references.extant_homes.clone();
+    let census = crate::native_cache::collect_native_cache_references(root, &homes)?;
+    if !objects.complete || !census.complete {
+        outcome.incomplete = true;
+        return Ok(());
+    }
+    let namespace = root.join(crate::native_cache::NATIVE_CACHE_NAMESPACE);
+    let mut removed = 0;
+    for object in crate::native_cache::deletion_candidates(&objects, &census) {
+        if removed >= NATIVE_OBJECTS_PER_PASS {
+            outcome.incomplete = true;
+            return Ok(());
+        }
+        // A protected path naming the object, something inside it, or any of
+        // its ancestors — up to the namespace itself — keeps the object
+        // regardless of the link census.
+        if protected
+            .iter()
+            .any(|path| covers(path, &object) || covers(path, &namespace))
+        {
+            continue;
+        }
+        outcome.native_removed += 1;
+        if mode == Mode::Apply {
+            let relative = object
+                .strip_prefix(root)
+                .map_err(|_| invalid("native cache object escapes its store root"))?;
+            let store = fs::Dir::open(root)?;
+            let parent = relative
+                .parent()
+                .ok_or_else(|| invalid("native cache object has no scope parent"))?;
+            let name = relative
+                .file_name()
+                .ok_or_else(|| invalid("native cache object has no name"))?;
+            let scope_dir = store.subdir(parent)?;
+            let name = Path::new(name);
+            let size = scope_dir
+                .open_file(name)?
+                .metadata()
+                .map_err(Error::from)?
+                .len();
+            scope_dir.remove(name)?;
+            outcome.bytes_reclaimed += size;
+            removed += 1;
+        }
+    }
+    Ok(())
 }
 
 /// Collects obsolete derived plugin-parent views before their trees.
@@ -881,11 +1020,13 @@ fn blob_pass(
     root: &Path,
     protected: &[PathBuf],
     mode: Mode,
+    references: &References,
     memo: &Memo,
     deadline: std::time::Instant,
     outcome: &mut Outcome,
 ) -> Result<()> {
-    let referenced: BTreeSet<PathBuf> = memo.trees.values().flatten().cloned().collect();
+    let mut referenced: BTreeSet<PathBuf> = memo.trees.values().flatten().cloned().collect();
+    referenced.extend(references.native_blobs.iter().cloned());
     if referenced.len() > REFERENCED_BLOBS_LIMIT {
         outcome.incomplete = true;
         return Ok(());
@@ -977,6 +1118,10 @@ fn staging_pass(root: &Path, mode: Mode, outcome: &mut Outcome) -> Result<()> {
         ("trees", fs::EntryType::Directory),
         ("blobs", fs::EntryType::File),
         (plugin_views::VIEW_NAMESPACE, fs::EntryType::Directory),
+        (
+            crate::native_cache::NATIVE_CACHE_NAMESPACE,
+            fs::EntryType::File,
+        ),
     ] {
         let Some(container) = store.subdir(Path::new(namespace)).ok() else {
             continue;

@@ -183,11 +183,13 @@ fn validate_root(root: &str) -> Result<()> {
 impl RuntimeStorageLayout {
     /// Validates the complete layout contract.
     ///
-    /// Fails for an unsupported version, a non-canonical home, a non-lowercase
-    /// digest, an empty or oversized root set, an unsafe root path, or two
-    /// roots where one is a component prefix of the other. Duplicate roots
-    /// cannot survive this contract's canonical-bytes check, which rejects
-    /// any text that is not already the sorted, compact encoding.
+    /// Fails for an unsupported version, a non-canonical home, a
+    /// non-lowercase digest, an oversized root set, an unsafe root path, or
+    /// two roots where one is a component prefix of the other. An empty root
+    /// set is accepted: it is the cache-only anchor of a home with no managed
+    /// trees. Duplicate roots cannot survive this contract's canonical-bytes
+    /// check, which rejects any text that is not already the sorted, compact
+    /// encoding.
     pub fn validate(&self) -> Result<()> {
         if self.version != LAYOUT_VERSION {
             return Err(invalid(format!(
@@ -201,9 +203,13 @@ impl RuntimeStorageLayout {
                 "runtime storage layout index digest must be 64 lowercase hexadecimal digits",
             ));
         }
-        if self.roots.is_empty() || self.roots.len() > MAX_ROOTS {
+        // An empty root set is a valid anchor: a cache-only home has no
+        // managed trees to map, yet its row still names the one physical home
+        // the shared store must keep accounting for. Schema 22 is unreleased,
+        // so widening the lower bound here changes no stored contract.
+        if self.roots.len() > MAX_ROOTS {
             return Err(invalid(format!(
-                "runtime storage layout must map between 1 and {MAX_ROOTS} managed roots"
+                "runtime storage layout must map at most {MAX_ROOTS} managed roots"
             )));
         }
         for (root, mapping) in &self.roots {

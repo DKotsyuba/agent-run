@@ -18,7 +18,11 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::os::unix::process::CommandExt;
-use std::{ffi::OsStr, path::{Path, PathBuf}, time::Duration};
+use std::{
+    ffi::OsStr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 /// Start one detached `_supervisor` session leader and return after its READY.
 ///
@@ -729,6 +733,39 @@ pub fn relocate_retained_home(
     }
 }
 
+/// Consolidates one retained home's native caches from its recorded
+/// authority, for the operator's offline compaction.
+///
+/// The same narrow seam as [`relocate_retained_home`]: the recorded identity
+/// and frozen configuration supply the compatibility domain, the recorded
+/// attempt the account, and the caller holds the offline locks with every
+/// holder terminal. An unverifiable home is a reported skip with its reason
+/// and preserved byte count, never a forced consolidation.
+pub fn consolidate_retained_native(
+    store: &mut Store,
+    app_home: &Path,
+    agent: &AgentId,
+) -> std::result::Result<serde_json::Value, String> {
+    let row = store.get(agent).map_err(|error| error.to_string())?;
+    let identity = ProviderLaunchIdentity::read(&row).map_err(|error| error.to_string())?;
+    let Some(runtime_home) = identity.runtime_home.clone() else {
+        return Err("recorded identity has no sealed runtime home".into());
+    };
+    let account = store
+        .recorded_account(agent)
+        .map_err(|error| error.to_string())?;
+    let report = crate::runtime_cache::consolidate(
+        store,
+        agent,
+        &identity,
+        &account,
+        app_home,
+        &runtime_home,
+    )
+    .map_err(|error| error.to_string())?;
+    serde_json::to_value(&report).map_err(|error| error.to_string())
+}
+
 /// Sums the file bytes of one home's still-private managed trees, counting
 /// each inode once and never following a symlink. Bounded to the store's own
 /// entry bound, so a pathological home reports a partial total rather than
@@ -952,10 +989,25 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 identity.authority.assets_sha256.as_str(),
             )?;
         }
+        // Native caches precede every child: recover this home's own
+        // interrupted native operations, then thaw every frozen remote plugin
+        // parent — the native store rewrites those in place, so they must be
+        // private again before any invocation that could write, including
+        // probes, explicit resumes and the account-switch loop.
+        crate::runtime_cache::prepare_native(home, &runtime_home)?;
         // A committed shared layout joins the launch plan itself, and its
         // guard is proven during planning. Anything still pending was either
-        // recovered or refused by the verification above.
-        let shared_assets = shared_launch_assets(store, home, &runtime_home)?;
+        // recovered or refused by the verification above. A cache-only home
+        // maps no managed root yet still reads through its native links, so
+        // it launches behind the same guard.
+        let mut shared_assets = shared_launch_assets(store, home, &runtime_home)?;
+        if shared_assets.is_none() && crate::runtime_cache::holds_shared_links(home, &runtime_home)?
+        {
+            shared_assets = Some(adapters::provider::SharedLaunchAssets {
+                store_root: crate::runtime_storage::store_root(home)?,
+                roots: BTreeMap::new(),
+            });
+        }
         if store.cancel_pending(id)? {
             if !store.provider_never_spawned(id)? {
                 return Err(invalid("provider attempt was already spawning"));
@@ -1332,23 +1384,31 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             domain::now(),
             verify::DEFAULT_SILENCE_THRESHOLD_SECONDS,
         )?;
-        if cleanup.confirmed
-            && outcome.status == Status::Succeeded
-            && identity.authority.harness == HarnessId::Codex
-            && row.parent_agent_id.is_none()
-            && continuing.is_none()
-        {
+        if cleanup.confirmed {
             // The destination is still exclusively owned: resume admission
             // cannot observe it as terminal until the following store.finish.
-            // Cache reuse never changes the model's completion verdict.
-            match crate::runtime_cache::reuse(store, id, &account, &runtime_home, &harness.home) {
-                Ok(reused) if reused.files_examined > 0 => {
-                    let _ = store.event(id, "runtime_cache_reuse", &json!(reused));
+            // Consolidation covers every terminal outcome and every resumed
+            // run, and never changes the model's completion verdict: a
+            // failed optional cache step is reported and skipped, never
+            // allowed to fail a valid answer or erase valid source data.
+            match crate::runtime_cache::consolidate(
+                store,
+                id,
+                &identity,
+                &account,
+                home,
+                &runtime_home,
+            ) {
+                Ok(report)
+                    if report.frozen + report.packed + report.already_frozen + report.skipped
+                        > 0 =>
+                {
+                    let _ = store.event(id, "native_cache_consolidated", &json!(report));
                 }
                 Err(error) => {
                     let _ = store.event(
                         id,
-                        "runtime_cache_reuse_skipped",
+                        "native_cache_consolidation_skipped",
                         &json!({"class": error.public().kind}),
                     );
                 }

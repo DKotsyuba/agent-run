@@ -300,6 +300,59 @@ fn validate_plugin_parents(
     Ok(())
 }
 
+/// Anchors one strictly verified sealed home that maps no managed roots.
+///
+/// A cache-only home still owns shared content — its native caches — and the
+/// registry row is the one durable anchor that keeps the physical home in the
+/// collector's census after its agent history expires. The home is verified
+/// exactly as [`plan`] verifies it, then an empty version-1 layout is
+/// installed through the same coordinator path: registry `prepare` under the
+/// store publish lock, bridge verification of the unchanged original index
+/// with an empty reference map, compare-and-swap commit. The row survives
+/// until the physical home is conclusively gone, exactly like a mapped row.
+/// An existing committed row binding the same digest is idempotent; a
+/// prepared row is an explicit refusal directing the caller to [`recover`].
+/// Index bytes, native history and authority digests are never rewritten.
+pub fn anchor(
+    store: &mut state::Store,
+    app_home: &Path,
+    runtime_home: &Path,
+    expected: &str,
+    owner: Option<&AgentId>,
+) -> Result<()> {
+    store_root(app_home)?;
+    let canonical = canonical_home(runtime_home)?;
+    let key = canonical.to_string_lossy().into_owned();
+    if let Some(record) = store.runtime_storage_layout(&key)? {
+        return match record.state {
+            state::runtime_storage::LayoutState::Committed if record.index_sha256 == expected => {
+                Ok(())
+            }
+            state::runtime_storage::LayoutState::Committed => Err(invalid(
+                "registered storage layout binds a different original index digest",
+            )),
+            state::runtime_storage::LayoutState::Prepared => Err(invalid(
+                "runtime home has a prepared storage layout; recover it before anchoring",
+            )),
+        };
+    }
+    let (revision, _) = index_document(&canonical, expected)?;
+    let inspection = snapshot_tree::inspect_runtime_snapshots(&canonical, &revision, expected)?;
+    if !inspection.verified {
+        return Err(invalid(
+            "runtime home must strictly verify before it is anchored",
+        ));
+    }
+    let layout = state::runtime_storage::RuntimeStorageLayout {
+        version: 1,
+        runtime_home: key,
+        index_sha256: expected.to_owned(),
+        roots: BTreeMap::new(),
+    };
+    layout.validate()?;
+    install(store, app_home, &layout, owner)
+}
+
 /// Installs one planned layout: imports every tree, swaps each private root
 /// for the exact whole-tree link (or, for a managed plugin root, its whole
 /// parent for the exact plugin-view link), verifies the unchanged original

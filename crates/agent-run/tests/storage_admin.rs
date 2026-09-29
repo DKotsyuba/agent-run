@@ -4,8 +4,8 @@
 
 use agent_run::storage_admin;
 use agent_run_core::{fs, runtime_storage, runtime_storage::StorageFault, state::Store};
-use fs2::FileExt;
 use agent_run_platform::snapshot_tree::{self, RUNTIME_SNAPSHOT_INDEX};
+use fs2::FileExt;
 use rusqlite::params;
 use std::{
     fs as stdfs,
@@ -131,7 +131,13 @@ fn dry_run_is_read_only_and_reports_both_size_bases() {
     let root = fixture._temp.path();
     let (runtime, digest, _index, _history) = seal(root, "legacy", b"private-bytes\n");
     let store = Store::open(&fixture.path).expect("store");
-    retained(&store, "ag-20260101-000000-0000000001", &runtime, &digest, "succeeded");
+    retained(
+        &store,
+        "ag-20260101-000000-0000000001",
+        &runtime,
+        &digest,
+        "succeeded",
+    );
     drop(store);
 
     let before_config = stdfs::read(fixture.path.join("config.toml")).ok();
@@ -151,8 +157,14 @@ fn dry_run_is_read_only_and_reports_both_size_bases() {
     let compact = storage_admin::compact(&fixture.path, false).expect("dry run");
     assert_eq!(compact["applied"], false);
     assert_eq!(compact["plan"]["homes"]["entries"][0]["state"], "eligible");
-    assert_eq!(before_config, stdfs::read(fixture.path.join("config.toml")).ok());
-    assert_eq!(before_db, stdfs::read(fixture.path.join("state.db")).expect("database"));
+    assert_eq!(
+        before_config,
+        stdfs::read(fixture.path.join("config.toml")).ok()
+    );
+    assert_eq!(
+        before_db,
+        stdfs::read(fixture.path.join("state.db")).expect("database")
+    );
     assert_eq!(before_tree, tree_digest(&fixture.path));
     permit(&runtime);
 }
@@ -175,10 +187,7 @@ fn unsupported_schema_is_refused_without_upgrade() {
         storage_admin::recover(&fixture.path),
     ] {
         let error = result.expect_err("older schema is refused");
-        assert!(
-            error.to_string().contains("migration_required"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("migration_required"), "{error}");
     }
     assert_eq!(
         stdfs::read(fixture.path.join("state.db")).expect("database"),
@@ -195,7 +204,13 @@ fn apply_refuses_busy_broker_and_active_agents() {
     let root = fixture._temp.path();
     let (runtime, digest, _index, _history) = seal(root, "legacy", b"private-bytes\n");
     let store = Store::open(&fixture.path).expect("store");
-    retained(&store, "ag-20260101-000000-0000000001", &runtime, &digest, "succeeded");
+    retained(
+        &store,
+        "ag-20260101-000000-0000000001",
+        &runtime,
+        &digest,
+        "succeeded",
+    );
     drop(store);
     let lock = hold_broker_lock(&fixture.path);
     lock.lock_exclusive().expect("broker lock held");
@@ -213,10 +228,7 @@ fn apply_refuses_busy_broker_and_active_agents() {
     );
     drop(store);
     let error = storage_admin::compact(&fixture.path, true).expect_err("active agent refused");
-    assert!(
-        error.to_string().contains("active agents"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("active agents"), "{error}");
     let error = storage_admin::recover(&fixture.path).expect_err("active agent refused");
     assert!(error.to_string().contains("active agents"), "{error}");
     permit(&runtime);
@@ -230,7 +242,13 @@ fn unverifiable_home_is_skipped_and_preserved() {
     let root = fixture._temp.path();
     let (runtime, digest, index, history) = seal(root, "legacy", b"precious-bytes\n");
     let store = Store::open(&fixture.path).expect("store");
-    retained(&store, "ag-20260101-000000-0000000001", &runtime, &digest, "succeeded");
+    retained(
+        &store,
+        "ag-20260101-000000-0000000001",
+        &runtime,
+        &digest,
+        "succeeded",
+    );
     drop(store);
     // The recorded identity carries none of the provider authority a
     // relocation preflight needs, so the home must be skipped, not forced.
@@ -240,11 +258,17 @@ fn unverifiable_home_is_skipped_and_preserved() {
     assert_eq!(relocations.len(), 1);
     assert_eq!(relocations[0]["relocated"], false);
     assert!(
-        !relocations[0]["reason"].as_str().unwrap_or_default().is_empty(),
+        !relocations[0]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
         "the skip states its reason: {relocations:?}"
     );
     assert!(
-        relocations[0]["preserved_private_bytes"].as_u64().unwrap_or(0) > 0,
+        relocations[0]["preserved_private_bytes"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
         "the preserved bytes are measured: {relocations:?}"
     );
     assert_eq!(
@@ -274,7 +298,13 @@ fn interrupted_relocation_recovers_forward_and_stays_idempotent() {
     let root = fixture._temp.path();
     let (runtime, digest, index, history) = seal(root, "legacy", b"recoverable-bytes\n");
     let mut store = Store::open(&fixture.path).expect("store");
-    retained(&store, "ag-20260101-000000-0000000001", &runtime, &digest, "succeeded");
+    retained(
+        &store,
+        "ag-20260101-000000-0000000001",
+        &runtime,
+        &digest,
+        "succeeded",
+    );
     let layout = runtime_storage::plan(
         &store,
         &fixture.path,
@@ -285,7 +315,9 @@ fn interrupted_relocation_recovers_forward_and_stays_idempotent() {
     .expect("plan")
     .expect("managed roots");
     let fault = |_: runtime_storage::StorageFault| -> agent_run_domain::Result<()> {
-        Err(agent_run_domain::Error::Validation("simulated crash".into()))
+        Err(agent_run_domain::Error::Validation(
+            "simulated crash".into(),
+        ))
     };
     runtime_storage::install_with_fault(&mut store, &fixture.path, &layout, None, Some(&fault))
         .expect_err("crash before commit");
@@ -324,7 +356,13 @@ fn foreign_prepared_home_is_refused_not_guessed() {
     let root = fixture._temp.path();
     let (runtime, digest, _index, _history) = seal(root, "legacy", b"foreign-bytes\n");
     let mut store = Store::open(&fixture.path).expect("store");
-    retained(&store, "ag-20260101-000000-0000000001", &runtime, &digest, "succeeded");
+    retained(
+        &store,
+        "ag-20260101-000000-0000000001",
+        &runtime,
+        &digest,
+        "succeeded",
+    );
     let layout = runtime_storage::plan(
         &store,
         &fixture.path,
@@ -336,7 +374,9 @@ fn foreign_prepared_home_is_refused_not_guessed() {
     .expect("managed roots");
     let fault = |point: StorageFault| -> agent_run_domain::Result<()> {
         if point == StorageFault::AfterRename {
-            Err(agent_run_domain::Error::Validation("simulated crash".into()))
+            Err(agent_run_domain::Error::Validation(
+                "simulated crash".into(),
+            ))
         } else {
             Ok(())
         }
@@ -352,8 +392,13 @@ fn foreign_prepared_home_is_refused_not_guessed() {
     let recovered = storage_admin::recover(&fixture.path).expect("recover");
     assert_eq!(recovered["recovered"], 0, "{recovered}");
     assert_eq!(recovered["refused"], 1);
-    let reason = recovered["outcomes"][0]["reason"].as_str().unwrap_or_default();
-    assert!(reason.contains("foreign"), "the refusal states its reason: {reason}");
+    let reason = recovered["outcomes"][0]["reason"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        reason.contains("foreign"),
+        "the refusal states its reason: {reason}"
+    );
     let store = Store::open(&fixture.path).expect("store");
     let state = store
         .runtime_storage_layout(&layout.runtime_home)
@@ -453,10 +498,20 @@ fn resumed_lineage_is_eligible_and_relocates_once() {
 
     let result = storage_admin::compact(&fixture.path, true).expect("apply");
     let relocations = result["relocations"].as_array().expect("relocations");
-    assert_eq!(relocations.len(), 1, "one home relocates once: {relocations:?}");
-    assert_eq!(relocations[0]["relocated"], false, "the fixture authority cannot qualify");
+    assert_eq!(
+        relocations.len(),
+        1,
+        "one home relocates once: {relocations:?}"
+    );
+    assert_eq!(
+        relocations[0]["relocated"], false,
+        "the fixture authority cannot qualify"
+    );
     assert!(
-        !relocations[0]["reason"].as_str().unwrap_or_default().is_empty(),
+        !relocations[0]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
         "the single skip states its reason: {relocations:?}"
     );
     // The home and its proofs are untouched by the refused relocation.
@@ -465,6 +520,9 @@ fn resumed_lineage_is_eligible_and_relocates_once() {
         index,
         "the frozen index bytes stay byte-exact"
     );
-    assert_eq!(stdfs::read(runtime.join("history.json")).expect("history"), history);
+    assert_eq!(
+        stdfs::read(runtime.join("history.json")).expect("history"),
+        history
+    );
     permit(&runtime);
 }

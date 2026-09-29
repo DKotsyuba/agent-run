@@ -143,11 +143,7 @@ impl SharedStoreLock {
         match options.open(&lock_path) {
             Ok(file) => Ok(Some(file)),
             // Without `create`, a missing lock file is simply nothing to take.
-            Err(error)
-                if !create && error.kind() == std::io::ErrorKind::NotFound =>
-            {
-                Ok(None)
-            }
+            Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
     }

@@ -66,7 +66,7 @@ fn invalid_layouts_are_refused() {
             "/runtime/alpha",
             json!({"a": mapping(), "a-b": mapping(), "a/b": mapping()}),
         ),
-        layout("/runtime/alpha", json!({})),
+        // An empty root set is the cache-only anchor and is accepted.
         // Valid contract but not the canonical encoding.
         layout("/runtime/alpha", json!({"assets": mapping()})).replace(",\"roots\"", ", \"roots\""),
         // A duplicate root collapses to one entry, so the text is not canonical.
@@ -93,6 +93,13 @@ fn invalid_layouts_are_refused() {
     // The one valid form is accepted and parses back to its own contract.
     let record = store.prepare_runtime_storage_layout(&valid, None).unwrap();
     assert_eq!(record.state, LayoutState::Prepared);
+    // The empty cache-only anchor is its own valid canonical form.
+    let anchor = format!(
+        "{{\"index_sha256\":\"{}\",\"roots\":{{}},\"runtime_home\":\"/runtime/anchor\",\"version\":1}}",
+        "1".repeat(64),
+    );
+    let anchor_record = store.prepare_runtime_storage_layout(&anchor, None).unwrap();
+    assert!(anchor_record.layout().roots.is_empty());
     assert_eq!(
         record.layout(),
         &serde_json::from_str::<RuntimeStorageLayout>(&valid).unwrap()

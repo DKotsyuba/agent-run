@@ -122,6 +122,17 @@ The coordinator owns the physical switch itself, above the registry and the
 platform store. The supervisor calls it after the actual harness guard is
 validated, never through a request-supplied path.
 
+`anchor(store, app_home, runtime_home, expected, owner)` registers one
+strictly verified sealed home that maps no managed roots. A cache-only home
+still owns shared content — its native caches — and this row is what keeps
+the physical home in the collector's census after its agent history expires.
+It is the same coordinator path as `install` with an empty map: registry
+`prepare` under the store publish lock, bridge verification of the unchanged
+original index, compare-and-swap commit. It is idempotent against a committed
+row binding the same digest and refuses a `prepared` row the same way
+`install` does. `plan` still returns `None` for a home with no managed roots,
+so sealing one imposes no needless preflight.
+
 `store_root(app_home)` derives `<canonical app home>/shared-assets/v1`
 read-only. A missing namespace is derived, not created (the launch path may
 create the empty trusted root before guard validation); an existing namespace

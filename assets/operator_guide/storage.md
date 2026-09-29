@@ -14,7 +14,8 @@ unique inode bytes (a bounded walk; a partial one is labelled `incomplete`,
 never passed off as a total), the filesystem's own free space as a separate
 number, and one entry per retained runtime home with its classification:
 
-- `shared` — a committed layout row backs the home.
+- `shared` — a committed layout row backs the home, including the empty
+  cache-only anchor of a home with no managed roots.
 - `eligible` — a private home the read-only planner can still strictly verify.
 - `prepared` — an interrupted relocation holds the home; run `storage recover`.
 - `protected` — an active or lost holder keeps it, or it has no managed roots.
@@ -40,7 +41,12 @@ reclaim, writing nothing. `--apply` additionally:
    recorded account — never the current provider, never a rewritten config. A
    home whose workdir, binary, grants or sandbox boundary cannot be verified
    is skipped with its reason and preserved byte count;
-4. runs one reference-aware collection pass over the shared store.
+4. consolidates each eligible home's native caches under the same locks and
+   the same latest-terminal authority: the home is anchored (cache-only homes
+   included), eligible native trees are frozen and both metadata caches are
+   packed under the compatibility domain derived from the frozen harness,
+   connection and recorded account;
+5. runs one reference-aware collection pass over the shared store.
 
 ## `agent-run storage recover`
 
@@ -61,8 +67,11 @@ nonblocking (a busy publisher means the pass simply retries), re-derives every
 reference while holding it, and only then unlinks: a `prepared` row always
 pins what it names, a `committed` row pins while its home exists, and any
 configuration, frozen identity, credential or unreleased service path pointing
-into the store pins the tree, view or blob it names — including the tree
-behind a protected view.
+into the store pins the tree, view, blob or native-cache object it names —
+including the tree behind a protected view. Native cache links and operation
+journals of every extant registered home join the same census, and a partial
+native census or a home whose existence cannot be determined retains
+everything.
 
 **A complete proof precedes any deletion.** A reference census that is
 partial, unreadable, corrupt or beyond its bound retains every candidate and
@@ -95,6 +104,5 @@ identifiers.
 - A state database older than the current schema is refused with
   `migration_required`; run `agent-run config migrate` first. Storage commands
   never upgrade the database implicitly.
-- Native unindexed caches are not shared or collected here.
 - A historical resume whose native session is broken stays broken: recovery
   repairs interrupted relocations, not native sessions.

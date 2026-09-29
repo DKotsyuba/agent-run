@@ -20,8 +20,8 @@ pub mod managed_services;
 pub mod native_cache;
 /// Freeze/thaw lifecycle for native Codex directory caches in retained homes.
 pub mod native_tree_cache;
-/// Optional reuse of native plugin blocks after verified, session-owned cleanup.
-mod runtime_cache;
+/// Native cache lifecycle glue shared by the supervisor and operator surfaces.
+pub mod runtime_cache;
 /// Filesystem relocation of sealed managed trees into the shared store.
 pub mod runtime_storage;
 pub mod service;
