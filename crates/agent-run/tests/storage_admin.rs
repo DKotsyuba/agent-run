@@ -526,3 +526,147 @@ fn resumed_lineage_is_eligible_and_relocates_once() {
     );
     permit(&runtime);
 }
+
+/// Seals one home, commits its managed layout through the real coordinator
+/// and then records its holders, so the survey classifies it from a
+/// committed registry row.
+fn committed(fixture: &Home, name: &str, holders: &[(&str, &str)]) -> PathBuf {
+    let root = fixture._temp.path();
+    let (runtime, digest, _index, _history) = seal(root, name, format!("{name}\n").as_bytes());
+    let runtime = runtime.canonicalize().expect("canonical home");
+    let mut store = Store::open(&fixture.path).expect("store");
+    let layout = runtime_storage::plan(
+        &store,
+        &fixture.path,
+        &runtime,
+        &digest,
+        &agent_run_core::supervisor::managed_scope(),
+    )
+    .expect("plan")
+    .expect("managed roots");
+    runtime_storage::install(&mut store, &fixture.path, &layout, None).expect("committed layout");
+    // Holders are recorded after the commit: the coordinator itself refuses
+    // to switch a home an active execution binds.
+    for (index, (id, status)) in holders.iter().enumerate() {
+        retained_at(&store, id, &runtime, &digest, status, 1000.0 + index as f64);
+    }
+    runtime
+}
+
+/// Repeated compaction selects every proven-idle shared home for native
+/// consolidation — a committed layout no longer hides caches the home
+/// accumulated since — while a home with an active or lost holder stays
+/// `protected` even with a committed layout, and protected, unreadable and
+/// malformed holders are never mutated.
+#[test]
+fn repeat_compact_selects_idle_shared_homes_and_keeps_protections() {
+    let fixture = home();
+    let shared = committed(
+        &fixture,
+        "shared",
+        &[("ag-20260101-000000-0000000001", "succeeded")],
+    );
+    let held = committed(
+        &fixture,
+        "held",
+        &[
+            ("ag-20260102-000000-0000000002", "succeeded"),
+            ("ag-20260102-000000-0000000003", "running"),
+        ],
+    );
+    let malformed = committed(&fixture, "malformed", &[("not-an-agent-id", "succeeded")]);
+    let (unreadable, digest, _index, _history) =
+        seal(fixture._temp.path(), "unreadable", b"unreadable\n");
+    let store = Store::open(&fixture.path).expect("store");
+    retained(
+        &store,
+        "ag-20260104-000000-0000000004",
+        &unreadable,
+        &digest,
+        "succeeded",
+    );
+    drop(store);
+    // A native cache the shared home accumulated after its layout committed.
+    let parent = shared.join("plugins/cache/remote/late-plugin");
+    stdfs::create_dir_all(parent.join("1.0.0")).expect("late parent");
+    stdfs::write(parent.join("1.0.0/plugin.toml"), "name = \"late\"\n").expect("late file");
+
+    let entry = |status: &serde_json::Value, home: &Path| {
+        status["homes"]["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .find(|entry| entry["runtime_home"] == home.to_string_lossy().as_ref())
+            .cloned()
+            .expect("surveyed home")
+    };
+    let status = storage_admin::status(&fixture.path).expect("status");
+    assert_eq!(entry(&status, &shared)["state"], "shared");
+    let held_entry = entry(&status, &held);
+    assert_eq!(
+        held_entry["state"], "protected",
+        "a committed layout never lifts protection"
+    );
+    assert!(
+        held_entry["reasons"].to_string().contains("active or lost"),
+        "{held_entry}"
+    );
+
+    // A lost holder is not active, so offline work may proceed — the home
+    // must still be excluded from every mutation.
+    let store = Store::open(&fixture.path).expect("store");
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='lost' WHERE id='ag-20260102-000000-0000000003'",
+            [],
+        )
+        .expect("lost holder");
+    drop(store);
+    let held_before = tree_digest(&held);
+    stdfs::set_permissions(&unreadable, stdfs::Permissions::from_mode(0o000)).expect("unreadable");
+    let result = storage_admin::compact(&fixture.path, true).expect("apply");
+    stdfs::set_permissions(&unreadable, stdfs::Permissions::from_mode(0o700)).expect("readable");
+
+    assert_eq!(entry(&result["plan"], &held)["state"], "protected");
+    assert_eq!(entry(&result["plan"], &unreadable)["state"], "unknown");
+    let native: Vec<&serde_json::Value> = result["native"]
+        .as_array()
+        .expect("native")
+        .iter()
+        .collect();
+    let homes: Vec<&str> = native
+        .iter()
+        .map(|item| item["runtime_home"].as_str().unwrap_or_default())
+        .collect();
+    let mut expected = vec![
+        malformed.to_string_lossy().into_owned(),
+        shared.to_string_lossy().into_owned(),
+    ];
+    expected.sort();
+    assert_eq!(
+        homes, expected,
+        "exactly the idle shared homes reach native work: {native:?}"
+    );
+    let malformed_item = native
+        .iter()
+        .find(|item| item["runtime_home"] == malformed.to_string_lossy().as_ref())
+        .expect("malformed item");
+    assert_eq!(malformed_item["reason"], "recorded agent id is malformed");
+    assert!(
+        result["relocations"]
+            .as_array()
+            .expect("relocations")
+            .is_empty(),
+        "shared homes never relocate again: {result}"
+    );
+    assert_eq!(
+        tree_digest(&held),
+        held_before,
+        "the protected home is untouched"
+    );
+    for path in [&shared, &held, &malformed, &unreadable] {
+        permit(path);
+    }
+    permit(&runtime_storage::store_root(&fixture.path).expect("store root"));
+}

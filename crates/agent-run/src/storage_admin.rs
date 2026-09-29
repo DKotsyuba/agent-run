@@ -70,8 +70,13 @@ struct Surveyed {
 struct Survey {
     /// The operator-facing JSON report.
     report: Value,
-    /// Latest terminal execution per eligible home, internal use only.
-    executors: Vec<(String, String)>,
+    /// Latest terminal execution per proven-idle `eligible` or `shared`
+    /// home as `(home, agent id, state)`, internal use only. Managed
+    /// relocation uses only the `eligible` ones; native consolidation uses
+    /// both, because a committed shared home keeps accumulating native
+    /// caches after its managed roots moved. A home with any active or lost
+    /// holder is `protected` and never listed.
+    executors: Vec<(String, String, &'static str)>,
 }
 
 /// Measures unique inode bytes below one directory, never following symlinks.
@@ -160,7 +165,10 @@ fn child_names(root: &Path) -> Vec<String> {
 /// holders of one home are considered together: a resume lineage legitimately
 /// leaves many terminal executions sharing one home, so a home is protected
 /// only while some holder is active or lost, and qualification uses the
-/// latest terminal holder's sealed index. A home no identity records is
+/// latest terminal holder's sealed index. The protection wins over every
+/// layout state: a committed or prepared home with an active or lost holder
+/// stays `protected` (the layout is added to its reasons). A home no
+/// identity records is
 /// reported as unknown and never touched, and so are aliases and unreadable
 /// homes; a home is `gone` only on a plain `NotFound`. Registry errors are
 /// reported, never hidden behind a fallback. An unmeasurable or partially
@@ -284,15 +292,23 @@ fn survey(home: &Path, store: &Store) -> Result<Survey> {
         }
         match layout.as_ref().map(|record| record.state) {
             Some(agent_run_store::runtime_storage::LayoutState::Prepared) => {
-                entry.state = "prepared";
+                if entry.state != "protected" {
+                    entry.state = "prepared";
+                }
                 entry.reasons.push(
                     "an interrupted relocation holds a prepared layout; run `storage recover`"
                         .into(),
                 );
             }
             Some(agent_run_store::runtime_storage::LayoutState::Committed) => {
-                entry.state = "shared";
-                entry.reasons.clear();
+                if entry.state == "protected" {
+                    entry
+                        .reasons
+                        .push("the home holds a committed shared layout".into());
+                } else {
+                    entry.state = "shared";
+                    entry.reasons.clear();
+                }
             }
             None => {
                 if entry.state != "protected" {
@@ -376,12 +392,12 @@ fn survey(home: &Path, store: &Store) -> Result<Survey> {
         // public report carries no migrating execution identifiers.
         executors: homes
             .values()
-            .filter(|entry| entry.state == "eligible")
+            .filter(|entry| matches!(entry.state, "eligible" | "shared") && entry.active.is_empty())
             .filter_map(|entry| {
                 entry
                     .executor
                     .clone()
-                    .map(|agent| (entry.home.clone(), agent))
+                    .map(|agent| (entry.home.clone(), agent, entry.state))
             })
             .collect(),
     })
@@ -424,8 +440,11 @@ fn shared_scope() -> String {
 /// collection preview, both of which only read schema, configuration,
 /// identities and the store's directory entries. `--apply` first takes the
 /// broker and service-manager startup locks and refuses active agents, then
-/// relocates each eligible single-holder home behind the real guard preflight
-/// and runs one collecting pass.
+/// relocates each eligible home behind the real guard preflight, consolidates
+/// the native caches of every proven-idle eligible or already-shared home
+/// (so repeated compaction reaches caches a shared home accumulated since),
+/// and runs one collecting pass. Protected, prepared, unknown and gone homes
+/// are never mutated.
 pub fn compact(home: &Path, apply: bool) -> Result<Value> {
     migrate::require_current_store(home)?;
     let mut store = Store::open(home)?;
@@ -443,10 +462,10 @@ pub fn compact(home: &Path, apply: bool) -> Result<Value> {
     let plan = survey(home, &store)?;
     // Each eligible home relocates once, behind its latest terminal
     // execution's recorded authority; internal per-run ids stay here.
-    let mut eligible = plan.executors.clone();
-    eligible.sort();
+    let mut selected = plan.executors.clone();
+    selected.sort();
     let mut relocations = Vec::new();
-    for (home_path, agent) in &eligible {
+    for (home_path, agent, _) in selected.iter().filter(|(_, _, state)| *state == "eligible") {
         let agent = match agent.parse() {
             Ok(agent) => agent,
             Err(_) => {
@@ -486,13 +505,20 @@ pub fn compact(home: &Path, apply: bool) -> Result<Value> {
         relocations.push(result);
     }
     // Native caches consolidate under the same offline locks and the same
-    // latest-terminal-executor authority, for every eligible home whether or
-    // not it maps managed roots.
+    // latest-terminal-executor authority, for every proven-idle eligible or
+    // already-shared home whether or not it maps managed roots.
     let mut native = Vec::new();
-    for (home_path, agent) in &eligible {
+    for (home_path, agent, _) in &selected {
         let agent = match agent.parse() {
             Ok(agent) => agent,
-            Err(_) => continue,
+            Err(_) => {
+                native.push(json!({
+                    "runtime_home": home_path,
+                    "consolidated": false,
+                    "reason": "recorded agent id is malformed",
+                }));
+                continue;
+            }
         };
         let result =
             match agent_run_core::supervisor::consolidate_retained_native(&mut store, home, &agent)

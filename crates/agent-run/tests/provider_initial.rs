@@ -4358,3 +4358,61 @@ async fn managed_codex_home_consolidates_through_its_registry_mapping() {
     assert_eq!(events("native_cache_consolidation_skipped"), 0);
     assert_eq!(events("native_cache_consolidated"), 1);
 }
+
+/// Repeated offline compaction reaches a home that is already shared: after
+/// a managed-role Codex run committed its layout, a remote plugin parent the
+/// home accumulated later is frozen by `storage compact --apply` through the
+/// real qualification, and the committed home is not relocated again.
+#[tokio::test]
+async fn repeat_compact_consolidates_caches_of_an_already_shared_home() {
+    let (_temp, home) = codex_home_with(&["ok"]);
+    fs::write(home.join("profiles/review.md"),
+        "+++\nrevision = \"1\"\nwrite = false\nnetwork = false\nallow_external_read_roots = false\nskills = [\"demo\"]\nmcp = []\nrequired_constraints = []\n+++\nReview safely.\n").unwrap();
+    fs::create_dir_all(home.join("skills/demo")).unwrap();
+    fs::write(
+        home.join("skills/demo/SKILL.md"),
+        "# demo\nManaged fixture skill.\n",
+    )
+    .unwrap();
+    let id = codex_run(&home, "repeat-1", None).await;
+    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    assert_eq!(row.status, Status::Succeeded, "{:?}", row.failure_text);
+    let runtime_home = std::path::PathBuf::from(
+        row.identity.as_ref().unwrap()["runtime_home"]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(
+        runtime_home.join("skills/demo").is_symlink(),
+        "the layout committed"
+    );
+    // A remote plugin parent the shared home accumulated after its run.
+    let parent = runtime_home.join("plugins/cache/remote/late-plugin");
+    fs::create_dir_all(parent.join("1.0.0")).unwrap();
+    fs::write(parent.join("1.0.0/plugin.toml"), "name = \"late\"\n").unwrap();
+    fs::write(
+        parent.join(".codex-remote-plugin-install.json"),
+        "{\"schema_version\":1,\"remote_plugin_id\":\"late-plugin\"}\n",
+    )
+    .unwrap();
+
+    let result = agent_run::storage_admin::compact(&home, true).expect("apply");
+    let canonical = runtime_home.canonicalize().unwrap();
+    let native = result["native"].as_array().expect("native");
+    let item = native
+        .iter()
+        .find(|item| item["runtime_home"] == canonical.to_string_lossy().as_ref())
+        .unwrap_or_else(|| panic!("the shared home reaches native work: {result}"));
+    assert!(
+        item["consolidated"]["frozen"].as_u64().unwrap_or(0) >= 1,
+        "the late parent froze: {item}"
+    );
+    assert!(parent.is_symlink(), "the late parent is shared now");
+    assert!(
+        result["relocations"]
+            .as_array()
+            .expect("relocations")
+            .is_empty(),
+        "a committed home never relocates again: {result}"
+    );
+}
