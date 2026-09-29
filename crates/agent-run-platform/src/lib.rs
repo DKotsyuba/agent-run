@@ -7,5 +7,6 @@ pub mod paths;
 pub mod process;
 pub mod publish;
 pub mod release;
+pub mod shared_asset_guard;
 pub mod snapshot_tree;
 pub mod verify;
