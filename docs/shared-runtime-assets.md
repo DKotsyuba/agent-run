@@ -21,3 +21,35 @@ profile. A nested test executor may prevent profile application. Wrapping an
 entire Codex app-server may also prevent its own nested sandbox application;
 that integration remains unqualified. This primitive does not choose an adapter
 launch boundary or change Codex permissions.
+
+## Codex integration gate
+
+Keep Codex's own shell sandbox. If the selected managed `Projects` profile
+already grants the canonical shared store read access and the store is disjoint
+from every effective write grant and denied subtree, reuse that profile. If
+either condition cannot be proved, refuse the launch until a supported policy
+is available. Do not place the store under `/tmp`, `$TMPDIR`, a workspace root,
+or a writable cache. In Codex CLI 0.156.1 on macOS, a nominal `read` override
+under `/private/tmp` did not stop writes because of the temporary-path grant.
+
+Before admitting a Codex launch, compare the canonical shared root against
+every canonical writable root in `Grant::writable_roots`, plus the built-in
+`:tmpdir` and `:slash_tmp` roots. Reject if either path is an ancestor of the
+other, or if a root cannot be resolved. `Grant::new` already freezes the chosen
+profile and writable roots; `Grant::verify` checks the app-server's echo. The
+shared-root overlap check belongs beside that existing admission path, before
+`Grant::request`, and must fail closed. A disposable native `codex sandbox
+--include-managed-config -P <profile>` fixture should then prove shared reads,
+ordinary sibling writes, and protected write denials under the actual selected
+profile. The ignored test in this module uses a temporary profile and owns all
+of its fixture files. It does not install a profile or alter managed policy.
+
+Codex permission profiles constrain its sandboxed commands, not the app-server
+plugin loader or an already-running external MCP server. Keep the app-server
+outside the outer Seatbelt wrapper so its own sandbox can start. A harness-owned
+stdio MCP child can use `SharedAssetGuard::wrap` at its launch boundary; no
+proxy is needed. Any future shared-layout bridge must also preserve the
+independent `materialize::verify` check in `provider::sealed` before credentials
+bind. The ignored fixture also checks metadata-only `claude --version` startup
+under the outer guard. See the [Codex permissions reference](https://developers.openai.com/codex/permissions)
+for profile scope and path precedence.

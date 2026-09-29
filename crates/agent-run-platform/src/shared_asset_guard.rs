@@ -576,4 +576,125 @@ mod tests {
         ));
         assert_eq!(std::fs::read(&file).unwrap(), b"original");
     }
+
+    /// Exercises Codex's native read carveout with managed configuration and
+    /// checks that a metadata-only Claude process starts under this guard.
+    /// All filesystem mutations are confined to a temporary directory below
+    /// the real home; neither executable starts a model turn.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires native macOS plus CODEX_BIN, CLAUDE_BIN and NATIVE_GUARD_HOME"]
+    fn live_native_codex_permissions_and_claude_startup() {
+        let codex = PathBuf::from(std::env::var_os("CODEX_BIN").expect("CODEX_BIN"));
+        let claude = PathBuf::from(std::env::var_os("CLAUDE_BIN").expect("CLAUDE_BIN"));
+        assert!(codex.is_absolute() && claude.is_absolute());
+        let home = PathBuf::from(std::env::var_os("NATIVE_GUARD_HOME").expect("NATIVE_GUARD_HOME"))
+            .canonicalize()
+            .unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("agent-run-native-guard-")
+            .tempdir_in(&home)
+            .unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let fixture = base.join("fixture");
+        let root = fixture.join("shared");
+        let work = base.join("work");
+        let codex_home = base.join("codex-home");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(&work).unwrap();
+        std::fs::create_dir(&codex_home).unwrap();
+        let file = root.join("asset");
+        std::fs::write(&file, b"original").unwrap();
+        let link = work.join("asset-link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+
+        let config = format!(
+            "[permissions.shared_probe]\nextends = \":workspace\"\n\
+             [permissions.shared_probe.workspace_roots]\n{} = true\n\
+             [permissions.shared_probe.filesystem]\n{} = \"read\"\n",
+            serde_json::to_string(&base.to_str().unwrap()).unwrap(),
+            serde_json::to_string(&root.to_str().unwrap()).unwrap()
+        );
+        std::fs::write(codex_home.join("config.toml"), config).unwrap();
+        let path = format!("{}:/usr/bin:/bin", codex.parent().unwrap().display());
+
+        // The closure runs only finite shell scripts; output carries the
+        // diagnostic when a positive control fails before any denial counts.
+        let run = |script: &str, args: &[&Path]| {
+            let mut command = std::process::Command::new(&codex);
+            command
+                .arg("sandbox")
+                .arg("--include-managed-config")
+                .arg("-P")
+                .arg("shared_probe")
+                .arg("-C")
+                .arg(&work)
+                .arg("--")
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .arg("--")
+                .args(args)
+                .env_clear()
+                .env("PATH", &path)
+                .env("HOME", &home)
+                .env("CODEX_HOME", &codex_home);
+            command.output().unwrap()
+        };
+
+        let sibling = work.join("sibling");
+        let readback = work.join("readback");
+        let positive = run(
+            "cat \"$1\" > \"$2\" && printf ok > \"$3\"",
+            &[&link, &readback, &sibling],
+        );
+        assert!(
+            positive.status.success(),
+            "{}",
+            String::from_utf8_lossy(&positive.stderr)
+        );
+        assert_eq!(std::fs::read(&readback).unwrap(), b"original");
+        assert_eq!(std::fs::read(&sibling).unwrap(), b"ok");
+        let renamed = work.join("renamed");
+        let positive_rename = run(
+            "mv \"$1\" \"$2\" && mv \"$2\" \"$1\"",
+            &[&sibling, &renamed],
+        );
+        assert!(
+            positive_rename.status.success(),
+            "{}",
+            String::from_utf8_lossy(&positive_rename.stderr)
+        );
+        assert!(!run("printf bad > \"$1\"", &[&file]).status.success());
+        assert!(!run("printf bad > \"$1\"", &[&link]).status.success());
+        assert!(!run("chmod 600 \"$1\"", &[&file]).status.success());
+        assert!(!run("rm \"$1\"", &[&file]).status.success());
+        let escaped = work.join("escaped");
+        assert!(!run("ln \"$1\" \"$2\"", &[&file, &escaped]).status.success());
+        assert!(!run("mv \"$1\" \"$2\"", &[&file, &escaped]).status.success());
+        assert!(!run("mv \"$1\" \"$2\"", &[&root, &escaped]).status.success());
+        let moved_fixture = fixture.with_extension("moved");
+        assert!(!run("mv \"$1\" \"$2\"", &[&fixture, &moved_fixture])
+            .status
+            .success());
+        assert_eq!(std::fs::read(&file).unwrap(), b"original");
+        assert!(!escaped.exists());
+
+        let guard = SharedAssetGuard::new(&root).unwrap();
+        let argv = guard.wrap(&claude, &["--version".to_string()]).unwrap();
+        let version = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &base)
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        assert!(
+            version.status.success(),
+            "{}",
+            String::from_utf8_lossy(&version.stderr)
+        );
+        assert!(!version.stdout.is_empty());
+    }
 }
