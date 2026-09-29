@@ -21,6 +21,8 @@ pub mod quota;
 pub mod retention;
 /// Python-compatible normalization and repair of cumulative run usage rows.
 pub mod run_stats;
+/// Durable physical storage-layout registry for shared runtime assets.
+pub mod runtime_storage;
 /// Atomic terminal lifecycle transitions and their durable completion notices.
 pub mod terminal;
 /// Authenticated, bounded worker reports and their durable outbox rows.

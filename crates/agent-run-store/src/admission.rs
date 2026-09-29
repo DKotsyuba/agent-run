@@ -132,6 +132,13 @@ pub fn admit_with_config_revision(
     let lineage = parent
         .map(|record| lineage::resume_parent(&tx, &record.id))
         .transpose()?;
+    // A runtime home with a still-prepared storage layout must not admit a
+    // new continuation while its physical placement is being changed; this
+    // runs inside the same transaction as the insert, so the two can never
+    // race. The frozen parent identity, never the request path, names the home.
+    if let Some(identity) = parent.and_then(|record| record.identity.as_ref()) {
+        crate::runtime_storage::refuse_prepared_resume_home(&tx, identity)?;
+    }
     let session = upsert_session(&tx, &checked, accepted_at)?;
     let id = AgentId::new();
     let summary = checked

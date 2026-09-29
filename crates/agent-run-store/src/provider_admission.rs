@@ -345,6 +345,21 @@ impl Store {
                         resume.parent
                     )));
                 }
+                // Same rule as the legacy path: a home whose storage layout is
+                // still prepared cannot gain a child, decided inside this
+                // transaction from the parent's frozen identity.
+                let parent_identity: Option<String> = tx
+                    .query_row(
+                        "SELECT identity_json FROM agents WHERE id=?1",
+                        [resume.parent.as_str()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(raw) = parent_identity {
+                    let identity: Value = serde_json::from_str(&raw)
+                        .map_err(|_| invalid("resume parent identity is malformed"))?;
+                    crate::runtime_storage::refuse_prepared_resume_home(&tx, &identity)?;
+                }
                 Some(lineage)
             }
             None => None,

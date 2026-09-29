@@ -735,3 +735,131 @@ fn late_records_keep_their_originating_attempt() {
         None
     );
 }
+
+/// A runtime home with a still-prepared storage layout admits no provider
+/// continuation, an already-admitted request id still replays, and the same
+/// resume succeeds once the layout is committed.
+#[test]
+fn prepared_storage_layout_gates_provider_resume_only() {
+    use agent_run_store::provider_admission::ProviderResume;
+    let home = home();
+    let mut store = Store::open(home.path()).unwrap();
+    let catalog = catalog(&store);
+    let request = provider_request(home.path(), "layout-parent");
+    let authority = authority(&catalog, home.path());
+    let revision = store.quota_capacity_revision().unwrap();
+    let admitted = store
+        .admit_provider(
+            &request,
+            &request.storage_projection(),
+            &catalog,
+            &authority,
+            &candidates(revision, &[("acct-a", 0)]),
+            &identity(&request, &authority),
+            8,
+            None,
+            None,
+        )
+        .unwrap();
+    // Seal the parent as the supervisor would: verified cleanup, a terminal
+    // status with no live process, a native session and its frozen home.
+    let runtime_home = home.path().join("runtime").to_string_lossy().to_string();
+    store
+        .conn
+        .execute(
+            "UPDATE attempts SET phase='cleanup_complete',process_identity='p',\
+             cleanup_proof_json='{\"confirmed\":true}' WHERE id=?",
+            [&admitted.attempt_id],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='failed',finished_at=2.0,runtime_session_id='sess-a',\
+             identity_json=json_set(identity_json,'$.runtime_home',?1) WHERE id=?",
+            rusqlite::params![runtime_home, admitted.agent_id.as_str()],
+        )
+        .unwrap();
+    let layout = serde_json::to_string(&serde_json::json!({
+        "version": 1,
+        "runtime_home": runtime_home,
+        "index_sha256": "1".repeat(64),
+        "roots": {"assets": {"scope": "2".repeat(64), "manifest_sha256": "3".repeat(64)}},
+    }))
+    .unwrap();
+    let prepared = store.prepare_runtime_storage_layout(&layout, None).unwrap();
+    let resume_request = provider_request(home.path(), "layout-child");
+    let mut resume_identity = identity(&resume_request, &authority);
+    resume_identity["runtime_home"] = serde_json::json!(runtime_home);
+    let error = store
+        .admit_provider_resume(
+            &resume_request,
+            &resume_request.storage_projection(),
+            &catalog,
+            &authority,
+            &candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]),
+            &resume_identity,
+            8,
+            None,
+            None,
+            ProviderResume {
+                parent: &admitted.agent_id,
+                prefer: &"acct-a".parse().unwrap(),
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::Unsupported(message) if message.contains("prepared storage layout")),
+        "{error:?}"
+    );
+    let children: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM agents WHERE parent_agent_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(children, 0);
+    // The parent's own request id is an already-created execution, so its
+    // replay is unaffected by the pending layout.
+    let replay = store
+        .admit_provider(
+            &request,
+            &request.storage_projection(),
+            &catalog,
+            &authority,
+            &candidates(revision, &[("acct-a", 0)]),
+            &identity(&request, &authority),
+            8,
+            None,
+            None,
+        )
+        .unwrap();
+    assert!(!replay.created);
+    store
+        .commit_runtime_storage_layout(
+            &runtime_home,
+            &prepared.operation_token,
+            &prepared.layout_sha256,
+        )
+        .unwrap();
+    let resumed = store
+        .admit_provider_resume(
+            &resume_request,
+            &resume_request.storage_projection(),
+            &catalog,
+            &authority,
+            &candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]),
+            &resume_identity,
+            8,
+            None,
+            None,
+            ProviderResume {
+                parent: &admitted.agent_id,
+                prefer: &"acct-a".parse().unwrap(),
+            },
+        )
+        .unwrap();
+    assert!(resumed.created);
+}
