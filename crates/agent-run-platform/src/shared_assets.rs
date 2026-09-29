@@ -292,14 +292,27 @@ fn file_identity(entry: &Value) -> Result<(String, u32, u64)> {
 /// bytes, refusing trees above the entry or total-size bounds before any
 /// filesystem work. The manifest's own [`MAX_TREE_MANIFEST_BYTES`] parse
 /// bound keeps this check cheap.
+///
+/// Every entry naming one payload digest must also declare the same size:
+/// all of them resolve to one content-addressed blob, which cannot satisfy
+/// two sizes, so a conflicting manifest is refused before publication
+/// rather than linking an entry to a blob of another length. Same-digest
+/// entries with the same size stay valid and share one blob.
 fn validate_entries(entries: &BTreeMap<String, Value>) -> Result<u64> {
     if entries.len() > MAX_TREE_ENTRIES {
         return Err(invalid("shared tree exceeds the manifest entry bound"));
     }
     let mut total = 0_u64;
+    let mut sizes: BTreeMap<String, u64> = BTreeMap::new();
     for entry in entries.values() {
         if entry["type"] == "file" {
-            total += file_identity(entry)?.2;
+            let (sha256, _, bytes) = file_identity(entry)?;
+            if *sizes.entry(sha256).or_insert(bytes) != bytes {
+                return Err(invalid(
+                    "shared tree manifest gives one payload digest conflicting sizes",
+                ));
+            }
+            total += bytes;
         }
     }
     if total > MAX_TREE_BYTES {
@@ -1418,6 +1431,59 @@ mod tests {
         fs::set_permissions(&blob, fs::Permissions::from_mode(0o400)).unwrap();
         let second = import(&root, &scope, second_home.path());
         verify_shared_tree(&root, &second).unwrap();
+    }
+
+    /// Two manifest entries naming one payload digest with different sizes
+    /// are refused before anything is published, even when each source
+    /// file matches its own entry's size: one blob identity cannot satisfy
+    /// both. Same-digest duplicates with the same size still share a blob.
+    #[test]
+    fn conflicting_sizes_for_one_digest_are_refused() {
+        let (_, home) = sealed(&[
+            ("a.txt", b"payload\n", false),
+            ("b.txt", b"payload plus more\n", false),
+            ("c.txt", b"payload\n", false),
+        ]);
+        let tree = home.path().join("assets/runtime");
+        let manifest_path = tree.join(SNAPSHOT_MANIFEST);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        let entries = manifest["entries"].as_array_mut().unwrap();
+        let digest_a = entries
+            .iter()
+            .find(|entry| entry["path"] == "a.txt")
+            .unwrap()["sha256"]
+            .clone();
+        for entry in entries.iter_mut() {
+            if entry["path"] == "b.txt" {
+                entry["sha256"] = digest_a.clone();
+            }
+        }
+        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let (_store, root) = store_root();
+        let scope = sha256(b"domain-conflict");
+        let error = import_shared_tree(&root, &scope, home.path(), Path::new("assets/runtime"))
+            .expect_err("conflicting sizes for one digest are refused");
+        assert!(error.to_string().contains("size"), "{error}");
+        assert!(
+            !root.join("blobs").join(&scope).exists()
+                || fs::read_dir(root.join("blobs").join(&scope))
+                    .unwrap()
+                    .next()
+                    .is_none()
+        );
+        // Valid same-digest duplicates (a.txt and c.txt) keep sharing a blob.
+        let (_, valid) = sealed(&[
+            ("a.txt", b"payload\n", false),
+            ("c.txt", b"payload\n", false),
+        ]);
+        let reference = import(&root, &scope, valid.path());
+        let shared = shared_tree_root(&root, &reference).unwrap();
+        assert_eq!(
+            inode_of(&shared.join("a.txt")),
+            inode_of(&shared.join("c.txt"))
+        );
     }
 
     /// A source that drifts after its manifest was sealed fails before the
