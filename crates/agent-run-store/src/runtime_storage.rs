@@ -345,6 +345,24 @@ fn validated(row: LayoutRow) -> Result<RuntimeStorageLayoutRecord> {
 const ROW_COLUMNS: &str = "runtime_home,index_sha256,layout_json,layout_sha256,state,\
      operation_token,owner_agent_id,updated_at";
 
+/// One durable agent identity's binding to a canonical runtime home.
+///
+/// Only recorded evidence is reported: the home exactly as the frozen
+/// identity spells it, the agent's current status, and the sealed asset-index
+/// digest when the identity carries one. Nothing here canonicalizes, guesses
+/// a provider, or touches the filesystem.
+#[derive(Debug, Clone)]
+pub struct RetainedHomeRef {
+    /// Runtime home exactly as recorded in the agent's frozen identity.
+    pub runtime_home: String,
+    /// Agent id whose identity binds this home.
+    pub agent_id: String,
+    /// Current durable status of that agent row.
+    pub status: String,
+    /// Sealed runtime asset-index digest recorded by the identity, if any.
+    pub index_sha256: Option<String>,
+}
+
 /// Returns the one registered layout row for `runtime_home`, if any.
 fn row_in(conn: &Connection, runtime_home: &str) -> Result<Option<RuntimeStorageLayoutRecord>> {
     conn.query_row(
@@ -617,6 +635,72 @@ impl Store {
         ))?;
         let rows = stmt.query_map([limit], read_row)?;
         rows.map(|row| validated(row?)).collect()
+    }
+
+    /// Returns one bounded page of every registered layout row, ordered by
+    /// runtime home strictly after `after`, with `true` when more rows remain.
+    ///
+    /// The keyset cursor keeps repeated maintenance passes advancing instead
+    /// of re-reading the same first page forever. `limit` is clamped to at
+    /// most one thousand rows; a corrupted row is an integrity error, so a
+    /// caller deciding retention treats the page as incomplete, never as
+    /// proof that anything is unreferenced.
+    pub fn runtime_storage_layouts_page(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<RuntimeStorageLayoutRecord>, bool)> {
+        let limit = limit.clamp(1, MAX_PENDING_PAGE as usize) as i64;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {ROW_COLUMNS} FROM runtime_storage_layouts \
+             WHERE ?1 IS NULL OR runtime_home > ?1 ORDER BY runtime_home LIMIT ?2"
+        ))?;
+        let rows = stmt
+            .query_map(rusqlite::params![after, limit + 1], read_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let more = rows.len() as i64 > limit;
+        let page = rows
+            .into_iter()
+            .take(limit as usize)
+            .map(validated)
+            .collect::<Result<Vec<_>>>()?;
+        Ok((page, more))
+    }
+
+    /// Returns one bounded page of runtime homes bound by durable identities,
+    /// ordered by home strictly after `after`, with `true` when more remain.
+    ///
+    /// Every row comes from a frozen identity's own recorded home and index
+    /// digest; homes that no identity records are not invented here. The
+    /// keyset cursor keeps repeated maintenance passes advancing instead of
+    /// re-reading the same first page forever, and `limit` is clamped to at
+    /// most one thousand rows.
+    pub fn retained_runtime_homes(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<RetainedHomeRef>, bool)> {
+        let limit = limit.clamp(1, MAX_PENDING_PAGE as usize) as i64;
+        let mut stmt = self.conn.prepare(
+            "SELECT json_extract(identity_json,'$.runtime_home') AS home, id, status, \
+             json_extract(identity_json,'$.snapshot_sha256') \
+             FROM agents \
+             WHERE home IS NOT NULL AND home != '' \
+               AND (?1 IS NULL OR home > ?1) \
+             ORDER BY home LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![after, limit + 1], |row| {
+                Ok(RetainedHomeRef {
+                    runtime_home: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    status: row.get(2)?,
+                    index_sha256: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let more = rows.len() as i64 > limit;
+        Ok((rows.into_iter().take(limit as usize).collect(), more))
     }
 
     /// Deletes one registered layout row explicitly and reports whether a

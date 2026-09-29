@@ -20,6 +20,8 @@ pub mod managed_services;
 mod runtime_cache;
 /// Filesystem relocation of sealed managed trees into the shared store.
 pub mod runtime_storage;
+/// Reference-aware collection of the shared managed-asset store.
+pub mod storage_gc;
 pub mod service;
 pub mod stream;
 pub mod supervisor;

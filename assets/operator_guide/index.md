@@ -14,6 +14,7 @@ topic for this index.
 | models | provider/model catalog, cached quota standing, delegation guide, historical schema-1 rosters |
 | releases | sealed release build/switch/retention under standalone/releases |
 | migrations | PRAGMA user_version, numbered SQL deltas, pre-backup, refusal cases |
+| storage | shared managed assets, `storage status`/`compact`/`recover`, collection rules |
 | troubleshoot | doctor first, failure_kind vocabulary, limits honesty, orphan check |
 
 Read `config` first. Valid changes are loaded at request boundaries and by the

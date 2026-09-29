@@ -174,3 +174,74 @@ in place with an explicit failure. Recovery never guesses from age and never
 re-downloads: imports are idempotent reuses of pinned or existing objects.
 Full operator-driven rollback remains a later unit; recovery here is
 roll-forward only.
+
+## Operator surface (`agent-run storage`)
+
+`storage status`, `storage compact` (dry-run by default, `--apply` to act)
+and `storage recover` are the operator commands over this registry; there are
+no new MCP tools. All three refuse a state database older than the current
+schema with `migration_required` and never open — and so never implicitly
+upgrade — one.
+
+`status` is read-only. It reports the store root, the store's measured
+unique inode bytes (a bounded walk; a partial one is labelled `incomplete`
+instead of passed off as a total), the filesystem's own free space as a
+separate number, and one entry per retained runtime home: `shared`,
+`eligible`, `prepared`, `protected`, `gone` or `unknown`, with the agents
+binding it, its recorded index digest, its private bytes and the reasons for
+its classification. Homes come only from frozen identities and configured
+run roots; a home no identity records is `unknown` and never touched, and so
+are aliases, unreadable and tampered homes. A logical saving (unique inode
+bytes) is never reported as a physical free-space gain: clones, snapshots and
+hardlinks move the two numbers independently.
+
+`compact --apply` holds the same broker and service-manager startup locks a
+paired config migration holds, refuses while any agent is active, relocates
+each eligible single-holder home, and then runs one collection pass. Each
+relocation replays the supervisor's own guard preflight from the recorded
+identity, frozen configuration and recorded account — never the current
+provider, never a rewritten configuration — and a home whose workdir, binary,
+grants or sandbox boundary cannot be verified is skipped with its reason and
+preserved byte count. `storage recover` runs under the same offline locks and
+finishes prepared rows forward; it starts no model and supports no rollback.
+
+## Collection (`agent-run-core::storage_gc`)
+
+Collection runs inside the existing bounded housekeeping and socket
+maintenance cycles — `housekeeping::sweep` calls one pass each cycle; there is
+no new daemon. A pass takes the store-wide publish/GC lock nonblocking (a
+busy publisher defers the pass instead of stalling the broker behind an
+import or a native preflight), and while it holds that lock it re-derives
+every reference before unlinking anything:
+
+- every registered row — `prepared` always pins what it names; `committed`
+  pins while its physical home exists;
+- the bounded storage-protection snapshot of frozen identities, frozen and
+  current configuration, credentials and not-conclusively-released service
+  definitions, any of which may name a shared tree or a single payload file
+  directly;
+- the trees those paths name.
+
+Trees are collected first, then the blobs derived from the manifests of the
+trees that remain, so a payload is unlinked only after every tree referencing
+it is gone. Committed rows are removed only once their physical home is
+conclusively gone and no configuration, service or agent row still references
+the home — the store's own removal is the authoritative final check, and
+prepared rows never age out. Publisher staging orphans are removed only
+inside the owned namespaces, only for the exact staging name shape and entry
+type, and only while this process holds the publish lock; age alone never
+qualifies anything. Anything unreadable, malformed or beyond a scan bound is
+retained and retried — unknown is never classified as unreferenced — and
+passes carry a broker-local cursor so a large store drains over successive
+passes instead of re-reading the same first page forever. There are no live
+reference counts. The `.publish.lock` file itself, and everything outside
+`trees/<scope>` and `blobs/<scope>`, is never touched.
+
+One store namespace holds derived *views* of shared trees (a real
+plugin-parent subtree whose files are internal hardlinks into the payloads).
+An obsolete view must be collected **before** the tree and payload beneath
+it — a surviving view keeps the payload's inode allocated, and a stale view
+whose tree is gone would corrupt a future import's reuse of the same
+content-addressed name — so the pass order is views, then trees, then blobs.
+That namespace is defined by the plugin-view unit; `VIEW_NAMESPACES` in
+`storage_gc` is the single place it is registered.

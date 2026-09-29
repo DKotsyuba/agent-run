@@ -140,7 +140,7 @@ async fn filesystem_retention_error_does_not_block_database_history() {
     wait_for_socket(&path).await;
     std::fs::write(temp.path().join("config.toml"), "schema_version = 999\n").unwrap();
     assert!(
-        agent_run_core::housekeeping::sweep(temp.path(), agent_run::domain::now(), &store).is_err()
+        agent_run_core::housekeeping::sweep(temp.path(), agent_run::domain::now(), &mut store).is_err()
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     loop {

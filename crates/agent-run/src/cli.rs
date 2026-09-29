@@ -327,6 +327,11 @@ pub enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Operator storage administration for the shared managed-asset store.
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommand,
+    },
     /// Manage global account references without invoking native login.
     Accounts {
         #[command(subcommand)]
@@ -611,9 +616,28 @@ pub enum ConfigCommand {
     },
 }
 
+/// Operator storage administration commands (see `crate::storage_admin`).
 #[derive(Subcommand, Debug)]
-pub enum Capacity {
-    Collect {
+pub enum StorageCommand {
+    /// Report the shared store and every retained runtime home read-only.
+    Status,
+    /// Plan offline compaction; add `--apply` to relocate and collect.
+    #[command(group(ArgGroup::new("storage_mode").required(true).args(["dry_run", "apply"])))]
+    Compact {
+        /// Print the survey and what collection would reclaim; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Hold the broker and service startup locks, relocate eligible
+        /// retained homes behind the guard preflight, and collect.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Roll interrupted shared-storage relocations forward, offline.
+    Recover,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Capacity {    Collect {
         #[arg(long, required = true)]
         once: bool,
     },
@@ -1634,6 +1658,17 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             }
             ConfigCommand::Rollback { snapshot } => {
                 (dependencies.output)(&crate::migrate::rollback(&home, &snapshot)?)?
+            }
+        },
+        Command::Storage { command } => match command {
+            StorageCommand::Status => {
+                (dependencies.output)(&crate::storage_admin::status(&home)?)?
+            }
+            StorageCommand::Compact { dry_run: _, apply } => {
+                (dependencies.output)(&crate::storage_admin::compact(&home, apply)?)?
+            }
+            StorageCommand::Recover => {
+                (dependencies.output)(&crate::storage_admin::recover(&home)?)?
             }
         },
         Command::Accounts { command } => match command {

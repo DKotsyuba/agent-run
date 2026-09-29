@@ -50,9 +50,9 @@ const MAX_TREE_BYTES: u64 = 256 * 1024 * 1024;
 const STREAM_CHUNK: usize = 64 * 1024;
 /// Prefix naming publisher-owned staging directories beneath `trees/<scope>`
 /// and temporary blobs beneath `blobs/<scope>`.
-const TEMP_PREFIX: &str = ".agent-run-staging-";
+pub const TEMP_PREFIX: &str = ".agent-run-staging-";
 /// Suffix matching the publisher-owned temporary convention of `snapshot_tree`.
-const TEMP_SUFFIX: &str = ".tmp";
+pub const TEMP_SUFFIX: &str = ".tmp";
 /// Name of the store-wide publish/GC lock file at the store root.
 const LOCK_NAME: &str = ".publish.lock";
 
@@ -126,6 +126,19 @@ pub struct SharedStoreLock {
 }
 
 impl SharedStoreLock {
+    /// Opens the store-wide lock file without locking it.
+    fn open_lock(store_root: &Path) -> Result<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let lock_path = store_root.join(LOCK_NAME);
+        Ok(std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&lock_path)?)
+    }
+
     /// Blocks until this process owns the shared store's publish lock.
     ///
     /// `store_root` must already exist as the canonical owner-controlled real
@@ -133,17 +146,26 @@ impl SharedStoreLock {
     /// fails only when the lock file cannot be opened (including when it is a
     /// symbolic link) or locked. The guard releases the lock on drop.
     pub fn acquire(store_root: &Path) -> Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt;
         let lock_path = store_root.join(LOCK_NAME);
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&lock_path)?;
+        let file = Self::open_lock(store_root)?;
         file.lock().map_err(Error::from)?;
         Ok(Self { file, lock_path })
+    }
+
+    /// Tries once to own the shared store's publish lock without waiting.
+    ///
+    /// Returns `Ok(None)` when another cooperating process holds it, so a
+    /// maintenance caller can skip this pass instead of stalling the broker
+    /// behind an import or a native guard preflight. Any failure to open or
+    /// lock the file other than contention is an error, never a silent pass.
+    pub fn try_acquire(store_root: &Path) -> Result<Option<Self>> {
+        let lock_path = store_root.join(LOCK_NAME);
+        let file = Self::open_lock(store_root)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { file, lock_path })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+        }
     }
 
     /// Absolute path of the lock file this guard holds.
@@ -758,6 +780,39 @@ fn discard_staging(store: &Dir, staging_rel: &Path) {
     if remove_owned_tree(&directory).is_ok() {
         let _ = store.remove_directory(staging_rel);
     }
+}
+
+/// Returns the store-relative blob paths one shared tree's manifest describes.
+///
+/// The tree is read through no-follow descriptors and only its manifest bytes
+/// are parsed, through the same validators publication uses; the tree's own
+/// files are not opened. A tree whose manifest is missing, unparsable, or
+/// violates the manifest contract is an error, so a caller collecting the
+/// still-referenced payload set treats it as incomplete evidence rather than
+/// proof that its blobs are unreferenced.
+pub fn shared_tree_blob_names(
+    store_root: &Path,
+    reference: &SharedTreeRef,
+) -> Result<BTreeSet<PathBuf>> {
+    if !is_digest(&reference.scope) || !is_digest(&reference.manifest_sha256) {
+        return Err(invalid("shared tree reference is invalid"));
+    }
+    let root = validated_root(store_root)?;
+    let store = Dir::open(&root)?;
+    let tree_dir = store.subdir(&tree_rel(reference))?;
+    let entries = entry_map(
+        &load_manifest(&tree_dir)?.ok_or_else(|| invalid("shared tree manifest is missing"))?,
+    )?;
+    validate_entries(&entries)?;
+    let mut blobs = BTreeSet::new();
+    for entry in entries.values() {
+        if entry["type"] != "file" {
+            continue;
+        }
+        let (sha256, logical, _) = file_identity(entry)?;
+        blobs.insert(blob_rel(&reference.scope, &sha256, logical));
+    }
+    Ok(blobs)
 }
 
 /// Verifies one shared tree against its reference and the store's physical

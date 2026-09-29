@@ -18,7 +18,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::os::unix::process::CommandExt;
-use std::{ffi::OsStr, path::Path, time::Duration};
+use std::{ffi::OsStr, path::{Path, PathBuf}, time::Duration};
 
 /// Start one detached `_supervisor` session leader and return after its READY.
 ///
@@ -381,7 +381,8 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
 /// is imported under: a digest of the versioned managed-assets domain and the
 /// effective UID, so payloads never alias across scopes or users while
 /// unrelated compatibility domains can later choose their own.
-fn managed_scope() -> String {
+/// The per-user scope every managed tree of this installation imports under.
+pub fn managed_scope() -> String {
     // SAFETY: geteuid only reads this process's effective identity.
     let uid = unsafe { libc::geteuid() };
     fs::sha256(format!("agent-run/managed-assets/v1:{uid}").as_bytes())
@@ -599,6 +600,182 @@ fn install_shared_assets(
     }
     drop(publish_lock);
     crate::runtime_storage::install(store, app_home, &layout, Some(owner))
+}
+
+/// The result of one operator-driven relocation of a retained sealed home.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Relocation {
+    /// The home has no managed roots or already carries its layout.
+    AlreadyShared,
+    /// The home was relocated into the shared store and committed.
+    Installed,
+    /// The home was preserved for this explicit reason, with the private
+    /// managed-root bytes the operator still holds.
+    Skipped { reason: String, private_bytes: u64 },
+}
+
+/// Relocates one already-sealed retained home behind the real guard preflight.
+///
+/// This is the narrow trusted seam for operator compaction: it replays the
+/// supervisor's own qualification exactly — the recorded launch identity (and
+/// the frozen configuration and authority it carries), the account the
+/// agent's attempt was actually admitted with, and the same native
+/// sandbox/permission probes — and only then hands the home to the registry
+/// coordinator. It never rewrites the frozen identity or configuration to
+/// make a check pass, never guesses the current provider, and never launches
+/// a model: the probes are the metadata-only ones the launch preflight uses.
+/// An unsupported guard, a vanished workdir or binary, or an unverifiable
+/// grant surfaces as [`Relocation::Skipped`] with the reason and the bytes
+/// still held privately; the home itself is untouched.
+pub fn relocate_retained_home(
+    store: &mut Store,
+    app_home: &Path,
+    agent: &AgentId,
+) -> Result<Relocation> {
+    let skip = |home: Option<&Path>, reason: String| Relocation::Skipped {
+        reason,
+        private_bytes: home.map(private_managed_bytes).unwrap_or(0),
+    };
+    // A row this build cannot even read — a legacy or damaged record — is a
+    // reported skip, never a forced switch or a hard failure of the whole
+    // compaction pass.
+    let row = match store.get(agent) {
+        Ok(row) => row,
+        Err(error) => {
+            let home = store
+                .retained_runtime_homes(None, 1)
+                .ok()
+                .and_then(|(page, _)| {
+                    page.into_iter()
+                        .find(|reference| reference.agent_id == agent.as_str())
+                        .map(|reference| PathBuf::from(reference.runtime_home))
+                });
+            return Ok(skip(home.as_deref(), error.to_string()));
+        }
+    };
+    let recorded_home = row.identity.as_ref().and_then(|identity| {
+        identity
+            .get("runtime_home")
+            .and_then(serde_json::Value::as_str)
+            .map(std::path::PathBuf::from)
+    });
+    let identity = match ProviderLaunchIdentity::read(&row) {
+        Ok(identity) => identity,
+        Err(error) => return Ok(skip(recorded_home.as_deref(), error.to_string())),
+    };
+    let Some(runtime_home) = identity.runtime_home.clone() else {
+        return Ok(Relocation::AlreadyShared);
+    };
+    let config = identity.provider_config.clone();
+    let catalog = match config.resolve_catalog(store.list_accounts()?) {
+        Ok(catalog) => catalog,
+        Err(error) => return Ok(skip(Some(&runtime_home), error.to_string())),
+    };
+    let account = match store.recorded_account(agent) {
+        Ok(account) => account,
+        Err(error) => return Ok(skip(Some(&runtime_home), error.to_string())),
+    };
+    if !config.harnesses.contains_key(&identity.authority.harness) {
+        return Ok(skip(
+            Some(&runtime_home),
+            "recorded harness is unavailable".into(),
+        ));
+    }
+    let host: BTreeMap<String, String> = std::env::vars().collect();
+    let preliminary = match adapters::provider::plan_selected_with(
+        &config,
+        &catalog,
+        &identity.authority,
+        &account,
+        &runtime_home,
+        app_home,
+        &host,
+        &adapters::authorized_request::SystemCredentialReader,
+        identity.provider_request.task.as_str(),
+        row.resume_of_runtime_session_id.as_deref(),
+        adapters::provider::LaunchOptions {
+            fast: identity.provider_request.fast,
+            output_schema: identity.provider_request.output_schema.as_ref(),
+        },
+        None,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => return Ok(skip(Some(&runtime_home), error.to_string())),
+    };
+    let codex_grant = if identity.authority.harness == HarnessId::Codex {
+        match crate::codex::Grant::new(
+            &preliminary.runtime,
+            &row.request,
+            &preliminary.profile,
+            app_home,
+        ) {
+            Ok(grant) => Some(grant),
+            Err(error) => return Ok(skip(Some(&runtime_home), error.to_string())),
+        }
+    } else {
+        None
+    };
+    match install_shared_assets(
+        store,
+        app_home,
+        &runtime_home,
+        identity.authority.assets_sha256.as_str(),
+        agent,
+        &preliminary,
+        codex_grant.as_ref(),
+    ) {
+        Ok(()) => Ok(Relocation::Installed),
+        Err(error) => Ok(skip(Some(&runtime_home), error.to_string())),
+    }
+}
+
+/// Sums the file bytes of one home's still-private managed trees, counting
+/// each inode once and never following a symlink. Bounded to the store's own
+/// entry bound, so a pathological home reports a partial total rather than
+/// walking without end; an unreadable home reports zero.
+fn private_managed_bytes(home: &Path) -> u64 {
+    fn walk(dir: &fs::Dir, seen: &mut BTreeMap<u64, u64>, budget: &mut usize) -> u64 {
+        let mut total = 0;
+        let names = match dir.list(None) {
+            Ok(names) => names,
+            Err(_) => return 0,
+        };
+        for name in names {
+            if *budget == 0 {
+                return total;
+            }
+            let relative = std::path::PathBuf::from(&name);
+            let Ok(entry) = dir.entry(Some(&relative)) else {
+                continue;
+            };
+            *budget -= 1;
+            match entry.kind {
+                fs::EntryType::Directory => match dir.subdir(&relative) {
+                    Ok(child) => total += walk(&child, seen, budget),
+                    Err(_) => continue,
+                },
+                fs::EntryType::File => {
+                    if seen.contains_key(&entry.inode) {
+                        continue;
+                    }
+                    let Ok(file) = dir.open_file(&relative) else {
+                        continue;
+                    };
+                    let Ok(metadata) = file.metadata() else {
+                        continue;
+                    };
+                    seen.insert(entry.inode, metadata.len());
+                    total += metadata.len();
+                }
+                _ => continue,
+            }
+        }
+        total
+    }
+    match fs::Dir::open(home) {
+        Ok(dir) => walk(&dir, &mut BTreeMap::new(), &mut 4096),
+        Err(_) => 0,
+    }
 }
 
 /// Returns the committed shared placement of one sealed home for its launch

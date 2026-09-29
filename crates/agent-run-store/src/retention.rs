@@ -24,9 +24,26 @@ pub struct StorageProtection {
 }
 
 impl StorageProtection {
+    /// Returns one empty proof, for callers collecting evidence themselves.
+    pub fn empty() -> Self {
+        Self {
+            ids: HashSet::new(),
+            paths: HashSet::new(),
+        }
+    }
+
     /// Returns true when a retained row owns `id` or contains `path` or one of its descendants.
     pub fn retains(&self, id: &str, path: &Path) -> bool {
         self.ids.contains(id) || self.paths.iter().any(|retained| retained.starts_with(path))
+    }
+
+    /// Returns every decoded, normalized and resolved path this proof protects.
+    ///
+    /// Callers deciding whether a shared store object is still referenced walk
+    /// this set; it is exactly the evidence the snapshot collected, never a
+    /// guess about the current configuration.
+    pub fn protected_paths(&self) -> impl Iterator<Item = &Path> {
+        self.paths.iter().map(PathBuf::as_path)
     }
 
     /// Protects one currently loaded configuration path, including `file:` credential refs.
@@ -119,7 +136,10 @@ impl Store {
     /// interrupted evidence returns an error; callers must retain all candidates.
     /// Runtime homes with a still-prepared storage-layout row are protected so
     /// no filesystem pass deletes a relocation target mid-flight; committed
-    /// rows describe a mapping and add no path. The progress handler is cleared
+    /// rows describe a mapping and add no path. Absolute paths named by
+    /// not-conclusively-released managed-service definitions are protected too,
+    /// because a live service may hold a shared-tree file or working directory
+    /// open directly. The progress handler is cleared
     /// on either outcome. OS I/O is not preempted.
     pub fn storage_protection_snapshot(&self) -> Result<StorageProtection> {
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -218,6 +238,23 @@ impl Store {
             check(row)?;
             let runtime_home: String = row.get(0)?;
             proof.protect_path(&runtime_home);
+        }
+        // A service generation that is not conclusively released — not
+        // stopped, or still leased, or still probed — may hold open files or a
+        // working directory anywhere its frozen definition names, including
+        // inside a shared tree, so its recorded absolute paths stay protected.
+        let mut services = self.conn.prepare(
+            "SELECT definition_json FROM managed_service_generations g \
+             WHERE g.state!='stopped' \
+               OR EXISTS(SELECT 1 FROM managed_service_leases l \
+                         WHERE l.generation_id=g.id AND l.released_at IS NULL) \
+               OR EXISTS(SELECT 1 FROM managed_service_probes p WHERE p.generation_id=g.id)",
+        )?;
+        let mut rows = services.query([])?;
+        while let Some(row) = rows.next()? {
+            check(row)?;
+            let raw: String = row.get(0)?;
+            proof.add_json(&serde_json::from_str::<Value>(&raw)?);
         }
         if Instant::now() >= deadline {
             return Err(invalid("storage protection deadline exceeded"));
