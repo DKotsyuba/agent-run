@@ -18,6 +18,8 @@ pub mod logging;
 pub mod managed_services;
 /// Optional reuse of native plugin blocks after verified, session-owned cleanup.
 mod runtime_cache;
+/// Filesystem relocation of sealed managed trees into the shared store.
+pub mod runtime_storage;
 pub mod service;
 pub mod stream;
 pub mod supervisor;

@@ -72,12 +72,16 @@ inspection rows.
 the same launch-path `Snapshot` result and revision extraction as
 `materialize::verify()`. The caller remains the trusted registry authority
 for the home, index, and root-to-reference binding; provider continuation
-still independently verifies through the strict path and is not wired to the
-bridge yet. A three-home fixture test (1 MiB identical payload per home)
-measures 4,197,931 unique regular-file inode bytes before replacement and
-1,051,114 after, counting the store exactly once; that is a measured fixture
-saving, not a promise of physical APFS free space or production-scale
-reclamation.
+verifies through the registry-selected strict or shared bridge, preserving the
+same original index digest and parent history seal. A three-home fixture test
+(1 MiB identical payload per home)
+measures its bytes at three points, counting each unique regular-file inode
+once: the true pre-import baseline of the three private homes, the staging
+peak while the private copies and the store coexist, and the state after the
+private copies are replaced by links (store only). The measured fixture has
+3,148,266 bytes before import, 4,197,931 at the staging peak and 1,051,114
+after relocation. Unique inode bytes do not measure physical APFS free space
+or predict production-scale reclamation.
 
 The current Codex provider auth link is deliberately outside the sealed asset
 index. After immutable assets verify and previous process cleanup is proven,

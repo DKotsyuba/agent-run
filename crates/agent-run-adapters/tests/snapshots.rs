@@ -827,8 +827,11 @@ mod shared_bridge {
         }
     }
 
-    /// A bounded three-home fixture measures deduplicated bytes; this is a
-    /// measured fixture saving, not a promise of physical APFS free space or
+    /// A bounded three-home fixture measures deduplicated bytes at three
+    /// points: the true pre-import baseline of the private homes, the staging
+    /// peak while both private copies and the store exist, and the state
+    /// after the private copies are replaced by links. These are measured
+    /// fixture bytes, not a promise of physical APFS free space or
     /// production-scale reclamation.
     #[test]
     fn three_home_fixture_measures_deduplicated_bytes() {
@@ -840,6 +843,8 @@ mod shared_bridge {
             .collect();
         let store = store();
         let scope = fs::sha256(b"measurement-scope");
+        let home_roots: Vec<PathBuf> = homes.iter().map(|home| home.home.clone()).collect();
+        let baseline = unique_file_bytes(&home_roots);
         let references: Vec<_> = homes
             .iter()
             .map(|home| import(&store, &scope, home))
@@ -849,9 +854,9 @@ mod shared_bridge {
             references.windows(2).all(|pair| pair[0] != pair[1]),
             "distinct skill stamps stay distinct trees"
         );
-        let mut roots: Vec<PathBuf> = homes.iter().map(|home| home.home.clone()).collect();
+        let mut roots = home_roots.clone();
         roots.push(store.root.clone());
-        let before = unique_file_bytes(&roots);
+        let peak = unique_file_bytes(&roots);
         for (home, reference) in homes.iter().zip(&references) {
             relink(home, &store, reference);
         }
@@ -860,11 +865,15 @@ mod shared_bridge {
         collect_exact(&store.root, payload.len() as u64, &mut one_mib);
         assert_eq!(one_mib.len(), 1, "the 1 MiB payload inode is stored once");
         assert!(
-            after < before,
-            "fixture bytes must shrink: {after} >= {before}"
+            after < baseline,
+            "fixture bytes must fall below the private-copy baseline: {after} >= {baseline}"
+        );
+        assert!(
+            peak > baseline,
+            "the staging peak holds both private copies and the store: {peak} <= {baseline}"
         );
         println!(
-            "shared-store fixture measurement: before={before} unique bytes, after={after} unique bytes (store included once)"
+            "shared-store fixture measurement: baseline={baseline} private bytes, staging peak={peak} bytes, after={after} bytes (store included once)"
         );
     }
 

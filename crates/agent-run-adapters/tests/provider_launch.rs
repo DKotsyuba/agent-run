@@ -419,6 +419,7 @@ fn native_provider_keeps_login_and_model_alias() {
             fast: true,
             output_schema: None,
         },
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -528,6 +529,7 @@ fn native_provider_keeps_login_and_model_alias() {
             fast: false,
             output_schema: schema.as_object(),
         },
+        None,
     )
     .unwrap();
     assert!(with_schema.launch.args.iter().any(|arg| {

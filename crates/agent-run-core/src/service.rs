@@ -942,12 +942,22 @@ impl Service {
         let runtime_home = frozen.runtime_home.clone().ok_or_else(|| {
             Error::Unsupported("continuation_unavailable: parent has no sealed runtime home".into())
         })?;
-        adapters::materialize::verify(&runtime_home, frozen.authority.assets_sha256.as_str())
-            .map_err(|_| {
-                Error::Unsupported(
-                    "continuation_unavailable: parent runtime assets no longer verify".into(),
-                )
-            })?;
+        // Resume verifies the parent's own home through the shared-asset
+        // registry: a private home keeps the strict verifier, a committed
+        // shared layout verifies the same original index through its bound
+        // trees, and a still-prepared row refuses — the parent's history is
+        // never rebuilt from changed live sources.
+        crate::runtime_storage::verify(
+            &Store::open(&self.home)?,
+            &self.home,
+            &runtime_home,
+            frozen.authority.assets_sha256.as_str(),
+        )
+        .map_err(|_| {
+            Error::Unsupported(
+                "continuation_unavailable: parent runtime assets no longer verify".into(),
+            )
+        })?;
         let (prefer, intent, pinned_id, adapter_state): (String, String, Option<String>, String) =
             Store::open(&self.home)?.conn.query_row(
                 "SELECT t.selected_account_id,a.selection_intent,a.requested_account_id,t.adapter_state_json \

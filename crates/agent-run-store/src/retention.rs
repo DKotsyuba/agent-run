@@ -89,7 +89,9 @@ impl Store {
     /// Returns the number of deleted rows (zero means no eligible work remains).
     /// Up to 32 terminal leaf agents are considered; recent/active descendants,
     /// workflows, unreleased service leases, unresolved process ownership and
-    /// in-flight deliveries retain their dependencies. Old queued notices expire
+    /// in-flight deliveries retain their dependencies, as does a runtime home
+    /// with a still-prepared storage-layout row (an unfinished relocation).
+    /// Old queued notices expire
     /// with their run. Journals drain before their agent metadata is removed, so
     /// large histories make progress over multiple calls. Accounts, quota
     /// exhaustion latches, live services and files on disk are never removed.
@@ -115,7 +117,10 @@ impl Store {
     /// and a cooperative two-second deadline shared by SQLite and row processing.
     /// It excludes task bodies and transcript journals. Malformed, oversized or
     /// interrupted evidence returns an error; callers must retain all candidates.
-    /// The progress handler is cleared on either outcome. OS I/O is not preempted.
+    /// Runtime homes with a still-prepared storage-layout row are protected so
+    /// no filesystem pass deletes a relocation target mid-flight; committed
+    /// rows describe a mapping and add no path. The progress handler is cleared
+    /// on either outcome. OS I/O is not preempted.
     pub fn storage_protection_snapshot(&self) -> Result<StorageProtection> {
         let deadline = Instant::now() + Duration::from_secs(2);
         self.conn
@@ -200,6 +205,20 @@ impl Store {
             let reference: String = row.get(0)?;
             proof.add_path(&reference);
         }
+        // A still-prepared layout row means a relocation into that physical
+        // runtime home is unfinished: its home and any backup the coordinator
+        // must still prove stay protected until the row commits or is removed.
+        // Committed rows describe a mapping and pin nothing here, so expired
+        // homes keep ageing out normally.
+        let mut pending = self
+            .conn
+            .prepare("SELECT runtime_home FROM runtime_storage_layouts WHERE state='prepared'")?;
+        let mut rows = pending.query([])?;
+        while let Some(row) = rows.next()? {
+            check(row)?;
+            let runtime_home: String = row.get(0)?;
+            proof.protect_path(&runtime_home);
+        }
         if Instant::now() >= deadline {
             return Err(invalid("storage protection deadline exceeded"));
         }
@@ -253,6 +272,9 @@ impl Store {
              AND NOT EXISTS (SELECT 1 FROM managed_service_leases l WHERE l.agent_id=a.id AND l.released_at IS NULL)
              AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.agent_id=a.id AND d.state='sending'
                AND (d.lease_until IS NULL OR d.lease_until > ?2))
+             AND NOT EXISTS (SELECT 1 FROM runtime_storage_layouts r
+               WHERE r.state='prepared'
+                 AND r.runtime_home=json_extract(a.identity_json,'$.runtime_home'))
              ORDER BY a.finished_at,a.id LIMIT 32",
             params![cutoff, at],
         )?;

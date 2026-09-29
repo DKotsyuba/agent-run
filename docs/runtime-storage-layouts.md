@@ -115,3 +115,62 @@ home, admits unchanged. An already-created matching request replay returns
 before the gate, so idempotent replays are not new executions. This closes
 the race between a layout being installed into a home and a resume attaching
 a new child to that home.
+
+## Filesystem coordinator (`agent-run-core::runtime_storage`)
+
+The coordinator owns the physical switch itself, above the registry and the
+platform store. The supervisor calls it after the actual harness guard is
+validated, never through a request-supplied path.
+
+`store_root(app_home)` derives `<canonical app home>/shared-assets/v1`
+read-only. A missing namespace is derived, not created (the launch path may
+create the empty trusted root before guard validation); an existing namespace
+must be a real directory reached without symlinked components, checked
+through no-follow descriptors and canonical form.
+
+`plan(store, app_home, runtime_home, expected, scope)` mutates nothing. It
+strictly verifies the original home — exact index bytes hashing to the frozen
+`expected` digest and every indexed root still a verified private directory —
+or returns an existing committed row's layout when it binds the same digest.
+Root references come only from the index's own `manifests` map, all under the
+caller's validated scope; an index without managed roots plans `None`. A
+prepared row is not a binding: a mid-switch home fails planning and directs
+the caller to recovery.
+
+`install(store, app_home, layout, owner)` runs the switch: strict original
+verification, registry `prepare` under the store publish lock (pins before
+any import; the lock is dropped before each import reacquires it — no nested
+locks), idempotent imports of every mapped tree, per-root
+move-into-backup + exact whole-tree link, shared-bridge verification of the
+unchanged original index, compare-and-swap `commit`, then deletion of only
+backups proven to still hold the replaced assets by manifest digest and
+strict inspection. An existing committed row for the same layout verifies
+idempotently; an existing prepared row for the same layout is finished by
+roll-forward recovery; any other row is a conflict. Replaced originals are
+staged inside the runtime home at
+`.agent-run-storage-<operation_token>/<root>`, so the prepared row's
+retention pin covers the recovery material itself; the token is validated as
+`rt_`-prefixed lowercase hex before it becomes path material. Frozen index
+bytes, native-history files, credential links and authority digests are
+never rewritten. `install_with_fault` is the test-only seam that simulates a
+crash at `BeforeRename`, `AfterRename` (the window where the home root name
+does not exist), `AfterLink` (before the registry commit) or `AfterCommit`
+(before cleanup).
+
+`verify(store, app_home, runtime_home, expected)` chooses the verifier from
+the registry: no row runs the original strict verifier unchanged, a committed
+row binding the same digest runs the shared bridge with that row's
+references, and a prepared row, a digest mismatch or a corrupt row is an
+explicit failure.
+
+`recover(store, app_home, runtime_home)` finishes only provably-owned work.
+No row means nothing to do. A prepared row is rolled forward from its own
+layout and token: still-private roots are imported and swapped, roots
+stranded between rename and link are relinked from their staged backup,
+already-correct links are left alone, foreign or missing roots are explicit
+failures, the converted home must bridge-verify, and the row is committed. A
+committed row only finishes cleanup. A backup that cannot be proven is left
+in place with an explicit failure. Recovery never guesses from age and never
+re-downloads: imports are idempotent reuses of pinned or existing objects.
+Full operator-driven rollback remains a later unit; recovery here is
+roll-forward only.

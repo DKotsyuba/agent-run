@@ -1,55 +1,37 @@
-# Shared asset launch guard prototype
+# Shared managed runtime assets
 
-`agent-run-platform::shared_asset_guard::SharedAssetGuard` prepares a macOS
-`sandbox-exec` argv for one canonical shared asset root. No launcher uses this
-primitive yet. `new` requires an absolute directory path with no symlinked
-components. `wrap` returns an argv for the requested child; it does not spawn
-the child.
+New provider homes can place their indexed, immutable managed trees in the
+caller-owned store at `<app home>/shared-assets/v1`. The home then contains one
+exact whole-tree symlink per indexed root. Its original runtime index bytes,
+index SHA-256, flat config, credential binding and native history remain in
+the private home. The committed registry layout binds that original index to
+the shared trees. Launch and resume verify that binding and the unchanged
+tree content; the old strict verifier still rejects arbitrary shared links.
 
-The generated profile contains `file-write*` rules for the root subtree and
-exact ancestor paths. Filesystem paths travel as `-D` arguments, not profile
-source text. A no-follow scan before argv creation counts regular-file paths
-by device and inode. Internal hardlinks pass; a link count exceeding the paths
-found inside the root refuses the launch. The scan stops after 100,000 paths.
+The supervisor validates the real native guard before moving a fresh home.
+It creates a unique owned sentinel in the shared root, then runs a finite
+`sandbox-exec` child that must read it and fail to write it. For Codex it also
+compares the root with every effective writable grant and native temporary
+root, then runs the selected Codex binary's `sandbox` command with the same
+private config and permission profile. That command must read the sentinel,
+fail to alter it, and write an owned workspace sentinel when the admitted
+role allows writes. Claude and GLM instead run guarded `--version` metadata
+startup. Each probe has a five-second process bound and removes only its own
+sentinels. A failed or unsupported native check refuses conversion and launch.
+The preflight holds the store's publish/GC lock while its sentinel files exist
+and while guard scans run; install releases and reacquires that lock at its own
+prepare and import steps. Launch wrapper scans use the same lock.
 
-The scan is a point-in-time check. It cannot prevent an unrelated same-UID
-process from creating a new external alias later, and a wrapped child does not
-constrain unrelated processes that were already running. The ignored
-`live_native_guard` test checks native deny/allow behavior, including child and
-grandchild processes, on a macOS host that permits `sandbox-exec` to apply a
-profile. A nested test executor may prevent profile application. Wrapping an
-entire Codex app-server may also prevent its own nested sandbox application;
-that integration remains unqualified. This primitive does not choose an adapter
-launch boundary or change Codex permissions.
+Codex keeps its original app-server and nested sandbox. The launch adds
+native `-c` overrides that wrap each harness-owned stdio MCP child with
+`sandbox-exec`, leaving the sealed config bytes, account environment, tool
+filters and approvals unchanged. Server names that the native override key
+cannot address unambiguously are refused. Claude and GLM launch their whole
+child process under the guard. An already-running external MCP server or
+daemon is outside the child guard; it is not treated as a protected child.
 
-## Codex integration gate
-
-Keep Codex's own shell sandbox. If the selected managed `Projects` profile
-already grants the canonical shared store read access and the store is disjoint
-from every effective write grant and denied subtree, reuse that profile. If
-either condition cannot be proved, refuse the launch until a supported policy
-is available. Do not place the store under `/tmp`, `$TMPDIR`, a workspace root,
-or a writable cache. In Codex CLI 0.156.1 on macOS, a nominal `read` override
-under `/private/tmp` did not stop writes because of the temporary-path grant.
-
-Before admitting a Codex launch, compare the canonical shared root against
-every canonical writable root in `Grant::writable_roots`, plus the built-in
-`:tmpdir` and `:slash_tmp` roots. Reject if either path is an ancestor of the
-other, or if a root cannot be resolved. `Grant::new` already freezes the chosen
-profile and writable roots; `Grant::verify` checks the app-server's echo. The
-shared-root overlap check belongs beside that existing admission path, before
-`Grant::request`, and must fail closed. A disposable native `codex sandbox
---include-managed-config -P <profile>` fixture should then prove shared reads,
-ordinary sibling writes, and protected write denials under the actual selected
-profile. The ignored test in this module uses a temporary profile and owns all
-of its fixture files. It does not install a profile or alter managed policy.
-
-Codex permission profiles constrain its sandboxed commands, not the app-server
-plugin loader or an already-running external MCP server. Keep the app-server
-outside the outer Seatbelt wrapper so its own sandbox can start. A harness-owned
-stdio MCP child can use `SharedAssetGuard::wrap` at its launch boundary; no
-proxy is needed. Any future shared-layout bridge must also preserve the
-independent `materialize::verify` check in `provider::sealed` before credentials
-bind. The ignored fixture also checks metadata-only `claude --version` startup
-under the outer guard. See the [Codex permissions reference](https://developers.openai.com/codex/permissions)
-for profile scope and path precedence.
+The guard's path and hardlink scan runs at launch time. It cannot control an
+unrelated same-UID process that later creates a new alias, or retroactively
+constrain another process. Shared conversion currently covers the roots in
+the frozen runtime index. Native unindexed caches, operator migration of old
+homes and shared-store collection remain separate work.
