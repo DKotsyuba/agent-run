@@ -4359,6 +4359,55 @@ async fn managed_codex_home_consolidates_through_its_registry_mapping() {
     assert_eq!(events("native_cache_consolidated"), 1);
 }
 
+/// Claude/GLM qualification probes the original harness even after its
+/// managed layout makes the launch plan a sandbox-exec wrapper. Offline
+/// compaction must still qualify the sealed native executable.
+#[tokio::test]
+async fn managed_claude_home_qualifies_the_native_binary() {
+    let (_temp, home) = home();
+    let profile = home.join("profiles/review.md");
+    fs::write(
+        &profile,
+        fs::read_to_string(&profile)
+            .unwrap()
+            .replace("skills = []", "skills = [\"demo\"]"),
+    )
+    .unwrap();
+    fs::create_dir_all(home.join("skills/demo")).unwrap();
+    fs::write(
+        home.join("skills/demo/SKILL.md"),
+        "# demo\nManaged skill.\n",
+    )
+    .unwrap();
+    let service = Service::new(home.clone());
+    let admitted = service
+        .admit_provider_trusted(request(&home), candidates(committed(&home)))
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    run_to_end(&home, &id).await;
+    assert_eq!(
+        Store::open(&home).unwrap().get(&id).unwrap().status,
+        Status::Succeeded
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-run"));
+    command
+        .arg("--home")
+        .arg(&home)
+        .args(["storage", "compact", "--apply"])
+        .env("HOME", &home)
+        .env("FAKE_TOKEN", "synthetic-token")
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(20), command.output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let native = result["native"].as_array().unwrap();
+    assert_eq!(native.len(), 1, "{result}");
+    assert!(native[0]["consolidated"].is_object(), "{result}");
+}
+
 /// Repeated offline compaction reaches a home that is already shared: after
 /// a managed-role Codex run committed its layout, a remote plugin parent the
 /// home accumulated later is frozen by `storage compact --apply` through the

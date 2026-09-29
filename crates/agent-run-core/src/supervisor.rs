@@ -584,7 +584,8 @@ fn install_shared_assets(
 /// harness's own boundary — for Codex, the grant must keep the store outside
 /// every admitted writable and temporary root and the native sandbox must
 /// prove read-only against a real sentinel; for every other harness the
-/// guarded metadata probe. The returned path is the only root a caller may
+/// guarded metadata probe of the frozen native executable, even when the
+/// supplied launch plan already wraps it. The returned path is the only root a caller may
 /// publish into: `consolidate` refuses any other, so an unqualified
 /// publication cannot masquerade as a qualified one.
 pub fn qualify_shared_root(
@@ -611,7 +612,7 @@ pub fn qualify_shared_root(
     } else {
         let version = vec!["--version".to_owned()];
         let argv = guard
-            .wrap(&preliminary.launch.binary, &version)
+            .wrap(&preliminary.runtime.binary, &version)
             .map_err(|error| Error::Unsupported(error.to_string()))?;
         let mut command = std::process::Command::new(&argv[0]);
         command
