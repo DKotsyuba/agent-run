@@ -1,6 +1,7 @@
 # agent-run architecture
 
-agent-run is one Rust workspace and one native `agent-run` executable. It owns
+agent-run is one Rust workspace with the `agent-run` executable and a separate
+read-only `agent-run-tui` observer, published at the same version. It owns
 durable admission, detached supervision, runtime materialization, evidence, and
 completion delivery for providers using Codex and Claude Code. Historical GLM
 adapter records remain readable. For the local wire contract, see
@@ -19,7 +20,7 @@ Unix socket API ───┘                              └─> detached super
 | `agent-run` | CLI, MCP proxy, Unix-socket daemon, launchd helper |
 | `agent-run-domain` | public requests, responses, tools, errors, states |
 | `agent-run-config` | strict config, profiles, role plans, snapshots |
-| `agent-run-store` | SQLite schema 20, migrations, events, projections |
+| `agent-run-store` | SQLite schema, migrations, events, projections |
 | `agent-run-adapters` | Codex, Claude, and GLM preparation and protocols |
 | `agent-run-core` | service, supervisor, lifecycle, delivery, capacity, doctor |
 | `agent-run-platform` | native launch, process identity, safe files, snapshots |
@@ -93,7 +94,7 @@ authority, generated-home snapshot, history and cleanup proofs verify. See
 
 SQLite is the source of truth for agents, events, messages, answers, native
 session lineage, deliveries, cleanup evidence, capacity, and statistics. The
-current schema is version 19. Numbered migrations live in `sql/migrations/`
+current schema is version 22. Numbered migrations live in `sql/migrations/`
 and apply transactionally after a pre-version backup. The step to 17 is paired
 with the schema-2 config: ordinary commands and the broker refuse an older
 database with `migration_required` until `agent-run config migrate` runs. A

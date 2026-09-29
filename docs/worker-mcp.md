@@ -54,7 +54,7 @@ MCP settings; this server does not proxy or filter other MCPs.
 
 The worker-channel flag is frozen in the role. Historical snapshots without it
 retain their exact payload and tool set on resume. Start a new run to get the
-channel. The broker needs schema 21 and a paired upgrade. Restart Desktop Agent
+channel. The broker needs schema 21 or newer and a paired upgrade. Restart Desktop Agent
 Run MCP frontends after installing a version that adds worker-message delivery;
 older frontends can reject the new notice type while the outbox retains it.
 

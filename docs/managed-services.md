@@ -164,6 +164,6 @@ as a warning, and unhealthy or mismatched process ownership as an error. It
 reads state without launching probes or starting services.
 
 Before enabling reuse on an existing installation, upgrade the broker and paired
-database to schema 20 and use the matching shipped probe. Old binaries reject
-the new setting. The normal paired migration preserves historical ownership as
+database together and use the matching shipped probe. Reuse requires schema 20
+or newer; old binaries reject the setting. The normal paired migration preserves historical ownership as
 managed; see [migration instructions](provider-migration.md).

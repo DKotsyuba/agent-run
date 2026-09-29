@@ -2,14 +2,15 @@
 
 ## Existing schema-2 homes
 
-When upgrading a schema-2 home to database schema 21, prepare a complete replacement
+When upgrading a schema-2 home to database schema 22, prepare a complete replacement
 configuration using external quota commands as described in
 [quota collectors](quota-collectors.md). Run the **new candidate binary** while
 the old broker and other agent-run writers are stopped:
 
-For 0.18.0, an already valid schema-2 configuration can be supplied unchanged.
-Schema 21 adds attempt capability hashes and worker reports without changing
-provider credentials, accounts, or existing execution history.
+For 0.19.1, an already valid schema-2 configuration can be supplied unchanged.
+Schema 22 adds the [runtime storage-layout registry](runtime-storage-layouts.md)
+and its admission gate without changing provider credentials, accounts, or
+existing execution history. Upgrading the schema alone does not move runtime files.
 
 ```bash
 candidate=/absolute/path/to/new-sealed-release/bin/agent-run
