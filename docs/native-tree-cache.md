@@ -88,7 +88,12 @@ by page size: a larger retained-home set is paged by the caller, resuming
 at the returned `homes` offset and merging with `NativeRefScan::merge`. A
 proven-absent directory is simply empty; any other unreadable home,
 directory, link, record, or manifest sets `complete == false` while keeping
-the partial references collected so far. Collectors must treat
+the partial references collected so far — and an unrecognized link in a
+supported cache slot (relative, foreign, or malformed, including a
+relative spelling that resolves onto a live store tree) is exactly such
+unknown reference evidence: the link is left untouched, never followed or
+normalized, and the pass reports itself incomplete so a collector retains
+rather than concluding the slot references nothing. Collectors must treat
 `complete == false` as partial evidence and retain, never as an empty
 reference set, and must drain obsolete native-cache trees and blobs only
 through this census plus their own managed-asset reference sets.

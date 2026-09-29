@@ -1048,3 +1048,120 @@ fn run_bounded(command: &mut Command) -> std::process::Output {
     }
     child.wait_with_output().expect("collect codex output")
 }
+
+/// Returns a relative path from directory `from` to `to`, for building
+/// links that resolve equivalently to an absolute target.
+fn relative_to(from: &Path, to: &Path) -> PathBuf {
+    let from: Vec<_> = from.components().collect();
+    let to: Vec<_> = to.components().collect();
+    let shared = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    let mut relative = PathBuf::new();
+    for _ in shared..from.len() {
+        relative.push("..");
+    }
+    for component in &to[shared..] {
+        relative.push(component.as_os_str());
+    }
+    relative
+}
+
+/// The aggregate byte bound spans the whole capture: small files split
+/// across two subdirectories whose sum exceeds the bound are refused before
+/// anything is published, and the originals remain.
+#[test]
+fn aggregate_bound_spans_subdirectories() {
+    let root = TempDir::new().expect("fixture root");
+    let store_root = store(root.path());
+    let home_path = root.path().join("oversized");
+    stdfs::create_dir_all(&home_path).expect("home");
+    // Nine sparse 15 MiB files across two subdirectories: each file is far
+    // below the 16 MiB per-file bound while the tree totals ~135 MiB, above
+    // the 128 MiB aggregate bound. Sparse extension keeps the fixture cheap.
+    let per_file: u64 = 15 * 1024 * 1024;
+    for (subdir, count) in [("a", 5), ("b", 4)] {
+        for index in 0..count {
+            let path = home_path
+                .join("skills/.system")
+                .join(subdir)
+                .join(format!("part-{index:02}.bin"));
+            stdfs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            let file = stdfs::File::create(&path).expect("sparse file");
+            file.set_len(per_file).expect("sparse length");
+        }
+    }
+    let error = native_tree_cache::freeze(&store_root, &home_path, "skills/.system", &scope())
+        .expect_err("the aggregate bound refuses the tree");
+    assert!(
+        error.to_string().contains("aggregate"),
+        "the refusal names the aggregate bound: {error}"
+    );
+    assert!(
+        !store_root.join("trees").exists(),
+        "nothing was published into the store"
+    );
+    assert!(
+        home_path.join("skills/.system/b/part-03.bin").is_file(),
+        "every original file remains"
+    );
+    assert!(
+        stdfs::read_dir(&home_path)
+            .expect("home listing")
+            .flatten()
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".agent-run-native-")),
+        "no operation backup was left behind"
+    );
+    cleanup_store(&store_root);
+}
+
+/// An unrecognized link in a supported cache slot — a relative spelling
+/// resolving onto the very tree another home froze, or a foreign absolute
+/// target — marks the census incomplete instead of proving no reference;
+/// the link itself is never followed or rewritten.
+#[test]
+fn unrecognized_links_mark_census_incomplete() {
+    let root = TempDir::new().expect("fixture root");
+    let payload = b"unknown evidence payload\n".repeat(32);
+    let store_root = store(root.path());
+    let home_path = home(root.path(), "home", &payload, Some(MARKER), false);
+    let root_key = "plugins/cache/fixture/probe";
+    native_tree_cache::freeze(&store_root, &home_path, root_key, &scope()).expect("freeze");
+    let link = home_path.join(root_key);
+    let exact = stdfs::read_link(&link).expect("exact link");
+
+    // A relative spelling resolving onto the very same store tree.
+    let relative = relative_to(&home_path.join("plugins/cache/fixture"), &exact);
+    assert!(relative.is_relative());
+    stdfs::remove_file(&link).expect("drop link");
+    std::os::unix::fs::symlink(&relative, &link).expect("relative link");
+    let scan = native_tree_cache::scan_refs(&store_root, &[&home_path]);
+    assert!(
+        !scan.complete,
+        "an unrecognized link is unknown reference evidence, not no reference"
+    );
+    assert!(
+        scan.trees.is_empty(),
+        "an unrecognized link proves no reference either; retention comes\
+         \nfrom complete == false, never from an invented ref"
+    );
+
+    // A foreign absolute target in a supported slot is equally conservative.
+    stdfs::remove_file(&link).expect("drop link");
+    std::os::unix::fs::symlink("/etc", &link).expect("foreign link");
+    let scan = native_tree_cache::scan_refs(&store_root, &[&home_path]);
+    assert!(!scan.complete);
+    assert!(
+        link.symlink_metadata().unwrap().is_symlink(),
+        "the foreign link itself stays untouched"
+    );
+
+    // The exact controlled spelling restores complete evidence with the ref.
+    stdfs::remove_file(&link).expect("drop link");
+    std::os::unix::fs::symlink(&exact, &link).expect("repair link");
+    let scan = native_tree_cache::scan_refs(&store_root, &[&home_path]);
+    assert!(scan.complete);
+    assert_eq!(scan.trees.len(), 1);
+    cleanup_store(&store_root);
+}

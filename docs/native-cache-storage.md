@@ -133,7 +133,7 @@ This unit never deletes anything. The collector integration consumes:
   physical references: only home entries that are symlinks whose target is
   exactly `<trusted root>/native-cache/<64 hex>/<64 hex>`, where the target
   object exists, is owned, is at mode `0o400`, and its bytes hash to its
-  own name. Tampered targets, dangling targets and foreign links are
+  own name. Tampered targets, dangling targets and unrecognized links are
   reported separately and are not references.
 
 A deletion candidate is an object the complete object census found that no
@@ -141,10 +141,14 @@ complete reference census covers — and nothing else:
 `deletion_candidates(&objects, &refs)` returns the empty set unless **both**
 censuses are `complete`. Corrupt or missing evidence always pins: a drifted
 link (target object fails verification), a dangling link (target missing),
-an unscanned home, an unreadable directory, a foreign shape inside the
+an unrecognized link in a cache slot — relative, foreign, or malformed,
+including a relative spelling that resolves onto a live store object; the
+census never follows or rewrites such a link — an unscanned home, an
+unreadable directory, a foreign shape inside the
 namespace, or any scan bound forces `complete == false` — never an empty
-success — so a still-linked tampered object is never deletable. Out-of-
-namespace foreign links name nothing in this store and pin nothing.
+success — so a still-linked tampered object is never deletable, and an
+out-of-namespace link is unknown reference evidence that pins every
+deletion candidate rather than proving none.
 Physical references suffice: a complete reference census must include every
 retained and extant protected home, including cache-only homes registered
 in the runtime-storage layout registry. A pack's staging orphans and

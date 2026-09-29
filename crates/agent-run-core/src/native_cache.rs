@@ -1043,8 +1043,11 @@ pub struct NativeCacheRefCensus {
     /// Exact in-namespace links whose target object exists but fails
     /// verification (owner, mode or content digest), as `(home path, target)`.
     pub drifted: Vec<(PathBuf, PathBuf)>,
-    /// Cache symlinks pointing anywhere other than this unit's namespace,
-    /// as `(home path, target)`; retained and never followed.
+    /// Cache symlinks pointing anywhere other than this unit's exact
+    /// namespace spelling, as `(home path, target)`; retained, never
+    /// followed, and never treated as proof of no reference — a relative or
+    /// foreign link may resolve onto a live store object, so every entry
+    /// here forces `complete == false`.
     pub foreign: Vec<(PathBuf, PathBuf)>,
     /// Directories or homes the census could not enumerate, with the
     /// failure; every entry here forces `complete == false`.
@@ -1179,7 +1182,14 @@ fn collect_cache_references(
             }
         };
         let Some((scope, content)) = parse_object_target(namespace, &target) else {
+            // An unrecognized link — relative, foreign, or malformed — is
+            // unknown reference evidence, not proof of no reference: it may
+            // resolve onto a store object this census would otherwise offer
+            // as a deletion candidate. The link is recorded and never
+            // followed or rewritten; the census turns incomplete so the
+            // collector retains until the anomaly is resolved.
             census.foreign.push((path, target));
+            census.complete = false;
             continue;
         };
         let relative = Path::new(NATIVE_CACHE_NAMESPACE)
@@ -2238,8 +2248,9 @@ mod tests {
             "corrupt evidence must pin every deletion candidate"
         );
 
-        // A foreign link is neither a reference nor corrupt evidence: it
-        // names nothing in this unit's store, so it cannot pin an object.
+        // A foreign link is unknown reference evidence: it may resolve onto
+        // a store object this census would otherwise offer for deletion, so
+        // it is recorded, never followed, and turns the census incomplete.
         fs::create_dir_all(second.join(TOOLS_CACHE_DIR)).unwrap();
         symlink("/etc/passwd", second.join(TOOLS_CACHE_DIR).join(IDENTITY)).unwrap();
         let census = collect_native_cache_references(&root, &homes).unwrap();
@@ -2288,6 +2299,87 @@ mod tests {
         assert!(!census.references.is_empty());
         assert!(deletion_candidates(&objects, &census).is_empty());
         let _ = (store, first_home, second_home);
+    }
+
+    /// Returns a relative path from `from` (a directory) to `to`, for
+    /// building links that resolve equivalently to an absolute target.
+    fn relative_to(from: &Path, to: &Path) -> PathBuf {
+        let from: Vec<_> = from.components().collect();
+        let to: Vec<_> = to.components().collect();
+        let shared = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+        let mut relative = PathBuf::new();
+        for _ in shared..from.len() {
+            relative.push("..");
+        }
+        for component in &to[shared..] {
+            relative.push(component.as_os_str());
+        }
+        relative
+    }
+
+    /// An unrecognized link in a cache slot — a relative spelling resolving
+    /// onto a live store object, or a foreign absolute target — is unknown
+    /// reference evidence: the census turns incomplete, the link stays
+    /// untouched, and no object may be deleted from that evidence.
+    #[test]
+    fn census_treats_relative_and_foreign_links_as_unknown_evidence() {
+        let (_store, root) = store_root();
+        let (_home_guard, home) = home();
+        let bytes = tools_json("bash");
+        entry(&home, TOOLS_CACHE_DIR, IDENTITY, &bytes);
+        let object = sole_object(&pack(&root, &home, NativeCacheKind::Tools));
+        let link = home.join(TOOLS_CACHE_DIR).join(IDENTITY);
+        let exact = fs::read_link(&link).unwrap();
+        let objects = enumerate_native_cache_objects(&root).unwrap();
+        assert_eq!(objects.objects.len(), 1);
+
+        // A relative spelling resolving onto the very same object.
+        let relative = relative_to(&home.join(TOOLS_CACHE_DIR), &object);
+        assert!(relative.is_relative());
+        assert_eq!(
+            home.join(TOOLS_CACHE_DIR)
+                .join(&relative)
+                .canonicalize()
+                .unwrap(),
+            object.canonicalize().unwrap(),
+            "the relative spelling resolves onto the live object"
+        );
+        fs::remove_file(&link).unwrap();
+        symlink(&relative, &link).unwrap();
+        let census = collect_native_cache_references(&root, &[home.clone()]).unwrap();
+        assert!(
+            !census.complete,
+            "an unrecognized link is uncertainty, never proof of no reference"
+        );
+        assert_eq!(census.foreign.len(), 1);
+        assert_eq!(
+            census.foreign[0].1, relative,
+            "the link itself is untouched"
+        );
+        assert!(
+            census.references.get(&object).is_none(),
+            "an unrecognized link proves no live reference either"
+        );
+        assert!(
+            deletion_candidates(&objects, &census).is_empty(),
+            "the still-referenced object must not become a deletion candidate"
+        );
+
+        // A foreign absolute target is equally conservative.
+        fs::remove_file(&link).unwrap();
+        symlink("/etc/passwd", &link).unwrap();
+        let census = collect_native_cache_references(&root, &[home.clone()]).unwrap();
+        assert!(!census.complete);
+        assert_eq!(census.foreign.len(), 1);
+        assert!(deletion_candidates(&objects, &census).is_empty());
+
+        // The exact controlled spelling restores complete live evidence.
+        fs::remove_file(&link).unwrap();
+        symlink(&exact, &link).unwrap();
+        let census = collect_native_cache_references(&root, &[home.clone()]).unwrap();
+        assert!(census.complete);
+        assert!(census.references(&object));
+        assert!(deletion_candidates(&objects, &census).is_empty());
     }
 
     /// The object census classifies canonical objects and foreign entries,

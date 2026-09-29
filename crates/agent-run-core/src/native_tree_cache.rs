@@ -350,7 +350,8 @@ fn require_owner(uid: u32, label: &str) -> Result<()> {
 /// buffering the whole tree.
 fn capture(directory: &Dir, deadline: Instant) -> Result<Capture> {
     let mut entries: Vec<Value> = Vec::new();
-    walk_capture(directory, "", 0, &mut entries, deadline)?;
+    let mut total = 0_u64;
+    walk_capture(directory, "", 0, &mut entries, &mut total, deadline)?;
     entries.sort_by_key(|entry| entry["path"].as_str().unwrap_or_default().to_owned());
     if entries.len() > MAX_TREE_ENTRIES {
         return Err(invalid("native cache tree exceeds the entry bound"));
@@ -366,12 +367,16 @@ fn capture(directory: &Dir, deadline: Instant) -> Result<Capture> {
     })
 }
 
-/// One recursion level of [`capture`]; `prefix` is the visited subtree path.
+/// One recursion level of [`capture`]; `prefix` is the visited subtree path
+/// and `total` accumulates the whole capture's payload bytes across every
+/// level, so the aggregate bound covers the entire tree rather than one
+/// directory.
 fn walk_capture(
     directory: &Dir,
     prefix: &str,
     depth: u8,
     entries: &mut Vec<Value>,
+    total: &mut u64,
     deadline: Instant,
 ) -> Result<()> {
     if depth > MAX_DEPTH {
@@ -380,7 +385,6 @@ fn walk_capture(
     if Instant::now() >= deadline {
         return Err(invalid("native cache capture exceeded its time budget"));
     }
-    let mut total = 0_u64;
     for name in directory.list(None)? {
         if entries.len() > MAX_TREE_ENTRIES {
             return Err(invalid("native cache tree exceeds the entry bound"));
@@ -408,13 +412,14 @@ fn walk_capture(
                     &path,
                     depth + 1,
                     entries,
+                    total,
                     deadline,
                 )?;
             }
             EntryType::File => {
                 let (sha256, length, executable) = hash_entry(directory, text)?;
-                total = total.saturating_add(length);
-                if total > MAX_TREE_BYTES {
+                *total = total.saturating_add(length);
+                if *total > MAX_TREE_BYTES {
                     return Err(invalid("native cache tree exceeds the aggregate bound"));
                 }
                 entries.push(json!({
@@ -1031,9 +1036,11 @@ fn rollback_to_link(
 /// [`NativeRefScan::merge`]. Any unreadable home, directory, link, record,
 /// or manifest sets `complete == false` while keeping the partial
 /// references collected so far — a proven-absent directory is simply empty,
-/// never an error swallowed as an empty census. A collector must treat
-/// `complete == false` as incomplete evidence and retain, never as an empty
-/// reference set.
+/// never an error swallowed as an empty census, and an unrecognized link in
+/// a supported cache slot (relative, foreign, or malformed) is unknown
+/// reference evidence that marks the pass incomplete while leaving the link
+/// untouched. A collector must treat `complete == false` as incomplete
+/// evidence and retain, never as an empty reference set.
 pub fn scan_refs(store_root: &Path, homes: &[&Path]) -> NativeRefScan {
     let mut scan = NativeRefScan {
         complete: true,
@@ -1124,8 +1131,12 @@ fn scan_home(store_root: &Path, home_path: &Path, scan: &mut NativeRefScan, dead
                         reference,
                     );
                 }
-                Err(Error::Io(_)) => scan.complete = false,
-                Err(_) => {}
+                // An unrecognized link in a supported cache slot — relative,
+                // foreign, or malformed — is unknown reference evidence: the
+                // pass never follows or rewrites it, and reports itself
+                // incomplete so a collector retains rather than concluding
+                // the slot references nothing.
+                Err(_) => scan.complete = false,
             },
             Ok(_) => {}
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
