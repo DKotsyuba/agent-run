@@ -20,7 +20,7 @@ use std::{
 pub const SNAPSHOT_MANIFEST: &str = ".agent-run-snapshot.json";
 /// Generated-home Python-v1 runtime index filename.
 pub const RUNTIME_SNAPSHOT_INDEX: &str = ".agent-run-snapshots.json";
-const MAX_METADATA: usize = 64 * 1024;
+pub(crate) const MAX_METADATA: usize = 64 * 1024;
 const TEMP_PREFIX: &str = ".agent-run-";
 /// Canonically sorted entries and their exact regular-file bytes.
 type TreeRead = (Vec<Value>, BTreeMap<String, Vec<u8>>);
@@ -220,7 +220,7 @@ fn manifest(entries: &[Value]) -> Vec<u8> {
     canonical(&json!({"snapshot_version": 1, "entries": entries}))
 }
 
-fn load_manifest(dir: &Dir) -> Result<Option<Vec<Value>>> {
+pub(crate) fn load_manifest(dir: &Dir) -> Result<Option<Vec<Value>>> {
     let Some(raw) = dir.optional(Path::new(SNAPSHOT_MANIFEST), MAX_METADATA)? else {
         return Ok(None);
     };
@@ -239,7 +239,10 @@ fn load_manifest(dir: &Dir) -> Result<Option<Vec<Value>>> {
     Ok(Some(entries))
 }
 
-fn entry_map(entries: &[Value]) -> Result<BTreeMap<String, Value>> {
+/// Parses and validates manifest entries for shared-store reuse; the checks
+/// are the same ones [`inspect_managed_snapshot`] applies and never weaken
+/// old snapshot verification.
+pub(crate) fn entry_map(entries: &[Value]) -> Result<BTreeMap<String, Value>> {
     let mut mapped = BTreeMap::new();
     for entry in entries {
         let path = entry
