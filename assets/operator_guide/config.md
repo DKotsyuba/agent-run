@@ -20,7 +20,7 @@ auth_family = "openai"
 limits_source = "exec"
 collector = { command = "/bin/bash", args = ["/opt/agent-run/collectors/codex.sh"], source = "codex-appserver" }
 [[providers.codex.models]]
-id = "gpt-6-sol"
+id = "gpt-6.1-sol"
 [[providers.codex.bindings]]
 label = "main"
 account = "acct-codex-native"

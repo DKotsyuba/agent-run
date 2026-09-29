@@ -134,7 +134,7 @@ release platform, and agent-run does not generate systemd units.
 ```bash
 agent-run delegation-guide             # read before choosing a delegation route
 agent-run models                       # providers, explicit models, roles, standing
-agent-run start --provider codex --model gpt-6-sol --profile review \
+agent-run start --provider codex --model gpt-6.1-sol --profile review \
   --task "Review this repository." --workdir "$PWD"
 
 agent-run agents

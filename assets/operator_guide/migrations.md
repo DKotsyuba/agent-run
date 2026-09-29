@@ -74,9 +74,9 @@ collector = { command = "/bin/bash", args = ["/opt/agent-run/collectors/codex.sh
 global_account = "acct-codex-native"
 labelled_accounts = { personal2 = "acct-codex-personal2" }
 [runtimes.codex.native_models]
-"gpt-6-sol" = "gpt-6-sol"
+"gpt-6.1-sol" = "gpt-6.1-sol"
 [runtimes.codex.model_recommendations]
-"gpt-6-sol" = ["Use for connected implementation, cross-system diagnosis, security or concurrency reasoning, and substantive reviews with interacting constraints."]
+"gpt-6.1-sol" = ["Use for connected implementation, cross-system diagnosis, security or concurrency reasoning, and substantive reviews with interacting constraints."]
 ```
 
 ```sh
