@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-09-30
+
 - perf(storage): share immutable runtime assets and compatible native Codex
   caches across independent starts while keeping history, databases,
   credentials, generated configuration and worker capabilities private
