@@ -18,7 +18,9 @@ const V1_AGENTS: [&str; 3] = ["agt_alpha", "agt_beta", "agt_gamma"];
 /// would leave a store that stopped at that version.
 fn build_fixture(path: &Path, version: i64) -> Connection {
     if version >= 2 {
-        let fixture_name = if version == VERSION || version == 20 {
+        // Python produced the historical fixtures only through v19; v20 on
+        // are Rust preparation fixtures, rebuilt at each schema bump.
+        let fixture_name = if version == VERSION || version >= 20 {
             format!("current-v{version}.sqlite")
         } else {
             format!("historical-v{version}.sqlite")
@@ -554,6 +556,68 @@ fn migration_registry_is_contiguous() {
         .map(|(version, _)| *version)
         .collect();
     assert_eq!(versions, (2..=VERSION).collect::<Vec<_>>());
+}
+
+/// Migration 022 adds the runtime storage layout registry on a v21 store
+/// without touching existing rows, and the table's constraints hold after
+/// the upgrade exactly as on a fresh schema.
+#[test]
+fn migration_022_registers_runtime_storage_layouts() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("state.db");
+    let build = build_fixture(&path, 21);
+    let before = agent_count(&build);
+    drop(build);
+    let store = Store::open(home.path()).unwrap();
+    assert_eq!(user_version(&store.conn), VERSION);
+    assert_eq!(agent_count(&store.conn), before);
+    assert!(store
+        .pending_runtime_storage_layouts(10)
+        .unwrap()
+        .is_empty());
+    // The row the public API would write: a canonical v1 layout and its
+    // digest, so the migrated store's registry is readable, not just present.
+    let layout = serde_json::to_string(&serde_json::json!({
+        "version": 1,
+        "runtime_home": "/runtime/migrated",
+        "index_sha256": "a".repeat(64),
+        "roots": {"assets": {"scope": "d".repeat(64), "manifest_sha256": "e".repeat(64)}},
+    }))
+    .unwrap();
+    let digest = agent_run_platform::fs::sha256(layout.as_bytes());
+    store
+        .conn
+        .execute(
+            "INSERT INTO runtime_storage_layouts(runtime_home,index_sha256,layout_json,\
+             layout_sha256,state,operation_token,updated_at) \
+             VALUES('/runtime/migrated',?1,?2,?3,'prepared',?4,1.0)",
+            params!["a".repeat(64), layout, digest, "c".repeat(32)],
+        )
+        .unwrap();
+    for invalid in [
+        // A relative home violates the canonical-home check.
+        ("relative/home", "a".repeat(64), "prepared"),
+        // An unknown state spelling violates the state check.
+        ("/runtime/other", "a".repeat(64), "retired"),
+        // A short digest violates the digest-length check.
+        ("/runtime/short", "a".repeat(63), "prepared"),
+    ] {
+        assert!(store
+            .conn
+            .execute(
+                "INSERT INTO runtime_storage_layouts(runtime_home,index_sha256,layout_json,\
+                 layout_sha256,state,operation_token,updated_at) \
+                 VALUES(?1,?2,'{\"version\":1}',?3,?4,1.0)",
+                params![invalid.0, invalid.1, "b".repeat(64), invalid.2],
+            )
+            .is_err());
+    }
+    assert_eq!(store.pending_runtime_storage_layouts(10).unwrap().len(), 1);
+    assert_eq!(
+        schema_objects(&store.conn),
+        fresh_schema_objects(),
+        "migrated v21 store drifted from a fresh v22 schema"
+    );
 }
 
 /// Mirrors `tests/test_state_migrations.py::MigrationRegistryTests::test_v9_to_v10_creates_bounded_route_snapshot_table`.

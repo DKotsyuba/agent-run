@@ -89,6 +89,10 @@ See [process identity](process-identity.md) for platform limits.
 
 ## Broker lifecycle contract
 
+One manager holds a home-wide writer lock, including brokers on custom sockets.
+Dropping the manager explicitly releases this lock without stopping services;
+inherited descriptors waiting for exec cannot delay a replacement manager.
+
 The broker warms every configured service before a new harness starts.
 Concurrent agents share one generation. Pending or active agents retain leases;
 unresolved process ownership retains them even after an agent is marked lost.
@@ -164,6 +168,6 @@ as a warning, and unhealthy or mismatched process ownership as an error. It
 reads state without launching probes or starting services.
 
 Before enabling reuse on an existing installation, upgrade the broker and paired
-database to schema 20 and use the matching shipped probe. Old binaries reject
-the new setting. The normal paired migration preserves historical ownership as
+database together and use the matching shipped probe. Reuse requires schema 20
+or newer; old binaries reject the setting. The normal paired migration preserves historical ownership as
 managed; see [migration instructions](provider-migration.md).

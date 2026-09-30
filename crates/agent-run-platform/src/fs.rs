@@ -88,9 +88,60 @@ pub fn tolerate_unsupported_sync(outcome: std::io::Result<()>) -> Result<()> {
 /// `directory` must be an open descriptor for the directory whose entries
 /// changed. Returns once those entries are durable, or immediately when the
 /// filesystem reports directory synchronization unsupported; see
-/// [`tolerate_unsupported_sync`] for the exact tolerated errors.
+/// [`tolerate_unsupported_sync`] for the exact tolerated errors. This is
+/// std's `File::sync_all`: `fcntl(F_FULLFSYNC)` on Apple hosts (fsync(2)
+/// plus a drain of the whole device write queue), `fsync(2)` elsewhere.
 fn sync_directory(directory: &File) -> Result<()> {
     tolerate_unsupported_sync(directory.sync_all())
+}
+
+/// How far one namespace mutation flushes its parent directory.
+///
+/// On Apple hosts `fsync(2)` only moves an object's data and attributes to
+/// the device, which may still reorder or lose them, while `F_FULLFSYNC`
+/// also drains the device queue so that "data that had been fsync'd on the
+/// same device before is guaranteed to be persisted when this call returns"
+/// (`fcntl(2)`). A batch may therefore apply [`Flush::Skipped`] mutations,
+/// push every changed object once with plain `fsync(2)` ([`push`],
+/// [`Dir::push`], [`Dir::push_tree`]) and make them all durable with one
+/// [`Dir::sync`] barrier on the same device. On other hosts `fsync(2)` is
+/// already the durable operation, so that ordering never weakens a
+/// non-Apple fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flush {
+    /// Durable when the call returns (`File::sync_all`, the historical
+    /// behavior of every synced primitive).
+    Durable,
+    /// Not flushed: either disposable content a crash may lose or leave
+    /// partial, which its owner's recovery must discard or re-prove, or a
+    /// batch whose caller pushes the changed directory and crosses a
+    /// [`Dir::sync`] barrier before anything depends on it.
+    Skipped,
+}
+
+/// Pushes one open file or directory to its device with plain `fsync(2)`.
+///
+/// Durable on return except on Apple hosts, where it becomes durable only
+/// once a later `F_FULLFSYNC` ([`Dir::sync`]) on the same device returns;
+/// see [`Flush`].
+/// Filesystems reporting synchronization unsupported are tolerated like
+/// [`tolerate_unsupported_sync`].
+pub fn push(file: &File) -> Result<()> {
+    // SAFETY: the descriptor is live for the duration of this call.
+    let outcome = if unsafe { libc::fsync(file.as_raw_fd()) } < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    };
+    tolerate_unsupported_sync(outcome)
+}
+
+/// Flushes one open directory descriptor to the requested [`Flush`] level.
+fn flush(file: &File, level: Flush) -> Result<()> {
+    match level {
+        Flush::Durable => sync_directory(file),
+        Flush::Skipped => Ok(()),
+    }
 }
 pub fn relative(path: &Path) -> Result<Vec<CString>> {
     let mut result = Vec::new();
@@ -153,6 +204,8 @@ pub struct Entry {
     pub inode: u64,
     /// Last modified time in Unix seconds, including available subseconds.
     pub modified: f64,
+    /// Permission bits (`st_mode & 0o7777`) of the entry, without following it.
+    pub mode: u32,
 }
 
 /// Converts one raw `stat` result into the public no-follow identity shape.
@@ -176,6 +229,7 @@ fn entry_of(status: &libc::stat) -> Entry {
         inode: status.st_ino,
         socket: kind == libc::S_IFSOCK,
         modified: status.st_mtime as f64 + status.st_mtime_nsec as f64 / 1e9,
+        mode: (status.st_mode & 0o7777) as u32,
     }
 }
 
@@ -365,13 +419,70 @@ impl Dir {
     /// dereferenced; the parent directory is synced like [`Dir::remove`].
     /// Fails with `ENOTEMPTY` while the directory still holds entries.
     pub fn remove_directory(&self, path: &Path) -> Result<()> {
+        self.unlink(path, libc::AT_REMOVEDIR, Flush::Durable)
+    }
+    /// [`Dir::remove_directory`] without the parent-directory durability
+    /// flush ([`Flush::Skipped`]), for emptying a disposable tree whose
+    /// removal a crash may leave partial and its owner's recovery removes
+    /// again without proof; a later durable removal of the emptied parent
+    /// is the only flush it needs.
+    pub fn discard_directory(&self, path: &Path) -> Result<()> {
+        self.unlink(path, libc::AT_REMOVEDIR, Flush::Skipped)
+    }
+    /// [`Dir::remove`] without the parent-directory durability flush, for
+    /// emptying a disposable tree; see [`Dir::discard_directory`].
+    pub fn discard(&self, path: &Path) -> Result<()> {
+        self.unlink(path, 0, Flush::Skipped)
+    }
+    /// Unlinks one final component through its no-follow parent with
+    /// `flags`, flushing the parent directory to `level`.
+    fn unlink(&self, path: &Path, flags: libc::c_int, level: Flush) -> Result<()> {
         let (parent, name) = self.parent(path, false)?;
         // SAFETY: parent is a live directory descriptor and name is NUL-terminated.
-        if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } < 0 {
+        if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) } < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        sync_directory(&parent)?;
-        Ok(())
+        flush(&parent, level)
+    }
+    /// Flushes this directory durably and acts as the device barrier.
+    ///
+    /// On Apple hosts this is `F_FULLFSYNC`, which drains the device queue so
+    /// every object earlier pushed with plain `fsync(2)` on the same device
+    /// ([`push`], [`Dir::push`], [`Dir::push_tree`]) is persisted
+    /// when it returns; elsewhere `fsync(2)`, where each push was already
+    /// durable. It persists nothing that was never pushed: objects created
+    /// with [`Flush::Skipped`] must be pushed first.
+    pub fn sync(&self) -> Result<()> {
+        sync_directory(&self.0)
+    }
+    /// Pushes this directory's own entries and attributes to the device
+    /// with plain `fsync(2)`; see [`push`].
+    pub fn push(&self) -> Result<()> {
+        push(&self.0)
+    }
+    /// Pushes every regular file and directory beneath this directory, and
+    /// this directory itself last, with plain `fsync(2)` through no-follow
+    /// descriptors.
+    ///
+    /// After a later [`Dir::sync`] barrier on the same device, every file's
+    /// data and attributes and every directory's entries and mode below are
+    /// persisted — the explicit per-object ordering a staged tree needs
+    /// before it may become authoritative, on any filesystem. A symlink or
+    /// special entry is refused rather than followed.
+    pub fn push_tree(&self) -> Result<()> {
+        for name in self.list(None)? {
+            let relative = PathBuf::from(&name);
+            match self.entry_type(&relative)? {
+                EntryType::Directory => self.subdir(&relative)?.push_tree()?,
+                EntryType::File => push(&self.open_file(&relative)?)?,
+                kind => {
+                    return Err(invalid(format!(
+                        "pushed tree holds an unsupported entry: {kind:?}"
+                    )))
+                }
+            }
+        }
+        self.push()
     }
     /// Classify a final path entry without following it or any parent link.
     pub fn entry_type(&self, path: &Path) -> Result<EntryType> {
@@ -421,6 +532,40 @@ impl Dir {
     pub fn permit_owner_write(&self) -> Result<()> {
         self.0
             .set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        Ok(())
+    }
+    /// Drops owner write permission on this already-open directory descriptor.
+    ///
+    /// Publishing an immutable shared-store tree leaves every directory it
+    /// contains at mode `0o500` (owner read and traverse only). Like
+    /// [`Dir::permit_owner_write`] the permission change runs on the live
+    /// descriptor this process opened and verified, so it restricts exactly
+    /// that one directory and never resolves a path again.
+    pub fn restrict_owner_read(&self) -> Result<()> {
+        self.0
+            .set_permissions(std::fs::Permissions::from_mode(0o500))?;
+        Ok(())
+    }
+    /// Sets the permission bits of one owned final entry below this
+    /// directory without following it or any parent link.
+    ///
+    /// `mode` is applied exactly (`fchmodat` with `AT_SYMLINK_NOFOLLOW`
+    /// through the no-follow parent descriptor), so a symlink at `path` is
+    /// never dereferenced and nothing outside this directory changes.
+    pub fn set_mode(&self, path: &Path, mode: u32) -> Result<()> {
+        let (parent, name) = self.parent(path, false)?;
+        // SAFETY: parent is a live directory descriptor and name is NUL-terminated.
+        if unsafe {
+            libc::fchmodat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                mode as libc::mode_t,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
         Ok(())
     }
     /// Read a final symbolic-link target without following it or its parents.
@@ -502,7 +647,24 @@ impl Dir {
         }
         Ok((fd, parts.last().expect("nonempty validated path").clone()))
     }
+    /// Creates, or validates an existing, owned real directory at `path`
+    /// (missing ancestors are created) and syncs its parent directory. An
+    /// existing symlink or non-directory at `path` is refused.
     pub fn directory(&self, path: &Path) -> Result<()> {
+        self.make_directory(path, Flush::Durable)
+    }
+    /// [`Dir::directory`] without the parent-directory durability flush, for
+    /// a disposable staging tree built parent-first ([`Flush::Skipped`]);
+    /// before the tree becomes live the caller pushes it
+    /// ([`Dir::push_tree`]) and issues one [`Dir::sync`] barrier. Missing
+    /// ancestors are still created (and synced) like [`Dir::write`].
+    pub fn stage_directory(&self, path: &Path) -> Result<()> {
+        self.make_directory(path, Flush::Skipped)
+    }
+    /// Creates, or validates an existing, owned real directory at `path`
+    /// like [`Dir::directory`], flushing its parent directory to `level`.
+    /// Missing ancestors are created and synced like [`Dir::write`].
+    pub fn make_directory(&self, path: &Path, level: Flush) -> Result<()> {
         let (parent, name) = self.parent(path, true)?;
         // SAFETY: parent and name are live, mkdirat does not retain pointers.
         let n = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
@@ -523,8 +685,7 @@ impl Dir {
         }
         // SAFETY: n is newly allocated by openat.
         let _directory = unsafe { File::from_raw_fd(n) };
-        sync_directory(&parent)?;
-        Ok(())
+        flush(&parent, level)
     }
     pub fn open_file(&self, path: &Path) -> Result<File> {
         let (parent, name) = self.parent(path, false)?;
@@ -662,19 +823,298 @@ impl Dir {
         sync_directory(&parent)?;
         Ok(())
     }
+    /// Links one verified regular source file under a new name in this directory.
+    ///
+    /// `path` is the destination relative to this directory and `source_path`
+    /// is the source relative to `source`; both are resolved component by
+    /// component through no-follow descriptors, exactly like [`Dir::write`].
+    /// Publication is no-replace: when `path` already exists the link is not
+    /// created and the call returns `Ok(false)`, leaving the existing entry
+    /// untouched; every other failure propagates. A first no-follow `fstatat`
+    /// refuses non-regular sources — with `linkat` flags `0` a symbolic link
+    /// would be linked as a link rather than followed — but that pre-stat is
+    /// a filter, not a race guard: the source name could be substituted
+    /// before the link lands. Publication is therefore only accepted after a
+    /// second no-follow stat of the fresh destination proves it bound the
+    /// exact `(device, inode)` observed beforehand; on any mismatch the new
+    /// link is unlinked again and the call fails. Missing destination parent
+    /// directories are created like [`Dir::write`], and the destination
+    /// parent directory is synchronized after an accepted link.
+    pub fn hardlink(&self, path: &Path, source: &Dir, source_path: &Path) -> Result<bool> {
+        self.hardlink_flushed(path, source, source_path, Flush::Durable)
+    }
+    /// [`Dir::hardlink`] flushing the destination parent directory to
+    /// `level` instead of always syncing it durably.
+    pub fn hardlink_flushed(
+        &self,
+        path: &Path,
+        source: &Dir,
+        source_path: &Path,
+        level: Flush,
+    ) -> Result<bool> {
+        let (source_parent, source_name) = source.parent(source_path, false)?;
+        // SAFETY: stat is a plain C output buffer; fstatat initializes it before use.
+        let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+        // SAFETY: descriptor/name are live and fstatat retains neither.
+        if unsafe {
+            libc::fstatat(
+                source_parent.as_raw_fd(),
+                source_name.as_ptr(),
+                &mut status,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if status.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(invalid("hardlink source must be a regular file"));
+        }
+        let observed = (status.st_dev as u64, status.st_ino as u64);
+        let (parent, name) = self.parent(path, true)?;
+        // SAFETY: both descriptors and NUL-terminated names are live for this
+        // call; flags 0 never dereference a symlink at the source name.
+        if unsafe {
+            libc::linkat(
+                source_parent.as_raw_fd(),
+                source_name.as_ptr(),
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                0,
+            )
+        } < 0
+        {
+            let error = std::io::Error::last_os_error();
+            return if error.raw_os_error() == Some(libc::EEXIST) {
+                Ok(false)
+            } else {
+                Err(error.into())
+            };
+        }
+        // SAFETY: stat is a plain C output buffer; fstatat initializes it before use.
+        let mut linked = unsafe { std::mem::zeroed::<libc::stat>() };
+        // SAFETY: descriptor/name are live and fstatat retains neither; the
+        // no-follow flag keeps a substituted destination name from being read
+        // through.
+        let identity = unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                &mut linked,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if identity < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if linked.st_mode & libc::S_IFMT != libc::S_IFREG
+            || (linked.st_dev as u64, linked.st_ino as u64) != observed
+        {
+            // SAFETY: unlink only the destination name this call just created.
+            unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+            sync_directory(&parent)?;
+            return Err(invalid("hardlink did not bind the verified source object"));
+        }
+        flush(&parent, level)?;
+        Ok(true)
+    }
+    /// Atomically renames one entry beneath this directory without following
+    /// links and without replacing anything already at the destination.
+    ///
+    /// `from` and `to` are relative to this directory and resolved through
+    /// no-follow parent descriptors. The move uses the kernel's no-replace
+    /// form (`renameatx_np` with `RENAME_EXCL` on macOS, `renameat2` with
+    /// `RENAME_NOREPLACE` on Linux): when `to` already exists — including as
+    /// an empty directory or a regular file — the kernel refuses the move,
+    /// nothing is touched, and the call returns `Ok(false)`. Hosts without a
+    /// no-replace rename fail with [`Error::Unsupported`] rather than falling
+    /// back to a replaceable rename. Missing parent directories of `to` are
+    /// created like [`Dir::write`], and both affected parent directories are
+    /// synchronized after a move.
+    pub fn rename_entry_no_replace(&self, from: &Path, to: &Path) -> Result<bool> {
+        self.rename_entry_no_replace_flushed(from, to, Flush::Durable)
+    }
+    /// [`Dir::rename_entry_no_replace`] flushing both affected parent
+    /// directories to `level` instead of always syncing them durably.
+    pub fn rename_entry_no_replace_flushed(
+        &self,
+        from: &Path,
+        to: &Path,
+        level: Flush,
+    ) -> Result<bool> {
+        let (from_parent, from_name) = self.parent(from, false)?;
+        let (to_parent, to_name) = self.parent(to, true)?;
+        match exclusive_rename(&from_parent, &from_name, &to_parent, &to_name)? {
+            ExclusiveRename::Moved => {}
+            ExclusiveRename::DestinationExists => return Ok(false),
+        }
+        flush(&from_parent, level)?;
+        if from_parent.as_raw_fd() != to_parent.as_raw_fd() {
+            flush(&to_parent, level)?;
+        }
+        Ok(true)
+    }
+    /// Atomically renames one entry beneath this directory, replacing
+    /// whatever entry already exists at the destination.
+    ///
+    /// `from` and `to` are relative to this directory and resolved through
+    /// no-follow parent descriptors exactly like
+    /// [`Dir::rename_entry_no_replace`], but the move uses the kernel's
+    /// plain replacing `renameat`: an entry already at `to` — a regular
+    /// file or a symbolic link, never dereferenced — is atomically replaced,
+    /// so an outside observer sees either the old entry or the complete new
+    /// one, never a missing name. It is the caller's job to prove the
+    /// replaced name quiescent; the primitive itself serializes nothing.
+    /// Missing parent directories of `to` are created like [`Dir::write`],
+    /// and both affected parent directories are synchronized after the move.
+    pub fn rename_entry_replace(&self, from: &Path, to: &Path) -> Result<()> {
+        let (from_parent, from_name) = self.parent(from, false)?;
+        let (to_parent, to_name) = self.parent(to, true)?;
+        // SAFETY: live descriptors and NUL-terminated names; renameat
+        // replaces the destination entry and never follows a link at either
+        // name.
+        if unsafe {
+            libc::renameat(
+                from_parent.as_raw_fd(),
+                from_name.as_ptr(),
+                to_parent.as_raw_fd(),
+                to_name.as_ptr(),
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        sync_directory(&from_parent)?;
+        if from_parent.as_raw_fd() != to_parent.as_raw_fd() {
+            sync_directory(&to_parent)?;
+        }
+        Ok(())
+    }
+    /// Creates one new exclusive file beneath this directory for streaming.
+    ///
+    /// `path` is relative to this directory and resolved through no-follow
+    /// parent descriptors like [`Dir::write`]; missing parent directories are
+    /// created. The file is created with `O_CREAT|O_EXCL` at `mode`, so the
+    /// caller owns a brand-new inode no other name can already reference —
+    /// the streaming-publish counterpart of [`Dir::write_seamed`]'s temp
+    /// file. Unlike `write`, the returned [`File`] is unsynced and the parent
+    /// is not synchronized; the caller streams bytes, syncs the file, and
+    /// atomically renames it into place. A failure to create the name (for
+    /// example an existing entry) propagates without touching anything.
+    pub fn create_exclusive(&self, path: &Path, mode: u32) -> Result<File> {
+        let (parent, name) = self.parent(path, true)?;
+        // SAFETY: parent descriptor and NUL-terminated name remain live for
+        // this call; O_EXCL guarantees the new inode has no other name.
+        let raw = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                mode as libc::c_uint,
+            )
+        };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: this call owns the fresh descriptor returned by openat.
+        Ok(unsafe { File::from_raw_fd(raw) })
+    }
     /// Remove one owned entry through its no-follow parent. Unlink never
     /// dereferences the final component, so a symlink there is removed as
     /// the link itself, matching the descriptor-anchored read/write above.
     pub fn remove(&self, path: &Path) -> Result<()> {
-        let (parent, name) = self.parent(path, false)?;
-        // SAFETY: parent is a live directory descriptor and name is NUL-terminated.
-        if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        sync_directory(&parent)?;
-        Ok(())
+        self.unlink(path, 0, Flush::Durable)
     }
 }
+/// Outcome of one kernel no-replace rename attempt between live descriptors.
+enum ExclusiveRename {
+    /// The move completed; nothing else changed.
+    Moved,
+    /// The destination already existed and the kernel refused the move.
+    DestinationExists,
+}
+
+/// Performs the platform's exclusive rename between two live parent
+/// descriptors, mapping `EEXIST` to [`ExclusiveRename::DestinationExists`];
+/// hosts and kernels without a no-replace rename fail with
+/// [`Error::Unsupported`], and every other failure propagates.
+#[cfg(target_os = "macos")]
+fn exclusive_rename(
+    from_parent: &File,
+    from_name: &CStr,
+    to_parent: &File,
+    to_name: &CStr,
+) -> Result<ExclusiveRename> {
+    // SAFETY: live descriptors and NUL-terminated names; RENAME_EXCL refuses
+    // the move instead of ever replacing an existing destination entry.
+    if unsafe {
+        libc::renameatx_np(
+            from_parent.as_raw_fd(),
+            from_name.as_ptr(),
+            to_parent.as_raw_fd(),
+            to_name.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    } < 0
+    {
+        return exclusive_rename_outcome();
+    }
+    Ok(ExclusiveRename::Moved)
+}
+
+/// Linux form of [`exclusive_rename`] using `renameat2` + `RENAME_NOREPLACE`.
+#[cfg(target_os = "linux")]
+fn exclusive_rename(
+    from_parent: &File,
+    from_name: &CStr,
+    to_parent: &File,
+    to_name: &CStr,
+) -> Result<ExclusiveRename> {
+    // SAFETY: live descriptors and NUL-terminated names; RENAME_NOREPLACE
+    // refuses the move instead of ever replacing an existing destination.
+    if unsafe {
+        libc::renameat2(
+            from_parent.as_raw_fd(),
+            from_name.as_ptr(),
+            to_parent.as_raw_fd(),
+            to_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } < 0
+    {
+        return exclusive_rename_outcome();
+    }
+    Ok(ExclusiveRename::Moved)
+}
+
+/// Other hosts have no no-replace rename this module is willing to use.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn exclusive_rename(
+    _from_parent: &File,
+    _from_name: &CStr,
+    _to_parent: &File,
+    _to_name: &CStr,
+) -> Result<ExclusiveRename> {
+    Err(Error::Unsupported(
+        "host offers no no-replace rename for content-addressed publication".into(),
+    ))
+}
+
+/// Classifies one failed exclusive rename: an existing destination is the
+/// documented no-move outcome, an unavailable syscall is unsupported, and
+/// anything else is a real error.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn exclusive_rename_outcome() -> Result<ExclusiveRename> {
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EEXIST) => Ok(ExclusiveRename::DestinationExists),
+        Some(libc::ENOSYS | libc::EINVAL | libc::ENOTSUP) => Err(Error::Unsupported(
+            "host kernel offers no no-replace rename for content-addressed publication".into(),
+        )),
+        _ => Err(error.into()),
+    }
+}
+
 pub fn canonical_json(value: &serde_json::Value) -> Result<Vec<u8>> {
     // Explicit recursion stays canonical even if another dependency enables
     // serde_json's preserve_order feature through Cargo feature unification.

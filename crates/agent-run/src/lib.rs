@@ -13,5 +13,6 @@ pub mod cli;
 pub mod init;
 pub mod launchd;
 pub mod migrate;
+pub mod storage_admin;
 pub mod transcript;
 pub mod transport;

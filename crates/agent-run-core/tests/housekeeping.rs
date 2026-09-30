@@ -43,7 +43,7 @@ fn orphan_recent_retained_and_escaped_paths() {
     for id in [orphan, recent, owned, referenced, account] {
         run_tree(&home, id);
     }
-    let store = home.store();
+    let mut store = home.store();
     retained(&store, owned, "{}");
     let ref_path = home.path.join("agents").join(referenced).join("é");
     let escaped = ref_path.to_string_lossy().replace('é', "\\u00e9");
@@ -64,7 +64,7 @@ fn orphan_recent_retained_and_escaped_paths() {
     let proof = store.storage_protection_snapshot().unwrap();
     assert!(!proof.retains(orphan, &home.path.join("agents").join(orphan)));
     for _ in 0..4 {
-        sweep(&home.path, NOW, &store).unwrap();
+        sweep(&home.path, NOW, &mut store).unwrap();
     }
     assert!(!home.path.join("agents").join(orphan).exists());
     for id in [recent, owned, referenced, account] {
@@ -76,20 +76,20 @@ fn orphan_recent_retained_and_escaped_paths() {
 #[test]
 fn completed_backup_expires_but_pending_and_corrupt_journals_block() {
     let home = common::Home::new();
-    let store = home.store();
+    let mut store = home.store();
     let prefix = home.path.join("standalone");
     fs::private_dir(&prefix.join("backups/1700000000")).unwrap();
     std::fs::write(prefix.join("backups/1700000000/state.db"), "fixture").unwrap();
     std::fs::write(prefix.join(".install.lock"), "").unwrap();
     std::fs::write(prefix.join("deploy.json"), r#"{"phase":"prepared"}"#).unwrap();
-    sweep(&home.path, NOW, &store).unwrap();
+    sweep(&home.path, NOW, &mut store).unwrap();
     assert!(prefix.join("backups/1700000000").exists());
     std::fs::write(prefix.join("deploy.json"), "broken").unwrap();
-    sweep(&home.path, NOW, &store).unwrap();
+    sweep(&home.path, NOW, &mut store).unwrap();
     assert!(prefix.join("backups/1700000000").exists());
     std::fs::write(prefix.join("deploy.json"), r#"{"phase":"committed"}"#).unwrap();
     for _ in 0..4 {
-        sweep(&home.path, NOW, &store).unwrap();
+        sweep(&home.path, NOW, &mut store).unwrap();
     }
     assert!(!prefix.join("backups/1700000000").exists());
 }
@@ -98,7 +98,7 @@ fn completed_backup_expires_but_pending_and_corrupt_journals_block() {
 #[test]
 fn registered_and_configured_file_refs_protect_backups() {
     let home = common::Home::new();
-    let store = home.store();
+    let mut store = home.store();
     let config_backup = home.path.join("config.toml.bak-1700000000");
     std::fs::write(&config_backup, "registered secret").unwrap();
     let unreferenced = home.path.join("config.toml.bak-1700000001");
@@ -128,7 +128,7 @@ fn registered_and_configured_file_refs_protect_backups() {
         ).unwrap();
     }
     for _ in 0..4 {
-        sweep(&home.path, NOW, &store).unwrap();
+        sweep(&home.path, NOW, &mut store).unwrap();
     }
     assert!(config_backup.exists());
     assert!(backup.exists());
@@ -139,13 +139,13 @@ fn registered_and_configured_file_refs_protect_backups() {
     let old_log = home.path.join("logs/cli.2026-01-01.log");
     fs::private_dir(old_log.parent().unwrap()).unwrap();
     std::fs::write(&old_log, "old").unwrap();
-    assert!(sweep(&home.path, NOW, &store).is_err());
+    assert!(sweep(&home.path, NOW, &mut store).is_err());
     assert!(
         old_log.exists(),
         "bad protection data blocks every deletion category"
     );
     std::fs::write(home.path.join("config.toml"), "schema_version = 999\n").unwrap();
-    assert!(sweep(&home.path, NOW, &store).is_err());
+    assert!(sweep(&home.path, NOW, &mut store).is_err());
     assert!(
         old_log.exists(),
         "invalid schema also blocks every deletion category"
@@ -156,7 +156,7 @@ fn registered_and_configured_file_refs_protect_backups() {
 #[test]
 fn readonly_migration_snapshot_resumes_and_pending_blocks() {
     let home = common::Home::new();
-    let store = home.store();
+    let mut store = home.store();
     let migrations = home.path.join("migrations");
     fs::private_dir(&migrations).unwrap();
     let name = "1700000000-0123456789abcdef0123456789abcdef-v1-to-v2";
@@ -172,11 +172,11 @@ fn readonly_migration_snapshot_resumes_and_pending_blocks() {
     .unwrap();
     std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o500)).unwrap();
     std::fs::write(migrations.join("in-progress.json"), "pending").unwrap();
-    sweep(&home.path, NOW, &store).unwrap();
+    sweep(&home.path, NOW, &mut store).unwrap();
     assert!(snapshot.exists());
     std::fs::remove_file(migrations.join("in-progress.json")).unwrap();
     for _ in 0..6 {
-        sweep(&home.path, NOW, &store).unwrap();
+        sweep(&home.path, NOW, &mut store).unwrap();
     }
     if snapshot.exists() {
         std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -189,7 +189,7 @@ fn readonly_migration_snapshot_resumes_and_pending_blocks() {
 #[test]
 fn migration_complete_survives_paginated_special_entry() {
     let home = common::Home::new();
-    let store = home.store();
+    let mut store = home.store();
     let migrations = home.path.join("migrations");
     fs::private_dir(&migrations).unwrap();
     let name = "1700000000-abcdef0123456789abcdef0123456789-v2-state-upgrade";
@@ -206,7 +206,7 @@ fn migration_complete_survives_paginated_special_entry() {
     std::fs::write(migrations.join(format!("{name}.applied.json")), "{}").unwrap();
     std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o500)).unwrap();
     for _ in 0..5 {
-        sweep(&home.path, NOW, &store).unwrap();
+        sweep(&home.path, NOW, &mut store).unwrap();
     }
     assert!(
         snapshot.join("COMPLETE").exists(),
@@ -216,7 +216,7 @@ fn migration_complete_survives_paginated_special_entry() {
     std::fs::remove_file(&fifo).unwrap();
     std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o500)).unwrap();
     for _ in 0..5 {
-        sweep(&home.path, NOW, &store).unwrap();
+        sweep(&home.path, NOW, &mut store).unwrap();
     }
     if snapshot.exists() {
         std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -228,7 +228,7 @@ fn migration_complete_survives_paginated_special_entry() {
 #[test]
 fn blocked_first_batch_does_not_starve_later_orphan() {
     let home = common::Home::new();
-    let store = home.store();
+    let mut store = home.store();
     for number in 0..17 {
         let id = format!("ag-20260101-000000-{number:010x}");
         let dir = home.path.join("agents").join(&id);
@@ -240,7 +240,7 @@ fn blocked_first_batch_does_not_starve_later_orphan() {
     let eligible = "ag-20260101-000000-fffffffffe";
     run_tree(&home, eligible);
     for _ in 0..6 {
-        sweep(&home.path, NOW, &store).unwrap();
+        sweep(&home.path, NOW, &mut store).unwrap();
     }
     assert!(!home.path.join("agents").join(eligible).exists());
 }
@@ -249,7 +249,7 @@ fn blocked_first_batch_does_not_starve_later_orphan() {
 #[test]
 fn daily_logs_expire_without_touching_legacy_or_recent_names() {
     let home = common::Home::new();
-    let store = home.store();
+    let mut store = home.store();
     let logs = home.path.join("logs");
     fs::private_dir(&logs).unwrap();
     std::fs::write(logs.join("cli.2026-01-01.log"), "old").unwrap();
@@ -257,7 +257,7 @@ fn daily_logs_expire_without_touching_legacy_or_recent_names() {
     std::fs::write(logs.join("cli.log"), "legacy").unwrap();
     std::fs::write(home.path.join("capacity-worker.err.log"), "legacy launchd").unwrap();
     for _ in 0..4 {
-        sweep(&home.path, NOW, &store).unwrap();
+        sweep(&home.path, NOW, &mut store).unwrap();
     }
     assert!(!logs.join("cli.2026-01-01.log").exists());
     assert!(logs.join("cli.2035-01-01.log").exists());
@@ -272,7 +272,7 @@ fn daily_logs_expire_without_touching_legacy_or_recent_names() {
 #[test]
 fn symlink_escape_is_retained_without_touching_target() {
     let home = common::Home::new();
-    let store = home.store();
+    let mut store = home.store();
     let outside = tempfile::tempdir().unwrap();
     std::fs::write(outside.path().join("sentinel"), "safe").unwrap();
     fs::private_dir(&home.path.join("agents")).unwrap();
@@ -281,7 +281,7 @@ fn symlink_escape_is_retained_without_touching_target() {
         home.path.join("agents/ag-20260101-000000-0123456789"),
     )
     .unwrap();
-    sweep(&home.path, NOW, &store).unwrap();
+    sweep(&home.path, NOW, &mut store).unwrap();
     assert_eq!(
         std::fs::read_to_string(outside.path().join("sentinel")).unwrap(),
         "safe"
@@ -292,13 +292,13 @@ fn symlink_escape_is_retained_without_touching_target() {
 #[test]
 fn live_and_stale_relay_sockets_are_distinguished() {
     let home = common::Home::new();
-    let store = home.store();
+    let mut store = home.store();
     let live = home.path.join("ar-cdx-v4-live.sock");
     let stale = home.path.join("ar-cdx-v4-stale.sock");
     let listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
     drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
     for _ in 0..3 {
-        sweep(&home.path, NOW, &store).unwrap();
+        sweep(&home.path, NOW, &mut store).unwrap();
     }
     assert!(live.exists());
     assert!(!stale.exists());
@@ -309,7 +309,7 @@ fn live_and_stale_relay_sockets_are_distinguished() {
 #[test]
 fn retained_namespaces_finish_one_scan_round_promptly() {
     let home = common::Home::new();
-    let store = home.store();
+    let mut store = home.store();
     for index in 0..31 {
         run_tree(&home, &format!("ag-20350101-000000-{index:010x}"));
     }
@@ -324,7 +324,7 @@ fn retained_namespaces_finish_one_scan_round_promptly() {
     let mut calls = 0;
     loop {
         calls += 1;
-        let progress = sweep(&home.path, NOW, &store).unwrap();
+        let progress = sweep(&home.path, NOW, &mut store).unwrap();
         if progress == 0 {
             break;
         }
@@ -344,7 +344,7 @@ fn retained_namespaces_finish_one_scan_round_promptly() {
 #[test]
 fn nested_runtime_scan_reaches_late_orphan() {
     let home = common::Home::new();
-    let store = home.store();
+    let mut store = home.store();
     fs::private_dir(&home.path.join("agents")).unwrap();
     let mut late_runs = None;
     for runtime in 0..17 {
@@ -364,7 +364,7 @@ fn nested_runtime_scan_reaches_late_orphan() {
     let mut finished = false;
     let mut observed = Vec::new();
     for _ in 0..6 {
-        let progress = sweep(&home.path, NOW, &store).unwrap();
+        let progress = sweep(&home.path, NOW, &mut store).unwrap();
         observed.push((progress, orphan.exists()));
         if !orphan.exists() && progress == 0 {
             finished = true;

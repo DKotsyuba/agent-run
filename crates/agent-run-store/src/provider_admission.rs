@@ -86,6 +86,34 @@ impl Store {
         Ok((attempt, account.parse()?))
     }
 
+    /// Returns the account the agent's most recent attempt was admitted with.
+    ///
+    /// The recorded selection is authoritative for offline work on a sealed
+    /// home: it never consults the current configuration or a provider
+    /// default. An agent with no recorded account selection — a legacy or
+    /// never-admitted row — is a validation error, not a guess.
+    pub fn recorded_account(&self, id: &AgentId) -> Result<AccountId> {
+        let account: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT selected_account_id FROM attempts WHERE agent_id=? \
+                 ORDER BY number DESC, rowid DESC LIMIT 1",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        account
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                invalid(format!(
+                    "agent {} has no recorded account selection",
+                    id.as_str()
+                ))
+            })?
+            .parse()
+    }
+
     /// Claims the owned prepared attempt for spawning before any child is
     /// created. Returns `false`, changing nothing, when a cancel is pending or
     /// claimed: the claim and the cancel check are one statement, so an
@@ -344,6 +372,21 @@ impl Store {
                         "continuation_unavailable: agent {} has an attempt without cleanup proof",
                         resume.parent
                     )));
+                }
+                // Same rule as the legacy path: a home whose storage layout is
+                // still prepared cannot gain a child, decided inside this
+                // transaction from the parent's frozen identity.
+                let parent_identity: Option<String> = tx
+                    .query_row(
+                        "SELECT identity_json FROM agents WHERE id=?1",
+                        [resume.parent.as_str()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(raw) = parent_identity {
+                    let identity: Value = serde_json::from_str(&raw)
+                        .map_err(|_| invalid("resume parent identity is malformed"))?;
+                    crate::runtime_storage::refuse_prepared_resume_home(&tx, &identity)?;
                 }
                 Some(lineage)
             }

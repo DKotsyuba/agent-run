@@ -157,9 +157,26 @@ impl Publisher {
     }
 }
 pub fn verify(root: &Path, expected: &str) -> Result<Snapshot> {
+    let revision = index_revision(root)?;
+    let inspection = snapshot_tree::inspect_runtime_snapshots(root, &revision, expected)
+        .map_err(|_| Error::Integrity("runtime snapshot index was modified".into()))?;
+    if !inspection.verified {
+        return Err(Error::Integrity(
+            "generated runtime snapshot was modified".into(),
+        ));
+    }
+    Ok(Snapshot::default())
+}
+
+/// Reads and returns one sealed home's runtime-index `materialize_revision`.
+///
+/// The revision is parsed no-follow from the exact index bytes; a missing,
+/// unreadable, or malformed index fails with an integrity error before any
+/// verification starts.
+fn index_revision(root: &Path) -> Result<String> {
     let dir = Dir::open(root)?;
     let raw = dir.read(Path::new(snapshot_tree::RUNTIME_SNAPSHOT_INDEX), 64 * 1024)?;
-    let revision = serde_json::from_slice::<Value>(&raw)
+    serde_json::from_slice::<Value>(&raw)
         .ok()
         .and_then(|document| {
             document
@@ -167,9 +184,37 @@ pub fn verify(root: &Path, expected: &str) -> Result<Snapshot> {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         })
-        .ok_or_else(|| Error::Integrity("runtime snapshot index is malformed".into()))?;
-    let inspection = snapshot_tree::inspect_runtime_snapshots(root, &revision, expected)
-        .map_err(|_| Error::Integrity("runtime snapshot index was modified".into()))?;
+        .ok_or_else(|| Error::Integrity("runtime snapshot index is malformed".into()))
+}
+
+/// Verifies one sealed home whose indexed managed trees may live in a shared
+/// store, returning the same launch-path snapshot shape as [`verify`].
+///
+/// Behavior is identical to [`verify`] — the exact original index bytes,
+/// revision, flat files, and credential links keep their original checks —
+/// except that each root present in `shared_roots` is accepted as one exact
+/// whole-tree symlink into `shared_store_root` and verified through the
+/// shared store's bounded physical verifier instead of a private directory
+/// copy. The caller remains the trusted registry authority: it supplies the
+/// canonical store root and the root-to-`SharedTreeRef` mapping bound when
+/// the tree was imported, and it remains responsible for the home, index,
+/// and registry binding. Roots absent from the mapping still require their
+/// original private directories.
+pub fn verify_with_shared(
+    root: &Path,
+    expected: &str,
+    shared_store_root: &Path,
+    shared_roots: &BTreeMap<String, agent_run_platform::shared_assets::SharedTreeRef>,
+) -> Result<Snapshot> {
+    let revision = index_revision(root)?;
+    let inspection = snapshot_tree::inspect_runtime_snapshots_with_shared(
+        root,
+        &revision,
+        expected,
+        shared_store_root,
+        shared_roots,
+    )
+    .map_err(|_| Error::Integrity("runtime snapshot index was modified".into()))?;
     if !inspection.verified {
         return Err(Error::Integrity(
             "generated runtime snapshot was modified".into(),

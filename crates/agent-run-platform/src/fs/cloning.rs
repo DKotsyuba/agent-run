@@ -66,13 +66,91 @@ impl Dir {
         mode: u32,
     ) -> Result<bool> {
         #[cfg(target_os = "macos")]
-        if self.try_clone_snapshot(path, source, source_path, data, mode, None)? {
+        if self.try_clone_snapshot(path, source, source_path, data, mode, None, true)? {
             return Ok(true);
         }
         #[cfg(not(target_os = "macos"))]
         let _ = (source, source_path);
         self.write(path, data, mode)?;
         Ok(false)
+    }
+
+    /// [`Dir::write_snapshot_file`] for a disposable staging tree: the same
+    /// verified exact-byte clone and private mode, without the per-file and
+    /// parent-directory durability flushes.
+    ///
+    /// Nothing is flushed: before the staged tree becomes live the caller
+    /// must push every staged object ([`Dir::push_tree`]) and then issue one
+    /// [`Dir::sync`] barrier, and its recovery must prove or discard a staged
+    /// tree a crash interrupted. Unsupported volumes fall back to the synced
+    /// byte writer. Returns whether a clone was published.
+    pub fn stage_snapshot_file(
+        &self,
+        path: &Path,
+        source: &Dir,
+        source_path: &Path,
+        data: &[u8],
+        mode: u32,
+    ) -> Result<bool> {
+        #[cfg(target_os = "macos")]
+        if self.try_clone_snapshot(path, source, source_path, data, mode, None, false)? {
+            return Ok(true);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (source, source_path);
+        self.write(path, data, mode)?;
+        Ok(false)
+    }
+
+    /// Clones one whole directory hierarchy into a new, unsynced name.
+    ///
+    /// `source_path` names a real directory below `source` and `path` a new
+    /// name below this directory; both are resolved through no-follow parent
+    /// descriptors, and the kernel clone itself follows no link anywhere in
+    /// the hierarchy. On APFS one `clonefileat` gives every entry an
+    /// independent inode sharing the source's data blocks, with the source's
+    /// modes and extended attributes — callers normalize modes afterwards,
+    /// then push every cloned object ([`Dir::push_tree`]) and issue one
+    /// [`Dir::sync`] barrier before the tree becomes live.
+    /// Returns `false` without creating anything when the volume or host
+    /// cannot clone directories (non-macOS, non-APFS, cross-device), so the
+    /// caller falls back to per-entry staging; other failures propagate and
+    /// leave at most a partial clone at `path` for the caller's recovery.
+    pub fn clone_directory(&self, path: &Path, source: &Dir, source_path: &Path) -> Result<bool> {
+        #[cfg(target_os = "macos")]
+        {
+            let (source_parent, source_name) = source.parent(source_path, false)?;
+            let (parent, name) = self.parent(path, true)?;
+            // SAFETY: both parents are live directory descriptors and both
+            // names NUL-terminated; the flags refuse every symlink and never
+            // copy foreign ownership.
+            if unsafe {
+                libc::clonefileat(
+                    source_parent.as_raw_fd(),
+                    source_name.as_ptr(),
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    0x0008 | 0x0002,
+                )
+            } < 0
+            {
+                let error = std::io::Error::last_os_error();
+                return if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOTSUP | libc::EXDEV | libc::ENOSYS)
+                ) {
+                    Ok(false)
+                } else {
+                    Err(error.into())
+                };
+            }
+            Ok(true)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (path, source, source_path);
+            Ok(false)
+        }
     }
 
     /// Replaces an idle cache file with an independent clone only when bytes match.
@@ -114,6 +192,7 @@ impl Dir {
                 &data,
                 metadata.permissions().mode() & 0o777,
                 Some(&original),
+                false,
             )?;
             Ok(if cloned { data.len() } else { 0 })
         }
@@ -127,7 +206,8 @@ impl Dir {
     /// Returns true only after an exact-byte clone has been atomically renamed.
     /// Optional `metadata_source` preserves an existing idle cache file's
     /// metadata before publication; snapshots use their requested private mode.
-    /// Snapshots sync file and parent; reconstructible caches omit those flushes.
+    /// `durable` syncs the file and its parent; reconstructible caches and
+    /// disposable staging trees omit those flushes.
     #[cfg(target_os = "macos")]
     #[allow(clippy::too_many_arguments)]
     fn try_clone_snapshot(
@@ -138,6 +218,7 @@ impl Dir {
         data: &[u8],
         mode: u32,
         metadata_source: Option<&File>,
+        durable: bool,
     ) -> Result<bool> {
         let source_file = match source.open_file(source_path) {
             Ok(file) => file,
@@ -218,7 +299,7 @@ impl Dir {
                     return Err(std::io::Error::last_os_error().into());
                 }
             }
-            if metadata_source.is_none() {
+            if durable {
                 file.sync_all()?;
             }
             // SAFETY: both names are relative to the verified directory;
@@ -234,7 +315,7 @@ impl Dir {
             {
                 return Err(std::io::Error::last_os_error().into());
             }
-            if metadata_source.is_none() {
+            if durable {
                 sync_directory(&parent)?;
             }
             Ok(true)

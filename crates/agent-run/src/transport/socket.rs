@@ -681,7 +681,7 @@ pub async fn serve_at_with_options(
                 // Filesystem retention runs every cycle, even while database
                 // batches still report work, so a large journal backlog can
                 // never starve reclaiming disposable files on disk.
-                let filesystem = agent_run_core::housekeeping::sweep(&home, now, &store);
+                let filesystem = agent_run_core::housekeeping::sweep(&home, now, &mut store);
                 let database_removed = database?;
                 let mut done = database_removed;
                 let filesystem_failed = match filesystem {

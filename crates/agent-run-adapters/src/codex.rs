@@ -5,8 +5,10 @@ pub mod limits;
 pub mod models;
 pub mod session;
 use agent_run_config::config::Runtime;
-use agent_run_domain::{error::invalid, Result};
+use agent_run_domain::{error::invalid, Error, Result};
 use agent_run_platform::fs;
+use agent_run_platform::shared_asset_guard::{SharedAssetGuard, MACOS_SANDBOX_EXEC};
+use agent_run_platform::shared_assets::SharedStoreLock;
 use serde_json::{json, Value};
 use std::{
     collections::BTreeSet,
@@ -341,10 +343,179 @@ fn resolve_command(command: &str, path: &str) -> Option<PathBuf> {
     })
 }
 
+/// One harness-owned stdio MCP server exactly as the sealed native config
+/// carries it: the launch `command` and its argument vector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedMcpServer {
+    /// Program the native harness launches for this server.
+    pub command: String,
+    /// Exact argument vector following `command`.
+    pub args: Vec<String>,
+}
+
+/// Compiles native launch-time `-c` overrides wrapping each harness-owned
+/// stdio MCP server of a shared-layout launch with the shared-asset guard.
+///
+/// `store_root` is the trusted canonical shared-store root the layout was
+/// installed under; `servers` are the frozen `(command, args)` definitions the
+/// sealed native config already carries for this role. The bytes of that
+/// config are never rewritten: for every server the compiler emits
+/// `-c mcp_servers.<name>.command=<sandbox-exec>` and
+/// `-c mcp_servers.<name>.args=[…]`, where the wrapped argv is
+/// [`agent_run_platform::shared_asset_guard::SharedAssetGuard::wrap`] applied
+/// to the original program and arguments — nothing else about the server
+/// (environment, approval mode, enabled tools) changes. The dotted override
+/// form is the native CLI's own verified contract: a probe against Codex
+/// 0.156.1 (`codex mcp get --json` with the same `-c` pairs) reflected the
+/// exact guard argv and preserved every other server property with the source
+/// config bytes unchanged, while a quoted key segment
+/// (`mcp_servers."a.b".command`) silently failed to override. Server names are
+/// therefore restricted to bare native key segments — ASCII letters, digits,
+/// underscore and hyphen — and any other name is an explicit error, never an
+/// invented quoting. Every recorded command is wrapped, including a command
+/// that itself names `sandbox-exec`: its recorded arguments are not proof of a
+/// safe profile. An unavailable guard is an
+/// error, never a silent private fallback: the caller must refuse the shared
+/// launch instead. One store publish/GC lock covers every wrapper scan, so
+/// concurrent imports cannot alter inode counts between checks.
+pub fn shared_guard_mcp_overrides(
+    store_root: &Path,
+    servers: &std::collections::BTreeMap<String, SealedMcpServer>,
+) -> Result<Vec<String>> {
+    let _publish_lock = SharedStoreLock::acquire(store_root)?;
+    let guard =
+        SharedAssetGuard::new(store_root).map_err(|error| Error::Unsupported(error.to_string()))?;
+    let sandbox_exec = MACOS_SANDBOX_EXEC.to_owned();
+    let mut overrides = Vec::new();
+    for (name, server) in servers {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        {
+            return Err(invalid(format!(
+                "MCP server name {name:?} is not a bare native key segment; rename the server \
+                 before enabling a shared layout"
+            )));
+        }
+        let argv = guard
+            .wrap(Path::new(&server.command), &server.args)
+            .map_err(|error| Error::Unsupported(error.to_string()))?;
+        let args = argv[1..]
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        overrides.push("-c".into());
+        overrides.push(format!("mcp_servers.{name}.command={sandbox_exec}"));
+        overrides.push("-c".into());
+        overrides.push(format!(
+            "mcp_servers.{name}.args=[{}]",
+            args.iter()
+                .map(|value| serde_json::to_string(value)
+                    .map_err(|_| invalid("MCP override argument is not encodable")))
+                .collect::<Result<Vec<_>>>()?
+                .join(",")
+        ));
+    }
+    Ok(overrides)
+}
+
 /// Exercises managed Projects policy validation without depending on host policy files.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shared MCP overrides guard the original command and exact arguments
+    /// under bare native keys; ambiguous keys are refused before launch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_mcp_overrides_preserve_server_argv() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let servers = std::collections::BTreeMap::from([(
+            "worker-probe".to_owned(),
+            SealedMcpServer {
+                command: "/bin/echo".into(),
+                args: vec!["a b".into(), "quoted\"value".into()],
+            },
+        )]);
+        let overrides = shared_guard_mcp_overrides(&root, &servers).unwrap();
+        assert_eq!(overrides.len(), 4);
+        assert_eq!(overrides[0], "-c");
+        assert_eq!(
+            overrides[1],
+            "mcp_servers.worker-probe.command=/usr/bin/sandbox-exec"
+        );
+        let args: Vec<String> = serde_json::from_str(
+            overrides[3]
+                .strip_prefix("mcp_servers.worker-probe.args=")
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(args
+            .windows(3)
+            .any(|window| { window == ["/bin/echo", "a b", "quoted\"value"] }));
+        let ambiguous = std::collections::BTreeMap::from([(
+            "worker.probe".to_owned(),
+            servers["worker-probe"].clone(),
+        )]);
+        assert!(shared_guard_mcp_overrides(&root, &ambiguous).is_err());
+        let self_named = std::collections::BTreeMap::from([(
+            "worker".to_owned(),
+            SealedMcpServer {
+                command: MACOS_SANDBOX_EXEC.into(),
+                args: vec!["--version".into()],
+            },
+        )]);
+        let nested = shared_guard_mcp_overrides(&root, &self_named).unwrap();
+        let nested_args: Vec<String> =
+            serde_json::from_str(nested[3].strip_prefix("mcp_servers.worker.args=").unwrap())
+                .unwrap();
+        assert!(nested_args
+            .windows(2)
+            .any(|window| { window == [MACOS_SANDBOX_EXEC, "--version"] }));
+    }
+
+    /// A launch waits for an in-flight publisher to finish creating both
+    /// internal hardlinks before its whole-store alias scan begins.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_mcp_scan_waits_for_store_publisher() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let publisher = SharedStoreLock::acquire(&root).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let other_root = root.clone();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx
+                .send(shared_guard_mcp_overrides(
+                    &other_root,
+                    &std::collections::BTreeMap::from([(
+                        "worker".into(),
+                        SealedMcpServer {
+                            command: "/bin/true".into(),
+                            args: vec![],
+                        },
+                    )]),
+                ))
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        std::fs::write(root.join("first"), b"asset").unwrap();
+        std::fs::hard_link(root.join("first"), root.join("second")).unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(publisher);
+        assert!(done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .is_ok());
+        handle.join().unwrap();
+    }
 
     /// Mirrors `test_codex_adapter.py::test_managed_projects_uses_one_definition_and_verifies_all_write_roots` refusal behavior.
     ///

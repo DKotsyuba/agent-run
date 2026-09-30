@@ -8,6 +8,7 @@
 use crate::{
     fs::{self, Dir, EntryType},
     publish::{self, Entry},
+    shared_assets,
 };
 use agent_run_domain::{canonical, error::invalid, Error, Result};
 use serde_json::{json, Map, Value};
@@ -20,7 +21,7 @@ use std::{
 pub const SNAPSHOT_MANIFEST: &str = ".agent-run-snapshot.json";
 /// Generated-home Python-v1 runtime index filename.
 pub const RUNTIME_SNAPSHOT_INDEX: &str = ".agent-run-snapshots.json";
-const MAX_METADATA: usize = 64 * 1024;
+pub(crate) const MAX_METADATA: usize = 64 * 1024;
 const TEMP_PREFIX: &str = ".agent-run-";
 /// Canonically sorted entries and their exact regular-file bytes.
 type TreeRead = (Vec<Value>, BTreeMap<String, Vec<u8>>);
@@ -100,7 +101,7 @@ fn entry(path: String, kind: EntryType, bytes: Option<Vec<u8>>) -> Result<Value>
             json!({"path": path, "type": "file", "mode": 0o600, "bytes": bytes.len(), "sha256": fs::sha256(&bytes)})
         }
         EntryType::Symlink | EntryType::Special => {
-            return Err(invalid(format!("snapshot entry must be regular: {path}")))
+            return Err(invalid(format!("snapshot entry must be regular: {path}")));
         }
     })
 }
@@ -180,7 +181,7 @@ fn read_tree(source: &Path, selected: Option<&[String]>, allow_special: bool) ->
                     entries.push(json!({"path": path, "type": if directory.entry_type(&relative_path)? == EntryType::Symlink { "symlink" } else { "special" }}));
                 }
                 EntryType::Symlink | EntryType::Special => {
-                    return Err(invalid(format!("snapshot entry must be regular: {path}")))
+                    return Err(invalid(format!("snapshot entry must be regular: {path}")));
                 }
             }
         }
@@ -220,8 +221,23 @@ fn manifest(entries: &[Value]) -> Vec<u8> {
     canonical(&json!({"snapshot_version": 1, "entries": entries}))
 }
 
-fn load_manifest(dir: &Dir) -> Result<Option<Vec<Value>>> {
-    let Some(raw) = dir.optional(Path::new(SNAPSHOT_MANIFEST), MAX_METADATA)? else {
+/// Loads one managed snapshot manifest under the historical 64 KiB bound.
+///
+/// Managed snapshots, plugin views and runtime-index checks keep this bound
+/// unchanged; `None` means the directory holds no manifest.
+pub(crate) fn load_manifest(dir: &Dir) -> Result<Option<Vec<Value>>> {
+    load_manifest_bounded(dir, MAX_METADATA)
+}
+
+/// Loads and version-checks one snapshot manifest read under `limit` bytes.
+///
+/// Returns the manifest's entry objects, `None` when no manifest exists, and
+/// an error for a manifest over `limit`, malformed JSON, a non-object entry
+/// or any `snapshot_version` other than 1. Only the read bound differs from
+/// [`load_manifest`]; the parsed shape and its validation are identical, so
+/// manifest bytes and their digests never change with the bound.
+pub(crate) fn load_manifest_bounded(dir: &Dir, limit: usize) -> Result<Option<Vec<Value>>> {
+    let Some(raw) = dir.optional(Path::new(SNAPSHOT_MANIFEST), limit)? else {
         return Ok(None);
     };
     let document: Value =
@@ -239,7 +255,10 @@ fn load_manifest(dir: &Dir) -> Result<Option<Vec<Value>>> {
     Ok(Some(entries))
 }
 
-fn entry_map(entries: &[Value]) -> Result<BTreeMap<String, Value>> {
+/// Parses and validates manifest entries for shared-store reuse; the checks
+/// are the same ones [`inspect_managed_snapshot`] applies and never weaken
+/// old snapshot verification.
+pub(crate) fn entry_map(entries: &[Value]) -> Result<BTreeMap<String, Value>> {
     let mut mapped = BTreeMap::new();
     for entry in entries {
         let path = entry
@@ -395,7 +414,7 @@ pub fn inspect_managed_snapshot(home: &Path, relative_root: &Path) -> Result<Sna
             return Ok(SnapshotInspection {
                 referenced_missing: vec![SNAPSHOT_MANIFEST.into()],
                 ..Default::default()
-            })
+            });
         }
         Ok(EntryType::Directory) => {}
         Ok(_) => return Err(invalid("snapshot destination must be a real directory")),
@@ -551,10 +570,88 @@ pub fn finalize_runtime_snapshots(
 }
 
 /// Verify a v1 index against its recorded revision and digest without repair.
+///
+/// This is the original strict verifier: every indexed managed root must
+/// still be a real directory below `home`, so a tree root replaced by any
+/// symlink is rejected. Homes whose trees were moved into a shared store
+/// must use [`inspect_runtime_snapshots_with_shared`].
 pub fn inspect_runtime_snapshots(
     home: &Path,
     expected_revision: &str,
     expected_sha256: &str,
+) -> Result<RuntimeSnapshotInspection> {
+    inspect_runtime_index(home, expected_revision, expected_sha256, None)
+}
+
+/// Verifies the same byte-exact original index as
+/// [`inspect_runtime_snapshots`] while explicitly accepting shared trees.
+///
+/// `shared_store_root` is the trusted canonical shared-store root and
+/// `shared_roots` maps indexed managed-root paths to the
+/// [`crate::shared_assets::SharedTreeRef`] the caller's registry bound when
+/// the tree was imported. The original index bytes, hash, revision, key
+/// shape, flat-file entries, and credential links keep their exact original
+/// checks; no home-local sidecar is trusted. For each mapped root the
+/// verifier additionally proves, failing closed on any mismatch:
+///
+/// - the mapping key is an exact member of the original indexed roots;
+/// - the reference's manifest digest equals the original index's
+///   `manifests[root]`;
+/// - the current home entry is exactly one whole-tree symlink whose target
+///   text equals the path derived from the trusted canonical store root plus
+///   the validated reference — a private directory copy, a missing link, a
+///   foreign or dangling target, or a wrong digest is never silently
+///   accepted;
+/// - [`crate::shared_assets::verify_shared_tree`] proves the unchanged
+///   logical paths, types, modes, and content through the physical shared
+///   tree with bounded streaming reads.
+///
+/// One geometry carries an explicit exception: a managed Codex plugin
+/// version root (see [`crate::plugin_views::plugin_mount`]) is verified
+/// through its **parent**. The plugin parent entry in the home must be
+/// exactly one symlink whose target text equals the readonly view container
+/// derived from the same trusted store root, validated reference, and safe
+/// version name, and [`crate::plugin_views::verify_view`] must prove that
+/// container holds the named real version subtree hardlinked from the same
+/// shared tree. The version root entry itself no longer exists in the home —
+/// it lives beneath the linked container — so the plain whole-tree check
+/// would wrongly reject it; every other guarantee, including the physical
+/// tree verification below, is unchanged. A parent link is never accepted by
+/// resolving or canonicalizing it: only its exact target text and the store
+/// object behind that derived path are trusted.
+///
+/// Unmapped indexed roots keep the original strict directory verification
+/// unchanged, so mixed original and shared homes verify. Structural trust
+/// failures on the shared branch return errors rather than a classified
+/// inspection; drift found by the original branch is reported through the
+/// returned inspection exactly as before.
+pub fn inspect_runtime_snapshots_with_shared(
+    home: &Path,
+    expected_revision: &str,
+    expected_sha256: &str,
+    shared_store_root: &Path,
+    shared_roots: &BTreeMap<String, crate::shared_assets::SharedTreeRef>,
+) -> Result<RuntimeSnapshotInspection> {
+    inspect_runtime_index(
+        home,
+        expected_revision,
+        expected_sha256,
+        Some((shared_store_root, shared_roots)),
+    )
+}
+
+/// One implementation behind the public strict and shared-bridge verifiers;
+/// `shared` is `None` for the original behavior and otherwise carries the
+/// trusted store root plus the exact root-to-reference mapping validated
+/// against the parsed index before any per-root work.
+fn inspect_runtime_index(
+    home: &Path,
+    expected_revision: &str,
+    expected_sha256: &str,
+    shared: Option<(
+        &Path,
+        &BTreeMap<String, crate::shared_assets::SharedTreeRef>,
+    )>,
 ) -> Result<RuntimeSnapshotInspection> {
     if expected_revision.trim().is_empty() || !is_sha256(expected_sha256) {
         return Err(invalid("runtime snapshot index expectation is invalid"));
@@ -622,7 +719,71 @@ pub fn inspect_runtime_snapshots(
         return Err(invalid("runtime snapshot index manifests are malformed"));
     }
     let mut result = RuntimeSnapshotInspection::default();
+    let shared_index = match shared {
+        Some((store_root, map)) => {
+            let canonical = shared_assets::validated_root(store_root)?;
+            for (key, reference) in map {
+                if !roots.iter().any(|root| root == key) {
+                    return Err(invalid(
+                        "shared mapping names a root the original index does not describe",
+                    ));
+                }
+                let recorded = manifests.get(key).and_then(Value::as_str).unwrap_or("");
+                if recorded != reference.manifest_sha256 {
+                    return Err(invalid(
+                        "shared mapping digest does not match the original index manifest",
+                    ));
+                }
+                match crate::plugin_views::plugin_mount(key) {
+                    Some((parent, version)) => {
+                        let target =
+                            crate::plugin_views::view_root(store_root, reference, &version)?;
+                        match directory.entry_type(Path::new(&parent)) {
+                            Ok(EntryType::Symlink) => {}
+                            _ => {
+                                return Err(invalid(
+                                    "mapped shared plugin root must be an exact parent symlink",
+                                ));
+                            }
+                        }
+                        if directory.read_link(Path::new(&parent))? != Some(target) {
+                            return Err(invalid(
+                                "shared plugin parent link target does not match its trusted \
+                                 reference",
+                            ));
+                        }
+                        crate::plugin_views::verify_view(store_root, reference, &version)?;
+                    }
+                    None => {
+                        let target = shared_assets::shared_tree_root(&canonical, reference)?;
+                        match directory.entry_type(Path::new(key)) {
+                            Ok(EntryType::Symlink) => {}
+                            _ => {
+                                return Err(invalid(
+                                    "mapped shared managed root must be an exact whole-tree symlink",
+                                ));
+                            }
+                        }
+                        if directory.read_link(Path::new(key))? != Some(target) {
+                            return Err(invalid(
+                                "shared managed root link target does not match its trusted \
+                                 reference",
+                            ));
+                        }
+                    }
+                }
+            }
+            Some((store_root, map))
+        }
+        None => None,
+    };
     for root in roots {
+        if let Some((store_root, map)) = shared_index {
+            if let Some(reference) = map.get(&root) {
+                shared_assets::verify_shared_tree(store_root, reference)?;
+                continue;
+            }
+        }
         let manifest_path = format!("{root}/{SNAPSHOT_MANIFEST}");
         match Dir::open(&home.join(&root))
             .and_then(|dir| dir.read(Path::new(SNAPSHOT_MANIFEST), MAX_METADATA))

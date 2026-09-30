@@ -472,6 +472,62 @@ impl Grant {
         }
         Ok(())
     }
+
+    /// Proves one canonical shared-asset store root stays outside everything
+    /// this grant can write.
+    ///
+    /// The Codex app-server runs its own nested executor sandbox and cannot be
+    /// wrapped whole, so a shared layout relies on the native read rules of the
+    /// unchanged managed profile. That is safe only while no writable root —
+    /// nor `/tmp`, `/private/tmp` or the process temporary directory, which
+    /// native temporary-path grants make effectively writable — covers the
+    /// store root or lies inside it. The root must resolve to a real readable
+    /// directory, and every writable root must resolve: an unresolved,
+    /// unreadable or overlapping root is a refusal, never a guess. Read-only
+    /// roots and the profile itself are untouched, so no permission is widened
+    /// by this check.
+    pub fn admits_shared_root(&self, root: &Path) -> Result<()> {
+        let refused = |why: &str| {
+            invalid(format!(
+                "shared asset store is not launchable under the admitted Codex grant: {why}"
+            ))
+        };
+        let canonical = root
+            .canonicalize()
+            .map_err(|_| refused("store root does not resolve to a real directory"))?;
+        if !canonical.is_dir() || std::fs::read_dir(&canonical).is_err() {
+            return Err(refused("store root is not a readable directory"));
+        }
+        let mut temporary = vec![PathBuf::from("/tmp"), PathBuf::from("/private/tmp")];
+        if let Ok(tempdir) = std::env::temp_dir().canonicalize() {
+            temporary.push(tempdir);
+        }
+        let overlaps = |candidate: &Path| -> Result<bool> {
+            let resolved = candidate.canonicalize().map_err(|_| {
+                refused(&format!(
+                    "writable root {} does not resolve",
+                    candidate.display()
+                ))
+            })?;
+            Ok(resolved == canonical
+                || resolved.starts_with(&canonical)
+                || canonical.starts_with(&resolved))
+        };
+        for writable in self
+            .writable_roots
+            .iter()
+            .map(Path::new)
+            .chain(temporary.iter().map(Path::new))
+        {
+            if overlaps(writable)? {
+                return Err(refused(&format!(
+                    "store root overlaps writable root {}",
+                    writable.display()
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 /// Renders the Codex permissions document for the configured workspace roots.
 ///

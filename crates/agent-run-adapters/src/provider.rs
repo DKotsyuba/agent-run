@@ -22,9 +22,10 @@ use agent_run_domain::{
     },
     domain::{Constraint, StartRequest},
     error::invalid,
-    CredentialRef, Result, Sha256Digest,
+    CredentialRef, Error, Result, Sha256Digest,
 };
 use agent_run_platform::fs;
+use agent_run_platform::{shared_asset_guard::SharedAssetGuard, shared_assets::SharedStoreLock};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -279,8 +280,27 @@ pub fn materialize_selected(
 
 /// Loads one sealed provider record after runtime-index verification and
 /// rejects drift from the durable launch authority before credentials bind.
-fn sealed(home: &Path, authority: &ResolvedLaunchAuthority) -> Result<SealedProvider> {
-    materialize::verify(home, authority.assets_sha256.as_str())?;
+///
+/// With `shared` the same original index proof runs through
+/// [`materialize::verify_with_shared`], which additionally proves each mapped
+/// root is exactly one whole-tree symlink to the object the registry bound
+/// and that the shared tree's own content is unchanged; a private copy, a
+/// dangling link or a foreign target is never accepted. Without it the home
+/// verifies strictly as a private tree, exactly as before.
+fn sealed(
+    home: &Path,
+    authority: &ResolvedLaunchAuthority,
+    shared: Option<&SharedLaunchAssets>,
+) -> Result<SealedProvider> {
+    match shared {
+        Some(assets) => materialize::verify_with_shared(
+            home,
+            authority.assets_sha256.as_str(),
+            &assets.store_root,
+            &assets.roots,
+        )?,
+        None => materialize::verify(home, authority.assets_sha256.as_str())?,
+    };
     let raw = fs::Dir::open(home)?.read(Path::new("provider-launch.json"), 64 * 1024)?;
     let sealed: SealedProvider = serde_json::from_slice(&raw)
         .map_err(|_| invalid("sealed provider launch metadata is invalid"))?;
@@ -326,6 +346,24 @@ fn bind_native_codex(
     materialize::Publisher::new(home)?.link("auth.json", &source)
 }
 
+/// Verified shared-store placement backing one sealed home's managed trees.
+///
+/// `store_root` is the trusted canonical shared-store root and `roots` maps
+/// each indexed managed-root path to the shared tree the durable registry
+/// bound when it was imported. The pair may only be built from a `committed`
+/// registry row whose layout already proved through the registry's own
+/// verifier: a missing, still-pending or corrupt row yields `None` and the
+/// strict private-home verifier stays in force. Passing it never widens what
+/// is accepted — the same original index bytes and hashes are checked, plus
+/// the shared targets' physical integrity.
+#[derive(Debug, Clone)]
+pub struct SharedLaunchAssets {
+    /// Canonical caller-owned shared store root.
+    pub store_root: PathBuf,
+    /// Indexed managed-root path to its bound shared tree reference.
+    pub roots: BTreeMap<String, agent_run_platform::shared_assets::SharedTreeRef>,
+}
+
 /// Per-request harness options frozen with the admitted request.
 ///
 /// `fast` asks the codex harness for its fast service tier; `output_schema`
@@ -339,7 +377,8 @@ pub struct LaunchOptions<'a> {
     pub output_schema: Option<&'a serde_json::Map<String, serde_json::Value>>,
 }
 
-/// [`plan_selected_with`] with no per-request harness options.
+/// [`plan_selected_with`] with no per-request harness options and a strictly
+/// private sealed home.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_selected(
     config: &ProviderConfig,
@@ -365,6 +404,7 @@ pub fn plan_selected(
         task,
         resume_session,
         LaunchOptions::default(),
+        None,
     )
 }
 
@@ -373,7 +413,10 @@ pub fn plan_selected(
 /// The caller supplies fresh task text, an optional exact native session id
 /// and the admitted request's [`LaunchOptions`]; none can alter frozen
 /// model, grants, connection, binary, or assets. `reader` resolves custom
-/// credentials only into the child environment.
+/// credentials only into the child environment. `shared` names the
+/// committed shared-store placement of the home's managed trees, when the
+/// registry recorded one; without it the sealed home verifies strictly as a
+/// private tree.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_selected_with(
     config: &ProviderConfig,
@@ -387,9 +430,10 @@ pub fn plan_selected_with(
     task: &str,
     resume_session: Option<&str>,
     options: LaunchOptions<'_>,
+    shared_assets: Option<&SharedLaunchAssets>,
 ) -> Result<ProviderLaunchPlan> {
     let role = role_from_authority(authority, &authority.assets_sha256)?;
-    let sealed = sealed(home, authority)?;
+    let sealed = sealed(home, authority, shared_assets)?;
     if config.snapshot()?["sha256"] != sealed.config_sha256 {
         return Err(invalid("provider configuration changed since admission"));
     }
@@ -430,8 +474,9 @@ pub fn plan_selected_with(
             .mcp
             .retain(|name| name != agent_run_domain::worker::SERVER_NAME);
     }
+    let shared_config = shared(config, false)?;
     let mut environment = materialize::environment_with_host(
-        &shared(config, false)?,
+        &shared_config,
         &runtime,
         &environment_profile,
         home,
@@ -522,7 +567,7 @@ pub fn plan_selected_with(
                 .into_owned(),
         );
     }
-    let args = if sealed.harness == HarnessId::Codex {
+    let mut args = if sealed.harness == HarnessId::Codex {
         // The same fast-tier overrides the historical codex launch uses.
         let mut args: Vec<String> = Vec::new();
         if options.fast {
@@ -545,9 +590,66 @@ pub fn plan_selected_with(
             options.output_schema,
         )?
     };
+    // A shared layout launches only behind a proven guard, and the guard is
+    // proven here, before any child exists. The whole Codex app-server cannot
+    // be wrapped (its nested executor sandbox would fail), so Codex keeps its
+    // original managed profile and instead guards every harness-owned stdio
+    // MCP server through launch-time overrides compiled from the same frozen
+    // definitions the sealed native config carries. Claude and GLM children
+    // are wrapped whole, which constrains their descendants too.
+    let binary = match shared_assets {
+        Some(assets) => {
+            let guard = SharedAssetGuard::new(&assets.store_root)
+                .map_err(|error| Error::Unsupported(error.to_string()))?;
+            if sealed.harness == HarnessId::Codex {
+                let mut servers = BTreeMap::new();
+                let server_config = shared(config, role.worker_mcp)?;
+                let declared = role.mcp.iter().map(|server| server.id.clone()).chain(
+                    role.worker_mcp
+                        .then(|| agent_run_domain::worker::SERVER_NAME.to_owned()),
+                );
+                for name in declared {
+                    let server = server_config.mcp.get(&name).ok_or_else(|| {
+                        invalid(format!("frozen MCP server {name:?} is unavailable"))
+                    })?;
+                    servers.insert(
+                        name,
+                        crate::codex::SealedMcpServer {
+                            command: server.command.to_string_lossy().into_owned(),
+                            args: server.args.iter().map(|arg| arg.to_string()).collect(),
+                        },
+                    );
+                }
+                args.extend(crate::codex::shared_guard_mcp_overrides(
+                    &assets.store_root,
+                    &servers,
+                )?);
+                sealed.binary.clone()
+            } else {
+                // The wrapper itself always spawns, so an absent harness is
+                // refused here, before any child exists, exactly as the
+                // unwrapped spawn would refuse it.
+                if !std::fs::metadata(&sealed.binary)?.is_file() {
+                    return Err(invalid("sealed harness binary is not a file"));
+                }
+                // Import and GC use the same lock; the whole-child wrapper
+                // scans one stable store state.
+                let _publish_lock = SharedStoreLock::acquire(&assets.store_root)?;
+                let argv = guard
+                    .wrap(&sealed.binary, &args)
+                    .map_err(|error| Error::Unsupported(error.to_string()))?;
+                args = argv[1..]
+                    .iter()
+                    .map(|value| value.to_string_lossy().into_owned())
+                    .collect();
+                PathBuf::from(&argv[0])
+            }
+        }
+        None => sealed.binary.clone(),
+    };
     Ok(ProviderLaunchPlan {
         launch: LaunchPlan {
-            binary: sealed.binary,
+            binary,
             args,
             cwd: authority.workdir.clone(),
             environment,

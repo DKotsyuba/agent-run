@@ -436,8 +436,23 @@ CREATE TABLE process_members (
 );
 CREATE INDEX idx_process_members_owner ON process_members(owner_kind, owner_id);
 
+CREATE TABLE runtime_storage_layouts (
+    runtime_home TEXT PRIMARY KEY
+        CHECK (length(runtime_home) > 1 AND runtime_home LIKE '/%'),
+    index_sha256 TEXT NOT NULL CHECK (length(index_sha256) = 64),
+    layout_json TEXT NOT NULL
+        CHECK (json_valid(layout_json) AND length(CAST(layout_json AS BLOB)) <= 65536),
+    layout_sha256 TEXT NOT NULL CHECK (length(layout_sha256) = 64),
+    state TEXT NOT NULL CHECK (state IN ('prepared','committed')),
+    operation_token TEXT NOT NULL CHECK (length(operation_token) BETWEEN 16 AND 64),
+    owner_agent_id TEXT,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX idx_runtime_storage_layouts_pending
+    ON runtime_storage_layouts(updated_at) WHERE state='prepared';
+
 CREATE INDEX idx_events_attempt ON events(attempt_id) WHERE attempt_id IS NOT NULL;
 CREATE INDEX idx_messages_attempt ON messages(attempt_id) WHERE attempt_id IS NOT NULL;
 CREATE INDEX idx_deliveries_terminal_event ON deliveries(terminal_event_seq) WHERE terminal_event_seq IS NOT NULL;
 
-PRAGMA user_version = 21;
+PRAGMA user_version = 22;

@@ -6,6 +6,7 @@ use agent_run_domain::domain::AgentId;
 use agent_run_store::{retention::HISTORY_SECONDS, Store};
 use rusqlite::params;
 use serde_json::json;
+use std::path::Path;
 
 /// Fixed Unix time keeps strict fourteen-day boundaries deterministic.
 const NOW: f64 = 1_800_000_000.0;
@@ -539,5 +540,56 @@ fn storage_protection_bounds_account_rows_and_clears_sql_handler() {
         [], |row| row.get(0),
     ).unwrap();
     assert_eq!(total, 50_005_000);
+    integrity(&store);
+}
+
+/// A still-prepared storage-layout row pins its runtime home's agents and the
+/// home path itself; committing the layout releases both.
+#[test]
+fn retention_pins_pending_layout_homes_only() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let runtime_home = home.path.join("runtime").to_string_lossy().to_string();
+    let pinned = agent(
+        &home,
+        &mut store,
+        "failed",
+        Some(NOW - HISTORY_SECONDS - 1.0),
+    );
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET identity_json=? WHERE id=?",
+            params![
+                json!({"runtime_home": runtime_home}).to_string(),
+                pinned.as_str()
+            ],
+        )
+        .unwrap();
+    let layout = serde_json::to_string(&json!({
+        "version": 1,
+        "runtime_home": runtime_home,
+        "index_sha256": "1".repeat(64),
+        "roots": {"assets": {"scope": "2".repeat(64), "manifest_sha256": "3".repeat(64)}},
+    }))
+    .unwrap();
+    let prepared = store.prepare_runtime_storage_layout(&layout, None).unwrap();
+    assert_eq!(store.prune_history(NOW).unwrap(), 0);
+    assert_eq!(count(&store, "agents"), 1);
+    let proof = store.storage_protection_snapshot().unwrap();
+    assert!(proof.retains(pinned.as_str(), Path::new(&runtime_home)));
+    // Committing turns the row into a plain mapping: the expired agent and its
+    // home age out again, and no committed home path is protected.
+    store
+        .commit_runtime_storage_layout(
+            &runtime_home,
+            &prepared.operation_token,
+            &prepared.layout_sha256,
+        )
+        .unwrap();
+    assert!(store.prune_history(NOW).unwrap() > 0);
+    assert_eq!(count(&store, "agents"), 0);
+    let proof = store.storage_protection_snapshot().unwrap();
+    assert!(!proof.retains("anyone", Path::new(&runtime_home)));
     integrity(&store);
 }

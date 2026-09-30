@@ -4,6 +4,22 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-09-30
+
+- perf(storage): share immutable runtime assets and compatible native Codex
+  caches across independent starts while keeping history, databases,
+  credentials, generated configuration and worker capabilities private
+- feat(storage): add offline `storage status`, `storage compact` and
+  `storage recover` commands for retained homes; preserve their original
+  snapshot digests and resume history, with schema 22 guarding the new layout
+- fix(storage): retain shared data while a home or recovery operation still
+  references it, and qualify native launches before publishing shared assets;
+  the shared-store launch protection is currently qualified on macOS only
+
+Upgrade: use the new binary's `config migrate` procedure before installing
+against an existing schema-21 home (`agent-run doc migrations`). Installation
+does not silently migrate the database; compaction is a separate offline step.
+
 ## [0.19.0] - 2026-09-28
 
 - feat(tui): ship `agent-run-tui` as a separate read-only terminal observer

@@ -22,9 +22,10 @@ pub fn topic_text(topic: &str) -> Result<&'static str> {
         "models" => Ok(include_str!("../../../assets/operator_guide/models.md")),
         "releases" => Ok(include_str!("../../../assets/operator_guide/releases.md")),
         "migrations" => Ok(include_str!("../../../assets/operator_guide/migrations.md")),
+        "storage" => Ok(include_str!("../../../assets/operator_guide/storage.md")),
         "troubleshoot" => Ok(include_str!("../../../assets/operator_guide/troubleshoot.md")),
         _ => Err(invalid(format!(
-            "unknown operator guide topic: {topic:?}; valid topics: completion, config, skills, mcp-servers, plugins, models, releases, migrations, troubleshoot"
+            "unknown operator guide topic: {topic:?}; valid topics: completion, config, skills, mcp-servers, plugins, models, releases, migrations, storage, troubleshoot"
         ))),
     }
 }

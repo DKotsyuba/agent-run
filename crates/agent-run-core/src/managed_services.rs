@@ -130,6 +130,15 @@ pub struct Manager {
     _lock: File,
 }
 
+impl Drop for Manager {
+    /// Releases the writer lease even if a concurrent fork still holds a duplicate
+    /// descriptor before exec. Closing our descriptor alone cannot release that
+    /// shared lock. Service processes remain alive for the replacement broker.
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self._lock);
+    }
+}
+
 impl Manager {
     /// Acquires the home-wide manager lock without starting any configured service.
     pub fn new(home: &Path, executable: PathBuf) -> Result<Self> {
@@ -880,6 +889,22 @@ pub async fn wait_for_gate(home: &Path, id: &AgentId) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A duplicate descriptor may outlive the manager during a concurrent fork before exec.
+    #[test]
+    fn dropping_manager_releases_lock_with_a_live_duplicate_descriptor() {
+        let home = tempfile::tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let manager = Manager::new(home.path(), executable.clone()).unwrap();
+        let inherited = manager._lock.try_clone().unwrap();
+        assert!(Manager::new(home.path(), executable.clone()).is_err());
+        drop(manager);
+        let replacement = Manager::new(home.path(), executable.clone())
+            .expect("dropping the manager must release its writer lease");
+        drop(inherited);
+        assert!(Manager::new(home.path(), executable).is_err());
+        drop(replacement);
+    }
 
     /// An old logical finish cannot consume the idle grace while process ownership remains unresolved.
     #[test]

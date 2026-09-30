@@ -118,6 +118,14 @@ pub fn require_current_store(home: &Path) -> Result<()> {
 
 /// Holds both broker and service-manager startup locks, including custom-socket brokers.
 /// Returned files retain exclusion throughout publication and rollback.
+///
+/// Offline storage administration (`storage compact --apply` and
+/// `storage recover`) takes exactly this exclusion, so a broker, its service
+/// manager and their writers cannot race a relocation or a collection pass.
+pub(crate) fn broker_exclusion(home: &Path) -> Result<(std::fs::File, std::fs::File)> {
+    exclusive(home)
+}
+
 fn exclusive(home: &Path) -> Result<(std::fs::File, std::fs::File)> {
     let lock = std::fs::OpenOptions::new()
         .read(true)

@@ -39,6 +39,67 @@ materialization revision. Deleting a whole indexed skill directory cannot hide
 its missing manifest. The configured executable path is frozen, but the index
 does not pin the external executable's bytes or version.
 
+## Shared-tree verification bridge
+
+`agent-run-platform::shared_assets` can import an already sealed managed tree
+into an immutable content-addressed store (blobs keyed by scope, content
+digest, and normalized mode; whole trees keyed by their original manifest
+digest) without changing the on-disk Python-v1 formats. A home whose managed
+root was replaced by one exact whole-tree symlink into that store no longer
+passes `inspect_runtime_snapshots()`: the original strict verifier keeps
+requiring real directories and rejects arbitrary tree-root symlinks, and
+`materialize::verify()` keeps that behavior.
+
+`inspect_runtime_snapshots_with_shared()` is the explicit bridge. The caller
+passes a trusted canonical store root plus a mapping of indexed root paths to
+the `SharedTreeRef` values its registry recorded at import time; no platform
+or adapters code reads a database, and no home-local sidecar is trusted. The
+original index bytes, hash, revision, key shape, flat files, and credential
+links keep their exact original checks. For each mapped root the bridge
+proves the mapping key is an exact indexed root, the reference digest equals
+the original index manifest hash, the home entry is exactly one symlink whose
+target text equals the path derived from the trusted store root plus the
+validated reference, and the shared store's bounded streaming verifier proves
+unchanged logical paths, types, modes, and content through the physical tree.
+A private directory copy, missing link, foreign or dangling target, unknown
+mapping root, or wrong digest fails closed. Unmapped roots keep the original
+strict directory verification, so mixed original and shared homes verify —
+prepared migration can convert roots one at a time. Structural trust failures
+on the shared branch are returned as errors rather than classified
+inspection rows.
+
+One managed-root geometry carries an explicit exception: a managed Codex
+plugin version root (`plugins/cache/personal/<plugin>/<version>`, classified
+by `agent-run-platform::plugin_views::plugin_mount`) is mounted by its
+**parent**. Native Codex plugin discovery classifies version directories
+with `entry.file_type().is_dir()` and ignores a version root that is itself a
+symlink, so the coordinator moves the whole plugin parent into its
+token-bound backup and replaces the parent with one exact symlink onto a
+readonly store container — `plugin-views/<scope>/<view-id>` — holding the
+correctly named **real** version subtree with every file one internal
+hardlink of the imported shared tree. The bridge accepts that parent link
+only when its target text equals the container path derived from the same
+trusted store root, validated reference, and safe version name, and
+`plugin_views::verify_view()` proves the container's real topology, modes,
+manifest bytes, and hardlink identity. The strict
+`inspect_runtime_snapshots()` verifier is unchanged and keeps refusing the
+converted home: its no-follow walk still meets the parent symlink.
+
+`agent-run-adapters::materialize::verify_with_shared()` wraps the bridge with
+the same launch-path `Snapshot` result and revision extraction as
+`materialize::verify()`. The caller remains the trusted registry authority
+for the home, index, and root-to-reference binding; provider continuation
+verifies through the registry-selected strict or shared bridge, preserving the
+same original index digest and parent history seal. A three-home fixture test
+(1 MiB identical payload per home)
+measures its bytes at three points, counting each unique regular-file inode
+once: the true pre-import baseline of the three private homes, the staging
+peak while the private copies and the store coexist, and the state after the
+private copies are replaced by links (store only). The measured fixture has
+3,148,266 bytes before import, 4,197,931 at the staging peak and 1,051,114
+after relocation. Unique inode bytes do not measure physical APFS free space
+or predict production-scale reclamation.
+
 The current Codex provider auth link is deliberately outside the sealed asset
 index. After immutable assets verify and previous process cleanup is proven,
 an eligible attempt can rebind `auth.json` to its selected account without

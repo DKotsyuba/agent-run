@@ -342,9 +342,12 @@ impl Pass {
 /// removed trees stay eligible because eligibility comes from immutable names
 /// and durable markers, never from timestamps the removal itself refreshes.
 /// The store is only read with short bounded queries between filesystem work,
-/// never inside a write transaction. Callers should rerun after one second
-/// while work remains and hourly when idle, matching history maintenance.
-pub fn sweep(home: &Path, now: f64, store: &Store) -> Result<usize> {
+/// never inside a write transaction. The same pass runs one bounded
+/// reference-aware collection over the shared managed-asset store, under its
+/// own nonblocking publish lock, so a busy publisher never delays the rest of
+/// retention. Callers should rerun after one second while work remains and
+/// hourly when idle, matching history maintenance.
+pub fn sweep(home: &Path, now: f64, store: &mut Store) -> Result<usize> {
     if !now.is_finite() || now < LOG_SECONDS {
         return Err(invalid("filesystem retention requires a finite Unix time"));
     }
@@ -366,6 +369,13 @@ pub fn sweep(home: &Path, now: f64, store: &Store) -> Result<usize> {
     config_profile_backups(home, &root, now, &config, &proof, &mut pass);
     aged_logs(home, &root, now, &proof, &mut pass);
     stale_sockets(home, &root, &proof, &mut pass);
+    // Shared-store collection reports its own backlog and never fails the
+    // retention pass: a busy publish lock or incomplete evidence simply
+    // retries on the next cycle, while everything above still makes progress.
+    let collected = crate::storage_gc::sweep(store, home, crate::storage_gc::Mode::Apply)
+        .map(|outcome| (outcome.removed(), outcome.backlog()))
+        .unwrap_or((0, true));
+    pass.removed += collected.0;
     if pass.removed > 0 {
         if let Some(logger) = logging::configured() {
             logger.log(
@@ -375,7 +385,7 @@ pub fn sweep(home: &Path, now: f64, store: &Store) -> Result<usize> {
         }
     }
     let more = pass.finish()?;
-    Ok(pass.removed + usize::from(more && pass.removed == 0))
+    Ok(pass.removed + usize::from((more || collected.1) && pass.removed == 0))
 }
 
 /// True when one canonical run id's encoded creation is older than the cutoff.
@@ -424,6 +434,32 @@ fn collect_config_paths(value: &toml::Value, proof: &mut StorageProtection) {
         }
         _ => {}
     }
+}
+
+/// Returns every absolute path the current configuration names.
+///
+/// Shared-store collection shares this evidence with retention: a service
+/// command, working directory or credential file may point directly into a
+/// shared tree or payload, so the live configuration pins those objects
+/// exactly as the frozen identities and service definitions do. A home with
+/// no configuration file has no configuration references, which is proof; a
+/// configuration that exists but cannot be read or parsed is **not** proof of
+/// an empty set — it is uncertainty, returned as an error so the caller
+/// retains everything and retries.
+pub(crate) fn config_paths(home: &Path) -> Result<Vec<PathBuf>> {
+    let root = fs::Dir::open(home)?;
+    let bytes = root
+        .optional(Path::new("config.toml"), 1024 * 1024)?
+        .ok_or_else(|| invalid("current configuration cannot prove store safety"))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| invalid("current configuration is not valid UTF-8"))?;
+    let _raw: toml::Value = toml::from_str(text)
+        .map_err(|_| invalid("current configuration cannot prove store safety"))?;
+    let config = current_config(home, &root)
+        .ok_or_else(|| invalid("current configuration cannot prove store safety"))?;
+    let mut proof = agent_run_store::retention::StorageProtection::empty();
+    collect_config_paths(&config, &mut proof);
+    Ok(proof.protected_paths().map(Path::to_path_buf).collect())
 }
 
 /// Reports an exact live configuration string or path-basename reference.

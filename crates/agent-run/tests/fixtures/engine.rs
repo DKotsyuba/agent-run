@@ -69,6 +69,9 @@ fn main() {
         app_server();
         return;
     }
+    if args.first().map(String::as_str) == Some("sandbox") {
+        sandbox(&args[1..]);
+    }
     if args.iter().any(|s| s == "--version") {
         println!("agent-run offline fixture 1.0");
         return;
@@ -93,6 +96,9 @@ fn main() {
     };
     if task == "fixture:slow-start" {
         std::thread::sleep(Duration::from_secs(2));
+    }
+    if task == "fixture:shared-write" {
+        shared_write();
     }
     if task == "fixture:ignore-sigterm" {
         // SAFETY: SIGTERM/SIG_IGN are valid disposition constants; this only
@@ -238,6 +244,68 @@ fn main() {
         io::stdout().flush().expect("fixture stdout");
         std::process::exit(3);
     }
+}
+
+/// Stands in for the native `codex sandbox` the shared-store qualification
+/// probes invoke: runs the command after `--` under a Seatbelt profile that
+/// denies every write except `/dev/null`, plus writes below the `-C` workdir
+/// when the flags request `workspace-write`, mirroring the native boundary
+/// the probes exercise. Exits with the command's status; never returns.
+fn sandbox(args: &[String]) -> ! {
+    let split = args
+        .iter()
+        .position(|arg| arg == "--")
+        .expect("fixture sandbox command");
+    let (flags, command) = (&args[..split], &args[split + 1..]);
+    let cwd = argument(flags, "-C").expect("fixture sandbox workdir");
+    let mut profile =
+        "(version 1)(allow default)(deny file-write*)(allow file-write* (literal \"/dev/null\"))"
+            .to_owned();
+    if flags.iter().any(|flag| flag.contains("workspace-write")) {
+        profile.push_str("(allow file-write* (subpath (param \"CWD\")))");
+    }
+    let status = std::process::Command::new("/usr/bin/sandbox-exec")
+        .arg("-p")
+        .arg(profile)
+        .arg("-D")
+        .arg(format!("CWD={cwd}"))
+        .arg("--")
+        .args(command)
+        .current_dir(&cwd)
+        .status()
+        .expect("fixture sandbox spawn");
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Waits, bounded to ten seconds, for the object a test publishes into the
+/// shared store below the workdir after this child started, then tries to
+/// rewrite it, chmod it and create a sibling beside it. Each outcome lands in
+/// `shared-write.json` in the workdir — itself an ordinary allowed write.
+fn shared_write() {
+    use std::os::unix::fs::PermissionsExt;
+    let store = std::path::Path::new("shared-assets/v1");
+    let object = store.join("fixture-published");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !object.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let write = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&object)
+        .and_then(|mut file| file.write_all(b"changed"));
+    let chmod = std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o644));
+    let create = std::fs::write(store.join("fixture-injected"), b"injected");
+    std::fs::write(
+        "shared-write.json",
+        json!({
+            "present": object.exists(),
+            "write_denied": write.is_err(),
+            "chmod_denied": chmod.is_err(),
+            "create_denied": create.is_err(),
+        })
+        .to_string(),
+    )
+    .expect("fixture shared-write report");
 }
 
 /// Appends this turn to a Claude-shaped native transcript, as the real
