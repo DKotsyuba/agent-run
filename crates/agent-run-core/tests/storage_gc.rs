@@ -208,6 +208,53 @@ fn shared_payload_survives_until_last_reference_is_gone() {
     permit_tree(&store_root(&app_home));
 }
 
+/// A legacy tree published with readonly `0o500` directories is still a
+/// verifiable object, and collection still reclaims it: the quarantine
+/// rename normalizes the directory to the portable owner-only `0o700`
+/// under the store lock before moving it into the staging namespace.
+#[test]
+fn legacy_readonly_directories_are_verified_and_collected() {
+    let root = TempDir::new().expect("fixture root");
+    let app_home = app(root.path());
+    let mut store = Store::initialize(&app_home).expect("store");
+    let sealed = seal(root.path(), "legacy", b"legacy-payload\n");
+    let layout = runtime_storage::plan(
+        &store,
+        &app_home,
+        &sealed.home,
+        &sealed.index_sha256,
+        &scope(),
+    )
+    .expect("plan")
+    .expect("managed roots");
+    let manifest = layout.roots["skills/demo"].manifest_sha256.clone();
+    runtime_storage::install(&mut store, &app_home, &layout, None).expect("install");
+    let tree = store_root(&app_home)
+        .join("trees")
+        .join(scope())
+        .join(&manifest);
+    // Rewind the published directories to the legacy readonly mode.
+    for directory in [&tree, &tree.join("scripts")] {
+        stdfs::set_permissions(directory, stdfs::Permissions::from_mode(0o500)).unwrap();
+    }
+    let reference = SharedTreeRef {
+        scope: scope(),
+        manifest_sha256: manifest.clone(),
+    };
+    shared_assets::verify_shared_tree(&store_root(&app_home), &reference)
+        .expect("legacy directories stay verifiable");
+    permit_tree(&sealed.home);
+    stdfs::remove_dir_all(&sealed.home).expect("home gone");
+    let outcomes = converge(&mut store, &app_home, Mode::Apply);
+    assert!(
+        outcomes.iter().any(|pass| pass.trees_removed == 1),
+        "the legacy tree is collected: {outcomes:?}"
+    );
+    assert!(names(&store_root(&app_home), "trees").is_empty());
+    assert!(names(&store_root(&app_home), "blobs").is_empty());
+    permit_tree(&store_root(&app_home));
+}
+
 /// A prepared row and a committed row whose home still exists both pin their
 /// objects; a configuration path or an unreleased service reference into the
 /// store pins a tree or a single blob directly.

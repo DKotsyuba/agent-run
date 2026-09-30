@@ -23,7 +23,9 @@ SHA-256 of the exact preimage
 `SharedTreeRef` plus the safe version name and no mutable state. Inside, the
 named version directory is real, every payload and the unchanged
 `.agent-run-snapshot.json` bytes are internal hardlinks of the imported
-`trees/<scope>/<manifest-sha256>` entries, directories are `0o500`, and no
+`trees/<scope>/<manifest-sha256>` entries, directories are owner-only `0o700`
+(published `0o500` trees and views from earlier releases remain verifiable and
+collectible), and no
 payload byte is copied. Ordinary skill and other roots keep the plain
 whole-root link; the original index bytes and index SHA-256 never change.
 Collection must drain obsolete `plugin-views` containers **before** the

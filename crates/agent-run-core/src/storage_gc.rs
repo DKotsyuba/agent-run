@@ -852,8 +852,14 @@ fn view_pass(
             }
             if mode == Mode::Apply {
                 roots -= 1;
-                // Same shape as trees: move into the staging namespace first,
-                // so a partially drained view is an ordinary resumable orphan.
+                // Same shape as trees: a legacy readonly `0o500` container is
+                // normalized to the portable owner-only `0o700` through its
+                // live descriptor first — macOS denies renaming a
+                // write-disabled directory — then moved into the staging
+                // namespace, so a partially drained view is an ordinary
+                // resumable orphan and an interruption before the rename
+                // leaves a still-verifiable container.
+                normalize_before_quarantine(&scope_dir, relative)?;
                 let staging = PathBuf::from(format!(
                     "{TEMP_PREFIX}{}{TEMP_SUFFIX}",
                     uuid::Uuid::new_v4().simple()
@@ -967,6 +973,14 @@ fn tree_pass(
             }
             if mode == Mode::Apply {
                 roots -= 1;
+                // A legacy readonly `0o500` tree is normalized to the
+                // portable owner-only `0o700` through its live descriptor
+                // before the quarantine rename: macOS denies renaming a
+                // write-disabled directory. The proof above already verified
+                // ownership, provenance and the unreferenced census, and an
+                // interruption after the normalization leaves a
+                // still-verifiable tree at its canonical name for retry.
+                normalize_before_quarantine(&scope_dir, Path::new(manifest))?;
                 // The proved-unreferenced object is moved, atomically and
                 // under the lock, into the recognized publisher-staging
                 // namespace of its own scope before any byte is unlinked. A
@@ -1206,6 +1220,26 @@ fn staging_pass(root: &Path, mode: Mode, outcome: &mut Outcome) -> Result<()> {
                 outcome.bytes_reclaimed += size;
             }
         }
+    }
+    Ok(())
+}
+
+/// Normalizes one proved-unreferenced legacy object for its quarantine
+/// rename, under the store lock the caller holds.
+///
+/// macOS denies renaming a write-disabled directory even within its parent,
+/// so a `0o500` directory published by the legacy readonly contract could
+/// never be moved into the staging namespace on those hosts. Only a live
+/// descriptor opened through the proved `scope_dir` is touched, and only
+/// when the object still carries the legacy `0o500` mode — a `0o700`
+/// publication passes untouched and no arbitrary object is ever chmodded.
+/// An interruption after this normalization leaves the object verifiable at
+/// its canonical name (both modes verify), so the next pass retries cleanly
+/// and a staging orphan is never created from invalid state.
+fn normalize_before_quarantine(scope_dir: &fs::Dir, relative: &Path) -> Result<()> {
+    let directory = scope_dir.subdir(relative)?;
+    if directory.entry(None)?.mode == 0o500 {
+        directory.permit_owner_write()?;
     }
     Ok(())
 }

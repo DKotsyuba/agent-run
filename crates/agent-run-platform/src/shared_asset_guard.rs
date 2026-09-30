@@ -504,6 +504,7 @@ mod tests {
     #[test]
     #[ignore = "requires native sandbox-exec application on a qualified macOS host"]
     fn live_native_guard() {
+        use std::os::unix::fs::PermissionsExt;
         let (_temp, root, work) = fixture();
         let file = root.join("asset");
         std::fs::write(&file, b"original").unwrap();
@@ -548,6 +549,26 @@ mod tests {
         let outside = base.with_extension("moved");
         assert!(!run(&guard, &work, "mv \"$1\" \"$2\"", &[base, &outside]));
         assert!(root.exists());
+
+        // The guard, not directory modes, is the same-UID immutability
+        // boundary: a published owner-only `0o700` shared-tree directory is
+        // writable by mode, yet a guarded child can neither create inside
+        // it, replace its payload, nor chmod the payload.
+        let tree = root.join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let payload = tree.join("payload");
+        std::fs::write(&payload, b"payload").unwrap();
+        assert!(!run(
+            &guard,
+            &work,
+            "printf bad > \"$1\"",
+            &[&tree.join("new")]
+        ));
+        assert!(!run(&guard, &work, "mv \"$1\" \"$2\"", &[&file, &payload]));
+        assert!(!run(&guard, &work, "chmod 600 \"$1\"", &[&payload]));
+        assert_eq!(std::fs::read(&payload).unwrap(), b"payload");
+        assert!(!tree.join("new").exists());
 
         let child_script = work.join("child.sh");
         std::fs::write(&child_script, "printf bad > \"$1\"\n").unwrap();

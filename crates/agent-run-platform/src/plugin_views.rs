@@ -21,7 +21,8 @@
 //!   exact preimage `plugin-view-v1\n<scope>\n<manifest-sha256>\n<version>`,
 //!   so the identity binds the original [`SharedTreeRef`] plus the safe
 //!   version name and never any mutable current state. Directories are
-//!   `0o500`, files keep the shared tree's physical `0o400`/`0o500` modes,
+//!   owner-only `0o700` (legacy `0o500` containers stay verifiable), files
+//!   keep the shared tree's physical `0o400`/`0o500` modes,
 //!   and every file — including the unchanged
 //!   `.agent-run-snapshot.json` bytes — is one internal hardlink of the
 //!   corresponding `trees/<scope>/<manifest-sha256>` entry, so no payload
@@ -146,12 +147,14 @@ pub fn view_root(store_root: &Path, reference: &SharedTreeRef, version: &str) ->
 /// directory per manifest directory entry, one internal hardlink of the
 /// corresponding shared-tree file per file entry, plus one hardlink of the
 /// tree's unchanged `.agent-run-snapshot.json` bytes. Nothing is copied, no
-/// link leaves the store, and every directory ends readonly at `0o500`.
+/// link leaves the store, and every directory keeps its final owner-only
+/// `0o700` mode — the mode [`Dir::make_directory`] created it with — so the
+/// publish rename is never denied as a write-disabled-directory rename.
 ///
 /// An existing container is verified through [`verify_view`] and reused,
 /// never rebuilt. A missing container is staged under a fresh
-/// `.agent-run-staging-*.tmp` name while holding [`SharedStoreLock`],
-/// restricted, and renamed into place with the kernel's no-replace rename; a
+/// `.agent-run-staging-*.tmp` name while holding [`SharedStoreLock`] and
+/// renamed into place with the kernel's no-replace rename; a
 /// concurrent publisher winning that name loses nothing and is verified
 /// instead. On error the staging directory is removed and no partial
 /// container exists under its final name.
@@ -198,7 +201,6 @@ pub fn materialize(store_root: &Path, reference: &SharedTreeRef, version: &str) 
         store.directory(&staging)?;
         let inside = staging.join(version);
         stage_view(&store, &inside, &entries, &tree_dir, &manifest_bytes)
-            .and_then(|()| restrict_view(&store, &staging, &inside, &entries))
             .and_then(|()| store.rename_entry_no_replace(&staging, &relative))
     };
     match published {
@@ -254,28 +256,6 @@ fn stage_view(
     Ok(())
 }
 
-/// Drops owner write permission on the staged container and its whole subtree.
-///
-/// Inner directories are restricted first through live descriptors; the
-/// version directory and the staging root follow, so every directory ends at
-/// `0o500`, matching the shared tree's physical contract.
-fn restrict_view(
-    store: &Dir,
-    staging: &Path,
-    inside: &Path,
-    entries: &BTreeMap<String, serde_json::Value>,
-) -> Result<()> {
-    for (path, entry) in entries {
-        if entry["type"] == "directory" {
-            store
-                .subdir(&inside.join(path.as_str()))?
-                .restrict_owner_read()?;
-        }
-    }
-    store.subdir(inside)?.restrict_owner_read()?;
-    store.subdir(staging)?.restrict_owner_read()
-}
-
 /// Removes one publisher-owned staging subtree through no-follow descriptors,
 /// tolerating the readonly modes restriction already applied; a removal that
 /// fails leaves the documented recoverable orphan in place.
@@ -314,15 +294,17 @@ fn remove_view_tree(directory: &Dir) -> Result<()> {
 /// closed on any drift.
 ///
 /// Proves, through no-follow descriptors only: the container is a real
-/// owner-held directory at `0o500` holding exactly one entry — the named
-/// real version directory, also owner-held at `0o500`; the hardlinked
-/// manifest bytes still hash to `reference.manifest_sha256` and parse through
-/// the shared manifest validators; the version subtree's topology is exactly
-/// the manifest's (no orphans, nothing missing, bounded by
-/// [`MAX_VIEW_ENTRIES`]); every directory is `0o500`; and every file is one
-/// internal hardlink of the corresponding `trees/<scope>/<manifest-sha256>`
-/// entry — same device and inode — at the physical mode that entry's logical
-/// mode maps to. The referenced shared tree itself is proven separately by
+/// owner-held directory at a valid owner-only directory mode (`0o700`, or
+/// legacy `0o500`) holding exactly one entry — the named
+/// real version directory, also owner-held at a valid owner-only mode; the
+/// hardlinked manifest bytes still hash to `reference.manifest_sha256` and
+/// parse through the shared manifest validators; the version subtree's
+/// topology is exactly the manifest's (no orphans, nothing missing, bounded
+/// by [`MAX_VIEW_ENTRIES`]); every directory carries a valid owner-only
+/// mode; and every file is one internal hardlink of the corresponding
+/// `trees/<scope>/<manifest-sha256>` entry — same device and inode — at the
+/// physical mode that entry's logical mode maps to. The referenced shared
+/// tree itself is proven separately by
 /// [`shared_assets::verify_shared_tree`], which this check deliberately does
 /// not repeat.
 pub fn verify_view(store_root: &Path, reference: &SharedTreeRef, version: &str) -> Result<()> {
@@ -343,7 +325,7 @@ pub fn verify_view(store_root: &Path, reference: &SharedTreeRef, version: &str) 
     }
     let container = store.entry(Some(&relative))?;
     require_owner(&container, "plugin view")?;
-    check_mode(&container, 0o500, "plugin view")?;
+    check_directory_mode(&container, "plugin view")?;
     let view = store.subdir(&relative)?;
     let names = view.list(None)?;
     if names.len() != 1 || names[0].to_str() != Some(version) {
@@ -358,7 +340,7 @@ pub fn verify_view(store_root: &Path, reference: &SharedTreeRef, version: &str) 
             "plugin view version entry must be a real directory",
         ));
     }
-    check_mode(&version_entry, 0o500, "plugin view version")?;
+    check_directory_mode(&version_entry, "plugin view version")?;
     let version_dir = view.subdir(Path::new(version))?;
     let manifest_bytes = version_dir.read(Path::new(SNAPSHOT_MANIFEST), MAX_METADATA)?;
     if fs::sha256(&manifest_bytes) != reference.manifest_sha256 {
@@ -430,7 +412,7 @@ fn walk_view(
                         "plugin view entry is not a real directory: {path}"
                     )));
                 }
-                check_mode(&identity, 0o500, "plugin view directory")?;
+                check_directory_mode(&identity, "plugin view directory")?;
                 walk_view(
                     &directory.subdir(Path::new(text))?,
                     &path,
@@ -481,6 +463,17 @@ fn physical_mode(logical: u32) -> u32 {
 /// bits.
 fn check_mode(identity: &fs::Entry, mode: u32, label: &str) -> Result<()> {
     if identity.mode != mode {
+        return Err(invalid(format!("shared store {label} mode drifted")));
+    }
+    Ok(())
+}
+
+/// Fails unless one owner-held directory identity carries a valid shared
+/// directory mode: the portable publication mode `0o700` or the legacy
+/// readonly `0o500` containers earlier releases published, exactly as
+/// [`shared_assets::is_shared_directory_mode`] defines them.
+fn check_directory_mode(identity: &fs::Entry, label: &str) -> Result<()> {
+    if !shared_assets::is_shared_directory_mode(identity.mode) {
         return Err(invalid(format!("shared store {label} mode drifted")));
     }
     Ok(())

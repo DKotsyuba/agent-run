@@ -11,7 +11,8 @@
 //! - `trees/<scope>/<original-manifest-sha256>/`: the original tree layout,
 //!   including the unchanged `.agent-run-snapshot.json` bytes, with every
 //!   file an internal hardlink to its canonical blob, every directory at
-//!   mode `0o500`, and the manifest at mode `0o400`.
+//!   owner-only mode `0o700` (legacy `0o500` trees stay verifiable), and
+//!   the manifest at mode `0o400`.
 //!
 //! `<scope>` is a caller-provided 64-character lowercase hexadecimal digest
 //! separating account or compatibility domains; payloads never alias across
@@ -265,6 +266,20 @@ fn physical_mode(logical: u32) -> u32 {
     }
 }
 
+/// Returns whether `mode` is a valid shared-tree or plugin-view directory
+/// mode: owner-only `0o700` (the portable publication mode) or owner-only
+/// readonly `0o500` (the legacy publication mode).
+///
+/// `0o700` is the mode new directories are published at because macOS
+/// denies renaming a write-disabled directory even within its parent, which
+/// would break the no-replace atomic publication and collection renames.
+/// `0o500` directories published before that contract remain first-class
+/// verifiable objects, so verification and collection accept exactly these
+/// two owner-only modes and no group- or other-accessible mode.
+pub fn is_shared_directory_mode(mode: u32) -> bool {
+    matches!(mode, 0o500 | 0o700)
+}
+
 /// Validates one manifest file entry and returns its `(sha256, logical mode,
 /// size)` triple. Rejects malformed or non-lowercase digests, modes outside
 /// the normalized `0o600`/`0o700` pair, and sizes beyond the payload bound,
@@ -337,7 +352,7 @@ enum TreeShape {
     /// on directories (source homes own their own modes).
     Source,
     /// A published shared tree: files at physical `0o400`/`0o500` and every
-    /// directory at `0o500`.
+    /// directory at a valid [`is_shared_directory_mode`] owner-only mode.
     Shared,
 }
 
@@ -360,7 +375,7 @@ fn verify_topology(
     label: &str,
 ) -> Result<()> {
     require_owner(root.entry(None)?.uid, label)?;
-    if shape == TreeShape::Shared && root.entry(None)?.mode != 0o500 {
+    if shape == TreeShape::Shared && !is_shared_directory_mode(root.entry(None)?.mode) {
         return Err(invalid(format!(
             "shared tree {label} directory mode drifted"
         )));
@@ -423,7 +438,7 @@ fn walk_topology(
                         "{label} entry is not a real directory: {path}"
                     )));
                 }
-                if shape == TreeShape::Shared && identity.mode != 0o500 {
+                if shape == TreeShape::Shared && !is_shared_directory_mode(identity.mode) {
                     return Err(invalid(format!(
                         "shared tree directory mode drifted: {path}"
                     )));
@@ -589,7 +604,7 @@ pub fn import_shared_tree(
     // Barrier: the staged tree's data, entries and modes are all persisted
     // before the no-replace rename makes it authoritative.
     let published = staged
-        .and_then(|()| restrict_staging(&store, &staging, &entries))
+        .and_then(|()| seal_staging(&store, &staging, &entries))
         .and_then(|()| store.sync())
         .and_then(|()| store.rename_entry_no_replace(&staging, &destination));
     match published {
@@ -627,8 +642,8 @@ pub fn import_shared_tree(
 ///
 /// Each directory whose entries changed is pushed once after all of its
 /// changes rather than once per entry: every blob directory after the
-/// renames here, and every staged directory by the caller's
-/// `restrict_staging` (entries and final mode), whose barrier then persists
+/// renames here, and every staged directory by the caller's `seal_staging`
+/// (entries and final mode), whose barrier then persists
 /// the staged namespace before its no-replace rename makes it
 /// authoritative. A source that changed
 /// since its capture is refused by the hash comparison, and on any error
@@ -748,7 +763,7 @@ fn publish_payloads(blobs: &Dir, pending: &[PendingBlob]) -> Result<()> {
 /// Directories are created parent-first in manifest order; files are then
 /// linked per parent directory, each parent resolved once, so every link
 /// names a single component on both sides. The caller's
-/// `restrict_staging` pushes each staged directory afterwards and its
+/// `seal_staging` pushes each staged directory afterwards and its
 /// barrier persists them before publication.
 fn link_staging(
     store: &Dir,
@@ -848,22 +863,25 @@ fn verify_blob(
     Ok(())
 }
 
-/// Drops owner write permission on every staged directory, including the
-/// staging root, leaving the tree readonly at `0o500` before its rename,
-/// and pushes each directory (entries and new mode) to the device; the
-/// caller's [`Dir::sync`] barrier then persists the whole staged namespace
-/// before the rename makes it authoritative.
-fn restrict_staging(store: &Dir, staging: &Path, entries: &BTreeMap<String, Value>) -> Result<()> {
+/// Seals every staged directory, including the staging root, at its final
+/// owner-only `0o700` mode and pushes each changed directory to the device;
+/// the caller's [`Dir::sync`] barrier then persists the whole staged
+/// namespace before the rename makes it authoritative.
+///
+/// Directories keep the `0o700` mode [`Dir::make_directory`] created them
+/// with instead of being restricted to readonly `0o500`: macOS denies
+/// renaming a write-disabled directory even within its parent, so a `0o500`
+/// staged tree could not be published by the no-replace atomic rename on
+/// those hosts. Same-UID agent immutability is enforced by the qualified
+/// native shared-root guard, not by directory modes; payload files keep
+/// their readonly physical `0o400`/`0o500` modes.
+fn seal_staging(store: &Dir, staging: &Path, entries: &BTreeMap<String, Value>) -> Result<()> {
     for (path, entry) in entries {
         if entry["type"] == "directory" {
-            let directory = store.subdir(&staging.join(path.as_str()))?;
-            directory.restrict_owner_read()?;
-            directory.push()?;
+            store.subdir(&staging.join(path.as_str()))?.push()?;
         }
     }
-    let root = store.subdir(staging)?;
-    root.restrict_owner_read()?;
-    root.push()
+    store.subdir(staging)?.push()
 }
 
 /// Removes every entry beneath one owned directory through no-follow
@@ -945,7 +963,8 @@ pub fn shared_tree_blob_names(
 /// as [`crate::snapshot_tree::inspect_managed_snapshot`], and stay within
 /// the entry and aggregate bounds. A bounded streaming walk then proves the
 /// exact topology with no orphan, missing, symlinked, or foreign-typed
-/// entries, every directory owner-held at `0o500`, every file owner-held at
+/// entries, every directory owner-held at a valid owner-only mode
+/// (`0o700`, or legacy `0o500`), every file owner-held at
 /// its readonly physical mode, and the manifest owner-held at `0o400`.
 /// Finally each file must be an internal hardlink to its canonical blob —
 /// same device and inode — whose content is streamed against the manifest
@@ -1117,7 +1136,10 @@ mod tests {
 
     /// Exercises the readonly publication primitives with stage-specific
     /// failures, so a host permission difference is distinguishable from a
-    /// manifest or supervisor error. Published payloads and trees stay readonly.
+    /// manifest or supervisor error. Published payload FILES stay readonly
+    /// while staged DIRECTORY entries keep their portable owner-only `0o700`
+    /// mode, so the no-replace publish rename of the tree itself cannot be
+    /// denied as a write-disabled-directory rename.
     #[test]
     fn readonly_publication_primitives_keep_their_contract() {
         let (_temporary, root) = store_root();
@@ -1155,24 +1177,40 @@ mod tests {
         let tree = directory
             .subdir(Path::new("staged"))
             .expect("open staged tree");
-        tree.restrict_owner_read()
-            .expect("seal staged directory mode");
-        tree.push().expect("push readonly directory metadata");
+        assert_eq!(tree.entry(None).unwrap().mode, 0o700);
+        tree.push().expect("push sealed directory metadata");
         directory.sync().expect("persist staged namespace");
         assert!(directory
             .rename_entry_no_replace(Path::new("staged"), Path::new("published"))
-            .expect("publish readonly tree"));
+            .expect("publish sealed tree"));
+        directory
+            .directory(Path::new("other"))
+            .expect("create sibling tree");
+        assert!(
+            !directory
+                .rename_entry_no_replace(Path::new("other"), Path::new("published"))
+                .expect("probe occupied destination"),
+            "publication never replaces an existing entry"
+        );
+        assert!(root.join("other").is_dir() && root.join("published").is_dir());
         assert_eq!(
             inode_of(&root.join("blob")),
             inode_of(&root.join("published/leaf"))
         );
         assert_eq!(
             directory.entry(Some(Path::new("published"))).unwrap().mode,
-            0o500
+            0o700
         );
         assert_eq!(
             directory
                 .entry(Some(Path::new("published/leaf")))
+                .unwrap()
+                .mode,
+            0o400
+        );
+        assert_eq!(
+            directory
+                .entry(Some(Path::new("published/manifest")))
                 .unwrap()
                 .mode,
             0o400
@@ -1217,7 +1255,7 @@ mod tests {
         let tree = shared_tree_root(&root, &first).unwrap();
         assert_eq!(
             fs::metadata(&tree).unwrap().permissions().mode() & 0o777,
-            0o500
+            0o700
         );
         assert_eq!(
             fs::metadata(tree.join("index.js"))
@@ -1231,6 +1269,36 @@ mod tests {
             fs::metadata(&util).unwrap().permissions().mode() & 0o777,
             0o400
         );
+    }
+
+    /// Trees published at the legacy readonly `0o500` directory mode stay
+    /// verifiable objects, while any group- or other-accessible directory
+    /// mode is rejected — the contract accepts exactly the two owner-only
+    /// modes, so an old store keeps working and a loosened one does not.
+    #[test]
+    fn legacy_readonly_directories_verify_and_group_modes_do_not() {
+        let (_, home) = sealed(&[
+            ("index.js", b"console.log('index')\n", true),
+            ("lib/util.js", b"module.exports = () => 42\n", false),
+        ]);
+        let (_store, root) = store_root();
+        let scope = sha256(b"domain-legacy");
+        let reference = import(&root, &scope, home.path());
+        let tree = shared_tree_root(&root, &reference).unwrap();
+        let restore = |mode: u32| {
+            for directory in [tree.clone(), tree.join("lib")] {
+                fs::set_permissions(&directory, fs::Permissions::from_mode(mode)).unwrap();
+            }
+        };
+        restore(0o500);
+        verify_shared_tree(&root, &reference).unwrap();
+        restore(0o750);
+        assert!(
+            verify_shared_tree(&root, &reference).is_err(),
+            "a group-accessible directory mode is drift"
+        );
+        restore(0o700);
+        verify_shared_tree(&root, &reference).unwrap();
     }
 
     /// A changed tree version shares only the unchanged file's inode.
