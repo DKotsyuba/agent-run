@@ -496,9 +496,9 @@ impl Service {
         effective.read_roots = profile.read_roots.clone();
         effective.required_constraints = profile.required_constraints.clone();
         effective.timeout_seconds = Some(
-            effective
-                .timeout_seconds
-                .unwrap_or(config.core.default_timeout_seconds),
+            config
+                .core
+                .effective_timeout_seconds(effective.timeout_seconds)?,
         );
         let eligible_accounts = provider
             .bindings
@@ -671,9 +671,9 @@ impl Service {
         let runtime = config.runtime(&request.runtime)?;
         request.account = runtime.selected_account(request.account.as_deref())?;
         request.timeout_seconds = Some(
-            request
-                .timeout_seconds
-                .unwrap_or(config.core.default_timeout_seconds),
+            config
+                .core
+                .effective_timeout_seconds(request.timeout_seconds)?,
         );
         let profile = profiles::load(&config, runtime, &request)?;
         request.write = profile.write;
@@ -832,7 +832,13 @@ impl Service {
         let mut request = parent.request.clone();
         request.task = task;
         request.request_id = request_id;
-        request.timeout_seconds = timeout.or(parent.request.timeout_seconds);
+        // A newly requested timeout is scaled once; an inherited one is the
+        // parent's already-effective allowance and is reused unscaled, so the
+        // configured margin never compounds across a lineage.
+        request.timeout_seconds = match timeout {
+            Some(explicit) => Some(current.core.effective_timeout_seconds(Some(explicit))?),
+            None => parent.request.timeout_seconds,
+        };
         if orchestrator.is_some() {
             request.orchestrator = orchestrator;
         }
@@ -1038,7 +1044,14 @@ impl Service {
         let mut effective = parent.request.clone();
         effective.task = request.task.clone();
         effective.request_id = request.request_id.clone();
-        effective.timeout_seconds = request.timeout_seconds.or(parent.request.timeout_seconds);
+        // A resume's newly requested timeout is scaled once by the current
+        // configuration; an inherited one keeps the parent's already-effective
+        // allowance (never the frozen pre-margin base), so the margin is
+        // applied exactly once per base value across a lineage.
+        effective.timeout_seconds = match timeout {
+            Some(explicit) => Some(current.core.effective_timeout_seconds(Some(explicit))?),
+            None => parent.request.timeout_seconds,
+        };
         effective.orchestrator = request.orchestrator.clone();
         let identity = serde_json::to_value(ProviderLaunchIdentity {
             provider_identity_version: 2,

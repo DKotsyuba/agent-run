@@ -6,6 +6,11 @@ schema_version = 1
 max_active_agents = 6
 # Legacy compatibility metadata, NOT an execution deadline:
 default_timeout_seconds = 480
+# Margin applied once to every newly admitted run's timeout (the explicit
+# request, or default_timeout_seconds when omitted) before it is persisted.
+# Finite and >= 1.0; 1.0 disables the margin. Existing runs, frozen snapshots
+# and inherited resume timeouts are never re-scaled.
+timeout_multiplier = 1.2
 
 [capacity]
 collect_interval_seconds = 300

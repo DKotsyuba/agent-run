@@ -78,6 +78,12 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct Core {
     pub default_timeout_seconds: f64,
+    /// Margin applied once to every newly admitted run's whole-run timeout:
+    /// the explicit `timeout_seconds` a caller requests, or
+    /// `default_timeout_seconds` when the request omits one. Finite and at
+    /// least `1.0`; `1.0` disables the margin. Existing runs, frozen
+    /// snapshots and inherited resume timeouts are never re-scaled.
+    pub timeout_multiplier: f64,
     pub max_active_agents: usize,
     pub warning_fraction: f64,
     pub stalled_after_seconds: f64,
@@ -86,10 +92,46 @@ impl Default for Core {
     fn default() -> Self {
         Self {
             default_timeout_seconds: 480.,
+            timeout_multiplier: 1.2,
             max_active_agents: 6,
             warning_fraction: 0.9,
             stalled_after_seconds: 900.,
         }
+    }
+}
+impl Core {
+    /// Returns the effective whole-run timeout one new admission persists.
+    ///
+    /// `requested` is the caller's explicit timeout in seconds, or `None` to
+    /// take [`Core::default_timeout_seconds`]. The configured
+    /// [`Core::timeout_multiplier`] is applied exactly once to that base, and
+    /// the product must satisfy the shared run-timeout contract (positive,
+    /// finite and at most 2592000 seconds); anything else is a validation
+    /// error and nothing is admitted or persisted.
+    ///
+    /// Resume callers pass `Some` only for a newly requested timeout; an
+    /// inherited timeout is the parent's already-effective value and is
+    /// reused as-is so the margin never compounds.
+    pub fn effective_timeout_seconds(&self, requested: Option<f64>) -> Result<f64> {
+        let effective = requested.unwrap_or(self.default_timeout_seconds) * self.timeout_multiplier;
+        domain::timeout_seconds(effective).map_err(|_| {
+            invalid(
+                "effective timeout_seconds (the requested value or core.default_timeout_seconds \
+                 times core.timeout_multiplier) must be positive, finite and at most 2592000",
+            )
+        })
+    }
+
+    /// Returns the effective default allowance for an admission that omitted a
+    /// timeout, without a validation round-trip.
+    ///
+    /// This is the infallible fallback for store writers that must persist a
+    /// concrete column value for a request carrying no timeout; a validated
+    /// configuration already proves the product is positive, finite and at
+    /// most 2592000 seconds, so the plain product can never overflow the
+    /// run-timeout contract here.
+    pub fn effective_default_timeout_seconds(&self) -> f64 {
+        self.default_timeout_seconds * self.timeout_multiplier
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -472,6 +514,14 @@ impl Config {
                 invalid("core.default_timeout_seconds must be positive, finite and at most 2592000")
             },
         )?;
+        if !self.core.timeout_multiplier.is_finite() || self.core.timeout_multiplier < 1.0 {
+            return Err(invalid(
+                "core.timeout_multiplier must be finite and at least 1",
+            ));
+        }
+        self.core
+            .effective_timeout_seconds(None)
+            .map_err(|_| invalid("core.default_timeout_seconds times core.timeout_multiplier must be positive, finite and at most 2592000"))?;
         if self.core.max_active_agents == 0 || self.core.max_active_agents > 4096 {
             return Err(invalid("max_active_agents must be 1..4096"));
         }

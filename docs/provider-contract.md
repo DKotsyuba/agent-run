@@ -450,7 +450,16 @@ tries to continue the same logical run on another account:
   its stored `timeout_seconds`, re-read before every spawn. A requested or
   resume-override timeout, and `core.default_timeout_seconds`, must be
   positive, finite and at most 2592000 seconds (30 days); anything else is
-  refused before a row is written. Each attempt runs
+  refused before a row is written. `core.timeout_multiplier` (finite, at
+  least 1.0, default 1.2) is applied exactly once to that base — the explicit
+  request or the default when omitted — before the effective timeout is
+  persisted, and the product must itself stay within the 2592000-second
+  ceiling. An explicit 1.0 disables the margin. A resume's newly requested
+  timeout is scaled once; an inherited timeout reuses the parent's
+  already-effective allowance, so the margin never compounds
+  (600 -> 720 -> 720, never 864). Configuration changes reach new admissions
+  only: an admitted row, a running agent and a frozen snapshot keep the
+  allowance they were admitted with. Each attempt runs
   only for the remainder; on expiry the runner is dropped, the process group
   cleaned, and the run ends `timed_out` once. An expired run allocates or
   spawns no further attempt; a pending cancel wins over expiry.

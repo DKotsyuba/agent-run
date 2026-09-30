@@ -4485,3 +4485,147 @@ async fn repeat_compact_consolidates_caches_of_an_already_shared_home() {
         "a committed home never relocates again: {result}"
     );
 }
+
+/// `core.timeout_multiplier` scales each new provider admission's effective
+/// timeout exactly once — an explicit request and the configured default both
+/// land in the authoritative `agents.timeout_seconds` column multiplied — and a
+/// config change reaches only admissions made after it: an already admitted
+/// row keeps the allowance it was admitted with, and a request whose scaled
+/// timeout leaves the run-timeout ceiling is refused before any row exists.
+#[tokio::test]
+async fn timeout_multiplier_scales_new_provider_admissions_once() {
+    let (_temp, home) = home_with("[core]\ndefault_timeout_seconds = 600\n", &[]);
+    let service = Service::new(home.clone());
+    let admitted = |request: agent_run_domain::ProviderStartRequest| {
+        let value = service.admit_provider(request).unwrap();
+        let id: AgentId = serde_json::from_value(value["agent_id"].clone()).unwrap();
+        Store::open(&home)
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT timeout_seconds FROM agents WHERE id=?",
+                [id.as_str()],
+                |row| row.get::<_, f64>(0),
+            )
+            .unwrap()
+    };
+    let mut explicit = request_for(&home, "glm-user", "multiplied-explicit", None);
+    explicit.timeout_seconds = Some(600.0);
+    let first = admitted(explicit);
+    assert_eq!(first, 720.0, "600 times the default 1.2");
+    let before = rows(&home);
+    let mut overflow = request_for(&home, "glm-user", "multiplied-overflow", None);
+    overflow.timeout_seconds = Some(2_500_000.0);
+    let refused = service.admit_provider(overflow).unwrap_err();
+    assert_eq!(refused.machine_code().as_str(), "ValidationError");
+    assert_eq!(
+        rows(&home),
+        before,
+        "the overflowing request admits nothing"
+    );
+    assert_eq!(
+        admitted(request_for(&home, "glm-user", "multiplied-default", None)),
+        720.0,
+        "the omitted timeout takes the scaled default"
+    );
+    edit_config(&home, |config| {
+        config
+            .as_table_mut()
+            .unwrap()
+            .entry("core")
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .unwrap()
+            .insert("timeout_multiplier".into(), toml::Value::Float(1.0));
+    });
+    let mut unscaled = request_for(&home, "glm-user", "unscaled-explicit", None);
+    unscaled.timeout_seconds = Some(600.0);
+    assert_eq!(
+        admitted(unscaled),
+        600.0,
+        "an explicit 1.0 disables the margin"
+    );
+    let reread: f64 = {
+        // The reload changed nothing for the row admitted under 1.2.
+        let store = Store::open(&home).unwrap();
+        store
+            .conn
+            .query_row(
+                "SELECT timeout_seconds FROM agents WHERE request_id=?",
+                ["multiplied-explicit"],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(reread, 720.0, "existing admissions are never rescaled");
+}
+
+/// A resume's newly requested timeout is scaled once, while an omitted one
+/// inherits the parent's already-effective allowance: the margin is applied to
+/// a base value exactly once per lineage, never compounded (600 -> 720 -> 720,
+/// not 600 -> 720 -> 864).
+#[tokio::test]
+async fn provider_resume_timeout_is_scaled_once_without_compounding() {
+    let (_temp, home) = home_with("[core]\ndefault_timeout_seconds = 600\n", &[]);
+    let service = Service::new(home.clone());
+    let mut parent_request = request(&home);
+    parent_request.request_id = Some("resume-multiplier-parent".into());
+    parent_request.timeout_seconds = Some(600.0);
+    let revision = Store::open(&home)
+        .unwrap()
+        .quota_capacity_revision()
+        .unwrap();
+    let value = service
+        .admit_provider_trusted(parent_request, candidates(revision))
+        .unwrap();
+    let parent: AgentId = serde_json::from_value(value["agent_id"].clone()).unwrap();
+    run_to_end(&home, &parent).await;
+    let column = |id: &AgentId| {
+        Store::open(&home)
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT timeout_seconds FROM agents WHERE id=?",
+                [id.as_str()],
+                |row| row.get::<_, f64>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(
+        column(&parent),
+        720.0,
+        "the parent base 600 was scaled once"
+    );
+    let parent_row = Store::open(&home).unwrap().get(&parent).unwrap();
+    let inherited = service
+        .admit_provider_resume(
+            &parent_row,
+            "fixture:answer".into(),
+            None,
+            Some("resume-multiplier-inherited".into()),
+            None,
+        )
+        .unwrap();
+    let child: AgentId = serde_json::from_value(inherited["agent_id"].clone()).unwrap();
+    assert_eq!(
+        column(&child),
+        720.0,
+        "an omitted timeout reuses the parent's effective allowance, not 600*1.2*1.2"
+    );
+    let child_row = Store::open(&home).unwrap().get(&child).unwrap();
+    let explicit = service
+        .admit_provider_resume(
+            &child_row,
+            "fixture:answer".into(),
+            Some(600.0),
+            Some("resume-multiplier-explicit".into()),
+            None,
+        )
+        .unwrap();
+    let grandchild: AgentId = serde_json::from_value(explicit["agent_id"].clone()).unwrap();
+    assert_eq!(
+        column(&grandchild),
+        720.0,
+        "a newly requested 600 is scaled once, however deep the lineage"
+    );
+}

@@ -459,7 +459,7 @@ pub struct Start {
     #[arg(
         long = "timeout",
         id = "timeout",
-        help = "Whole-run deadline in seconds, at most 2592000; defaults to core.default_timeout_seconds"
+        help = "Whole-run deadline in seconds, at most 2592000; defaults to core.default_timeout_seconds; either base is scaled once by core.timeout_multiplier"
     )]
     pub timeout_seconds: Option<f64>,
     #[arg(long = "read-root", id = "read_root")]
@@ -488,7 +488,11 @@ pub struct Resume {
     pub task: Option<String>,
     #[arg(long)]
     pub task_file: Option<PathBuf>,
-    #[arg(long = "timeout", id = "timeout")]
+    #[arg(
+        long = "timeout",
+        id = "timeout",
+        help = "Whole-run deadline in seconds, at most 2592000; a new value is scaled once by core.timeout_multiplier, omission inherits the previous run's effective deadline"
+    )]
     pub timeout_seconds: Option<f64>,
     #[arg(long)]
     pub request_id: Option<String>,
