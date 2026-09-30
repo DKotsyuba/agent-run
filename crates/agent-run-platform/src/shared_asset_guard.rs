@@ -565,7 +565,15 @@ mod tests {
             "printf bad > \"$1\"",
             &[&tree.join("new")]
         ));
-        assert!(!run(&guard, &work, "mv \"$1\" \"$2\"", &[&file, &payload]));
+        let replacement = work.join("replacement");
+        std::fs::write(&replacement, b"replacement").unwrap();
+        assert!(!run(
+            &guard,
+            &work,
+            "mv \"$1\" \"$2\"",
+            &[&replacement, &payload]
+        ));
+        assert_eq!(std::fs::read(&replacement).unwrap(), b"replacement");
         assert!(!run(&guard, &work, "chmod 600 \"$1\"", &[&payload]));
         assert_eq!(std::fs::read(&payload).unwrap(), b"payload");
         assert!(!tree.join("new").exists());

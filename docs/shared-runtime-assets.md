@@ -24,10 +24,14 @@ SHA-256 of the exact preimage
 named version directory is real, every payload and the unchanged
 `.agent-run-snapshot.json` bytes are internal hardlinks of the imported
 `trees/<scope>/<manifest-sha256>` entries, directories are owner-only `0o700`
-(published `0o500` trees and views from earlier releases remain verifiable and
+(previously published `0o500` trees and views remain verifiable and
 collectible), and no
 payload byte is copied. Ordinary skill and other roots keep the plain
 whole-root link; the original index bytes and index SHA-256 never change.
+Owner-only writable directory modes let the broker publish and collect on
+macOS versions that refuse renaming write-disabled directories. Payload files
+remain readonly; the qualified native shared-root guard prevents agent writes,
+entry replacement and permission changes throughout the store.
 Collection must drain obsolete `plugin-views` containers **before** the
 trees and blobs beneath them, and treat every view still referenced by a
 registered layout row as live (`agent-run-platform::plugin_views::{plugin_mount,

@@ -45,7 +45,9 @@ jobs:
         run: test "$(uname -m)" = "${{ matrix.architecture }}"
       - name: Verify shared filesystem support
         if: runner.os == 'macOS'
-        run: cargo test --offline --locked -p agent-run-platform --all-features --lib shared_assets -- --nocapture
+        run: |
+          cargo test --offline --locked -p agent-run-platform --all-features --lib shared_assets -- --nocapture
+          cargo test --offline --locked -p agent-run-platform --all-features --lib shared_asset_guard::tests::live_native_guard -- --ignored --exact
       - name: Run workspace gates
         run: cargo xtask check
       - name: Verify desktop transport and service probe fixtures

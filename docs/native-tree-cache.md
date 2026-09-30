@@ -121,7 +121,7 @@ The store publisher uses two barriers: every new payload streams into an
 exclusive temporary blob and is pushed, one barrier persists them all,
 and only then are the temporaries renamed to canonical names (so a
 canonical name never refers to non-durable data); the staged tree's
-directories, links and readonly modes are pushed per directory and a
+directories, links and final owner-only directory modes are pushed per directory and a
 second barrier persists them before the no-replace rename publishes the
 tree. A failure before the first barrier publishes nothing; leftovers of a
 later crash (canonical blobs, temporary blobs, staging trees) are verified
