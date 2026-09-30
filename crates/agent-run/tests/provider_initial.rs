@@ -3302,13 +3302,20 @@ fn times(home: &Path, id: &AgentId, number: u32) -> ((f64, f64), (f64, f64)) {
     (agent, attempt)
 }
 
-/// One deadline spans the whole run: A (a 1.5 s exhausted turn) consumes part
+/// With the configurable margin disabled, one deadline spans the whole run:
+/// A (a 1.5 s exhausted turn) consumes part
 /// of a 5 s budget, B hangs and is stopped at the ORIGINAL deadline — not 5 s
 /// after B started (a fresh budget would end at least ~7 s after admission) — with confirmed cleanup, `timed_out` once, and no third
 /// attempt.
 #[tokio::test]
 async fn one_deadline_spans_attempts_and_cleans_a_hung_engine() {
     let (_temp, home) = codex_home(["exhausted-slow", "ok-hold"]);
+    edit_config(&home, |config| {
+        config.as_table_mut().unwrap().insert(
+            "core".into(),
+            toml::Value::Table(toml::toml! { timeout_multiplier = 1.0 }),
+        );
+    });
     let id = codex_admit(&home, "deadline-1", Some(5.0));
     run_to_end(&home, &id).await;
     let row = Store::open(&home).unwrap().get(&id).unwrap();
