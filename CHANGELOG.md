@@ -16,6 +16,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   references it, and qualify native launches before publishing shared assets;
   the shared-store launch protection is currently qualified on macOS only
 
+Upgrade: use the new binary's `config migrate` procedure before installing
+against an existing schema-21 home (`agent-run doc migrations`). Installation
+does not silently migrate the database; compaction is a separate offline step.
+
 ## [0.19.0] - 2026-09-28
 
 - feat(tui): ship `agent-run-tui` as a separate read-only terminal observer

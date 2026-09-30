@@ -18,7 +18,7 @@ number, and one entry per retained runtime home with its classification:
   cache-only anchor of a home with no managed roots.
 - `eligible` — a private home the read-only planner can still strictly verify.
 - `prepared` — an interrupted relocation holds the home; run `storage recover`.
-- `protected` — an active or lost holder keeps it, or it has no managed roots.
+- `protected` — an active or lost holder keeps it.
 - `gone` — the physical home is gone; only its registry row may remain.
 - `unknown` — evidence is missing, unreadable or tampered. Never touched.
 
@@ -27,10 +27,10 @@ identity records is reported `unknown` and never migrated. Logical savings
 (unique inode bytes) are never reported as physical free-space gains: clones,
 snapshots and hardlinks mean the two numbers move independently.
 
-## `agent-run storage compact` / `--apply`
+## `agent-run storage compact --dry-run` / `--apply`
 
-The default is a dry run: the survey above plus exactly what collection would
-reclaim, writing nothing. `--apply` additionally:
+Choose one flag explicitly. `--dry-run` reports the survey above plus exactly
+what collection would reclaim, writing nothing. `--apply` additionally:
 
 1. holds the broker and service-manager startup locks (`.api.sock.lock`,
    `.services.lock`) — the same exclusion `config migrate --apply` uses, so a
@@ -41,7 +41,7 @@ reclaim, writing nothing. `--apply` additionally:
    recorded account — never the current provider, never a rewritten config. A
    home whose workdir, binary, grants or sandbox boundary cannot be verified
    is skipped with its reason and preserved byte count;
-4. consolidates each eligible home's native caches under the same locks and
+4. consolidates each eligible or already-shared idle home's native caches under the same locks and
    the same latest-terminal authority, behind the same real guard
    qualification as a managed relocation: the home is anchored (cache-only
    homes included), eligible native trees are frozen and both metadata caches
