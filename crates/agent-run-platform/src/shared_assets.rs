@@ -1115,6 +1115,72 @@ mod tests {
         .is_err());
     }
 
+    /// Exercises the readonly publication primitives with stage-specific
+    /// failures, so a host permission difference is distinguishable from a
+    /// manifest or supervisor error. Published payloads and trees stay readonly.
+    #[test]
+    fn readonly_publication_primitives_keep_their_contract() {
+        let (_temporary, root) = store_root();
+        let directory = Dir::open(&root).expect("open owned store");
+        let mut file = directory
+            .create_exclusive(Path::new("pending"), 0o400)
+            .expect("create readonly temporary blob");
+        file.write_all(b"payload")
+            .expect("write through creator descriptor");
+        crate::fs::push(&file).expect("push readonly blob contents");
+        drop(file);
+        directory.sync().expect("persist blob contents");
+        assert!(directory
+            .rename_entry_no_replace_flushed(
+                Path::new("pending"),
+                Path::new("blob"),
+                Flush::Skipped
+            )
+            .expect("rename readonly blob"));
+        directory.push().expect("push blob namespace");
+        directory
+            .directory(Path::new("staged"))
+            .expect("create staged tree");
+        assert!(directory
+            .hardlink_flushed(
+                Path::new("staged/leaf"),
+                &directory,
+                Path::new("blob"),
+                Flush::Skipped
+            )
+            .expect("link readonly blob into staged tree"));
+        directory
+            .write(Path::new("staged/manifest"), b"manifest", 0o400)
+            .expect("write readonly manifest");
+        let tree = directory
+            .subdir(Path::new("staged"))
+            .expect("open staged tree");
+        tree.restrict_owner_read()
+            .expect("seal staged directory mode");
+        tree.push().expect("push readonly directory metadata");
+        directory.sync().expect("persist staged namespace");
+        assert!(directory
+            .rename_entry_no_replace(Path::new("staged"), Path::new("published"))
+            .expect("publish readonly tree"));
+        assert_eq!(
+            inode_of(&root.join("blob")),
+            inode_of(&root.join("published/leaf"))
+        );
+        assert_eq!(
+            directory.entry(Some(Path::new("published"))).unwrap().mode,
+            0o500
+        );
+        assert_eq!(
+            directory
+                .entry(Some(Path::new("published/leaf")))
+                .unwrap()
+                .mode,
+            0o400
+        );
+        tree.permit_owner_write()
+            .expect("allow owned fixture cleanup");
+    }
+
     /// Two imports of one sealed tree converge on one ref and shared inodes
     /// while the source keeps its independent inode.
     #[test]
