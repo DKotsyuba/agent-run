@@ -45,6 +45,9 @@ jobs:
         run: test "$(uname -m)" = "${{ matrix.architecture }}"
       - name: Run workspace gates
         run: cargo xtask check
+      - name: Diagnose shared filesystem failures
+        if: failure() && runner.os == 'macOS'
+        run: cargo test --offline --locked -p agent-run-platform --all-features --lib shared_assets -- --nocapture
       - name: Verify desktop transport and service probe fixtures
         run: node --test scripts/check-desktop-transport.cjs scripts/check-codegraph-probe.cjs
       - name: Build and verify sealed native release
