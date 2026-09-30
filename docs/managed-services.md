@@ -89,6 +89,10 @@ See [process identity](process-identity.md) for platform limits.
 
 ## Broker lifecycle contract
 
+One manager holds a home-wide writer lock, including brokers on custom sockets.
+Dropping the manager explicitly releases this lock without stopping services;
+inherited descriptors waiting for exec cannot delay a replacement manager.
+
 The broker warms every configured service before a new harness starts.
 Concurrent agents share one generation. Pending or active agents retain leases;
 unresolved process ownership retains them even after an agent is marked lost.
