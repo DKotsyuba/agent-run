@@ -1624,13 +1624,33 @@ async fn provider_resume_checks_frozen_default_effort() {
 
 /// Runs one admitted provider agent to its terminal state through the real
 /// supervisor executable (bounded to 20 s).
+///
+/// On failure, reports only the durable status, failure kind, bounded public
+/// failure text and exit code. Task, identity and environment fields are never
+/// printed, and diagnostics preserve the original timeout and failure.
 async fn run_to_end(home: &Path, id: &AgentId) {
     let mut child = supervisor(home, id);
     let exit = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .unwrap()
         .unwrap();
-    assert!(exit.success(), "supervisor exit: {exit}");
+    if exit.success() {
+        return;
+    }
+    let row = Store::open(home).ok().and_then(|store| store.get(id).ok());
+    let row = row
+        .map(|row| {
+            let failure_text = row
+                .failure_text
+                .as_deref()
+                .map(|text| text.chars().take(2048).collect::<String>());
+            format!(
+                "status={:?} failure_kind={:?} failure_text={:?} exit_code={:?}",
+                row.status, row.failure_kind, failure_text, row.exit_code
+            )
+        })
+        .unwrap_or_else(|| "row unreadable".into());
+    panic!("supervisor exit: {exit}; {row}");
 }
 
 /// Returns the parsed adapter state of `id`'s latest attempt.
