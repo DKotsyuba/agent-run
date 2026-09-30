@@ -85,6 +85,8 @@ fn role_payload() -> serde_json::Value {
 fn plan(binary: &Path) -> ProviderLaunchPlan {
     let role =
         agent_run_config::role_plan::ResolvedRolePlan::from_payload(&role_payload()).unwrap();
+    let mut runtime = runtime(Path::new("/tmp"));
+    runtime.binary = binary.to_path_buf();
     ProviderLaunchPlan {
         launch: LaunchPlan {
             binary: binary.to_path_buf(),
@@ -95,7 +97,7 @@ fn plan(binary: &Path) -> ProviderLaunchPlan {
         },
         native_model: "gpt-5.6-sol".into(),
         role,
-        runtime: runtime(Path::new("/tmp")),
+        runtime,
         profile: profile_writing(false),
     }
 }
