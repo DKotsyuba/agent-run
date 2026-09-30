@@ -6,7 +6,10 @@
 //! multiplier) must stay inside the shared 2592000-second run-timeout bound so
 //! a fresh admission can never overflow the deadline arithmetic.
 
-use agent_run_config::{config::Config, provider_config::ProviderConfig};
+use agent_run_config::{
+    config::{Config, Core},
+    provider_config::ProviderConfig,
+};
 
 /// Loads one schema-1 home whose `[core]` section is exactly `core`.
 fn load(core: &str) -> Result<Config, agent_run_domain::Error> {
@@ -107,5 +110,91 @@ fn effective_timeout_seconds_multiplies_exactly_once() {
     assert!(
         overflow.to_string().contains("core.timeout_multiplier"),
         "{overflow}"
+    );
+}
+
+/// The core table exactly as a pre-field serializer emitted it, hand-written
+/// so the compatibility proofs below compare against real history rather
+/// than the current serializer's own output.
+fn pre_field_core() -> serde_json::Value {
+    serde_json::json!({
+        "default_timeout_seconds": 480.0,
+        "max_active_agents": 6,
+        "warning_fraction": 0.9,
+        "stalled_after_seconds": 900.0,
+    })
+}
+
+/// Historical v2 snapshots frozen before `core.timeout_multiplier` existed
+/// keep their exact digest: the default `1.2` is skipped at serialization, so
+/// a pre-field normalized document round-trips byte-identically, its
+/// re-computed snapshot equals the stored one (the exact comparison
+/// `ProviderLaunchIdentity::read` performs), and the sealed `sha256` matches
+/// the digest the old code computed over the same document. Every explicit
+/// non-default factor stays in the document and therefore in the digest.
+#[test]
+fn historical_absent_field_preserves_v2_snapshot() {
+    let config = parse_v2("").unwrap();
+    let historical = serde_json::to_value(&config).unwrap();
+    assert_eq!(
+        historical["core"],
+        pre_field_core(),
+        "the default margin serializes exactly like a pre-field core"
+    );
+    let frozen = config.snapshot().unwrap();
+    assert_eq!(
+        frozen["sha256"],
+        serde_json::json!(agent_run_domain::canonical::sha256_hex(&historical, true)),
+        "the sealed digest is the pre-field document's digest"
+    );
+    let revived: ProviderConfig = serde_json::from_value(historical.clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&revived).unwrap(),
+        historical,
+        "the normalized document round-trips byte-identically"
+    );
+    assert_eq!(
+        revived.snapshot().unwrap(),
+        frozen,
+        "a frozen pre-field identity re-snapshots to its stored value"
+    );
+    let disabled = parse_v2("[core]\ntimeout_multiplier = 1.0\n").unwrap();
+    assert_eq!(
+        serde_json::to_value(&disabled).unwrap()["core"]["timeout_multiplier"],
+        serde_json::json!(1.0),
+        "an explicit factor is emitted"
+    );
+    assert_ne!(
+        disabled.snapshot().unwrap()["sha256"],
+        frozen["sha256"],
+        "an explicit factor changes the digest"
+    );
+    assert_ne!(
+        parse_v2("[core]\ntimeout_multiplier = 2.5\n")
+            .unwrap()
+            .snapshot()
+            .unwrap()["sha256"],
+        disabled.snapshot().unwrap()["sha256"],
+        "different factors keep different digests"
+    );
+}
+
+/// A `Core` and a schema-1 `Config` serialized before the field existed parse
+/// back with the default margin and re-serialize to the identical document,
+/// so legacy launch identities embedding a serialized `Config` keep their
+/// bytes and stay resumable.
+#[test]
+fn legacy_serialized_core_and_config_round_trip_without_the_field() {
+    let historical = pre_field_core();
+    let core: Core = serde_json::from_value(historical.clone()).unwrap();
+    assert_eq!(core.timeout_multiplier, 1.2);
+    assert_eq!(serde_json::to_value(&core).unwrap(), historical);
+    let document = serde_json::to_value(load("").unwrap()).unwrap();
+    assert_eq!(document["core"], historical);
+    let revived: Config = serde_json::from_value(document.clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&revived).unwrap(),
+        document,
+        "a legacy serialized schema-1 Config round-trips byte-identically"
     );
 }

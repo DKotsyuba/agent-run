@@ -4612,6 +4612,9 @@ async fn provider_resume_timeout_is_scaled_once_without_compounding() {
         720.0,
         "an omitted timeout reuses the parent's effective allowance, not 600*1.2*1.2"
     );
+    // The second resume reads the child's frozen identity, which exists only
+    // once the child has actually run and sealed its runtime session.
+    run_to_end(&home, &child).await;
     let child_row = Store::open(&home).unwrap().get(&child).unwrap();
     let explicit = service
         .admit_provider_resume(

@@ -83,6 +83,12 @@ pub struct Core {
     /// `default_timeout_seconds` when the request omits one. Finite and at
     /// least `1.0`; `1.0` disables the margin. Existing runs, frozen
     /// snapshots and inherited resume timeouts are never re-scaled.
+    ///
+    /// The default `1.2` is omitted from serialization: pre-field snapshots
+    /// and identities never carried the key, so skipping the default keeps
+    /// their normalized documents and digests byte-identical, while every
+    /// other value is emitted and sealed into the config digest.
+    #[serde(skip_serializing_if = "is_default_timeout_multiplier")]
     pub timeout_multiplier: f64,
     pub max_active_agents: usize,
     pub warning_fraction: f64,
@@ -212,6 +218,12 @@ pub struct Mcp {
 /// Returns whether a boolean is `false`, for skipping default serialization.
 fn is_false(value: &bool) -> bool {
     !*value
+}
+/// Returns whether `multiplier` equals the documented default margin, so the
+/// default serializes exactly like a pre-field document and historical
+/// snapshots keep their frozen digest; any other value is emitted.
+fn is_default_timeout_multiplier(multiplier: &f64) -> bool {
+    *multiplier == 1.2
 }
 fn auto() -> String {
     "auto".into()
