@@ -76,18 +76,21 @@ and credentials are intentionally unavailable.
 `claude_uds` attempts record the same evidence shape with `classifier`
 `uds_receipt_held`, `uds_receipt_delivered`, `uds_receipt_refused`,
 `uds_unconfirmed`, `uds_ambiguous`, `uds_session_gone`, `uds_rejected`, or
-`uds_unavailable`. Each send advertises an ephemeral reply socket beside the
-inbox socket and correlates the inbox's native hold-receipt by notification
-id: `uds_receipt_held` means the inbox confirmed it queued the notice (the
-`delivered` variant means it confirmed handing it to the session
-immediately); enqueue confirmation is still not proof the recipient's model
-read the message. `uds_unconfirmed` (a clean write with no correlated
-receipt, for example on an inbox that never answers or when no reply socket
-could be bound) is not success: it retries with backoff and then ends
-`failed` with `ambiguous: true`, meaning the notice was written to the inbox
-socket up to three times without confirmation. If a notice looks lost,
-check the recipient Claude session's queue state before resending, because
-a retried notice may already be sitting in that queue.
+`uds_unavailable`. Each send proves the inbox socket's kernel peer identity
+(the descriptor's process id as this user) before any frame is written,
+advertises an ephemeral reply socket beside the inbox socket, and correlates
+the inbox's native hold-receipt by notification id, accepting it only from
+the same proven receiver identity: `uds_receipt_held` means the inbox
+confirmed it queued the notice (the `delivered` variant means it confirmed
+handing it to the session immediately); enqueue confirmation is still not
+proof the recipient's model read the message. `uds_unconfirmed` (a clean
+write with no correlated receipt, for example on an inbox that never answers
+or when no reply socket could be bound) and `uds_ambiguous` (an interrupted
+write) are both uncertain, not success: they retry with backoff and then end
+`failed` with `ambiguous: true`, meaning the notice was written toward the
+inbox socket at most three times without confirmation. If a notice looks
+lost, check the recipient Claude session's queue state before resending,
+because a retried notice may already be sitting in that queue.
 
 Desktop relay discovery requires the MCP process to have started with absolute
 `CODEX_MCP_NODE_PATH` and `CODEX_APP_TOOLS_PIPE_PATH` values. In that mode the

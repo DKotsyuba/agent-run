@@ -21,10 +21,11 @@ const LEASE_SECONDS: f64 = 30.0;
 const MAX_TAIL_BYTES: usize = 4096;
 const MAX_EVIDENCE_BYTES: usize = 16 * 1024;
 const DEFAULT_MAX_BATCH: usize = 1000;
-/// Claude inbox attempts that never confirm enqueue before the notice stops
-/// retrying; a configured `max_attempts` of zero means unlimited retries, so
-/// without this cap one fire-and-forget notice would duplicate forever.
-const CLAUDE_UNCONFIRMED_MAX_ATTEMPTS: u32 = 3;
+/// Claude inbox attempts whose outcome stays uncertain (unconfirmed or
+/// ambiguous) before the notice stops retrying; a configured `max_attempts`
+/// of zero means unlimited retries, so without this cap one fire-and-forget
+/// notice would duplicate forever.
+const CLAUDE_UNCERTAIN_MAX_ATTEMPTS: u32 = 3;
 /// Version of the frozen completion-notice payload.
 pub const NOTICE_VERSION: u32 = 1;
 
@@ -566,10 +567,10 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
 /// transaction, using the delivery policy from either supported config schema.
 ///
 /// A Claude inbox attempt is never accepted on write alone (see
-/// [`claude::send`]); its `uds_unconfirmed` observations retry with backoff
-/// until [`CLAUDE_UNCONFIRMED_MAX_ATTEMPTS`] and then fail terminally with the
-/// ambiguous flag set, so one notice can neither look delivered without a
-/// confirmation nor duplicate forever.
+/// [`claude::send`]); its uncertain observations (`uds_unconfirmed` or
+/// `uds_ambiguous`) retry with backoff until [`CLAUDE_UNCERTAIN_MAX_ATTEMPTS`]
+/// and then fail terminally with the ambiguous flag set, so one notice can
+/// neither look delivered without a confirmation nor duplicate forever.
 fn complete(home: &Path, claim: &Claim, evidence: &Evidence) -> Result<()> {
     let delivery = match ProviderConfig::load(home) {
         Ok((config, _)) => config.delivery,
@@ -591,11 +592,14 @@ fn complete(home: &Path, claim: &Claim, evidence: &Evidence) -> Result<()> {
     let accepted = evidence.accepted();
     let ambiguous = evidence.ambiguous();
     let exhausted = delivery.max_attempts > 0 && claim.attempt >= delivery.max_attempts;
-    let unconfirmed_exhausted = claim.transport == "claude_uds"
-        && evidence.classifier == "uds_unconfirmed"
-        && claim.attempt >= CLAUDE_UNCONFIRMED_MAX_ATTEMPTS;
+    let uncertain_exhausted = claim.transport == "claude_uds"
+        && matches!(
+            evidence.classifier.as_str(),
+            "uds_unconfirmed" | "uds_ambiguous"
+        )
+        && claim.attempt >= CLAUDE_UNCERTAIN_MAX_ATTEMPTS;
     let failed = !accepted
-        && (exhausted || unconfirmed_exhausted || evidence.classifier == "unsupported_transport");
+        && (exhausted || uncertain_exhausted || evidence.classifier == "unsupported_transport");
     let state = if accepted {
         "delivered"
     } else if failed {

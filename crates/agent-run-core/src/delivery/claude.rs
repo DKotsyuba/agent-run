@@ -3,7 +3,8 @@
 use super::{Evidence, Notice};
 use agent_run_domain::worker::WorkerNotice;
 use serde_json::{json, Value};
-use std::os::unix::fs::FileTypeExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -91,20 +92,29 @@ pub async fn send_after(
 
 /// An ephemeral reply socket this process bound beside the target inbox.
 ///
-/// Dropping the guard removes exactly the socket file it created, and only
-/// while that path is still a socket inode, so cancellation, panics, and
-/// early returns cannot leak the endpoint and can never delete a file some
-/// other process replaced it with.
+/// The bound inode's kernel identity is recorded at bind time; dropping the
+/// guard removes the path only while it is still a socket with that exact
+/// device and inode number, so cancellation, panics, and early returns
+/// cannot leak the endpoint and can never unlink a file another process
+/// renamed over it.
 struct OwnedCallback {
     path: PathBuf,
+    /// Device number of the bound socket inode.
+    device: u64,
+    /// Inode number of the bound socket inode.
+    inode: u64,
 }
 
 impl Drop for OwnedCallback {
     fn drop(&mut self) {
-        if std::fs::symlink_metadata(&self.path)
-            .map(|metadata| metadata.file_type().is_socket())
-            .unwrap_or(false)
-        {
+        let still_owned = std::fs::symlink_metadata(&self.path)
+            .map(|metadata| {
+                metadata.file_type().is_socket()
+                    && metadata.dev() == self.device
+                    && metadata.ino() == self.inode
+            })
+            .unwrap_or(false);
+        if still_owned {
             let _ = std::fs::remove_file(&self.path);
         }
     }
@@ -114,11 +124,16 @@ impl Drop for OwnedCallback {
 ///
 /// The native reply-address check accepts any `*.sock` endpoint that shares
 /// the inbox socket's resolved directory, so a fresh unguessable name there
-/// is a valid `from` target. Binding uses a fresh name so an existing file
-/// fails the bind instead of being touched; the created endpoint is verified
-/// to be a real socket (never a symlink) before it is advertised. Returns
-/// `None` when the directory is missing or not writable, in which case the
-/// send proceeds without a reply address and cannot be confirmed.
+/// is a valid `from` target. The directory is used exactly as the inbox
+/// socket spells it, without canonicalization: the native check resolves
+/// both sides itself, and rewrites such as `/tmp` to `/private/tmp` on macOS
+/// must not diverge from the advertised path. Binding uses a fresh name so
+/// an existing file fails the bind instead of being touched; the endpoint is
+/// advertised only when the bound inode is provably the plain socket this
+/// bind created. A path replaced after the bind is left for its new owner,
+/// never unlinked. Returns `None` when the directory is missing or not
+/// writable, in which case the send proceeds without a reply address and
+/// cannot be confirmed.
 fn bind_callback(inbox_socket: &Path) -> Option<(OwnedCallback, UnixListener)> {
     let directory = inbox_socket.parent()?;
     for _ in 0..3 {
@@ -127,38 +142,111 @@ fn bind_callback(inbox_socket: &Path) -> Option<(OwnedCallback, UnixListener)> {
         let name = format!("{}.sock", &uuid::Uuid::new_v4().simple().to_string()[..12]);
         let path = directory.join(name);
         let listener = UnixListener::bind(&path).ok()?;
-        // Advertise only an endpoint we still own as a plain socket inode.
-        let owned = std::fs::symlink_metadata(&path)
-            .map(|metadata| metadata.file_type().is_socket())
-            .unwrap_or(false);
-        if owned {
-            return Some((OwnedCallback { path }, listener));
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_socket() => {
+                return Some((
+                    OwnedCallback {
+                        path,
+                        device: metadata.dev(),
+                        inode: metadata.ino(),
+                    },
+                    listener,
+                ));
+            }
+            // The path no longer names our bound socket: another process
+            // replaced or removed it, and the replacement is not ours to
+            // unlink. Dropping the listener releases our inode only.
+            _ => drop(listener),
         }
-        drop(listener);
-        let _ = std::fs::remove_file(&path);
     }
     None
+}
+
+/// Reads the kernel-proven `(pid, uid)` identity of a connected socket's peer
+/// using the macOS local-socket credential options; `None` when the kernel
+/// does not report a peer identity.
+#[cfg(target_os = "macos")]
+fn peer_identity(stream: &UnixStream) -> Option<(i32, u32)> {
+    let fd = stream.as_raw_fd();
+    let mut pid: libc::pid_t = 0;
+    let mut pid_size = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most one pid_t into the correctly sized
+    // buffer and reads nothing else.
+    let pid_ok = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut pid_size,
+        ) == 0
+    };
+    // SAFETY: an all-zero xucred is a valid unpopulated credential value
+    // that getsockopt fills completely below.
+    let mut cred: libc::xucred = unsafe { std::mem::zeroed() };
+    let mut cred_size = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most one xucred into the correctly sized
+    // buffer and reads nothing else.
+    let cred_ok = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERCRED,
+            (&mut cred as *mut libc::xucred).cast(),
+            &mut cred_size,
+        ) == 0
+    };
+    (pid_ok && cred_ok && pid > 0).then_some((pid, cred.cr_uid))
+}
+
+/// Reads the kernel-proven `(pid, uid)` identity of a connected socket's peer
+/// from the portable socket credential API; `None` when unavailable.
+#[cfg(not(target_os = "macos"))]
+fn peer_identity(stream: &UnixStream) -> Option<(i32, u32)> {
+    let cred = stream.peer_cred().ok()?;
+    Some((cred.pid(), cred.uid()))
+}
+
+/// Returns this process's effective user id, the only uid permitted on
+/// either delivery connection.
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid only reads kernel state and cannot fail.
+    unsafe { libc::geteuid() }
 }
 
 /// Waits one bounded window for the inbox hold-receipt that matches `msg_id`.
 ///
 /// Only a `control`/`peer_message_status` frame whose `orig_msg_id` equals
 /// this attempt's notification id and whose `status` is a native enqueue
-/// outcome is honoured; every other frame, connection, or silence is ignored.
-/// Returns the native status word of the first correlated receipt.
-async fn await_receipt(listener: UnixListener, msg_id: &str) -> Option<&'static str> {
+/// outcome is honoured, and only when the connecting peer's kernel-proven
+/// identity is the descriptor's receiver process running as this user; every
+/// other frame, connection, or silence is ignored. Each connection may feed
+/// at most `RECEIPT_FRAME_LIMIT + 1` bytes into memory, so a hostile or
+/// endless stream is bounded before allocation, not after. Returns the
+/// native status word of the first correlated receipt.
+async fn await_receipt(
+    listener: UnixListener,
+    msg_id: &str,
+    receiver: (i64, u32),
+) -> Option<&'static str> {
     let deadline = tokio::time::Instant::now() + RECEIPT_WAIT;
     for _ in 0..RECEIPT_CONNECTION_LIMIT {
         let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
         if wait.is_zero() {
             return None;
         }
-        let (mut stream, _) = match tokio::time::timeout(wait, listener.accept()).await {
+        let (stream, _) = match tokio::time::timeout(wait, listener.accept()).await {
             Ok(Ok(connection)) => connection,
             Ok(Err(_)) | Err(_) => return None,
         };
+        // A different process that found the reply socket is not the
+        // receiver, even with a perfectly formed receipt.
+        if peer_identity(&stream).map(|(pid, uid)| (pid as i64, uid)) != Some(receiver) {
+            continue;
+        }
         let mut frame = Vec::new();
-        let read = tokio::time::timeout_at(deadline, stream.read_to_end(&mut frame)).await;
+        let mut bounded = stream.take(RECEIPT_FRAME_LIMIT as u64 + 1);
+        let read = tokio::time::timeout_at(deadline, bounded.read_to_end(&mut frame)).await;
         if !matches!(read, Ok(Ok(_))) || frame.len() > RECEIPT_FRAME_LIMIT {
             continue;
         }
@@ -246,6 +334,12 @@ async fn send_text_after(
             Ok(Err(_)) => return uds_evidence("uds_unavailable", false, false),
             Err(_) => return uds_evidence("uds_session_gone", false, false),
         };
+    // Prove the endpoint still belongs to the descriptor's process, as this
+    // user, before any token or frame is written: a rebound or foreign
+    // endpoint fails closed with nothing sent.
+    if peer_identity(&stream).map(|(pid, uid)| (pid as i64, uid)) != Some((pid, effective_uid())) {
+        return uds_evidence("uds_unavailable", false, false);
+    }
     before_write.await;
     let from = callback
         .as_ref()
@@ -278,7 +372,7 @@ async fn send_text_after(
         // the attempt is explicitly unconfirmed rather than delivered.
         return uds_evidence("uds_unconfirmed", false, true);
     };
-    match await_receipt(listener, msg_id).await {
+    match await_receipt(listener, msg_id, (pid, effective_uid())).await {
         Some("held") => uds_evidence("uds_receipt_held", true, false),
         Some("delivered") => uds_evidence("uds_receipt_delivered", true, false),
         // A native refusal is a definite non-acceptance, not an ambiguity.
@@ -374,4 +468,51 @@ fn token(registry: &Path, pid: i64) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_callback;
+    use std::os::unix::fs::FileTypeExt;
+
+    /// The reply endpoint removes only the exact inode it bound: a path
+    /// replaced by a regular file or by a different socket survives the
+    /// guard, while the owned endpoint itself is always removed.
+    #[tokio::test]
+    async fn callback_removal_requires_the_exact_owned_inode() {
+        let directory = tempfile::tempdir().unwrap();
+        let inbox = directory.path().join("inbox.sock");
+
+        // A replacement regular file is never unlinked.
+        let (owned, listener) = bind_callback(&inbox).unwrap();
+        let replaced = owned.path.clone();
+        std::fs::remove_file(&replaced).unwrap();
+        std::fs::write(&replaced, b"replacement").unwrap();
+        drop(listener);
+        drop(owned);
+        assert!(replaced.is_file(), "a replacement file must survive");
+
+        // A replacement socket bound by someone else is never unlinked.
+        let (owned, listener) = bind_callback(&inbox).unwrap();
+        let rebound = owned.path.clone();
+        std::fs::remove_file(&rebound).unwrap();
+        let other = tokio::net::UnixListener::bind(&rebound).unwrap();
+        drop(listener);
+        drop(owned);
+        assert!(
+            std::fs::symlink_metadata(&rebound)
+                .map(|metadata| metadata.file_type().is_socket())
+                .unwrap_or(false),
+            "a foreign replacement socket must survive"
+        );
+        drop(other);
+        let _ = std::fs::remove_file(&rebound);
+
+        // The endpoint this process owns is removed.
+        let (owned, listener) = bind_callback(&inbox).unwrap();
+        let owned_path = owned.path.clone();
+        drop(listener);
+        drop(owned);
+        assert!(!owned_path.exists(), "the owned endpoint must be removed");
+    }
 }

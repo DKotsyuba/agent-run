@@ -556,18 +556,72 @@ async fn host_exchange(request: Value, mode: &str) -> (Value, Option<Value>) {
     (response, called)
 }
 
-/// Writes a fake Claude descriptor and its paired inbox key under a temporary registry.
+/// Writes a fake Claude descriptor and its paired inbox key under a temporary
+/// registry, named for this process: the fake inbox listens from inside this
+/// test process, so the receiver identity the sender must prove is the real
+/// process id, never a placeholder.
 fn claude_descriptor(registry: &Path, session: &str, socket: &Path) {
+    let pid = std::process::id();
     std::fs::write(
-        registry.join("41.json"),
-        json!({"sessionId":session,"messagingSocketPath":socket,"pid":41}).to_string(),
+        registry.join(format!("{pid}.json")),
+        json!({"sessionId":session,"messagingSocketPath":socket,"pid":pid}).to_string(),
     )
     .unwrap();
     std::fs::write(
-        registry.join("41.fixture.key"),
+        registry.join(format!("{pid}.fixture.key")),
         r#"{"peerToken":"fixture-token"}"#,
     )
     .unwrap();
+}
+
+/// A bounded child that is always killed and reaped, even when the owning
+/// test panics or is cancelled while it runs.
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Forger child entry point: connects to the first foreign `*.sock` it finds
+/// in the directory named by `AGENT_RUN_FORGER_DIR` and writes a perfectly
+/// formed receipt for `AGENT_RUN_FORGER_MSG`. It runs as a different process,
+/// so the sender must reject it on peer identity, not on frame shape.
+#[test]
+fn claude_uds_forger_child() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    let Ok(directory) = std::env::var("AGENT_RUN_FORGER_DIR") else {
+        return;
+    };
+    let msg = std::env::var("AGENT_RUN_FORGER_MSG").unwrap();
+    let mut target = None;
+    for _ in 0..60 {
+        target = std::fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "sock")
+                    && path.file_name().is_some_and(|name| name != "inbox.sock")
+            });
+        if target.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let target = target.expect("a reply socket to attack");
+    let mut stream = UnixStream::connect(target).unwrap();
+    let frame = json!({
+        "type":"control","action":"peer_message_status","status":"held",
+        "orig_msg_id":msg,"from":"uds:ignored","reason":"queue"
+    });
+    stream.write_all(format!("{}\n", frame).as_bytes()).unwrap();
+    stream.flush().unwrap();
 }
 
 /// Mirrors `tests/test_delivery_base.py::test_metadata_must_be_bounded_strings_or_none`.
@@ -793,6 +847,181 @@ async fn claude_uds_unwritable_directory_sends_without_reply_address() {
     std::fs::set_permissions(temporary.path(), mode).unwrap();
     peer.await.unwrap();
     assert_eq!(evidence.classifier, "uds_unconfirmed");
+}
+
+/// A receipt forged by a DIFFERENT process with a perfectly formed frame is
+/// rejected on kernel peer identity, never on frame shape: the forger child
+/// completes its attack, and the attempt still ends unconfirmed.
+#[tokio::test]
+async fn claude_uds_forged_receipt_from_other_process_is_rejected() {
+    use tokio::io::AsyncReadExt;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let registry = temporary.path().join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    let socket = temporary.path().join("inbox.sock");
+    claude_descriptor(&registry, "session-1", &socket);
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let silent = tokio::spawn(async move {
+        // Reads the frames and never answers, keeping the sender waiting.
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut received = String::new();
+        stream.read_to_string(&mut received).await.unwrap();
+    });
+    let mut forger = std::process::Command::new(std::env::current_exe().unwrap());
+    forger
+        .args([
+            "--exact",
+            "claude_uds_forger_child",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env("AGENT_RUN_FORGER_DIR", temporary.path())
+        .env("AGENT_RUN_FORGER_MSG", "ntf_test");
+    let mut guard = ChildGuard(forger.spawn().unwrap());
+    // Hold the connection open before writing so a slow-starting forger child
+    // still lands its attack inside the sender's bounded receipt window.
+    let attacked = notice();
+    let evidence = claude::send_after(
+        &registry,
+        "session-1",
+        &attacked,
+        tokio::time::sleep(Duration::from_secs(1)),
+    )
+    .await;
+    assert!(
+        guard.0.wait().unwrap().success(),
+        "forger child must complete its attack for the rejection to prove anything"
+    );
+    silent.await.unwrap();
+    assert_eq!(evidence.classifier, "uds_unconfirmed");
+}
+
+/// An endless oversized receipt stream is bounded before allocation and never
+/// accepted: the sender stops reading past the frame limit and ends
+/// unconfirmed with its reply endpoint cleaned up.
+#[tokio::test]
+async fn claude_uds_endless_receipt_stream_stays_bounded_and_unaccepted() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let temporary = tempfile::tempdir().unwrap();
+    let registry = temporary.path().join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    let socket = temporary.path().join("inbox.sock");
+    claude_descriptor(&registry, "session-1", &socket);
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut received = String::new();
+        stream.read_to_string(&mut received).await.unwrap();
+        let user: Value = serde_json::from_str(received.lines().nth(1).unwrap()).unwrap();
+        let target = user["from"].as_str().unwrap().strip_prefix("uds:").unwrap();
+        let mut reply = tokio::net::UnixStream::connect(target).await.unwrap();
+        // Far more than the frame limit, with no newline-terminated valid
+        // frame, and the connection is then held open to the end. A write
+        // error is expected: the sender stops reading past its bound.
+        let _ = reply.write_all(&vec![b'x'; 64 * 1024]).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    });
+    let evidence = claude::send(&registry, "session-1", &notice()).await;
+    peer.await.unwrap();
+    assert_eq!(evidence.classifier, "uds_unconfirmed");
+    let leftovers: Vec<_> = std::fs::read_dir(temporary.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".sock") && name != "inbox.sock")
+        .collect();
+    assert!(leftovers.is_empty(), "reply sockets leaked: {leftovers:?}");
+}
+
+/// A receiver that resets right after the buffered write cannot retry
+/// forever: every uncertain attempt (ambiguous or unconfirmed) counts toward
+/// the same cap and the notice leaves the schedule terminally failed.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn claude_uds_reset_after_write_stops_retrying_at_the_uncertain_cap() {
+    use std::os::fd::AsRawFd;
+
+    let home = common::Home::new();
+    let registry = home.path.join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    let socket = home.path.join("inbox.sock");
+    claude_descriptor(&registry, "session-1", &socket);
+    let _guard = REGISTRY_OVERRIDE.lock().unwrap();
+    std::env::set_var("AGENT_RUN_CLAUDE_SESSION_REGISTRY", &registry);
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let peer = tokio::spawn(async move {
+        for _ in 0..3 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let linger = libc::linger {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            // SAFETY: the accepted stream owns this valid socket descriptor
+            // until drop below.
+            unsafe {
+                libc::setsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    (&linger as *const libc::linger).cast(),
+                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                )
+            };
+            drop(stream);
+        }
+    });
+    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) VALUES('sess','claude_uds','session-1',?1,?1)",
+            [now()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary',?1,'{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',?2,1.0,'fixture','ag-20260825-120000-0123456789')",
+            params![home.path.to_string_lossy(), now()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,next_attempt_at) VALUES('ntf_reset','ag-20260825-120000-0123456789','sess','pending',0)",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    for _ in 0..2 {
+        assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+        let (state, error): (String, String) = Connection::open(home.path.join("state.db"))
+            .unwrap()
+            .query_row(
+                "SELECT state,last_error FROM deliveries WHERE id='ntf_reset'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "retry_wait");
+        assert!(matches!(
+            error.as_str(),
+            "uds_ambiguous" | "uds_unconfirmed"
+        ));
+        make_due(&home.path, "ntf_reset");
+    }
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+    peer.await.unwrap();
+    let row: (String, u32, Option<f64>) = Connection::open(home.path.join("state.db"))
+        .unwrap()
+        .query_row(
+            "SELECT state,attempts,next_attempt_at FROM deliveries WHERE id='ntf_reset'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((row.0.as_str(), row.1), ("failed", 3));
+    assert_eq!(row.2, None, "capped notice leaves the schedule");
 }
 
 /// A dispatcher-level regression for the delivery-confirmation bug: a Claude
@@ -1129,8 +1358,11 @@ async fn claude_uds_peer_close_is_ambiguous() {
     });
     let evidence = send.await.unwrap();
     peer.await.unwrap();
-    assert_eq!(evidence.classifier, "uds_ambiguous");
-    assert_eq!(evidence.error_class.as_deref(), Some("ambiguous"));
+    // The endpoint's kernel identity can no longer be proven once the peer
+    // has reset, so the sender refuses to write anything at all: a definite
+    // non-acceptance rather than an ambiguous interrupted write.
+    assert_eq!(evidence.classifier, "uds_unavailable");
+    assert_eq!(evidence.error_class.as_deref(), Some("unavailable"));
 }
 
 /// Mirrors `tests/test_codex_desktop_relay.py::RelayClientTests::test_v2_advertised_endpoint_receives_the_exact_rich_payload`.
