@@ -1,14 +1,27 @@
 # History retention
 
-The resident broker automatically expires completed database history **14 days
-after `finished_at`**. Database expiry runs on startup and then hourly; a
+The resident broker automatically expires completed database history by two
+independent rules: **14 days after `finished_at`**, and a **bounded count of
+logical sessions**. A logical session is one resume lineage — every run
+sharing a `root_agent_id`, however many resume rows it holds, counts as one
+session. All logical sessions are ranked by the latest `created_at` admitted
+in the lineage, newest first, with the root id as a deterministic
+tie-breaker; everything ranked below the newest **100** becomes eligible for
+count expiry however recent it is. The cap only ever adds expiry: the newest
+hundred are protected from count expiry but not from the fourteen-day age
+rule, which still applies to them on its own schedule. A recent resume
+therefore counts once and lifts its whole lineage into the protected set,
+matching the intuition that resumed work is still current history.
+
+Database expiry runs on startup and then hourly; a
 backlog drains in small transactions with a one-second pause between batches.
 Filesystem cleanup keeps its own independent schedule — a one-second cadence
 while entries remain, hourly when idle — so a filesystem backlog never forces
 a database writer transaction every second, and a database backlog never
 starves reclaiming disposable files. A pass that finds nothing eligible
-proves the database idle with a read-only query and skips the writer
-transaction entirely. Failures and deferrals retry after a minute. No cron job
+proves the database idle with a read-only query (age windows plus a cheap
+session-count superset) and skips the writer transaction entirely. Failures
+and deferrals retry after a minute. No cron job
 or provider-specific configuration is needed.
 
 Maintenance yields to normal workload. Every maintenance connection uses a
@@ -37,6 +50,23 @@ Retention preserves:
 - Provider accounts, credential references, current quota exhaustion latches,
   running services and unresolved readiness probes.
 
+Every protection above wins over the numerical session cap. A count-expired
+lineage that still holds active work, unresolved ownership, a live lease or a
+workflow reference stays stored, so more than 100 logical sessions can survive
+temporarily; the count never forces an unsafe deletion. Conversely the cap
+never rescues age-expired history: a lineage older than fourteen days still
+expires on schedule even when fewer than 100 sessions exist. A lineage with an
+unknown completion time (`lost` runs without `finished_at`) is retained as
+uncertain evidence under both rules.
+
+A retired multi-run lineage drains tail-first: its newest leaf run is deleted
+first, then the exposed predecessor, until the root goes. Removing a tail row
+can only lower its lineage's latest `created_at`, so a draining lineage can
+never drift back above the protected boundary mid-drain, and each batch
+removes only fully drained agents so no ancestor is ever stranded behind a
+broken reference. Sessions are recounted from durable rows on every pass, so
+the boundary converges to at most 100 unprotected lineages without drifting.
+
 An expired large transcript can disappear progressively before its agent row is
 removed. Each transaction considers at most 32 agents and deletes at most 2,000
 rows per large journal. Foreign keys stay enabled. SQLite's progress callback
@@ -64,12 +94,27 @@ can reuse completed physical preparation.
 
 Filesystem cleanup removes recognized, owned data after durable references are
 gone. Orphan `agents/<run-id>` and runtime `runs/<run-id>` trees expire after
-14 days by the canonical run ID timestamp. Obsolete configuration/profile
-backups and completed deployment backups also expire after 14 days. Applied
+14 days by the canonical run ID timestamp. In addition, while at least 100
+logical sessions are stored, a tree whose id predates the count boundary —
+the latest `created_at` of the hundredth-newest session, computed once per
+pass inside the bounded protection snapshot — is reclaimed as count-retired
+without waiting out that window, provided one fresh indexed store read proves
+no agents row for the id exists. The boundary remains actionable at exactly
+100 sessions, which is where database retention converges, and disappears
+below the cap, where a recent orphan keeps the fourteen-day rule. The row
+read happens after the pass has observed the tree, and run trees are only
+created after their agent row commits, so an admission the pass's protection
+snapshot missed — including a run admitted within the same wall-clock second,
+an id generated before its admission, or a clock that rolled back — is still
+found and its tree kept. The durable row, never the id's second-resolution
+timestamp, is the authority. This is what makes disk reclamation converge for
+count-expired sessions of any age. Obsolete configuration/profile
+backups and completed deployment backups still expire after 14 days. Applied
 migration snapshots expire only with their completion and applied markers;
 an unfinished migration or deployment protects recovery data. Retained agents,
 attempts, registered `file:` credentials and the parsed current configuration
-protect every referenced path. Unreadable or malformed protection evidence
+protect every referenced path, and a retained row keeps both its `agents/` and
+runtime trees whatever their age. Unreadable or malformed protection evidence
 blocks deletion rather than becoming an empty reference set.
 The retained-reference snapshot is read only and limited to 20,000 metadata
 rows, 64 MiB of structural evidence and a cooperative two-second SQL deadline;

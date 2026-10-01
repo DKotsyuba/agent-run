@@ -1,10 +1,11 @@
 //! Bounded filesystem retention for recognized disposable agent-run storage.
 //!
 //! Database history retention (`agent_run_store::retention`) expires durable
-//! runs fourteen days after they finish. This module reclaims the files those
-//! runs leave behind, plus a fixed set of other agent-run-owned disposable
-//! artifacts. It never sweeps by modification time alone: every candidate must
-//! be a recognized, named, currently effective-user-owned shape inside the
+//! runs fourteen days after they finish and keeps only the newest bounded set
+//! of logical sessions. This module reclaims the files those runs leave
+//! behind, plus a fixed set of other agent-run-owned disposable artifacts. It
+//! never sweeps by modification time alone: every candidate must be a
+//! recognized, named, currently effective-user-owned shape inside the
 //! configured home, and run trees additionally require the store to prove no
 //! retained row still owns or references them. Unknown names, foreign
 //! ownership, unreadable metadata and unrecognized categories are always
@@ -363,7 +364,7 @@ pub fn sweep(home: &Path, now: f64, store: &mut Store) -> Result<usize> {
         .ok_or_else(|| invalid("current configuration cannot prove filesystem retention safety"))?;
     collect_config_paths(&config, &mut proof);
     let mut pass = Pass::new(home, &root)?;
-    run_directories(home, &root, now, &proof, &mut pass);
+    run_directories(home, &root, now, &proof, store, &mut pass);
     standalone_backups(home, &root, now, &proof, &mut pass);
     migration_snapshots(home, &root, now, &proof, &mut pass);
     config_profile_backups(home, &root, now, &config, &proof, &mut pass);
@@ -477,19 +478,49 @@ fn config_references(value: &toml::Value, name: &str) -> bool {
     }
 }
 
+/// True when the pass-wide count boundary proves a tree's lineage ranks
+/// outside the protected set and a fresh indexed read finds no admitted row
+/// owning it.
+///
+/// `boundary` is the snapshot's newest-hundredth session boundary (`None`
+/// below the cap proves nothing), `created` is the tree's encoded creation,
+/// and the row check runs only after the tree was observed on disk, so an
+/// admission landing after the snapshot still wins. Any store error counts
+/// as "not retired": the tree stays and the next pass retries.
+fn count_retired(store: &Store, boundary: Option<f64>, id: &str, created: f64) -> bool {
+    boundary.is_some_and(|boundary| created < boundary)
+        && matches!(store.run_admitted(id), Ok(false))
+}
+
 /// Removes orphan `agents/<id>` trees and pruned runtime run directories.
 ///
 /// A tree qualifies only when its canonical id encodes a creation older than
-/// fourteen days and the store proves no retained agent row owns the id or
-/// references the exact path (covering resumed children and identities that
-/// embed `runtime_home`). Read failures fail closed and retain the tree.
+/// fourteen days, or when the pass can prove it count-retired: the snapshot's
+/// count boundary exists (see [`StorageProtection::count_boundary`]), the id
+/// predates it, and no agents row for the id exists as of a fresh indexed
+/// read taken after this pass observed the tree (see [`Store::run_admitted`]).
+/// That fresh row check is what makes the decision admission-safe — a run
+/// admitted in the same wall-clock second as the pass, an id generated before
+/// its admission, or a rolled-back clock all still resolve through the
+/// durable row rather than the id's second-resolution timestamp — and the
+/// pass-wide boundary is what keeps the per-tree check to one primary-key
+/// lookup instead of a ranking scan per candidate. Together they let
+/// count-expired trees of any age reclaim, at or after the database has
+/// converged to exactly the newest hundred sessions, instead of waiting out
+/// the fourteen-day orphan window. Either way the protection snapshot must
+/// also prove no retained row owns the id or references the exact path
+/// (covering resumed children and identities that embed `runtime_home`).
+/// A tree whose recency the store cannot prove keeps the age rule. Read
+/// failures fail closed and retain the tree.
 fn run_directories(
     home: &Path,
     root: &fs::Dir,
     now: f64,
     proof: &StorageProtection,
+    store: &Store,
     pass: &mut Pass,
 ) {
+    let boundary = proof.count_boundary();
     let Some(agents) = open_owned(root, "agents") else {
         return;
     };
@@ -504,7 +535,9 @@ fn run_directories(
         let Some(created) = run_id_created(id) else {
             continue;
         };
-        if !older_than(created, now, STORAGE_SECONDS) {
+        if !older_than(created, now, STORAGE_SECONDS)
+            && !count_retired(store, boundary, id, created)
+        {
             continue;
         }
         if proof.retains(id, &home.join("agents").join(id)) {
@@ -550,7 +583,9 @@ fn run_directories(
                 let Some(created) = run_id_created(id) else {
                     continue;
                 };
-                if !older_than(created, now, STORAGE_SECONDS) {
+                if !older_than(created, now, STORAGE_SECONDS)
+                    && !count_retired(store, boundary, id, created)
+                {
                     continue;
                 }
                 if proof.retains(
@@ -1189,10 +1224,55 @@ fn drain(dir: &fs::Dir, preserve_complete: bool, depth: usize, pass: &mut Pass) 
 }
 
 #[cfg(test)]
-/// Socket probes use private finite listeners and never launch a model process.
+/// Retention and socket probes use private fixtures and never launch a model process.
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+
+    /// An admission committed after protection capture keeps its same-second
+    /// tree through the real collector, even though the stale count boundary
+    /// makes the name eligible and the old proof has no reference to it.
+    #[test]
+    fn count_collection_rechecks_admission_after_protection_capture() {
+        let home = tempfile::tempdir().unwrap();
+        Store::initialize(home.path()).unwrap();
+        let store = Store::open(home.path()).unwrap();
+        let at = 2_000_000_000.0;
+        for index in 0..100 {
+            let id = format!("ag-20330518-040000-{index:010x}");
+            store.conn.execute(
+                "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,
+                 request_json,status,created_at,finished_at,timeout_seconds,config_revision,root_agent_id)
+                 VALUES(?1,'mock','fixture','review','fixture','fixture','/tmp','{}',
+                        'succeeded',?2,?2,1,'fixture',?1)",
+                rusqlite::params![id, at + 1_000.0 + index as f64],
+            ).unwrap();
+        }
+        let stale = store.storage_protection_snapshot().unwrap();
+        assert_eq!(stale.count_boundary(), Some(at + 1_000.0));
+        let id = "ag-20330518-033320-ffffffffff";
+        let tree = home.path().join("agents").join(id);
+        assert!(!stale.retains(id, &tree));
+        store
+            .conn
+            .execute(
+                "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,
+             request_json,status,created_at,timeout_seconds,config_revision,root_agent_id)
+             VALUES(?1,'mock','fixture','review','fixture','fixture','/tmp','{}',
+                    'running',?2,1,'fixture',?1)",
+                rusqlite::params![id, at + 0.8],
+            )
+            .unwrap();
+        fs::private_dir(&tree).unwrap();
+        std::fs::write(tree.join("live"), "fixture").unwrap();
+        let root = fs::Dir::open(home.path()).unwrap();
+        let mut pass = Pass::new(home.path(), &root).unwrap();
+        run_directories(home.path(), &root, at + 0.9, &stale, &store, &mut pass);
+        assert!(
+            tree.join("live").exists(),
+            "fresh admission wins over stale protection"
+        );
+    }
 
     /// A listener with zero queued slots still returns from the nonblocking probe promptly.
     #[test]

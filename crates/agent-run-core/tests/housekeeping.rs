@@ -31,6 +31,22 @@ fn retained(store: &agent_run_store::Store, id: &str, identity: &str) {
         .unwrap();
 }
 
+/// Inserts one terminal row that is its own logical session, admitted at
+/// `created` and finished one second later, so count-retirement proofs and
+/// database retention both see a chosen session boundary.
+fn session_row(store: &agent_run_store::Store, id: &str, created: f64) {
+    store
+        .conn
+        .execute(
+            r#"INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,
+         status,created_at,finished_at,timeout_seconds,config_revision,root_agent_id,identity_json)
+         VALUES(?,'mock','fixture','review','task','task','/tmp','{"read_roots":[]}',
+         'succeeded',?,?,100,'fixture',?,'{}')"#,
+            params![id, created, created + 1.0, id],
+        )
+        .unwrap();
+}
+
 /// A bounded number of passes removes only old orphan trees, preserving live references.
 #[test]
 fn orphan_recent_retained_and_escaped_paths() {
@@ -375,4 +391,175 @@ fn nested_runtime_scan_reaches_late_orphan() {
         finished,
         "late nested orphan must drain and the scan round must become idle: {observed:?}"
     );
+}
+
+/// Run trees whose durable rows were count-pruned — far younger than fourteen
+/// days — reclaim on later passes, while a retained row, a registered
+/// credential reference and a tree whose recency the store cannot prove all
+/// stay protected.
+#[test]
+fn count_pruned_run_trees_reclaim_after_database_pruning() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let retained_id = "ag-20270101-000000-0000000001";
+    let pruned_id = "ag-20270101-000000-0000000002";
+    let future_id = "ag-20350101-000000-0000000003";
+    let credential_id = "ag-20270101-000000-0000000004";
+    for id in [retained_id, pruned_id, future_id, credential_id] {
+        run_tree(&home, id);
+    }
+    // The same run also owns a runtime run tree, reclaimed with its agent row.
+    let runtime_run = home.path.join("runtimes/mock/home/runs").join(pruned_id);
+    fs::private_dir(&runtime_run).unwrap();
+    std::fs::write(runtime_run.join("transcript.jsonl"), "fixture").unwrap();
+    // A hundred filler sessions keep the store above the newest-hundred cap,
+    // with the count boundary above every 2027-encoded tree below.
+    for index in 0..100 {
+        session_row(
+            &store,
+            &format!("ag-20280101-000000-{index:010x}"),
+            NOW - 2_000.0 + index as f64,
+        );
+    }
+    session_row(&store, retained_id, NOW - 3_000.0);
+    session_row(&store, pruned_id, NOW - 3_000.0);
+    store.conn.execute(
+        "INSERT INTO provider_accounts(account_id,auth_family,secret_ref,status,created_at,updated_at)
+         VALUES('fixture','api_key',?,'disabled',1,1)",
+        [format!(
+            "file:{}/agents/{credential_id}/secret",
+            home.path.display()
+        )],
+    )
+    .unwrap();
+    for _ in 0..4 {
+        sweep(&home.path, NOW, &mut store).unwrap();
+    }
+    // Retained rows still protect both of the pruned run's trees.
+    assert!(home.path.join("agents").join(pruned_id).exists());
+    assert!(runtime_run.exists());
+    // Database retention removed the row — count expiry does this at any age.
+    store
+        .conn
+        .execute("DELETE FROM agents WHERE id=?", [pruned_id])
+        .unwrap();
+    for _ in 0..4 {
+        sweep(&home.path, NOW, &mut store).unwrap();
+    }
+    assert!(
+        !home.path.join("agents").join(pruned_id).exists(),
+        "a count-pruned run tree must reclaim without waiting fourteen days"
+    );
+    assert!(
+        !runtime_run.exists(),
+        "the runtime run tree reclaims with it"
+    );
+    for id in [retained_id, credential_id, future_id] {
+        assert!(home.path.join("agents").join(id).exists(), "retained {id}");
+    }
+}
+
+/// A run admitted in the same wall-clock second as the pass cannot lose its
+/// tree: ids resolve only to seconds while the pass runs at a fractional
+/// instant, so the decision re-reads the durable row after observing the tree.
+/// The pruned tree in that same second still reclaims, and an unproved recent
+/// orphan keeps the fourteen-day rule.
+#[test]
+fn same_second_admission_survives_count_reclamation() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    // The pass runs at a fractional instant inside this encoded second.
+    let now = 2_000_000_000.8;
+    let racer_id = "ag-20330518-033320-00000000b2";
+    let pruned_id = "ag-20330518-033320-00000000a1";
+    let orphan_id = "ag-20330518-034400-00000000c3";
+    run_tree(&home, racer_id);
+    run_tree(&home, pruned_id);
+    run_tree(&home, orphan_id);
+    // A hundred and one sessions whose latest admissions sit in the future
+    // keep the count boundary above the shared second.
+    for index in 0..100 {
+        session_row(
+            &store,
+            &format!("ag-20330518-040000-{index:010x}"),
+            now + 600.0 + index as f64,
+        );
+    }
+    // The racer's row exists by the time the pass decides, exactly like an
+    // admission that committed after the pass's protection snapshot.
+    session_row(&store, racer_id, now + 700.0);
+    for _ in 0..4 {
+        sweep(&home.path, now, &mut store).unwrap();
+    }
+    assert!(
+        home.path.join("agents").join(racer_id).exists(),
+        "a same-second admission must survive the fractional pass instant"
+    );
+    assert!(
+        !home.path.join("agents").join(pruned_id).exists(),
+        "a rowless tree below the boundary still reclaims in the same second"
+    );
+    assert!(
+        home.path.join("agents").join(orphan_id).exists(),
+        "a recent orphan above the boundary keeps the fourteen-day rule"
+    );
+}
+
+/// After database retention converges to exactly the newest hundred sessions,
+/// filesystem collection still follows: the pruned session's `agents/` and
+/// runtime trees reclaim at the cap, while every retained root's tree stays
+/// protected.
+#[test]
+fn collection_follows_database_convergence_to_the_cap() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let mut ids = Vec::new();
+    for index in 0..101 {
+        let id = format!("ag-20280101-000000-{index:010x}");
+        session_row(&store, &id, NOW - 5_000.0 + index as f64);
+        run_tree(&home, &id);
+        ids.push(id);
+    }
+    let oldest = ids[0].clone();
+    let runtime_run = home.path.join("runtimes/mock/home/runs").join(&oldest);
+    fs::private_dir(&runtime_run).unwrap();
+    std::fs::write(runtime_run.join("transcript.jsonl"), "fixture").unwrap();
+    // Drain database retention: the count-expired lineage goes and exactly a
+    // hundred recent sessions remain, none old enough for age expiry.
+    for _ in 0..8 {
+        if store.prune_history(NOW).unwrap() == 0 {
+            break;
+        }
+    }
+    let stored: i64 = store
+        .conn
+        .query_row(
+            "SELECT count(DISTINCT COALESCE(NULLIF(root_agent_id,''),id)) FROM agents",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, 100, "database retention converges to the cap");
+    let gone: i64 = store
+        .conn
+        .query_row("SELECT count(*) FROM agents WHERE id=?", [&oldest], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(gone, 0, "the count-expired session's row is gone");
+    // Filesystem collection follows at exactly the cap, not only above it.
+    for _ in 0..4 {
+        sweep(&home.path, NOW, &mut store).unwrap();
+    }
+    assert!(
+        !home.path.join("agents").join(&oldest).exists(),
+        "the pruned session's tree reclaims at the cap"
+    );
+    assert!(
+        !runtime_run.exists(),
+        "the pruned session's runtime tree reclaims with it"
+    );
+    for id in &ids[1..] {
+        assert!(home.path.join("agents").join(id).exists(), "retained {id}");
+    }
 }

@@ -27,6 +27,58 @@ fn agent(home: &common::Home, store: &mut Store, status: &str, finished: Option<
     id
 }
 
+/// Admits one terminal run of a logical session at explicit `created`/`finished`
+/// times, so count retention can rank lineages that age expiry would keep.
+fn run(home: &common::Home, store: &mut Store, created: f64, finished: f64) -> AgentId {
+    let (id, _) = store
+        .admit(&home.request(), &home.config, &json!({}), None)
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='succeeded',created_at=?,finished_at=? WHERE id=?",
+            params![created, finished, id.as_str()],
+        )
+        .unwrap();
+    id
+}
+
+/// Links `child` into `root`'s resume lineage as the tail run.
+fn resume(store: &mut Store, root: &AgentId, child: &AgentId) {
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET parent_agent_id=?,root_agent_id=?,sequence=2 WHERE id=?",
+            params![root.as_str(), root.as_str(), child.as_str()],
+        )
+        .unwrap();
+}
+
+/// Repeats prune passes until one reports no work, bounded by `limit` passes.
+fn drain(store: &mut Store, limit: usize) -> usize {
+    let mut total = 0;
+    for _ in 0..limit {
+        let removed = store.prune_history(NOW).unwrap();
+        total += removed;
+        if removed == 0 {
+            return total;
+        }
+    }
+    panic!("retention did not settle within {limit} passes");
+}
+
+/// Number of stored logical sessions (distinct resume lineages).
+fn sessions(store: &Store) -> i64 {
+    store
+        .conn
+        .query_row(
+            "SELECT count(DISTINCT COALESCE(NULLIF(root_agent_id,''),id)) FROM agents",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
 /// Returns a table's row count; table names are test constants, never user input.
 fn count(store: &Store, table: &str) -> i64 {
     store
@@ -843,5 +895,354 @@ fn maintenance_concurrent_with_transcripts_and_deliveries_preserves_both() {
     assert!(terminal.is_some());
     assert_eq!(count(&store, "agents"), 1, "only the retained run remains");
     assert_eq!(count(&store, "capacity_samples"), 0);
+    integrity(&store);
+}
+
+/// Count retention keeps the newest hundred logical sessions: fewer and exactly
+/// hundred change nothing, more expire by lineage rank, and a tied boundary is
+/// broken deterministically by root id.
+#[test]
+fn count_retention_keeps_newest_hundred_sessions_with_deterministic_ties() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    // Fewer than the cap: nothing is eligible and no pass removes a row.
+    for index in 0..50 {
+        run(&home, &mut store, NOW - 5_000.0 + index as f64, NOW - 10.0);
+    }
+    assert_eq!(store.prune_history(NOW).unwrap(), 0);
+    assert_eq!(sessions(&store), 50);
+    // Ninety-nine sessions strictly newer than the tie instant, then two
+    // sessions whose latest admitted run shares that one created_at: the
+    // hundredth slot is a tie between exactly those two.
+    for index in 0..99 {
+        run(&home, &mut store, NOW - 900.0 + index as f64, NOW - 10.0);
+    }
+    let tied: Vec<AgentId> = (0..2)
+        .map(|_| run(&home, &mut store, NOW - 1_000.0, NOW - 5.0))
+        .collect();
+    let (kept, dropped) = if tied[0].as_str() < tied[1].as_str() {
+        (&tied[0], &tied[1])
+    } else {
+        (&tied[1], &tied[0])
+    };
+    // Fifty older sessions, ninety-nine newer ones and the tied pair.
+    assert_eq!(sessions(&store), 151);
+    let removed = drain(&mut store, 8);
+    assert!(removed > 0, "the tied loser is count-expired");
+    assert_eq!(sessions(&store), 100, "exactly the newest hundred survive");
+    assert!(
+        store.get(kept).is_ok(),
+        "tie-break keeps the smaller root id"
+    );
+    assert!(
+        store.get(dropped).is_err(),
+        "tie-break drops the larger root id"
+    );
+    // A settled database stays at the cap: no further pass removes anything.
+    assert_eq!(store.prune_history(NOW).unwrap(), 0);
+    assert_eq!(sessions(&store), 100);
+    integrity(&store);
+}
+
+/// A recent resume of an old root counts once, lifts the whole lineage into the
+/// protected set, and leaves every chain row usable.
+#[test]
+fn count_retention_ranks_lineage_once_and_keeps_resumed_chain_usable() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    // One old root resumed recently, plus a hundred newer single-run sessions:
+    // the lineage ranks by the resume's created_at, not the root's age.
+    let root = run(&home, &mut store, NOW - 3_000.0, NOW - 2_900.0);
+    let child = run(&home, &mut store, NOW - 10.0, NOW - 5.0);
+    resume(&mut store, &root, &child);
+    for index in 0..100 {
+        run(&home, &mut store, NOW - 900.0 + index as f64, NOW - 4.0);
+    }
+    assert_eq!(sessions(&store), 101);
+    drain(&mut store, 8);
+    // The resumed chain counts once, both rows survive, and history reads work.
+    assert_eq!(sessions(&store), 100);
+    for id in [&root, &child] {
+        let row = store.get(id).unwrap();
+        assert_eq!(row.root_agent_id, root, "chain stays intact for {id}");
+    }
+    // The oldest of the hundred newer sessions is what count expiry removed;
+    // the two-row chain keeps both of its rows.
+    assert_eq!(count(&store, "agents"), 101);
+    integrity(&store);
+}
+
+/// A retired multi-run lineage drains tail-first across batches without cap
+/// drift: after the first tail deletion its ancestors stay expired and none is
+/// stranded behind a broken reference.
+#[test]
+fn retired_chains_drain_tail_first_without_cap_drift() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    // The count-expired lineage holds three runs; a hundred protected single
+    // sessions keep it ranked outside the newest hundred.
+    let root = run(&home, &mut store, NOW - 5_000.0, NOW - 4_900.0);
+    let middle = run(&home, &mut store, NOW - 4_000.0, NOW - 3_900.0);
+    let tail = run(&home, &mut store, NOW - 3_000.0, NOW - 2_900.0);
+    resume(&mut store, &root, &middle);
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET parent_agent_id=?,root_agent_id=?,sequence=3 WHERE id=?",
+            params![middle.as_str(), root.as_str(), tail.as_str()],
+        )
+        .unwrap();
+    for index in 0..100 {
+        run(&home, &mut store, NOW - 1_000.0 + index as f64, NOW - 10.0);
+    }
+    assert_eq!(sessions(&store), 101);
+    // First pass removes only the leaf: ancestors keep their child protection.
+    assert!(store.prune_history(NOW).unwrap() > 0);
+    assert!(store.get(&tail).is_err(), "the leaf run is deleted first");
+    assert!(store.get(&middle).is_ok() && store.get(&root).is_ok());
+    assert_eq!(
+        sessions(&store),
+        101,
+        "shrinking a lineage must not re-rank it"
+    );
+    drain(&mut store, 8);
+    // The whole chain is gone, including the root: no stranded ancestors.
+    for id in [&root, &middle, &tail] {
+        assert!(store.get(id).is_err(), "chain row {id} must drain");
+    }
+    assert_eq!(sessions(&store), 100);
+    integrity(&store);
+}
+
+/// Protections beat the numerical cap: active descendants, unresolved process
+/// ownership and live sending leases inside count-expired lineages all survive.
+#[test]
+fn count_expiry_never_deletes_protected_work() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    // An old lineage whose newest run is still active: nothing inside may go.
+    let root = run(&home, &mut store, NOW - 5_000.0, NOW - 4_900.0);
+    let active = run(&home, &mut store, NOW - 4_000.0, NOW - 3_900.0);
+    resume(&mut store, &root, &active);
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='running',finished_at=NULL WHERE id=?",
+            [active.as_str()],
+        )
+        .unwrap();
+    // A count-expired run with unresolved ownership, and one holding a live
+    // sending lease, each form their own old lineage.
+    let owned = run(&home, &mut store, NOW - 6_000.0, NOW - 5_900.0);
+    let attempt = store.create_attempt(&owned, "lost", &json!({})).unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE attempts SET ownership_active=1 WHERE id=?",
+            [&attempt],
+        )
+        .unwrap();
+    let sending = run(&home, &mut store, NOW - 7_000.0, NOW - 6_900.0);
+    store
+        .conn
+        .execute(
+            "INSERT INTO deliveries(id,agent_id,state,lease_until) VALUES ('sending',?,'sending',?)",
+            params![sending.as_str(), NOW + 10.0],
+        )
+        .unwrap();
+    for index in 0..99 {
+        run(&home, &mut store, NOW - 1_000.0 + index as f64, NOW - 10.0);
+    }
+    assert_eq!(sessions(&store), 102);
+    // Every pass reports no work: protected lineages exceed the cap safely.
+    assert_eq!(store.prune_history(NOW).unwrap(), 0);
+    for id in [&root, &active, &owned, &sending] {
+        assert!(store.get(id).is_ok(), "protected work must survive: {id}");
+    }
+    assert_eq!(sessions(&store), 102);
+    integrity(&store);
+}
+
+/// A count-only backlog — nothing age-expired — still trips the read-only
+/// probe and takes the writer path, while at or below the cap the probe proves
+/// the database idle without acquiring the writer at all.
+#[test]
+fn count_only_backlog_trips_the_probe_and_the_cap_does_not() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    for index in 0..100 {
+        run(&home, &mut store, NOW - 900.0 + index as f64, NOW - 10.0);
+    }
+    let holder = home.store();
+    holder.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    holder
+        .conn
+        .execute(
+            "INSERT INTO capacity_samples(runtime,lane,window,source,payload_json,observed_at)
+             VALUES ('mock','shared','fixture','fixture',zeroblob(16),0)",
+            [],
+        )
+        .unwrap();
+    store
+        .conn
+        .busy_timeout(std::time::Duration::from_millis(100))
+        .unwrap();
+    // At exactly the cap the probe proves nothing eligible: no writer lock.
+    assert_eq!(store.prune_history(NOW).unwrap(), 0);
+    holder.conn.execute_batch("COMMIT").unwrap();
+    // One more recent session makes a count-only backlog: the probe must see
+    // it and the pass must defer on the held writer instead of reporting idle.
+    run(&home, &mut store, NOW - 1.0, NOW - 1.0);
+    holder.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    holder
+        .conn
+        .execute(
+            "INSERT INTO capacity_samples(runtime,lane,window,source,payload_json,observed_at)
+             VALUES ('mock','shared','fixture','fixture',zeroblob(16),0)",
+            [],
+        )
+        .unwrap();
+    let deferred = store.prune_history(NOW);
+    let error = deferred.expect_err("a count-only backlog must take the writer");
+    assert!(
+        retention::is_writer_contention(&error),
+        "expected writer contention, got {error:?}"
+    );
+    holder.conn.execute_batch("COMMIT").unwrap();
+    drop(holder);
+    drain(&mut store, 8);
+    assert_eq!(sessions(&store), 100);
+    integrity(&store);
+}
+
+/// Large journals of count-expired lineages drain in bounded batches, exactly
+/// as age-expired ones do, until the whole session is gone.
+#[test]
+fn count_expired_large_transcripts_drain_in_bounded_batches() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = run(&home, &mut store, NOW - 5_000.0, NOW - 4_900.0);
+    let attempt = store.create_attempt(&id, "succeeded", &json!({})).unwrap();
+    let tx = store.conn.transaction().unwrap();
+    for _ in 0..2_010 {
+        tx.execute(
+            "INSERT INTO events(agent_id,attempt_id,at,kind) VALUES (?,?,0,'fixture')",
+            params![id.as_str(), attempt],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO messages(agent_id,attempt_id,at,role,content) VALUES (?,?,0,'assistant','fixture')",
+            params![id.as_str(), attempt],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    for index in 0..100 {
+        run(&home, &mut store, NOW - 900.0 + index as f64, NOW - 10.0);
+    }
+    // First batch is bounded and keeps the agent row until its journals drain.
+    assert!(store.prune_history(NOW).unwrap() > 0);
+    assert!(store.get(&id).is_ok());
+    assert_eq!(count(&store, "messages"), 10);
+    drain(&mut store, 8);
+    assert!(store.get(&id).is_err());
+    assert_eq!(sessions(&store), 100);
+    integrity(&store);
+}
+
+/// Count-retirement evidence comes from a fresh row read plus the snapshot's
+/// pass-wide boundary, never from the id's second-resolution timestamp: a run
+/// admitted after the protection snapshot — in the same wall-clock second,
+/// with an early-generated id, or under a rolled-back clock — is not retired
+/// while its row exists, retirement stays actionable at exactly the cap, and
+/// below the cap there is no boundary so recent orphans keep the age rule.
+#[test]
+fn count_retirement_is_proved_by_a_fresh_row_not_id_timestamps() {
+    let home = common::Home::new();
+    let store = home.store();
+    // The stale snapshot a filesystem pass held when the racing admission
+    // landed: it must not retain the racer, so only the fresh row read can.
+    // The racer is a bare agents row, like one whose dependents never landed.
+    let stale = store.storage_protection_snapshot().unwrap();
+    assert_eq!(
+        stale.count_boundary(),
+        None,
+        "an empty store has no boundary"
+    );
+    let racer = format!("ag-20260101-000000-{:010x}", NOW as i64);
+    store
+        .conn
+        .execute(
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,
+             status,created_at,finished_at,timeout_seconds,config_revision,root_agent_id)
+             VALUES(?,'mock','fixture','review','task','task','/tmp','{}',
+             'succeeded',?,?,100,'fixture',?)",
+            params![racer, NOW, NOW - 1.0, racer],
+        )
+        .unwrap();
+    let racer_dir = home.path.join("agents").join(&racer);
+    assert!(
+        !stale.retains(&racer, &racer_dir),
+        "the snapshot predates the racing admission"
+    );
+    // A hundred newer sessions put the count boundary far above any
+    // early-encoded id the racer could carry; bare rows keep deletion cheap.
+    for index in 0..100 {
+        store
+            .conn
+            .execute(
+                "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,
+                 status,created_at,finished_at,timeout_seconds,config_revision,root_agent_id)
+                 VALUES(?,'mock','fixture','review','task','task','/tmp','{}',
+                 'succeeded',?,?,100,'fixture',?)",
+                params![
+                    format!("ag-20260101-000000-{:010x}", index),
+                    NOW + 1_000.0 + index as f64,
+                    NOW + 900.0,
+                    format!("ag-20260101-000000-{:010x}", index),
+                ],
+            )
+            .unwrap();
+    }
+    // The racer's row exists: however early its encoded creation reads — an
+    // id generated before admission or under a rolled-back clock — the fresh
+    // indexed row check keeps its tree.
+    assert!(store.run_admitted(&racer).unwrap());
+    let boundary = store
+        .storage_protection_snapshot()
+        .unwrap()
+        .count_boundary();
+    assert!(boundary.is_some_and(|boundary| boundary > 0.0));
+    // Retention removed the row while exactly a hundred sessions remain: the
+    // boundary must stay actionable at the cap itself, not only above it.
+    store
+        .conn
+        .execute("DELETE FROM agents WHERE id=?", [&racer])
+        .unwrap();
+    assert_eq!(sessions(&store), 100);
+    let at_cap = store.storage_protection_snapshot().unwrap();
+    assert_eq!(
+        at_cap.count_boundary(),
+        Some(NOW + 1_000.0),
+        "the hundredth-newest session still bounds count retirement at the cap"
+    );
+    assert!(!store.run_admitted(&racer).unwrap());
+    // Below the cap no lineage can rank outside the protected set: no
+    // boundary exists, so recent orphan trees keep the fourteen-day rule.
+    store
+        .conn
+        .execute(
+            "DELETE FROM agents WHERE id=?",
+            ["ag-20260101-000000-0000000000"],
+        )
+        .unwrap();
+    assert_eq!(sessions(&store), 99);
+    assert_eq!(
+        store
+            .storage_protection_snapshot()
+            .unwrap()
+            .count_boundary(),
+        None
+    );
     integrity(&store);
 }
