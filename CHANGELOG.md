@@ -4,9 +4,14 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.19.4] - 2026-10-01
+
 - feat(retention): keep the newest 100 logical agent sessions alongside
   fourteen-day expiry; count resumes once, protect active references and
   reclaim count-pruned run directories through bounded admission-safe checks
+
+The database schema remains 22. Active and otherwise protected sessions may
+temporarily exceed the count limit. No migration from 0.19.1–0.19.3 is needed.
 
 ## [0.19.3] - 2026-10-01
 
