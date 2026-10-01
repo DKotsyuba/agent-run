@@ -364,7 +364,7 @@ pub fn sweep(home: &Path, now: f64, store: &mut Store) -> Result<usize> {
         .ok_or_else(|| invalid("current configuration cannot prove filesystem retention safety"))?;
     collect_config_paths(&config, &mut proof);
     let mut pass = Pass::new(home, &root)?;
-    run_directories(home, &root, now, &proof, &mut pass);
+    run_directories(home, &root, now, &proof, store, &mut pass);
     standalone_backups(home, &root, now, &proof, &mut pass);
     migration_snapshots(home, &root, now, &proof, &mut pass);
     config_profile_backups(home, &root, now, &config, &proof, &mut pass);
@@ -478,26 +478,49 @@ fn config_references(value: &toml::Value, name: &str) -> bool {
     }
 }
 
+/// True when the pass-wide count boundary proves a tree's lineage ranks
+/// outside the protected set and a fresh indexed read finds no admitted row
+/// owning it.
+///
+/// `boundary` is the snapshot's newest-hundredth session boundary (`None`
+/// below the cap proves nothing), `created` is the tree's encoded creation,
+/// and the row check runs only after the tree was observed on disk, so an
+/// admission landing after the snapshot still wins. Any store error counts
+/// as "not retired": the tree stays and the next pass retries.
+fn count_retired(store: &Store, boundary: Option<f64>, id: &str, created: f64) -> bool {
+    boundary.is_some_and(|boundary| created < boundary)
+        && matches!(store.run_admitted(id), Ok(false))
+}
+
 /// Removes orphan `agents/<id>` trees and pruned runtime run directories.
 ///
-/// A tree qualifies only when its canonical id encodes a creation that
-/// strictly predates `now` — the instant this pass's protection snapshot was
-/// taken — and the store proves no retained agent row owns the id or
-/// references the exact path (covering resumed children and identities that
-/// embed `runtime_home`). Run trees are only ever created after their agent
-/// row is durably admitted, so a tree older than the snapshot with no
-/// retained reference proves its row was already removed by age or count
-/// expiry (or never existed), while a tree at or after `now` may still be
-/// racing its own admission and stays for the next pass. This converges for
-/// count-expired sessions of any age instead of waiting out a flat
-/// fourteen-day orphan window. Read failures fail closed and retain the tree.
+/// A tree qualifies only when its canonical id encodes a creation older than
+/// fourteen days, or when the pass can prove it count-retired: the snapshot's
+/// count boundary exists (see [`StorageProtection::count_boundary`]), the id
+/// predates it, and no agents row for the id exists as of a fresh indexed
+/// read taken after this pass observed the tree (see [`Store::run_admitted`]).
+/// That fresh row check is what makes the decision admission-safe — a run
+/// admitted in the same wall-clock second as the pass, an id generated before
+/// its admission, or a rolled-back clock all still resolve through the
+/// durable row rather than the id's second-resolution timestamp — and the
+/// pass-wide boundary is what keeps the per-tree check to one primary-key
+/// lookup instead of a ranking scan per candidate. Together they let
+/// count-expired trees of any age reclaim, at or after the database has
+/// converged to exactly the newest hundred sessions, instead of waiting out
+/// the fourteen-day orphan window. Either way the protection snapshot must
+/// also prove no retained row owns the id or references the exact path
+/// (covering resumed children and identities that embed `runtime_home`).
+/// A tree whose recency the store cannot prove keeps the age rule. Read
+/// failures fail closed and retain the tree.
 fn run_directories(
     home: &Path,
     root: &fs::Dir,
     now: f64,
     proof: &StorageProtection,
+    store: &Store,
     pass: &mut Pass,
 ) {
+    let boundary = proof.count_boundary();
     let Some(agents) = open_owned(root, "agents") else {
         return;
     };
@@ -512,7 +535,9 @@ fn run_directories(
         let Some(created) = run_id_created(id) else {
             continue;
         };
-        if created >= now {
+        if !older_than(created, now, STORAGE_SECONDS)
+            && !count_retired(store, boundary, id, created)
+        {
             continue;
         }
         if proof.retains(id, &home.join("agents").join(id)) {
@@ -558,7 +583,9 @@ fn run_directories(
                 let Some(created) = run_id_created(id) else {
                     continue;
                 };
-                if created >= now {
+                if !older_than(created, now, STORAGE_SECONDS)
+                    && !count_retired(store, boundary, id, created)
+                {
                     continue;
                 }
                 if proof.retains(

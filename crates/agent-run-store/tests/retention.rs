@@ -1149,3 +1149,100 @@ fn count_expired_large_transcripts_drain_in_bounded_batches() {
     assert_eq!(sessions(&store), 100);
     integrity(&store);
 }
+
+/// Count-retirement evidence comes from a fresh row read plus the snapshot's
+/// pass-wide boundary, never from the id's second-resolution timestamp: a run
+/// admitted after the protection snapshot — in the same wall-clock second,
+/// with an early-generated id, or under a rolled-back clock — is not retired
+/// while its row exists, retirement stays actionable at exactly the cap, and
+/// below the cap there is no boundary so recent orphans keep the age rule.
+#[test]
+fn count_retirement_is_proved_by_a_fresh_row_not_id_timestamps() {
+    let home = common::Home::new();
+    let store = home.store();
+    // The stale snapshot a filesystem pass held when the racing admission
+    // landed: it must not retain the racer, so only the fresh row read can.
+    // The racer is a bare agents row, like one whose dependents never landed.
+    let stale = store.storage_protection_snapshot().unwrap();
+    assert_eq!(
+        stale.count_boundary(),
+        None,
+        "an empty store has no boundary"
+    );
+    let racer = format!("ag-20260101-000000-{:010x}", NOW as i64);
+    store
+        .conn
+        .execute(
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,
+             status,created_at,finished_at,timeout_seconds,config_revision,root_agent_id)
+             VALUES(?,'mock','fixture','review','task','task','/tmp','{}',
+             'succeeded',?,?,100,'fixture',?)",
+            params![racer, NOW, NOW - 1.0, racer],
+        )
+        .unwrap();
+    let racer_dir = home.path.join("agents").join(&racer);
+    assert!(
+        !stale.retains(&racer, &racer_dir),
+        "the snapshot predates the racing admission"
+    );
+    // A hundred newer sessions put the count boundary far above any
+    // early-encoded id the racer could carry; bare rows keep deletion cheap.
+    for index in 0..100 {
+        store
+            .conn
+            .execute(
+                "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,
+                 status,created_at,finished_at,timeout_seconds,config_revision,root_agent_id)
+                 VALUES(?,'mock','fixture','review','task','task','/tmp','{}',
+                 'succeeded',?,?,100,'fixture',?)",
+                params![
+                    format!("ag-20260101-000000-{:010x}", index),
+                    NOW + 1_000.0 + index as f64,
+                    NOW + 900.0,
+                    format!("ag-20260101-000000-{:010x}", index),
+                ],
+            )
+            .unwrap();
+    }
+    // The racer's row exists: however early its encoded creation reads — an
+    // id generated before admission or under a rolled-back clock — the fresh
+    // indexed row check keeps its tree.
+    assert!(store.run_admitted(&racer).unwrap());
+    let boundary = store
+        .storage_protection_snapshot()
+        .unwrap()
+        .count_boundary();
+    assert!(boundary.is_some_and(|boundary| boundary > 0.0));
+    // Retention removed the row while exactly a hundred sessions remain: the
+    // boundary must stay actionable at the cap itself, not only above it.
+    store
+        .conn
+        .execute("DELETE FROM agents WHERE id=?", [&racer])
+        .unwrap();
+    assert_eq!(sessions(&store), 100);
+    let at_cap = store.storage_protection_snapshot().unwrap();
+    assert_eq!(
+        at_cap.count_boundary(),
+        Some(NOW + 1_000.0),
+        "the hundredth-newest session still bounds count retirement at the cap"
+    );
+    assert!(!store.run_admitted(&racer).unwrap());
+    // Below the cap no lineage can rank outside the protected set: no
+    // boundary exists, so recent orphan trees keep the fourteen-day rule.
+    store
+        .conn
+        .execute(
+            "DELETE FROM agents WHERE id=?",
+            ["ag-20260101-000000-0000000000"],
+        )
+        .unwrap();
+    assert_eq!(sessions(&store), 99);
+    assert_eq!(
+        store
+            .storage_protection_snapshot()
+            .unwrap()
+            .count_boundary(),
+        None
+    );
+    integrity(&store);
+}

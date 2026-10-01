@@ -6,11 +6,12 @@ logical sessions**. A logical session is one resume lineage — every run
 sharing a `root_agent_id`, however many resume rows it holds, counts as one
 session. All logical sessions are ranked by the latest `created_at` admitted
 in the lineage, newest first, with the root id as a deterministic
-tie-breaker; only the newest **100** lineages stay regardless of age, and
-everything ranked below that boundary becomes eligible for expiry however
-recent it is. A recent resume therefore counts once and lifts its whole
-lineage into the protected set, matching the intuition that resumed work is
-still current history.
+tie-breaker; everything ranked below the newest **100** becomes eligible for
+count expiry however recent it is. The cap only ever adds expiry: the newest
+hundred are protected from count expiry but not from the fourteen-day age
+rule, which still applies to them on its own schedule. A recent resume
+therefore counts once and lifts its whole lineage into the protected set,
+matching the intuition that resumed work is still current history.
 
 Database expiry runs on startup and then hourly; a
 backlog drains in small transactions with a one-second pause between batches.
@@ -92,16 +93,22 @@ stopped. A failed later schema step keeps the backup and old version; a retry
 can reuse completed physical preparation.
 
 Filesystem cleanup removes recognized, owned data after durable references are
-gone. `agents/<run-id>` and runtime `runs/<run-id>` trees are reclaimed once
-the store proves no retained row owns the run id or references any path inside
-the tree, and once the canonical run ID timestamp strictly predates the
-cleanup pass's reference instant. Because run trees are only ever created
-after their agent row is durably admitted, a tree older than that instant with
-no retained reference proves its row was already removed — by age or count
-expiry — or never existed, while a tree created at or after the instant may
-still be racing its own admission and waits for a later pass. This is what
-makes disk reclamation converge for count-expired sessions of any age instead
-of waiting out a flat fourteen-day orphan window. Obsolete configuration/profile
+gone. Orphan `agents/<run-id>` and runtime `runs/<run-id>` trees expire after
+14 days by the canonical run ID timestamp. In addition, while at least 100
+logical sessions are stored, a tree whose id predates the count boundary —
+the latest `created_at` of the hundredth-newest session, computed once per
+pass inside the bounded protection snapshot — is reclaimed as count-retired
+without waiting out that window, provided one fresh indexed store read proves
+no agents row for the id exists. The boundary remains actionable at exactly
+100 sessions, which is where database retention converges, and disappears
+below the cap, where a recent orphan keeps the fourteen-day rule. The row
+read happens after the pass has observed the tree, and run trees are only
+created after their agent row commits, so an admission the pass's protection
+snapshot missed — including a run admitted within the same wall-clock second,
+an id generated before its admission, or a clock that rolled back — is still
+found and its tree kept. The durable row, never the id's second-resolution
+timestamp, is the authority. This is what makes disk reclamation converge for
+count-expired sessions of any age. Obsolete configuration/profile
 backups and completed deployment backups still expire after 14 days. Applied
 migration snapshots expire only with their completion and applied markers;
 an unfinished migration or deployment protects recovery data. Retained agents,

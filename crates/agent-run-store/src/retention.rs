@@ -13,13 +13,16 @@ use std::{
 
 /// Completed history expires strictly after fourteen days, measured from `finished_at`.
 pub const HISTORY_SECONDS: f64 = 14.0 * 24.0 * 3600.0;
-/// Logical sessions (resume lineages sharing one `root_agent_id`) kept
-/// regardless of age; older lineages become count-expired.
+/// Logical sessions (resume lineages sharing one `root_agent_id`) kept from
+/// count expiry; older lineages become count-expired.
 ///
 /// All logical sessions are ranked by the latest `created_at` admitted in the
 /// lineage (descending, tie-break by root id) and the newest
-/// [`HISTORY_SESSIONS`] survive. Protected work inside an expired lineage can
-/// keep it stored, so the retained set may temporarily exceed this bound.
+/// [`HISTORY_SESSIONS`] survive count expiry. Age expiry is independent and
+/// still applies to them: a lineage older than [`HISTORY_SECONDS`] expires on
+/// schedule however few sessions exist. Protected work inside an expired
+/// lineage can keep it stored, so the retained set may temporarily exceed
+/// this bound.
 pub const HISTORY_SESSIONS: i64 = 100;
 /// Maximum rows removed from each large journal in one transaction.
 const ROW_BATCH: i64 = 2_000;
@@ -97,6 +100,10 @@ pub struct StorageProtection {
     ids: HashSet<String>,
     /// Decoded, normalized and resolved paths, deduplicated across retained records.
     paths: HashSet<PathBuf>,
+    /// Latest `created_at` of the [`HISTORY_SESSIONS`]-th newest logical
+    /// session, when at least that many sessions were stored while this proof
+    /// was collected; `None` below the cap, where no lineage is count-expired.
+    count_boundary: Option<f64>,
 }
 
 impl StorageProtection {
@@ -105,12 +112,28 @@ impl StorageProtection {
         Self {
             ids: HashSet::new(),
             paths: HashSet::new(),
+            count_boundary: None,
         }
     }
 
     /// Returns true when a retained row owns `id` or contains `path` or one of its descendants.
     pub fn retains(&self, id: &str, path: &Path) -> bool {
         self.ids.contains(id) || self.paths.iter().any(|retained| retained.starts_with(path))
+    }
+
+    /// Returns the count-expiry boundary captured with this proof.
+    ///
+    /// This is the latest `created_at` of the [`HISTORY_SESSIONS`]-th newest
+    /// logical session at snapshot time, or `None` when fewer sessions were
+    /// stored. A run tree whose canonical id encodes a creation at or after
+    /// the boundary belongs to a lineage that ranks inside the protected set,
+    /// so it can never be proved count-expired from this evidence; one below
+    /// the boundary may be, once a fresh read proves no agents row owns it
+    /// (see [`Store::run_admitted`]). The snapshot may predate later
+    /// admissions, which only ever push the boundary newer, so a stale value
+    /// never widens what this proof can authorize.
+    pub fn count_boundary(&self) -> Option<f64> {
+        self.count_boundary
     }
 
     /// Returns every decoded, normalized and resolved path this proof protects.
@@ -225,6 +248,9 @@ impl Store {
     ///
     /// The read is limited to 20,000 metadata rows, 64 MiB of selected values,
     /// and a cooperative two-second deadline shared by SQLite and row processing.
+    /// It also computes the count-expiry boundary once (see
+    /// [`StorageProtection::count_boundary`]) under the same deadline, so a
+    /// filesystem pass never repeats a ranking scan per candidate tree.
     /// It excludes task bodies and transcript journals. Malformed, oversized or
     /// interrupted evidence returns an error; callers must retain all candidates.
     /// Runtime homes with a still-prepared storage-layout row are protected so
@@ -251,6 +277,7 @@ impl Store {
         let mut proof = StorageProtection {
             ids: HashSet::new(),
             paths: HashSet::new(),
+            count_boundary: None,
         };
         let mut bytes = 0usize;
         let mut visited = 0usize;
@@ -349,6 +376,22 @@ impl Store {
             let raw: String = row.get(0)?;
             proof.add_json(&serde_json::from_str::<Value>(&raw)?);
         }
+        // One aggregate under the same cooperative deadline replaces a
+        // per-candidate scan: the count-expiry boundary is a property of the
+        // whole snapshot, not of any one tree, so it is computed exactly once
+        // here. At or above the cap the boundary is the newest-hundredth
+        // session's latest admission; below the cap no lineage can rank
+        // outside the protected set and the boundary stays `None`.
+        proof.count_boundary = self.conn.query_row(
+            "SELECT CASE WHEN (SELECT count(DISTINCT COALESCE(NULLIF(root_agent_id,''),id))
+                          FROM agents) >= ?1
+                        THEN (SELECT MIN(latest) FROM (
+                                SELECT MAX(created_at) AS latest FROM agents
+                                 GROUP BY COALESCE(NULLIF(root_agent_id,''),id)
+                                 ORDER BY latest DESC LIMIT ?1)) END",
+            [HISTORY_SESSIONS],
+            |row| row.get::<_, Option<f64>>(0),
+        )?;
         if Instant::now() >= deadline {
             return Err(invalid("storage protection deadline exceeded"));
         }
@@ -384,6 +427,29 @@ impl Store {
             |row| row.get(0),
         )?;
         Ok(pending)
+    }
+
+    /// Reports whether one fresh indexed read shows an admitted agents row for
+    /// `id`, for a run tree the caller has already observed on disk.
+    ///
+    /// This is the per-tree half of count-retirement evidence (the pass-wide
+    /// boundary lives in [`StorageProtection::count_boundary`]): a single
+    /// primary-key lookup on one consistent snapshot taken after the tree was
+    /// seen. Run trees are only ever created after their agents row is
+    /// durably committed, so `Ok(false)` while the tree exists proves no
+    /// admission owns it — its row was pruned or never existed — while an
+    /// admission the protection snapshot missed, including one in the same
+    /// wall-clock second, an id generated before admission, or a rolled-back
+    /// clock, is still found here. The durable row, never the id's
+    /// second-resolution timestamp, is the authority. Callers must treat any
+    /// error as "a row exists" (fail closed) and retry on the next pass.
+    pub fn run_admitted(&self, id: &str) -> Result<bool> {
+        let admitted: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE id=?1)",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(admitted)
     }
 
     /// Runs one short transaction under the caller's progress/lock deadlines.
