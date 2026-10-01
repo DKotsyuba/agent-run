@@ -3,6 +3,7 @@
 use super::{Evidence, Notice};
 use agent_run_domain::worker::WorkerNotice;
 use serde_json::{json, Value};
+#[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -196,7 +197,12 @@ fn peer_identity(stream: &UnixStream) -> Option<(i32, u32)> {
             &mut cred_size,
         ) == 0
     };
-    (pid_ok && cred_ok && pid > 0).then_some((pid, cred.cr_uid))
+    (pid_ok
+        && cred_ok
+        && pid > 0
+        && pid_size as usize == std::mem::size_of::<libc::pid_t>()
+        && cred_size as usize == std::mem::size_of::<libc::xucred>())
+    .then_some((pid, cred.cr_uid))
 }
 
 /// Reads the kernel-proven `(pid, uid)` identity of a connected socket's peer
@@ -204,7 +210,7 @@ fn peer_identity(stream: &UnixStream) -> Option<(i32, u32)> {
 #[cfg(not(target_os = "macos"))]
 fn peer_identity(stream: &UnixStream) -> Option<(i32, u32)> {
     let cred = stream.peer_cred().ok()?;
-    Some((cred.pid(), cred.uid()))
+    Some((cred.pid()?, cred.uid()))
 }
 
 /// Returns this process's effective user id, the only uid permitted on
