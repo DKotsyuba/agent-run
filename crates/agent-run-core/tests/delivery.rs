@@ -16,6 +16,11 @@ use std::{
 
 mod common;
 
+/// Serialises tests that point the process-wide Claude registry override at
+/// their own fixture, so concurrent dispatcher tests cannot resolve each
+/// other's registry.
+static REGISTRY_OVERRIDE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Returns a repository fixture path without making the immutable fixture writable.
 fn fixture(path: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -587,41 +592,207 @@ fn notice_rejects_invalid_metadata_and_contains_only_trusted_facts() {
     assert!(!rendered.contains("answer"));
 }
 
-/// Mirrors `tests/test_claude_uds.py::ClaudeSessionSenderTests::test_clean_send_writes_the_auth_line_then_the_user_line`.
-/// Mirrors `tests/test_claude_uds.py::ClaudeUdsTransportTests::test_send_injects_the_fixed_trusted_message_without_a_remote_id`.
-/// Unix socket test: the endpoint is a private temporary fake, never a live Claude socket.
-#[tokio::test]
-async fn claude_uds_writes_auth_then_trusted_notice_to_fake_socket() {
-    use tokio::io::AsyncReadExt;
+/// One native-shaped fake inbox connection: reads the sender's frames and
+/// optionally answers on the `from` reply socket exactly like the real
+/// inbox's hold-receipt client (one JSON line, then close). `receipt`
+/// overrides `orig_msg_id`/`status` so forged and refused receipts can be
+/// replayed. Returns the parsed user frame.
+async fn native_inbox_connection(
+    stream: &mut tokio::net::UnixStream,
+    inbox: &Path,
+    receipt: Option<(&str, &str)>,
+) -> Value {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    let mut received = String::new();
+    stream.read_to_string(&mut received).await.unwrap();
+    let lines = received.lines().collect::<Vec<_>>();
+    assert_eq!(
+        serde_json::from_str::<Value>(lines[0]).unwrap(),
+        json!({"token":"fixture-token","type":"auth"})
+    );
+    let user: Value = serde_json::from_str(lines[1]).unwrap();
+    if let Some((orig, status)) = receipt {
+        let target = user["from"].as_str().unwrap().strip_prefix("uds:").unwrap();
+        let mut reply = tokio::net::UnixStream::connect(target).await.unwrap();
+        let frame = json!({
+            "type":"control","action":"peer_message_status","status":status,
+            "orig_msg_id":orig,"from":format!("uds:{}", inbox.display()),"reason":"queue"
+        });
+        reply
+            .write_all(format!("{}\n", frame).as_bytes())
+            .await
+            .unwrap();
+        reply.shutdown().await.unwrap();
+    }
+    user
+}
+
+/// A correlated native hold-receipt is the only accepted outcome: the frame
+/// shape is exact, the receipt matches this attempt's notification id, and
+/// both parallel attempts clean up their own reply endpoints afterwards.
+/// Unix socket test: every endpoint is a private temporary fake.
+#[tokio::test]
+async fn claude_uds_hold_receipt_confirms_enqueue_and_cleans_up() {
     let temporary = tempfile::tempdir().unwrap();
     let registry = temporary.path().join("sessions");
     std::fs::create_dir(&registry).unwrap();
     let socket = temporary.path().join("inbox.sock");
     claude_descriptor(&registry, "session-1", &socket);
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-    let receiver = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut received = String::new();
-        stream.read_to_string(&mut received).await.unwrap();
-        received
+    let inbox = socket.clone();
+    let peer = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        let user = native_inbox_connection(&mut first, &inbox, Some(("ntf_a", "held"))).await;
+        let (mut second, _) = listener.accept().await.unwrap();
+        let other =
+            native_inbox_connection(&mut second, &inbox, Some(("ntf_b", "delivered"))).await;
+        (user, other)
     });
-    let evidence = claude::send(&registry, "session-1", &notice()).await;
-    let received = receiver.await.unwrap();
-    let lines = received.lines().collect::<Vec<_>>();
-    // The inbox never acknowledges, so even a clean write is explicitly
-    // unconfirmed and ambiguous, never delivered.
+    let mut first = notice();
+    first.notification_id = "ntf_a".into();
+    let mut second = notice();
+    second.notification_id = "ntf_b".into();
+    let registry_two = registry.clone();
+    let (evidence_a, evidence_b) = tokio::join!(
+        claude::send(&registry, "session-1", &first),
+        claude::send(&registry_two, "session-1", &second)
+    );
+    let (frame_a, frame_b) = peer.await.unwrap();
+    for (frame, notice) in [(&frame_a, &first), (&frame_b, &second)] {
+        assert_eq!(frame["type"], "user");
+        assert_eq!(frame["session_id"], "session-1");
+        assert_eq!(frame["msg_id"], notice.notification_id);
+        assert_eq!(frame["message"]["content"], notice.render().unwrap());
+        let from = frame["from"].as_str().unwrap();
+        assert!(from.starts_with("uds:") && from.ends_with(".sock"));
+        let reply = std::path::Path::new(from.strip_prefix("uds:").unwrap());
+        assert_eq!(reply.parent(), socket.parent());
+    }
+    assert_eq!(evidence_a.classifier, "uds_receipt_held");
+    assert_eq!(evidence_b.classifier, "uds_receipt_delivered");
+    for evidence in [&evidence_a, &evidence_b] {
+        assert_eq!(evidence.error_class, None);
+        assert!(evidence.message_id_present);
+        assert_eq!(evidence.executable, "claude-uds");
+    }
+    // Every ephemeral reply endpoint this process created is gone.
+    let leftovers: Vec<_> = std::fs::read_dir(temporary.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".sock") && name != "inbox.sock")
+        .collect();
+    assert!(leftovers.is_empty(), "reply sockets leaked: {leftovers:?}");
+}
+
+/// A receipt that does not correlate with this attempt's notification id is
+/// ignored, and silence afterwards keeps the attempt explicitly unconfirmed.
+#[tokio::test]
+async fn claude_uds_uncorrelated_receipt_stays_unconfirmed() {
+    let temporary = tempfile::tempdir().unwrap();
+    let registry = temporary.path().join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    let socket = temporary.path().join("inbox.sock");
+    claude_descriptor(&registry, "session-1", &socket);
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let inbox = socket.clone();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        native_inbox_connection(&mut stream, &inbox, Some(("ntf_other", "held"))).await
+    });
+    let mut other = notice();
+    other.notification_id = "ntf_mine".into();
+    let evidence = claude::send(&registry, "session-1", &other).await;
+    let frame = peer.await.unwrap();
+    assert_eq!(frame["msg_id"], "ntf_mine");
     assert_eq!(evidence.classifier, "uds_unconfirmed");
     assert_eq!(evidence.error_class.as_deref(), Some("ambiguous"));
-    assert_eq!(evidence.executable, "claude-uds");
-    assert_eq!(
-        serde_json::from_str::<Value>(lines[0]).unwrap(),
-        json!({"token":"fixture-token","type":"auth"})
-    );
-    assert_eq!(
-        serde_json::from_str::<Value>(lines[1]).unwrap(),
-        json!({"type":"user","session_id":"session-1","msg_id":"ntf_test","message":{"role":"user","content":notice().render().unwrap()}})
-    );
+}
+
+/// A correlated native refusal is a definite non-acceptance, not a delivery
+/// and not an ambiguity.
+#[tokio::test]
+async fn claude_uds_refused_receipt_is_not_delivered() {
+    let temporary = tempfile::tempdir().unwrap();
+    let registry = temporary.path().join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    let socket = temporary.path().join("inbox.sock");
+    claude_descriptor(&registry, "session-1", &socket);
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let inbox = socket.clone();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        native_inbox_connection(&mut stream, &inbox, Some(("ntf_test", "dropped"))).await
+    });
+    let evidence = claude::send(&registry, "session-1", &notice()).await;
+    peer.await.unwrap();
+    assert_eq!(evidence.classifier, "uds_receipt_refused");
+    assert_eq!(evidence.error_class.as_deref(), Some("unavailable"));
+}
+
+/// Cancelling the send future mid-receipt-wait still removes the ephemeral
+/// reply endpoint; nothing this process created survives cancellation.
+#[tokio::test]
+async fn claude_uds_cancellation_removes_reply_socket() {
+    let temporary = tempfile::tempdir().unwrap();
+    let registry = temporary.path().join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    let socket = temporary.path().join("inbox.sock");
+    claude_descriptor(&registry, "session-1", &socket);
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let silent = tokio::spawn(async move {
+        // Reads the frames but never answers, holding the sender in its
+        // bounded receipt wait.
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut received = String::new();
+        use tokio::io::AsyncReadExt;
+        stream.read_to_string(&mut received).await.unwrap();
+    });
+    let registry_cancel = registry.clone();
+    let cancelled = notice();
+    tokio::select! {
+        _ = claude::send(&registry_cancel, "session-1", &cancelled) => {}
+        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+    }
+    silent.await.unwrap();
+    let leftovers: Vec<_> = std::fs::read_dir(temporary.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".sock") && name != "inbox.sock")
+        .collect();
+    assert!(leftovers.is_empty(), "reply sockets leaked: {leftovers:?}");
+}
+
+/// When the inbox socket's directory cannot host a reply endpoint, the send
+/// proceeds without `from` and reports an explicit unconfirmed outcome
+/// instead of blocking or failing.
+#[tokio::test]
+async fn claude_uds_unwritable_directory_sends_without_reply_address() {
+    let temporary = tempfile::tempdir().unwrap();
+    let registry = temporary.path().join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    let socket = temporary.path().join("inbox.sock");
+    claude_descriptor(&registry, "session-1", &socket);
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut received = String::new();
+        use tokio::io::AsyncReadExt;
+        stream.read_to_string(&mut received).await.unwrap();
+        assert!(received.contains("\"from\":null"));
+    });
+    // Drop the owner's write bit on the socket directory: binding a reply
+    // endpoint there now fails, while connecting to the inbox still works.
+    let mode = std::fs::metadata(temporary.path()).unwrap().permissions();
+    let mut read_only = mode.clone();
+    read_only.set_readonly(true);
+    std::fs::set_permissions(temporary.path(), read_only).unwrap();
+    let evidence = claude::send(&registry, "session-1", &notice()).await;
+    std::fs::set_permissions(temporary.path(), mode).unwrap();
+    peer.await.unwrap();
+    assert_eq!(evidence.classifier, "uds_unconfirmed");
 }
 
 /// A dispatcher-level regression for the delivery-confirmation bug: a Claude
@@ -630,6 +801,7 @@ async fn claude_uds_writes_auth_then_trusted_notice_to_fake_socket() {
 /// observable), and must stop retrying after the unconfirmed cap instead of
 /// duplicating the notice forever. The endpoint is a private temporary fake.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
     use tokio::io::AsyncReadExt;
 
@@ -638,6 +810,7 @@ async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
     std::fs::create_dir(&registry).unwrap();
     let socket = home.path.join("inbox.sock");
     claude_descriptor(&registry, "session-1", &socket);
+    let _guard = REGISTRY_OVERRIDE.lock().unwrap();
     std::env::set_var("AGENT_RUN_CLAUDE_SESSION_REGISTRY", &registry);
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let peer = tokio::spawn(async move {
@@ -721,6 +894,88 @@ async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
         .unwrap();
     assert_eq!(status["state"], "failed");
     assert_eq!(status["last_attempt"]["classifier"], "uds_unconfirmed");
+}
+
+/// A dispatcher-level happy path: a correlated native hold-receipt moves the
+/// delivery to `delivered` with one immutable evidence row recording only the
+/// static classifier and booleans — the receipt's payload never lands in the
+/// database, and the schedule is cleared exactly once.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn claude_uds_hold_receipt_delivers_with_correlated_evidence() {
+    let home = common::Home::new();
+    let registry = home.path.join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    let socket = home.path.join("inbox.sock");
+    claude_descriptor(&registry, "session-1", &socket);
+    let _guard = REGISTRY_OVERRIDE.lock().unwrap();
+    std::env::set_var("AGENT_RUN_CLAUDE_SESSION_REGISTRY", &registry);
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let inbox = socket.clone();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        native_inbox_connection(&mut stream, &inbox, Some(("ntf_held", "held"))).await
+    });
+    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) VALUES('sess','claude_uds','session-1',?1,?1)",
+            [now()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary',?1,'{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',?2,1.0,'fixture','ag-20260825-120000-0123456789')",
+            params![home.path.to_string_lossy(), now()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,next_attempt_at) VALUES('ntf_held','ag-20260825-120000-0123456789','sess','pending',0)",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let result = dispatch_with_batch(&home.path, 1).await.unwrap();
+    let frame = peer.await.unwrap();
+    assert_eq!(
+        (result.claimed, result.delivered, result.retried),
+        (1, 1, 0)
+    );
+    assert_eq!(frame["msg_id"], "ntf_held");
+    let row: (String, Option<f64>, Option<String>, bool) =
+        Connection::open(home.path.join("state.db"))
+            .unwrap()
+            .query_row(
+                "SELECT state,next_attempt_at,last_error,ambiguous_result FROM deliveries WHERE id='ntf_held'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+    assert_eq!(row.0, "delivered");
+    assert_eq!(row.1, None);
+    assert_eq!(row.2, None);
+    assert!(!row.3);
+    let evidence: (i64, String) = Connection::open(home.path.join("state.db"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*),MAX(evidence_json) FROM delivery_attempt_evidence WHERE delivery_id='ntf_held'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(evidence.0, 1);
+    assert!(evidence.1.contains("\"classifier\":\"uds_receipt_held\""));
+    assert!(evidence.1.contains("\"message_id_present\":true"));
+    assert!(!evidence.1.contains("ntf_held"), "no notice id persisted");
+    assert!(!evidence.1.contains("session-1"), "no session id persisted");
+    let agent: AgentId = "ag-20260825-120000-0123456789".parse().unwrap();
+    let status = agent_run_store::Store::open(&home.path)
+        .unwrap()
+        .delivery_status(&agent)
+        .unwrap();
+    assert_eq!(status["state"], "delivered");
+    assert_eq!(status["last_attempt"]["classifier"], "uds_receipt_held");
 }
 
 /// Mirrors `tests/test_claude_uds.py::ClaudeSessionSenderTests::test_malformed_descriptors_are_skipped_not_fatal`.

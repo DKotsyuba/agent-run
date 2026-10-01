@@ -74,14 +74,18 @@ has been recorded. Raw messages, session ids, argument/environment values,
 and credentials are intentionally unavailable.
 
 `claude_uds` attempts record the same evidence shape with `classifier`
+`uds_receipt_held`, `uds_receipt_delivered`, `uds_receipt_refused`,
 `uds_unconfirmed`, `uds_ambiguous`, `uds_session_gone`, `uds_rejected`, or
-`uds_unavailable`. The Claude inbox accepts written frames without ever
-acknowledging them to foreign senders, so `uds_unconfirmed` (a clean write
-with no confirmation) is not success: it retries with backoff and then ends
+`uds_unavailable`. Each send advertises an ephemeral reply socket beside the
+inbox socket and correlates the inbox's native hold-receipt by notification
+id: `uds_receipt_held` means the inbox confirmed it queued the notice (the
+`delivered` variant means it confirmed handing it to the session
+immediately); enqueue confirmation is still not proof the recipient's model
+read the message. `uds_unconfirmed` (a clean write with no correlated
+receipt, for example on an inbox that never answers or when no reply socket
+could be bound) is not success: it retries with backoff and then ends
 `failed` with `ambiguous: true`, meaning the notice was written to the inbox
-socket up to three times but its enqueue was never confirmed. Enqueue
-confirmation and consumption by the recipient's model are separate facts;
-agent-run can observe neither for this transport. If a notice looks lost,
+socket up to three times without confirmation. If a notice looks lost,
 check the recipient Claude session's queue state before resending, because
 a retried notice may already be sitting in that queue.
 

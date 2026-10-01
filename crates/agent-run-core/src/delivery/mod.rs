@@ -143,7 +143,10 @@ impl Evidence {
 
     /// Returns whether this observation is an accepted remote acknowledgement.
     fn accepted(&self) -> bool {
-        matches!(self.classifier.as_str(), "relay_accepted" | "delivered")
+        matches!(
+            self.classifier.as_str(),
+            "relay_accepted" | "uds_receipt_held" | "uds_receipt_delivered" | "delivered"
+        )
     }
 
     /// Returns whether this observation can have reached the peer without acknowledgement.
