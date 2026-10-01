@@ -4,6 +4,17 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.19.3] - 2026-10-01
+
+- fix(delivery): require a correlated native Claude inbox receipt before
+  marking completion and worker notices delivered; verify receiver process
+  credentials, bound receipt reads, and remove only owned reply sockets
+- fix(delivery): persist safe Claude attempt diagnostics and stop uncertain
+  retries after three attempts instead of reporting success from a socket write
+
+The database schema remains 22. Receipt confirmation proves inbox acceptance,
+not that the recipient model has read the notice.
+
 ## [0.19.2] - 2026-10-01
 
 - fix(maintenance): schedule database expiry independently from filesystem

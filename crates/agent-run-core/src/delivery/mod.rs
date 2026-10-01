@@ -21,6 +21,11 @@ const LEASE_SECONDS: f64 = 30.0;
 const MAX_TAIL_BYTES: usize = 4096;
 const MAX_EVIDENCE_BYTES: usize = 16 * 1024;
 const DEFAULT_MAX_BATCH: usize = 1000;
+/// Claude inbox attempts whose outcome stays uncertain (unconfirmed or
+/// ambiguous) before the notice stops retrying; a configured `max_attempts`
+/// of zero means unlimited retries, so without this cap one fire-and-forget
+/// notice would duplicate forever.
+const CLAUDE_UNCERTAIN_MAX_ATTEMPTS: u32 = 3;
 /// Version of the frozen completion-notice payload.
 pub const NOTICE_VERSION: u32 = 1;
 
@@ -71,7 +76,7 @@ impl Receipt {
     }
 }
 
-/// Immutable, secret-safe facts recorded for one owned Codex queue attempt.
+/// Immutable, secret-safe facts recorded for one owned delivery attempt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Evidence {
@@ -141,7 +146,7 @@ impl Evidence {
     fn accepted(&self) -> bool {
         matches!(
             self.classifier.as_str(),
-            "relay_accepted" | "uds_written" | "delivered"
+            "relay_accepted" | "uds_receipt_held" | "uds_receipt_delivered" | "delivered"
         )
     }
 
@@ -149,7 +154,7 @@ impl Evidence {
     fn ambiguous(&self) -> bool {
         matches!(
             self.classifier.as_str(),
-            "relay_ambiguous" | "uds_ambiguous"
+            "relay_ambiguous" | "uds_ambiguous" | "uds_unconfirmed"
         )
     }
 
@@ -560,6 +565,12 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
 
 /// Persists one owned result and its immutable queue evidence in the same
 /// transaction, using the delivery policy from either supported config schema.
+///
+/// A Claude inbox attempt is never accepted on write alone (see
+/// [`claude::send`]); its uncertain observations (`uds_unconfirmed` or
+/// `uds_ambiguous`) retry with backoff until [`CLAUDE_UNCERTAIN_MAX_ATTEMPTS`]
+/// and then fail terminally with the ambiguous flag set, so one notice can
+/// neither look delivered without a confirmation nor duplicate forever.
 fn complete(home: &Path, claim: &Claim, evidence: &Evidence) -> Result<()> {
     let delivery = match ProviderConfig::load(home) {
         Ok((config, _)) => config.delivery,
@@ -581,7 +592,14 @@ fn complete(home: &Path, claim: &Claim, evidence: &Evidence) -> Result<()> {
     let accepted = evidence.accepted();
     let ambiguous = evidence.ambiguous();
     let exhausted = delivery.max_attempts > 0 && claim.attempt >= delivery.max_attempts;
-    let failed = !accepted && (exhausted || evidence.classifier == "unsupported_transport");
+    let uncertain_exhausted = claim.transport == "claude_uds"
+        && matches!(
+            evidence.classifier.as_str(),
+            "uds_unconfirmed" | "uds_ambiguous"
+        )
+        && claim.attempt >= CLAUDE_UNCERTAIN_MAX_ATTEMPTS;
+    let failed = !accepted
+        && (exhausted || uncertain_exhausted || evidence.classifier == "unsupported_transport");
     let state = if accepted {
         "delivered"
     } else if failed {
@@ -598,7 +616,7 @@ fn complete(home: &Path, claim: &Claim, evidence: &Evidence) -> Result<()> {
     } else {
         None
     };
-    if claim.transport == "codex_queue" {
+    if matches!(claim.transport.as_str(), "codex_queue" | "claude_uds") {
         let persisted = evidence.persisted()?;
         tx.execute(
             "INSERT OR IGNORE INTO delivery_attempt_evidence(delivery_id,attempt,recorded_at,evidence_json) VALUES(?,?,?,?)",
