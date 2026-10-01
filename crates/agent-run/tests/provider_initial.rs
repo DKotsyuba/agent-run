@@ -3303,10 +3303,10 @@ fn times(home: &Path, id: &AgentId, number: u32) -> ((f64, f64), (f64, f64)) {
 }
 
 /// With the configurable margin disabled, one deadline spans the whole run:
-/// A (a 1.5 s exhausted turn) consumes part
-/// of a 5 s budget, B hangs and is stopped at the ORIGINAL deadline — not 5 s
-/// after B started (a fresh budget would end at least ~7 s after admission) — with confirmed cleanup, `timed_out` once, and no third
-/// attempt.
+/// A spends 3 s of a 5 s budget before exhaustion; B hangs and is stopped at
+/// the original deadline. A fresh B budget would end after at least 8 s.
+/// The larger consumed portion leaves cleanup headroom without relaxing the
+/// timing, confirmed-cleanup, single-timeout or attempt-count assertions.
 #[tokio::test]
 async fn one_deadline_spans_attempts_and_cleans_a_hung_engine() {
     let (_temp, home) = codex_home(["exhausted-slow", "ok-hold"]);
