@@ -346,7 +346,7 @@ impl Pass {
 /// reference-aware collection over the shared managed-asset store, under its
 /// own nonblocking publish lock, so a busy publisher never delays the rest of
 /// retention. Callers should rerun after one second while work remains and
-/// hourly when idle, matching history maintenance.
+/// hourly when idle; database expiry keeps its own independent schedule.
 pub fn sweep(home: &Path, now: f64, store: &mut Store) -> Result<usize> {
     if !now.is_finite() || now < LOG_SECONDS {
         return Err(invalid("filesystem retention requires a finite Unix time"));

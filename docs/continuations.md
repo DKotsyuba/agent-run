@@ -29,7 +29,9 @@ The original provider, harness, model, reasoning effort, generated home, working
 directory, write/network/read-root grants, output schema and fast setting are
 inherited. The task changes; timeout and caller binding may be overridden.
 Omitted `timeout_seconds` and `orchestrator` inherit the previous request's
-values. The new run has its own deadline from admission, and preparation and
+values; an inherited timeout keeps the previous run's already-effective
+allowance (`core.timeout_multiplier` is never applied twice), while a newly
+requested timeout is scaled once by the current multiplier. The new run has its own deadline from admission, and preparation and
 all its attempts share that budget. Missing identity or incompatible current
 permissions fail explicitly, including a changed profile.
 

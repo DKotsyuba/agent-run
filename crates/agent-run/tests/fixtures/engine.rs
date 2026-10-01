@@ -402,12 +402,13 @@ fn app_server() {
                 emit(json!({"id":id,"result":echo}));
             }
             "turn/start" => {
-                // `slow` in the auth file makes each turn take 1.5 s.
+                // `slow` spends 3 s of the deadline before account switching,
+                // leaving a clear gap between the remainder and a fresh budget.
                 if std::fs::read_to_string(home.join("auth.json"))
                     .map(|text| text.contains("slow"))
                     .unwrap_or(false)
                 {
-                    std::thread::sleep(Duration::from_millis(1500));
+                    std::thread::sleep(Duration::from_millis(3000));
                 }
                 turns += 1;
                 let turn = format!("turn-{}-{turns}", std::process::id());

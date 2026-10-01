@@ -2,8 +2,9 @@
 
 mod common;
 
-use agent_run_domain::domain::AgentId;
-use agent_run_store::{retention::HISTORY_SECONDS, Store};
+use agent_run_domain::domain::{AgentId, OrchestratorRef};
+use agent_run_domain::Error;
+use agent_run_store::{retention, retention::HISTORY_SECONDS, Store};
 use rusqlite::params;
 use serde_json::json;
 use std::path::Path;
@@ -591,5 +592,256 @@ fn retention_pins_pending_layout_homes_only() {
     assert_eq!(count(&store, "agents"), 0);
     let proof = store.storage_protection_snapshot().unwrap();
     assert!(!proof.retains("anyone", Path::new(&runtime_home)));
+    integrity(&store);
+}
+
+/// An idle database takes no writer lock at all: with nothing eligible, prune
+/// Safe maintenance diagnostics classify contention and carry code names
+/// without any SQLite message text.
+#[test]
+fn maintenance_diagnostics_map_busy_locked_and_interrupt_codes() {
+    for (extended, name) in [
+        (5, Some("SQLITE_BUSY")),
+        (6, Some("SQLITE_LOCKED")),
+        (9, Some("SQLITE_INTERRUPT")),
+        (261, Some("SQLITE_BUSY_RECOVERY")),
+        (262, Some("SQLITE_LOCKED_SHAREDCACHE")),
+        (517, Some("SQLITE_BUSY_SNAPSHOT")),
+        (11, None),
+    ] {
+        let error = Error::Sql(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(extended),
+            Some("never logged".into()),
+        ));
+        let codes = retention::sqlite_codes(&error).expect("sqlite failure detail");
+        assert_eq!(codes.primary, extended & 0xff);
+        assert_eq!(codes.extended, extended);
+        assert_eq!(codes.extended_name, name, "extended {extended}");
+        if matches!(extended, 5 | 6 | 9 | 261 | 262 | 517) {
+            assert!(
+                retention::is_writer_contention(&error),
+                "extended {extended}"
+            );
+        } else {
+            assert!(
+                !retention::is_writer_contention(&error),
+                "extended {extended}"
+            );
+        }
+    }
+    // Non-SQLite failures classify as neither contention nor SQLite detail.
+    let plain = Error::Validation("fixture".into());
+    assert!(retention::sqlite_codes(&plain).is_none());
+    assert!(!retention::is_writer_contention(&plain));
+}
+
+/// An idle database takes no writer lock at all: with nothing eligible, prune
+/// completes as a no-op through its read-only probe even while another
+/// connection holds the single WAL writer. Regression for the old cadence,
+/// which opened `BEGIN IMMEDIATE` before checking for work and failed here.
+#[test]
+fn idle_prune_skips_the_writer_transaction_entirely() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = agent(&home, &mut store, "running", None);
+    let holder = home.store();
+    holder.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    holder
+        .conn
+        .execute(
+            "INSERT INTO capacity_samples(runtime,lane,window,source,payload_json,observed_at)
+             VALUES ('mock','shared','fixture','fixture',zeroblob(16),0)",
+            [],
+        )
+        .unwrap();
+    // The broker's maintenance connection only waits out a writer briefly.
+    store
+        .conn
+        .busy_timeout(std::time::Duration::from_millis(100))
+        .unwrap();
+    assert_eq!(store.prune_history(NOW).unwrap(), 0);
+    assert!(store.get(&id).is_ok());
+    holder.conn.execute_batch("COMMIT").unwrap();
+    integrity(&store);
+}
+
+/// A held writer makes prune defer — bounded, classified as writer contention,
+/// and never reported as completion — and releasing it resumes real progress.
+#[test]
+fn prune_defers_while_a_writer_holds_the_database_then_resumes() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = agent(
+        &home,
+        &mut store,
+        "failed",
+        Some(NOW - HISTORY_SECONDS - 1.0),
+    );
+    let holder = home.store();
+    holder.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    holder
+        .conn
+        .execute(
+            "INSERT INTO capacity_samples(runtime,lane,window,source,payload_json,observed_at)
+             VALUES ('mock','shared','fixture','fixture',zeroblob(16),0)",
+            [],
+        )
+        .unwrap();
+    store
+        .conn
+        .busy_timeout(std::time::Duration::from_millis(100))
+        .unwrap();
+    let started = std::time::Instant::now();
+    let deferred = store.prune_history(NOW);
+    let elapsed = started.elapsed();
+    let error = deferred.expect_err("a deferred pass must not report completion");
+    assert!(
+        retention::is_writer_contention(&error),
+        "expected writer contention, got {error:?}"
+    );
+    let codes = retention::sqlite_codes(&error).expect("sqlite failure detail");
+    assert_eq!(codes.primary, 5, "primary busy code, got {codes:?}");
+    assert!(
+        codes.primary_name.contains("Busy"),
+        "primary code name, got {codes:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "deferral must be bounded by the short busy timeout, took {elapsed:?}"
+    );
+    assert!(store.get(&id).is_ok(), "deferred work removed nothing");
+    holder.conn.execute_batch("COMMIT").unwrap();
+    drop(holder);
+    assert!(store.prune_history(NOW).unwrap() > 0);
+    assert!(store.get(&id).is_err());
+    integrity(&store);
+}
+
+/// Repeated maintenance passes concurrent with real journal writes, transcript
+/// reads and terminal delivery commits never lose or corrupt either side.
+#[test]
+fn maintenance_concurrent_with_transcripts_and_deliveries_preserves_both() {
+    let at = agent_run_domain::domain::now();
+    let home = common::Home::new();
+    let mut store = home.store();
+    let mut request = home.request();
+    request.orchestrator = Some(OrchestratorRef {
+        transport: "codex_queue".into(),
+        external_session_id: "fixture-session".into(),
+        external_turn_id: None,
+    });
+    let (id, _) = store
+        .admit(&request, &home.config, &json!({}), None)
+        .unwrap();
+    store.running(&id, 7).unwrap();
+    // A genuine multi-batch backlog keeps every maintenance pass busy writing.
+    for _ in 0..3 {
+        agent(
+            &home,
+            &mut store,
+            "failed",
+            Some(at - HISTORY_SECONDS - 1.0),
+        );
+    }
+    let backlog = at - HISTORY_SECONDS - 1.0;
+    for index in 0..4_000i64 {
+        store
+            .conn
+            .execute(
+                "INSERT INTO capacity_samples(runtime,lane,window,source,payload_json,observed_at)
+                 VALUES ('mock','shared','fixture','fixture',zeroblob(64),?)",
+                [backlog - index as f64],
+            )
+            .unwrap();
+    }
+    // The maintenance connection mirrors the broker worker: its own SQLite
+    // handle, the broker's short busy timeout, and deferral on contention.
+    let maintenance_home = home.path.clone();
+    let maintenance = std::thread::spawn(move || {
+        let mut deferred = 0usize;
+        let mut passes = 0usize;
+        for _ in 0..24 {
+            let Ok(mut store) = Store::open(&maintenance_home) else {
+                continue;
+            };
+            let _ = store
+                .conn
+                .busy_timeout(std::time::Duration::from_millis(100));
+            passes += 1;
+            match store.prune_history(at) {
+                Ok(_) => {}
+                Err(error) if retention::is_writer_contention(&error) => deferred += 1,
+                Err(error) => panic!("maintenance failure is not contention: {error:?}"),
+            }
+            // Compaction stays idle-only: the live agent keeps it a no-op.
+            let _ = store.vacuum_history();
+        }
+        (passes, deferred)
+    });
+    let messages = 120;
+    for index in 0..messages {
+        let text = format!("fixture message {index}");
+        store
+            .append_message(&id, "assistant", &text, None, None, None)
+            .unwrap();
+        let page = store.transcript_page(&id, 0, 1000).unwrap();
+        assert!(page.complete, "concurrent reads stay consistent");
+        // Interleave a bounded read of the newest writes.
+        let tail = store
+            .transcript_page(
+                &id,
+                (page.messages.len().saturating_sub(2)).max(1) as i64 - 1,
+                2,
+            )
+            .unwrap();
+        assert_eq!(tail.messages.len(), 2.min(page.messages.len()));
+    }
+    let root = home.path.join("agents").join(id.as_str());
+    std::fs::create_dir_all(&root).unwrap();
+    let proof =
+        agent_run_platform::verify::seal(&root, Path::new("answer.md"), "fixture answer").unwrap();
+    // Commit the completion while the maintenance thread remains eligible to run.
+    // Its real completion time stays inside the same retention window.
+    store
+        .finish(
+            &id,
+            &agent_run_domain::domain::Outcome::failure("fixture"),
+            Some(&proof),
+            None,
+        )
+        .unwrap();
+    let (passes, _deferred) = maintenance.join().unwrap();
+    assert_eq!(passes, 24);
+    // Repeated passes after the commit must leave the durable completion and
+    // its transcript exactly as committed.
+    for _ in 0..5 {
+        let mut pass = home.store();
+        assert_eq!(pass.prune_history(at).unwrap(), 0);
+        let _ = pass.vacuum_history();
+    }
+    // Every transcript message survives maintenance, in order, and the
+    // completion delivery stays durable with its terminal event.
+    let page = store.transcript_page(&id, 0, 1000).unwrap();
+    let contents: Vec<String> = page
+        .messages
+        .iter()
+        .map(|message| message.content.clone())
+        .collect();
+    assert_eq!(contents.len(), messages);
+    for (index, content) in contents.iter().enumerate() {
+        assert_eq!(*content, format!("fixture message {index}"));
+    }
+    let (state, terminal): (String, Option<i64>) = store
+        .conn
+        .query_row(
+            "SELECT state,terminal_event_seq FROM deliveries WHERE agent_id=?",
+            [id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "pending");
+    assert!(terminal.is_some());
+    assert_eq!(count(&store, "agents"), 1, "only the retained run remains");
+    assert_eq!(count(&store, "capacity_samples"), 0);
     integrity(&store);
 }

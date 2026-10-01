@@ -4,6 +4,18 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-10-01
+
+- fix(maintenance): schedule database expiry independently from filesystem
+  cleanup, avoiding repeated idle writer transactions during file backlogs;
+  defer contention and record safe SQLite primary and extended result codes
+- feat(config): add `core.timeout_multiplier`, defaulting to 1.2 (+20%), for
+  explicit and default agent timeouts; preserve inherited resume allowances
+  without compounding and retain historical configuration snapshot digests
+
+The database schema remains 22. Set `core.timeout_multiplier = 1.0` to disable
+the timeout margin. Existing admitted runs keep their original deadlines.
+
 ## [0.19.1] - 2026-09-30
 
 - perf(storage): share immutable runtime assets and compatible native Codex

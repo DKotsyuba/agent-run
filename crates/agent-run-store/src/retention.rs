@@ -1,8 +1,8 @@
 //! Fourteen-day retention for completed work; active ownership and retained lineage win over age.
 
 use crate::Store;
-use agent_run_domain::{domain::AgentId, error::invalid, Result};
-use rusqlite::{params, TransactionBehavior};
+use agent_run_domain::{domain::AgentId, error::invalid, Error, Result};
+use rusqlite::{params, ErrorCode, TransactionBehavior};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 use std::{
@@ -14,6 +14,73 @@ use std::{
 pub const HISTORY_SECONDS: f64 = 14.0 * 24.0 * 3600.0;
 /// Maximum rows removed from each large journal in one transaction.
 const ROW_BATCH: i64 = 2_000;
+
+/// Safe structured SQLite result-code detail extracted from one store error.
+///
+/// Only numeric result codes and static code names are captured. SQLite
+/// message strings, SQL text and bound values can echo configuration and
+/// transcript content, so they are deliberately excluded from maintenance
+/// diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteCodes {
+    /// Primary SQLite result code (`extended & 0xff`, e.g. `5` for busy).
+    pub primary: i32,
+    /// Stable name of the primary code as spelled by the SQLite binding.
+    pub primary_name: String,
+    /// Extended SQLite result code (e.g. `517` for a busy WAL snapshot).
+    pub extended: i32,
+    /// Static name of the extended code when it is one of the well-known
+    /// busy/locked/interrupt spellings, else `None`.
+    pub extended_name: Option<&'static str>,
+}
+
+/// Extracts safe SQLite result-code detail from `error`, when it carries a
+/// SQLite failure. Every other error returns `None` and callers log their own
+/// stable category instead.
+pub fn sqlite_codes(error: &Error) -> Option<SqliteCodes> {
+    let source = as_sqlite(error)?.sqlite_error()?;
+    let extended = source.extended_code;
+    Some(SqliteCodes {
+        primary: extended & 0xff,
+        primary_name: format!("{:?}", source.code),
+        extended,
+        extended_name: extended_name(extended),
+    })
+}
+
+/// True when a maintenance failure is ordinary writer contention or an interruption.
+///
+/// Busy, locked and interrupted SQLite outcomes mean the pass must defer: the
+/// work may still exist, so callers retry later instead of treating the pass
+/// as complete or reporting a data-integrity failure. Every other error keeps
+/// its normal error contract.
+pub fn is_writer_contention(error: &Error) -> bool {
+    matches!(
+        as_sqlite(error).and_then(rusqlite::Error::sqlite_error_code),
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked | ErrorCode::OperationInterrupted)
+    )
+}
+
+/// Returns the SQLite source error when the domain error carries one.
+fn as_sqlite(error: &Error) -> Option<&rusqlite::Error> {
+    match error {
+        Error::Sql(source) => Some(source),
+        _ => None,
+    }
+}
+
+/// Names the extended busy/locked/interrupt spellings maintenance defers on.
+fn extended_name(extended: i32) -> Option<&'static str> {
+    match extended {
+        5 => Some("SQLITE_BUSY"),
+        6 => Some("SQLITE_LOCKED"),
+        9 => Some("SQLITE_INTERRUPT"),
+        261 => Some("SQLITE_BUSY_RECOVERY"),
+        262 => Some("SQLITE_LOCKED_SHAREDCACHE"),
+        517 => Some("SQLITE_BUSY_SNAPSHOT"),
+        _ => None,
+    }
+}
 
 /// Bounded in-memory proof of paths and run identities still referenced by retained rows.
 pub struct StorageProtection {
@@ -113,6 +180,11 @@ impl Store {
     /// large histories make progress over multiple calls. Accounts, quota
     /// exhaustion latches, live services and files on disk are never removed.
     /// Every batch commits atomically or rolls back on error; no await is allowed.
+    /// A read-only eligibility probe first skips the writer transaction entirely
+    /// when nothing can expire yet, so an idle database never competes for the
+    /// writer lock. A busy, locked or interrupted SQLite outcome returns the
+    /// corresponding error (see [`is_writer_contention`]): callers must defer
+    /// and retry rather than treat it as completion or a data-integrity failure.
     /// Callback setup/cleanup errors propagate; cleanup is attempted even if the batch fails.
     pub fn prune_history(&mut self, at: f64) -> Result<usize> {
         if !at.is_finite() || at < HISTORY_SECONDS {
@@ -262,9 +334,41 @@ impl Store {
         Ok(proof)
     }
 
+    /// Runs one read-only eligibility probe before any writer transaction.
+    ///
+    /// The query mirrors the batch's eligibility sources as supersets: every
+    /// row the batch could consider matches at least one `EXISTS` here, and
+    /// the batch's ownership, lineage and lease protections are applied later
+    /// inside its own transaction. `false` therefore proves the next batch
+    /// would delete nothing, so callers skip taking the database writer lock
+    /// at all; WAL readers never block a concurrent writer.
+    fn prune_work_pending(&self, cutoff: f64) -> Result<bool> {
+        let pending: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_runs
+                WHERE status IN ('succeeded','failed','cancelled','lost') AND finished_at < ?1)
+             OR EXISTS(SELECT 1 FROM agents
+                WHERE status IN ('succeeded','failed','timed_out','cancelled','lost')
+                  AND finished_at < ?1)
+             OR EXISTS(SELECT 1 FROM capacity_samples WHERE observed_at < ?1)
+             OR EXISTS(SELECT 1 FROM capacity_route_snapshots WHERE valid_until < ?1)
+             OR EXISTS(SELECT 1 FROM managed_service_generations
+                WHERE state='stopped' AND COALESCE(checked_at,created_at) < ?1)
+             OR EXISTS(SELECT 1 FROM orchestrator_sessions WHERE last_seen_at < ?1)",
+            params![cutoff],
+            |row| row.get(0),
+        )?;
+        Ok(pending)
+    }
+
     /// Runs one short transaction under the caller's progress/lock deadlines.
     fn prune_history_batch(&mut self, at: f64) -> Result<usize> {
         let cutoff = at - HISTORY_SECONDS;
+        // An idle database must not take the writer lock at all: the probe
+        // above is read-only, so an ordinary workload never sees a no-op
+        // maintenance transaction compete for the single WAL writer.
+        if !self.prune_work_pending(cutoff)? {
+            return Ok(0);
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
