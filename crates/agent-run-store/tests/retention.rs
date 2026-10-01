@@ -721,6 +721,7 @@ fn prune_defers_while_a_writer_holds_the_database_then_resumes() {
 /// reads and terminal delivery commits never lose or corrupt either side.
 #[test]
 fn maintenance_concurrent_with_transcripts_and_deliveries_preserves_both() {
+    let at = agent_run_domain::domain::now();
     let home = common::Home::new();
     let mut store = home.store();
     let mut request = home.request();
@@ -739,10 +740,10 @@ fn maintenance_concurrent_with_transcripts_and_deliveries_preserves_both() {
             &home,
             &mut store,
             "failed",
-            Some(NOW - HISTORY_SECONDS - 1.0),
+            Some(at - HISTORY_SECONDS - 1.0),
         );
     }
-    let backlog = NOW - HISTORY_SECONDS - 1.0;
+    let backlog = at - HISTORY_SECONDS - 1.0;
     for index in 0..4_000i64 {
         store
             .conn
@@ -767,7 +768,7 @@ fn maintenance_concurrent_with_transcripts_and_deliveries_preserves_both() {
                 .conn
                 .busy_timeout(std::time::Duration::from_millis(100));
             passes += 1;
-            match store.prune_history(NOW) {
+            match store.prune_history(at) {
                 Ok(_) => {}
                 Err(error) if retention::is_writer_contention(&error) => deferred += 1,
                 Err(error) => panic!("maintenance failure is not contention: {error:?}"),
@@ -799,12 +800,8 @@ fn maintenance_concurrent_with_transcripts_and_deliveries_preserves_both() {
     std::fs::create_dir_all(&root).unwrap();
     let proof =
         agent_run_platform::verify::seal(&root, Path::new("answer.md"), "fixture answer").unwrap();
-    // The concurrent maintenance worker stops before the terminal commit: a
-    // finished run carries a real `finished_at` until the fixture clock below
-    // restores it inside the retention window, and deleting it in that gap is
-    // exactly what retention would correctly do at the fixture's future time.
-    let (passes, deferred) = maintenance.join().unwrap();
-    assert_eq!(passes, 24);
+    // Commit the completion while the maintenance thread remains eligible to run.
+    // Its real completion time stays inside the same retention window.
     store
         .finish(
             &id,
@@ -813,19 +810,13 @@ fn maintenance_concurrent_with_transcripts_and_deliveries_preserves_both() {
             None,
         )
         .unwrap();
-    // Keep the finished run inside the retention window under the fixture clock.
-    store
-        .conn
-        .execute(
-            "UPDATE agents SET finished_at=? WHERE id=?",
-            params![NOW - 10.0, id.as_str()],
-        )
-        .unwrap();
+    let (passes, _deferred) = maintenance.join().unwrap();
+    assert_eq!(passes, 24);
     // Repeated passes after the commit must leave the durable completion and
     // its transcript exactly as committed.
     for _ in 0..5 {
         let mut pass = home.store();
-        assert_eq!(pass.prune_history(NOW).unwrap(), 0);
+        assert_eq!(pass.prune_history(at).unwrap(), 0);
         let _ = pass.vacuum_history();
     }
     // Every transcript message survives maintenance, in order, and the
@@ -850,10 +841,6 @@ fn maintenance_concurrent_with_transcripts_and_deliveries_preserves_both() {
         .unwrap();
     assert_eq!(state, "pending");
     assert!(terminal.is_some());
-    assert!(
-        deferred > 0 || passes > 0,
-        "deferrals are allowed, never errors"
-    );
     assert_eq!(count(&store, "agents"), 1, "only the retained run remains");
     assert_eq!(count(&store, "capacity_samples"), 0);
     integrity(&store);
