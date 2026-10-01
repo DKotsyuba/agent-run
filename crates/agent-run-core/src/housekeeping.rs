@@ -1224,10 +1224,55 @@ fn drain(dir: &fs::Dir, preserve_complete: bool, depth: usize, pass: &mut Pass) 
 }
 
 #[cfg(test)]
-/// Socket probes use private finite listeners and never launch a model process.
+/// Retention and socket probes use private fixtures and never launch a model process.
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+
+    /// An admission committed after protection capture keeps its same-second
+    /// tree through the real collector, even though the stale count boundary
+    /// makes the name eligible and the old proof has no reference to it.
+    #[test]
+    fn count_collection_rechecks_admission_after_protection_capture() {
+        let home = tempfile::tempdir().unwrap();
+        Store::initialize(home.path()).unwrap();
+        let store = Store::open(home.path()).unwrap();
+        let at = 2_000_000_000.0;
+        for index in 0..100 {
+            let id = format!("ag-20330518-040000-{index:010x}");
+            store.conn.execute(
+                "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,
+                 request_json,status,created_at,finished_at,timeout_seconds,config_revision,root_agent_id)
+                 VALUES(?1,'mock','fixture','review','fixture','fixture','/tmp','{}',
+                        'succeeded',?2,?2,1,'fixture',?1)",
+                rusqlite::params![id, at + 1_000.0 + index as f64],
+            ).unwrap();
+        }
+        let stale = store.storage_protection_snapshot().unwrap();
+        assert_eq!(stale.count_boundary(), Some(at + 1_000.0));
+        let id = "ag-20330518-033320-ffffffffff";
+        let tree = home.path().join("agents").join(id);
+        assert!(!stale.retains(id, &tree));
+        store
+            .conn
+            .execute(
+                "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,
+             request_json,status,created_at,timeout_seconds,config_revision,root_agent_id)
+             VALUES(?1,'mock','fixture','review','fixture','fixture','/tmp','{}',
+                    'running',?2,1,'fixture',?1)",
+                rusqlite::params![id, at + 0.8],
+            )
+            .unwrap();
+        fs::private_dir(&tree).unwrap();
+        std::fs::write(tree.join("live"), "fixture").unwrap();
+        let root = fs::Dir::open(home.path()).unwrap();
+        let mut pass = Pass::new(home.path(), &root).unwrap();
+        run_directories(home.path(), &root, at + 0.9, &stale, &store, &mut pass);
+        assert!(
+            tree.join("live").exists(),
+            "fresh admission wins over stale protection"
+        );
+    }
 
     /// A listener with zero queued slots still returns from the nonblocking probe promptly.
     #[test]

@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- feat(retention): keep the newest 100 logical agent sessions alongside
+  fourteen-day expiry; count resumes once, protect active references and
+  reclaim count-pruned run directories through bounded admission-safe checks
+
 ## [0.19.3] - 2026-10-01
 
 - fix(delivery): require a correlated native Claude inbox receipt before
