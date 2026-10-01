@@ -1,10 +1,26 @@
 # History retention
 
 The resident broker automatically expires completed database history **14 days
-after `finished_at`**. It runs on startup and then hourly. A backlog drains in
-small transactions, with a one-second pause between batches; failures retry
-after a minute. Filesystem cleanup runs on the same schedule even while the
-database has a backlog. No cron job or provider-specific configuration is needed.
+after `finished_at`**. Database expiry runs on startup and then hourly; a
+backlog drains in small transactions with a one-second pause between batches.
+Filesystem cleanup keeps its own independent schedule — a one-second cadence
+while entries remain, hourly when idle — so a filesystem backlog never forces
+a database writer transaction every second, and a database backlog never
+starves reclaiming disposable files. A pass that finds nothing eligible
+proves the database idle with a read-only query and skips the writer
+transaction entirely. Failures and deferrals retry after a minute. No cron job
+or provider-specific configuration is needed.
+
+Maintenance yields to normal workload. Every maintenance connection uses a
+100 ms busy timeout, so a held writer makes a prune or compaction pass defer —
+busy, locked and interrupted SQLite outcomes are classified as deferrals, not
+data-integrity failures and never as completed passes — and the work resumes
+on the next retry. Diagnostics for a failed or deferred pass log only a static
+operation and stage plus SQLite numeric result codes and static code names
+(for example `sqlite_primary=5 sqlite_primary_name=DatabaseBusy
+sqlite_extended=517 SQLITE_BUSY_SNAPSHOT`); SQLite messages, SQL text, paths
+and payloads are never logged because they can echo configuration or
+transcript content.
 
 Expired agents lose their transcripts, events, commands, delivery attempts,
 usage rows, attempts and process snapshots. Their completion notices, including

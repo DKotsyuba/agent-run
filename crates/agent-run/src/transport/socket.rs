@@ -286,6 +286,129 @@ const CONTROL_FRAME_DEADLINE: Duration = Duration::from_millis(500);
 /// Interval between content-digest checks for a running broker's configuration.
 const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
 const CONTROL_METHODS: &[&str] = &["start", "resume", "cancel", "steer"];
+/// Steady database maintenance interval: expiry found no work and compaction
+/// reclaimed no pages, so nothing eligible remains.
+const DATABASE_STEADY: Duration = Duration::from_secs(3600);
+/// Database maintenance interval while a pass removed rows or reclaimed pages:
+/// a bounded backlog keeps draining at one-second batches.
+const DATABASE_BACKLOG: Duration = Duration::from_secs(1);
+/// Steady filesystem retention interval: the last pass removed nothing and
+/// reported no further pass.
+const FILESYSTEM_STEADY: Duration = Duration::from_secs(3600);
+/// Filesystem retention interval while a pass removed entries or reported that
+/// another pass is needed; database outcomes never influence it.
+const FILESYSTEM_BACKLOG: Duration = Duration::from_secs(1);
+/// Retry interval after a maintenance pass deferred on writer contention or
+/// failed; long enough that a busy broker is never hammered by its own cleanup.
+const MAINTENANCE_RETRY: Duration = Duration::from_secs(60);
+
+/// Returns the next database maintenance delay after one pass removed
+/// `removed` rows plus reclaimed-page batches.
+///
+/// `removed == 0` means the pass proved the database idle (a read-only probe
+/// can skip the writer transaction entirely), so expiry returns to its hourly
+/// steady cadence. Any filesystem outcome is invisible here: the two
+/// schedules are independent, so a filesystem backlog cannot force a database
+/// writer transaction every second.
+fn database_maintenance_delay(removed: usize) -> Duration {
+    if removed == 0 {
+        DATABASE_STEADY
+    } else {
+        DATABASE_BACKLOG
+    }
+}
+
+/// Returns the next filesystem retention delay after one pass removed
+/// `removed` entries or reported that another pass is needed.
+///
+/// `removed == 0` means the pass found no actionable work, so retention
+/// returns to its hourly steady cadence. Database outcomes are invisible here.
+fn filesystem_maintenance_delay(removed: usize) -> Duration {
+    if removed == 0 {
+        FILESYSTEM_STEADY
+    } else {
+        FILESYSTEM_BACKLOG
+    }
+}
+
+/// The two broker maintenance schedules' next due times.
+///
+/// Database expiry/compaction and filesystem retention run on independent
+/// cadences: each pass outcome advances only its own schedule, so a filesystem
+/// backlog drains in one-second passes without forcing a database writer
+/// transaction every second, and a database backlog never starves filesystem
+/// cleanup. Both schedules start due immediately, matching the startup pass.
+#[derive(Debug)]
+struct MaintenanceSchedules {
+    /// Next due time of the database expiry and compaction pass.
+    next_database: tokio::time::Instant,
+    /// Next due time of the filesystem retention pass.
+    next_filesystem: tokio::time::Instant,
+}
+
+impl MaintenanceSchedules {
+    /// Returns both schedules due at `at`, so the first broker cycle runs each
+    /// pass once at startup.
+    fn starting_at(at: tokio::time::Instant) -> Self {
+        Self {
+            next_database: at,
+            next_filesystem: at,
+        }
+    }
+
+    /// The earlier of both due times; the worker sleeps until it.
+    fn next_due(&self) -> tokio::time::Instant {
+        self.next_database.min(self.next_filesystem)
+    }
+
+    /// Advances only the database schedule after one pass completed at `at`
+    /// having removed `removed` rows plus reclaimed-page batches. A deferred
+    /// or failed pass is recorded by the caller through [`MAINTENANCE_RETRY`].
+    fn database_pass(&mut self, at: tokio::time::Instant, removed: usize) {
+        self.next_database = at + database_maintenance_delay(removed);
+    }
+
+    /// Advances only the filesystem schedule after one pass completed at `at`
+    /// having removed `removed` entries or reported that another pass is
+    /// needed. A deferred or failed pass is recorded by the caller through
+    /// [`MAINTENANCE_RETRY`].
+    fn filesystem_pass(&mut self, at: tokio::time::Instant, removed: usize) {
+        self.next_filesystem = at + filesystem_maintenance_delay(removed);
+    }
+}
+
+/// Prints one structured, secret-free diagnostic line for a failed
+/// maintenance pass.
+///
+/// `operation` and `stage` are static labels identifying the failing pass.
+/// A SQLite failure adds only numeric result codes and static code names via
+/// [`agent_run_store::retention::sqlite_codes`]: SQLite messages, SQL text,
+/// paths and payloads are never printed because they can echo configuration
+/// or transcript content. Writer contention (busy, locked or interrupted) is
+/// reported as a deferral; every other failure keeps its stable public kind.
+fn maintenance_diagnostic(operation: &str, stage: &str, error: &Error) {
+    match crate::state::retention::sqlite_codes(error) {
+        Some(codes) => {
+            let extended = codes
+                .extended_name
+                .map(|name| format!(" {name}"))
+                .unwrap_or_default();
+            let disposition = if crate::state::retention::is_writer_contention(error) {
+                "deferred"
+            } else {
+                "failed"
+            };
+            eprintln!(
+                "{operation} maintenance {disposition}: stage={stage} sqlite_primary={} sqlite_primary_name={} sqlite_extended={}{}",
+                codes.primary, codes.primary_name, codes.extended, extended
+            );
+        }
+        None => eprintln!(
+            "{operation} maintenance failed: stage={stage} error={}",
+            error.public().kind
+        ),
+    }
+}
 
 /// Bounds one socket server's connections, request queue, and frame deadlines.
 #[derive(Debug, Clone)]
@@ -669,53 +792,78 @@ pub async fn serve_at_with_options(
     let mut workers = JoinSet::new();
     let history_home = home.to_owned();
     workers.spawn(async move {
+        // Database expiry/compaction and filesystem retention keep independent
+        // schedules: a filesystem backlog drains in one-second passes without
+        // forcing a database writer transaction every second, and one side
+        // deferring, failing or backlogging never changes the other's cadence.
+        let mut schedules = MaintenanceSchedules::starting_at(tokio::time::Instant::now());
         loop {
-            let home = history_home.clone();
-            // SQLite work runs outside the async executor. One job at a time;
-            // short SQL deadlines also bound it if the broker task is aborted.
-            let result = tokio::task::spawn_blocking(move || -> Result<(usize, bool)> {
-                let mut store = crate::state::Store::open(&home)?;
-                store.conn.busy_timeout(Duration::from_millis(100))?;
-                let now = crate::domain::now();
-                let database = store.prune_history(now);
-                // Filesystem retention runs every cycle, even while database
-                // batches still report work, so a large journal backlog can
-                // never starve reclaiming disposable files on disk.
-                let filesystem = agent_run_core::housekeeping::sweep(&home, now, &mut store);
-                let database_removed = database?;
-                let mut done = database_removed;
-                let filesystem_failed = match filesystem {
-                    Ok(removed) => {
-                        done += removed;
-                        false
+            if schedules.next_due() > tokio::time::Instant::now() {
+                tokio::time::sleep_until(schedules.next_due()).await;
+            }
+            if schedules.next_database <= tokio::time::Instant::now() {
+                let home = history_home.clone();
+                // SQLite work runs outside the async executor. One job at a time;
+                // short SQL deadlines also bound it if the broker task is aborted.
+                let result = tokio::task::spawn_blocking(
+                    move || -> std::result::Result<usize, (&'static str, Error)> {
+                        let mut store =
+                            crate::state::Store::open(&home).map_err(|error| ("open", error))?;
+                        store
+                            .conn
+                            .busy_timeout(Duration::from_millis(100))
+                            .map_err(|error| ("open", Error::from(error)))?;
+                        let now = crate::domain::now();
+                        let removed = store.prune_history(now).map_err(|error| ("prune", error))?;
+                        // SQLite compaction follows its own idle rules: it only
+                        // runs once expiry reports no remaining work, so a page
+                        // backlog keeps its own cadence without delaying expiry.
+                        Ok(removed
+                            + usize::from(
+                                removed == 0
+                                    && store.vacuum_history().map_err(|error| ("vacuum", error))?,
+                            ))
+                    },
+                )
+                .await;
+                let at = tokio::time::Instant::now();
+                match result {
+                    Ok(Ok(removed)) => schedules.database_pass(at, removed),
+                    Ok(Err((stage, error))) => {
+                        maintenance_diagnostic("history", stage, &error);
+                        schedules.next_database = at + MAINTENANCE_RETRY;
                     }
-                    Err(error) => {
-                        eprintln!("filesystem maintenance: {}", error.public().kind);
-                        true
+                    Err(_) => {
+                        eprintln!("history maintenance: worker failed");
+                        schedules.next_database = at + MAINTENANCE_RETRY;
                     }
-                };
-                // SQLite compaction follows its own idle rules. A filesystem
-                // traversal can need more passes without delaying free-page work.
-                if database_removed == 0 && store.vacuum_history()? {
-                    done += 1;
                 }
-                Ok((done, filesystem_failed))
-            })
-            .await;
-            let delay = match result {
-                Ok(Ok((0, false))) => 3600,
-                Ok(Ok((0, true))) => 60,
-                Ok(Ok(_)) => 1,
-                Ok(Err(error)) => {
-                    eprintln!("history maintenance: {}", error.public().kind);
-                    60
+            }
+            if schedules.next_filesystem <= tokio::time::Instant::now() {
+                let home = history_home.clone();
+                // Filesystem retention runs on its own schedule, even while
+                // database batches still report work, so a large journal
+                // backlog can never starve reclaiming disposable files on disk.
+                let result = tokio::task::spawn_blocking(move || -> Result<usize> {
+                    let mut store = crate::state::Store::open(&home)?;
+                    store.conn.busy_timeout(Duration::from_millis(100))?;
+                    let now = crate::domain::now();
+                    agent_run_core::housekeeping::sweep(&home, now, &mut store)
+                })
+                .await;
+                let at = tokio::time::Instant::now();
+                match result {
+                    Ok(Ok(removed)) => schedules.filesystem_pass(at, removed),
+                    Ok(Err(error)) => {
+                        maintenance_diagnostic("filesystem", "sweep", &error);
+                        schedules.next_filesystem = at + MAINTENANCE_RETRY;
+                    }
+                    Err(_) => {
+                        eprintln!("filesystem maintenance: worker failed");
+                        schedules.next_filesystem = at + MAINTENANCE_RETRY;
+                    }
                 }
-                Err(_) => {
-                    eprintln!("history maintenance: worker failed");
-                    60
-                }
-            };
-            tokio::time::sleep(Duration::from_secs(delay)).await;
+            }
         }
     });
     workers.spawn(async move {
@@ -1012,5 +1160,50 @@ mod tests {
         .unwrap();
         assert_eq!(result["terminal"], true);
         server.await.unwrap();
+    }
+
+    // A filesystem backlog drains on its own one-second cadence without
+    // forcing a database writer transaction every second. Drives the same
+    // MaintenanceSchedules seam the broker loop uses, so a regression to the
+    // old shared cadence — which reran the prune transaction after any
+    // removal, including filesystem ones — fails here.
+    #[test]
+    fn filesystem_backlog_keeps_database_prune_on_its_steady_cadence() {
+        let mut clock = tokio::time::Instant::now();
+        let mut schedules = MaintenanceSchedules::starting_at(clock);
+        let mut database_passes = 0usize;
+        let mut filesystem_passes = 0usize;
+        for _ in 0..20 {
+            if schedules.next_database <= clock {
+                database_passes += 1;
+                // The database stays idle: expiry removes nothing.
+                schedules.database_pass(clock, 0);
+            }
+            if schedules.next_filesystem <= clock {
+                filesystem_passes += 1;
+                // The filesystem backlog never drains this pass.
+                schedules.filesystem_pass(clock, 1);
+            }
+            // Advance to whichever schedule is due next, exactly as the
+            // maintenance loop's sleep_until does in real time.
+            clock = clock.max(schedules.next_due());
+        }
+        assert_eq!(filesystem_passes, 20, "backlog keeps draining");
+        assert_eq!(
+            database_passes, 1,
+            "a filesystem backlog must not accelerate database prune passes"
+        );
+    }
+
+    // A database backlog keeps its own one-second drain cadence, and deferral
+    // or failure backs off for a retry interval instead of hammering.
+    #[test]
+    fn database_backlog_and_retry_have_documented_cadences() {
+        assert_eq!(database_maintenance_delay(0), DATABASE_STEADY);
+        assert_eq!(database_maintenance_delay(1), DATABASE_BACKLOG);
+        assert_eq!(database_maintenance_delay(2_001), DATABASE_BACKLOG);
+        assert_eq!(filesystem_maintenance_delay(0), FILESYSTEM_STEADY);
+        assert_eq!(filesystem_maintenance_delay(1), FILESYSTEM_BACKLOG);
+        assert_eq!(MAINTENANCE_RETRY, Duration::from_secs(60));
     }
 }
