@@ -1,4 +1,5 @@
-//! Fourteen-day retention for completed work; active ownership and retained lineage win over age.
+//! Fourteen-day and bounded-session-count retention for completed work; active
+//! ownership and retained lineage win over both age and count.
 
 use crate::Store;
 use agent_run_domain::{domain::AgentId, error::invalid, Error, Result};
@@ -12,6 +13,14 @@ use std::{
 
 /// Completed history expires strictly after fourteen days, measured from `finished_at`.
 pub const HISTORY_SECONDS: f64 = 14.0 * 24.0 * 3600.0;
+/// Logical sessions (resume lineages sharing one `root_agent_id`) kept
+/// regardless of age; older lineages become count-expired.
+///
+/// All logical sessions are ranked by the latest `created_at` admitted in the
+/// lineage (descending, tie-break by root id) and the newest
+/// [`HISTORY_SESSIONS`] survive. Protected work inside an expired lineage can
+/// keep it stored, so the retained set may temporarily exceed this bound.
+pub const HISTORY_SESSIONS: i64 = 100;
 /// Maximum rows removed from each large journal in one transaction.
 const ROW_BATCH: i64 = 2_000;
 
@@ -171,11 +180,23 @@ impl Store {
     /// Removes one bounded portion of expired history at finite Unix time `at`.
     ///
     /// Returns the number of deleted rows (zero means no eligible work remains).
+    /// History expires by age — strictly fourteen days after `finished_at` —
+    /// or by count: every logical session (one resume lineage per
+    /// `root_agent_id`, counted once however many runs it holds) is ranked by
+    /// the latest `created_at` admitted in its lineage, newest first with the
+    /// root id as deterministic tie-breaker, and lineages ranked outside the
+    /// newest [`HISTORY_SESSIONS`] become eligible however recent they are.
+    /// All logical sessions are counted when ranking, and protected work can
+    /// keep an expired lineage stored, so more than [`HISTORY_SESSIONS`]
+    /// sessions may survive; safety never yields to the numerical cap.
     /// Up to 32 terminal leaf agents are considered; recent/active descendants,
     /// workflows, unreleased service leases, unresolved process ownership and
     /// in-flight deliveries retain their dependencies, as does a runtime home
     /// with a still-prepared storage-layout row (an unfinished relocation).
-    /// Old queued notices expire
+    /// Terminal agents with an unknown completion time stay as uncertain
+    /// evidence. A retired multi-run lineage therefore drains tail-first —
+    /// its newest row first — and never strands an ancestor behind a broken
+    /// foreign key. Old queued notices expire
     /// with their run. Journals drain before their agent metadata is removed, so
     /// large histories make progress over multiple calls. Accounts, quota
     /// exhaustion latches, live services and files on disk are never removed.
@@ -339,9 +360,12 @@ impl Store {
     /// The query mirrors the batch's eligibility sources as supersets: every
     /// row the batch could consider matches at least one `EXISTS` here, and
     /// the batch's ownership, lineage and lease protections are applied later
-    /// inside its own transaction. `false` therefore proves the next batch
-    /// would delete nothing, so callers skip taking the database writer lock
-    /// at all; WAL readers never block a concurrent writer.
+    /// inside its own transaction. Count expiry contributes one cheap
+    /// superset: with at most [`HISTORY_SESSIONS`] logical sessions no lineage
+    /// can rank outside the newest set, while more sessions guarantee at
+    /// least one count-expired candidate. `false` therefore proves the next
+    /// batch would delete nothing, so callers skip taking the database
+    /// writer lock at all; WAL readers never block a concurrent writer.
     fn prune_work_pending(&self, cutoff: f64) -> Result<bool> {
         let pending: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM workflow_runs
@@ -353,8 +377,10 @@ impl Store {
              OR EXISTS(SELECT 1 FROM capacity_route_snapshots WHERE valid_until < ?1)
              OR EXISTS(SELECT 1 FROM managed_service_generations
                 WHERE state='stopped' AND COALESCE(checked_at,created_at) < ?1)
-             OR EXISTS(SELECT 1 FROM orchestrator_sessions WHERE last_seen_at < ?1)",
-            params![cutoff],
+             OR EXISTS(SELECT 1 FROM orchestrator_sessions WHERE last_seen_at < ?1)
+             OR (SELECT count(DISTINCT COALESCE(NULLIF(root_agent_id,''),id))
+                   FROM agents) > ?2",
+            params![cutoff, HISTORY_SESSIONS],
             |row| row.get(0),
         )?;
         Ok(pending)
@@ -377,8 +403,26 @@ impl Store {
              CREATE TEMP TABLE IF NOT EXISTS retention_workflows(id TEXT PRIMARY KEY);
              CREATE TEMP TABLE IF NOT EXISTS retention_services(id TEXT PRIMARY KEY);
              CREATE TEMP TABLE IF NOT EXISTS retention_sessions(id TEXT PRIMARY KEY);
+             CREATE TEMP TABLE IF NOT EXISTS retention_roots(root TEXT PRIMARY KEY);
              DELETE FROM retention_agents; DELETE FROM retention_workflows;
-             DELETE FROM retention_services; DELETE FROM retention_sessions;",
+             DELETE FROM retention_services; DELETE FROM retention_sessions;
+             DELETE FROM retention_roots;",
+        )?;
+        // Count expiry: rank every logical session (one resume lineage per
+        // root agent id, with unrooted legacy rows counting as their own
+        // session) by the latest `created_at` admitted in the lineage,
+        // newest first with the root id as the deterministic tie-breaker, and
+        // keep everything ranked outside the newest HISTORY_SESSIONS. Only
+        // whole sessions are selected, so a retired multi-run lineage drains
+        // tail-first and its shrinking `created_at` maximum can never lift it
+        // back into the protected set mid-drain.
+        tx.execute(
+            "INSERT INTO retention_roots
+             SELECT session FROM (
+               SELECT COALESCE(NULLIF(root_agent_id,''),id) AS session, MAX(created_at) AS latest
+                 FROM agents GROUP BY session
+                ORDER BY latest DESC, session LIMIT -1 OFFSET ?)",
+            [HISTORY_SESSIONS],
         )?;
         tx.execute(
             "INSERT INTO retention_workflows
@@ -406,7 +450,10 @@ impl Store {
         )?;
         tx.execute(
             "INSERT INTO retention_agents SELECT a.id FROM agents a
-             WHERE a.status IN ('succeeded','failed','timed_out','cancelled','lost') AND a.finished_at < ?1
+             WHERE a.status IN ('succeeded','failed','timed_out','cancelled','lost')
+             AND (a.finished_at < ?1
+                  OR (a.finished_at IS NOT NULL
+                      AND COALESCE(NULLIF(a.root_agent_id,''),a.id) IN retention_roots))
              AND NOT EXISTS (SELECT 1 FROM attempts t WHERE t.agent_id=a.id AND t.ownership_active=1)
              AND NOT EXISTS (SELECT 1 FROM agents child WHERE child.parent_agent_id=a.id)
              AND NOT EXISTS (SELECT 1 FROM workflow_steps s WHERE s.agent_id=a.id)

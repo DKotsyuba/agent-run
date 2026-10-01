@@ -376,3 +376,59 @@ fn nested_runtime_scan_reaches_late_orphan() {
         "late nested orphan must drain and the scan round must become idle: {observed:?}"
     );
 }
+
+/// Run trees whose durable rows were pruned — including count-expired sessions
+/// far younger than fourteen days — reclaim on later passes, while a retained
+/// row, a registered credential reference and a tree created at or after the
+/// pass's reference instant all stay protected.
+#[test]
+fn count_pruned_run_trees_reclaim_after_database_pruning() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let retained_id = "ag-20270101-000000-0000000001";
+    let pruned_id = "ag-20270101-000000-0000000002";
+    let racing_id = "ag-20350101-000000-0000000003";
+    let credential_id = "ag-20270101-000000-0000000004";
+    for id in [retained_id, pruned_id, racing_id, credential_id] {
+        run_tree(&home, id);
+    }
+    // The same run also owns a runtime run tree, reclaimed with its agent row.
+    let runtime_run = home.path.join("runtimes/mock/home/runs").join(pruned_id);
+    fs::private_dir(&runtime_run).unwrap();
+    std::fs::write(runtime_run.join("transcript.jsonl"), "fixture").unwrap();
+    retained(&store, retained_id, "{}");
+    retained(&store, pruned_id, "{}");
+    store.conn.execute(
+        "INSERT INTO provider_accounts(account_id,auth_family,secret_ref,status,created_at,updated_at)
+         VALUES('fixture','api_key',?,'disabled',1,1)",
+        [format!(
+            "file:{}/agents/{credential_id}/secret",
+            home.path.display()
+        )],
+    ).unwrap();
+    for _ in 0..4 {
+        sweep(&home.path, NOW, &mut store).unwrap();
+    }
+    // Retained rows still protect both of the pruned run's trees.
+    assert!(home.path.join("agents").join(pruned_id).exists());
+    assert!(runtime_run.exists());
+    // Database retention removed the row — count expiry does this at any age.
+    store
+        .conn
+        .execute("DELETE FROM agents WHERE id=?", [pruned_id])
+        .unwrap();
+    for _ in 0..4 {
+        sweep(&home.path, NOW, &mut store).unwrap();
+    }
+    assert!(
+        !home.path.join("agents").join(pruned_id).exists(),
+        "a pruned run tree must reclaim without waiting fourteen days"
+    );
+    assert!(
+        !runtime_run.exists(),
+        "the runtime run tree reclaims with it"
+    );
+    for id in [retained_id, credential_id, racing_id] {
+        assert!(home.path.join("agents").join(id).exists(), "retained {id}");
+    }
+}

@@ -104,7 +104,8 @@ Large payloads live under the run directory and are referenced by path, size,
 and SHA-256. A terminal success must be reproducible from stored state and
 sealed files.
 
-Completed database history expires after fourteen days through the resident
+Completed database history expires after fourteen days, and only the newest
+hundred logical sessions (resume lineages) are kept, through the resident
 broker's bounded maintenance loop; active work and retained lineage are protected.
 Idle compaction returns unused SQLite pages to disk. See
 [history-retention.md](history-retention.md) for retention and space-reclamation rules.

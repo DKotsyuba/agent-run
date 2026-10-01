@@ -1,10 +1,11 @@
 //! Bounded filesystem retention for recognized disposable agent-run storage.
 //!
 //! Database history retention (`agent_run_store::retention`) expires durable
-//! runs fourteen days after they finish. This module reclaims the files those
-//! runs leave behind, plus a fixed set of other agent-run-owned disposable
-//! artifacts. It never sweeps by modification time alone: every candidate must
-//! be a recognized, named, currently effective-user-owned shape inside the
+//! runs fourteen days after they finish and keeps only the newest bounded set
+//! of logical sessions. This module reclaims the files those runs leave
+//! behind, plus a fixed set of other agent-run-owned disposable artifacts. It
+//! never sweeps by modification time alone: every candidate must be a
+//! recognized, named, currently effective-user-owned shape inside the
 //! configured home, and run trees additionally require the store to prove no
 //! retained row still owns or references them. Unknown names, foreign
 //! ownership, unreadable metadata and unrecognized categories are always
@@ -479,10 +480,17 @@ fn config_references(value: &toml::Value, name: &str) -> bool {
 
 /// Removes orphan `agents/<id>` trees and pruned runtime run directories.
 ///
-/// A tree qualifies only when its canonical id encodes a creation older than
-/// fourteen days and the store proves no retained agent row owns the id or
+/// A tree qualifies only when its canonical id encodes a creation that
+/// strictly predates `now` — the instant this pass's protection snapshot was
+/// taken — and the store proves no retained agent row owns the id or
 /// references the exact path (covering resumed children and identities that
-/// embed `runtime_home`). Read failures fail closed and retain the tree.
+/// embed `runtime_home`). Run trees are only ever created after their agent
+/// row is durably admitted, so a tree older than the snapshot with no
+/// retained reference proves its row was already removed by age or count
+/// expiry (or never existed), while a tree at or after `now` may still be
+/// racing its own admission and stays for the next pass. This converges for
+/// count-expired sessions of any age instead of waiting out a flat
+/// fourteen-day orphan window. Read failures fail closed and retain the tree.
 fn run_directories(
     home: &Path,
     root: &fs::Dir,
@@ -504,7 +512,7 @@ fn run_directories(
         let Some(created) = run_id_created(id) else {
             continue;
         };
-        if !older_than(created, now, STORAGE_SECONDS) {
+        if created >= now {
             continue;
         }
         if proof.retains(id, &home.join("agents").join(id)) {
@@ -550,7 +558,7 @@ fn run_directories(
                 let Some(created) = run_id_created(id) else {
                     continue;
                 };
-                if !older_than(created, now, STORAGE_SECONDS) {
+                if created >= now {
                     continue;
                 }
                 if proof.retains(
