@@ -73,6 +73,18 @@ delivery never invokes the Codex UI queue. `null` means no attempt evidence
 has been recorded. Raw messages, session ids, argument/environment values,
 and credentials are intentionally unavailable.
 
+`claude_uds` attempts record the same evidence shape with `classifier`
+`uds_unconfirmed`, `uds_ambiguous`, `uds_session_gone`, `uds_rejected`, or
+`uds_unavailable`. The Claude inbox accepts written frames without ever
+acknowledging them to foreign senders, so `uds_unconfirmed` (a clean write
+with no confirmation) is not success: it retries with backoff and then ends
+`failed` with `ambiguous: true`, meaning the notice was written to the inbox
+socket up to three times but its enqueue was never confirmed. Enqueue
+confirmation and consumption by the recipient's model are separate facts;
+agent-run can observe neither for this transport. If a notice looks lost,
+check the recipient Claude session's queue state before resending, because
+a retried notice may already be sitting in that queue.
+
 Desktop relay discovery requires the MCP process to have started with absolute
 `CODEX_MCP_NODE_PATH` and `CODEX_APP_TOOLS_PIPE_PATH` values. In that mode the
 MCP PID belongs to the supplied signed Node frontend, while its distinct Rust

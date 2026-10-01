@@ -6,12 +6,27 @@ use serde_json::{json, Value};
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 const DESCRIPTOR_LIMIT: usize = 512;
 const SESSION_LIMIT: usize = 512;
 const MESSAGE_LIMIT: usize = 4096;
+/// Bounded wait for an inbox acknowledgement after the frames are written.
+const CONFIRM_WAIT: Duration = Duration::from_millis(250);
+
+/// Builds one Claude inbox attempt observation with transport-fixed labels.
+///
+/// Every field is a static classifier or boolean; no host response payload,
+/// filesystem path, session identifier, message text, or token ever enters
+/// the persisted evidence. The classifier is never accepted, because a write
+/// to this inbox cannot confirm enqueue (see [`send`]).
+fn uds_evidence(classifier: &str, ambiguous: bool) -> Evidence {
+    let mut evidence = Evidence::new(classifier, false, ambiguous);
+    evidence.executable = "claude-uds".into();
+    evidence.argv_shape = vec!["claude-uds".into()];
+    evidence
+}
 
 /// Delivers one rendered completion notice through a specified Claude registry.
 ///
@@ -19,16 +34,31 @@ const MESSAGE_LIMIT: usize = 4096;
 /// hosts can use private temporary directories. A missing descriptor, dead
 /// socket, or deleted endpoint is classified as a definite session loss, while
 /// an endpoint that is not a socket (such as a directory) is classified as an
-/// unavailable endpoint because Linux reports both as `ECONNREFUSED`; an
-/// interrupted write is
-/// classified as ambiguous because the inbox has no acknowledgement protocol.
+/// unavailable endpoint because Linux reports both as `ECONNREFUSED`.
+///
+/// The inbox is fire-and-forget for senders that are not themselves published
+/// Claude sessions: it accepts written frames without ever acknowledging them
+/// on the connection, so a completed write proves only that the kernel accepted
+/// the bytes. A clean write is therefore reported as `uds_unconfirmed`
+/// (ambiguous, not delivered) and the dispatcher retries a bounded number of
+/// times before failing explicitly; a write interrupted by a peer abort stays
+/// `uds_ambiguous` for the same reason.
 pub async fn send(registry: &Path, session: &str, notice: &Notice) -> Evidence {
     send_after(registry, session, notice, async {}).await
 }
 
 /// Delivers a bounded worker report through the same Claude inbox route.
 pub async fn send_worker(registry: &Path, session: &str, notice: &WorkerNotice) -> Evidence {
-    send_text_after(registry, session, notice.render().ok(), async {}).await
+    send_text_after(
+        registry,
+        session,
+        notice
+            .render()
+            .ok()
+            .map(|text| (notice.notification_id.as_str(), text)),
+        async {},
+    )
+    .await
 }
 
 /// [`send`] with `before_write` awaited after the connection is established
@@ -41,28 +71,45 @@ pub async fn send_after(
     notice: &Notice,
     before_write: impl std::future::Future<Output = ()>,
 ) -> Evidence {
-    send_text_after(registry, session, notice.render().ok(), before_write).await
+    send_text_after(
+        registry,
+        session,
+        notice
+            .render()
+            .ok()
+            .map(|text| (notice.notification_id.as_str(), text)),
+        before_write,
+    )
+    .await
 }
 
 /// Writes already-rendered trusted framing around bounded report text.
+///
+/// The user frame repeats two facts the recipient already owns: the resolved
+/// `session_id` (the inbox drops a frame whose session no longer matches its
+/// socket, which guards against a socket rebound to another session) and the
+/// stable notification id as `msg_id` so retries and any receiver-side drop
+/// telemetry correlate with one notice.
 async fn send_text_after(
     registry: &Path,
     session: &str,
-    message: Option<String>,
+    message: Option<(&str, String)>,
     before_write: impl std::future::Future<Output = ()>,
 ) -> Evidence {
     if !bounded(session, SESSION_LIMIT) {
-        return Evidence::new("uds_rejected", false, false);
+        return uds_evidence("uds_rejected", false);
     }
-    let message = match message {
-        Some(message) if message.len() <= MESSAGE_LIMIT => message,
-        _ => return Evidence::new("uds_rejected", false, false),
+    let Some((msg_id, text)) = message else {
+        return uds_evidence("uds_rejected", false);
     };
+    if text.len() > MESSAGE_LIMIT || !bounded(msg_id, SESSION_LIMIT) {
+        return uds_evidence("uds_rejected", false);
+    }
     let Some((pid, socket)) = resolve(registry, session) else {
-        return Evidence::new("uds_session_gone", false, false);
+        return uds_evidence("uds_session_gone", false);
     };
     let Some(token) = token(registry, pid) else {
-        return Evidence::new("uds_rejected", false, false);
+        return uds_evidence("uds_rejected", false);
     };
     let mut stream =
         match tokio::time::timeout(Duration::from_secs(1), UnixStream::connect(&socket)).await {
@@ -76,19 +123,19 @@ async fn send_text_after(
                     std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
                 ) && socket_is_gone_or_socket(&socket) =>
             {
-                return Evidence::new("uds_session_gone", false, false);
+                return uds_evidence("uds_session_gone", false);
             }
-            Ok(Err(_)) => return Evidence::new("uds_unavailable", false, false),
-            Err(_) => return Evidence::new("uds_session_gone", false, false),
+            Ok(Err(_)) => return uds_evidence("uds_unavailable", false),
+            Err(_) => return uds_evidence("uds_session_gone", false),
         };
     before_write.await;
     let frames = format!(
         "{}\n{}\n",
         json!({"type":"auth","token":token}),
-        json!({"type":"user","message":{"role":"user","content":message}}),
+        json!({"type":"user","session_id":session,"msg_id":msg_id,"message":{"role":"user","content":text}}),
     );
     match tokio::time::timeout(Duration::from_secs(5), stream.write_all(frames.as_bytes())).await {
-        Ok(Ok(())) => Evidence::new("uds_written", true, false),
+        Ok(Ok(())) => {}
         Ok(Err(error))
             if matches!(
                 error.kind(),
@@ -97,9 +144,32 @@ async fn send_text_after(
                     | std::io::ErrorKind::TimedOut
             ) =>
         {
-            Evidence::new("uds_ambiguous", false, true)
+            return uds_evidence("uds_ambiguous", true);
         }
-        Ok(Err(_)) | Err(_) => Evidence::new("uds_unavailable", false, false),
+        Ok(Err(_)) | Err(_) => return uds_evidence("uds_unavailable", false),
+    }
+    // The frames are already kernel-buffered, so dropping the socket now
+    // would not lose them; the half-close instead hands the allowHalfOpen
+    // inbox its end-of-frames marker, and one bounded read observes a
+    // peer-side abort (reset) if the inbox destroys the connection now.
+    let _ = stream.shutdown().await;
+    let mut sink = [0u8; 1024];
+    match tokio::time::timeout(CONFIRM_WAIT, stream.read(&mut sink)).await {
+        Ok(Err(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            uds_evidence("uds_ambiguous", true)
+        }
+        // Clean EOF, silence within the bound, or unsolicited bytes: none of
+        // these confirm enqueue, and unsolicited bytes are never trusted as
+        // a receipt, so the attempt stays explicitly unconfirmed.
+        _ => uds_evidence("uds_unconfirmed", true),
     }
 }
 

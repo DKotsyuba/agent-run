@@ -609,15 +609,118 @@ async fn claude_uds_writes_auth_then_trusted_notice_to_fake_socket() {
     let evidence = claude::send(&registry, "session-1", &notice()).await;
     let received = receiver.await.unwrap();
     let lines = received.lines().collect::<Vec<_>>();
-    assert_eq!(evidence.classifier, "uds_written");
+    // The inbox never acknowledges, so even a clean write is explicitly
+    // unconfirmed and ambiguous, never delivered.
+    assert_eq!(evidence.classifier, "uds_unconfirmed");
+    assert_eq!(evidence.error_class.as_deref(), Some("ambiguous"));
+    assert_eq!(evidence.executable, "claude-uds");
     assert_eq!(
         serde_json::from_str::<Value>(lines[0]).unwrap(),
         json!({"token":"fixture-token","type":"auth"})
     );
     assert_eq!(
-        serde_json::from_str::<Value>(lines[1]).unwrap()["message"]["content"],
-        notice().render().unwrap()
+        serde_json::from_str::<Value>(lines[1]).unwrap(),
+        json!({"type":"user","session_id":"session-1","msg_id":"ntf_test","message":{"role":"user","content":notice().render().unwrap()}})
     );
+}
+
+/// A dispatcher-level regression for the delivery-confirmation bug: a Claude
+/// inbox that accepts the write but stays silent must never reach `delivered`,
+/// must persist one immutable evidence row per attempt (so `last_attempt` is
+/// observable), and must stop retrying after the unconfirmed cap instead of
+/// duplicating the notice forever. The endpoint is a private temporary fake.
+#[tokio::test]
+async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
+    use tokio::io::AsyncReadExt;
+
+    let home = common::Home::new();
+    let registry = home.path.join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    let socket = home.path.join("inbox.sock");
+    claude_descriptor(&registry, "session-1", &socket);
+    std::env::set_var("AGENT_RUN_CLAUDE_SESSION_REGISTRY", &registry);
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let peer = tokio::spawn(async move {
+        // Three accepted-and-read connections: every retry is written in full.
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut received = String::new();
+            stream.read_to_string(&mut received).await.unwrap();
+            assert_eq!(received.lines().count(), 2);
+        }
+    });
+    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) VALUES('sess','claude_uds','session-1',?1,?1)",
+            [now()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary',?1,'{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',?2,1.0,'fixture','ag-20260825-120000-0123456789')",
+            params![home.path.to_string_lossy(), now()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,next_attempt_at) VALUES('ntf_unconfirmed','ag-20260825-120000-0123456789','sess','pending',0)",
+            [],
+        )
+        .unwrap();
+    for attempt in 1..=2 {
+        assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+        let row: (String, u32, Option<String>, bool) = Connection::open(home.path.join("state.db"))
+            .unwrap()
+            .query_row(
+                "SELECT state,attempts,last_error,ambiguous_result FROM deliveries WHERE id='ntf_unconfirmed'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row.1, attempt, "one attempt per dispatch");
+        assert_eq!(row.0, "retry_wait", "unconfirmed never looks delivered");
+        assert_eq!(row.2.as_deref(), Some("uds_unconfirmed"));
+        assert!(row.3, "unconfirmed stays flagged ambiguous");
+        make_due(&home.path, "ntf_unconfirmed");
+    }
+    // The capped third attempt ends terminally failed, still ambiguous.
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+    peer.await.unwrap();
+    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let row: (String, u32, Option<String>, Option<f64>, bool) = connection
+        .query_row(
+            "SELECT state,attempts,last_error,next_attempt_at,ambiguous_result FROM deliveries WHERE id='ntf_unconfirmed'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!((row.0.as_str(), row.1), ("failed", 3));
+    assert_eq!(row.2.as_deref(), Some("uds_unconfirmed"));
+    assert_eq!(row.3, None, "capped notice leaves the schedule");
+    assert!(row.4);
+    let evidence: (i64, String) = connection
+        .query_row(
+            "SELECT COUNT(*),MAX(evidence_json) FROM delivery_attempt_evidence WHERE delivery_id='ntf_unconfirmed'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(evidence.0, 3, "one immutable evidence row per attempt");
+    assert!(evidence.1.contains("\"classifier\":\"uds_unconfirmed\""));
+    assert!(!evidence.1.contains("session-1"), "no session id persisted");
+    assert!(
+        !evidence.1.contains("ntf_unconfirmed"),
+        "no notice id persisted"
+    );
+    // The public status view exposes the last attempt instead of null.
+    let agent: AgentId = "ag-20260825-120000-0123456789".parse().unwrap();
+    let status = agent_run_store::Store::open(&home.path)
+        .unwrap()
+        .delivery_status(&agent)
+        .unwrap();
+    assert_eq!(status["state"], "failed");
+    assert_eq!(status["last_attempt"]["classifier"], "uds_unconfirmed");
 }
 
 /// Mirrors `tests/test_claude_uds.py::ClaudeSessionSenderTests::test_malformed_descriptors_are_skipped_not_fatal`.

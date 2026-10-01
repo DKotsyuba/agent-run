@@ -1296,6 +1296,9 @@ fn safe_evidence(raw: &Value) -> Option<Value> {
         "session_gone",
         "uds_unavailable",
         "uds_ambiguous",
+        "uds_unconfirmed",
+        "uds_session_gone",
+        "uds_rejected",
         "unsupported_transport",
         "delivery_expired",
     ]
