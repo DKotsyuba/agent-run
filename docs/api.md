@@ -134,6 +134,13 @@ is transport metadata, not another agent identifier; orchestrators use only
 `agent_id`. This socket API and the CLI
 keep the structured contracts documented here.
 
+The current MCP contract, byte/row budgets, protocol-versus-business error
+channels, and status-preserving presentation fallback are documented in
+[MCP presentation](mcp-presentation.md). Current discovery is generated with
+`cargo xtask contract export` and checked against both live registries;
+`schemas/mcp-registration.json` describes commands and environment names
+without registering anything with a host.
+
 The tool set (same names as the MCP server) is exactly `start`, `resume`,
 `cancel`, `steer`, `list_agents`, `answer`, `transcript`, `capacity_order`,
 `doc`, `models`, `delegation_guide`, and `limits`.

@@ -5,25 +5,44 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::OnceLock;
 
-/// A public tool as represented by the Python-compatible discovery payload.
+/// Reviewed MCP hints, carried by the schema-first assets and shared discovery.
+/// Hints describe effects; they confer no authority or unconditional replay safety.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolAnnotations {
+    /// Whether the operation leaves application state unchanged.
+    pub read_only_hint: bool,
+    /// Whether it may terminate work or remove/replace existing state.
+    pub destructive_hint: bool,
+    /// Whether identical arguments guarantee no additional effect; optional
+    /// request keys alone are insufficient for an unconditional true hint.
+    pub idempotent_hint: bool,
+    /// Whether configured engines, hosts or other external entities participate.
+    pub open_world_hint: bool,
+}
+
+/// A tool in the schema-first discovery contract.
 ///
-/// The serialized schema fields intentionally match
-/// `tests/fixtures/baseline/tools.json`. Human-facing descriptions may extend
-/// the Python baseline with current transport requirements, while transport-only
-/// metadata such as public error classes and argument defaults is derived from
-/// this schema and is never added to the wire payload.
+/// Input schemas preserve the frozen Python oracle plus explicitly tested
+/// product extensions. Descriptions and typed effect annotations come from the
+/// same reviewed assets; current snapshots pin them together. Error classes and
+/// dispatch defaults are derived metadata, separate from MCP discovery.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ToolDefinition {
     /// Stable method name shared by CLI, MCP, and the Unix socket API.
     pub name: String,
-    /// Human-facing discovery text, including the completion-notice contract for start.
+    /// Discovery guidance, including the completion-notice contract for start.
     pub description: String,
-    /// JSON Schema for the sole object argument of this tool.
+    /// Reviewed effect hints from this asset, never transport-local defaults.
+    pub annotations: ToolAnnotations,
+    /// JSON Schema for the sole object argument.
     pub input_schema: Value,
-    /// Optional JSON Schema for a result; Python currently declares no result schemas.
+    /// Optional MCP result schema; absent for the current text-first profile.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<Value>,
-    /// Optional non-schema result declaration; Python currently declares none.
+    /// Optional product result declaration; absent on the current SDK wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub result_shape: Option<Value>,
 }
 
@@ -175,6 +194,26 @@ pub fn registry() -> &'static [ToolDefinition] {
                 .expect("assets/tools.json must be a valid public tool registry")
         })
         .as_slice()
+}
+
+/// Returns the separate worker-capability registry from its sole asset.
+/// This table never adds operator tools or accepts capability material as input.
+pub fn worker_registry() -> &'static [ToolDefinition] {
+    static REGISTRY: OnceLock<Vec<ToolDefinition>> = OnceLock::new();
+    REGISTRY
+        .get_or_init(|| {
+            serde_json::from_str(include_str!("../../../assets/worker_tools.json"))
+                .expect("worker_tools.json must be a valid worker registry")
+        })
+        .as_slice()
+}
+
+/// Serializes the worker-only registry used by live MCP and contract exports.
+pub fn worker_tools_json() -> Vec<Value> {
+    worker_registry()
+        .iter()
+        .map(|tool| serde_json::to_value(tool).expect("tool definition is JSON"))
+        .collect()
 }
 
 /// Finds a public tool by its stable method name.

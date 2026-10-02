@@ -4,6 +4,17 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- feat(mcp)!: use Cargo product versions and server instructions, add reviewed
+  effect annotations and registry-generated discovery/registration snapshots;
+  route unknown tools and malformed protocol parameters through MCP errors
+- feat(presentation)!: validate typed allowlisted views, quote display labels,
+  remove private account/pool metadata, bound whole pages and exact content,
+  and preserve accepted/unknown execution receipts when presentation fails
+
+These MCP compatibility changes require the next pre-1.0 minor release, 0.20.
+The workspace version is unchanged until release preparation; host
+qualification, release provenance and doctor reflection remain separate work.
+
 - feat(family): declare Agent MCP family standard adoption with a truthful
   `family.toml` profile, managed adoption metadata under `.family/` verified
   by `cargo xtask family verify`, and a public boundary summary in

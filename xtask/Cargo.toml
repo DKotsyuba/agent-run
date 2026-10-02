@@ -10,6 +10,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+agent-run-domain = { path = "../crates/agent-run-domain" }
 agent-run-config = { path = "../crates/agent-run-config" }
 agent-run-platform = { path = "../crates/agent-run-platform" }
 fs2.workspace = true

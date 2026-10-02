@@ -187,6 +187,64 @@ pub fn update(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Exports or verifies current discovery snapshots from the same domain registries
+/// used by live MCP. `export` only writes these three generated files; `check`
+/// compares complete JSON including descriptions, schemas and typed annotations.
+/// The descriptor contains names, never environment values or capability secrets.
+pub fn contract(root: &Path, export: bool) -> Result<(), String> {
+    let descriptor = serde_json::json!({
+        "schema_version": 1,
+        "product_version": env!("CARGO_PKG_VERSION"),
+        "sdk": {"name": "rmcp", "version": "3.4.0"},
+        "protocol_versions": ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"],
+        "operator": {
+            "server_name": "agent-run", "registration_name": "agent-run",
+            "transport": "stdio", "command": "agent-run", "args": ["mcp"],
+            "optional_environment_names": ["AGENT_RUN_HOME"],
+            "startup_timeout_seconds": null, "tool_timeout_seconds": null,
+            "timeout_policy": "Host chooses startup/call deadlines; cancellation abandons the wait, not admitted work."
+        },
+        "worker": {
+            "server_name": "agent-run-worker",
+            "registration_name": agent_run_domain::worker::SERVER_NAME,
+            "transport": "stdio", "command": "agent-run", "args": ["_worker-mcp"],
+            "required_environment_names": agent_run_domain::worker::ENV_NAMES,
+            "startup_timeout_seconds": null, "tool_timeout_seconds": null,
+            "supervisor_only": true,
+            "timeout_policy": "Supervisor supplies attempt capability; cancelled waits do not undo durable enqueue."
+        }
+    });
+    for (path, value) in [
+        (
+            "schemas/tools.json",
+            serde_json::json!(agent_run_domain::tools::tools_json()),
+        ),
+        (
+            "schemas/worker-tools.json",
+            serde_json::json!(agent_run_domain::tools::worker_tools_json()),
+        ),
+        ("schemas/mcp-registration.json", descriptor),
+    ] {
+        let mut bytes =
+            serde_json::to_vec_pretty(&value).map_err(|_| "contract serialization failed")?;
+        bytes.push(b'\n');
+        if export {
+            std::fs::create_dir_all(root.join("schemas"))
+                .map_err(|_| "schema directory unavailable")?;
+            std::fs::write(root.join(path), bytes)
+                .map_err(|_| format!("{path} must be writable"))?;
+        } else if std::fs::read(root.join(path))
+            .map_err(|_| format!("{path} missing; run cargo xtask contract export"))?
+            != bytes
+        {
+            return Err(format!(
+                "{path} drifted; review cargo xtask contract export"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{MANIFEST_PATH, Manifest, verify};
@@ -359,5 +417,30 @@ mod tests {
         manifest_for(root.path(), &[("docs/family-standard.md", "summary\n")]);
         super::update(root.path()).expect("update refreshes digests");
         verify(root.path()).expect("refreshed manifest verifies");
+    }
+
+    /// Exported schemas and registration are deterministic; description,
+    /// annotation and input drift each fail the read-only contract gate.
+    #[test]
+    fn contract_export_detects_all_discovery_drift() {
+        let root = tempdir().unwrap();
+        super::contract(root.path(), true).unwrap();
+        super::contract(root.path(), false).unwrap();
+        let path = root.path().join("schemas/tools.json");
+        let original = fs::read(&path).unwrap();
+        for field in ["description", "annotations", "inputSchema"] {
+            let mut tools: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            tools[0][field] = json!("drift");
+            fs::write(&path, tools.to_string()).unwrap();
+            assert!(
+                super::contract(root.path(), false)
+                    .unwrap_err()
+                    .contains("drifted")
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), tools.to_string());
+        }
+        super::contract(root.path(), true).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        super::contract(root.path(), false).unwrap();
     }
 }

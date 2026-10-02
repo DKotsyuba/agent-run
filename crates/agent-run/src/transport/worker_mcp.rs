@@ -33,10 +33,16 @@ pub struct WorkerProxy {
     token: String,
 }
 
-/// Decode the embedded worker-only discovery table. An invalid asset is a build defect.
-fn tools() -> Vec<Tool> {
-    serde_json::from_str(include_str!("../../../../assets/worker_tools.json"))
-        .expect("valid embedded worker tool registry")
+/// Converts every domain-owned worker definition through the pinned SDK.
+/// Invalid embedded definitions fail explicitly; no tool is silently dropped.
+fn tools() -> std::result::Result<Vec<Tool>, ErrorData> {
+    agent_run_domain::tools::worker_tools_json()
+        .into_iter()
+        .map(|tool| {
+            serde_json::from_value(tool)
+                .map_err(|_| ErrorData::internal_error("invalid worker registry", None))
+        })
+        .collect()
 }
 
 impl WorkerProxy {
@@ -61,6 +67,7 @@ impl WorkerProxy {
         if let Err(error) = input.validate() {
             return super::mcp_text::error_result(error.public().kind, &error.public().message);
         }
+        let request_id = input.request_id.clone();
         let call = WorkerCall {
             run_id: self.run_id.clone(),
             attempt_id: self.attempt_id.clone(),
@@ -74,22 +81,45 @@ impl WorkerProxy {
             tokio::spawn(async move { broker.call(METHOD, serde_json::to_value(call)?).await })
                 .await;
         match result {
-            Ok(Ok(value)) => super::mcp_text::success_result("notify_orchestrator", &value),
-            Ok(Err(error)) => {
-                super::mcp_text::error_result(error.public().kind, &error.public().message)
-            }
-            Err(_) => super::mcp_text::error_result("RuntimeError", "worker notification failed"),
+            Ok(Ok(value)) => super::mcp_text::success_result_with_request(
+                "notify_orchestrator",
+                &value,
+                Some(&request_id),
+            ),
+            Ok(Err(error)) => super::mcp_text::failure_result(
+                "notify_orchestrator",
+                &error,
+                Some(&request_id),
+                None,
+            ),
+            Err(_) => super::mcp_text::failure_result(
+                "notify_orchestrator",
+                &Error::Runtime("worker wait ended".into()),
+                Some(&request_id),
+                None,
+            ),
         }
     }
 }
 
 impl ServerHandler for WorkerProxy {
+    /// Malformed known methods remain protocol errors, using the shared SDK
+    /// fallback classification; no custom method can reach the operator broker.
+    async fn on_custom_request(
+        &self,
+        request: rmcp::model::CustomRequest,
+        _: RequestContext<RoleServer>,
+    ) -> std::result::Result<rmcp::model::CustomResult, ErrorData> {
+        Err(super::mcp::unparsed_request_error(&request.method))
+    }
+
     /// Advertise tools only; this surface has no resources, prompts or operator capabilities.
     fn get_info(&self) -> ServerConfig {
         let mut info = ServerConfig::default();
         info.capabilities = serde_json::from_value(json!({"tools":{"listChanged":false}}))
             .expect("static capabilities");
-        info.server_info = Implementation::new("agent-run-worker", "1");
+        info.server_info = Implementation::new("agent-run-worker", env!("CARGO_PKG_VERSION"));
+        info.instructions = Some("This private surface exposes only notify_orchestrator for the supervisor-bound attempt. A receipt confirms queueing, never delivery or approval. Reuse the same request_id and content after uncertainty; never send credentials.".into());
         info
     }
 
@@ -99,12 +129,12 @@ impl ServerHandler for WorkerProxy {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(tools()))
+        Ok(ListToolsResult::with_all_items(tools()?))
     }
 
     /// Resolve only an embedded worker tool, never the operator tool table.
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        tools().into_iter().find(|tool| tool.name == name)
+        tools().ok()?.into_iter().find(|tool| tool.name == name)
     }
 
     /// Execute one validated report and return compact text with no secret context.
@@ -113,6 +143,9 @@ impl ServerHandler for WorkerProxy {
         request: CallToolRequestParams,
         _: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResponse, ErrorData> {
+        if self.get_tool(&request.name).is_none() {
+            return Err(ErrorData::invalid_params("unknown worker tool", None));
+        }
         Ok(self
             .call(
                 &request.name,
@@ -148,6 +181,8 @@ pub async fn serve_from_env() -> Result<()> {
     {
         return Err(invalid("invalid worker capability"));
     }
+    super::mcp_text::initialize()?;
+    tools().map_err(|_| Error::Runtime("worker registry initialization failed".into()))?;
     let proxy = WorkerProxy {
         broker: Arc::new(SocketBroker { home }),
         run_id,
@@ -198,8 +233,8 @@ mod tests {
             attempt_id: "attempt".into(),
             token: "a".repeat(64),
         };
-        assert_eq!(tools().len(), 1);
-        assert_eq!(tools()[0].name, "notify_orchestrator");
+        assert_eq!(tools().unwrap().len(), 1);
+        assert_eq!(tools().unwrap()[0].name, "notify_orchestrator");
         for name in ["start", "resume", "cancel", "steer", "tools", METHOD] {
             assert!(proxy.get_tool(name).is_none());
             assert_eq!(proxy.call(name, json!({})).await.is_error, Some(true));

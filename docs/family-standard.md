@@ -40,9 +40,12 @@ The authoritative public tool contract is **schema-first**:
 once into the typed registry in `crates/agent-run-domain/src/tools.rs`, which
 owns lookup, argument metadata, and public error declarations. No transport
 keeps an independent schema. `tests/fixtures/baseline/tools.json` is the
-frozen Python-port oracle, not the live snapshot; a generated current-state
-snapshot gate (`cargo xtask contract export|check`) is planned adoption work,
-not an existing claim.
+frozen Python-port oracle. Current discovery snapshots are
+`schemas/tools.json` and `schemas/worker-tools.json`, generated from the same
+domain registries used by live MCP through `cargo xtask contract export`.
+`cargo xtask contract check` compares complete descriptions, schemas and
+annotations and is included in the unified gate. The private worker authority
+is `assets/worker_tools.json`; it never imports the operator registry.
 
 ## Compatibility: observed versus not verified
 
@@ -90,11 +93,13 @@ a hostile process with the same UID; that limit is documented, not denied.
 
 ## Open requirements (truthful, not waived)
 
-- **MCP stage (planned, 0.20 compatibility review):** `serverInfo` version is
-  a hardcoded placeholder; tools declare no annotations; server instructions
-  are absent; the unknown-tool channel stays the Python-compatible execution
-  error until that review decides otherwise. No change is hidden behind a
-  waiver.
+- **MCP compatibility:** both server identities use the Cargo product version
+  and short English instructions. Tools carry reviewed effect annotations;
+  admission replay is conditional on an unchanged request key and arguments.
+  Unknown tools and malformed protocol parameters use MCP protocol errors.
+  The presentation contract and intentional pre-1.0 minor delta are described
+  in [MCP presentation](mcp-presentation.md). These local changes require the
+  next release to be 0.20; they do not qualify hosts or publish a release.
 - **Release/delivery stage (planned):** no external `release-manifest.json`
   binding commit/run/attempt, no draft-verify-publish sequence, no post-
   publication verification, no release waiter; the archive checks prove
@@ -107,11 +112,12 @@ a hostile process with the same UID; that limit is documented, not denied.
   manifest during installation. Neither automatically verifies attestations
   before the helper executes. Emission alone does not
   establish the declared `github-attestation` trust profile end to end.
-- **Bounds evidence:** connection/frame/request bounds exist and are tested;
-  per-tool response budgets, upstream-page caps, and child-process limits
-  beyond connection bounds are not yet separately declared and proven.
-- **Result validation:** argument validation is strict; projection of
-  dispatcher *results* into the presenters is not separately schema-validated.
+- **Bounds evidence:** MCP has separate per-tool text, row and exact-content
+  budgets and a bounded private writer. Oversized pages fail as a whole.
+  Broader upstream and child-process limits remain separate requirements.
+- **Result validation:** MCP validates critical dynamic broker fields and
+  projects explicit typed response views before rendering. This does not
+  claim a separate JSON Schema validator for all CLI/socket result variants.
 - **Observability:** component logs are UTC-daily and expire after 30 idle
   days (see [history retention](history-retention.md)); a per-file size cap
   is not yet evidenced.

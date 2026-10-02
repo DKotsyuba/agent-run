@@ -1,0 +1,45 @@
+[
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Send a material finding, risk, question or blocker to this run's orchestrator without ending your work. Use only when coordination is needed, never for routine progress. The recipient and run are fixed by Agent Run. Reuse the same request_id and content after an uncertain result; use a new id for a distinct report. A receipt only confirms durable queueing, not delivery, approval or an answer. Continue independent authorized work; the orchestrator can reply through steer. Do not send credentials. Maximum 2048 UTF-8 bytes, 20 distinct reports per run, at least 30 seconds apart.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "default": "notice",
+          "enum": [
+            "notice",
+            "risk",
+            "question",
+            "blocker"
+          ],
+          "type": "string"
+        },
+        "message": {
+          "description": "Concise report; UTF-8 byte limit is enforced by the broker. Newlines and tabs are permitted; other control characters are rejected.",
+          "maxLength": 2048,
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_id": {
+          "description": "Stable retry key for this report within the current run.",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "request_id",
+        "message"
+      ],
+      "type": "object"
+    },
+    "name": "notify_orchestrator"
+  }
+]

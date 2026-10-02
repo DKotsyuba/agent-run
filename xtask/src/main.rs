@@ -26,9 +26,25 @@ fn main() {
         family_command(&arguments[1..]);
         return;
     }
+    if arguments.first().map(String::as_str) == Some("contract") {
+        let export = match arguments.get(1).map(String::as_str) {
+            Some("export") if arguments.len() == 2 => true,
+            Some("check") if arguments.len() == 2 => false,
+            _ => {
+                eprintln!("usage: cargo xtask contract export|check");
+                std::process::exit(2);
+            }
+        };
+        let root = env::current_dir().expect("current directory must be readable");
+        if let Err(error) = xtask::family::contract(&root, export) {
+            eprintln!("contract: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
     if arguments.first().map(String::as_str) != Some("check") {
         eprintln!(
-            "usage: cargo xtask check | family verify|update | release build|build-native|verify|install|update|recover|roll-forward|rollback | archive --verify"
+            "usage: cargo xtask check | contract export|check | family verify|update | release build|build-native|verify|install|update|recover|roll-forward|rollback | archive --verify"
         );
         std::process::exit(2);
     }
@@ -87,7 +103,9 @@ fn main() {
         std::process::exit(status.code().unwrap_or(1));
     }
     let root = env::current_dir().expect("current directory must be readable");
-    if let Err(error) = xtask::family::verify(&root) {
+    if let Err(error) =
+        xtask::family::contract(&root, false).and_then(|()| xtask::family::verify(&root))
+    {
         eprintln!("family adoption metadata: {error}");
         std::process::exit(2);
     }

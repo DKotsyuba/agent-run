@@ -1,10 +1,19 @@
 agent-run answer for {{ agent_id }}
 
 - Status: {{ status }}
+{% if sha256 is not none %}
+- SHA-256: {{ sha256 }}
+{% endif %}
+{% if relative_path is not none %}
+- Relative artifact: {{ relative_path }}
+{% endif %}
 {% if available %}
 - Answer: available (verified){% if inline_complete %}, complete inline text below{% else %}; inline text absent or partial — full artifact: {{ kind }}{% if media_type %} ({{ media_type }}){% endif %}{% if path %} at {{ path }}{% endif %}{% if size_bytes %}, {{ size_bytes }} bytes{% endif %}{{ "" }}
 {% endif %}
-{% if content %}
+{% if content is not none %}
+{% if content == "" %}
+- Inline content: empty (0 UTF-8 bytes)
+{% endif %}
 
 {{ content }}
 {% endif %}
