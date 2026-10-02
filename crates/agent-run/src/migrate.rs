@@ -29,7 +29,7 @@
 //!
 //! Writer exclusion: besides the broker lock and the `migration_required` /
 //! `migration_incomplete` gate for newly started commands, apply and rollback
-//! hold one exclusive SQLite lease on the live database ([`lease`]) from
+//! hold one exclusive SQLite lease on the live database from
 //! before the first live read until the journal is cleared. Every live read
 //! (active agents, row digest, the snapshot backup) and every replacement run
 //! through that same connection. A process that already holds the database

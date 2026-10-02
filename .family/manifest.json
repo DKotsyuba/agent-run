@@ -8,13 +8,13 @@
       "path": "family.toml",
       "role": "declaration",
       "origin": "product",
-      "sha256": "5a06ba0543088c537dce42d73d0883372c50c2e4d24cd60bdff0041d43d7e9c6"
+      "sha256": "552881016f7ce9025656a94b94271e7fadb3ac7dcda30381b33501a2aafa8c5e"
     },
     {
       "path": "docs/family-standard.md",
       "role": "boundary-summary",
       "origin": "product",
-      "sha256": "c0c9e678193f24e6b14647ff95e5d7de22dc1e683e26ec2f7de8f0637c878d8c"
+      "sha256": "6ace6406d425f372ab1efdd01b5b83337e8c780f956ff045edd141797662c2f9"
     },
     {
       "path": ".family/baseline/scaffold-family.toml",
@@ -26,7 +26,7 @@
       "path": ".family/baseline/NOTICE",
       "role": "license-notice",
       "origin": "product",
-      "sha256": "ab2466d4ae96fa75d2bf8ce6e57189ac4d916da55aae05269fd6a07bbda78519"
+      "sha256": "dc216e1c29f69740d44c7cab724e0160cb3ccb8db94005f9fc7f7ebc21f6a172"
     }
   ]
 }

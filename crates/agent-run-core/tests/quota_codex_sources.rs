@@ -222,8 +222,9 @@ account = "acct-work"
 }
 
 /// An isolated child copy of this test binary that owns its own process
-/// group, so every collector and fake server it spawns is killed and reaped
-/// together with it on drop, timeout, or parent panic.
+/// group. On drop, timeout, or parent panic it signals that group only while
+/// the owned leader is verified unreaped and running, then kills and reaps
+/// the child. Once the leader exits, no recycled group id is signalled.
 struct QuotaChild(std::process::Child);
 
 impl QuotaChild {
@@ -247,9 +248,9 @@ impl QuotaChild {
         Self(command.spawn().expect("child test process"))
     }
 
-    /// Waits for the child group to exit within `timeout`, failing the test
-    /// on a non-success exit or an expired bounded window; the whole group is
-    /// killed and reaped first in either failure case.
+    /// Waits for a successful child exit within `timeout`; on failure or
+    /// panic the guard cleans up only while its owned leader is unreaped.
+    /// A successful exit proves the case assertions, not descendant reaping.
     fn finish(mut self, timeout: std::time::Duration) {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -265,14 +266,16 @@ impl QuotaChild {
         }
     }
 
-    /// Kills the child's whole process group and reaps the child itself.
+    /// Signals the child's process group only while the owned leader is
+    /// verified running, then kills and reaps the exact child.
     ///
     /// Once the leader has been reaped its process id could be recycled, so
     /// the group signal is sent only while the leader is still known to run.
     fn terminate(&mut self) {
         if self.0.try_wait().expect("child must be waitable").is_none() {
-            // SAFETY: the child was spawned in its own process group, so
-            // this signals only that group, never this process's own group.
+            // SAFETY: try_wait proved this owned, unreaped child was running;
+            // its PID cannot be reused before reaping, even if it exits now.
+            // process_group(0) made that PID its private group id.
             unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
             let _ = self.0.kill();
         }
@@ -281,6 +284,7 @@ impl QuotaChild {
 }
 
 impl Drop for QuotaChild {
+    /// Cleans up only the owned unreaped leader and its verified private group.
     fn drop(&mut self) {
         self.terminate();
     }

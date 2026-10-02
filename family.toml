@@ -13,6 +13,7 @@ repository = "DKotsyuba/agent-run"
 env_prefix = "AGENT_RUN_"
 standard_version = "1.0.0-rc.2"
 response_profile = "rust-minijinja-v1"
+response_profile_version = "0.1.0"
 # Devkit whose standard documents and scaffold were reviewed for this
 # adoption; the exact template revision is recorded in .family/manifest.json.
 devkit_version = "0.2.0"
@@ -28,12 +29,17 @@ process = "resident"
 state = "local"
 # stdio MCP is the family transport; the Unix-socket JSON-RPC API and the
 # shared CLI are agent-run's separately declared native surfaces.
-transports = ["stdio", "unix-socket-rpc"]
+transports = ["stdio"]
 # Engine CLIs (Codex, Claude Code, GLM) are configured external programs.
 external_programs = "tools"
 # Host-specific integration exists: the signed Desktop MCP frontend, host
-# hook binding, and the Node bridge service checked by doctor and CI.
+# hook binding, and the embedded host-supplied Node Desktop bridge.
+# CI fixture checks exist; explicit doctor reflection remains open.
 host_adapter = true
+
+[native_surfaces]
+# Product surfaces separate from the MCP transport axis above.
+transports = ["cli", "unix-socket-json-rpc"]
 
 [compatibility]
 # Historically qualified through the published 0.19.x native releases; every

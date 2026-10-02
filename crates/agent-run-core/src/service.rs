@@ -888,7 +888,7 @@ impl Service {
     /// parent's own account.
     ///
     /// Refuses with `continuation_unavailable` when the sealed assets or the
-    /// native history cannot be proved (see [`crate::continuity::prove`]),
+    /// native history cannot be proved by the continuity checks,
     /// and with a validation error when the current configuration no longer
     /// offers the provider, harness, connection or model. Admission itself
     /// proves the parent terminal, quiescent and cleaned up, and admits at

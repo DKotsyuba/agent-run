@@ -21,14 +21,17 @@ to that template.
 | State | `local` | SQLite store under the owned product home; no second source of truth |
 | Transports | `stdio` MCP plus the separately declared Unix-socket JSON-RPC API and shared CLI | One dispatcher, one public tool table |
 | External programs | `tools` | Codex, Claude Code, and GLM engine CLIs are configured, version-reported external executables |
-| Host adapter | yes | Signed Desktop MCP frontend, host hook binding, and the Node bridge service (`scripts/services/`), checked by `doctor` and CI |
+| Host adapter | yes | Embedded Desktop frontend (`assets/desktop-transport.cjs`) executed by host-supplied Node, plus host hook binding |
 
 The release payload is one main binary plus the `agent-run-tui` observer and
 the `agent-run-deploy` installation helper, all sealed from the same
-workspace version. The Node bridge is a declared product integration with
-the host Desktop relay: it ships in the release payload as a service, `doctor`
-and CI exercise it as the integration object, and it is not used as a general
-scripting stack for unrelated automation.
+workspace version. The Desktop bridge is embedded in the binary; it is not
+`scripts/services/codegraph-probe.cjs`, the separately shipped CodeGraph
+integration probe. Node is used for these declared product integrations, not
+general repository automation. CI invokes their fixture checks through
+`scripts/check-desktop-transport.cjs` and `scripts/check-codegraph-probe.cjs`;
+this records configured checks, not a green run of the adoption revision.
+Explicit Desktop bridge/version reflection in `doctor` remains open.
 
 ## Machine-contract authority
 
@@ -77,9 +80,13 @@ a hostile process with the same UID; that limit is documented, not denied.
   `CLAUDE_CODE_OAUTH_TOKEN`, the Claude session registry override, GC tuning
   knobs) rerun in isolated child test processes that receive their values
   through the child's command environment, with bounded windows and
-  kill-and-reap on timeout or parent panic; assertion semantics are
-  unchanged. The pre-existing guarded logger-level tests in
-  `crates/agent-run-core/tests/logging.rs` are unchanged upstream code.
+  kill-and-reap on timeout or parent panic; logger-level cases use the same
+  isolation. Assertions are preserved and independent parent tests remain
+  concurrent. Process-group cleanup signals only a verified owned,
+  unreaped leader; it does not promise to signal groups after leader exit.
+- Adoption verification checks manifest structure, pinned managed-file
+  digests, and agreement on the declared standard version. It does not
+  certify normative compliance, host qualification, or release provenance.
 
 ## Open requirements (truthful, not waived)
 
@@ -93,6 +100,13 @@ a hostile process with the same UID; that limit is documented, not denied.
   publication verification, no release waiter; the archive checks prove
   path/link safety but not duplicate-member, entry-count, unpacked-size, or
   mode constraints.
+- **Release provenance:** the existing release workflow emits GitHub
+  attestations. Independent attestation verification is a separate check;
+  the current bootstrap installer checks the archive checksum before executing
+  the downloaded installation helper; that helper verifies the sealed internal
+  manifest during installation. Neither automatically verifies attestations
+  before the helper executes. Emission alone does not
+  establish the declared `github-attestation` trust profile end to end.
 - **Bounds evidence:** connection/frame/request bounds exist and are tested;
   per-tool response budgets, upstream-page caps, and child-process limits
   beyond connection bounds are not yet separately declared and proven.

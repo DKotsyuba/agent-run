@@ -57,7 +57,8 @@ impl Manifest {
     /// Loads and validates the manifest stored under `root`.
     ///
     /// Fails with one actionable message when the file is missing, malformed,
-    /// uses an unknown schema or mode, lists itself, or repeats a path.
+    /// uses an unknown schema or mode, has a malformed pinned revision or digest,
+    /// lists itself, repeats a path, or names an empty/non-relative path.
     pub fn load(root: &Path) -> Result<Self, String> {
         let path = root.join(MANIFEST_PATH);
         let bytes = std::fs::read(&path)
@@ -75,17 +76,42 @@ impl Manifest {
                 "{MANIFEST_PATH} adoption must be \"{ADOPTION_MODE}\"; this repository was aligned by review, not generated"
             ));
         }
+        if manifest.template_revision.len() != 40
+            || !manifest
+                .template_revision
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(format!(
+                "{MANIFEST_PATH} template_revision must pin a full lowercase commit SHA"
+            ));
+        }
         if manifest.managed.is_empty() {
             return Err(format!("{MANIFEST_PATH} must manage at least one file"));
         }
         let mut seen = std::collections::BTreeSet::new();
         for file in &manifest.managed {
+            if file.path.is_empty()
+                || !Path::new(&file.path)
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+            {
+                return Err(format!(
+                    "managed file {} must be a nonempty repository-relative path without traversal",
+                    file.path
+                ));
+            }
             if file.path == MANIFEST_PATH {
                 return Err(format!(
                     "{MANIFEST_PATH} must not hash itself; pin only the managed files"
                 ));
             }
-            if file.sha256.len() != 64 || !file.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+            if file.sha256.len() != 64
+                || !file
+                    .sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
                 return Err(format!(
                     "managed file {} must pin a 64-character lowercase SHA-256",
                     file.path
@@ -286,6 +312,43 @@ mod tests {
         .unwrap();
         let error = Manifest::load(root.path()).expect_err("non-manual adoption must fail");
         assert!(error.contains("manual"), "{error}");
+    }
+
+    /// Malformed pins and paths fail before any managed file is read or updated.
+    #[test]
+    fn malformed_manifest_pins_and_paths_are_refused() {
+        let root = tempdir().unwrap();
+        manifest_for(root.path(), &[("docs/family-standard.md", "summary\n")]);
+        let raw = fs::read_to_string(root.path().join(MANIFEST_PATH)).unwrap();
+        let valid: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        for field in ["template_revision", "sha256", "path"] {
+            let invalid = match field {
+                "template_revision" => {
+                    vec!["short", "ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFAB"]
+                }
+                "sha256" => vec![
+                    "short",
+                    "ABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFABCDEFAB",
+                ],
+                _ => vec!["", "/outside", "../outside", "docs/../outside"],
+            };
+            for value in invalid {
+                let mut document = valid.clone();
+                if field == "template_revision" {
+                    document[field] = json!(value);
+                } else {
+                    document["managed"][0][field] = json!(value);
+                }
+                fs::write(root.path().join(MANIFEST_PATH), document.to_string()).unwrap();
+                Manifest::load(root.path()).expect_err("malformed manifest must fail");
+                super::update(root.path()).expect_err("update must reject malformed manifest");
+                assert_eq!(
+                    fs::read_to_string(root.path().join(MANIFEST_PATH)).unwrap(),
+                    document.to_string(),
+                    "rejected update must not rewrite metadata"
+                );
+            }
+        }
     }
 
     /// `update` records new bytes only for already-managed paths.
