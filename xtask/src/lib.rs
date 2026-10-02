@@ -9,3 +9,9 @@ pub mod deploy;
 pub mod family;
 pub mod installer;
 pub mod release;
+
+/// External release inventory and observed acceptance evidence.
+pub mod delivery;
+
+/// Bounded tar validation before extraction or execution.
+pub mod tar_guard;

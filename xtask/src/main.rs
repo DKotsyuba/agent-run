@@ -26,6 +26,16 @@ fn main() {
         family_command(&arguments[1..]);
         return;
     }
+    if arguments.first().map(String::as_str) == Some("package") {
+        if let Err(error) = xtask::delivery::command(
+            &env::current_dir().expect("workspace root"),
+            &arguments[1..],
+        ) {
+            eprintln!("package refused: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
     if arguments.first().map(String::as_str) == Some("contract") {
         let export = match arguments.get(1).map(String::as_str) {
             Some("export") if arguments.len() == 2 => true,

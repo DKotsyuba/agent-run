@@ -30,7 +30,9 @@ struct FileRecord {
 /// from that revision; build output and per-worktree caches are excluded even
 /// if a revision happens to track such a path. The manifest records the
 /// resolved commit, every included file, and the Cargo.lock digest. Errors
-/// include Git, tar, filesystem, or malformed-tree failures.
+/// include Git, tar, filesystem, or malformed-tree failures. Tracked links and
+/// special files are rejected explicitly before extraction, never omitted or
+/// dereferenced; such revisions require portable source fixtures.
 pub fn build(root: &Path, output: &Path, revision: &str) -> Result<PathBuf, String> {
     let commit = resolve_commit(root, revision)?;
     let short = &commit[..commit.len().min(12)];
@@ -77,9 +79,9 @@ pub fn build(root: &Path, output: &Path, revision: &str) -> Result<PathBuf, Stri
 
 /// Verifies an archive's manifest, commit reference, lock entry, and contents.
 ///
-/// The archive is extracted into a private temporary directory. Every
-/// manifest digest and byte count is recomputed from the extracted content,
-/// and every regular file or symbolic link in the archive must be listed.
+/// Bounded metadata inspection refuses linked, special, or escaping entries
+/// before extraction into a private temporary directory. Every manifest digest
+/// and byte count is recomputed, and every regular file must be listed.
 /// Verification returns all detected content errors together so one run does
 /// not hide later mismatches. The archive itself is never modified.
 pub fn verify(root: &Path, archive: &Path) -> Result<(), String> {
@@ -219,7 +221,9 @@ fn temporary_directory(label: &str) -> Result<PathBuf, String> {
     Ok(directory)
 }
 
-/// Runs git archive with the source-tree exclusions required for handoff.
+/// Archives every tracked source file at commit except the declared cache paths.
+/// No links are omitted or dereferenced; strict inspection rejects unsafe trees
+/// before extraction. An optional generated manifest is added at the prefix.
 fn git_archive(
     root: &Path,
     commit: &str,
@@ -228,18 +232,16 @@ fn git_archive(
     manifest: Option<&str>,
 ) -> Result<(), String> {
     if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let prefix_argument = format!("{prefix}/");
-    let output_argument = output.to_str().ok_or("archive output is not valid UTF-8")?;
     let mut command = Command::new("git");
     command.current_dir(root).args([
         "archive",
         "--format=tar",
         "--prefix",
-        &prefix_argument,
+        &format!("{prefix}/"),
         "--output",
-        output_argument,
+        output.to_str().ok_or("archive path not UTF-8")?,
         commit,
     ]);
     if let Some(manifest) = manifest {
@@ -252,33 +254,31 @@ fn git_archive(
         ":(exclude).cargo-home/**",
         ":(exclude).wt/**",
     ]);
-    let output = command.output().map_err(|error| error.to_string())?;
+    let output = command.output().map_err(|_| "git archive unavailable")?;
     if output.status.success() {
         Ok(())
     } else {
-        Err(format!(
-            "git archive failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
+        Err("git archive failed".into())
     }
 }
 
-/// Extracts a tar archive into a newly created directory.
+/// Validates bounded member metadata before extracting into a new private tree.
+/// No linked/special/traversing/duplicate member can reach the filesystem.
 fn extract(archive: &Path, destination: &Path) -> Result<(), String> {
+    crate::tar_guard::inspect(archive, false)?;
     fs::create_dir_all(destination).map_err(|error| error.to_string())?;
     let status = Command::new("tar")
-        .args([
-            "-xf",
-            archive.to_str().ok_or("archive path is not valid UTF-8")?,
-            "-C",
-        ])
+        .args(["-xf"])
+        .arg(archive)
+        .arg("-C")
         .arg(destination)
+        .args(["--no-same-owner", "--no-same-permissions"])
         .status()
         .map_err(|error| error.to_string())?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!("tar extraction failed for {}", archive.display()))
+        Err("tar extraction failed".into())
     }
 }
 

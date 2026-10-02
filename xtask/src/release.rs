@@ -83,7 +83,9 @@ pub fn build_with_installer(
 /// `binary` is sealed as `bin/agent-run`; `installer`, when present, as
 /// `bin/agent-run-deploy`; `tui`, when present, as `bin/agent-run-tui`. Each
 /// input must already be a regular file, checked before the release directory
-/// is created so a bad argument never leaves an incomplete candidate.
+/// is created so a bad argument never leaves an incomplete candidate. Existing
+/// sealed versions are reused only when every supplied binary has identical
+/// bytes; conflicts require a new version and leave the sealed release intact.
 fn build_inner(
     output: &Path,
     version: &str,
@@ -108,6 +110,20 @@ fn build_inner(
     let release = output.join("releases").join(version);
     if release.exists() {
         verify(&release)?;
+        for (source, name) in [
+            (Some(binary), "agent-run"),
+            (installer, "agent-run-deploy"),
+            (tui, "agent-run-tui"),
+        ] {
+            if let Some(source) = source {
+                let expected = digest(source).map_err(|_| "input digest unavailable")?;
+                let actual = digest(&release.join("bin").join(name))
+                    .map_err(|_| "existing release payload differs")?;
+                if expected != actual {
+                    return Err("same-version release bytes conflict; choose a new version".into());
+                }
+            }
+        }
         return Ok(release);
     }
     fs::create_dir_all(release.join("bin")).map_err(|error| error.to_string())?;
