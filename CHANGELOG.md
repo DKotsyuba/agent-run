@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.19.5] - 2026-10-02
+
 - fix(mcp): answer `tools/list` on both the operator and the worker MCP surface
   with `ttlMs` (60 s) and `cacheScope: private` when the request negotiated MCP
   2026-07-28 or later, so such clients no longer reject the tool list (Claude
