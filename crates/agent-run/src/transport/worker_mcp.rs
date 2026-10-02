@@ -93,13 +93,14 @@ impl ServerHandler for WorkerProxy {
         info
     }
 
-    /// Return the entire bounded worker registry without pagination.
+    /// Return the entire bounded worker registry without pagination;
+    /// 2026-07-28 requests also carry cache hints.
     async fn list_tools(
         &self,
         _: Option<PaginatedRequestParams>,
-        _: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(tools()))
+        Ok(super::mcp_cache::tools_list_result(&context, tools()))
     }
 
     /// Resolve only an embedded worker tool, never the operator tool table.
@@ -230,5 +231,49 @@ mod tests {
         assert_eq!(calls[0].1["attempt_id"], "attempt");
         assert_eq!(calls[0].1["token"], proxy.token);
         assert!(!crate::dispatch::is_tool("notify_orchestrator"));
+    }
+
+    /// A raw 2026-07-28 `tools/list` (no `initialize`) carries private cache hints,
+    /// so Claude children on that protocol keep `notify_orchestrator`; legacy sessions do not.
+    #[tokio::test]
+    async fn worker_modern_tools_list_carries_cache_hints() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let proxy = WorkerProxy {
+            broker: Arc::new(Broker::default()),
+            run_id: "ag-20260928-000000-0000000001".parse().unwrap(),
+            attempt_id: "attempt".into(),
+            token: "a".repeat(64),
+        };
+        let (mut input_writer, input_reader) = tokio::io::duplex(64 * 1024);
+        let (output_writer, output_reader) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            proxy
+                .serve((input_reader, output_writer))
+                .await
+                .unwrap()
+                .waiting()
+                .await
+        });
+        let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{
+            "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities":{}
+        }}});
+        input_writer
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(output_reader)
+            .read_line(&mut line)
+            .await
+            .unwrap();
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        let result = &reply["result"];
+        assert_eq!(result["resultType"], "complete", "{reply}");
+        assert_eq!(result["ttlMs"], 60_000, "{reply}");
+        assert_eq!(result["cacheScope"], "private", "{reply}");
+        assert_eq!(result["tools"][0]["name"], "notify_orchestrator");
+        drop(input_writer);
+        let _ = server.await;
     }
 }

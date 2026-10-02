@@ -233,18 +233,21 @@ impl ServerHandler for Proxy {
         info.server_info = Implementation::new("agent-run", "1");
         info
     }
-    /// Serve the single packaged Python-equivalent tool table without pagination.
+    /// Serve the single packaged Python-equivalent tool table without pagination;
+    /// 2026-07-28 requests also carry cache hints.
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, ErrorData> {
         let tools: Vec<Tool> = dispatch::tools()
             .into_iter()
             .map(serde_json::from_value)
             .collect::<std::result::Result<_, _>>()
             .map_err(|_| ErrorData::internal_error("invalid packaged tool schema", None))?;
-        Ok(ListToolsResult::with_all_items(tools))
+        Ok(crate::transport::mcp_cache::tools_list_result(
+            &context, tools,
+        ))
     }
     /// Look up one advertised tool so rmcp can route its call without a second registry.
     fn get_tool(&self, name: &str) -> Option<Tool> {
