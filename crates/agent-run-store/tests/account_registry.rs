@@ -1,10 +1,10 @@
 //! Disposable-store account registration and reference identity checks.
 
 use agent_run_domain::{
+    AccountId, SecretRef,
     catalog::{
         AccountRecord, AccountStatus, AttemptCredentials, ProviderCatalog, ProviderDefinition,
     },
-    AccountId, SecretRef,
 };
 use agent_run_store::Store;
 
@@ -28,14 +28,18 @@ fn registry_keeps_global_identity_and_reference_metadata() {
     let account = record("acct-one", "openai", "native:codex");
     store.register_account(&account).unwrap();
     assert!(store.register_account(&account).is_err());
-    assert!(store
-        .register_account(&record("acct-two", "openai", "native:codex"))
-        .is_err());
+    assert!(
+        store
+            .register_account(&record("acct-two", "openai", "native:codex"))
+            .is_err()
+    );
     // Raw token-like text is refused before it can even form a record.
     assert!("raw-fake-token".parse::<SecretRef>().is_err());
-    assert!(store
-        .register_account(&record("acct-wrong", "anthropic", "native:codex"))
-        .is_err());
+    assert!(
+        store
+            .register_account(&record("acct-wrong", "anthropic", "native:codex"))
+            .is_err()
+    );
     store
         .register_account(&record(
             "acct-two",
@@ -92,9 +96,11 @@ fn registry_keeps_global_identity_and_reference_metadata() {
     assert!(
         AttemptCredentials::from_selected(&catalog, &"codex".parse().unwrap(), "gpt", &id).is_err()
     );
-    assert!(store
-        .disable_account(&"acct-missing".parse().unwrap())
-        .is_err());
+    assert!(
+        store
+            .disable_account(&"acct-missing".parse().unwrap())
+            .is_err()
+    );
     assert_eq!(store.list_accounts().unwrap().len(), 5);
 }
 
@@ -113,8 +119,10 @@ fn registry_mutations_advance_the_capacity_revision() {
     store.disable_account(&"acct-rev".parse().unwrap()).unwrap();
     let disabled = store.quota_capacity_revision().unwrap();
     assert!(disabled > registered);
-    assert!(store
-        .disable_account(&"acct-missing".parse().unwrap())
-        .is_err());
+    assert!(
+        store
+            .disable_account(&"acct-missing".parse().unwrap())
+            .is_err()
+    );
     assert_eq!(store.quota_capacity_revision().unwrap(), disabled);
 }

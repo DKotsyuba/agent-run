@@ -10,20 +10,21 @@ members = [
     "crates/agent-run-tui",
     "xtask",
 ]
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
 version = "0.19.4"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 rust-version = "1.98.1"
+publish = false
 
 [workspace.dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 fs2 = "0.4"
 libc = "0.2"
-minijinja = { version = "2.24.0", default-features = false, features = ["serde"] }
+minijinja = { version = "=2.24.0", default-features = false, features = ["serde"] }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
 regex = "1.11"
 reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls"] }
@@ -48,4 +49,4 @@ strip = true
 unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
-undocumented_unsafe_blocks = "warn"
+undocumented_unsafe_blocks = "deny"

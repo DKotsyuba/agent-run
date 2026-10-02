@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "adoption": "manual",
+  "standard_version": "1.0.0-rc.2",
+  "template_revision": "7f094e0463c0a6d5cf52d68d91ca32f6bc0f465f",
+  "managed": [
+    {
+      "path": "family.toml",
+      "role": "declaration",
+      "origin": "product",
+      "sha256": "5a06ba0543088c537dce42d73d0883372c50c2e4d24cd60bdff0041d43d7e9c6"
+    },
+    {
+      "path": "docs/family-standard.md",
+      "role": "boundary-summary",
+      "origin": "product",
+      "sha256": "c0c9e678193f24e6b14647ff95e5d7de22dc1e683e26ec2f7de8f0637c878d8c"
+    },
+    {
+      "path": ".family/baseline/scaffold-family.toml",
+      "role": "template-baseline",
+      "origin": "template",
+      "sha256": "bba12c3687e4b57c3e9c63d6fba02c98cf32851ac4af4909116d78d2cb93c06b"
+    },
+    {
+      "path": ".family/baseline/NOTICE",
+      "role": "license-notice",
+      "origin": "product",
+      "sha256": "ab2466d4ae96fa75d2bf8ce6e57189ac4d916da55aae05269fd6a07bbda78519"
+    }
+  ]
+}

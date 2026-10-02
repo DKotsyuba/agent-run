@@ -9,7 +9,7 @@
 
 use crate::adapters::materialize::claude_account_config;
 use agent_run_adapters::authorized_request::{CredentialReader, SystemCredentialReader};
-use agent_run_domain::{catalog::HarnessId, CredentialRef, Error, Result};
+use agent_run_domain::{CredentialRef, Error, Result, catalog::HarnessId};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -101,15 +101,14 @@ impl QuotaCredentialReader {
     fn claude_oauth(&self, label: Option<&str>) -> Result<String> {
         let (dir, overridden) = self.claude_config(label)?;
         let file = dir.join(".credentials.json");
-        if file.is_file() {
-            if let Some(token) = SystemCredentialReader
+        if file.is_file()
+            && let Some(token) = SystemCredentialReader
                 .read(&CredentialRef::File(file))
                 .ok()
                 .as_deref()
                 .and_then(access_token)
-            {
-                return Ok(token);
-            }
+        {
+            return Ok(token);
         }
         agent_run_platform::keychain::generic_password_service(&keychain_service(&dir, overridden))
             .as_deref()

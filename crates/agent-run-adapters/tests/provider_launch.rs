@@ -7,15 +7,15 @@ use agent_run_adapters::{
 use agent_run_config::{
     profiles::Profile,
     provider_config::ProviderConfig,
-    role_plan::{resolve_role_plan, ResolvedRolePlan},
+    role_plan::{ResolvedRolePlan, resolve_role_plan},
 };
 use agent_run_domain::{
+    CredentialRef, Result, Sha256Digest,
     catalog::{
         AccountRecord, AccountStatus, HarnessId, ProviderCatalog, ProviderId,
         ResolvedLaunchAuthority,
     },
     domain::Constraint,
-    CredentialRef, Result, Sha256Digest,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -187,9 +187,11 @@ fn historical_role_keeps_worker_channel_absent() {
         .unwrap();
         assert!(!run_home.join("mcp/mcp-config.json").exists());
         if provider == "codex-plus" {
-            assert!(!fs::read_to_string(run_home.join("config.toml"))
-                .unwrap()
-                .contains("agent_run_worker"));
+            assert!(
+                !fs::read_to_string(run_home.join("config.toml"))
+                    .unwrap()
+                    .contains("agent_run_worker")
+            );
         }
     }
 }
@@ -377,10 +379,11 @@ fn native_provider_keeps_login_and_model_alias() {
     .unwrap();
     assert_eq!(plan.native_model, "gpt-native");
     assert_eq!(plan.profile.body, role.prompt);
-    assert!(plan
-        .profile
-        .body
-        .starts_with(include_str!("../../../assets/worker_instructions.md").trim_end()));
+    assert!(
+        plan.profile
+            .body
+            .starts_with(include_str!("../../../assets/worker_instructions.md").trim_end())
+    );
     assert!(plan.profile.body.ends_with("Review safely."));
     assert!(run_home.join("auth.json").exists());
     let native_config: toml::Value =
@@ -395,13 +398,17 @@ fn native_provider_keeps_login_and_model_alias() {
     for name in agent_run_domain::worker::ENV_NAMES {
         assert!(!plan.launch.environment.contains_key(name));
     }
-    assert!(!fs::read_to_string(run_home.join("config.toml"))
-        .unwrap()
-        .contains("model_providers"));
-    assert!(!plan
-        .launch
-        .environment
-        .contains_key("AGENT_RUN_PROVIDER_TOKEN"));
+    assert!(
+        !fs::read_to_string(run_home.join("config.toml"))
+            .unwrap()
+            .contains("model_providers")
+    );
+    assert!(
+        !plan
+            .launch
+            .environment
+            .contains_key("AGENT_RUN_PROVIDER_TOKEN")
+    );
     assert!(run_fake(&plan.launch).contains("app-server"));
     // The admitted fast option becomes the codex fast service tier.
     let fast = agent_run_adapters::provider::plan_selected_with(
@@ -487,11 +494,12 @@ fn native_provider_keeps_login_and_model_alias() {
     .unwrap();
     assert_eq!(plan.native_model, "claude-sonnet");
     assert!(plan.launch.args.iter().any(|arg| arg == "--mcp-config"));
-    assert!(plan
-        .launch
-        .args
-        .iter()
-        .any(|arg| arg.contains("mcp__agent_run_worker")));
+    assert!(
+        plan.launch
+            .args
+            .iter()
+            .any(|arg| arg.contains("mcp__agent_run_worker"))
+    );
     let mcp: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(run_home.join("mcp/mcp-config.json")).unwrap())
             .unwrap();
@@ -509,8 +517,10 @@ fn native_provider_keeps_login_and_model_alias() {
         .unwrap()
         + 1];
     assert_eq!(system_prompt, &role.prompt);
-    assert!(system_prompt
-        .starts_with(include_str!("../../../assets/worker_instructions.md").trim_end()));
+    assert!(
+        system_prompt
+            .starts_with(include_str!("../../../assets/worker_instructions.md").trim_end())
+    );
     assert!(system_prompt.ends_with("Review safely."));
     // The admitted output_schema joins the claude system prompt.
     let schema = serde_json::json!({"type": "object"});
@@ -535,11 +545,12 @@ fn native_provider_keeps_login_and_model_alias() {
     assert!(with_schema.launch.args.iter().any(|arg| {
         arg.contains("Return only JSON matching this schema: {\"type\":\"object\"}")
     }));
-    assert!(plan
-        .launch
-        .args
-        .iter()
-        .any(|arg| arg == "--include-partial-messages"));
+    assert!(
+        plan.launch
+            .args
+            .iter()
+            .any(|arg| arg == "--include-partial-messages")
+    );
     assert!(!plan.launch.environment.contains_key("ANTHROPIC_BASE_URL"));
     assert!(!plan.launch.environment.contains_key("ANTHROPIC_AUTH_TOKEN"));
     assert!(!plan.launch.environment.contains_key("ANTHROPIC_API_KEY"));
@@ -567,18 +578,20 @@ fn custom_providers_use_sealed_settings_and_fake_credentials() {
     let catalog = catalog(&config);
     let unsafe_role = role(root, true);
     let role = role(root, false);
-    assert!(materialize_selected(
-        &config,
-        &catalog,
-        &"glm-any".parse().unwrap(),
-        "glm",
-        &"acct-glm".parse().unwrap(),
-        &unsafe_role,
-        root,
-        &root.join("unsafe-run"),
-        root,
-    )
-    .is_err());
+    assert!(
+        materialize_selected(
+            &config,
+            &catalog,
+            &"glm-any".parse().unwrap(),
+            "glm",
+            &"acct-glm".parse().unwrap(),
+            &unsafe_role,
+            root,
+            &root.join("unsafe-run"),
+            root,
+        )
+        .is_err()
+    );
     let host = BTreeMap::from([("HOME".into(), root.to_string_lossy().into_owned())]);
 
     let provider: ProviderId = "glm-any".parse().unwrap();
@@ -603,11 +616,12 @@ fn custom_providers_use_sealed_settings_and_fake_credentials() {
     )
     .unwrap();
     assert_eq!(plan.native_model, "glm-5.3[1m]");
-    assert!(plan
-        .launch
-        .args
-        .iter()
-        .any(|arg| arg == "--include-partial-messages"));
+    assert!(
+        plan.launch
+            .args
+            .iter()
+            .any(|arg| arg == "--include-partial-messages")
+    );
     assert_eq!(
         plan.launch.environment["ANTHROPIC_BASE_URL"],
         "https://gateway.example/api"
@@ -638,11 +652,13 @@ fn custom_providers_use_sealed_settings_and_fake_credentials() {
             None,
         )
         .unwrap();
-        assert!(planned
-            .launch
-            .args
-            .windows(2)
-            .any(|pair| pair == ["--effort", effort]));
+        assert!(
+            planned
+                .launch
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--effort", effort])
+        );
     }
     let mut changed_config = config.clone();
     changed_config
@@ -652,66 +668,74 @@ fn custom_providers_use_sealed_settings_and_fake_credentials() {
         .native_settings
         .insert("model_verbosity".into(), toml::Value::String("high".into()));
     changed_config.validate(root).unwrap();
-    assert!(plan_selected(
-        &changed_config,
-        &catalog,
-        &authority,
-        &account,
-        &run_home,
-        root,
-        &host,
-        &FakeReader,
-        "task",
-        None,
-    )
-    .is_err());
+    assert!(
+        plan_selected(
+            &changed_config,
+            &catalog,
+            &authority,
+            &account,
+            &run_home,
+            root,
+            &host,
+            &FakeReader,
+            "task",
+            None,
+        )
+        .is_err()
+    );
     let mut changed = authority.clone();
     changed.connection = catalog
         .provider(&"codex-gateway".parse().unwrap())
         .unwrap()
         .connection
         .clone();
-    assert!(plan_selected(
-        &config,
-        &catalog,
-        &changed,
-        &account,
-        &run_home,
-        root,
-        &host,
-        &FakeReader,
-        "task",
-        None
-    )
-    .is_err());
+    assert!(
+        plan_selected(
+            &config,
+            &catalog,
+            &changed,
+            &account,
+            &run_home,
+            root,
+            &host,
+            &FakeReader,
+            "task",
+            None
+        )
+        .is_err()
+    );
     let mut changed_grant = authority.clone();
     changed_grant.role_payload["grants"]["write"] = serde_json::json!(true);
-    assert!(plan_selected(
-        &config,
-        &catalog,
-        &changed_grant,
-        &account,
-        &run_home,
-        root,
-        &host,
-        &FakeReader,
-        "task",
-        None,
-    )
-    .is_err());
-    assert!(plan_selected(
-        &config,
-        &catalog,
-        &authority,
-        &"acct-native".parse().unwrap(),
-        &run_home,
-        root,
-        &host,
-        &FakeReader,
-        "task",
-        None
-    )
-    .is_err());
+    assert!(
+        plan_selected(
+            &config,
+            &catalog,
+            &changed_grant,
+            &account,
+            &run_home,
+            root,
+            &host,
+            &FakeReader,
+            "task",
+            None,
+        )
+        .is_err()
+    );
+    assert!(
+        plan_selected(
+            &config,
+            &catalog,
+            &authority,
+            &"acct-native".parse().unwrap(),
+            &run_home,
+            root,
+            &host,
+            &FakeReader,
+            "task",
+            None
+        )
+        .is_err()
+    );
 
     let provider: ProviderId = "codex-gateway".parse().unwrap();
     let account = "acct-openai".parse().unwrap();
@@ -753,17 +777,19 @@ fn custom_providers_use_sealed_settings_and_fake_credentials() {
     );
     assert!(run_fake(&plan.launch).contains("app-server"));
     fs::write(run_home.join("provider-launch.json"), "{}").unwrap();
-    assert!(plan_selected(
-        &config,
-        &catalog,
-        &authority,
-        &account,
-        &run_home,
-        root,
-        &host,
-        &FakeReader,
-        "task",
-        None
-    )
-    .is_err());
+    assert!(
+        plan_selected(
+            &config,
+            &catalog,
+            &authority,
+            &account,
+            &run_home,
+            root,
+            &host,
+            &FakeReader,
+            "task",
+            None
+        )
+        .is_err()
+    );
 }

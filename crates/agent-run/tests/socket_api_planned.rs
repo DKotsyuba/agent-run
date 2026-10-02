@@ -7,7 +7,7 @@ use agent_run::{
     transport::{frame, socket},
     verify,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -284,12 +284,14 @@ async fn python_unknown_method_and_validation_use_standard_codes() {
 /// Mirrors `tests/test_api_socket.py::ApiSocketTests::test_notification_produces_no_reply`.
 #[tokio::test]
 async fn python_notification_produces_no_reply() {
-    assert!(socket::respond(
-        &Service::new(PathBuf::from("/nonexistent")),
-        json!({"jsonrpc":"2.0","method":"ping"})
-    )
-    .await
-    .is_none());
+    assert!(
+        socket::respond(
+            &Service::new(PathBuf::from("/nonexistent")),
+            json!({"jsonrpc":"2.0","method":"ping"})
+        )
+        .await
+        .is_none()
+    );
 }
 
 /// Mirrors `tests/test_api_socket.py::ApiSocketTests::test_request_deadline_and_queue_overload_are_explicit`.
@@ -303,16 +305,18 @@ async fn python_request_capacity_is_explicitly_bounded() {
     .await
     .unwrap();
     assert_eq!(response["error"]["code"], -32602);
-    assert!(socket::serve_at_with_options(
-        Path::new("/nonexistent"),
-        Path::new("/tmp/no.sock"),
-        socket::ServeOptions {
-            max_pending_requests: 0,
-            ..Default::default()
-        }
-    )
-    .await
-    .is_err());
+    assert!(
+        socket::serve_at_with_options(
+            Path::new("/nonexistent"),
+            Path::new("/tmp/no.sock"),
+            socket::ServeOptions {
+                max_pending_requests: 0,
+                ..Default::default()
+            }
+        )
+        .await
+        .is_err()
+    );
 }
 
 /// Mirrors `tests/test_api_socket.py::ApiSocketTests::test_slow_bytes_cannot_extend_reserved_first_frame_deadline`.
@@ -476,13 +480,15 @@ async fn python_successful_tool_round_trip() {
         .await["result"],
         json!({"ok":true})
     );
-    assert!(request(
-        &path,
-        json!({"jsonrpc":"2.0","id":2,"method":"models","params":{}})
-    )
-    .await
-    .get("result")
-    .is_some());
+    assert!(
+        request(
+            &path,
+            json!({"jsonrpc":"2.0","id":2,"method":"models","params":{}})
+        )
+        .await
+        .get("result")
+        .is_some()
+    );
     stop(task).await;
     drop(home);
 }

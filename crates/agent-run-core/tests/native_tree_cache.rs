@@ -142,13 +142,13 @@ fn unique_inode_bytes(paths: &[PathBuf]) -> u64 {
 /// Makes every readonly store directory removable, then drops a fixture.
 fn cleanup_store(store_root: &Path) {
     fn permit(path: &Path) {
-        if let Ok(metadata) = stdfs::symlink_metadata(path) {
-            if metadata.is_dir() {
-                let _ = stdfs::set_permissions(path, stdfs::Permissions::from_mode(0o700));
-                if let Ok(children) = stdfs::read_dir(path) {
-                    for child in children.flatten() {
-                        permit(&child.path());
-                    }
+        if let Ok(metadata) = stdfs::symlink_metadata(path)
+            && metadata.is_dir()
+        {
+            let _ = stdfs::set_permissions(path, stdfs::Permissions::from_mode(0o700));
+            if let Ok(children) = stdfs::read_dir(path) {
+                for child in children.flatten() {
+                    permit(&child.path());
                 }
             }
         }
@@ -849,12 +849,14 @@ fn ref_scan_pins_links_backups_and_blobs() {
     let scan: NativeRefScan = native_tree_cache::scan_refs(&store_root, &[&first, &second]);
     assert!(scan.complete, "a fully readable pass is complete");
     assert_eq!(scan.homes, 2);
-    assert!(scan
-        .trees
-        .contains_key(&format!("{}/{}", frozen.scope, frozen.manifest_sha256)));
-    assert!(scan
-        .trees
-        .contains_key(&format!("{}/{}", system.scope, system.manifest_sha256)));
+    assert!(
+        scan.trees
+            .contains_key(&format!("{}/{}", frozen.scope, frozen.manifest_sha256))
+    );
+    assert!(
+        scan.trees
+            .contains_key(&format!("{}/{}", system.scope, system.manifest_sha256))
+    );
     let blobs = shared_assets::shared_tree_blob_names(&store_root, &frozen).unwrap();
     assert!(!blobs.is_empty());
     for blob in &blobs {
@@ -876,9 +878,10 @@ fn ref_scan_pins_links_backups_and_blobs() {
     let scan = native_tree_cache::scan_refs(&store_root, &[&first, &pending]);
     assert!(scan.complete);
     assert_eq!(scan.backups, 1);
-    assert!(scan
-        .trees
-        .contains_key(&format!("{}/{}", frozen.scope, frozen.manifest_sha256)));
+    assert!(
+        scan.trees
+            .contains_key(&format!("{}/{}", frozen.scope, frozen.manifest_sha256))
+    );
 
     // An unreadable cache directory marks the pass incomplete but keeps the
     // prior home's refs — an enumeration error is never an empty census.
@@ -1276,11 +1279,13 @@ fn measured_curated_mirror_and_large_parent_round_trip() {
                 .unwrap_or_else(|error| panic!("{root_key}: {error}")),
         );
         shared_assets::verify_shared_tree(&store_root, &reference).expect("verified");
-        assert!(home_path
-            .join(root_key)
-            .symlink_metadata()
-            .unwrap()
-            .is_symlink());
+        assert!(
+            home_path
+                .join(root_key)
+                .symlink_metadata()
+                .unwrap()
+                .is_symlink()
+        );
         references.push(reference);
     }
     let (mirror_bytes, mirror_entries) = manifest_of(&store_root, &references[0]);
@@ -1302,11 +1307,13 @@ fn measured_curated_mirror_and_large_parent_round_trip() {
             .expect("thaw")
             .expect("was frozen");
         assert_eq!(&thawed, reference);
-        assert!(home_path
-            .join(root_key)
-            .symlink_metadata()
-            .unwrap()
-            .is_dir());
+        assert!(
+            home_path
+                .join(root_key)
+                .symlink_metadata()
+                .unwrap()
+                .is_dir()
+        );
     }
     let restored = home_path
         .join(MIRROR)

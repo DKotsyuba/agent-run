@@ -1,10 +1,10 @@
 //! Immutable post-tool session binding and raw host-payload normalization.
 
 use crate::{
-    domain::{now, AgentId, OrchestratorRef},
+    Error, Result,
+    domain::{AgentId, OrchestratorRef, now},
     error::invalid,
     state::Store,
-    Error, Result,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -346,5 +346,7 @@ fn collect_ids(value: &Value, field: &str, ids: &mut BTreeSet<String>) -> Result
 
 /// Formats the required host-visible notification-confirmation failure.
 fn loud(agent_id: &str, reason: &(impl std::fmt::Display + ?Sized)) -> Error {
-    Error::Runtime(format!("agent-run: chat notification is NOT confirmed for {agent_id}: {reason}. The agent may still be running; keep this turn alive and recover with agent-run bind."))
+    Error::Runtime(format!(
+        "agent-run: chat notification is NOT confirmed for {agent_id}: {reason}. The agent may still be running; keep this turn alive and recover with agent-run bind."
+    ))
 }

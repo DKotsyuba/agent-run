@@ -1,10 +1,10 @@
 //! Strict provider start input, distinct from readable historical runtime requests.
 
 use crate::{
+    Result,
     catalog::ProviderId,
     domain::{Constraint, OrchestratorRef, StartRequest},
     types::AccountLabel,
-    Result,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, path::PathBuf};

@@ -18,7 +18,7 @@
 //! IMMEDIATE` without the statement-by-statement splitting the Python port
 //! needs to work around that quirk.
 
-use agent_run_domain::{error::invalid, Error, Result};
+use agent_run_domain::{Error, Result, error::invalid};
 use rusqlite::{Connection, MAIN_DB};
 use std::{
     collections::HashSet,
@@ -190,12 +190,12 @@ fn drop_stale_backups(path: &Path) {
         let Some(digits) = rest.strip_suffix(".backup") else {
             continue;
         };
-        if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-            if let Ok(version) = digits.parse::<i64>() {
-                if version <= super::VERSION {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
+        if !digits.is_empty()
+            && digits.chars().all(|c| c.is_ascii_digit())
+            && let Ok(version) = digits.parse::<i64>()
+            && version <= super::VERSION
+        {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
 }
@@ -344,7 +344,7 @@ fn apply_pending(conn: &Connection, path: &Path) -> Result<i64> {
 /// The connection opened here waits `super::MIGRATION_BUSY_TIMEOUT` on a busy
 /// store instead of the ordinary `super::BUSY_TIMEOUT`, matching
 /// `src/agent_run/state/migrations.py`. Concurrent openers of an out-of-date
-/// store queue behind each other on [`SchemaLock`], so the last one in line
+/// store queue behind each other on `SchemaLock`, so the last one in line
 /// waits out every upgrade ahead of it; at the ordinary ceiling that queue
 /// surfaces as a spurious `DatabaseBusy` during an otherwise healthy upgrade.
 pub fn migrate(path: &Path) -> Result<i64> {

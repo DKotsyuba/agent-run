@@ -1,6 +1,6 @@
 //! Golden and metadata contracts for the one public tool registry.
 
-use agent_run_domain::{registry, tool, tools_json, ArgumentDefault};
+use agent_run_domain::{ArgumentDefault, registry, tool, tools_json};
 use serde_json::Value;
 
 /// Parses the captured Python discovery payload shared by all registry assertions.
@@ -48,10 +48,12 @@ fn registry_matches_python_golden_field_by_field() {
                 .find(". ")
                 .map(|end| text[..end + 1].to_owned())
                 .unwrap_or(text);
-            assert!(actual["description"]
-                .as_str()
-                .unwrap()
-                .starts_with(base.as_str()));
+            assert!(
+                actual["description"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(base.as_str())
+            );
             expected["description"] = actual["description"].clone();
             for name in filters {
                 expected["inputSchema"]["properties"][name] =
@@ -144,9 +146,11 @@ fn start_description_extends_the_python_baseline_exactly() {
 #[test]
 fn delegation_guide_is_the_additive_twelfth_tool() {
     let definition = tool("delegation_guide").expect("delegation_guide tool");
-    assert!(golden()
-        .iter()
-        .all(|tool| tool["name"] != "delegation_guide"));
+    assert!(
+        golden()
+            .iter()
+            .all(|tool| tool["name"] != "delegation_guide")
+    );
     assert!(definition.arguments().is_empty());
     assert_eq!(definition.input_schema["additionalProperties"], false);
     assert_eq!(definition.input_schema["properties"], serde_json::json!({}));

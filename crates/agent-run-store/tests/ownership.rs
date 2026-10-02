@@ -47,9 +47,11 @@ fn dead_startup_owner_is_reconciled_and_capacity_is_released() {
         vec![id.clone()]
     );
     assert_eq!(store.get(&id).unwrap().status, Status::Lost);
-    assert!(store
-        .admit(&home.request(), &config, &json!({}), None)
-        .is_ok());
+    assert!(
+        store
+            .admit(&home.request(), &config, &json!({}), None)
+            .is_ok()
+    );
 }
 
 /// Mirrors `tests/test_reconciliation.py::UnownedStartingReconciliationTests::test_handoff_renews_deadline_until_late_supervisor_proof`
@@ -66,9 +68,11 @@ fn live_startup_owner_survives_handoff_and_late_supervisor_proof() {
     store
         .claim_startup(&id, owner, Some(12.5), 10.0, 120.0)
         .unwrap();
-    assert!(store
-        .begin_supervisor_handoff(&id, owner, 129.0, 40.0)
-        .unwrap());
+    assert!(
+        store
+            .begin_supervisor_handoff(&id, owner, 129.0, 40.0)
+            .unwrap()
+    );
     let deadline: f64 = store
         .conn
         .query_row(

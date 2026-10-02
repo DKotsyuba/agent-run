@@ -97,13 +97,13 @@ fn tree_digest(path: &Path) -> String {
 
 /// Restores owner write below one fixture tree so the temporary dir can drop.
 fn permit(path: &Path) {
-    if let Ok(metadata) = stdfs::symlink_metadata(path) {
-        if metadata.is_dir() {
-            let _ = stdfs::set_permissions(path, stdfs::Permissions::from_mode(0o700));
-            if let Ok(children) = stdfs::read_dir(path) {
-                for child in children.flatten() {
-                    permit(&child.path());
-                }
+    if let Ok(metadata) = stdfs::symlink_metadata(path)
+        && metadata.is_dir()
+    {
+        let _ = stdfs::set_permissions(path, stdfs::Permissions::from_mode(0o700));
+        if let Ok(children) = stdfs::read_dir(path) {
+            for child in children.flatten() {
+                permit(&child.path());
             }
         }
     }

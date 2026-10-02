@@ -2,24 +2,75 @@
 
 use agent_run_core::{
     delivery::{
-        claude, dispatch, dispatch_once, dispatch_with_batch, relay, safe_evidence,
-        CompletionNotice, Notice, Receipt, NOTICE_VERSION,
+        CompletionNotice, NOTICE_VERSION, Notice, Receipt, claude, dispatch, dispatch_once,
+        dispatch_with_batch, relay, safe_evidence,
     },
-    domain::{now, AgentId, Status},
+    domain::{AgentId, Status, now},
 };
-use rusqlite::{params, Connection};
-use serde_json::{json, Value};
+use rusqlite::{Connection, params};
+use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
+    process::Child,
     time::Duration,
 };
 
 mod common;
 
-/// Serialises tests that point the process-wide Claude registry override at
-/// their own fixture, so concurrent dispatcher tests cannot resolve each
-/// other's registry.
-static REGISTRY_OVERRIDE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// An isolated child copy of this test binary that is killed and reaped on
+/// drop, so a parent panic, timeout, or cancelled case can never leave it
+/// running. The child receives a fresh private fixture home and the
+/// process-wide Claude session registry override only through its command
+/// environment.
+struct DeliveryChild {
+    /// The child process; dropped first so it is gone before the fixture.
+    child: Child,
+    /// Fixture home kept alive for exactly as long as the child needs it.
+    _home: common::Home,
+}
+
+impl DeliveryChild {
+    /// Spawns this test binary running only `test`, against a fresh fixture
+    /// home whose sessions directory the registry override selects; the child
+    /// creates that directory itself before writing descriptors.
+    fn spawn(test: &str) -> Self {
+        let home = common::Home::new();
+        let registry = home.path.join("sessions");
+        let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", test, "--test-threads", "1", "--nocapture"])
+            .env("AGENT_RUN_TEST_DELIVERY_HOME", &home.path)
+            .env("AGENT_RUN_CLAUDE_SESSION_REGISTRY", &registry)
+            .spawn()
+            .expect("child test process");
+        Self { child, _home: home }
+    }
+
+    /// Waits for the child to exit within `timeout`, failing the test on a
+    /// non-success exit or an expired bounded window; the child is killed
+    /// and reaped first in either failure case.
+    fn finish(mut self, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("child must be waitable") {
+                assert!(status.success(), "isolated delivery case failed: {status}");
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                panic!("isolated delivery case exceeded its bounded window");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for DeliveryChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
 
 /// Returns a repository fixture path without making the immutable fixture writable.
 fn fixture(path: &str) -> PathBuf {
@@ -940,17 +991,25 @@ async fn claude_uds_endless_receipt_stream_stays_bounded_and_unaccepted() {
 /// forever: every uncertain attempt (ambiguous or unconfirmed) counts toward
 /// the same cap and the notice leaves the schedule terminally failed.
 #[tokio::test]
-#[allow(clippy::await_holding_lock)]
 async fn claude_uds_reset_after_write_stops_retrying_at_the_uncertain_cap() {
+    if let Some(home) = std::env::var_os("AGENT_RUN_TEST_DELIVERY_HOME") {
+        claude_uds_reset_after_write_body(home.as_ref()).await;
+        return;
+    }
+    DeliveryChild::spawn("claude_uds_reset_after_write_stops_retrying_at_the_uncertain_cap")
+        .finish(std::time::Duration::from_secs(240));
+}
+
+/// Body of the reset case, run in an isolated child test process that
+/// receives the Claude session registry override only through its command
+/// environment.
+async fn claude_uds_reset_after_write_body(home: &Path) {
     use std::os::fd::AsRawFd;
 
-    let home = common::Home::new();
-    let registry = home.path.join("sessions");
+    let registry = home.join("sessions");
     std::fs::create_dir(&registry).unwrap();
-    let socket = home.path.join("inbox.sock");
+    let socket = home.join("inbox.sock");
     claude_descriptor(&registry, "session-1", &socket);
-    let _guard = REGISTRY_OVERRIDE.lock().unwrap();
-    std::env::set_var("AGENT_RUN_CLAUDE_SESSION_REGISTRY", &registry);
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let peer = tokio::spawn(async move {
         for _ in 0..3 {
@@ -973,7 +1032,7 @@ async fn claude_uds_reset_after_write_stops_retrying_at_the_uncertain_cap() {
             drop(stream);
         }
     });
-    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let connection = Connection::open(home.join("state.db")).unwrap();
     connection
         .execute(
             "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) VALUES('sess','claude_uds','session-1',?1,?1)",
@@ -983,7 +1042,7 @@ async fn claude_uds_reset_after_write_stops_retrying_at_the_uncertain_cap() {
     connection
         .execute(
             "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary',?1,'{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',?2,1.0,'fixture','ag-20260825-120000-0123456789')",
-            params![home.path.to_string_lossy(), now()],
+            params![home.to_string_lossy(), now()],
         )
         .unwrap();
     connection
@@ -994,8 +1053,8 @@ async fn claude_uds_reset_after_write_stops_retrying_at_the_uncertain_cap() {
         .unwrap();
     drop(connection);
     for _ in 0..2 {
-        assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
-        let (state, error): (String, String) = Connection::open(home.path.join("state.db"))
+        assert_eq!(dispatch_once(home).await.unwrap(), 1);
+        let (state, error): (String, String) = Connection::open(home.join("state.db"))
             .unwrap()
             .query_row(
                 "SELECT state,last_error FROM deliveries WHERE id='ntf_reset'",
@@ -1008,11 +1067,11 @@ async fn claude_uds_reset_after_write_stops_retrying_at_the_uncertain_cap() {
             error.as_str(),
             "uds_ambiguous" | "uds_unconfirmed"
         ));
-        make_due(&home.path, "ntf_reset");
+        make_due(home, "ntf_reset");
     }
-    assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+    assert_eq!(dispatch_once(home).await.unwrap(), 1);
     peer.await.unwrap();
-    let row: (String, u32, Option<f64>) = Connection::open(home.path.join("state.db"))
+    let row: (String, u32, Option<f64>) = Connection::open(home.join("state.db"))
         .unwrap()
         .query_row(
             "SELECT state,attempts,next_attempt_at FROM deliveries WHERE id='ntf_reset'",
@@ -1030,17 +1089,25 @@ async fn claude_uds_reset_after_write_stops_retrying_at_the_uncertain_cap() {
 /// observable), and must stop retrying after the unconfirmed cap instead of
 /// duplicating the notice forever. The endpoint is a private temporary fake.
 #[tokio::test]
-#[allow(clippy::await_holding_lock)]
 async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
+    if let Some(home) = std::env::var_os("AGENT_RUN_TEST_DELIVERY_HOME") {
+        claude_uds_unconfirmed_write_body(home.as_ref()).await;
+        return;
+    }
+    DeliveryChild::spawn("claude_uds_unconfirmed_write_retries_then_fails_with_evidence")
+        .finish(std::time::Duration::from_secs(240));
+}
+
+/// Body of the unconfirmed-write case, run in an isolated child test process
+/// that receives the Claude session registry override only through its
+/// command environment.
+async fn claude_uds_unconfirmed_write_body(home: &Path) {
     use tokio::io::AsyncReadExt;
 
-    let home = common::Home::new();
-    let registry = home.path.join("sessions");
+    let registry = home.join("sessions");
     std::fs::create_dir(&registry).unwrap();
-    let socket = home.path.join("inbox.sock");
+    let socket = home.join("inbox.sock");
     claude_descriptor(&registry, "session-1", &socket);
-    let _guard = REGISTRY_OVERRIDE.lock().unwrap();
-    std::env::set_var("AGENT_RUN_CLAUDE_SESSION_REGISTRY", &registry);
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let peer = tokio::spawn(async move {
         // Three accepted-and-read connections: every retry is written in full.
@@ -1051,7 +1118,7 @@ async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
             assert_eq!(received.lines().count(), 2);
         }
     });
-    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let connection = Connection::open(home.join("state.db")).unwrap();
     connection
         .execute(
             "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) VALUES('sess','claude_uds','session-1',?1,?1)",
@@ -1061,7 +1128,7 @@ async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
     connection
         .execute(
             "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary',?1,'{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',?2,1.0,'fixture','ag-20260825-120000-0123456789')",
-            params![home.path.to_string_lossy(), now()],
+            params![home.to_string_lossy(), now()],
         )
         .unwrap();
     connection
@@ -1071,8 +1138,8 @@ async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
         )
         .unwrap();
     for attempt in 1..=2 {
-        assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
-        let row: (String, u32, Option<String>, bool) = Connection::open(home.path.join("state.db"))
+        assert_eq!(dispatch_once(home).await.unwrap(), 1);
+        let row: (String, u32, Option<String>, bool) = Connection::open(home.join("state.db"))
             .unwrap()
             .query_row(
                 "SELECT state,attempts,last_error,ambiguous_result FROM deliveries WHERE id='ntf_unconfirmed'",
@@ -1084,12 +1151,12 @@ async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
         assert_eq!(row.0, "retry_wait", "unconfirmed never looks delivered");
         assert_eq!(row.2.as_deref(), Some("uds_unconfirmed"));
         assert!(row.3, "unconfirmed stays flagged ambiguous");
-        make_due(&home.path, "ntf_unconfirmed");
+        make_due(home, "ntf_unconfirmed");
     }
     // The capped third attempt ends terminally failed, still ambiguous.
-    assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+    assert_eq!(dispatch_once(home).await.unwrap(), 1);
     peer.await.unwrap();
-    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let connection = Connection::open(home.join("state.db")).unwrap();
     let row: (String, u32, Option<String>, Option<f64>, bool) = connection
         .query_row(
             "SELECT state,attempts,last_error,next_attempt_at,ambiguous_result FROM deliveries WHERE id='ntf_unconfirmed'",
@@ -1117,7 +1184,7 @@ async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
     );
     // The public status view exposes the last attempt instead of null.
     let agent: AgentId = "ag-20260825-120000-0123456789".parse().unwrap();
-    let status = agent_run_store::Store::open(&home.path)
+    let status = agent_run_store::Store::open(home)
         .unwrap()
         .delivery_status(&agent)
         .unwrap();
@@ -1130,22 +1197,30 @@ async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
 /// static classifier and booleans — the receipt's payload never lands in the
 /// database, and the schedule is cleared exactly once.
 #[tokio::test]
-#[allow(clippy::await_holding_lock)]
 async fn claude_uds_hold_receipt_delivers_with_correlated_evidence() {
-    let home = common::Home::new();
-    let registry = home.path.join("sessions");
+    if let Some(home) = std::env::var_os("AGENT_RUN_TEST_DELIVERY_HOME") {
+        claude_uds_hold_receipt_body(home.as_ref()).await;
+        return;
+    }
+    DeliveryChild::spawn("claude_uds_hold_receipt_delivers_with_correlated_evidence")
+        .finish(std::time::Duration::from_secs(240));
+}
+
+/// Body of the hold-receipt case, run in an isolated child test process that
+/// receives the Claude session registry override only through its command
+/// environment.
+async fn claude_uds_hold_receipt_body(home: &Path) {
+    let registry = home.join("sessions");
     std::fs::create_dir(&registry).unwrap();
-    let socket = home.path.join("inbox.sock");
+    let socket = home.join("inbox.sock");
     claude_descriptor(&registry, "session-1", &socket);
-    let _guard = REGISTRY_OVERRIDE.lock().unwrap();
-    std::env::set_var("AGENT_RUN_CLAUDE_SESSION_REGISTRY", &registry);
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let inbox = socket.clone();
     let peer = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         native_inbox_connection(&mut stream, &inbox, Some(("ntf_held", "held"))).await
     });
-    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let connection = Connection::open(home.join("state.db")).unwrap();
     connection
         .execute(
             "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) VALUES('sess','claude_uds','session-1',?1,?1)",
@@ -1155,7 +1230,7 @@ async fn claude_uds_hold_receipt_delivers_with_correlated_evidence() {
     connection
         .execute(
             "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary',?1,'{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',?2,1.0,'fixture','ag-20260825-120000-0123456789')",
-            params![home.path.to_string_lossy(), now()],
+            params![home.to_string_lossy(), now()],
         )
         .unwrap();
     connection
@@ -1165,7 +1240,7 @@ async fn claude_uds_hold_receipt_delivers_with_correlated_evidence() {
         )
         .unwrap();
     drop(connection);
-    let result = dispatch_with_batch(&home.path, 1).await.unwrap();
+    let result = dispatch_with_batch(home, 1).await.unwrap();
     let frame = peer.await.unwrap();
     assert_eq!(
         (result.claimed, result.delivered, result.retried),
@@ -1173,7 +1248,7 @@ async fn claude_uds_hold_receipt_delivers_with_correlated_evidence() {
     );
     assert_eq!(frame["msg_id"], "ntf_held");
     let row: (String, Option<f64>, Option<String>, bool) =
-        Connection::open(home.path.join("state.db"))
+        Connection::open(home.join("state.db"))
             .unwrap()
             .query_row(
                 "SELECT state,next_attempt_at,last_error,ambiguous_result FROM deliveries WHERE id='ntf_held'",
@@ -1185,7 +1260,7 @@ async fn claude_uds_hold_receipt_delivers_with_correlated_evidence() {
     assert_eq!(row.1, None);
     assert_eq!(row.2, None);
     assert!(!row.3);
-    let evidence: (i64, String) = Connection::open(home.path.join("state.db"))
+    let evidence: (i64, String) = Connection::open(home.join("state.db"))
         .unwrap()
         .query_row(
             "SELECT COUNT(*),MAX(evidence_json) FROM delivery_attempt_evidence WHERE delivery_id='ntf_held'",
@@ -1199,7 +1274,7 @@ async fn claude_uds_hold_receipt_delivers_with_correlated_evidence() {
     assert!(!evidence.1.contains("ntf_held"), "no notice id persisted");
     assert!(!evidence.1.contains("session-1"), "no session id persisted");
     let agent: AgentId = "ag-20260825-120000-0123456789".parse().unwrap();
-    let status = agent_run_store::Store::open(&home.path)
+    let status = agent_run_store::Store::open(home)
         .unwrap()
         .delivery_status(&agent)
         .unwrap();
@@ -2464,10 +2539,11 @@ async fn notice_projection_tolerates_rows_without_metadata() {
         effort: None,
         failure_kind: None,
     };
-    assert!(bare
-        .render()
-        .unwrap()
-        .contains("- Runtime/model: unknown/unknown:unspecified\n"));
+    assert!(
+        bare.render()
+            .unwrap()
+            .contains("- Runtime/model: unknown/unknown:unspecified\n")
+    );
 }
 
 /// Mirrors `tests/test_delivery_dispatch.py::DeliveryDispatchTests::test_constructor_validates_config_and_every_transport`

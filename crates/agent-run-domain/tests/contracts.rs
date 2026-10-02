@@ -3,7 +3,7 @@
 use agent_run_domain::{
     domain::{AgentId, Status},
     error::{Error, MachineCode},
-    fsm::{validate_transition, ACTIVE, TERMINAL},
+    fsm::{ACTIVE, TERMINAL, validate_transition},
     types::{
         AbsoluteDirectory, AccountSelector, Message, MessageRole, NonNegativeFinite,
         PositiveFinite, RelativeOwnedPath, RuntimeName, Sha256Digest,
@@ -54,24 +54,28 @@ fn python_test_message_validation_and_nonfinite_rejection() {
     }
     .validate()
     .unwrap();
-    assert!(Message {
-        at: -1.0,
-        role: MessageRole::User,
-        content: "hello".into(),
-        name: None,
-        raw_ref: None
-    }
-    .validate()
-    .is_err());
-    assert!(Message {
-        at: 0.0,
-        role: MessageRole::User,
-        content: "  ".into(),
-        name: None,
-        raw_ref: None
-    }
-    .validate()
-    .is_err());
+    assert!(
+        Message {
+            at: -1.0,
+            role: MessageRole::User,
+            content: "hello".into(),
+            name: None,
+            raw_ref: None
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        Message {
+            at: 0.0,
+            role: MessageRole::User,
+            content: "  ".into(),
+            name: None,
+            raw_ref: None
+        }
+        .validate()
+        .is_err()
+    );
     assert!(PositiveFinite::try_from(f64::INFINITY).is_err());
     assert!(NonNegativeFinite::try_from(f64::NAN).is_err());
 }
@@ -230,12 +234,12 @@ fn credential_references_are_typed_storage_locations() {
 }
 
 use agent_run_domain::catalog::{
-    decode_legacy_request, legacy_runtime, AccountId, AccountRecord, AccountStatus,
-    AttemptCredentials, AuthFamily, HarnessId, LegacyRuntime, LimitsSource,
-    NormalizedQuotaSnapshot, PhysicalQuotaKey, ProviderBinding, ProviderCatalog,
-    ProviderConnection, ProviderDefinition, ProviderId, ProviderModel, ProviderProtocol,
-    QuotaAdmissionError, QuotaCandidate, QuotaCandidateSet, QuotaModelObservation,
-    QuotaPoolObservation, QuotaWindow, ResolvedLaunchAuthority, SecretRef, SelectionIntent,
+    AccountId, AccountRecord, AccountStatus, AttemptCredentials, AuthFamily, HarnessId,
+    LegacyRuntime, LimitsSource, NormalizedQuotaSnapshot, PhysicalQuotaKey, ProviderBinding,
+    ProviderCatalog, ProviderConnection, ProviderDefinition, ProviderId, ProviderModel,
+    ProviderProtocol, QuotaAdmissionError, QuotaCandidate, QuotaCandidateSet,
+    QuotaModelObservation, QuotaPoolObservation, QuotaWindow, ResolvedLaunchAuthority, SecretRef,
+    SelectionIntent, decode_legacy_request, legacy_runtime,
 };
 
 /// Builds one registered account bound by two provider aliases.
@@ -309,10 +313,12 @@ fn provider_alias_identity_shares_one_physical_quota_pool() {
 #[test]
 fn codex_appserver_source_requires_a_probeable_native_codex_login() {
     let catalog = aliased_catalog();
-    let account = vec![catalog
-        .account(&AccountId::from_str("acct-codex-native").unwrap())
-        .unwrap()
-        .clone()];
+    let account = vec![
+        catalog
+            .account(&AccountId::from_str("acct-codex-native").unwrap())
+            .unwrap()
+            .clone(),
+    ];
     let provider = catalog.providers()[0].clone();
     assert!(ProviderCatalog::new(account.clone(), vec![provider.clone()]).is_ok());
     let mut custom = provider.clone();
@@ -361,10 +367,12 @@ fn provider_binding_requires_registered_matching_auth_family() {
 /// identities, model subsets, endpoints, and account storage identities.
 #[test]
 fn catalog_wire_and_endpoint_reject_invalid_registration() {
-    assert!(serde_json::from_value::<ProviderBinding>(json!({
-        "label":"../outside", "account":"acct-codex-native"
-    }))
-    .is_err());
+    assert!(
+        serde_json::from_value::<ProviderBinding>(json!({
+            "label":"../outside", "account":"acct-codex-native"
+        }))
+        .is_err()
+    );
     let valid = aliased_catalog();
     let mut wire = serde_json::to_value(&valid).unwrap();
     wire["providers"][1]["id"] = json!("codex-plus");
@@ -385,14 +393,18 @@ fn catalog_wire_and_endpoint_reject_invalid_registration() {
 
     let mut provider = valid.providers()[0].clone();
     provider.bindings[0].models = Some(vec!["missing".into()]);
-    assert!(ProviderCatalog::new(
-        vec![valid
-            .account(&"acct-codex-native".parse().unwrap())
-            .unwrap()
-            .clone()],
-        vec![provider]
-    )
-    .is_err());
+    assert!(
+        ProviderCatalog::new(
+            vec![
+                valid
+                    .account(&"acct-codex-native".parse().unwrap())
+                    .unwrap()
+                    .clone()
+            ],
+            vec![provider]
+        )
+        .is_err()
+    );
 
     // Endpoint checks are independent of the limits source; a custom
     // connection cannot carry the app-server source.
@@ -479,27 +491,33 @@ fn aliases_and_lease_scope_remain_bound_to_one_account() {
             .collect::<Vec<_>>(),
         vec!["plus", "backup"]
     );
-    assert!(AttemptCredentials::from_selected(
-        &catalog,
-        &"missing".parse().unwrap(),
-        "gpt-5.1",
-        &account
-    )
-    .is_err());
-    assert!(AttemptCredentials::from_selected(
-        &catalog,
-        &"codex-plus".parse().unwrap(),
-        "missing",
-        &account
-    )
-    .is_err());
-    assert!(AttemptCredentials::from_selected(
-        &catalog,
-        &"codex-plus".parse().unwrap(),
-        "gpt-5.1",
-        &"acct-other".parse().unwrap()
-    )
-    .is_err());
+    assert!(
+        AttemptCredentials::from_selected(
+            &catalog,
+            &"missing".parse().unwrap(),
+            "gpt-5.1",
+            &account
+        )
+        .is_err()
+    );
+    assert!(
+        AttemptCredentials::from_selected(
+            &catalog,
+            &"codex-plus".parse().unwrap(),
+            "missing",
+            &account
+        )
+        .is_err()
+    );
+    assert!(
+        AttemptCredentials::from_selected(
+            &catalog,
+            &"codex-plus".parse().unwrap(),
+            "gpt-5.1",
+            &"acct-other".parse().unwrap()
+        )
+        .is_err()
+    );
 }
 
 /// Collector observations preserve missing values and reject cross-account
@@ -865,12 +883,14 @@ fn legacy_request_json_decodes_without_rewriting_history() {
         assert_eq!(decoded.provider.unwrap().as_str(), provider);
         assert_eq!(decode_legacy_request(&raw, None).unwrap().provider, None);
     }
-    assert!(decode_legacy_request(
-        &stored,
-        Some(&LegacyRuntime {
-            provider: "claude-code".parse().unwrap(),
-            harness: HarnessId::ClaudeCode
-        })
-    )
-    .is_err());
+    assert!(
+        decode_legacy_request(
+            &stored,
+            Some(&LegacyRuntime {
+                provider: "claude-code".parse().unwrap(),
+                harness: HarnessId::ClaudeCode
+            })
+        )
+        .is_err()
+    );
 }

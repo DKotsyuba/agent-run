@@ -3,12 +3,12 @@ use agent_run_config::{
     config::{Adapter, Auth, Config, Runtime},
     profiles::Profile,
 };
-use agent_run_domain::{domain::StartRequest, error::invalid, Error, Result};
+use agent_run_domain::{Error, Result, domain::StartRequest, error::invalid};
 use agent_run_platform::{
     fs::{self, Dir},
     snapshot_tree,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -327,15 +327,15 @@ pub fn environment_with_host(
     if kind == Adapter::Codex {
         env.insert("CODEX_HOME".into(), home.to_string_lossy().into_owned());
     }
-    if kind == Adapter::Claude {
-        if let Some(a) = account {
-            env.insert(
-                "CLAUDE_CONFIG_DIR".into(),
-                claude_account_config(app_home, &runtime.home, a)?
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-        }
+    if kind == Adapter::Claude
+        && let Some(a) = account
+    {
+        env.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            claude_account_config(app_home, &runtime.home, a)?
+                .to_string_lossy()
+                .into_owned(),
+        );
     }
     let mut paths = Vec::new();
     let mut overrides = BTreeMap::new();
@@ -402,17 +402,16 @@ pub fn environment_with_host(
         .environment
         .as_ref()
         .and_then(|n| config.environments.get(n))
+        && !e.denied_commands.is_empty()
     {
-        if !e.denied_commands.is_empty() {
-            let directory = "command-refusals";
-            // An absent or empty inherited PATH must not become an empty entry.
-            let policy = home.join(directory).display().to_string();
-            let value = match env.get("PATH") {
-                Some(host) if !host.is_empty() => format!("{policy}:{host}"),
-                _ => policy,
-            };
-            env.insert("PATH".into(), value);
-        }
+        let directory = "command-refusals";
+        // An absent or empty inherited PATH must not become an empty entry.
+        let policy = home.join(directory).display().to_string();
+        let value = match env.get("PATH") {
+            Some(host) if !host.is_empty() => format!("{policy}:{host}"),
+            _ => policy,
+        };
+        env.insert("PATH".into(), value);
     }
     let mut mcp_names = Vec::new();
     for name in &profile.mcp {
@@ -727,38 +726,37 @@ fn materialize_with_provider(
                 None
             };
             super::codex::render_permissions(&mut doc, runtime, home, auth_target)?;
-            if let Some((provider, _, _)) = provider {
-                if let agent_run_domain::ProviderConnection::Custom { endpoint, .. } =
+            if let Some((provider, _, _)) = provider
+                && let agent_run_domain::ProviderConnection::Custom { endpoint, .. } =
                     &provider.connection
-                {
-                    let mut gateway = toml::Table::new();
-                    gateway.insert(
-                        "name".into(),
-                        toml::Value::String("agent-run gateway".into()),
-                    );
-                    gateway.insert("base_url".into(), toml::Value::String(endpoint.clone()));
-                    gateway.insert(
-                        "env_key".into(),
-                        toml::Value::String("AGENT_RUN_PROVIDER_TOKEN".into()),
-                    );
-                    gateway.insert("wire_api".into(), toml::Value::String("responses".into()));
-                    doc.insert(
-                        "model_provider".into(),
-                        toml::Value::String("agent_run_gateway".into()),
-                    );
-                    let mut providers = toml::Table::new();
-                    providers.insert("agent_run_gateway".into(), toml::Value::Table(gateway));
-                    doc.insert("model_providers".into(), toml::Value::Table(providers));
-                    let mut shell = toml::Table::new();
-                    shell.insert("inherit".into(), toml::Value::String("core".into()));
-                    shell.insert(
-                        "exclude".into(),
-                        toml::Value::Array(vec![toml::Value::String(
-                            "AGENT_RUN_PROVIDER_TOKEN".into(),
-                        )]),
-                    );
-                    doc.insert("shell_environment_policy".into(), toml::Value::Table(shell));
-                }
+            {
+                let mut gateway = toml::Table::new();
+                gateway.insert(
+                    "name".into(),
+                    toml::Value::String("agent-run gateway".into()),
+                );
+                gateway.insert("base_url".into(), toml::Value::String(endpoint.clone()));
+                gateway.insert(
+                    "env_key".into(),
+                    toml::Value::String("AGENT_RUN_PROVIDER_TOKEN".into()),
+                );
+                gateway.insert("wire_api".into(), toml::Value::String("responses".into()));
+                doc.insert(
+                    "model_provider".into(),
+                    toml::Value::String("agent_run_gateway".into()),
+                );
+                let mut providers = toml::Table::new();
+                providers.insert("agent_run_gateway".into(), toml::Value::Table(gateway));
+                doc.insert("model_providers".into(), toml::Value::Table(providers));
+                let mut shell = toml::Table::new();
+                shell.insert("inherit".into(), toml::Value::String("core".into()));
+                shell.insert(
+                    "exclude".into(),
+                    toml::Value::Array(vec![toml::Value::String(
+                        "AGENT_RUN_PROVIDER_TOKEN".into(),
+                    )]),
+                );
+                doc.insert("shell_environment_policy".into(), toml::Value::Table(shell));
             }
             let text = toml::to_string_pretty(&doc)
                 .map_err(|_| invalid("native config could not be serialized"))?;

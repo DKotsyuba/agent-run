@@ -32,7 +32,7 @@ pub mod supervisor;
 
 pub use agent_run_adapters as adapters;
 pub use agent_run_config::{config, policy, profiles};
-pub use agent_run_domain::{domain, error, Error, Result};
+pub use agent_run_domain::{Error, Result, domain, error};
 pub use agent_run_platform::{frame, fs, launch, process};
 pub use agent_run_store as state;
 

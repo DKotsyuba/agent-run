@@ -1,8 +1,9 @@
 //! Bounded, read-only installation diagnostics.
 
 use crate::{
+    Result,
     config::{Auth, Config, Runtime},
-    state, Result,
+    state,
 };
 use agent_run_config::{profiles, role_plan};
 use agent_run_domain::{domain::StartRequest, error::invalid};
@@ -1134,16 +1135,16 @@ fn supervisors(rows: &[Value], findings: &mut Vec<Finding>) {
                 &format!("agent:{id}"),
                 "dead or reused process identity",
             );
-            if let Some(group) = row.get("process_group_id").and_then(Value::as_i64) {
-                if process_group_alive(group as i32) {
-                    add(
-                        findings,
-                        "suspected_orphan",
-                        "error",
-                        &format!("agent:{id}"),
-                        "engine group remains alive",
-                    );
-                }
+            if let Some(group) = row.get("process_group_id").and_then(Value::as_i64)
+                && process_group_alive(group as i32)
+            {
+                add(
+                    findings,
+                    "suspected_orphan",
+                    "error",
+                    &format!("agent:{id}"),
+                    "engine group remains alive",
+                );
             }
         }
     }
@@ -1332,7 +1333,9 @@ fn mcp_inventory(home: &Path, findings: &mut Vec<Finding>, lister: &dyn Fn() -> 
                 "mcp_process_older_release",
                 "warning",
                 &format!("mcp:{}", process.pid),
-                format!("started={started} release={release}; started before the current release switch and may run older code -- reconnect MCP in this session before pruning releases"),
+                format!(
+                    "started={started} release={release}; started before the current release switch and may run older code -- reconnect MCP in this session before pruning releases"
+                ),
             );
         } else {
             add(
@@ -1449,9 +1452,11 @@ readiness={command="/bin/true"}
             .collect();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].code, "state_migration_pending");
-        assert!(findings[0]
-            .detail
-            .contains(&format!("expected v{}", crate::state::VERSION)));
+        assert!(
+            findings[0]
+                .detail
+                .contains(&format!("expected v{}", crate::state::VERSION))
+        );
         assert!(!report.ok());
     }
 
@@ -1466,10 +1471,12 @@ readiness={command="/bin/true"}
         let role = profiles.join("review.md");
         std::fs::write(&role, "+++\nwrite = false\n+++\nReview.\n").unwrap();
         let report = run(home.path()).unwrap();
-        assert!(!report
-            .findings
-            .iter()
-            .any(|finding| finding.code == "canonical_role_required"));
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.code == "canonical_role_required")
+        );
         std::fs::write(
             home.path().join("config.toml"),
             format!(
@@ -1479,20 +1486,24 @@ readiness={command="/bin/true"}
         )
         .unwrap();
         let report = run(home.path()).unwrap();
-        assert!(report
-            .findings
-            .iter()
-            .any(|finding| finding.code == "canonical_role_required"));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.code == "canonical_role_required")
+        );
         std::fs::write(
             &role,
             "+++\nrevision = 'v2'\nwrite = false\nnetwork = false\nallow_external_read_roots = true\nskills = []\nmcp = []\nrequired_constraints = []\n+++\nReview.\n",
         )
         .unwrap();
         let report = run(home.path()).unwrap();
-        assert!(!report
-            .findings
-            .iter()
-            .any(|finding| finding.code == "canonical_role_required"));
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.code == "canonical_role_required")
+        );
     }
 
     /// Builds one enabled runtime fixture from Python-equivalent config fields.
@@ -1668,11 +1679,13 @@ readiness={command="/bin/true"}
     /// Mirrors `tests/test_capacity_diagnostics.py::CapacityDiagnosticTests::test_frequent_healthy_samples_do_not_hide_stale_identity`.
     #[test]
     fn capacity_staleness_deduplicates_identity_before_reporting() {
-        assert!(capacity_lanes(&[
-            capacity_row("same", 900., Some(2_000.)),
-            capacity_row("same", 100., Some(500.)),
-        ])
-        .is_empty());
+        assert!(
+            capacity_lanes(&[
+                capacity_row("same", 900., Some(2_000.)),
+                capacity_row("same", 100., Some(500.)),
+            ])
+            .is_empty()
+        );
     }
 
     /// Creates Python `HookTrustTests.setUp`'s resolved home and install root.
@@ -1739,14 +1752,16 @@ readiness={command="/bin/true"}
         let script = root.join("hooks/context.py");
         fs::write(&script, "pass\n").expect("hook script");
         let script = script.to_string_lossy().into_owned();
-        assert!(hook_codes(
-            &root,
-            &home,
-            &["/usr/bin/python3", &script, "--event", "PostToolUse"],
-            &[],
-            None,
-        )
-        .is_empty());
+        assert!(
+            hook_codes(
+                &root,
+                &home,
+                &["/usr/bin/python3", &script, "--event", "PostToolUse"],
+                &[],
+                None,
+            )
+            .is_empty()
+        );
     }
 
     /// Mirrors `test_doctor.py::HookTrustTests::test_a_script_outside_the_trusted_roots_is_untrusted`.
@@ -1791,14 +1806,16 @@ readiness={command="/bin/true"}
     #[test]
     fn python_doctor_declared_plugin_token_is_trusted() {
         let (_temp, home, root) = hook_home();
-        assert!(hook_codes(
-            &root,
-            &home,
-            &["/usr/bin/python3", PLUGIN_SCRIPT],
-            &[PLUGIN_DECLARATION],
-            None,
-        )
-        .is_empty());
+        assert!(
+            hook_codes(
+                &root,
+                &home,
+                &["/usr/bin/python3", PLUGIN_SCRIPT],
+                &[PLUGIN_DECLARATION],
+                None,
+            )
+            .is_empty()
+        );
     }
 
     /// Mirrors `test_doctor.py::HookTrustTests::test_an_undeclared_plugin_token_stays_untrusted`.
@@ -1824,14 +1841,16 @@ readiness={command="/bin/true"}
         let install = home.join("uv/python");
         let interpreter = install.join("cpython-3.14/bin/python3.14");
         touch_executable(&interpreter);
-        assert!(hook_codes(
-            &root,
-            &home,
-            &[&interpreter.to_string_lossy(), PLUGIN_SCRIPT],
-            &[PLUGIN_DECLARATION],
-            Some(&install),
-        )
-        .is_empty());
+        assert!(
+            hook_codes(
+                &root,
+                &home,
+                &[&interpreter.to_string_lossy(), PLUGIN_SCRIPT],
+                &[PLUGIN_DECLARATION],
+                Some(&install),
+            )
+            .is_empty()
+        );
     }
 
     /// Mirrors `test_doctor.py::HookTrustTests::test_an_arbitrary_python_named_program_does_not_trust_its_argument`.
@@ -1927,14 +1946,16 @@ readiness={command="/bin/true"}
         let install = home.join("uv/python");
         let interpreter = install.join("cpython-3.14/bin/python3.14");
         touch_executable(&interpreter);
-        assert!(hook_codes(
-            &root,
-            &home,
-            &[&interpreter.to_string_lossy(), "-EsS", PLUGIN_SCRIPT],
-            &[PLUGIN_DECLARATION],
-            Some(&install),
-        )
-        .is_empty());
+        assert!(
+            hook_codes(
+                &root,
+                &home,
+                &[&interpreter.to_string_lossy(), "-EsS", PLUGIN_SCRIPT],
+                &[PLUGIN_DECLARATION],
+                Some(&install),
+            )
+            .is_empty()
+        );
     }
 
     // Protects doctor from a process-listing descendant that inherits stdout.

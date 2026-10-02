@@ -1,12 +1,11 @@
 //! Recorded-fixture regressions for the Python capacity collector contracts.
 
 use agent_run_core::capacity::{
-    omniroute, sources,
+    Key, omniroute, sources,
     sources::{capture, normalize_codex, read_claude_stream},
-    Key,
 };
 use agent_run_domain::Error;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path, process::Command};
 
 const OBSERVED: f64 = 1_785_000_000.0;
@@ -364,11 +363,12 @@ fn omniroute_sanitizer_rejects_quota_arrays() {
     ) else {
         return;
     };
-    assert!(rows
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|row| row["remaining_percentage"].is_null()));
+    assert!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["remaining_percentage"].is_null())
+    );
 }
 
 /// Mirrors `tests/test_omniroute_current_cache.py::DockerScriptSanitizerTests::test_a_reset_only_change_survives_the_real_node_sanitizer`.
@@ -387,13 +387,14 @@ fn omniroute_sanitizer_preserves_reset_only_changes() {
         return;
     };
     let one = |rows: Value| {
-        Value::Array(vec![rows
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["window_key"] == "session")
-            .unwrap()
-            .clone()])
+        Value::Array(vec![
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["window_key"] == "session")
+                .unwrap()
+                .clone(),
+        ])
     };
     let now = omniroute_at("2026-08-24T19:18:02Z");
     let before = omniroute::samples(&one(before), now).unwrap();
@@ -541,11 +542,13 @@ fn python_test_capacity_codex_appserver_pro_routes_keep_every_window() {
     assert_eq!(backend.as_deref(), Some("acct-pro"));
     assert_eq!(slice.samples.len(), 3);
     assert_eq!(slice.topology.pools.len(), 2);
-    assert!(slice
-        .topology
-        .routes
-        .iter()
-        .any(|r| r.quota_lane == "Spark"));
+    assert!(
+        slice
+            .topology
+            .routes
+            .iter()
+            .any(|r| r.quota_lane == "Spark")
+    );
 }
 
 // Mirrors `tests/test_capacity_codex_appserver.py::NormalizeRateLimitsTests::test_plus_scope_namespaces_ids_and_falls_back_to_limit_id_lane`
@@ -614,13 +617,15 @@ fn python_test_capacity_codex_appserver_malformed_windows_do_not_drop_valid_data
     let (slice, _) = normalize_codex("fictitious", None, &response, OBSERVED).unwrap();
     assert_eq!(slice.samples.len(), 1);
     assert_eq!(slice.topology.routes.len(), 1);
-    assert!(normalize_codex(
-        "fictitious",
-        None,
-        &json!({"rateLimitsByLimitId":"nope"}),
-        OBSERVED
-    )
-    .is_err());
+    assert!(
+        normalize_codex(
+            "fictitious",
+            None,
+            &json!({"rateLimitsByLimitId":"nope"}),
+            OBSERVED
+        )
+        .is_err()
+    );
 }
 
 // Mirrors `tests/test_capacity_codex_appserver.py::NormalizeRateLimitsTests::test_window_names_cover_named_and_minute_windows`
@@ -707,10 +712,12 @@ fn python_test_capacity_codex_appserver_probe_identity_does_not_enter_payload() 
     let response = normalize_codex("fictitious", Some("plus"), &pro_response("acct"), OBSERVED)
         .unwrap()
         .0;
-    assert!(response
-        .samples
-        .iter()
-        .all(|s| s.key.target.as_deref() == Some("plus")));
+    assert!(
+        response
+            .samples
+            .iter()
+            .all(|s| s.key.target.as_deref() == Some("plus"))
+    );
     assert!(!format!("{response:?}").contains("/tmp/fictitious-home"));
 }
 

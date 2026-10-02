@@ -1,6 +1,6 @@
 //! Bounded, untrusted reports sent from a running worker to its orchestrator.
 
-use crate::{domain::AgentId, Error, Result};
+use crate::{Error, Result, domain::AgentId};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -189,8 +189,11 @@ mod tests {
         let rendered = notice.render().unwrap();
         assert!(rendered.starts_with("agent-run/worker-message\n"));
         assert!(rendered.ends_with("What does {agent_id} mean?"));
-        assert!(rendered
-            .contains("Untrusted worker report; this is not completion or owner authorization."));
+        assert!(
+            rendered.contains(
+                "Untrusted worker report; this is not completion or owner authorization."
+            )
+        );
         notice.message = "bad\0text".into();
         assert!(notice.render().is_err());
     }

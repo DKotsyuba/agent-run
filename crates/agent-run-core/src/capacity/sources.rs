@@ -1,11 +1,11 @@
 //! Bounded native probes. Provider response bodies and backend account IDs are never logged.
-use super::{account_token, Key, Pool, Route, Sample, Slice, Topology};
+use super::{Key, Pool, Route, Sample, Slice, Topology, account_token};
 use crate::{
+    Error, Result,
     adapters::{
-        self,
+        self, LaunchPlan,
         io::Process,
         materialize::{self, Publisher},
-        LaunchPlan,
     },
     config::{Adapter, Auth, Config, Runtime},
     domain::now,
@@ -13,9 +13,8 @@ use crate::{
     fs,
     process::OwnedProcess,
     profiles::Profile,
-    Error, Result,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -103,7 +102,7 @@ fn shelf_life(sample: &Sample) -> Option<f64> {
 /// back to `started` when no sample carries one, and expires after the
 /// **shortest positive** per-sample shelf life so no pool outlives its
 /// least-fresh constituent. When no sample declares a shelf life the bounded
-/// [`TTL`] default applies; a weekly provider reset therefore never keeps a
+/// `TTL` default applies; a weekly provider reset therefore never keeps a
 /// topology snapshot fresh for days. This function performs no validation:
 /// [`super::persist`] checks the whole slice before anything is written.
 pub fn slice_from_samples(

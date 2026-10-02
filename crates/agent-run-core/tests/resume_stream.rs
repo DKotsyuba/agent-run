@@ -5,7 +5,7 @@
 
 mod common;
 
-use agent_run_adapters::{io::Process, LaunchPlan};
+use agent_run_adapters::{LaunchPlan, io::Process};
 use agent_run_core::{dispatch, domain::Status, service::Service, stream};
 use serde_json::json;
 use std::{collections::BTreeMap, path::Path};

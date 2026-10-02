@@ -5,8 +5,8 @@
 //! engine has stopped, so every pending command receives one stable result
 //! without attempting an engine operation twice.
 
-use crate::{domain::AgentId, state::Store, Result};
-use serde_json::{json, Value};
+use crate::{Result, domain::AgentId, state::Store};
+use serde_json::{Value, json};
 
 /// Maximum number of live-engine commands handled before polling resumes.
 pub const COMMAND_PAGE_LIMIT: usize = 16;
@@ -16,7 +16,7 @@ pub const COMMAND_PAGE_SECONDS: f64 = 1.0;
 /// Completes all commands that became pending after an agent reached a terminal state.
 ///
 /// The caller invokes this only after its terminal transition has committed;
-/// lost reconciliation instead uses [`complete_pending_in`] inside its own
+/// lost reconciliation instead uses `complete_pending_in` inside its own
 /// transaction. Commands are claimed one at a time in cancellation-first order and are
 /// recorded as terminal rather than delivered to an absent engine.  A command
 /// already claimed by the crashed owning supervisor is deliberately untouched:

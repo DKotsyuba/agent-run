@@ -1,8 +1,8 @@
 //! Frozen parser and process-boundary checks mirroring Python CLI tests.
 
 use agent_run::{
-    cli::{run, Cli},
     Error,
+    cli::{Cli, run},
 };
 use clap::{Command, CommandFactory, Parser};
 use serde_json::Value;
@@ -603,8 +603,7 @@ fn python_capacity_launchd_renders_config_without_state_or_collection() {
     assert_eq!(relative.status.code(), Some(2));
     assert!(relative.stdout.is_empty(), "{relative:?}");
     assert_eq!(
-        serde_json::from_slice::<Value>(&relative.stderr).expect("JSON error envelope")["error"]
-            ["type"],
+        serde_json::from_slice::<Value>(&relative.stderr).expect("JSON error envelope")["error"]["type"],
         "ValidationError"
     );
 }

@@ -6,7 +6,7 @@ use agent_run::{
     state::Store,
     transport::socket,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     path::PathBuf,
     process::{Child, Command, Stdio},
@@ -150,12 +150,12 @@ impl Drop for Harness {
     fn drop(&mut self) {
         // Request cancellation while the temporary state still exists. Never
         // blindly signal a persisted PID, which could have been reused.
-        if let Ok(store) = Store::open(&self.home) {
-            if let Ok((rows, _)) = store.list(true, 0, 1000, None) {
-                let service = Service::new(self.home.clone());
-                for row in rows {
-                    let _ = service.cancel(&row.id);
-                }
+        if let Ok(store) = Store::open(&self.home)
+            && let Ok((rows, _)) = store.list(true, 0, 1000, None)
+        {
+            let service = Service::new(self.home.clone());
+            for row in rows {
+                let _ = service.cancel(&row.id);
             }
         }
         self.stop_broker();

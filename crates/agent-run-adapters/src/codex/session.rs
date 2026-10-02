@@ -1,5 +1,5 @@
 //! Typed state and notification parsing for one Codex app-server turn.
-use agent_run_domain::{error::invalid, Result};
+use agent_run_domain::{Result, error::invalid};
 use serde_json::Value;
 
 /// The locally-observed lifecycle of one app-server protocol session.

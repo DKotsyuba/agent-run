@@ -5,11 +5,11 @@ mod common;
 use agent_run_core::service::{Query, Service};
 use agent_run_core::{policy, profiles};
 use agent_run_domain::{
-    domain::{Constraint, OrchestratorRef, Outcome, Status},
     Error,
+    domain::{Constraint, OrchestratorRef, Outcome, Status},
 };
 use agent_run_platform::{fs, verify};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::Path};
 
 /// Proves content-based configuration refresh skips identical bytes, accepts a
@@ -167,12 +167,14 @@ async fn list_has_bounded_explicit_pagination() {
         .unwrap();
     assert_eq!(last["next_offset"], serde_json::Value::Null);
     assert_eq!(last["complete"], true);
-    assert!(Query {
-        limit: 0,
-        ..Query::default()
-    }
-    .validate()
-    .is_err());
+    assert!(
+        Query {
+            limit: 0,
+            ..Query::default()
+        }
+        .validate()
+        .is_err()
+    );
 }
 
 /// Mirrors `tests/test_service.py::AgentServiceTests::test_new_opencode_start_is_rejected_with_migration_guidance`.
@@ -412,12 +414,14 @@ fn python_test_service_unknown_model_is_rejected_before_admission() {
     request.model = "unknown".into();
     let runtime = home.config.runtime("mock").unwrap();
     let profile = identity(&home, &home.request());
-    assert!(agent_run_core::adapters::validate(
-        &request,
-        runtime,
-        &serde_json::from_value(profile["profile"].clone()).unwrap()
-    )
-    .is_err());
+    assert!(
+        agent_run_core::adapters::validate(
+            &request,
+            runtime,
+            &serde_json::from_value(profile["profile"].clone()).unwrap()
+        )
+        .is_err()
+    );
     assert_eq!(
         home.store()
             .conn
@@ -760,15 +764,17 @@ async fn python_test_service_models_do_not_create_isolated_cache() {
 fn python_test_service_from_home_opens_the_existing_store() {
     let home = common::Home::new();
     let service = Service::new(home.path.clone());
-    assert!(service
-        .view(
-            &home.store(),
-            &home
-                .store()
-                .get(&admit(&home, home.request(), json!({})))
-                .unwrap()
-        )
-        .is_ok());
+    assert!(
+        service
+            .view(
+                &home.store(),
+                &home
+                    .store()
+                    .get(&admit(&home, home.request(), json!({})))
+                    .unwrap()
+            )
+            .is_ok()
+    );
 }
 
 /// Mirrors `tests/test_service.py::AgentServiceTests::test_transcript_cursor_is_explicit_and_raw_ref_is_preserved`.

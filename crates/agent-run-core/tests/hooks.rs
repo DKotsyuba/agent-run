@@ -4,7 +4,7 @@ mod common;
 
 use agent_run_core::{
     capacity::{self, Key, Pool, Route, Sample, Slice, Topology},
-    domain::{now, AgentId, OrchestratorRef, Outcome, Status},
+    domain::{AgentId, OrchestratorRef, Outcome, Status, now},
     hooks::{bind, context},
 };
 use serde_json::json;
@@ -187,9 +187,11 @@ fn python_context_hook_is_bounded_changed_only_and_session_scoped() {
     let first = context::build(&home.path, &reference, Some(1000.0)).expect("first context");
     let second = context::build(&home.path, &reference, Some(1001.0)).expect("dedup context");
     assert!(first.injected);
-    assert!(first
-        .text
-        .starts_with("Runtime priorities (highest first)."));
+    assert!(
+        first
+            .text
+            .starts_with("Runtime priorities (highest first).")
+    );
     assert!(first.text.chars().count() <= context::CONTEXT_HARD_LIMIT_CHARS);
     assert!(!second.injected);
     assert!(second.text.is_empty());
@@ -296,13 +298,18 @@ fn python_context_malformed_component_receipts_are_replaced_safely() {
             )
             .expect("malformed receipt");
     }
-    assert!(store
-        .record_context_components_for_ref(
-            &reference,
-            &std::collections::BTreeMap::from([(String::from("priority"), String::from("next"))]),
-            2.0,
-        )
-        .is_ok());
+    assert!(
+        store
+            .record_context_components_for_ref(
+                &reference,
+                &std::collections::BTreeMap::from([(
+                    String::from("priority"),
+                    String::from("next")
+                )]),
+                2.0,
+            )
+            .is_ok()
+    );
 }
 
 /// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_changed_only_priority_resends_after_returning_to_an_order`.
@@ -651,12 +658,12 @@ fn bound_agent_gets_exactly_one_notice_and_a_rebind_never_resurrects_it() {
             .conn
             .prepare("SELECT state FROM deliveries WHERE agent_id=? ORDER BY id")
             .unwrap();
-        let rows = statement
+
+        statement
             .query_map([agent_id.as_str()], |row| row.get::<_, String>(0))
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        rows
+            .unwrap()
     };
     assert_eq!(notices(&store), vec!["pending".to_owned()]);
 

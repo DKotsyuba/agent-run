@@ -3,7 +3,7 @@
 use agent_run_config::{config::Runtime, profiles::Profile};
 use agent_run_core::codex::Grant;
 use agent_run_domain::domain::StartRequest;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::PathBuf};
 
 /// Returns the baseline read-only grant used by the app-server echo tests.
@@ -37,9 +37,11 @@ fn echo(sandbox: Value, roots: Value, writable_roots: Value) -> Value {
 /// Mirrors `test_codex_app_server.py::test_matching_params_pass`.
 #[test]
 fn python_test_codex_app_server_matching_params_pass() {
-    assert!(read_only_grant()
-        .verify(&echo(json!("read-only"), json!(["/work"]), json!([])))
-        .is_ok());
+    assert!(
+        read_only_grant()
+            .verify(&echo(json!("read-only"), json!(["/work"]), json!([])))
+            .is_ok()
+    );
 }
 
 /// Mirrors `test_codex_app_server.py::test_non_network_sandbox_mode_is_sent_as_a_plain_string`.
@@ -104,21 +106,25 @@ fn python_test_codex_app_server_permission_profile_replaces_legacy_sandbox_field
 fn python_test_codex_app_server_read_root_leaking_into_writable_roots_is_refused() {
     let mut grant = read_only_grant();
     grant.roots.push("/extra".into());
-    assert!(grant
-        .verify(&echo(
-            json!("read-only"),
-            json!(["/work", "/extra"]),
-            json!(["/extra"]),
-        ))
-        .is_err());
+    assert!(
+        grant
+            .verify(&echo(
+                json!("read-only"),
+                json!(["/work", "/extra"]),
+                json!(["/extra"]),
+            ))
+            .is_err()
+    );
 }
 
 /// Mirrors `test_codex_app_server.py::test_sandbox_mismatch_is_refused`.
 #[test]
 fn python_test_codex_app_server_sandbox_mismatch_is_refused() {
-    assert!(read_only_grant()
-        .verify(&echo(json!("workspace-write"), json!(["/work"]), json!([]),))
-        .is_err());
+    assert!(
+        read_only_grant()
+            .verify(&echo(json!("workspace-write"), json!(["/work"]), json!([]),))
+            .is_err()
+    );
 }
 
 /// Mirrors `test_codex_app_server.py::test_named_permission_profile_must_match_exactly`.
@@ -136,13 +142,15 @@ fn python_test_codex_app_server_named_permission_profile_must_match_exactly() {
 /// Mirrors `test_codex_app_server.py::test_sandbox_beta_object_echo_matching_type_passes`.
 #[test]
 fn python_test_codex_app_server_sandbox_beta_object_echo_matching_type_passes() {
-    assert!(read_only_grant()
-        .verify(&echo(
-            json!({"type": "readOnly", "networkAccess": false}),
-            json!(["/work"]),
-            json!([]),
-        ))
-        .is_ok());
+    assert!(
+        read_only_grant()
+            .verify(&echo(
+                json!({"type": "readOnly", "networkAccess": false}),
+                json!(["/work"]),
+                json!([]),
+            ))
+            .is_ok()
+    );
 }
 
 /// Mirrors `test_codex_app_server.py::test_requested_network_access_must_be_echoed`.
@@ -163,33 +171,39 @@ fn python_test_codex_app_server_requested_network_access_must_be_echoed() {
 /// Mirrors `test_codex_app_server.py::test_sandbox_legacy_string_echo_still_passes`.
 #[test]
 fn python_test_codex_app_server_sandbox_legacy_string_echo_still_passes() {
-    assert!(read_only_grant()
-        .verify(&echo(json!("read-only"), json!(["/work"]), json!([])))
-        .is_ok());
+    assert!(
+        read_only_grant()
+            .verify(&echo(json!("read-only"), json!(["/work"]), json!([])))
+            .is_ok()
+    );
 }
 
 /// Mirrors `test_codex_app_server.py::test_sandbox_beta_object_echo_mismatched_type_is_refused`.
 #[test]
 fn python_test_codex_app_server_sandbox_beta_object_echo_mismatched_type_is_refused() {
-    assert!(read_only_grant()
-        .verify(&echo(
-            json!({"type": "workspaceWrite", "networkAccess": true}),
-            json!(["/work"]),
-            json!([]),
-        ))
-        .is_err());
+    assert!(
+        read_only_grant()
+            .verify(&echo(
+                json!({"type": "workspaceWrite", "networkAccess": true}),
+                json!(["/work"]),
+                json!([]),
+            ))
+            .is_err()
+    );
 }
 
 /// Mirrors `test_codex_app_server.py::test_sandbox_beta_object_echo_unknown_type_is_refused`.
 #[test]
 fn python_test_codex_app_server_sandbox_beta_object_echo_unknown_type_is_refused() {
-    assert!(read_only_grant()
-        .verify(&echo(
-            json!({"type": "somethingNew", "networkAccess": false}),
-            json!(["/work"]),
-            json!([]),
-        ))
-        .is_err());
+    assert!(
+        read_only_grant()
+            .verify(&echo(
+                json!({"type": "somethingNew", "networkAccess": false}),
+                json!(["/work"]),
+                json!([]),
+            ))
+            .is_err()
+    );
 }
 
 /// Mirrors `test_codex_app_server.py::test_live_read_only_echo_shape_passes`.
@@ -225,16 +239,18 @@ fn python_test_codex_app_server_live_workspace_write_echo_shape_passes() {
         network_access: false,
         permission_profile: None,
     };
-    assert!(grant
-        .verify(&json!({
-            "thread": {"id": "thread"},
-            "model": "gpt-5.6-luna",
-            "cwd": cwd,
-            "runtimeWorkspaceRoots": [cwd],
-            "approvalPolicy": "never",
-            "sandbox": {"type": "workspaceWrite", "writableRoots": [], "networkAccess": false},
-        }))
-        .is_ok());
+    assert!(
+        grant
+            .verify(&json!({
+                "thread": {"id": "thread"},
+                "model": "gpt-5.6-luna",
+                "cwd": cwd,
+                "runtimeWorkspaceRoots": [cwd],
+                "approvalPolicy": "never",
+                "sandbox": {"type": "workspaceWrite", "writableRoots": [], "networkAccess": false},
+            }))
+            .is_ok()
+    );
 }
 
 /// Mirrors `test_codex_app_server.py::test_beta_roots_key_missing_entirely_is_refused`.
@@ -281,110 +297,132 @@ fn multi_root_grant() -> Grant {
 /// A pure permutation of the echoed readable and writable roots passes.
 #[test]
 fn roots_echo_order_is_not_contractual() {
-    assert!(multi_root_grant()
-        .verify(&echo(
-            json!("workspace-write"),
-            json!(["/c", "/a", "/b"]),
-            json!(["/b", "/c", "/a"]),
-        ))
-        .is_ok());
+    assert!(
+        multi_root_grant()
+            .verify(&echo(
+                json!("workspace-write"),
+                json!(["/c", "/a", "/b"]),
+                json!(["/b", "/c", "/a"]),
+            ))
+            .is_ok()
+    );
 }
 
 /// An extra echoed root fails closed even when every granted root is present.
 #[test]
 fn extra_echoed_root_is_refused() {
-    assert!(multi_root_grant()
-        .verify(&echo(
-            json!("workspace-write"),
-            json!(["/a", "/b", "/c", "/d"]),
-            json!(["/a", "/b", "/c"]),
-        ))
-        .is_err());
-    assert!(multi_root_grant()
-        .verify(&echo(
-            json!("workspace-write"),
-            json!(["/a", "/b", "/c"]),
-            json!(["/a", "/b", "/c", "/d"]),
-        ))
-        .is_err());
+    assert!(
+        multi_root_grant()
+            .verify(&echo(
+                json!("workspace-write"),
+                json!(["/a", "/b", "/c", "/d"]),
+                json!(["/a", "/b", "/c"]),
+            ))
+            .is_err()
+    );
+    assert!(
+        multi_root_grant()
+            .verify(&echo(
+                json!("workspace-write"),
+                json!(["/a", "/b", "/c"]),
+                json!(["/a", "/b", "/c", "/d"]),
+            ))
+            .is_err()
+    );
 }
 
 /// A missing echoed root fails closed.
 #[test]
 fn missing_echoed_root_is_refused() {
-    assert!(multi_root_grant()
-        .verify(&echo(
-            json!("workspace-write"),
-            json!(["/a", "/c"]),
-            json!(["/a", "/b", "/c"]),
-        ))
-        .is_err());
-    assert!(multi_root_grant()
-        .verify(&echo(
-            json!("workspace-write"),
-            json!(["/a", "/b", "/c"]),
-            json!(["/a", "/c"]),
-        ))
-        .is_err());
+    assert!(
+        multi_root_grant()
+            .verify(&echo(
+                json!("workspace-write"),
+                json!(["/a", "/c"]),
+                json!(["/a", "/b", "/c"]),
+            ))
+            .is_err()
+    );
+    assert!(
+        multi_root_grant()
+            .verify(&echo(
+                json!("workspace-write"),
+                json!(["/a", "/b", "/c"]),
+                json!(["/a", "/c"]),
+            ))
+            .is_err()
+    );
 }
 
 /// A non-string element in the echoed readable roots fails closed.
 #[test]
 fn malformed_readable_roots_element_is_refused() {
-    assert!(read_only_grant()
-        .verify(&echo(json!("read-only"), json!(["/work", 7]), json!([])))
-        .is_err());
+    assert!(
+        read_only_grant()
+            .verify(&echo(json!("read-only"), json!(["/work", 7]), json!([])))
+            .is_err()
+    );
 }
 
 /// A non-array readable roots shape fails closed.
 #[test]
 fn malformed_readable_roots_shape_is_refused() {
-    assert!(read_only_grant()
-        .verify(&echo(json!("read-only"), json!("/work"), json!([])))
-        .is_err());
+    assert!(
+        read_only_grant()
+            .verify(&echo(json!("read-only"), json!("/work"), json!([])))
+            .is_err()
+    );
 }
 
 /// A non-string element in the echoed writableRoots fails closed.
 #[test]
 fn malformed_writable_roots_element_is_refused() {
-    assert!(multi_root_grant()
-        .verify(&echo(
-            json!("workspace-write"),
-            json!(["/a", "/b", "/c"]),
-            json!(["/a", "/b", true]),
-        ))
-        .is_err());
+    assert!(
+        multi_root_grant()
+            .verify(&echo(
+                json!("workspace-write"),
+                json!(["/a", "/b", "/c"]),
+                json!(["/a", "/b", true]),
+            ))
+            .is_err()
+    );
 }
 
 /// A non-array writableRoots shape fails closed.
 #[test]
 fn malformed_writable_roots_shape_is_refused() {
-    assert!(multi_root_grant()
-        .verify(&echo(
-            json!("workspace-write"),
-            json!(["/a", "/b", "/c"]),
-            json!("/a"),
-        ))
-        .is_err());
+    assert!(
+        multi_root_grant()
+            .verify(&echo(
+                json!("workspace-write"),
+                json!(["/a", "/b", "/c"]),
+                json!("/a"),
+            ))
+            .is_err()
+    );
 }
 
 /// A duplicated echoed root fails closed because comparison stays a multiset.
 #[test]
 fn duplicate_echoed_root_is_refused() {
-    assert!(multi_root_grant()
-        .verify(&echo(
-            json!("workspace-write"),
-            json!(["/a", "/a", "/b", "/c"]),
-            json!(["/a", "/b", "/c"]),
-        ))
-        .is_err());
-    assert!(multi_root_grant()
-        .verify(&echo(
-            json!("workspace-write"),
-            json!(["/a", "/b", "/c"]),
-            json!(["/a", "/b", "/c", "/c"]),
-        ))
-        .is_err());
+    assert!(
+        multi_root_grant()
+            .verify(&echo(
+                json!("workspace-write"),
+                json!(["/a", "/a", "/b", "/c"]),
+                json!(["/a", "/b", "/c"]),
+            ))
+            .is_err()
+    );
+    assert!(
+        multi_root_grant()
+            .verify(&echo(
+                json!("workspace-write"),
+                json!(["/a", "/b", "/c"]),
+                json!(["/a", "/b", "/c", "/c"]),
+            ))
+            .is_err()
+    );
 }
 
 /// Builds the read-only role for request-grant construction tests.
@@ -476,24 +514,28 @@ fn python_test_codex_adapter_grant_refuses_authority_outside_the_workspace() {
         write: true,
         ..read_only_profile(vec![PathBuf::from("/private/tmp/read")])
     };
-    assert!(Grant::new(
-        &grant_runtime(&["/private/tmp/project"]),
-        &request,
-        &write_with_read,
-        PathBuf::from("/private/tmp/home").as_path(),
-    )
-    .is_err());
-    assert!(Grant::new(
-        &grant_runtime(&["/private/tmp/project"]),
-        &grant_request("/private/tmp/elsewhere", true),
-        &Profile {
-            name: "implement".into(),
-            write: true,
-            ..read_only_profile(vec![])
-        },
-        PathBuf::from("/private/tmp/home").as_path(),
-    )
-    .is_err());
+    assert!(
+        Grant::new(
+            &grant_runtime(&["/private/tmp/project"]),
+            &request,
+            &write_with_read,
+            PathBuf::from("/private/tmp/home").as_path(),
+        )
+        .is_err()
+    );
+    assert!(
+        Grant::new(
+            &grant_runtime(&["/private/tmp/project"]),
+            &grant_request("/private/tmp/elsewhere", true),
+            &Profile {
+                name: "implement".into(),
+                write: true,
+                ..read_only_profile(vec![])
+            },
+            PathBuf::from("/private/tmp/home").as_path(),
+        )
+        .is_err()
+    );
 }
 
 /// A write-capable request is admitted under any one configured workspace
@@ -546,7 +588,9 @@ fn write_requests_admit_any_configured_workspace_root() {
         home.as_path(),
     )
     .expect_err("a workdir outside every root must be refused");
-    assert!(error
-        .to_string()
-        .contains("outside configured workspace_roots"));
+    assert!(
+        error
+            .to_string()
+            .contains("outside configured workspace_roots")
+    );
 }

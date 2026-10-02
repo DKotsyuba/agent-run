@@ -1,16 +1,16 @@
 //! Bounded LF-delimited JSON-RPC 2.0 over a private same-user Unix socket.
 use super::frame;
-use crate::{dispatch, service::Service, Error, Result};
+use crate::{Error, Result, dispatch, service::Service};
 use agent_run_domain::ProviderStartRequest;
 use fs2::FileExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     fs::{File, OpenOptions},
     os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -109,12 +109,11 @@ impl BrokerClient {
         }
         // A stable agent may advance while a lost response is retried. Pin the
         // resume intent once, outside the reconnect loop, to prevent a second turn.
-        if method == "resume" {
-            if let Some(arguments) = params.as_mut().and_then(Value::as_object_mut) {
-                if arguments.get("request_id").is_none_or(Value::is_null) {
-                    arguments.insert("request_id".into(), json!(uuid::Uuid::new_v4().to_string()));
-                }
-            }
+        if method == "resume"
+            && let Some(arguments) = params.as_mut().and_then(Value::as_object_mut)
+            && arguments.get("request_id").is_none_or(Value::is_null)
+        {
+            arguments.insert("request_id".into(), json!(uuid::Uuid::new_v4().to_string()));
         }
         let mut connection = self.connection.lock().await;
         for attempt in 0..2 {
@@ -177,7 +176,7 @@ impl BrokerClient {
             Some(_) => {
                 return Err(Error::Runtime(
                     "broker returned an invalid start result".into(),
-                ))
+                ));
             }
         };
         let run_id = match object.get("run_id") {
@@ -476,10 +475,12 @@ struct SocketGuard {
 }
 impl Drop for SocketGuard {
     fn drop(&mut self) {
-        if let Ok(m) = std::fs::symlink_metadata(&self.path) {
-            if m.dev() == self.device && m.ino() == self.inode && m.file_type().is_socket() {
-                let _ = std::fs::remove_file(&self.path);
-            }
+        if let Ok(m) = std::fs::symlink_metadata(&self.path)
+            && m.dev() == self.device
+            && m.ino() == self.inode
+            && m.file_type().is_socket()
+        {
+            let _ = std::fs::remove_file(&self.path);
         }
     }
 }
@@ -565,11 +566,7 @@ pub async fn respond(service: &Service, v: Value) -> Option<Value> {
             }
         }
     };
-    if notification {
-        None
-    } else {
-        Some(response)
-    }
+    if notification { None } else { Some(response) }
 }
 /// Runs one connection with framed parsing, lane admission, and ordered writes.
 async fn connection(
@@ -1016,10 +1013,8 @@ async fn client_with_wait_deadlines(
     wait_call_timeout: Duration,
 ) -> Result<Value> {
     let is_wait = method == "wait";
-    if is_wait {
-        if let Some(object) = params.as_object_mut() {
-            object.insert("timeout_seconds".into(), json!(wait_seconds.as_secs_f64()));
-        }
+    if is_wait && let Some(object) = params.as_object_mut() {
+        object.insert("timeout_seconds".into(), json!(wait_seconds.as_secs_f64()));
     }
     loop {
         let mut stream = tokio::time::timeout(

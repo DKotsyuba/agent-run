@@ -13,7 +13,7 @@
 use crate::{Error, Result};
 use minijinja::{AutoEscape, Environment, UndefinedBehavior};
 use rmcp::model::{CallToolResult, ContentBlock};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::OnceLock;
 
 /// The embedded per-tool templates, keyed by public tool name.
@@ -108,7 +108,10 @@ pub fn success_result(tool: &str, value: &Value) -> CallToolResult {
                 .and_then(Value::as_u64)
                 .filter(|n| *n > 0 && *n <= u32::MAX as u64);
             let Some(sequence) = sequence else {
-                return error_result("RuntimeError", "admission has no valid binding receipt; inspect delivery status before continuing");
+                return error_result(
+                    "RuntimeError",
+                    "admission has no valid binding receipt; inspect delivery status before continuing",
+                );
             };
             Some(json!({"agent_id": value["agent_id"], "sequence": sequence}))
         }
@@ -505,7 +508,7 @@ fn prose(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{error_result, success_result};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     /// Minimal agent view proving sparse optional metadata remains renderable.
     fn agent_view() -> Value {
@@ -641,10 +644,12 @@ mod tests {
         ] {
             let result = success_result(name, &value);
             assert_eq!(result.is_error, Some(true), "{name}");
-            assert!(serde_json::to_value(result.content).unwrap()[0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("RuntimeError"));
+            assert!(
+                serde_json::to_value(result.content).unwrap()[0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("RuntimeError")
+            );
         }
     }
 

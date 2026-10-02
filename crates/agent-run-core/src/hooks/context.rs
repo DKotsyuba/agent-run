@@ -1,12 +1,11 @@
 //! Bounded changed-only routing context for UserPromptSubmit hooks.
 
 use crate::{
-    capacity,
+    Result, capacity,
     config::Config,
-    domain::{now, OrchestratorRef},
+    domain::{OrchestratorRef, now},
     error::invalid,
     state::Store,
-    Result,
 };
 use serde::Serialize;
 use serde_json::Value;

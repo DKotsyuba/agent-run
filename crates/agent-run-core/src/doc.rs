@@ -1,6 +1,6 @@
 //! Embedded operator-guide pages shared by the CLI and MCP transports.
 
-use crate::{error::invalid, Result};
+use crate::{Result, error::invalid};
 
 /// Returns one complete, build-time embedded operator-guide page.
 ///
@@ -17,13 +17,17 @@ pub fn topic_text(topic: &str) -> Result<&'static str> {
         "completion" => Ok(include_str!("../../../assets/operator_guide/completion.md").trim_end()),
         "config" => Ok(include_str!("../../../assets/operator_guide/config.md")),
         "skills" => Ok(include_str!("../../../assets/operator_guide/skills.md")),
-        "mcp-servers" => Ok(include_str!("../../../assets/operator_guide/mcp-servers.md")),
+        "mcp-servers" => Ok(include_str!(
+            "../../../assets/operator_guide/mcp-servers.md"
+        )),
         "plugins" => Ok(include_str!("../../../assets/operator_guide/plugins.md")),
         "models" => Ok(include_str!("../../../assets/operator_guide/models.md")),
         "releases" => Ok(include_str!("../../../assets/operator_guide/releases.md")),
         "migrations" => Ok(include_str!("../../../assets/operator_guide/migrations.md")),
         "storage" => Ok(include_str!("../../../assets/operator_guide/storage.md")),
-        "troubleshoot" => Ok(include_str!("../../../assets/operator_guide/troubleshoot.md")),
+        "troubleshoot" => Ok(include_str!(
+            "../../../assets/operator_guide/troubleshoot.md"
+        )),
         _ => Err(invalid(format!(
             "unknown operator guide topic: {topic:?}; valid topics: completion, config, skills, mcp-servers, plugins, models, releases, migrations, storage, troubleshoot"
         ))),

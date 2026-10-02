@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 description = "Interactive terminal observer for the agent-run resident broker"
 repository = "https://github.com/DKotsyuba/agent-run"
-publish = false
+publish.workspace = true
 
 [dependencies]
 agent-run = { path = "../agent-run" }

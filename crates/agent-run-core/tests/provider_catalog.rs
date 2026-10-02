@@ -4,10 +4,10 @@
 
 use agent_run_core::{dispatch, service::Service};
 use agent_run_domain::{
-    catalog::{AccountRecord, AccountStatus},
     CapacityOrderQuery, ModelsQuery,
+    catalog::{AccountRecord, AccountStatus},
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{fs, path::Path};
 
 /// Writes the v2 config with `recommendation` on the codex provider and a
@@ -770,7 +770,7 @@ async fn overflowing_provider_scores_saturate_in_the_public_order() {
 /// `s1`'s exhaustion).
 #[tokio::test]
 async fn source_switch_with_carried_latch_stays_scoped_through_admission() {
-    use agent_run_core::capacity::quota::{normalize_collector_output, CollectorScope};
+    use agent_run_core::capacity::quota::{CollectorScope, normalize_collector_output};
     let temp = ranking_home();
     let root = temp.path();
     fs::write(
@@ -834,7 +834,7 @@ async fn source_switch_with_carried_latch_stays_scoped_through_admission() {
 /// `m-a` cannot release it; a fresh one can.
 #[tokio::test]
 async fn cross_source_latch_survives_small_retention_and_releases_only_on_coverage() {
-    use agent_run_core::capacity::quota::{normalize_collector_output, CollectorScope};
+    use agent_run_core::capacity::quota::{CollectorScope, normalize_collector_output};
     for second in [None, Some(50.0)] {
         let temp = ranking_home();
         let root = temp.path();

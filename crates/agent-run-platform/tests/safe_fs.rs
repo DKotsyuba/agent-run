@@ -182,11 +182,13 @@ fn agent_directory_cannot_escape_through_symlink() {
     std::fs::create_dir(root.path().join("agents")).unwrap();
     std::fs::remove_dir(root.path().join("agents")).unwrap();
     std::os::unix::fs::symlink(outside.path(), root.path().join("agents")).unwrap();
-    assert!(paths::agent_dir(
-        "ag-20260101-000000-abcdef0123",
-        Some(root.path().to_path_buf())
-    )
-    .is_err());
+    assert!(
+        paths::agent_dir(
+            "ag-20260101-000000-abcdef0123",
+            Some(root.path().to_path_buf())
+        )
+        .is_err()
+    );
 }
 
 /// Mirrors `tests/test_paths.py::PathTests::test_blank_and_unresolved_home_are_rejected`
@@ -319,9 +321,10 @@ fn managed_paths_refuse_traversal_and_symlink_escape() {
     std::os::unix::fs::symlink(outside.path(), root.path().join("linked")).unwrap();
 
     assert!(dir.write(Path::new("../outside"), b"no", 0o600).is_err());
-    assert!(dir
-        .write(Path::new("linked/outside"), b"no", 0o600)
-        .is_err());
+    assert!(
+        dir.write(Path::new("linked/outside"), b"no", 0o600)
+            .is_err()
+    );
     assert!(
         !outside.path().join("outside").exists(),
         "a symlinked parent must never receive the payload"
@@ -337,9 +340,10 @@ fn new_parent_is_created_before_file_publication() {
     // created parent is already on disk (and, in `Dir::parent`, already synced)
     // while the target name does not exist yet.
     let fault = fail_at(fs::FaultPoint::MidWrite);
-    assert!(dir
-        .write_seamed(Path::new("nested/answer.md"), b"done", 0o600, Some(&fault))
-        .is_err());
+    assert!(
+        dir.write_seamed(Path::new("nested/answer.md"), b"done", 0o600, Some(&fault))
+            .is_err()
+    );
     let parent = root.path().join("nested");
     assert!(parent.is_dir(), "the parent is created before publication");
     assert_eq!(
@@ -363,9 +367,10 @@ fn replacement_is_published_only_after_its_own_bytes_are_durable() {
 
     // Before the rename the published name still holds the previous bytes.
     let fault = fail_at(fs::FaultPoint::BeforeRename);
-    assert!(dir
-        .write_seamed(Path::new("answer.md"), b"done", 0o600, Some(&fault))
-        .is_err());
+    assert!(
+        dir.write_seamed(Path::new("answer.md"), b"done", 0o600, Some(&fault))
+            .is_err()
+    );
     assert_eq!(
         std::fs::read(root.path().join("answer.md")).unwrap(),
         b"original"
@@ -374,9 +379,10 @@ fn replacement_is_published_only_after_its_own_bytes_are_durable() {
     // After the rename, and before the parent directory is synced, the name
     // already holds the complete new payload -- never a partial one.
     let fault = fail_at(fs::FaultPoint::AfterRename);
-    assert!(dir
-        .write_seamed(Path::new("answer.md"), b"done", 0o600, Some(&fault))
-        .is_err());
+    assert!(
+        dir.write_seamed(Path::new("answer.md"), b"done", 0o600, Some(&fault))
+            .is_err()
+    );
     assert_eq!(
         std::fs::read(root.path().join("answer.md")).unwrap(),
         b"done"
@@ -434,14 +440,15 @@ fn failed_atomic_replace_preserves_existing_content() {
         .unwrap();
 
     let fault = fail_at(fs::FaultPoint::BeforeRename);
-    assert!(dir
-        .write_seamed(
+    assert!(
+        dir.write_seamed(
             Path::new("settings/config.toml"),
             b"replacement",
             0o600,
             Some(&fault)
         )
-        .is_err());
+        .is_err()
+    );
     assert_eq!(
         std::fs::read(root.path().join("settings/config.toml")).unwrap(),
         b"original"
@@ -451,9 +458,10 @@ fn failed_atomic_replace_preserves_existing_content() {
     // The fault injected above simulates a crash, which deliberately leaves its
     // temporary behind, so this half is checked in its own directory.
     dir.directory(Path::new("occupied/target")).unwrap();
-    assert!(dir
-        .write(Path::new("occupied/target"), b"replacement", 0o600)
-        .is_err());
+    assert!(
+        dir.write(Path::new("occupied/target"), b"replacement", 0o600)
+            .is_err()
+    );
     assert!(
         temporaries(&root.path().join("occupied")).is_empty(),
         "a failed publish removes the temporary it owns"
@@ -495,9 +503,10 @@ fn failed_publication_publishes_nothing_and_cleans_its_temp() {
 
     // Payload failure before the rename: nothing is published under the name.
     let fault = fail_at(fs::FaultPoint::MidWrite);
-    assert!(dir
-        .write_seamed(Path::new("answer.md"), b"replacement", 0o600, Some(&fault))
-        .is_err());
+    assert!(
+        dir.write_seamed(Path::new("answer.md"), b"replacement", 0o600, Some(&fault))
+            .is_err()
+    );
     assert!(!root.path().join("answer.md").exists());
 
     // A live failure (a parent that cannot accept the temporary) leaves neither
@@ -505,9 +514,10 @@ fn failed_publication_publishes_nothing_and_cleans_its_temp() {
     dir.directory(Path::new("locked")).unwrap();
     let locked = root.path().join("locked");
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
-    assert!(dir
-        .write(Path::new("locked/answer.md"), b"replacement", 0o600)
-        .is_err());
+    assert!(
+        dir.write(Path::new("locked/answer.md"), b"replacement", 0o600)
+            .is_err()
+    );
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert!(!locked.join("answer.md").exists());
     assert!(temporaries(&locked).is_empty());

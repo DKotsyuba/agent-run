@@ -1,7 +1,7 @@
 //! Independent APFS clones for frozen assets and exact-byte idle cache reuse.
+use super::Dir;
 #[cfg(target_os = "macos")]
 use super::sync_directory;
-use super::Dir;
 #[cfg(target_os = "macos")]
 use agent_run_domain::Error;
 use agent_run_domain::Result;
@@ -426,15 +426,17 @@ mod snapshot_clone_tests {
             },
             0
         );
-        assert!(!target
-            .write_snapshot_file(
-                Path::new("asset"),
-                &source,
-                Path::new("asset"),
-                payload,
-                0o600
-            )
-            .unwrap());
+        assert!(
+            !target
+                .write_snapshot_file(
+                    Path::new("asset"),
+                    &source,
+                    Path::new("asset"),
+                    payload,
+                    0o600
+                )
+                .unwrap()
+        );
         assert_eq!(target.read(Path::new("asset"), 1024).unwrap(), payload);
         assert_eq!(
             // SAFETY: a null output buffer only queries whether the known xattr exists.
@@ -471,15 +473,17 @@ mod snapshot_clone_tests {
             unsafe { libc::fchflags(file.as_raw_fd(), libc::UF_NODUMP) },
             0
         );
-        assert!(!target
-            .write_snapshot_file(
-                Path::new("asset"),
-                &source,
-                Path::new("asset"),
-                payload,
-                0o600
-            )
-            .unwrap());
+        assert!(
+            !target
+                .write_snapshot_file(
+                    Path::new("asset"),
+                    &source,
+                    Path::new("asset"),
+                    payload,
+                    0o600
+                )
+                .unwrap()
+        );
         assert_eq!(target.read(Path::new("asset"), 1024).unwrap(), payload);
         assert_eq!(
             std::fs::metadata(target_path.join("asset"))

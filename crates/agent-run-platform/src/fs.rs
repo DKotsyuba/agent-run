@@ -1,6 +1,6 @@
 //! Descriptor-anchored local storage. No symlinks are followed inside an owned tree.
 mod cloning;
-use agent_run_domain::{error::invalid, Error, Result};
+use agent_run_domain::{Error, Result, error::invalid};
 use sha2::{Digest, Sha256};
 use std::{
     ffi::{CStr, CString, OsString},
@@ -53,10 +53,10 @@ pub fn home(path: Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 pub fn private_dir(path: &Path) -> Result<()> {
-    if let Ok(m) = std::fs::symlink_metadata(path) {
-        if m.file_type().is_symlink() || !m.is_dir() {
-            return Err(invalid("private home must be a real directory"));
-        }
+    if let Ok(m) = std::fs::symlink_metadata(path)
+        && (m.file_type().is_symlink() || !m.is_dir())
+    {
+        return Err(invalid("private home must be a real directory"));
     }
     std::fs::create_dir_all(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
@@ -478,7 +478,7 @@ impl Dir {
                 kind => {
                     return Err(invalid(format!(
                         "pushed tree holds an unsupported entry: {kind:?}"
-                    )))
+                    )));
                 }
             }
         }

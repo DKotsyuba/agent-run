@@ -58,7 +58,8 @@ fn history(home: &Path) -> Vec<String> {
     let mut statement = conn
         .prepare("SELECT id,status,runtime,model,task,request_json FROM agents ORDER BY id")
         .unwrap();
-    let rows = statement
+
+    statement
         .query_map([], |row| {
             Ok((0..6)
                 .map(|index| format!("{:?}", row.get::<_, rusqlite::types::Value>(index).unwrap()))
@@ -67,8 +68,7 @@ fn history(home: &Path) -> Vec<String> {
         })
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap();
-    rows
+        .unwrap()
 }
 
 /// Seals `dir` the way `xtask release` does (`bin/agent-run`,
@@ -505,9 +505,11 @@ fn apply_and_rollback_move_the_whole_pair() {
     let (ok, applied) = home.apply("mapping.toml", false);
     assert!(ok, "{applied}");
     assert_eq!(version(&home.root), agent_run::state::VERSION as u32);
-    assert!(fs::read_to_string(home.root.join("config.toml"))
-        .unwrap()
-        .contains("schema_version = 2"));
+    assert!(
+        fs::read_to_string(home.root.join("config.toml"))
+            .unwrap()
+            .contains("schema_version = 2")
+    );
     let snapshot = PathBuf::from(applied["snapshot"].as_str().unwrap());
     let manifest: Value =
         serde_json::from_slice(&fs::read(snapshot.join("manifest.json")).unwrap()).unwrap();
@@ -580,9 +582,11 @@ fn apply_and_rollback_move_the_whole_pair() {
         "{refused}"
     );
     assert_eq!(version(&home.root), agent_run::state::VERSION as u32);
-    assert!(fs::read_to_string(home.root.join("config.toml"))
-        .unwrap()
-        .contains("schema_version = 2"));
+    assert!(
+        fs::read_to_string(home.root.join("config.toml"))
+            .unwrap()
+            .contains("schema_version = 2")
+    );
     for (name, digest) in frozen {
         assert_eq!(
             sha(&snapshot.join(&name)),

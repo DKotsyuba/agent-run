@@ -7,6 +7,10 @@ evidence, process ownership, and secret safety are product requirements.
 
 - Use the pinned Rust toolchain and the committed `Cargo.lock`. Prefer the
   standard library and existing workspace dependencies.
+- `family.toml` and `.family/manifest.json` are the family-standard
+  declaration: keep them truthful, rerun `cargo xtask family update` after a
+  reviewed change to a managed adoption file, and never claim qualification
+  the repository has not tested (see docs/family-standard.md).
 - Keep modules focused. Add tests for every behavior change.
 - Agent-task harnesses are created only through adapters and the supervisor.
   Configured quota commands use the bounded external collector runner; shipped

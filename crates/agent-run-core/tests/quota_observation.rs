@@ -1,9 +1,9 @@
 //! Account-bound quota observation normalization, persistence, and latch.
 
-use agent_run_core::capacity::quota::{normalize_collector_output, CollectorScope};
+use agent_run_core::capacity::quota::{CollectorScope, normalize_collector_output};
 use agent_run_domain::catalog::{AccountId, AccountRecord, AccountStatus};
 use agent_run_store::quota::record_quota_snapshot;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::Path, str::FromStr};
 use tempfile::tempdir;
 

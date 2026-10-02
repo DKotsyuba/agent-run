@@ -5,15 +5,15 @@
 //! `created` and `start_accepted` events. Its `IMMEDIATE` transaction makes
 //! those facts visible together or not at all.
 
-use crate::{lineage, tx_event, Record, Store, ACTIVE_SQL};
+use crate::{ACTIVE_SQL, Record, Store, lineage, tx_event};
 use agent_run_config::config::Config;
 use agent_run_domain::{
-    domain::{now, AgentId, StartRequest, Status},
     Error, Result,
+    domain::{AgentId, StartRequest, Status, now},
 };
 use agent_run_platform::process;
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
-use serde_json::{json, Value};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use serde_json::{Value, json};
 
 /// Return the recorded request-id replay in its orchestrator namespace.
 ///
@@ -102,12 +102,12 @@ pub fn admit_with_config_revision(
     // Replay precedes session upsert and capacity: Python deliberately makes a
     // repeated accepted request insensitive to later mutable config edits.
     let session = replay_session(&tx, &checked)?;
-    if checked.orchestrator.is_none() || session.is_some() {
-        if let Some(found) = replay_in_transaction(&tx, &checked, session.as_deref())? {
-            ensure_same_replay(&found, &checked, identity, parent)?;
-            tx.commit()?;
-            return Ok((found.id, false));
-        }
+    if (checked.orchestrator.is_none() || session.is_some())
+        && let Some(found) = replay_in_transaction(&tx, &checked, session.as_deref())?
+    {
+        ensure_same_replay(&found, &checked, identity, parent)?;
+        tx.commit()?;
+        return Ok((found.id, false));
     }
 
     let global: i64 = tx.query_row(

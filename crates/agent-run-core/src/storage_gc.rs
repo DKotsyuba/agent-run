@@ -34,8 +34,8 @@
 //! The lock file itself, and everything outside the store's own namespaces,
 //! is never touched.
 
-use crate::{fs, state::Store, Result};
-use agent_run_domain::{error::invalid, Error};
+use crate::{Result, fs, state::Store};
+use agent_run_domain::{Error, error::invalid};
 use agent_run_platform::{
     plugin_views,
     shared_assets::{self, SharedStoreLock, TEMP_PREFIX, TEMP_SUFFIX},
@@ -1268,7 +1268,7 @@ fn drain(directory: &fs::Dir, unlinks: &mut usize) -> Result<bool> {
             kind => {
                 return Err(invalid(format!(
                     "shared store holds an unexpected entry: {kind:?}"
-                )))
+                )));
             }
         }
         *unlinks -= 1;

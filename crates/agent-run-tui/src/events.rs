@@ -10,12 +10,12 @@ use crate::app::App;
 use crate::net::{self, Broker, SharedBroker};
 use agent_run_domain::domain::AgentId;
 use agent_run_domain::views::{AgentPage, AnswerView, TranscriptPage};
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event as TerminalEvent, KeyCode, KeyEvent,
     KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use ratatui::Terminal;
 use std::io::Stdout;
 use std::sync::Arc;
 use std::time::Duration;
@@ -459,16 +459,18 @@ impl Drop for TerminalGuard {
 
 /// Spawns the blocking thread that reads terminal input into [`UiEvent`]s.
 pub fn spawn_input(tx: mpsc::UnboundedSender<UiEvent>) {
-    std::thread::spawn(move || loop {
-        match ratatui::crossterm::event::read() {
-            Ok(event) => {
-                if tx.send(UiEvent::Terminal(event)).is_err() {
+    std::thread::spawn(move || {
+        loop {
+            match ratatui::crossterm::event::read() {
+                Ok(event) => {
+                    if tx.send(UiEvent::Terminal(event)).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => {
+                    let _ = tx.send(UiEvent::InputClosed);
                     return;
                 }
-            }
-            Err(_) => {
-                let _ = tx.send(UiEvent::InputClosed);
-                return;
             }
         }
     });

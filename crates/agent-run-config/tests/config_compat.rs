@@ -19,8 +19,8 @@ mod common;
 use agent_run_config::{config::Config, profiles};
 use agent_run_domain::error::Error;
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
-use std::path::PathBuf;
+use serde_json::{Map, Value, json};
+use std::path::{Path, PathBuf};
 
 #[derive(Deserialize)]
 struct Case {
@@ -269,17 +269,25 @@ fn expected_config_value(raw: &Value, tmp_home: &std::path::Path) -> Value {
 /// `HOME` is set for tilde expansion, `config.toml` is written below the same
 /// root, and expected host paths are canonicalized before that temporary
 /// filesystem is removed. An error case without an oracle returns `None`.
+///
+/// Cases whose TOML expands `~` read the process `HOME`; they run through
+/// [`run_home_isolated_case`] instead, so this function never depends on this
+/// process's environment.
 fn run_config_case(case: &Case) -> (Result<Value, Error>, Option<Value>) {
     let temp = tempfile::tempdir().expect("temp dir");
     let home = temp.path().canonicalize().unwrap();
-    std::env::set_var("HOME", &home);
+    run_config_case_at(case, &home)
+}
+
+/// Runs one config case against an already-created canonical fixture `home`.
+fn run_config_case_at(case: &Case, home: &Path) -> (Result<Value, Error>, Option<Value>) {
     let text = case.toml.replace("${TMP_HOME}", &home.to_string_lossy());
     std::fs::write(home.join("config.toml"), text).unwrap();
-    let result = Config::load(&home).map(|cfg| config_to_value(&cfg));
+    let result = Config::load(home).map(|cfg| config_to_value(&cfg));
     let expected = case
         .normalized_result_summary
         .as_ref()
-        .map(|raw| expected_config_value(raw, &home));
+        .map(|raw| expected_config_value(raw, home));
     (result, expected)
 }
 
@@ -377,10 +385,30 @@ fn expected_config_paths_are_portable_without_relaxing_other_strings() {
 /// Mirrors Python `tests/test_config.py::ConfigTests::test_validation_errors_do_not_echo_rejected_values`.
 #[test]
 fn golden_config_cases_match_python() {
+    if let Some(id) = std::env::var_os("AGENT_RUN_TEST_CONFIG_CASE") {
+        let id = id.to_string_lossy().into_owned();
+        let case = cases()
+            .into_iter()
+            .find(|case| case.id == id)
+            .expect("marker must name one golden case");
+        let home = PathBuf::from(
+            std::env::var_os("HOME").expect("child HOME names the case fixture root"),
+        );
+        std::fs::create_dir_all(&home).unwrap();
+        let (result, expected) = run_config_case_at(&case, &home);
+        if let Err(failure) = evaluate_case(&case, result, expected) {
+            panic!("{failure}");
+        }
+        return;
+    }
     let mut failures: Vec<String> = Vec::new();
     let mut checked = 0usize;
     for case in cases() {
         checked += 1;
+        if case.toml.contains('~') {
+            run_home_isolated_case(&case);
+            continue;
+        }
         let (result, expected) = if case.source_test == "tests/test_profiles.py" {
             (
                 run_profile_case(&case),
@@ -389,31 +417,8 @@ fn golden_config_cases_match_python() {
         } else {
             run_config_case(&case)
         };
-        match (&result, case.outcome.as_str()) {
-            (Ok(actual), "ok") => {
-                if let Some(expected) = expected {
-                    if !compatible(actual, &expected) {
-                        failures.push(format!(
-                            "{}: accepted but structure differs\n  actual:   {actual}\n  expected: {expected}",
-                            case.id
-                        ));
-                    }
-                }
-            }
-            (Err(_), "ok") => {
-                failures.push(format!(
-                    "{}: expected ok, got error: {}",
-                    case.id,
-                    result.as_ref().unwrap_err()
-                ));
-            }
-            (Ok(_), "error") => failures.push(format!("{}: expected error, got ok", case.id)),
-            (Err(e), "error") => {
-                if !matches!(e, Error::Validation(_)) {
-                    failures.push(format!("{}: wrong error class: {e:?}", case.id));
-                }
-            }
-            (_, other) => failures.push(format!("{}: unknown outcome {other:?}", case.id)),
+        if let Err(failure) = evaluate_case(&case, result, expected) {
+            failures.push(failure);
         }
     }
     assert!(
@@ -426,4 +431,97 @@ fn golden_config_cases_match_python() {
         failures.len(),
         failures.join("\n---\n")
     );
+}
+
+/// Evaluates one case's outcome against its declared result, returning the
+/// exact mismatch message the corpus loop reports.
+fn evaluate_case(
+    case: &Case,
+    result: Result<Value, Error>,
+    expected: Option<Value>,
+) -> Result<(), String> {
+    match (&result, case.outcome.as_str()) {
+        (Ok(actual), "ok") => {
+            if let Some(expected) = expected
+                && !compatible(actual, &expected)
+            {
+                return Err(format!(
+                    "{}: accepted but structure differs\n  actual:   {actual}\n  expected: {expected}",
+                    case.id
+                ));
+            }
+            Ok(())
+        }
+        (Err(_), "ok") => Err(format!(
+            "{}: expected ok, got error: {}",
+            case.id,
+            result.as_ref().unwrap_err()
+        )),
+        (Ok(_), "error") => Err(format!("{}: expected error, got ok", case.id)),
+        (Err(e), "error") => {
+            if matches!(e, Error::Validation(_)) {
+                Ok(())
+            } else {
+                Err(format!("{}: wrong error class: {e:?}", case.id))
+            }
+        }
+        (_, other) => Err(format!("{}: unknown outcome {other:?}", case.id)),
+    }
+}
+
+/// Runs one `~`-expansion case in an isolated child test process whose
+/// command environment names its fixture root as `HOME`; the parent asserts
+/// the child passed. The child is killed and reaped on drop or on an expired
+/// bounded window, so it can never outlive this test.
+fn run_home_isolated_case(case: &Case) {
+    let temp = tempfile::tempdir().expect("case fixture root");
+    let home = temp.path().canonicalize().unwrap();
+    let mut child = ConfigCaseChild(
+        std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "golden_config_cases_match_python",
+                "--test-threads",
+                "1",
+                "--nocapture",
+            ])
+            .env("HOME", &home)
+            .env("AGENT_RUN_TEST_CONFIG_CASE", &case.id)
+            .spawn()
+            .expect("child test process"),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        if let Some(status) = child.0.try_wait().expect("child must be waitable") {
+            assert!(
+                status.success(),
+                "isolated HOME case {} failed: {status}",
+                case.id
+            );
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.terminate();
+            panic!("isolated HOME case {} exceeded its bounded window", case.id);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// The isolated case child, killed and reaped on drop so a parent panic or
+/// cancelled case can never leave it running.
+struct ConfigCaseChild(std::process::Child);
+
+impl ConfigCaseChild {
+    /// Kills and reaps the child.
+    fn terminate(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for ConfigCaseChild {
+    fn drop(&mut self) {
+        self.terminate();
+    }
 }

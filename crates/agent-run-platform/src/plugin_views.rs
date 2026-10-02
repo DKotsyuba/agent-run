@@ -37,9 +37,9 @@
 use crate::{
     fs::{self, Dir, EntryType},
     shared_assets::{self, SharedStoreLock, SharedTreeRef, TEMP_PREFIX, TEMP_SUFFIX},
-    snapshot_tree::{entry_map, load_manifest, MAX_METADATA, SNAPSHOT_MANIFEST},
+    snapshot_tree::{MAX_METADATA, SNAPSHOT_MANIFEST, entry_map, load_manifest},
 };
-use agent_run_domain::{error::invalid, Error, Result};
+use agent_run_domain::{Error, Result, error::invalid};
 use std::{
     collections::{BTreeMap, BTreeSet},
     os::unix::fs::MetadataExt,
@@ -300,7 +300,7 @@ fn remove_view_tree(directory: &Dir) -> Result<()> {
 /// hardlinked manifest bytes still hash to `reference.manifest_sha256` and
 /// parse through the shared manifest validators; the version subtree's
 /// topology is exactly the manifest's (no orphans, nothing missing, bounded
-/// by [`MAX_VIEW_ENTRIES`]); every directory carries a valid owner-only
+/// by `MAX_VIEW_ENTRIES`); every directory carries a valid owner-only
 /// mode; and every file is one internal hardlink of the corresponding
 /// `trees/<scope>/<manifest-sha256>` entry — same device and inode — at the
 /// physical mode that entry's logical mode maps to. The referenced shared
@@ -452,11 +452,7 @@ fn walk_view(
 
 /// Returns the readonly physical store mode for one normalized logical mode.
 fn physical_mode(logical: u32) -> u32 {
-    if logical & 0o111 != 0 {
-        0o500
-    } else {
-        0o400
-    }
+    if logical & 0o111 != 0 { 0o500 } else { 0o400 }
 }
 
 /// Fails unless one owner-held identity carries exactly `mode`'s permission

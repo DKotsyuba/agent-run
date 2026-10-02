@@ -2,7 +2,7 @@
 
 mod common;
 
-use agent_run_domain::{domain::Status, Error};
+use agent_run_domain::{Error, domain::Status};
 use agent_run_store::Store;
 use serde_json::json;
 use std::{

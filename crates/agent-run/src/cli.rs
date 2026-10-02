@@ -1,20 +1,20 @@
 //! Operator CLI. Starts and resumes always go through the resident broker.
 use crate::{
-    capacity,
+    Result, capacity,
     config::{Adapter, Config},
     domain::{AgentId, OrchestratorRef},
     error::invalid,
     fs, hooks,
     service::{Query, Service},
     state::Store,
-    transport, Result,
+    transport,
 };
 use agent_run_domain::{
-    catalog::{AccountId, AccountRecord, AccountStatus, AuthFamily, SecretRef},
     CredentialRef,
+    catalog::{AccountId, AccountRecord, AccountStatus, AuthFamily, SecretRef},
 };
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     future::Future,
     io::Write,
@@ -799,15 +799,53 @@ pub fn init(home: &Path) -> Result<Value> {
             0o600,
         )?;
     }
-    for (name,body) in [
-        ("review","+++\nwrite = false\nnetwork = false\n+++\nReview the repository read-only. Separate observed facts, risks, and recommendations. Do not modify files.\n"),
-        ("architect","+++\nwrite = false\nnetwork = false\n+++\nStudy the repository read-only and propose an implementation plan. Do not change files.\n"),
-        ("code","+++\nwrite = true\nnetwork = false\n+++\nImplement the assigned change within the granted workspace. Preserve existing behaviour and report the exact checks performed.\n"),
-        ("research","+++\nwrite = false\nnetwork = true\n+++\nResearch the task. Distinguish sourced facts from assumptions. Do not change local files.\n"),
-    ]{let file=format!("profiles/{name}.md");if dir.optional(Path::new(&file),1024*1024)?.is_none(){dir.write(Path::new(&file),body.as_bytes(),0o600)?;}}
-    for (name,write,body) in [("role-review",false,"Perform a read-only review. Report evidence and recommendations; do not modify files."),("role-architect",false,"Analyze architecture read-only and produce a plan with explicit acceptance tests."),("role-code",true,"Implement the assigned task within the granted workspace. Test changes and report remaining uncertainty.")]{
-        let file=format!("profiles/{name}.md");let text=format!("+++\nrevision = \"rust-role-v1\"\nwrite = {write}\nnetwork = false\nallow_external_read_roots = true\nskills = []\nmcp = []\nrequired_constraints = []\n+++\n{body}\n");
-        if dir.optional(Path::new(&file),1024*1024)?.is_none(){dir.write(Path::new(&file),text.as_bytes(),0o600)?;}
+    for (name, body) in [
+        (
+            "review",
+            "+++\nwrite = false\nnetwork = false\n+++\nReview the repository read-only. Separate observed facts, risks, and recommendations. Do not modify files.\n",
+        ),
+        (
+            "architect",
+            "+++\nwrite = false\nnetwork = false\n+++\nStudy the repository read-only and propose an implementation plan. Do not change files.\n",
+        ),
+        (
+            "code",
+            "+++\nwrite = true\nnetwork = false\n+++\nImplement the assigned change within the granted workspace. Preserve existing behaviour and report the exact checks performed.\n",
+        ),
+        (
+            "research",
+            "+++\nwrite = false\nnetwork = true\n+++\nResearch the task. Distinguish sourced facts from assumptions. Do not change local files.\n",
+        ),
+    ] {
+        let file = format!("profiles/{name}.md");
+        if dir.optional(Path::new(&file), 1024 * 1024)?.is_none() {
+            dir.write(Path::new(&file), body.as_bytes(), 0o600)?;
+        }
+    }
+    for (name, write, body) in [
+        (
+            "role-review",
+            false,
+            "Perform a read-only review. Report evidence and recommendations; do not modify files.",
+        ),
+        (
+            "role-architect",
+            false,
+            "Analyze architecture read-only and produce a plan with explicit acceptance tests.",
+        ),
+        (
+            "role-code",
+            true,
+            "Implement the assigned task within the granted workspace. Test changes and report remaining uncertainty.",
+        ),
+    ] {
+        let file = format!("profiles/{name}.md");
+        let text = format!(
+            "+++\nrevision = \"rust-role-v1\"\nwrite = {write}\nnetwork = false\nallow_external_read_roots = true\nskills = []\nmcp = []\nrequired_constraints = []\n+++\n{body}\n"
+        );
+        if dir.optional(Path::new(&file), 1024 * 1024)?.is_none() {
+            dir.write(Path::new(&file), text.as_bytes(), 0o600)?;
+        }
     }
     let _ = operator_config(home)?;
     let store = Store::initialize(home)?;
@@ -936,7 +974,14 @@ pub fn launchd(
             interval.max(1)
         )
     };
-    let plist = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>{}</string>\n  <key>ProgramArguments</key><array>\n{args}  </array>\n  <key>EnvironmentVariables</key><dict><key>HOME</key><string>{}</string><key>PATH</key><string>{}</string></dict>\n  <key>RunAtLoad</key><true/>\n{schedule}  <key>StandardOutPath</key><string>{}</string>\n  <key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",xml(label),xml(&home_env),xml(&path),xml(&stdout_log.to_string_lossy()),xml(&stderr_log.to_string_lossy()));
+    let plist = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>{}</string>\n  <key>ProgramArguments</key><array>\n{args}  </array>\n  <key>EnvironmentVariables</key><dict><key>HOME</key><string>{}</string><key>PATH</key><string>{}</string></dict>\n  <key>RunAtLoad</key><true/>\n{schedule}  <key>StandardOutPath</key><string>{}</string>\n  <key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",
+        xml(label),
+        xml(&home_env),
+        xml(&path),
+        xml(&stdout_log.to_string_lossy()),
+        xml(&stderr_log.to_string_lossy())
+    );
     Ok(if kind == "api" {
         json!({"label":label,"argv":argv,"plist":plist})
     } else {
@@ -1148,7 +1193,7 @@ fn provider_login_target(
         None => {
             return Err(invalid(
                 "provider binds several accounts; name one with --account",
-            ))
+            ));
         }
     }
     .ok_or_else(|| invalid("account is not bound to this provider"))?;
@@ -1163,7 +1208,7 @@ fn provider_login_target(
         _ => {
             return Err(invalid(
                 "account is not a native login of this provider's harness",
-            ))
+            ));
         }
     };
     let harness = cfg
@@ -1656,7 +1701,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                     _ => {
                         return Err(invalid(
                             "choose one migration input; --ack applies only to a legacy mapping",
-                        ))
+                        ));
                     }
                 };
                 (dependencies.output)(&result)?;

@@ -268,9 +268,11 @@ fn a_missing_executable_is_refused_before_any_spawn() {
     );
     assert_eq!(failure.stage.as_deref(), Some("preflight"));
     assert_eq!(failure.provisional_pid, None);
-    assert!(failure
-        .message
-        .contains("reconnect/restart this MCP session"));
+    assert!(
+        failure
+            .message
+            .contains("reconnect/restart this MCP session")
+    );
 }
 
 /// Mirrors Python `tests/test_launch.py::DetachedLaunchTests::test_posix_spawn_requests_setsid_without_fork_fallback`.

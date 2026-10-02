@@ -275,10 +275,12 @@ fn format_marker_without_sidecar_never_looks_like_legacy_completion() {
     let inspection = verify::inspect_answer(root, Path::new("answer.md")).unwrap();
     assert_eq!(inspection.proof_version, 2);
     assert!(!inspection.complete());
-    assert!(inspection
-        .proof_error
-        .as_deref()
-        .is_some_and(|error| error.contains("missing")));
+    assert!(
+        inspection
+            .proof_error
+            .as_deref()
+            .is_some_and(|error| error.contains("missing"))
+    );
 }
 
 /// Mirrors Python `tests/test_answer_payload_proof.py::SealAndProofTests::test_read_answer_payload_raises_distinct_typed_errors`.

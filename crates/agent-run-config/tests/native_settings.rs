@@ -12,7 +12,7 @@ use agent_run_config::{
     role_plan::ResolvedRolePlan,
     snapshot,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn write(home: &common::Home, extra: &str) -> String {
@@ -114,11 +114,13 @@ fn blank_key_is_rejected() {
 #[test]
 fn date_value_is_rejected() {
     let home = common::Home::new();
-    assert!(load(
-        &home,
-        "[runtimes.codex.native_settings]\nseen = 2024-01-01\n"
-    )
-    .is_err());
+    assert!(
+        load(
+            &home,
+            "[runtimes.codex.native_settings]\nseen = 2024-01-01\n"
+        )
+        .is_err()
+    );
 }
 
 /// Mirrors `test_nonfinite_and_exotic_values_are_rejected` for the subset TOML
@@ -158,9 +160,10 @@ fn documented_full_config_example_loads() {
     let home = common::Home::new();
     std::fs::write(home.path.join("config.toml"), block).unwrap();
     let (cfg, _) = agent_run_config::provider_config::ProviderConfig::load(&home.path).unwrap();
-    assert!(cfg
-        .harnesses
-        .contains_key(&agent_run_domain::catalog::HarnessId::Codex));
+    assert!(
+        cfg.harnesses
+            .contains_key(&agent_run_domain::catalog::HarnessId::Codex)
+    );
 }
 
 /// Build a fixed runtime and role so canonical snapshot bytes are reproducible.

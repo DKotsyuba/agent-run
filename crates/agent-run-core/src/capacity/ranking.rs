@@ -6,7 +6,7 @@
 //! `order()` projection in `capacity::mod`) own config lookups and topology
 //! parsing; this module never inspects `Key::target` or config.
 use super::{Forecast, Key, Pool, Route};
-use crate::{error::invalid, Result};
+use crate::{Result, error::invalid};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 

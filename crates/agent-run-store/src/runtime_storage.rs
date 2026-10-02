@@ -14,8 +14,8 @@
 //! compaction paths, which already hold the frozen launch identity; nothing
 //! here accepts a wire request or an arbitrary caller-supplied path.
 
-use crate::{Store, ACTIVE_SQL};
-use agent_run_domain::{domain::now, domain::AgentId, error::invalid, Error, Result};
+use crate::{ACTIVE_SQL, Store};
+use agent_run_domain::{Error, Result, domain::AgentId, domain::now, error::invalid};
 use agent_run_platform::fs;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -59,7 +59,7 @@ pub struct SharedRootMapping {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeStorageLayout {
-    /// Explicit contract version; only [`LAYOUT_VERSION`] is accepted.
+    /// Explicit contract version; only `LAYOUT_VERSION` is accepted.
     pub version: u32,
     /// Canonical absolute runtime home this layout belongs to.
     pub runtime_home: String,
@@ -332,7 +332,7 @@ fn validated(row: LayoutRow) -> Result<RuntimeStorageLayoutRecord> {
         other => {
             return Err(Error::Integrity(format!(
                 "runtime storage layout row for {runtime_home} has unknown state {other}"
-            )))
+            )));
         }
     };
     Ok(RuntimeStorageLayoutRecord {
@@ -487,7 +487,7 @@ impl Store {
     /// version-1 layout; anything else is refused without touching the
     /// registry. The write runs in one `IMMEDIATE` transaction. An absent row
     /// is created only when no agent still holds the home unresolved (see
-    /// [`unsettled_home_holders`]); when a holder exists, only that holder
+    /// `unsettled_home_holders`); when a holder exists, only that holder
     /// itself, passed as `owner` and proving it holds nothing live, may
     /// register the layout. When a row already exists, this call is strictly
     /// idempotent: a `prepared` row returns itself unchanged — same operation
@@ -522,10 +522,10 @@ impl Store {
             {
                 return Err(Error::Conflict);
             }
-            if let Some(recorded) = existing.owner_agent_id.as_deref() {
-                if !holds_nothing_live(&tx, &recorded.parse()?)? {
-                    return Err(Error::Conflict);
-                }
+            if let Some(recorded) = existing.owner_agent_id.as_deref()
+                && !holds_nothing_live(&tx, &recorded.parse()?)?
+            {
+                return Err(Error::Conflict);
             }
             tx.commit()?;
             return Ok(existing);

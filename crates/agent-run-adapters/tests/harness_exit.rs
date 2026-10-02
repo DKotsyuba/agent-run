@@ -1,8 +1,8 @@
 //! A dead harness must not wait for stdout/stderr inherited by its descendants.
 
 use agent_run_adapters::{
-    io::{Event, Process},
     LaunchPlan,
+    io::{Event, Process},
 };
 use agent_run_platform::process::{self, ProcessState};
 use serde_json::json;

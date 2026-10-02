@@ -1,16 +1,16 @@
 //! Trusted candidate admission, replay, scope, reservation, and contention.
 
 use agent_run_domain::{
+    Error, PositiveFinite, ProviderStartRequest,
     catalog::{
         AccountId, AccountRecord, AccountStatus, AuthFamily, PhysicalQuotaKey, ProviderCatalog,
         QuotaAdmissionError, QuotaCandidate, QuotaCandidateSet, ResolvedLaunchAuthority,
         SelectionIntent,
     },
     domain::Outcome,
-    Error, PositiveFinite, ProviderStartRequest,
 };
 use agent_run_store::Store;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     path::Path,
     sync::{Arc, Barrier},
@@ -207,9 +207,11 @@ fn stale_replay_and_ranked_reservation_are_atomic() {
         [admitted.agent_id.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
     ).unwrap();
     assert_eq!(facts, ("auto".into(), "acct-a::tokens".into(), 1));
-    assert!(store
-        .finish(&admitted.agent_id, &Outcome::failure("test"), None, None)
-        .is_err());
+    assert!(
+        store
+            .finish(&admitted.agent_id, &Outcome::failure("test"), None, None)
+            .is_err()
+    );
     assert_eq!(
         store
             .conn
@@ -585,9 +587,11 @@ fn next_attempt_allocation_is_atomic_and_evidence_bound() {
     assert_eq!(event_attempt.as_deref(), Some(next.attempt_id.as_str()));
     // B is not cleaned up yet: a second allocation is refused.
     let revision = store.quota_capacity_revision().unwrap();
-    assert!(store
-        .allocate_next_attempt(&id, &catalog, &candidates(revision, &[("acct-b", 0)]))
-        .is_err());
+    assert!(
+        store
+            .allocate_next_attempt(&id, &catalog, &candidates(revision, &[("acct-b", 0)]))
+            .is_err()
+    );
     assert_eq!(ownership(&store, &id), (1, 0, 2));
 
     // Missing continuation evidence and pending cancel refuse.
@@ -603,13 +607,15 @@ fn next_attempt_allocation_is_atomic_and_evidence_bound() {
     let (mut cancelled, cancel_id) = cleaned_run(path, "next-3", true);
     cancelled.enqueue(&cancel_id, "cancel", &json!({})).unwrap();
     let revision = cancelled.quota_capacity_revision().unwrap();
-    assert!(cancelled
-        .allocate_next_attempt(
-            &cancel_id,
-            &catalog,
-            &candidates(revision, &[("acct-b", 0)])
-        )
-        .is_err());
+    assert!(
+        cancelled
+            .allocate_next_attempt(
+                &cancel_id,
+                &catalog,
+                &candidates(revision, &[("acct-b", 0)])
+            )
+            .is_err()
+    );
     assert_eq!(ownership(&cancelled, &cancel_id).2, 1);
 }
 
@@ -627,9 +633,11 @@ fn pinned_runs_never_allocate_another_account() {
         .unwrap();
     let catalog = catalog(&store);
     let revision = store.quota_capacity_revision().unwrap();
-    assert!(store
-        .allocate_next_attempt(&id, &catalog, &candidates(revision, &[("acct-b", 0)]))
-        .is_err());
+    assert!(
+        store
+            .allocate_next_attempt(&id, &catalog, &candidates(revision, &[("acct-b", 0)]))
+            .is_err()
+    );
     assert_eq!(ownership(&store, &id), (1, 1, 1));
 }
 

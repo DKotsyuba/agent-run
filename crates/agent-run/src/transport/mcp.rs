@@ -1,14 +1,14 @@
 //! Rust MCP stdio compatibility proxy; durable execution stays in the broker.
-use crate::{cli::CliBroker, dispatch, domain::OrchestratorRef, Error, Result};
+use crate::{Error, Result, cli::CliBroker, dispatch, domain::OrchestratorRef};
 use rmcp::{
+    ServerHandler, ServiceExt,
     model::{
         CallToolRequestParams, CallToolResponse, ErrorData, Implementation, ListToolsResult,
         PaginatedRequestParams, ServerConfig, Tool,
     },
     service::{RequestContext, RoleServer},
-    ServerHandler, ServiceExt,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     ffi::CString,
     os::unix::{ffi::OsStrExt, process::CommandExt},
@@ -292,10 +292,9 @@ impl ServerHandler for Proxy {
         }
         if matches!(request.name.as_ref(), "start" | "resume")
             && !arguments.contains_key("orchestrator")
+            && let Some(o) = &self.orchestrator
         {
-            if let Some(o) = &self.orchestrator {
-                arguments.insert("orchestrator".into(), json!(o));
-            }
+            arguments.insert("orchestrator".into(), json!(o));
         }
         let result = match detached_broker_call(
             self.broker.clone(),
@@ -423,8 +422,8 @@ mod tests {
     use crate::cli::{CliBroker, CliFuture};
     use serde_json::json;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

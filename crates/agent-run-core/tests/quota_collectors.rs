@@ -206,7 +206,10 @@ fn assert_gone(identities: &[process::Identity]) {
 async fn timeout_and_cancel_clean_children() {
     for cancel in [false, true] {
         let root = tempfile::tempdir().unwrap();
-        let mut command=script(root.path(),"cat >/dev/null; trap '' TERM; sleep 30 & child=$!; printf '%s %s' $$ $child >pids; wait");
+        let mut command = script(
+            root.path(),
+            "cat >/dev/null; trap '' TERM; sleep 30 & child=$!; printf '%s %s' $$ $child >pids; wait",
+        );
         command.timeout_seconds = 1;
         let cwd = root.path().to_owned();
         let task =
@@ -229,7 +232,10 @@ async fn timeout_and_cancel_clean_children() {
 #[tokio::test]
 async fn exited_script_cleans_inherited_pipes_without_waiting_for_deadline() {
     let root = tempfile::tempdir().unwrap();
-    let mut command=script(root.path(),"cat >/dev/null; sleep 30 & child=$!; printf '%s %s' $$ $child >pids; echo '{\"version\":1,\"windows\":[]}'; sleep 0.3");
+    let mut command = script(
+        root.path(),
+        "cat >/dev/null; sleep 30 & child=$!; printf '%s %s' $$ $child >pids; echo '{\"version\":1,\"windows\":[]}'; sleep 0.3",
+    );
     command.timeout_seconds = 20;
     let cwd = root.path().to_owned();
     let started = std::time::Instant::now();
@@ -322,11 +328,13 @@ async fn supplied_http_collectors_emit_the_shared_contract() {
         let result = collect_providers(root.path(), &config).await.unwrap();
         assert_eq!(result["ok"], true, "{script_name}: {result}");
         assert_eq!(result["results"][0]["windows"], windows);
-        assert!(server
-            .join()
-            .unwrap()
-            .to_ascii_lowercase()
-            .contains(authorization));
+        assert!(
+            server
+                .join()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains(authorization)
+        );
     }
 }
 
@@ -410,12 +418,14 @@ async fn failing_account_does_not_block_healthy_account() {
     let report = collect_providers(root.path(), &config).await.unwrap();
     assert_eq!(report["ok"], false, "{report}");
     let rows = report["results"].as_array().unwrap();
-    assert!(rows
-        .iter()
-        .any(|r| r["account"] == "acct-test" && r["status"] == "collected"));
-    assert!(rows
-        .iter()
-        .any(|r| r["account"] == "acct-bad" && r["status"] == "failed"));
+    assert!(
+        rows.iter()
+            .any(|r| r["account"] == "acct-test" && r["status"] == "collected")
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r["account"] == "acct-bad" && r["status"] == "failed")
+    );
     let count: i64 = store
         .conn
         .query_row(

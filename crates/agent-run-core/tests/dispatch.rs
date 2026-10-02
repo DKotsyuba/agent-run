@@ -3,7 +3,7 @@ mod common;
 
 use agent_run_core::{dispatch, policy, profiles, service::LaunchIdentity, service::Service};
 use agent_run_domain::domain::Status;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 /// Creates the launch identity required by the steer capability gate.

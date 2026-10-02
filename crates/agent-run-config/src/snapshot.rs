@@ -8,9 +8,9 @@ use crate::{
     config::{Config, Runtime},
     role_plan::ResolvedRolePlan,
 };
-use agent_run_domain::{canonical, error::invalid, Result};
+use agent_run_domain::{Result, canonical, error::invalid};
 use agent_run_platform::{fs, snapshot_tree};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::path::Path;
 
 /// Python's attempt-relative effective configuration evidence filename.

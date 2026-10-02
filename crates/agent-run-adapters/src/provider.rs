@@ -4,25 +4,25 @@
 //! verifies those bytes and the frozen role before binding its own account.
 
 use crate::{
+    LaunchPlan,
     authorized_request::CredentialReader,
     materialize::{self, Snapshot},
-    LaunchPlan,
 };
 use agent_run_config::{
     config::{self, Config, Runtime},
     policy,
     profiles::Profile,
     provider_config::ProviderConfig,
-    role_plan::{role_from_authority, ResolvedRolePlan},
+    role_plan::{ResolvedRolePlan, role_from_authority},
 };
 use agent_run_domain::{
+    CredentialRef, Error, Result, Sha256Digest,
     catalog::{
         AccountId, AttemptCredentials, HarnessId, ProviderCatalog, ProviderConnection, ProviderId,
         ResolvedLaunchAuthority,
     },
     domain::{Constraint, StartRequest},
     error::invalid,
-    CredentialRef, Error, Result, Sha256Digest,
 };
 use agent_run_platform::fs;
 use agent_run_platform::{shared_asset_guard::SharedAssetGuard, shared_assets::SharedStoreLock};
@@ -215,7 +215,7 @@ pub fn materialize_selected(
         _ => {
             return Err(invalid(
                 "credential reference is incompatible with provider connection",
-            ))
+            ));
         }
     }
     let role = ResolvedRolePlan::from_payload(&role.to_payload())?;
@@ -551,7 +551,7 @@ pub fn plan_selected_with(
         _ => {
             return Err(invalid(
                 "credential reference is incompatible with provider connection",
-            ))
+            ));
         }
     }
     if sealed.harness == HarnessId::Codex {

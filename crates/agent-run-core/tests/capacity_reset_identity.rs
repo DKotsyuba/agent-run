@@ -1,6 +1,6 @@
 //! Reset-cycle recognition: samples of one shared reset instant must supply
 //! burn evidence together despite provider-reported sub-second jitter.
-use agent_run_core::capacity::{forecast, Key, Sample};
+use agent_run_core::capacity::{Key, Sample, forecast};
 
 fn key() -> Key {
     Key {

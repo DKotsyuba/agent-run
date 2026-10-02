@@ -10,8 +10,8 @@ use agent_run_store::Store;
 use serde_json::Value;
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Instant,
 };

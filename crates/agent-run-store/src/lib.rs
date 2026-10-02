@@ -28,17 +28,17 @@ pub mod terminal;
 /// Authenticated, bounded worker reports and their durable outbox rows.
 pub mod worker;
 use agent_run_domain::{
-    catalog::{AccountId, PhysicalQuotaKey},
-    domain::{self, now, AgentId, Outcome, StartRequest, Status},
-    error::invalid,
     Error, Result,
+    catalog::{AccountId, PhysicalQuotaKey},
+    domain::{self, AgentId, Outcome, StartRequest, Status, now},
+    error::invalid,
 };
 use agent_run_platform::{fs, verify::Proof};
 use rusqlite::{
-    params, Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior,
+    Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -186,8 +186,7 @@ impl Record {
 /// SQL for the attempt id of a record written for agent `?1` by a handle
 /// bound to attempt `?2`: exactly that attempt when bound (NULL if it is not
 /// the agent's), otherwise the agent's currently owned attempt, else NULL.
-const ATTEMPT_OF: &str =
-    "CASE WHEN ?2 IS NOT NULL THEN (SELECT id FROM attempts WHERE id=?2 AND agent_id=?1) \
+const ATTEMPT_OF: &str = "CASE WHEN ?2 IS NOT NULL THEN (SELECT id FROM attempts WHERE id=?2 AND agent_id=?1) \
      ELSE (SELECT id FROM attempts WHERE agent_id=?1 AND ownership_active=1) END";
 pub(crate) fn tx_event(
     tx: &Transaction<'_>,
@@ -279,10 +278,10 @@ impl Store {
     /// New stores enable incremental page reclamation before the first transaction.
     fn connect(home: &Path, create: bool) -> Result<Self> {
         let path = home.join("state.db");
-        if let Ok(meta) = std::fs::symlink_metadata(&path) {
-            if !meta.is_file() || meta.file_type().is_symlink() {
-                return Err(invalid("state.db must be a regular file"));
-            }
+        if let Ok(meta) = std::fs::symlink_metadata(&path)
+            && (!meta.is_file() || meta.file_type().is_symlink())
+        {
+            return Err(invalid("state.db must be a regular file"));
         }
         if !create && !path.exists() {
             return Err(invalid("state.db is missing; run agent-run init"));
@@ -351,7 +350,7 @@ impl Store {
                     Ok(mode) => {
                         return Err(invalid(format!(
                             "state database could not enable WAL mode: {mode}"
-                        )))
+                        )));
                     }
                     Err(error)
                         if attempt < 7
@@ -779,16 +778,15 @@ impl Store {
                 "terminal agent cannot bind a supervisor".into(),
             ));
         }
-        if let Some(old_pid) = old_pid {
-            if old_pid != pid
+        if let Some(old_pid) = old_pid
+            && (old_pid != pid
                 || old_identity.as_deref() != Some(identity)
                 || old_birth != birth_time
                 || (old_group.is_some()
                     && old_group != Some(process_group_id)
-                    && old_group != Some(pid))
-            {
-                return Err(invalid("supervisor ownership is immutable"));
-            }
+                    && old_group != Some(pid)))
+        {
+            return Err(invalid("supervisor ownership is immutable"));
         }
         tx.execute(
             "UPDATE agents SET supervisor_pid=?,supervisor_identity=?,process_group_id=?,supervisor_birth_time=?,heartbeat_at=? WHERE id=? AND status IN ('starting','running')",

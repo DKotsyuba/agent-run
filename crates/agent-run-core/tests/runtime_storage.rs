@@ -5,7 +5,7 @@
 use agent_run_core::{
     adapters::materialize,
     runtime_storage::{self, StorageFault},
-    state::{runtime_storage::LayoutState, Store},
+    state::{Store, runtime_storage::LayoutState},
 };
 use agent_run_platform::{
     fs,
@@ -243,13 +243,13 @@ fn cleanup_store(store_root: &Path) {
 
 /// Restores owner write permission below one fixture tree.
 fn permit_tree(path: &Path) {
-    if let Ok(metadata) = stdfs::symlink_metadata(path) {
-        if metadata.is_dir() {
-            let _ = stdfs::set_permissions(path, stdfs::Permissions::from_mode(0o700));
-            if let Ok(children) = stdfs::read_dir(path) {
-                for child in children.flatten() {
-                    permit_tree(&child.path());
-                }
+    if let Ok(metadata) = stdfs::symlink_metadata(path)
+        && metadata.is_dir()
+    {
+        let _ = stdfs::set_permissions(path, stdfs::Permissions::from_mode(0o700));
+        if let Ok(children) = stdfs::read_dir(path) {
+            for child in children.flatten() {
+                permit_tree(&child.path());
             }
         }
     }
@@ -531,10 +531,12 @@ fn holders_block_install_and_prepared_rows_refuse_replacement() {
     let blocked = runtime_storage::install(&mut store, &app.home, &layout, None)
         .expect_err("an unresolved holder blocks installation");
     assert!(matches!(blocked, agent_run_domain::Error::Conflict));
-    assert!(store
-        .runtime_storage_layout(&layout.runtime_home)
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .runtime_storage_layout(&layout.runtime_home)
+            .unwrap()
+            .is_none()
+    );
 
     store
         .conn
@@ -680,13 +682,15 @@ fn plugin_parent_mount_keeps_real_version_discoverable() {
         "the original manifest bytes are unchanged"
     );
     // The ordinary skill root keeps the plain whole-tree link geometry.
-    assert!(sealed
-        .home
-        .join("skills/plain")
-        .symlink_metadata()
-        .expect("plain skill link")
-        .file_type()
-        .is_symlink());
+    assert!(
+        sealed
+            .home
+            .join("skills/plain")
+            .symlink_metadata()
+            .expect("plain skill link")
+            .file_type()
+            .is_symlink()
+    );
     runtime_storage::verify(&store, &app.home, &sealed.home, &sealed.index_sha256)
         .expect("bridge verification accepts the parent mount");
     assert_eq!(

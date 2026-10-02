@@ -1,20 +1,21 @@
-use crate::{commands, journal};
 use crate::{
+    Result,
     config::{Config, Runtime},
     domain::{AgentId, Outcome, StartRequest, Status},
     error::invalid,
     profiles::{self, Profile},
     state::{Record, Store},
-    verify, Result,
+    verify,
 };
+use crate::{commands, journal};
 use agent_run_adapters::{
-    codex::session::{failure_kind as structured_failure_kind, Session},
+    EngineResult, LaunchPlan,
+    codex::session::{Session, failure_kind as structured_failure_kind},
     io::{Event, Process},
     redact::StreamingRedactor,
-    EngineResult, LaunchPlan,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -448,13 +449,12 @@ impl Grant {
                 "Codex effective readable/writable roots differ from admitted grant",
             ));
         }
-        if let Some(profile) = &self.permission_profile {
-            if v.pointer("/activePermissionProfile/id")
+        if let Some(profile) = &self.permission_profile
+            && v.pointer("/activePermissionProfile/id")
                 .and_then(Value::as_str)
                 != Some(profile.as_str())
-            {
-                return Err(invalid("Codex permission profile mismatch"));
-            }
+        {
+            return Err(invalid("Codex permission profile mismatch"));
         }
         if v.pointer("/sandbox/networkAccess")
             .and_then(Value::as_bool)
@@ -465,10 +465,10 @@ impl Grant {
                 "Codex effective network access differs from the admitted grant",
             ));
         }
-        if let Some(reviewer) = &self.reviewer {
-            if v.get("approvalsReviewer").and_then(Value::as_str) != Some(reviewer.as_str()) {
-                return Err(invalid("Codex reviewer routing differs"));
-            }
+        if let Some(reviewer) = &self.reviewer
+            && v.get("approvalsReviewer").and_then(Value::as_str) != Some(reviewer.as_str())
+        {
+            return Err(invalid("Codex reviewer routing differs"));
         }
         Ok(())
     }
@@ -681,10 +681,10 @@ pub async fn run(
         .iter()
         .find(|model| model.id == record.request.model)
         .ok_or_else(|| invalid("selected account did not report the configured model"))?;
-    if let Some(effort) = &record.request.effort {
-        if !model.efforts.iter().any(|choice| choice == effort) {
-            return Err(invalid("effort is not offered by selected account/model"));
-        }
+    if let Some(effort) = &record.request.effort
+        && !model.efforts.iter().any(|choice| choice == effort)
+    {
+        return Err(invalid("effort is not offered by selected account/model"));
     }
     let grant = Grant::new(runtime, &record.request, role, home)?;
     let mut params = grant.request();
@@ -1013,32 +1013,31 @@ pub async fn run(
                 let turn = &p["turn"];
                 if let Some(items) = turn.get("items").and_then(Value::as_array) {
                     for item in items {
-                        if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
-                            if let Some(text) = item
+                        if item.get("type").and_then(Value::as_str) == Some("agentMessage")
+                            && let Some(text) = item
                                 .get("text")
                                 .and_then(Value::as_str)
                                 .filter(|s| !s.trim().is_empty())
-                            {
-                                let key = item.get("id").and_then(Value::as_str).unwrap_or("");
-                                if !completed.contains_key(key) {
-                                    let prefix = emitted.get(key).map(String::as_str).unwrap_or("");
-                                    let tail = text
-                                        .strip_prefix(prefix)
-                                        .unwrap_or(if prefix.is_empty() { text } else { "" });
-                                    journal_assistant_fragment(
-                                        process,
-                                        store,
-                                        &record.id,
-                                        &mut redactors,
-                                        key,
-                                        tail,
-                                        true,
-                                    )?;
-                                    streamed.remove(key);
-                                    emitted.remove(key);
-                                }
-                                final_answer = Some(text.into());
+                        {
+                            let key = item.get("id").and_then(Value::as_str).unwrap_or("");
+                            if !completed.contains_key(key) {
+                                let prefix = emitted.get(key).map(String::as_str).unwrap_or("");
+                                let tail = text
+                                    .strip_prefix(prefix)
+                                    .unwrap_or(if prefix.is_empty() { text } else { "" });
+                                journal_assistant_fragment(
+                                    process,
+                                    store,
+                                    &record.id,
+                                    &mut redactors,
+                                    key,
+                                    tail,
+                                    true,
+                                )?;
+                                streamed.remove(key);
+                                emitted.remove(key);
                             }
+                            final_answer = Some(text.into());
                         }
                     }
                 }
@@ -1149,9 +1148,11 @@ network = { enabled = false }
             table,
         )
         .expect_err("one ungranted root rejects the policy");
-        assert!(error
-            .to_string()
-            .contains("workspace_roots are not granted by managed Projects"));
+        assert!(
+            error
+                .to_string()
+                .contains("workspace_roots are not granted by managed Projects")
+        );
 
         assert_eq!(
             managed_roots(&root_runtime(&["/workspace/b", "/workspace/a"]), table)
@@ -1189,9 +1190,11 @@ network = { enabled = false }
         );
         let error = admitted_root(&roots, Path::new("/workspace/elsewhere"), true)
             .expect_err("a workdir outside every root is refused");
-        assert!(error
-            .to_string()
-            .contains("outside configured workspace_roots"));
+        assert!(
+            error
+                .to_string()
+                .contains("outside configured workspace_roots")
+        );
         assert!(admitted_root(&roots, Path::new("/workspace/a2/repo"), true).is_err());
         assert_eq!(
             admitted_root(&roots, Path::new("/workspace/elsewhere"), false)

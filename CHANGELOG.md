@@ -4,6 +4,18 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- feat(family): declare Agent MCP family standard adoption with a truthful
+  `family.toml` profile, managed adoption metadata under `.family/` verified
+  by `cargo xtask family verify`, and a public boundary summary in
+  `docs/family-standard.md` separating observed from unverified compatibility
+- build(workspace): migrate to edition 2024 with resolver 3, inherit
+  `publish = false` in every member, deny undocumented unsafe blocks, and pin
+  MiniJinja to `=2.24.0`
+- feat(xtask): extend the single quality gate with rustdoc `-D warnings`, a
+  supported default-feature compile check, and adoption-metadata verification;
+  replace test process-environment mutation with isolated, bounded, reaped
+  child test processes that receive their values via the command environment
+
 ## [0.19.4] - 2026-10-01
 
 - feat(retention): keep the newest 100 logical agent sessions alongside

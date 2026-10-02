@@ -1,4 +1,4 @@
-use clap::{error::ErrorKind, Parser};
+use clap::{Parser, error::ErrorKind};
 
 /// Parses and executes the operator CLI with JSON errors compatible with Python.
 #[tokio::main]

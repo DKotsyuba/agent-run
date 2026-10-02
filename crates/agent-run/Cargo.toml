@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 description = "Durable local coding-agent supervisor"
 repository = "https://github.com/DKotsyuba/agent-run"
-publish = false
+publish.workspace = true
 
 [dependencies]
 agent-run-adapters = { path = "../agent-run-adapters" }

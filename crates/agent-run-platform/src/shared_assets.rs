@@ -25,10 +25,10 @@
 //! reference tracking are later units.
 
 use crate::{
-    fs::{sha256, Dir, EntryType, Flush},
-    snapshot_tree::{entry_map, load_manifest_bounded, SNAPSHOT_MANIFEST},
+    fs::{Dir, EntryType, Flush, sha256},
+    snapshot_tree::{SNAPSHOT_MANIFEST, entry_map, load_manifest_bounded},
 };
-use agent_run_domain::{canonical::hex_digest, error::invalid, Error, Result};
+use agent_run_domain::{Error, Result, canonical::hex_digest, error::invalid};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -259,11 +259,7 @@ fn blob_name(sha256: &str, logical: u32) -> PathBuf {
 /// restricted, and restoring owner write later requires the verified native
 /// launch guard.
 fn physical_mode(logical: u32) -> u32 {
-    if logical & 0o111 != 0 {
-        0o500
-    } else {
-        0o400
-    }
+    if logical & 0o111 != 0 { 0o500 } else { 0o400 }
 }
 
 /// Returns whether `mode` is a valid shared-tree or plugin-view directory
@@ -583,7 +579,7 @@ pub fn import_shared_tree(
         Ok(_) => {
             return Err(invalid(
                 "shared tree destination exists and is not a real directory",
-            ))
+            ));
         }
         Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
@@ -1152,25 +1148,29 @@ mod tests {
         crate::fs::push(&file).expect("push readonly blob contents");
         drop(file);
         directory.sync().expect("persist blob contents");
-        assert!(directory
-            .rename_entry_no_replace_flushed(
-                Path::new("pending"),
-                Path::new("blob"),
-                Flush::Skipped
-            )
-            .expect("rename readonly blob"));
+        assert!(
+            directory
+                .rename_entry_no_replace_flushed(
+                    Path::new("pending"),
+                    Path::new("blob"),
+                    Flush::Skipped
+                )
+                .expect("rename readonly blob")
+        );
         directory.push().expect("push blob namespace");
         directory
             .directory(Path::new("staged"))
             .expect("create staged tree");
-        assert!(directory
-            .hardlink_flushed(
-                Path::new("staged/leaf"),
-                &directory,
-                Path::new("blob"),
-                Flush::Skipped
-            )
-            .expect("link readonly blob into staged tree"));
+        assert!(
+            directory
+                .hardlink_flushed(
+                    Path::new("staged/leaf"),
+                    &directory,
+                    Path::new("blob"),
+                    Flush::Skipped
+                )
+                .expect("link readonly blob into staged tree")
+        );
         directory
             .write(Path::new("staged/manifest"), b"manifest", 0o400)
             .expect("write readonly manifest");
@@ -1180,9 +1180,11 @@ mod tests {
         assert_eq!(tree.entry(None).unwrap().mode, 0o700);
         tree.push().expect("push sealed directory metadata");
         directory.sync().expect("persist staged namespace");
-        assert!(directory
-            .rename_entry_no_replace(Path::new("staged"), Path::new("published"))
-            .expect("publish sealed tree"));
+        assert!(
+            directory
+                .rename_entry_no_replace(Path::new("staged"), Path::new("published"))
+                .expect("publish sealed tree")
+        );
         directory
             .directory(Path::new("other"))
             .expect("create sibling tree");
@@ -1404,14 +1406,16 @@ mod tests {
         fs::hard_link(&target, &blob).unwrap();
         verify_shared_tree(&root, &reference).unwrap();
 
-        assert!(verify_shared_tree(
-            &root,
-            &SharedTreeRef {
-                scope: "not-a-scope".into(),
-                manifest_sha256: reference.manifest_sha256.clone(),
-            }
-        )
-        .is_err());
+        assert!(
+            verify_shared_tree(
+                &root,
+                &SharedTreeRef {
+                    scope: "not-a-scope".into(),
+                    manifest_sha256: reference.manifest_sha256.clone(),
+                }
+            )
+            .is_err()
+        );
         let manifest = tree.join(SNAPSHOT_MANIFEST);
         fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600)).unwrap();
         let bytes = fs::read(&manifest).unwrap();
@@ -1478,14 +1482,16 @@ mod tests {
             import_shared_tree(&root, &scope, home.path(), Path::new("assets/runtime")).is_err()
         );
         assert!(destination.read_dir().unwrap().next().is_none());
-        assert!(verify_shared_tree(
-            &root,
-            &SharedTreeRef {
-                scope: scope.clone(),
-                manifest_sha256: sha256(&manifest),
-            }
-        )
-        .is_err());
+        assert!(
+            verify_shared_tree(
+                &root,
+                &SharedTreeRef {
+                    scope: scope.clone(),
+                    manifest_sha256: sha256(&manifest),
+                }
+            )
+            .is_err()
+        );
     }
 
     /// Concurrent publishers of one tree converge on one ref with no staging
@@ -1547,13 +1553,15 @@ mod tests {
         fs::set_permissions(&blob, fs::Permissions::from_mode(0o600)).unwrap();
         fs::write(&blob, b"drifted\n").unwrap();
         fs::set_permissions(&blob, fs::Permissions::from_mode(0o400)).unwrap();
-        assert!(import_shared_tree(
-            &root,
-            &scope,
-            second_home.path(),
-            Path::new("assets/runtime")
-        )
-        .is_err());
+        assert!(
+            import_shared_tree(
+                &root,
+                &scope,
+                second_home.path(),
+                Path::new("assets/runtime")
+            )
+            .is_err()
+        );
         let container = root.join("trees").join(&scope);
         let names: Vec<_> = fs::read_dir(&container)
             .unwrap()

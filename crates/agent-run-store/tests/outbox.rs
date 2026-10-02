@@ -2,10 +2,10 @@
 
 mod common;
 
-use agent_run_domain::domain::{OrchestratorRef, Outcome};
 use agent_run_domain::Error;
+use agent_run_domain::domain::{OrchestratorRef, Outcome};
 use agent_run_platform::{fs, verify};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 
 /// Creates one admitted agent for an outbox scenario.
@@ -106,10 +106,12 @@ fn python_test_state_outbox_claim_reclaims_expired_lease_once() {
         .unwrap();
     assert_eq!(first["id"], delivery);
     assert_eq!(first["attempts"], 1);
-    assert!(store
-        .claim_delivery("worker-2", 14.0, 10.0)
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .claim_delivery("worker-2", 14.0, 10.0)
+            .unwrap()
+            .is_none()
+    );
     assert!(matches!(
         store.complete_delivery(&delivery, "worker-1", 15.0, None, false, None),
         Err(Error::Validation(_))
@@ -119,13 +121,17 @@ fn python_test_state_outbox_claim_reclaims_expired_lease_once() {
         .unwrap()
         .unwrap();
     assert_eq!(reclaimed["attempts"], 2);
-    assert!(store
-        .claim_delivery("worker-3", 15.0, 10.0)
-        .unwrap()
-        .is_none());
-    assert!(store
-        .complete_delivery(&delivery, "worker-1", 16.0, None, false, None)
-        .is_err());
+    assert!(
+        store
+            .claim_delivery("worker-3", 15.0, 10.0)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .complete_delivery(&delivery, "worker-1", 16.0, None, false, None)
+            .is_err()
+    );
     store
         .complete_delivery(&delivery, "worker-2", 16.0, Some("remote-1"), false, None)
         .unwrap();
@@ -155,9 +161,11 @@ fn python_test_state_outbox_retry_backoff_and_cancellation_preserve_terminal_res
     assert!(store.claim_delivery("worker", 6.9, 10.0).unwrap().is_none());
     let retried = store.claim_delivery("worker", 7.0, 10.0).unwrap().unwrap();
     assert_eq!(retried["attempts"], 2);
-    assert!(store
-        .cancel_delivery(retried["id"].as_str().unwrap())
-        .unwrap());
+    assert!(
+        store
+            .cancel_delivery(retried["id"].as_str().unwrap())
+            .unwrap()
+    );
     assert_eq!(store.get(&id).unwrap().status.as_str(), "succeeded");
     assert_eq!(
         store
@@ -170,10 +178,12 @@ fn python_test_state_outbox_retry_backoff_and_cancellation_preserve_terminal_res
             .unwrap(),
         1
     );
-    assert!(store
-        .claim_delivery("other", 1000.0, 10.0)
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .claim_delivery("other", 1000.0, 10.0)
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// Mirrors `tests/test_state_outbox.py::test_delivery_attempt_evidence_is_immutable_and_latest_is_validated`.
@@ -221,12 +231,16 @@ fn python_test_state_outbox_failure_requires_a_live_owned_lease() {
     let (_, delivery) = bound_delivery(&home);
     let mut store = home.store();
     store.claim_delivery("worker-1", 5.0, 10.0).unwrap();
-    assert!(store
-        .fail_delivery(&delivery, "worker-2", "wrong owner", 6.0, false, None)
-        .is_err());
-    assert!(store
-        .fail_delivery(&delivery, "worker-1", "expired", 15.0, false, None)
-        .is_err());
+    assert!(
+        store
+            .fail_delivery(&delivery, "worker-2", "wrong owner", 6.0, false, None)
+            .is_err()
+    );
+    assert!(
+        store
+            .fail_delivery(&delivery, "worker-1", "expired", 15.0, false, None)
+            .is_err()
+    );
     let unchanged: (String, Option<String>, i64, Option<String>) = store
         .conn
         .query_row(
@@ -264,19 +278,27 @@ fn python_test_state_outbox_context_receipt_changes_only_changed_keys() {
             5.0,
         )
         .unwrap();
-    assert!(store
-        .record_context_receipt(&session, "first", 6.0)
-        .unwrap());
-    assert!(!store
-        .record_context_receipt(&session, "first", 7.0)
-        .unwrap());
+    assert!(
+        store
+            .record_context_receipt(&session, "first", 6.0)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .record_context_receipt(&session, "first", 7.0)
+            .unwrap()
+    );
     assert_eq!(store.conn.query_row("SELECT context_key,injected_at FROM context_receipts WHERE orchestrator_session_id=?", [&session], |row| Ok((row.get::<_,String>(0)?,row.get::<_,f64>(1)?))).unwrap(), ("first".into(), 6.0));
-    assert!(store
-        .record_context_receipt(&session, "second", 8.0)
-        .unwrap());
-    assert!(store
-        .record_context_receipt("unknown-session", "key", 9.0)
-        .is_err());
+    assert!(
+        store
+            .record_context_receipt(&session, "second", 8.0)
+            .unwrap()
+    );
+    assert!(
+        store
+            .record_context_receipt("unknown-session", "key", 9.0)
+            .is_err()
+    );
 }
 
 /// Mirrors `tests/test_state_outbox.py::test_context_receipt_for_ref_creates_and_reuses_session`.

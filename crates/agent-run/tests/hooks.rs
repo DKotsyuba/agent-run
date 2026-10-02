@@ -7,7 +7,7 @@ use agent_run::{
     state::Store,
 };
 use clap::Parser;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     io::Write,
     path::Path,
@@ -130,10 +130,12 @@ fn python_hook_bind_reads_raw_json_stdin_and_is_idempotent() {
     let second = hook(home.path(), "bind", payload);
     assert_eq!(first["hookSpecificOutput"]["hookEventName"], "PostToolUse");
     assert_eq!(first, second);
-    assert!(first["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .expect("message")
-        .contains("is bound"));
+    assert!(
+        first["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("message")
+            .contains("is bound")
+    );
 }
 
 /// Mirrors Python `test_context_hook.py::test_first_prompt_creates_receipt_dedups_and_reuses_later_binding`.
@@ -147,9 +149,11 @@ fn python_hook_context_injects_once_then_returns_an_empty_object() {
         first["hookSpecificOutput"]["hookEventName"],
         "UserPromptSubmit"
     );
-    assert!(first["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .expect("context")
-        .starts_with("Runtime priorities (highest first)."));
+    assert!(
+        first["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("context")
+            .starts_with("Runtime priorities (highest first).")
+    );
     assert_eq!(second, json!({}));
 }

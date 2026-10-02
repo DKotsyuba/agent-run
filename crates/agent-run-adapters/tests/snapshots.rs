@@ -172,10 +172,12 @@ fn runtime_index_detects_an_entire_missing_snapshot_root() {
     stdfs::remove_dir_all(home.join("skills/demo")).unwrap();
     let inspection = snapshot_tree::inspect_runtime_snapshots(&home, "files-1", &digest).unwrap();
     assert!(!inspection.verified);
-    assert!(inspection
-        .missing
-        .iter()
-        .any(|path| path == "skills/demo/.agent-run-snapshot.json"));
+    assert!(
+        inspection
+            .missing
+            .iter()
+            .any(|path| path == "skills/demo/.agent-run-snapshot.json")
+    );
 }
 
 /// Mirrors `tests/test_snapshots.py::ManagedSnapshotTests::test_runtime_index_binds_each_root_manifest_revision`
@@ -192,10 +194,12 @@ fn runtime_index_binds_each_root_manifest_revision() {
     stdfs::write(home.join(RUNTIME_SNAPSHOT_INDEX), finalized).unwrap();
     let inspection = snapshot_tree::inspect_runtime_snapshots(&home, "files-1", &digest).unwrap();
     assert!(!inspection.verified);
-    assert!(inspection
-        .hash_mismatches
-        .iter()
-        .any(|path| path == "skills/demo/.agent-run-snapshot.json"));
+    assert!(
+        inspection
+            .hash_mismatches
+            .iter()
+            .any(|path| path == "skills/demo/.agent-run-snapshot.json")
+    );
 }
 
 /// Mirrors `tests/test_snapshots.py::ManagedSnapshotTests::test_symlinked_manifest_is_a_type_mismatch`
@@ -210,14 +214,18 @@ fn symlinked_manifest_is_a_type_mismatch() {
     stdfs::remove_file(&manifest).unwrap();
     std::os::unix::fs::symlink(source.join("SKILL.md"), &manifest).unwrap();
     let inspection = snapshot_tree::inspect_runtime_snapshots(&home, "files-1", &digest).unwrap();
-    assert!(inspection
-        .type_mismatches
-        .iter()
-        .any(|path| path == "skills/demo/.agent-run-snapshot.json"));
-    assert!(!inspection
-        .missing
-        .iter()
-        .any(|path| path == "skills/demo/.agent-run-snapshot.json"));
+    assert!(
+        inspection
+            .type_mismatches
+            .iter()
+            .any(|path| path == "skills/demo/.agent-run-snapshot.json")
+    );
+    assert!(
+        !inspection
+            .missing
+            .iter()
+            .any(|path| path == "skills/demo/.agent-run-snapshot.json")
+    );
 }
 
 /// Mirrors `tests/test_snapshots.py::ManagedSnapshotTests::test_flat_file_classification_never_follows_an_intermediate_symlink`
@@ -240,14 +248,18 @@ fn flat_file_classification_never_follows_an_intermediate_symlink() {
     stdfs::write(outside.join("settings.json"), "outside").unwrap();
     std::os::unix::fs::symlink(&outside, home.join("nested")).unwrap();
     let inspection = snapshot_tree::inspect_runtime_snapshots(&home, "files-1", &digest).unwrap();
-    assert!(inspection
-        .type_mismatches
-        .iter()
-        .any(|path| path == "nested/settings.json"));
-    assert!(!inspection
-        .missing
-        .iter()
-        .any(|path| path == "nested/settings.json"));
+    assert!(
+        inspection
+            .type_mismatches
+            .iter()
+            .any(|path| path == "nested/settings.json")
+    );
+    assert!(
+        !inspection
+            .missing
+            .iter()
+            .any(|path| path == "nested/settings.json")
+    );
 }
 
 /// Mirrors `tests/test_snapshots.py::ManagedSnapshotTests::test_runtime_hash_reader_rejects_incomplete_index_shape`
@@ -260,11 +272,10 @@ fn runtime_hash_reader_rejects_incomplete_index_shape() {
         "{\"materialize_revision\":\"files-1\"}\n",
     )
     .unwrap();
-    assert!(snapshot_tree::runtime_snapshot_index_sha256(
-        &temporary.path().join("home"),
-        "files-1"
-    )
-    .is_err());
+    assert!(
+        snapshot_tree::runtime_snapshot_index_sha256(&temporary.path().join("home"), "files-1")
+            .is_err()
+    );
 }
 
 /// Mirrors `test_snapshots.py::test_interrupted_metadata_and_recovery_states_never_verify`.
@@ -589,13 +600,13 @@ mod shared_bridge {
 
     /// Restores owner write permission below one fixture tree.
     fn permit_tree(path: &Path) {
-        if let Ok(metadata) = stdfs::symlink_metadata(path) {
-            if metadata.is_dir() {
-                let _ = stdfs::set_permissions(path, stdfs::Permissions::from_mode(0o700));
-                if let Ok(children) = stdfs::read_dir(path) {
-                    for child in children.flatten() {
-                        permit_tree(&child.path());
-                    }
+        if let Ok(metadata) = stdfs::symlink_metadata(path)
+            && metadata.is_dir()
+        {
+            let _ = stdfs::set_permissions(path, stdfs::Permissions::from_mode(0o700));
+            if let Ok(children) = stdfs::read_dir(path) {
+                for child in children.flatten() {
+                    permit_tree(&child.path());
                 }
             }
         }

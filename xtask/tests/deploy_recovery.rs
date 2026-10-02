@@ -18,8 +18,8 @@
 //! `xtask::deploy::quiescent` opens, and the same PID/birth-time verdicts are
 //! available through `agent_run_platform::process::observe`.
 
-use agent_run_platform::process::{inspect, ProcessState};
-use rusqlite::{params, Connection};
+use agent_run_platform::process::{ProcessState, inspect};
+use rusqlite::{Connection, params};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
@@ -457,8 +457,7 @@ fn t84_db_busy_retains_prepared_phase_and_lock_next_operation() {
         .count();
     let candidate_manifest = fs::read(new.join("SHA256SUMS")).expect("candidate manifest");
 
-    let expected =
-        "next operation: release the SQLite lock held by another writer, then rerun `release deploy`";
+    let expected = "next operation: release the SQLite lock held by another writer, then rerun `release deploy`";
     let error = deploy::deploy(&prefix, &home, &new, false).expect_err("locked DB must refuse");
     assert!(
         error.contains("database is locked"),
@@ -504,8 +503,7 @@ fn t84_db_busy_retains_prepared_phase_and_lock_next_operation() {
 fn t84_missing_release_asset_retains_prepared_phase_and_asset_next_operation() {
     let (_temporary, prefix, home, old, new) = cutover_fixture_for_recovery();
     fs::remove_file(new.join("bin/agent-run")).expect("remove named release asset");
-    let expected =
-        "next operation: restore the named asset or rebuild the sealed candidate, then rerun `release deploy`";
+    let expected = "next operation: restore the named asset or rebuild the sealed candidate, then rerun `release deploy`";
     let error = deploy::deploy(&prefix, &home, &new, false).expect_err("missing asset must refuse");
     assert!(error.contains("candidate release is missing asset bin/agent-run"));
     assert!(
@@ -541,8 +539,7 @@ fn t84_permission_denied_release_asset_retains_prepared_phase_and_permission_nex
     let complete = new.join("COMPLETE");
     fs::set_permissions(&complete, fs::Permissions::from_mode(0o000))
         .expect("deny candidate asset read permission");
-    let expected =
-        "next operation: restore read permission on the named candidate asset, then rerun `release deploy`";
+    let expected = "next operation: restore read permission on the named candidate asset, then rerun `release deploy`";
     let error = deploy::deploy(&prefix, &home, &new, false)
         .expect_err("permission-denied asset must refuse");
     assert!(error.contains("candidate release asset access was denied"));

@@ -2,11 +2,11 @@
 
 use crate::Store;
 use agent_run_domain::{
+    CredentialRef, Result,
     catalog::{AccountId, AccountRecord, AccountStatus, AuthFamily, SecretRef},
     error::invalid,
-    CredentialRef, Result,
 };
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use std::str::FromStr;
 
 /// Decodes one trusted registry row into validated public identity types.

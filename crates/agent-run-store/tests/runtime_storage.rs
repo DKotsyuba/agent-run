@@ -2,12 +2,12 @@
 
 mod common;
 
-use agent_run_domain::{domain::Outcome, Error};
+use agent_run_domain::{Error, domain::Outcome};
 use agent_run_store::{
-    runtime_storage::{LayoutState, RuntimeStorageLayout},
     Store,
+    runtime_storage::{LayoutState, RuntimeStorageLayout},
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// A canonical version-1 layout for `home` mapping the given managed roots.
 fn layout(home: &str, roots: Value) -> String {
@@ -85,10 +85,12 @@ fn invalid_layouts_are_refused() {
             matches!(error, Error::Validation(ref message) if !message.is_empty()),
             "{bad}: {error:?}"
         );
-        assert!(store
-            .runtime_storage_layout("/runtime/alpha")
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .runtime_storage_layout("/runtime/alpha")
+                .unwrap()
+                .is_none()
+        );
     }
     // The one valid form is accepted and parses back to its own contract.
     let record = store.prepare_runtime_storage_layout(&valid, None).unwrap();
@@ -508,10 +510,12 @@ fn rows_survive_history_and_removal_requires_no_references() {
         matches!(&refused, Error::Validation(message) if message.contains("still referenced")),
         "{refused:?}"
     );
-    assert!(blocked
-        .runtime_storage_layout(&runtime_home)
-        .unwrap()
-        .is_some());
+    assert!(
+        blocked
+            .runtime_storage_layout(&runtime_home)
+            .unwrap()
+            .is_some()
+    );
     // Once the last reference is gone the explicit removal succeeds once.
     blocked
         .conn
@@ -519,10 +523,12 @@ fn rows_survive_history_and_removal_requires_no_references() {
         .unwrap();
     assert!(store.remove_runtime_storage_layout(&runtime_home).unwrap());
     assert!(!store.remove_runtime_storage_layout(&runtime_home).unwrap());
-    assert!(store
-        .runtime_storage_layout(&runtime_home)
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .runtime_storage_layout(&runtime_home)
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// Counts all agent rows in the store.

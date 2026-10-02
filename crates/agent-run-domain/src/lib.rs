@@ -24,10 +24,10 @@ pub use catalog::{
 };
 pub use credential_ref::CredentialRef;
 pub use error::{Error, MachineCode, ProtocolMapping, PublicError, Result};
-pub use fsm::{validate_transition, ACTIVE, TERMINAL};
+pub use fsm::{ACTIVE, TERMINAL, validate_transition};
 pub use provider_start::ProviderStartRequest;
 pub use tools::{
-    is_tool, registry, tool, tools_json, ArgumentDefault, ArgumentDefinition, ToolDefinition,
+    ArgumentDefault, ArgumentDefinition, ToolDefinition, is_tool, registry, tool, tools_json,
 };
 pub use types::{
     AbsoluteDirectory, AccountLabel, AccountSelector, GlobalAccount, NonNegativeFinite,

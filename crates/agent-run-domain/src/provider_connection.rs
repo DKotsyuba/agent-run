@@ -1,6 +1,6 @@
 //! Native and custom provider transport identities, with gateway validation.
 
-use crate::{catalog::HarnessId, error::invalid, Result};
+use crate::{Result, catalog::HarnessId, error::invalid};
 use serde::{Deserialize, Serialize};
 use url::Url;
 

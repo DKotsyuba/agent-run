@@ -2,13 +2,13 @@
 //! finished sessions hidden behind a dropdown.
 
 use super::theme;
-use crate::app::{human_duration, status_pictogram, App};
+use crate::app::{App, human_duration, status_pictogram};
 use ratatui::{
+    Frame,
     layout::Rect,
     style::Style,
     text::{Line, Span},
     widgets::Paragraph,
-    Frame,
 };
 
 /// Card height in rows: one padding row on each side plus five content rows

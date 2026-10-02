@@ -5,7 +5,7 @@
 //! recorded, sanitized rows without Docker or credentials.
 
 use super::{Key, Sample};
-use crate::{domain::now, error::invalid, Error, Result};
+use crate::{Error, Result, domain::now, error::invalid};
 use serde_json::Value;
 use std::path::Path;
 

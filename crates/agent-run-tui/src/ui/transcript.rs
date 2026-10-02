@@ -13,14 +13,14 @@
 //! scroll offsets and click mapping can never drift from what is on screen.
 
 use super::theme;
-use crate::app::{status_label, status_pictogram, App, TranscriptBuffer};
+use crate::app::{App, TranscriptBuffer, status_label, status_pictogram};
 use agent_run_domain::views::MessageView;
 use ratatui::{
+    Frame,
     layout::Rect,
     style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
-    Frame,
 };
 
 /// A coalesced run of same-identity streaming text, one tool call with its
@@ -437,15 +437,15 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             theme::dim(),
         ),
     ];
-    if let Some(silence) = agent.silence_seconds {
-        if !agent.status.terminal() {
-            let warn = silence >= crate::app::SILENCE_WARN_SECONDS;
-            header_line.push(Span::raw(" "));
-            header_line.push(Span::styled(
-                format!("silent {}", crate::app::human_duration(silence)),
-                if warn { theme::warning() } else { theme::dim() },
-            ));
-        }
+    if let Some(silence) = agent.silence_seconds
+        && !agent.status.terminal()
+    {
+        let warn = silence >= crate::app::SILENCE_WARN_SECONDS;
+        header_line.push(Span::raw(" "));
+        header_line.push(Span::styled(
+            format!("silent {}", crate::app::human_duration(silence)),
+            if warn { theme::warning() } else { theme::dim() },
+        ));
     }
     if let Some(failure) = &agent.failure_text {
         header_line.push(Span::raw(" "));

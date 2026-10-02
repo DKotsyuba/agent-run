@@ -245,14 +245,13 @@ impl App {
             })
             .unwrap_or(0);
         self.selected = self.selected.min(cards.len().saturating_sub(1));
-        if let Some(buffer) = &mut self.transcript {
-            if let Some(fresh) = self
+        if let Some(buffer) = &mut self.transcript
+            && let Some(fresh) = self
                 .sessions
                 .iter()
                 .find(|agent| agent.agent_id == buffer.agent.agent_id)
-            {
-                buffer.agent = fresh.clone();
-            }
+        {
+            buffer.agent = fresh.clone();
         }
     }
 
@@ -265,10 +264,10 @@ impl App {
     /// Merges one transcript page into the open buffer when it still belongs
     /// to the selected session.
     pub fn apply_transcript(&mut self, agent_id: &AgentId, page: &TranscriptPage) {
-        if let Some(buffer) = &mut self.transcript {
-            if buffer.agent.agent_id == *agent_id {
-                buffer.merge(page);
-            }
+        if let Some(buffer) = &mut self.transcript
+            && buffer.agent.agent_id == *agent_id
+        {
+            buffer.merge(page);
         }
     }
 

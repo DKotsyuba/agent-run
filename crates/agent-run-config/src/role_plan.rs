@@ -17,9 +17,9 @@ use crate::{
     profiles::{self, Profile},
 };
 use agent_run_domain::{
-    canonical, catalog::ResolvedLaunchAuthority, error::invalid, Result, Sha256Digest,
+    Result, Sha256Digest, canonical, catalog::ResolvedLaunchAuthority, error::invalid,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Component, Path, PathBuf},
@@ -347,7 +347,7 @@ impl ResolvedRolePlan {
                     _ => {
                         return Err(invalid(format!(
                             "resolved role mcp[{index}] selection is invalid"
-                        )))
+                        )));
                     }
                 },
                 None => McpSelectionSource::Profile,
@@ -408,10 +408,10 @@ impl ResolvedRolePlan {
         {
             return Err(invalid("resolved role auth choice is invalid"));
         }
-        if let Some(reference) = &auth_reference {
-            if !crate::config::account(reference) {
-                return Err(invalid("resolved role auth reference is invalid"));
-            }
+        if let Some(reference) = &auth_reference
+            && !crate::config::account(reference)
+        {
+            return Err(invalid("resolved role auth reference is invalid"));
         }
 
         let role_name = text(&document["role_name"], "resolved role role_name", false)?.to_string();

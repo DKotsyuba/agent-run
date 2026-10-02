@@ -101,7 +101,8 @@ async fn broker_expires_old_history_on_startup() {
         assert!(
             tokio::time::Instant::now() < deadline,
             "broker did not expire history and filesystem artifacts: samples={count} runs={remaining} daily_log={} config={}",
-            old_log.exists(),temp.path().join("config.toml").exists()
+            old_log.exists(),
+            temp.path().join("config.toml").exists()
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

@@ -16,7 +16,7 @@
 //! lifecycle — each recognized call has a nonempty unique id, each result
 //! answers exactly one earlier pending call, and no call is left pending.
 
-use crate::{fs, Error, Result};
+use crate::{Error, Result, fs};
 use agent_run_domain::catalog::HarnessId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -253,13 +253,13 @@ fn lifecycle<'a>(tools: impl Iterator<Item = Tool<'a>>) -> Result<()> {
                 _ => {
                     return Err(unavailable(
                         "native history has a tool result without an earlier pending call",
-                    ))
+                    ));
                 }
             },
             _ => {
                 return Err(unavailable(
                     "native history has a tool record without an id",
-                ))
+                ));
             }
         }
     }
@@ -331,7 +331,7 @@ fn prove(harness: HarnessId, root: &Path, session: &str) -> Result<HistorySeal> 
 
 #[cfg(test)]
 mod tests {
-    use super::{prove, HarnessId};
+    use super::{HarnessId, prove};
     use std::fs;
 
     /// Writes one Codex rollout for `session` with `body` records.
@@ -417,32 +417,38 @@ mod tests {
     fn tool_lifecycles_are_chronological_and_unambiguous() {
         let temp = tempfile::tempdir().unwrap();
         let meta = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\"}}\n";
-        let item = |kind: &str, id: Option<&str>| {
-            match id {
-            Some(id) => format!("{{\"type\":\"response_item\",\"payload\":{{\"type\":\"{kind}\",\"call_id\":\"{id}\"}}}}\n"),
+        let item = |kind: &str, id: Option<&str>| match id {
+            Some(id) => format!(
+                "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"{kind}\",\"call_id\":\"{id}\"}}}}\n"
+            ),
             None => format!("{{\"type\":\"response_item\",\"payload\":{{\"type\":\"{kind}\"}}}}\n"),
-        }
         };
         let codex = |body: String| {
             rollout(temp.path(), "s1", &format!("{meta}{body}"));
             prove(HarnessId::Codex, temp.path(), "s1")
         };
-        assert!(codex(
-            item("custom_tool_call", Some("a")) + &item("custom_tool_call_output", Some("a"))
-        )
-        .is_ok());
-        assert!(codex(
-            item("function_call", Some("a"))
-                + &item("function_call", Some("a"))
-                + &item("function_call_output", Some("a"))
-        )
-        .is_err());
-        assert!(codex(
-            item("function_call", Some("a"))
-                + &item("function_call_output", Some("a"))
-                + &item("function_call_output", Some("a"))
-        )
-        .is_err());
+        assert!(
+            codex(
+                item("custom_tool_call", Some("a")) + &item("custom_tool_call_output", Some("a"))
+            )
+            .is_ok()
+        );
+        assert!(
+            codex(
+                item("function_call", Some("a"))
+                    + &item("function_call", Some("a"))
+                    + &item("function_call_output", Some("a"))
+            )
+            .is_err()
+        );
+        assert!(
+            codex(
+                item("function_call", Some("a"))
+                    + &item("function_call_output", Some("a"))
+                    + &item("function_call_output", Some("a"))
+            )
+            .is_err()
+        );
         assert!(codex(item("function_call", None) + &item("function_call_output", None)).is_err());
         assert!(
             codex(item("function_call", Some("")) + &item("function_call_output", Some("")))

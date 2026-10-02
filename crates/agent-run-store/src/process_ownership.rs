@@ -1,9 +1,9 @@
 //! Durable process membership shared by harness attempts and broker service generations.
 
 use crate::Store;
-use agent_run_domain::{domain::now, error::invalid, Error, Result};
+use agent_run_domain::{Error, Result, domain::now, error::invalid};
 use agent_run_platform::process::{Identity, OwnedProcess, OwnershipSnapshot};
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 /// Validates attempt, service and temporary readiness-probe ownership; identifiers are SQL parameters.
 fn validate_owner(kind: &str, id: &str) -> Result<()> {

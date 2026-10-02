@@ -7,7 +7,7 @@
 
 use agent_run::transport::socket::BrokerClient;
 use agent_run_domain::views::{AgentPage, AnswerView, TranscriptPage};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc};
 
 /// Upper bound of one transcript page accepted from the broker.

@@ -1,19 +1,20 @@
-use crate::{commands, journal};
 use crate::{
+    Result,
     config::{Adapter, Config, Runtime},
     domain::{AgentId, Outcome, Status},
     error::invalid,
     profiles::Profile,
     state::{Record, Store},
-    verify, Result,
+    verify,
 };
+use crate::{commands, journal};
 use agent_run_adapters::{
+    EngineResult, LaunchPlan,
     io::{Event, Process},
     materialize::Snapshot,
     redact::StreamingRedactor,
-    EngineResult, LaunchPlan,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
 
 /// Flushes the unresolved suffix of one assistant message only after applying

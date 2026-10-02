@@ -1,20 +1,19 @@
 //! Atomic first-attempt admission from trusted provider quota candidates.
 
-use crate::{admission, lineage, tx_event, Record, Store, ACTIVE_SQL};
+use crate::{ACTIVE_SQL, Record, Store, admission, lineage, tx_event};
 use agent_run_domain::{
-    canonical,
+    Error, ProviderStartRequest, Result, canonical,
     catalog::{
         AccountId, AttemptCredentials, ProviderCatalog, QuotaAdmissionError, QuotaCandidateSet,
         ResolvedLaunchAuthority, SelectionIntent,
     },
-    domain::{now, AgentId, StartRequest, Status},
+    domain::{AgentId, StartRequest, Status, now},
     error::invalid,
-    Error, ProviderStartRequest, Result,
 };
 use agent_run_platform::process;
 use agent_run_platform::process::{Cleanup, Identity};
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
-use serde_json::{json, Value};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use serde_json::{Value, json};
 
 /// One durable first-attempt selection, including an idempotent replay.
 #[derive(Debug, Clone)]
@@ -346,17 +345,16 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let session = admission::replay_session(&tx, effective)?;
-        if effective.orchestrator.is_none() || session.is_some() {
-            if let Some(found) =
+        if (effective.orchestrator.is_none() || session.is_some())
+            && let Some(found) =
                 admission::replay_in_transaction(&tx, effective, session.as_deref())?
-            {
-                if found.parent_agent_id.as_ref() != resume.map(|resume| resume.parent) {
-                    return Err(Error::Conflict);
-                }
-                let replay = replayed(&tx, &found, request)?;
-                tx.commit()?;
-                return Ok(replay);
+        {
+            if found.parent_agent_id.as_ref() != resume.map(|resume| resume.parent) {
+                return Err(Error::Conflict);
             }
+            let replay = replayed(&tx, &found, request)?;
+            tx.commit()?;
+            return Ok(replay);
         }
         let lineage = match resume {
             Some(resume) => {

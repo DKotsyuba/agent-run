@@ -441,12 +441,12 @@ pub fn recover(prefix: &Path, home: &Path, force: bool) -> Result<(), String> {
     let new_schema = journal["new_schema"]
         .as_u64()
         .ok_or("journal has no new schema evidence")?;
-    if let Some(schema) = schema {
-        if schema > new_schema {
-            return Err(format!(
-                "database schema {schema} is newer than recovery target {new_schema}"
-            ));
-        }
+    if let Some(schema) = schema
+        && schema > new_schema
+    {
+        return Err(format!(
+            "database schema {schema} is newer than recovery target {new_schema}"
+        ));
     }
     let compatible = match (schema, old.as_ref(), old_schema) {
         (Some(schema), Some(_old), Some(old_schema)) if schema > old_schema => target.clone(),
@@ -525,7 +525,7 @@ pub fn rollback(prefix: &Path, home: &Path, force: bool) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{deploy, deploy_with_failure, recover, roll_forward, rollback, CutoverStage};
+    use super::{CutoverStage, deploy, deploy_with_failure, recover, roll_forward, rollback};
     use crate::{release, release::build};
     use rusqlite::Connection;
     use std::fs;

@@ -6,7 +6,7 @@ use agent_run::{
     service::{Query, Service},
     transport::{frame, socket},
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, BufReader};
 fn service() -> Service {
     Service::new(std::path::PathBuf::from(
@@ -168,24 +168,30 @@ fn list_query_bounds_reject_nonfinite_or_negative_waits() {
         (decoded.after_revision, decoded.wait_seconds, decoded.limit),
         (Some(12), 1.5, 7)
     );
-    assert!(Query {
-        wait_seconds: f64::NAN,
-        ..Query::default()
-    }
-    .validate()
-    .is_err());
-    assert!(Query {
-        wait_seconds: -1.0,
-        ..Query::default()
-    }
-    .validate()
-    .is_err());
-    assert!(Query {
-        limit: 1001,
-        ..Query::default()
-    }
-    .validate()
-    .is_err());
+    assert!(
+        Query {
+            wait_seconds: f64::NAN,
+            ..Query::default()
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        Query {
+            wait_seconds: -1.0,
+            ..Query::default()
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        Query {
+            limit: 1001,
+            ..Query::default()
+        }
+        .validate()
+        .is_err()
+    );
 }
 
 /// Mirrors `test_dispatch.py::test_removed_tools_are_rejected`.
@@ -242,13 +248,17 @@ async fn doc_dispatch_returns_the_index_and_requested_topic() {
         .await
         .expect("models document");
     assert_eq!(index["topic"], "index");
-    assert!(index["text"]
-        .as_str()
-        .is_some_and(|text| text.contains("agent-run")));
+    assert!(
+        index["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("agent-run"))
+    );
     assert_eq!(models["topic"], "models");
-    assert!(models["text"]
-        .as_str()
-        .is_some_and(|text| text.contains("claude, codex, and glm")));
+    assert!(
+        models["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("claude, codex, and glm"))
+    );
 }
 
 /// Mirrors `test_doc.py::test_doc_tool_call_rejects_unknown_topic`.
@@ -276,14 +286,16 @@ fn start_tool_description_embeds_the_completion_contract() {
         .expect("start tool");
     let description = start["description"].as_str().expect("description text");
     assert!(description.starts_with("Start one asynchronous durable agent."));
-    assert!(description.contains(
-        dispatch::doc("completion")
-            .expect("completion contract")
-            .split("\n## Stable agent and execution ids")
-            .next()
-            .unwrap()
-            .trim_end()
-    ));
+    assert!(
+        description.contains(
+            dispatch::doc("completion")
+                .expect("completion contract")
+                .split("\n## Stable agent and execution ids")
+                .next()
+                .unwrap()
+                .trim_end()
+        )
+    );
     for field in ["- ID:", "- Status:", "- Runtime/model:", "- Notice:"] {
         assert!(description.contains(field), "missing {field}");
     }
@@ -306,10 +318,12 @@ async fn socket_wait_rejects_nonpositive_timeouts_before_store_access() {
 }
 #[tokio::test]
 async fn huge_wait_is_rejected_without_panicking_or_opening_state() {
-    assert!(service()
-        .wait(&AgentId::new(), Some(f64::MAX))
-        .await
-        .is_err());
+    assert!(
+        service()
+            .wait(&AgentId::new(), Some(f64::MAX))
+            .await
+            .is_err()
+    );
 }
 fn notice() -> Notice {
     Notice {

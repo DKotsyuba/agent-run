@@ -29,14 +29,14 @@
 //! Option<&str> pin label, &BTreeSet<AccountId> hard-ineligible)` again and
 //! resubmitting; this helper never admits, reserves, or replays.
 
-use super::{forecast, ranking, Key, Pool, Route, Sample};
-use crate::{domain::now, error::invalid, state::Store, Result};
+use super::{Key, Pool, Route, Sample, forecast, ranking};
+use crate::{Result, domain::now, error::invalid, state::Store};
 use agent_run_domain::{
+    ProviderId,
     catalog::{
         AccountId, AccountStatus, PhysicalQuotaKey, ProviderCatalog, ProviderDefinition,
         ProviderModel, QuotaAdmissionError, QuotaCandidate, QuotaCandidateSet, SelectionIntent,
     },
-    ProviderId,
 };
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;

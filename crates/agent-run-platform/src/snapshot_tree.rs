@@ -10,8 +10,8 @@ use crate::{
     publish::{self, Entry},
     shared_assets,
 };
-use agent_run_domain::{canonical, error::invalid, Error, Result};
-use serde_json::{json, Map, Value};
+use agent_run_domain::{Error, Result, canonical, error::invalid};
+use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -778,11 +778,11 @@ fn inspect_runtime_index(
         None => None,
     };
     for root in roots {
-        if let Some((store_root, map)) = shared_index {
-            if let Some(reference) = map.get(&root) {
-                shared_assets::verify_shared_tree(store_root, reference)?;
-                continue;
-            }
+        if let Some((store_root, map)) = shared_index
+            && let Some(reference) = map.get(&root)
+        {
+            shared_assets::verify_shared_tree(store_root, reference)?;
+            continue;
         }
         let manifest_path = format!("{root}/{SNAPSHOT_MANIFEST}");
         match Dir::open(&home.join(&root))

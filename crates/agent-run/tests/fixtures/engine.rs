@@ -1,6 +1,6 @@
 //! Offline fake engine. It neither contacts a provider nor executes task text.
 //! Only explicit fixture-mode keywords change deterministic test behavior.
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::time::Duration;
 fn emit(value: Value) {

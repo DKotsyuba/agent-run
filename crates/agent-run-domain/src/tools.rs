@@ -2,7 +2,7 @@
 
 use crate::MachineCode;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::OnceLock;
 
 /// A public tool as represented by the Python-compatible discovery payload.

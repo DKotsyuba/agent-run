@@ -20,7 +20,7 @@
 //! content-keyed FILE object inside the caller-owned shared store at
 //! `<store>/native-cache/<scope>/<content-sha256>` — one fixed namespace
 //! beside `trees/`, `blobs/` and `plugin-views/`, under the same
-//! [`SharedStoreLock`] and the same guard that protects those. `<scope>` is
+//! `SharedStoreLock` and the same guard that protects those. `<scope>` is
 //! the SHA-256 of the exact preimage `native-cache-v1\n<cache dir>\n<schema>
 //! \n<identity file>\n<effective uid>\n<compatibility domain>`, so payloads
 //! never alias across file kind, native disk schema, native identity,
@@ -55,13 +55,13 @@
 //! references with explicit complete/incomplete evidence: a scan that meets
 //! I/O trouble, a bound, or a drifted or dangling in-namespace link is
 //! `complete == false` — never an empty success — and
-//! [`deletion_candidates`] returns nothing from incomplete evidence. This
+//! `deletion_candidates` returns nothing from incomplete evidence. This
 //! unit never deletes anything; collection is a later integration that
 //! consumes these censuses.
 
-use crate::{fs, Result};
-use agent_run_domain::{canonical::hex_digest, error::invalid, Error};
-use agent_run_platform::shared_assets::{is_scope, SharedStoreLock, TEMP_PREFIX, TEMP_SUFFIX};
+use crate::{Result, fs};
+use agent_run_domain::{Error, canonical::hex_digest, error::invalid};
+use agent_run_platform::shared_assets::{SharedStoreLock, TEMP_PREFIX, TEMP_SUFFIX, is_scope};
 use agent_run_platform::snapshot_tree::RUNTIME_SNAPSHOT_INDEX;
 use serde::Serialize;
 use serde_json::Value;
@@ -192,7 +192,7 @@ pub struct NativeCacheDomain {
     /// and store object must be owned by it.
     effective_uid: u32,
     /// Trusted endpoint/harness compatibility label; non-empty, at most
-    /// [`MAX_DOMAIN_BYTES`] UTF-8 bytes.
+    /// `MAX_DOMAIN_BYTES` UTF-8 bytes.
     compatibility_domain: String,
 }
 
@@ -202,7 +202,7 @@ impl NativeCacheDomain {
     /// The schema is fixed by `kind` and the effective uid is captured from
     /// the running process, so neither can drift from what the caller
     /// actually runs. Fails when the label is empty or exceeds
-    /// [`MAX_DOMAIN_BYTES`] UTF-8 bytes.
+    /// `MAX_DOMAIN_BYTES` UTF-8 bytes.
     pub fn new(kind: NativeCacheKind, compatibility_domain: impl Into<String>) -> Result<Self> {
         let compatibility_domain = compatibility_domain.into();
         let bytes = compatibility_domain.len();
@@ -606,7 +606,7 @@ fn lower_object_mtime(
 /// any indexed root, flat managed file or managed link overlapping the
 /// cache directory refuses the whole pack, and a symlinked cache path is
 /// refused the same way. Every mutation holds the store-wide
-/// [`SharedStoreLock`]: bytes are published as immutable objects first,
+/// `SharedStoreLock`: bytes are published as immutable objects first,
 /// then the home entry is swapped by one complete temporary symlink
 /// atomically renamed over the original name, so an interrupted or racing
 /// pack always leaves either the original file or the complete shared link
@@ -1418,7 +1418,7 @@ mod tests {
     use agent_run_platform::snapshot_tree;
     use std::{
         fs,
-        os::unix::fs::{symlink, MetadataExt, PermissionsExt},
+        os::unix::fs::{MetadataExt, PermissionsExt, symlink},
         thread,
     };
 
@@ -2427,9 +2427,11 @@ mod tests {
                 0o400
             );
         }
-        assert!(census
-            .objects
-            .contains(&fs::read_link(first.join(TOOLS_CACHE_DIR).join(IDENTITY)).unwrap()));
+        assert!(
+            census
+                .objects
+                .contains(&fs::read_link(first.join(TOOLS_CACHE_DIR).join(IDENTITY)).unwrap())
+        );
 
         // An unreadable scope directory is I/O trouble, not emptiness.
         fs::set_permissions(&first_scope, fs::Permissions::from_mode(0o000)).unwrap();
@@ -2477,9 +2479,11 @@ mod tests {
                 .is_err()
         );
         assert!(domain.scope_digest("nope.json").is_err());
-        assert!(domain
-            .scope_digest("0123456789ABCDEF0123456789abcdef01234567.json")
-            .is_err());
+        assert!(
+            domain
+                .scope_digest("0123456789ABCDEF0123456789abcdef01234567.json")
+                .is_err()
+        );
         assert!(native_cache_object_path(&root, "short", &"0".repeat(64)).is_err());
         let _ = (store, home_dir);
     }

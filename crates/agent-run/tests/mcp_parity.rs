@@ -3,7 +3,7 @@
 //! These tests require Unix sockets because the MCP proxy forwards every tool
 //! call through a temporary resident broker; they never use the owner's socket.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader, Write},
     os::unix::fs::FileTypeExt,
@@ -149,12 +149,11 @@ fn extend_start_description(value: &mut Value) {
                 name @ ("start" | "resume" | "cancel" | "steer" | "answer" | "transcript"
                 | "list_agents" | "models" | "capacity_order"),
             ) = object.get("name").and_then(Value::as_str)
+                && object.contains_key("inputSchema")
             {
-                if object.contains_key("inputSchema") {
-                    let tool = agent_run_domain::tool(name).unwrap();
-                    object.insert("description".into(), tool.description.clone().into());
-                    object.insert("inputSchema".into(), tool.input_schema.clone());
-                }
+                let tool = agent_run_domain::tool(name).unwrap();
+                object.insert("description".into(), tool.description.clone().into());
+                object.insert("inputSchema".into(), tool.input_schema.clone());
             }
             object.values_mut().for_each(extend_start_description);
         }

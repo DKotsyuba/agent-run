@@ -1,6 +1,6 @@
 //! LaunchAgent descriptor parity checks; these never invoke `launchctl`.
 
-use agent_run::{launchd, Error};
+use agent_run::{Error, launchd};
 use std::path::Path;
 use tempfile::tempdir;
 
@@ -155,10 +155,15 @@ fn python_capacity_launchd_plist_is_escaped_bounded_and_one_shot() {
         assert!(plist.contains("<key>StartInterval</key><integer>60</integer>"));
         assert!(plist.contains("<key>RunAtLoad</key><false/>"));
         assert!(!plist.contains("<key>KeepAlive</key>"));
-        assert!(plist
-            .contains("<key>StandardOutPath</key><string>/tmp/capacity&lt;out&gt;.log</string>"));
-        assert!(plist
-            .contains("<key>StandardErrorPath</key><string>/tmp/capacity&amp;err.log</string>"));
+        assert!(
+            plist.contains(
+                "<key>StandardOutPath</key><string>/tmp/capacity&lt;out&gt;.log</string>"
+            )
+        );
+        assert!(
+            plist
+                .contains("<key>StandardErrorPath</key><string>/tmp/capacity&amp;err.log</string>")
+        );
     } else {
         assert!(rendered.is_err(), "Linux must explicitly reject launchd");
     }

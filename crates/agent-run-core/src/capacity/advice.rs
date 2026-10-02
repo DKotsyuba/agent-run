@@ -38,10 +38,10 @@ pub fn build_advice(forecasts: &[Forecast]) -> Vec<CapacityAdvice> {
 
 pub fn capacity_label(key: &Key) -> String {
     let mut parts = vec![format!("{}/{}", key.runtime, key.lane), key.window.clone()];
-    if let Some(target) = &key.target {
-        if !target.is_empty() {
-            parts.push(format!("target={target}"));
-        }
+    if let Some(target) = &key.target
+        && !target.is_empty()
+    {
+        parts.push(format!("target={target}"));
     }
     if !key.source.is_empty() {
         parts.push(format!("source={}", key.source));

@@ -220,10 +220,11 @@ fn claude_launch_is_explicitly_scoped_without_secret_argv() {
         1,
         "the legacy CLI plan must request partial messages exactly once"
     );
-    assert!(plan
-        .initial_input
-        .expect("Claude input")
-        .contains("fixture task"));
+    assert!(
+        plan.initial_input
+            .expect("Claude input")
+            .contains("fixture task")
+    );
 }
 
 /// Mirrors `tests/test_claude_adapter.py::ClaudeAdapterTests::test_declared_plugins_are_loaded_by_path_without_widening_tools`.

@@ -2,7 +2,7 @@
 
 mod common;
 
-use agent_run_adapters::{io::Process, LaunchPlan};
+use agent_run_adapters::{LaunchPlan, io::Process};
 use agent_run_config::{config::Runtime, profiles::Profile};
 use agent_run_core::codex::{self, Grant};
 use agent_run_domain::domain::Status;
@@ -351,11 +351,13 @@ async fn terminal_turn_keeps_redactor_tail_without_item_completion() {
     .unwrap();
     assert_eq!(result.outcome.status, Status::Succeeded);
     let transcript = store.transcript(&id, 0, 10).unwrap();
-    assert!(transcript["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|message| { message["role"] == "assistant" && message["content"] == "Hello" }));
+    assert!(
+        transcript["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| { message["role"] == "assistant" && message["content"] == "Hello" })
+    );
     drop(process.input.take());
     process.reap().await;
 }

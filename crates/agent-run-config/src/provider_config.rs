@@ -7,18 +7,17 @@ use crate::config::{
     self, Capacity, Catalog, Config, Core, Delivery, Environment, Hook, Mcp, RustRoots,
 };
 use agent_run_domain::{
-    canonical,
+    Result, canonical,
     catalog::{
         AccountRecord, AuthFamily, CollectorBinding, HarnessId, LimitsSource, ProviderBinding,
         ProviderCatalog, ProviderConnection, ProviderDefinition, ProviderId, ProviderModel,
     },
     error::invalid,
     types::PositiveFinite,
-    Result,
 };
 use agent_run_platform::fs;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -365,7 +364,9 @@ impl ProviderConfig {
                 provider.limits_source,
                 LimitsSource::Lua | LimitsSource::CodexAppserver
             ) {
-                return Err(invalid("built-in quota collectors are retired; configure limits_source = exec and collector.command"));
+                return Err(invalid(
+                    "built-in quota collectors are retired; configure limits_source = exec and collector.command",
+                ));
             }
             if !self.harnesses.contains_key(&provider.harness) {
                 return Err(invalid("provider names an undeclared harness"));

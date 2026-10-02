@@ -1,6 +1,6 @@
 //! Credential resolution shared by adapters that use managed macOS Keychain items.
 
-use agent_run_domain::{error::invalid, Result};
+use agent_run_domain::{Result, error::invalid};
 use std::{
     collections::BTreeMap,
     sync::Mutex,
@@ -100,8 +100,8 @@ pub fn glm_environment(host: &BTreeMap<String, String>) -> Result<BTreeMap<Strin
 mod tests {
     use super::*;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use std::thread;
 

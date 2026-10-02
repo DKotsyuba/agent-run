@@ -42,13 +42,17 @@ fn restored_members_are_durable_and_owner_conflicts_roll_back() {
     store
         .remember_processes("service", "first", &snapshot)
         .unwrap();
-    assert!(store
-        .remember_processes("service", "second", &snapshot)
-        .is_err());
-    assert!(store
-        .remembered_processes("service", "second")
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .remember_processes("service", "second", &snapshot)
+            .is_err()
+    );
+    assert!(
+        store
+            .remembered_processes("service", "second")
+            .unwrap()
+            .is_none()
+    );
     drop(store);
     let store = Store::open(home.path()).unwrap();
     let snapshot = store
@@ -59,10 +63,12 @@ fn restored_members_are_durable_and_owner_conflicts_roll_back() {
         .unwrap();
     assert_eq!(snapshot.members.len(), 3);
     assert!(snapshot.descendants_observed);
-    assert!(store
-        .remembered_processes("attempt", "historical-with-no-snapshot")
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .remembered_processes("attempt", "historical-with-no-snapshot")
+            .unwrap()
+            .is_none()
+    );
     let mut broken = snapshot.clone();
     broken.members.clear();
     assert!(OwnedProcess::restore(broken).is_err());

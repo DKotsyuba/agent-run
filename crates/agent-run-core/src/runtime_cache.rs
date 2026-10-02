@@ -23,8 +23,8 @@
 //! fail a valid model answer, erase source data, or block a managed-asset
 //! resume. Nothing here rewrites the frozen index, history, credentials or
 //! authority digests.
-use crate::{domain::AgentId, fs, service::ProviderLaunchIdentity, state::Store, Result};
-use agent_run_domain::{catalog::HarnessId, error::invalid, AccountId};
+use crate::{Result, domain::AgentId, fs, service::ProviderLaunchIdentity, state::Store};
+use agent_run_domain::{AccountId, catalog::HarnessId, error::invalid};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 

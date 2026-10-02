@@ -7,9 +7,8 @@
 //! `capacity.rs`, `capacity_tail.rs`, and `capacity_collectors.rs`.
 
 use agent_run_core::capacity::{
-    self, account_token_with, persist,
+    self, Key, Route, Sample, Topology, account_token_with, persist,
     sources::{self, claude_native, claude_oauth_token, normalize_codex},
-    Key, Route, Sample, Topology,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -440,38 +439,115 @@ fn claude_runtime(temp: &std::path::Path, declared: bool) -> agent_run_config::c
 /// Mirrors `tests/test_capacity_oauth_refresh.py::ClaudeCapacityOAuthRefreshTests::test_declared_oauth_environment_remains_authoritative`.
 /// Mirrors `tests/test_capacity_oauth_refresh.py::ClaudeCapacityOAuthRefreshTests::test_native_capacity_reports_a_safe_fixed_failure_without_explicit_oauth`.
 ///
-/// The three behaviors share one test because they all manipulate the
-/// process-wide `CLAUDE_CODE_OAUTH_TOKEN`, which cannot be done safely from
-/// tests running concurrently in one binary.
+/// The three behaviors observe the process-wide `CLAUDE_CODE_OAUTH_TOKEN`, so
+/// each phase reruns in its own isolated child test process that receives the
+/// variable only through its command environment (present, empty, or
+/// removed); the parent asserts every phase passed.
 #[tokio::test]
 async fn native_claude_capacity_never_reaches_outside_declared_oauth() {
+    if let Some(phase) = std::env::var_os("AGENT_RUN_TEST_OAUTH_PHASE") {
+        native_claude_capacity_phase(&phase.to_string_lossy()).await;
+        return;
+    }
+    let phases = [
+        ("absent", None),
+        ("declared", Some("env-token")),
+        ("empty", Some("")),
+    ];
+    for (phase, value) in phases {
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("test executable"));
+        command.args([
+            "--exact",
+            "native_claude_capacity_never_reaches_outside_declared_oauth",
+            "--test-threads",
+            "1",
+            "--nocapture",
+        ]);
+        command.env("AGENT_RUN_TEST_OAUTH_PHASE", phase);
+        match value {
+            Some(value) => {
+                command.env("CLAUDE_CODE_OAUTH_TOKEN", value);
+            }
+            None => {
+                command.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+            }
+        }
+        let child = OAuthChild(command.spawn().expect("child test process"));
+        child.finish(phase, std::time::Duration::from_secs(120));
+    }
+}
+
+/// One declared/undeclared OAuth phase of the capacity case above, run where
+/// `CLAUDE_CODE_OAUTH_TOKEN` arrives only from the isolated child command
+/// environment.
+async fn native_claude_capacity_phase(phase: &str) {
     let temp = tempfile::tempdir().expect("temporary home");
     let undeclared = claude_runtime(temp.path(), false);
     let declared = claude_runtime(temp.path(), true);
+    match phase {
+        // Scoped CLI state stays opaque rather than becoming a global-token
+        // fallback: without a declared variable there is no token at all, no
+        // scoped credential read and no provider request is attempted, and
+        // the failure is one fixed reason code.
+        "absent" => {
+            assert_eq!(claude_oauth_token(&undeclared), None);
+            assert_eq!(claude_oauth_token(&declared), None);
+            let error = claude_native("claude", &undeclared)
+                .await
+                .expect_err("native capacity without OAuth is a source failure");
+            assert!(error.to_string().contains("retired"));
+        }
+        // An export the runtime never declared must not widen the auth
+        // bridge, while a declared nonempty value powers native usage.
+        "declared" => {
+            assert_eq!(claude_oauth_token(&undeclared), None);
+            assert_eq!(
+                claude_oauth_token(&declared).as_deref(),
+                Some("env-token"),
+                "a declared nonempty OAuth environment value powers native usage"
+            );
+        }
+        // An empty export is an absent token, never a blank bearer credential.
+        "empty" => {
+            assert_eq!(claude_oauth_token(&declared), None);
+        }
+        other => panic!("unknown isolated oauth phase: {other}"),
+    }
+}
 
-    // Scoped CLI state stays opaque rather than becoming a global-token
-    // fallback: without a declared variable there is no token at all.
-    std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
-    assert_eq!(claude_oauth_token(&undeclared), None);
-    assert_eq!(claude_oauth_token(&declared), None);
+/// An isolated child copy of this test binary that is killed and reaped on
+/// drop, so a parent panic, timeout, or cancelled phase can never leave it
+/// running.
+struct OAuthChild(std::process::Child);
 
-    // An export the runtime never declared must not widen the auth bridge.
-    std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "env-token");
-    assert_eq!(claude_oauth_token(&undeclared), None);
-    assert_eq!(
-        claude_oauth_token(&declared).as_deref(),
-        Some("env-token"),
-        "a declared nonempty OAuth environment value powers native usage"
-    );
-    // An empty export is an absent token, never a blank bearer credential.
-    std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "");
-    assert_eq!(claude_oauth_token(&declared), None);
-    std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
+impl OAuthChild {
+    /// Waits for the phase child to exit within `timeout`, failing the test
+    /// on a non-success exit or an expired bounded window; the child is
+    /// killed and reaped first in either failure case.
+    fn finish(mut self, phase: &str, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.0.try_wait().expect("child must be waitable") {
+                assert!(
+                    status.success(),
+                    "isolated oauth phase {phase} failed: {status}"
+                );
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+                panic!("isolated oauth phase {phase} exceeded its bounded window");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
 
-    // No scoped credential read and no provider request is attempted when
-    // native OAuth is unavailable; the failure is one fixed reason code.
-    let error = claude_native("claude", &undeclared)
-        .await
-        .expect_err("native capacity without OAuth is a source failure");
-    assert!(error.to_string().contains("retired"));
+impl Drop for OAuthChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }

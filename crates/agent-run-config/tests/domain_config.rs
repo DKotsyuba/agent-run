@@ -183,14 +183,16 @@ fn native_security_roots_cannot_be_overridden() {
         let m = BTreeMap::from([(key.to_owned(), toml::Value::String("override".into()))]);
         assert!(config::native_settings(adapter, &m).is_err());
     }
-    assert!(config::native_settings(
-        Adapter::Codex,
-        &BTreeMap::from([(
-            "model_context_window".into(),
-            toml::Value::Integer(1_000_000)
-        )])
-    )
-    .is_ok());
+    assert!(
+        config::native_settings(
+            Adapter::Codex,
+            &BTreeMap::from([(
+                "model_context_window".into(),
+                toml::Value::Integer(1_000_000)
+            )])
+        )
+        .is_ok()
+    );
 }
 
 /// Removed Qwen identifiers fail with actionable migration guidance.
@@ -271,7 +273,9 @@ fn legacy_profile_only_narrows_writes() {
     );
 }
 fn canonical(write: bool) -> String {
-    format!("+++\nrevision='v1'\nwrite={write}\nnetwork=false\nallow_external_read_roots=false\nskills=[]\nmcp=[]\nrequired_constraints=[]\n+++\nRole")
+    format!(
+        "+++\nrevision='v1'\nwrite={write}\nnetwork=false\nallow_external_read_roots=false\nskills=[]\nmcp=[]\nrequired_constraints=[]\n+++\nRole"
+    )
 }
 #[test]
 fn canonical_role_owns_writes_and_retains_caller_constraints() {
@@ -281,9 +285,10 @@ fn canonical_role_owns_writes_and_retains_caller_constraints() {
         .insert(Constraint::ExternalNetworkIsolation);
     let role = profiles::parse(&canonical(true), &r).unwrap();
     assert!(role.write);
-    assert!(role
-        .required_constraints
-        .contains(&Constraint::ExternalNetworkIsolation));
+    assert!(
+        role.required_constraints
+            .contains(&Constraint::ExternalNetworkIsolation)
+    );
 }
 #[test]
 fn incomplete_canonical_role_and_external_roots_fail() {
@@ -320,8 +325,10 @@ fn policy_does_not_invent_os_isolation() {
     let evidence = policy::evaluate("mock", h.config.runtime("mock").unwrap(), &p);
     assert_eq!(evidence.constraints.len(), 8);
     assert!(evidence.admit().is_err());
-    assert!(evidence
-        .constraints
-        .iter()
-        .any(|e| e.constraint == Constraint::WebToolsDisabled && e.supported));
+    assert!(
+        evidence
+            .constraints
+            .iter()
+            .any(|e| e.constraint == Constraint::WebToolsDisabled && e.supported)
+    );
 }

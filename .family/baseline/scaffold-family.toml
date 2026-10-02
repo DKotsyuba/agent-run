@@ -1,0 +1,26 @@
+schema_version = 1
+product = "__PRODUCT__"
+repository = "__REPOSITORY__"
+env_prefix = "__ENV_PREFIX___"
+standard_version = "1.0.0-rc.2"
+response_profile = "rust-minijinja-v1"
+devkit_version = "0.2.0"
+baseline = "rust-macos-2026-09-candidate1"
+qualification = "not_verified"
+
+[profiles]
+process = "in-process"
+state = "none"
+transports = ["stdio"]
+host_adapter = false
+
+[compatibility]
+candidate_targets = ["aarch64-apple-darwin"]
+qualified_targets = []
+qualified_hosts = []
+
+[release]
+enabled = false
+workflow = "release.yml"
+delivery_profile = "single-binary-v1"
+trust_profile = "github-authenticated"

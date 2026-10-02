@@ -3,9 +3,9 @@
 //! Storage, supervisors and delivery leases continue to address exact run rows.
 //! Public callers use only the lineage root; legacy execution selectors remain accepted.
 
-use crate::{domain::AgentId, error::invalid, state::Record, state::Store, Error, Result};
+use crate::{Error, Result, domain::AgentId, error::invalid, state::Record, state::Store};
 use rusqlite::OptionalExtension;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Resolve a stable agent or historical alias to its latest run, or to `run_id`.
 ///

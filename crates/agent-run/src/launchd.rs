@@ -1,7 +1,7 @@
 //! macOS LaunchAgent documents for the broker and bounded maintenance jobs.
 
-use crate::{error::invalid, Error, Result};
-use serde_json::{json, Value};
+use crate::{Error, Result, error::invalid};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 /// Escapes text placed in the deliberately small XML plist emitter.
@@ -91,7 +91,16 @@ pub fn render(
     } else {
         ""
     };
-    let plist = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>{}</string>\n  <key>ProgramArguments</key><array>\n{}  </array>\n{}{}{}  <key>StandardOutPath</key><string>{}</string>\n  <key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n", xml(label), program_arguments, environment, schedule, limits, xml(&stdout_log.display().to_string()), xml(&stderr_log.display().to_string()));
+    let plist = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>{}</string>\n  <key>ProgramArguments</key><array>\n{}  </array>\n{}{}{}  <key>StandardOutPath</key><string>{}</string>\n  <key>StandardErrorPath</key><string>{}</string>\n</dict></plist>\n",
+        xml(label),
+        program_arguments,
+        environment,
+        schedule,
+        limits,
+        xml(&stdout_log.display().to_string()),
+        xml(&stderr_log.display().to_string())
+    );
     Ok(if kind == "api" {
         json!({"label":label,"argv":argv,"plist":plist})
     } else {

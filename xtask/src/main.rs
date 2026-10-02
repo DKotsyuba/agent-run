@@ -20,9 +20,15 @@ fn main() {
         archive_command(&arguments[1..]);
         return;
     }
+    if let Some(subcommand) = arguments.first().map(String::as_str)
+        && subcommand == "family"
+    {
+        family_command(&arguments[1..]);
+        return;
+    }
     if arguments.first().map(String::as_str) != Some("check") {
         eprintln!(
-            "usage: cargo xtask check | release build|build-native|verify|install|update|recover|roll-forward|rollback | archive --verify"
+            "usage: cargo xtask check | family verify|update | release build|build-native|verify|install|update|recover|roll-forward|rollback | archive --verify"
         );
         std::process::exit(2);
     }
@@ -53,6 +59,53 @@ fn main() {
             .expect("cargo must be executable");
         if !status.success() {
             std::process::exit(status.code().unwrap_or(1));
+        }
+    }
+    // The supported default-feature configuration must also compile; the
+    // all-features passes above do not prove the minimal build stays valid.
+    let status = Command::new("cargo")
+        .args([
+            "check",
+            "--offline",
+            "--locked",
+            "--workspace",
+            "--all-targets",
+        ])
+        .status()
+        .expect("cargo must be executable");
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    // Documentation is part of the public contract: rustdoc warnings fail the
+    // gate the same way compiler warnings do.
+    let status = Command::new("cargo")
+        .args(["doc", "--offline", "--locked", "--workspace", "--no-deps"])
+        .env("RUSTDOCFLAGS", "-D warnings")
+        .status()
+        .expect("cargo must be executable");
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    let root = env::current_dir().expect("current directory must be readable");
+    if let Err(error) = xtask::family::verify(&root) {
+        eprintln!("family adoption metadata: {error}");
+        std::process::exit(2);
+    }
+}
+
+/// Runs the read-only adoption-metadata verifier or its reviewed updater.
+fn family_command(arguments: &[String]) {
+    let root = env::current_dir().expect("current directory must be readable");
+    let result = match arguments.first().map(String::as_str) {
+        Some("verify") => xtask::family::verify(&root).map(|()| "verified".to_owned()),
+        Some("update") => xtask::family::update(&root).map(|()| "updated".to_owned()),
+        _ => Err("usage: cargo xtask family verify|update".to_owned()),
+    };
+    match result {
+        Ok(outcome) => println!("family adoption metadata {outcome}"),
+        Err(error) => {
+            eprintln!("family stopped: {error}");
+            std::process::exit(2);
         }
     }
 }

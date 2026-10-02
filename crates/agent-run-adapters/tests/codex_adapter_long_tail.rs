@@ -159,9 +159,11 @@ async fn python_codex_partial_start_is_terminated_on_timeout() {
         .args(["-c", "sleep 1"])
         .spawn()
         .expect("child");
-    assert!(tokio::time::timeout(Duration::from_millis(1), child.wait())
-        .await
-        .is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), child.wait())
+            .await
+            .is_err()
+    );
     child.kill().await.expect("terminate");
     child.wait().await.expect("reap");
 }
@@ -270,9 +272,11 @@ fn python_codex_limits_nonfinite_evidence_is_unknown() {
     std::fs::write(home.join("cache/rollout_evidence.json"), r#"{"samples":[{"lane":"primary","window":"5h","remaining_percent":42,"observed_at":NaN,"reset_at":Infinity},{"lane":"primary","window":"weekly","remaining_percent":10,"observed_at":1e30,"reset_at":-1e30}]}"#).unwrap();
     let samples = limits::limits(home, &models(), 1_780_000_000.0);
     assert_eq!(samples.len(), 2);
-    assert!(samples
-        .iter()
-        .all(|s| s.source == "unknown" && s.remaining_percent.is_none()));
+    assert!(
+        samples
+            .iter()
+            .all(|s| s.source == "unknown" && s.remaining_percent.is_none())
+    );
 }
 
 /// Mirrors `test_codex_adapter.py::test_limits_marks_stale_or_missing_observations_unknown`.
@@ -351,9 +355,11 @@ fn python_codex_stale_rollout_has_unknown_remaining() {
     rollout(home, "stale", &rollout_event("2020-01-01T00:00:00Z"));
     let samples = limits::rollout_limits(home, &models(), 1_780_000_000.0);
     assert_eq!(samples.len(), 3);
-    assert!(samples
-        .iter()
-        .all(|s| s.remaining_percent.is_none() && s.source == "unknown"));
+    assert!(
+        samples
+            .iter()
+            .all(|s| s.remaining_percent.is_none() && s.source == "unknown")
+    );
 }
 
 /// Mirrors `test_codex_adapter.py::test_limits_survives_unreadable_evidence`.
@@ -434,9 +440,11 @@ fn python_codex_materialize_links_auth_without_copying_bytes() {
     let (_temporary, _rt, _cfg, _request, _profile, home) = materialized();
     let bridge = home.join("auth.json");
     assert!(bridge.is_symlink());
-    assert!(!std::fs::read_to_string(&bridge)
-        .unwrap()
-        .contains("missing"));
+    assert!(
+        !std::fs::read_to_string(&bridge)
+            .unwrap()
+            .contains("missing")
+    );
 }
 
 /// Mirrors `test_codex_adapter.py::test_materialize_network_opt_in_adds_curl_review_rules`.
@@ -538,9 +546,11 @@ fn python_codex_materialize_requires_declared_mcp_definition() {
     rt.mcp = vec!["server".into()];
     profile.mcp = vec!["server".into()];
     materialize::materialize(&cfg, &rt, &request, &profile, &home, temporary.path()).unwrap();
-    assert!(std::fs::read_to_string(home.join("config.toml"))
-        .unwrap()
-        .contains("server"));
+    assert!(
+        std::fs::read_to_string(home.join("config.toml"))
+            .unwrap()
+            .contains("server")
+    );
 }
 
 /// Mirrors `test_codex_adapter.py::test_materialize_trusts_post_tool_use_failure_plugin_hook`.

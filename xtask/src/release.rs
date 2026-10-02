@@ -97,13 +97,13 @@ fn build_inner(
     if !binary.is_file() {
         return Err(format!("binary is not a file: {}", binary.display()));
     }
-    if let Some(tui) = tui {
-        if !tui.is_file() {
-            return Err(format!(
-                "bundled TUI binary is not a file: {}",
-                tui.display()
-            ));
-        }
+    if let Some(tui) = tui
+        && !tui.is_file()
+    {
+        return Err(format!(
+            "bundled TUI binary is not a file: {}",
+            tui.display()
+        ));
     }
     let release = output.join("releases").join(version);
     if release.exists() {

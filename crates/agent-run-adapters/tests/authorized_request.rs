@@ -3,7 +3,7 @@
 use agent_run_adapters::authorized_request::{
     AuthorizedRequest, CredentialReader, SystemCredentialReader,
 };
-use agent_run_domain::{catalog::ProviderCatalog, CredentialRef, Result};
+use agent_run_domain::{CredentialRef, Result, catalog::ProviderCatalog};
 use reqwest::Method;
 use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
@@ -55,9 +55,11 @@ fn capability_binds_account_and_origin_without_exposing_a_token() {
         "https://user@api.example.com/quota",
         "https://api.example.com/quota#fragment",
     ] {
-        assert!(capability
-            .prepare_request(Method::GET, rejected, &fake)
-            .is_err());
+        assert!(
+            capability
+                .prepare_request(Method::GET, rejected, &fake)
+                .is_err()
+        );
     }
     assert_eq!(fake.0.load(Ordering::SeqCst), 0);
     let request = capability
@@ -70,31 +72,37 @@ fn capability_binds_account_and_origin_without_exposing_a_token() {
     assert!(request.headers()["authorization"].is_sensitive());
     assert!(!format!("{request:?}").contains("synthetic-secret"));
     assert_eq!(fake.0.load(Ordering::SeqCst), 1);
-    assert!(AuthorizedRequest::new(
-        &catalog,
-        &"glm".parse().unwrap(),
-        "missing",
-        &"acct-work".parse().unwrap()
-    )
-    .is_err());
-    assert!(AuthorizedRequest::new(
-        &catalog,
-        &"glm".parse().unwrap(),
-        "glm-5.3",
-        &"acct-other".parse().unwrap()
-    )
-    .is_err());
+    assert!(
+        AuthorizedRequest::new(
+            &catalog,
+            &"glm".parse().unwrap(),
+            "missing",
+            &"acct-work".parse().unwrap()
+        )
+        .is_err()
+    );
+    assert!(
+        AuthorizedRequest::new(
+            &catalog,
+            &"glm".parse().unwrap(),
+            "glm-5.3",
+            &"acct-other".parse().unwrap()
+        )
+        .is_err()
+    );
 
     let mut disabled = serde_json::to_value(&catalog).unwrap();
     disabled["accounts"][0]["status"] = json!("disabled");
     let disabled: ProviderCatalog = serde_json::from_value(disabled).unwrap();
-    assert!(AuthorizedRequest::new(
-        &disabled,
-        &"glm".parse().unwrap(),
-        "glm-5.3",
-        &"acct-work".parse().unwrap()
-    )
-    .is_err());
+    assert!(
+        AuthorizedRequest::new(
+            &disabled,
+            &"glm".parse().unwrap(),
+            "glm-5.3",
+            &"acct-work".parse().unwrap()
+        )
+        .is_err()
+    );
 }
 
 /// Header style is explicit and native login never becomes an HTTP token.
@@ -120,13 +128,15 @@ fn gateway_header_and_native_login_remain_distinct() {
     assert_eq!(request.headers()["x-api-key"], "synthetic-secret");
     wire["accounts"][0]["secret_ref"] = json!("native:claude-code");
     let catalog: ProviderCatalog = serde_json::from_value(wire).unwrap();
-    assert!(AuthorizedRequest::new(
-        &catalog,
-        &"glm".parse().unwrap(),
-        "glm-5.3",
-        &"acct-work".parse().unwrap()
-    )
-    .is_err());
+    assert!(
+        AuthorizedRequest::new(
+            &catalog,
+            &"glm".parse().unwrap(),
+            "glm-5.3",
+            &"acct-work".parse().unwrap()
+        )
+        .is_err()
+    );
 }
 
 /// The system reader handles an existing file without persisting its bytes.

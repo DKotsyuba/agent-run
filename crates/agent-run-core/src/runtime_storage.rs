@@ -2,7 +2,7 @@
 //! shared store, with roll-forward crash recovery.
 //!
 //! This unit owns the physical switch itself. It plans a version-1
-//! [`RuntimeStorageLayout`] from a strictly verified original home, imports
+//! `RuntimeStorageLayout` from a strictly verified original home, imports
 //! every indexed managed tree into the caller's shared store, swaps each
 //! private root for one exact whole-tree symlink, verifies the unchanged
 //! original index through the shared bridge, and commits the registry row.
@@ -22,8 +22,8 @@
 //! anything but its single indexed version is refused during planning and
 //! preserved untouched.
 
-use crate::{adapters, domain::AgentId, fs, state, Result};
-use agent_run_domain::{error::invalid, Error};
+use crate::{Result, adapters, domain::AgentId, fs, state};
+use agent_run_domain::{Error, error::invalid};
 use agent_run_platform::{
     plugin_views,
     shared_assets::{self, SharedStoreLock, SharedTreeRef},
@@ -188,7 +188,7 @@ fn references(
 /// the index describes no managed roots, otherwise a validated version-1
 /// layout carrying the home's canonical path. A prepared row is not a
 /// binding: planning continues against the original home and fails if the
-/// home is mid-switch, directing the caller to [`recover`] first. This
+/// home is mid-switch, directing the caller to `recover` first. This
 /// function performs no database or filesystem mutation.
 pub fn plan(
     store: &state::Store,
@@ -205,15 +205,15 @@ pub fn plan(
     store_root(app_home)?;
     let canonical = canonical_home(runtime_home)?;
     let key = canonical.to_string_lossy().into_owned();
-    if let Some(record) = store.runtime_storage_layout(&key)? {
-        if record.state == state::runtime_storage::LayoutState::Committed {
-            if record.index_sha256 != expected {
-                return Err(invalid(
-                    "registered storage layout binds a different original index digest",
-                ));
-            }
-            return Ok(Some(record.layout().clone()));
+    if let Some(record) = store.runtime_storage_layout(&key)?
+        && record.state == state::runtime_storage::LayoutState::Committed
+    {
+        if record.index_sha256 != expected {
+            return Err(invalid(
+                "registered storage layout binds a different original index digest",
+            ));
         }
+        return Ok(Some(record.layout().clone()));
     }
     let (revision, document) = index_document(&canonical, expected)?;
     let inspection = snapshot_tree::inspect_runtime_snapshots(&canonical, &revision, expected)?;
@@ -311,7 +311,7 @@ fn validate_plugin_parents(
 /// with an empty reference map, compare-and-swap commit. The row survives
 /// until the physical home is conclusively gone, exactly like a mapped row.
 /// An existing committed row binding the same digest is idempotent; a
-/// prepared row is an explicit refusal directing the caller to [`recover`].
+/// prepared row is an explicit refusal directing the caller to `recover`.
 /// Index bytes, native history and authority digests are never rewritten.
 pub fn anchor(
     store: &mut state::Store,
@@ -370,7 +370,7 @@ pub fn anchor(
 /// lock dropped before the import reacquires it), imports every tree, swaps
 /// roots under a token-bound in-home backup, bridge-verifies, commits, and
 /// only then deletes proven backups. On any failure the row stays `prepared`
-/// and [`recover`] completes the switch without re-downloading anything.
+/// and `recover` completes the switch without re-downloading anything.
 pub fn install(
     store: &mut state::Store,
     app_home: &Path,

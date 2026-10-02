@@ -15,6 +15,18 @@ Native releases are published only for macOS Apple silicon
 an unqualified, non-blocking validation target; its release and qualification
 are deferred. Keychain and launchd integration remain macOS-only.
 
+## Family standard
+
+agent-run declares its adoption of the Agent MCP family standard in
+[`family.toml`](family.toml): a resident+local profile, one dispatcher behind
+the CLI, stdio MCP, and the Unix-socket API, a pinned compiler/SDK baseline,
+and the sealed-archive delivery contract. The declaration and the managed
+adoption files in `.family/` are verified by `cargo xtask family verify`
+inside `cargo xtask check`. What is adopted, what is only observed, and what
+remains open is recorded truthfully in
+[docs/family-standard.md](docs/family-standard.md); it is a declaration, not
+a compliance certificate.
+
 ## Install
 
 Use the same command for a fresh installation or an update:

@@ -5,12 +5,12 @@
 
 use crate::Store;
 use agent_run_domain::{
-    domain::{now, AgentId},
-    error::invalid,
     Result,
+    domain::{AgentId, now},
+    error::invalid,
 };
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
-use serde_json::{json, Map, Value};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use serde_json::{Map, Value, json};
 
 /// Maximum age of an unbound completion notice before it is permanently expired.
 pub const BINDING_WINDOW_SECONDS: f64 = 3600.0;

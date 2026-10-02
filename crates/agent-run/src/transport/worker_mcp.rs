@@ -1,22 +1,22 @@
 //! Run-bound subagent MCP. No operator tools, recipient selection or Desktop relay.
 use crate::{
+    Error, Result,
     cli::{CliBroker, SocketBroker},
     error::invalid,
-    Error, Result,
 };
 use agent_run_domain::{
     domain::AgentId,
-    worker::{NotifyRequest, WorkerCall, ENV_NAMES, METHOD},
+    worker::{ENV_NAMES, METHOD, NotifyRequest, WorkerCall},
 };
 use rmcp::{
+    ServerHandler, ServiceExt,
     model::{
         CallToolRequestParams, CallToolResponse, ErrorData, Implementation, ListToolsResult,
         PaginatedRequestParams, ServerConfig, Tool,
     },
     service::{RequestContext, RoleServer},
-    ServerHandler, ServiceExt,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc};
 
 /// One authenticated attempt's transport context. Never serializable or Debug:
@@ -55,7 +55,7 @@ impl WorkerProxy {
                 return super::mcp_text::error_result(
                     "ValidationError",
                     "unknown, missing, or incorrectly typed report argument",
-                )
+                );
             }
         };
         if let Err(error) = input.validate() {

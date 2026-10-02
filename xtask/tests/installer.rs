@@ -96,15 +96,17 @@ impl Fixture {
         let remote = self.temporary.path().join("remote");
         fs::create_dir(&remote).unwrap();
         let asset = "agent-run-1.0.0-aarch64-apple-darwin.tar.gz";
-        assert!(Command::new("tar")
-            .args(["-czf"])
-            .arg(remote.join(asset))
-            .arg("-C")
-            .arg(&self.candidate)
-            .arg(".")
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            Command::new("tar")
+                .args(["-czf"])
+                .arg(remote.join(asset))
+                .arg("-C")
+                .arg(&self.candidate)
+                .arg(".")
+                .status()
+                .unwrap()
+                .success()
+        );
         checksums(&remote, asset);
         fs::write(remote.join("latest"), "{\n  \"tag_name\": \"v1.0.0\"\n}\n").unwrap();
         remote
@@ -248,10 +250,12 @@ fn installed_version_is_not_rewritten_and_pending_recovery_is_preserved() {
         r#"{"phase":"prepared"}"#,
     )
     .unwrap();
-    assert!(fixture
-        .install()
-        .unwrap_err()
-        .contains("unfinished deployment"));
+    assert!(
+        fixture
+            .install()
+            .unwrap_err()
+            .contains("unfinished deployment")
+    );
 }
 
 /// Exercises both downloaders without network access, including integrity and archive rejection.
@@ -322,28 +326,33 @@ cp "$TEST_REMOTE/${url##*/}" "$output"
         assert!(String::from_utf8_lossy(&unsupported.stderr).contains("only macOS"));
         std::os::unix::fs::symlink("/tmp", fixture.candidate.join("unsafe-link")).unwrap();
         let asset = "agent-run-1.0.0-aarch64-apple-darwin.tar.gz";
-        assert!(Command::new("tar")
-            .arg("-czf")
-            .arg(remote.join(asset))
-            .arg("-C")
-            .arg(&fixture.candidate)
-            .arg(".")
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            Command::new("tar")
+                .arg("-czf")
+                .arg(remote.join(asset))
+                .arg("-C")
+                .arg(&fixture.candidate)
+                .arg(".")
+                .status()
+                .unwrap()
+                .success()
+        );
         checksums(&remote, asset);
         let unsafe_archive = run().output().unwrap();
         assert!(!unsafe_archive.status.success());
-        assert!(String::from_utf8_lossy(&unsafe_archive.stderr).contains("links and special files"));
+        assert!(
+            String::from_utf8_lossy(&unsafe_archive.stderr).contains("links and special files")
+        );
         assert_eq!(
             fs::read_link(fixture.prefix.join("current")).unwrap(),
             current
         );
-        assert!(!fs::read_dir(fixture.temporary.path()).unwrap().any(|e| e
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with("agent-run-install.")));
+        assert!(!fs::read_dir(fixture.temporary.path()).unwrap().any(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("agent-run-install.")
+        }));
     }
 }
 

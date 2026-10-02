@@ -1,6 +1,6 @@
 //! Broker-owned foreground service declarations; no provider-specific daemon logic.
 
-use agent_run_domain::{error::invalid, Result};
+use agent_run_domain::{Result, error::invalid};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, path::PathBuf};
 

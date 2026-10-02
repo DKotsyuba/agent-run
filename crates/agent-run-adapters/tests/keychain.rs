@@ -1,6 +1,6 @@
 //! Credential fallback regressions using injected Keychain lookups only.
 
-use agent_run_adapters::auth::{glm_environment_with, GLM_BASE_URL};
+use agent_run_adapters::auth::{GLM_BASE_URL, glm_environment_with};
 use std::collections::BTreeMap;
 
 /// GLM prefers its managed Keychain credential over an inherited Anthropic token.

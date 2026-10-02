@@ -372,11 +372,13 @@ async fn truncated_frame_fails_the_run() {
         row.failure_kind.as_deref(),
         Some("engine_transport_failure")
     );
-    assert!(Store::open(&home)
-        .unwrap()
-        .last_event(&row.id, "process_cleanup")
-        .unwrap()
-        .is_some());
+    assert!(
+        Store::open(&home)
+            .unwrap()
+            .last_event(&row.id, "process_cleanup")
+            .unwrap()
+            .is_some()
+    );
 }
 
 /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_session_wait_exception_reaches_cleanup_and_durable_failure`

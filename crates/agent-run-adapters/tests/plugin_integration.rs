@@ -6,7 +6,7 @@ use agent_run_config::{
     profiles::Profile,
 };
 use agent_run_domain::domain::StartRequest;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -284,16 +284,20 @@ fn codex_hook_groups_include_config_path_trust_entries() {
         hooks["PreToolUse"][0]["hooks"][0]["timeout"].as_integer(),
         Some(600)
     );
-    assert!(hooks["state"]
-        .as_table()
-        .unwrap()
-        .keys()
-        .any(|key| key.contains(":pre_tool_use:0:0")));
-    assert!(hooks["state"]
-        .as_table()
-        .unwrap()
-        .keys()
-        .any(|key| key.contains("demo-plugin@personal:hooks/hooks.json:pre_tool_use:0:0")));
+    assert!(
+        hooks["state"]
+            .as_table()
+            .unwrap()
+            .keys()
+            .any(|key| key.contains(":pre_tool_use:0:0"))
+    );
+    assert!(
+        hooks["state"]
+            .as_table()
+            .unwrap()
+            .keys()
+            .any(|key| key.contains("demo-plugin@personal:hooks/hooks.json:pre_tool_use:0:0"))
+    );
 }
 
 /// Accepts a safe manifest-selected hook file and keys trust to that exact path.
@@ -324,11 +328,13 @@ fn codex_plugin_manifest_selects_relative_hook_file() {
 
     let document: toml::Value =
         toml::from_str(&std::fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
-    assert!(document["hooks"]["state"]
-        .as_table()
-        .unwrap()
-        .keys()
-        .any(|key| key.contains("custom-hooks@personal:config/custom.json:pre_tool_use:0:0")));
+    assert!(
+        document["hooks"]["state"]
+            .as_table()
+            .unwrap()
+            .keys()
+            .any(|key| key.contains("custom-hooks@personal:config/custom.json:pre_tool_use:0:0"))
+    );
 }
 
 /// Rejects non-string, blank, absolute, and traversing manifest hook paths.
@@ -516,9 +522,10 @@ fn codex_config_lists_both_declared_mcp_servers() {
         document["plugins"]["demo-plugin@personal"]["enabled"].as_bool(),
         Some(true)
     );
-    assert!(home
-        .join("plugins/cache/personal/demo-plugin/1.0.0/.claude-plugin/plugin.json")
-        .is_file());
+    assert!(
+        home.join("plugins/cache/personal/demo-plugin/1.0.0/.claude-plugin/plugin.json")
+            .is_file()
+    );
 }
 
 /// Mirrors `tests/test_plugin_integration.py::ExtraMcpServerTests::test_claude_mcp_config_lists_both_servers`.

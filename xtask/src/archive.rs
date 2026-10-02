@@ -1,7 +1,7 @@
 //! Reproducible source archive creation and content verification.
 
 use crate::release;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     env, fs,

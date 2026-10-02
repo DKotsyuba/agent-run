@@ -2,7 +2,7 @@
 
 mod common;
 
-use agent_run_domain::{domain::Outcome, Error};
+use agent_run_domain::{Error, domain::Outcome};
 use serde_json::json;
 use std::{
     sync::{Arc, Barrier},

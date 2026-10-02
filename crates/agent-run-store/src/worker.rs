@@ -2,12 +2,12 @@
 
 use crate::Store;
 use agent_run_domain::{
+    Error, Result,
     domain::AgentId,
     worker::{NotifyReceipt, NotifyRequest},
-    Error, Result,
 };
 use agent_run_platform::fs::sha256;
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 /// Maximum distinct reports accepted for one exact run.
 const MAX_MESSAGES: i64 = 20;

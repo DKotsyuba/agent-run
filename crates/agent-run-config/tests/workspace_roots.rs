@@ -52,10 +52,12 @@ fn plural_workspace_roots_are_accepted() {
 /// Declaring both the singular and plural forms is an ambiguous error.
 #[test]
 fn duplicate_singular_and_plural_declarations_are_rejected() {
-    assert!(load(&codex(
-        "workspace_root = \"${HOME}/projects\"\nworkspace_roots = [\"${HOME}/worktrees\"]\n"
-    ))
-    .is_err());
+    assert!(
+        load(&codex(
+            "workspace_root = \"${HOME}/projects\"\nworkspace_roots = [\"${HOME}/worktrees\"]\n"
+        ))
+        .is_err()
+    );
 }
 
 /// Workspace roots remain a codex-only feature.
@@ -71,8 +73,10 @@ fn workspace_roots_require_codex() {
 fn workspace_network_requires_a_workspace_root() {
     assert!(load(&codex("workspace_network = true\n")).is_err());
     assert!(load(&codex("workspace_roots = []\nworkspace_network = true\n")).is_err());
-    assert!(load(&codex(
-        "workspace_roots = [\"${HOME}/projects\"]\nworkspace_network = true\n"
-    ))
-    .is_ok());
+    assert!(
+        load(&codex(
+            "workspace_roots = [\"${HOME}/projects\"]\nworkspace_network = true\n"
+        ))
+        .is_ok()
+    );
 }

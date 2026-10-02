@@ -12,7 +12,7 @@ use agent_run_config::{
     profiles::Profile,
 };
 use agent_run_domain::domain::StartRequest;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -280,10 +280,12 @@ fn python_test_codex_adapter_materializes_only_declared_mcp_approval() {
         .and_then(toml::Value::as_array)
         .expect("narrow permission hook");
     assert_eq!(hooks.len(), 1);
-    assert!(hooks[0]
-        .get("matcher")
-        .and_then(toml::Value::as_str)
-        .is_some_and(|matcher| matcher.contains("mcp__approved__")));
+    assert!(
+        hooks[0]
+            .get("matcher")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|matcher| matcher.contains("mcp__approved__"))
+    );
 }
 
 /// Codex receives its native exact allowlist, preserving omitted and empty semantics.
@@ -338,13 +340,15 @@ fn python_test_codex_adapter_materializes_only_declared_service_skills() {
     );
 
     profile.skills = vec!["missing".into()];
-    assert!(materialize::materialize(
-        &config,
-        &runtime,
-        &request,
-        &profile,
-        &root.join("missing-home"),
-        &root,
-    )
-    .is_err());
+    assert!(
+        materialize::materialize(
+            &config,
+            &runtime,
+            &request,
+            &profile,
+            &root.join("missing-home"),
+            &root,
+        )
+        .is_err()
+    );
 }
