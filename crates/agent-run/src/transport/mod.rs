@@ -1,4 +1,6 @@
 pub mod mcp;
+/// Cache hints shared by both MCP `tools/list` handlers.
+pub mod mcp_cache;
 pub mod mcp_text;
 pub mod socket;
 /// Run-bound worker MCP with no operator capabilities.

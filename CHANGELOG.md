@@ -4,6 +4,14 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- fix(mcp): answer `tools/list` on both the operator and the worker MCP surface
+  with `ttlMs` (60 s) and `cacheScope: private` when the request negotiated MCP
+  2026-07-28 or later, so such clients no longer reject the tool list (Claude
+  child agents lost `notify_orchestrator`); 2025-11-25 and earlier sessions
+  keep their byte-identical replies
+
+No schema change. The client-side `mcp_catalog` probe remains legacy-only.
+
 ## [0.19.4] - 2026-10-01
 
 - feat(retention): keep the newest 100 logical agent sessions alongside

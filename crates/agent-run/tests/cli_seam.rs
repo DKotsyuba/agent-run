@@ -745,6 +745,108 @@ async fn test_mcp_uses_injected_stdio_for_initialize_and_tools_list() {
     let _ = server.await;
 }
 
+/// Serve one in-process MCP session, write raw JSON-RPC `requests` to its stdio and
+/// return one raw reply per request that carries an `id`.
+async fn raw_mcp_exchange(requests: &[Value]) -> Vec<Value> {
+    let temp = tempdir().unwrap();
+    let (mut input_writer, input_reader) = tokio::io::duplex(64 * 1024);
+    let (output_writer, output_reader) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(agent_run::transport::mcp::serve_io(
+        temp.path().to_owned(),
+        None,
+        Arc::new(FakeBroker::new(Vec::new())),
+        input_reader,
+        output_writer,
+    ));
+    let mut output = BufReader::new(output_reader);
+    let mut replies = Vec::new();
+    for request in requests {
+        input_writer
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        input_writer.flush().await.unwrap();
+        if request.get("id").is_some() {
+            let mut line = String::new();
+            output.read_line(&mut line).await.unwrap();
+            replies.push(serde_json::from_str(&line).unwrap());
+        }
+    }
+    drop(input_writer);
+    let _ = server.await;
+    replies
+}
+
+/// Per-request `_meta` of a self-contained 2026-07-28 request.
+fn modern_meta() -> Value {
+    json!({"_meta":{
+        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities":{}
+    }})
+}
+
+/// A 2026-07-28 `tools/list` without `initialize` carries the cache hints and the full tool table.
+#[tokio::test]
+async fn modern_tools_list_carries_cache_hints() {
+    let reply = raw_mcp_exchange(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":modern_meta()}),
+    ])
+    .await
+    .remove(0);
+    let result = &reply["result"];
+    assert_eq!(result["resultType"], "complete", "{reply}");
+    assert_eq!(result["ttlMs"], 60_000, "{reply}");
+    assert_eq!(result["cacheScope"], "private", "{reply}");
+    let names: Vec<&str> = result["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    let expected: Vec<String> = agent_run::dispatch::tools()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(!names.is_empty());
+    assert_eq!(names, expected);
+}
+
+/// A 2025-11-25 session keeps the legacy `tools/list` shape: no hints, no `resultType`.
+#[tokio::test]
+async fn legacy_tools_list_has_no_cache_hints() {
+    let replies = raw_mcp_exchange(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+    ])
+    .await;
+    let result = replies[1]["result"].as_object().unwrap();
+    assert!(!result["tools"].as_array().unwrap().is_empty());
+    for key in ["ttlMs", "cacheScope", "resultType"] {
+        assert!(!result.contains_key(key), "{key} leaked: {result:?}");
+    }
+}
+
+/// `server/discover` without `initialize` advertises 2026-07-28 and the same cache hints.
+#[tokio::test]
+async fn modern_discover_advertises_2026_07_28() {
+    let reply = raw_mcp_exchange(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":modern_meta()}),
+    ])
+    .await
+    .remove(0);
+    let result = &reply["result"];
+    assert!(
+        result["supportedVersions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("2026-07-28")),
+        "{reply}"
+    );
+    assert!(result["ttlMs"].is_u64(), "{reply}");
+    assert!(result["cacheScope"].is_string(), "{reply}");
+}
+
 /// Proves production MCP startup replaces its process image with the configured frontend.
 #[test]
 fn test_mcp_exec_preserves_pid_and_passes_exact_arguments() {

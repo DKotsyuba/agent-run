@@ -236,10 +236,15 @@ fn mcp_matches_python_handshake_tools_calls_notifications_and_eof() {
             mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}})),
             None
         );
-        assert_eq!(
-            mcp.send(expected[2]["request"].clone()).unwrap(),
-            expected[2]["response"]
-        );
+        let listed = mcp.send(expected[2]["request"].clone()).unwrap();
+        assert_eq!(listed, expected[2]["response"]);
+        // Legacy sessions must not acquire the 2026-07-28 cache hints.
+        for key in ["ttlMs", "cacheScope"] {
+            assert!(
+                listed["result"].get(key).is_none(),
+                "{version}: {key} leaked to a legacy session"
+            );
+        }
         for index in [3usize, 4, 5] {
             let reply = mcp.send(expected[index]["request"].clone()).unwrap();
             let captured = &expected[index]["response"];
