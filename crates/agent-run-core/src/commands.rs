@@ -6,6 +6,7 @@
 //! without attempting an engine operation twice.
 
 use crate::{domain::AgentId, state::Store, Result};
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 
 /// Maximum number of live-engine commands handled before polling resumes.
@@ -83,4 +84,94 @@ pub fn steer_text(payload: &Value) -> Option<&str> {
         .get("text")
         .and_then(Value::as_str)
         .filter(|text| !text.trim().is_empty())
+}
+
+/// One pool command's payload sequence number.
+pub fn pool_seq(payload: &Value) -> Option<i64> {
+    payload
+        .get("seq")
+        .and_then(Value::as_i64)
+        .filter(|seq| *seq > 0)
+}
+
+/// Loads, validates and renders the entry a `pool` command points at.
+///
+/// The recipient must be the current tip execution of a current (unreplaced)
+/// member of the entry's own pool. A foreign pool, a replaced member or a
+/// superseded tip refuses honestly with a typed reason and the durable log
+/// keeps the entry for `pool_read` catch-up. Returns the refusal reason or the
+/// text rendered by the one formatter shared with peers and the orchestrator.
+pub fn pool_entry_text(
+    store: &crate::state::Store,
+    run_id: &AgentId,
+    seq: i64,
+) -> Result<std::result::Result<String, &'static str>> {
+    let (root, tip): (String, String) = store.conn.query_row(
+        "SELECT CASE WHEN a.root_agent_id='' THEN a.id ELSE a.root_agent_id END,          (SELECT t.id FROM agents t WHERE t.root_agent_id=CASE WHEN a.root_agent_id='' THEN a.id ELSE a.root_agent_id END OR t.id=CASE WHEN a.root_agent_id='' THEN a.id ELSE a.root_agent_id END           ORDER BY t.sequence DESC,t.created_at DESC,t.id DESC LIMIT 1) \
+         FROM agents a WHERE a.id=?",
+        [run_id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let row: Option<bool> = store
+        .conn
+        .query_row(
+            "SELECT m.agent_id IS NOT NULL AND m.replaced_by IS NULL FROM pool_entries e \
+             LEFT JOIN pool_members m ON m.pool_id=e.pool_id AND m.agent_id=? \
+             WHERE e.seq=?",
+            rusqlite::params![root, seq],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(current) = row else {
+        return Ok(Err("entry_not_found"));
+    };
+    if !current {
+        return Ok(Err("not_pool_member"));
+    }
+    if tip != run_id.as_str() {
+        return Ok(Err("stale_tip"));
+    }
+    // Re-read the full stamped row through the one shared renderer.
+    let entry: agent_run_domain::pool::PoolEntryView = store.conn.query_row(
+        "SELECT seq,author_kind,author_agent_id,author_name,author_role,direction,kind,\
+         severity,proposal_seq,roster_revision,decision,body \
+         FROM pool_entries WHERE seq=?",
+        [seq],
+        crate::state::pool_log::entry_view,
+    )?;
+    Ok(Ok(agent_run_domain::pool::render_entry(&entry)?))
+}
+
+/// The text to push for one claimed `pool` command, or the finite command
+/// result to record when nothing may be sent.
+///
+/// Every refusal is a known no-send with a safe code: a malformed payload, a
+/// missing entry, a replaced, foreign or superseded recipient, or a failed
+/// lookup. No payload, session or raw error text reaches the result, and a
+/// lookup failure never aborts the run; the log keeps the entry for catch-up.
+pub fn pool_push_text(
+    store: &crate::state::Store,
+    run_id: &AgentId,
+    payload: &Value,
+) -> std::result::Result<String, Value> {
+    let Some(seq) = pool_seq(payload) else {
+        return Err(pool_result("refused", "malformed_pool_command"));
+    };
+    match pool_entry_text(store, run_id, seq) {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(reason)) => Err(pool_result("refused", reason)),
+        Err(_) => Err(pool_result("refused", "pool_lookup_failed")),
+    }
+}
+
+/// The finite command result of one pool push.
+///
+/// `push` is one of `refused`/`unsent` (known not sent), `rejected` (the
+/// engine refused it), `written` (bytes reached the engine's stdin, nothing
+/// more), `native_accepted` (a correlated native reply, still not consumption)
+/// or `unknown` (a bounded end after a possible write). None of them claims the
+/// model read the entry; the durable log keeps it for `pool_read` regardless.
+pub fn pool_result(push: &'static str, reason: &'static str) -> Value {
+    json!({"push": push, "reason": reason,
+           "note": "enqueued transport evidence only, not consumption; the entry stays in the pool log for pool_read"})
 }

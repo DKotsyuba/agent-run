@@ -1067,7 +1067,7 @@ impl Store {
         run_stats::backfill(self)
     }
     pub fn enqueue(&mut self, id: &AgentId, kind: &str, payload: &Value) -> Result<Value> {
-        if !["cancel", "steer"].contains(&kind) {
+        if !["cancel", "steer", "pool"].contains(&kind) {
             return Err(invalid("unknown command kind"));
         }
         let tx = self

@@ -230,6 +230,55 @@ impl Store {
             params![notification_id, run_id.as_str(), attempt_id, input.request_id,
                 input.kind.as_str(), input.message, at],
         )?;
+        // An active pool member also gets exactly one linked team copy of the
+        // report and one pending `pool` command per peer tip, all inside this
+        // same transaction: an insert failure rolls the notification, the
+        // copy and every command back together. The replay path above returns
+        // before this point, so a retry never duplicates the copy. The copy
+        // lives in the pool's own idempotency scope (`notify:` prefix), so a
+        // pool_post reusing the same request key can never collide with it.
+        let seat: Option<(String, String, String, u32)> = tx
+            .query_row(
+                "SELECT p.id,m.name,m.role,p.roster_revision FROM pool_members m \
+                 JOIN pools p ON p.id=m.pool_id \
+                 WHERE m.agent_id=? AND m.replaced_by IS NULL AND p.state='open'",
+                [auth.root_agent_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get::<_, i64>(3)?.max(1) as u32,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((pool_id, name, role, roster_revision)) = seat {
+            let scope = format!("notify:{}", run_id.as_str());
+            tx.execute(
+                "INSERT INTO pool_entries(pool_id,author_kind,author_agent_id,author_name,author_role,\
+                 direction,kind,severity,roster_revision,body,delivery_id,sender_run_id,sender_attempt_id,\
+                 idem_scope,request_id,created_at) \
+                 VALUES(?,'member',?,?,?,'orchestrator_copy','report',?,?,?,?,?,?,?,?,?)",
+                params![
+                    pool_id,
+                    auth.root_agent_id.as_str(),
+                    name,
+                    role,
+                    input.kind.as_str(),
+                    roster_revision,
+                    input.message,
+                    notification_id,
+                    run_id.as_str(),
+                    attempt_id,
+                    scope,
+                    input.request_id,
+                    at,
+                ],
+            )?;
+            let seq = tx.last_insert_rowid().max(0) as u64;
+            crate::pool_log::fanout_entry(&tx, &pool_id, auth.root_agent_id.as_str(), seq)?;
+        }
         tx.commit()?;
         Ok(NotifyReceipt {
             notification_id,

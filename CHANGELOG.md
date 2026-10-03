@@ -22,8 +22,13 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   propose, vote) over one authenticated broker route: authors are stamped from
   durable membership, refusals are typed codes, reads page the append-only log
   by cursor with an optional bounded wait and render plain-text entries, and
-  derived vote status is reported without ever completing the pool; pushes,
-  operator pool APIs, replacement and settlement are not implemented yet
+  derived vote status is reported without ever completing the pool
+- feat(pools): enqueue every new pool entry, and a member's notify team copy,
+  for each peer's tip in the same transaction; delivery records only a finite
+  disposition (native accepted, written, rejected, unsent, refused, unknown),
+  never consumption, and the orchestrator's notice for a pool member's report
+  carries the stamped sender; operator pool APIs, replacement and settlement
+  are not implemented yet
 
 Database schema 25 adds the `pools`, `pool_members` and `pool_entries` tables
 with historical membership, one current member per slot and immutable

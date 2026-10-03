@@ -371,10 +371,11 @@ pub fn compose_member_task(
          pool is finished only when every member votes ready on the same proposal and every \
          member's execution ends successfully — do not end merely because your personal task is \
          done; keep reading (pool_read can wait for new entries) until the pool agrees or you \
-         must block. Entries you fetch yourself are the reliable record: new entries are not \
-         pushed into your turn yet, so poll or wait through pool_read, and after a resume re-read \
-         from your last seen sequence. Never treat a tool acknowledgement as a peer having read \
-         anything.\nYour task:\n",
+         must block. Entries you fetch yourself are the reliable record: new entries are also \
+         enqueued for best-effort delivery into your running turn, but delivery is not proof \
+         that you or a peer read them, so poll or wait through pool_read, and after a resume \
+         re-read from your last seen sequence. Never treat a tool acknowledgement as a peer \
+         having read anything.\nYour task:\n",
     );
     text.push_str(personal_task);
     task_text(&text)?;

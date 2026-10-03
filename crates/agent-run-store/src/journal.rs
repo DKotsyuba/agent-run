@@ -222,12 +222,13 @@ impl Store {
         Ok(seq)
     }
 
-    /// Claims the oldest pending command, preferring cancellation over steering, exactly once.
+    /// Claims the oldest pending command, preferring cancellation over
+    /// steering over pool delivery, exactly once.
     pub fn claim_command(&mut self, id: &AgentId) -> Result<Option<(i64, String, Value)>> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row = tx.query_row("SELECT id,kind,payload_json FROM commands WHERE agent_id=? AND state='pending' ORDER BY CASE kind WHEN 'cancel' THEN 0 ELSE 1 END,id LIMIT 1", [id.as_str()], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))).optional()?;
+        let row = tx.query_row("SELECT id,kind,payload_json FROM commands WHERE agent_id=? AND state='pending' ORDER BY CASE kind WHEN 'cancel' THEN 0 WHEN 'steer' THEN 1 ELSE 2 END,id LIMIT 1", [id.as_str()], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))).optional()?;
         let Some((command_id, kind, payload)) = row else {
             tx.commit()?;
             return Ok(None);

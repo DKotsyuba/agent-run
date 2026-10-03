@@ -119,9 +119,18 @@ for a new entry), renders each entry as one compact plain-text block through
 the shared renderer, and reports derived status — current roster, current
 proposal and each member's vote validity with its reason. Ordinary chat is
 budgeted while proposals, votes, blocks and revokes stay possible, and
-agreement is reported without completing the pool. Automatic pushes into
-running members, operator-facing pool APIs, replacement and settlement are
-not implemented yet. The tables retain replaced members, keep one current member per slot, store
+agreement is reported without completing the pool. Every appended entry also enqueues
+one `pool` command, holding only its sequence number, for each current peer's
+tip in the same transaction (a member's `notify_orchestrator` report likewise
+writes one linked team-copy entry, and the orchestrator's notice is rendered
+from that entry with the same stamped sender, direction and stable identity). The command
+claims after cancel and steer, re-checks that the recipient is still a current
+member's tip of that entry's pool, and records only a finite push disposition:
+`native_accepted` for a correlated Codex reply, `written` for a Claude/GLM stdin
+write, `rejected`, `unsent`, `refused` (with a typed reason) or `unknown` after
+a possible write. None of them means the member consumed the entry; the log
+remains the source of truth and members catch up through `pool_read`.
+Operator-facing pool APIs, replacement and settlement are not implemented yet. The tables retain replaced members, keep one current member per slot, store
 an immutable author stamped at send time, and reference agents and deliveries
 without cascades so a later purge can delete pool rows first.
 

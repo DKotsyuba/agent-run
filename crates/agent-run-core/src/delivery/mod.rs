@@ -517,6 +517,23 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
             "blocker" => WorkerMessageKind::Blocker,
             _ => return Err(invalid("invalid stored worker kind")),
         };
+        // A pool member's report carries its immutable linked pool entry: the
+        // orchestrator then sees the same stamped sender, direction and
+        // stable identity as peers, from the one shared renderer. The stored
+        // worker message stays raw for idempotent replay.
+        let message = match tx
+            .query_row(
+                "SELECT seq,author_kind,author_agent_id,author_name,author_role,direction,kind,\
+                 severity,proposal_seq,roster_revision,decision,body \
+                 FROM pool_entries WHERE delivery_id=?",
+                [&delivery_id],
+                agent_run_store::pool_log::entry_view,
+            )
+            .optional()?
+        {
+            Some(entry) => pool_decorated(&agent_run_domain::pool::render_entry(&entry)?),
+            None => message,
+        };
         let notice = WorkerNotice {
             notification_id: delivery_id.clone(),
             agent_id: root.parse()?,
@@ -717,6 +734,25 @@ fn claude_registry() -> std::path::PathBuf {
                 .map(|home| std::path::PathBuf::from(home).join(".claude/sessions"))
         })
         .unwrap_or_default()
+}
+
+/// Fits a rendered pool entry into the worker notice's fixed 2048-byte bound
+/// by shortening only the untrusted body, never the stamped header. The full
+/// body stays in the pool log and the stored report.
+fn pool_decorated(rendered: &str) -> String {
+    const LIMIT: usize = 2048;
+    const MARKER: &str = "\n[truncated; the full text is in the pool log]";
+    if rendered.len() <= LIMIT {
+        return rendered.to_owned();
+    }
+    let split = rendered
+        .find("untrusted body:\n")
+        .map_or(0, |i| i + "untrusted body:\n".len());
+    let mut end = LIMIT.saturating_sub(MARKER.len()).max(split);
+    while !rendered.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{MARKER}", &rendered[..end])
 }
 
 #[cfg(test)]

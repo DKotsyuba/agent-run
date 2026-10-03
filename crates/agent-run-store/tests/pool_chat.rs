@@ -912,3 +912,345 @@ fn final_vote_slot_accepts_revoke_after_seven_votes() {
         PoolDenial::VoteBudgetExhausted
     );
 }
+
+/// A member write fans out one pending `pool` command holding only the
+/// sequence to every current peer tip — never to the sender — and a replay
+/// of the same key enqueues nothing twice.
+#[test]
+fn write_fans_out_to_peer_tips_once() {
+    let home = common::Home::new();
+    let (_, members) = pool(&home, &[("done", "it ships")]);
+    let (run, attempt, token) = &members[0];
+    let (run2, _, _) = &members[1];
+    let mut store = home.store();
+    let receipt = store
+        .pool_write(run, attempt, token, message("f1", "hi"))
+        .unwrap()
+        .unwrap();
+    let peer_commands: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM commands WHERE agent_id=? AND kind='pool'",
+            [run2.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(peer_commands, 1);
+    let sender_commands: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM commands WHERE agent_id=? AND kind='pool'",
+            [run.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sender_commands, 0, "the sender is never pushed to itself");
+    let payload: serde_json::Value = store
+        .conn
+        .query_row(
+            "SELECT payload_json FROM commands WHERE agent_id=? AND kind='pool'",
+            [run2.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|raw| serde_json::from_str(&raw).unwrap())
+        .unwrap();
+    assert_eq!(payload, serde_json::json!({"seq": receipt.seq}));
+    // Replay: the entry duplicates and no second command appears.
+    let again = store
+        .pool_write(run, attempt, token, message("f1", "hi"))
+        .unwrap()
+        .unwrap();
+    assert!(again.duplicate);
+    let peer_commands: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM commands WHERE agent_id=? AND kind='pool'",
+            [run2.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(peer_commands, 1, "a replay enqueues nothing twice");
+}
+
+/// A pool member's notify creates the original worker notification plus one
+/// linked team copy and peer commands in the same transaction, with no self
+/// push; the non-member notify path is untouched.
+#[test]
+fn notify_copies_to_the_team_once_in_one_transaction() {
+    let home = common::Home::new();
+    let (_, members) = pool(&home, &[("done", "it ships")]);
+    let (run, attempt, token) = &members[0];
+    let (run2, _, _) = &members[1];
+    // The notify route requires a bound session on a delivery transport.
+    home.store()
+        .conn
+        .execute(
+            "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) \
+             VALUES('os-1','claude_uds','sess-1',1.0,1.0)",
+            [],
+        )
+        .unwrap();
+    home.store()
+        .conn
+        .execute(
+            "UPDATE agents SET orchestrator_session_id='os-1' WHERE id=?",
+            [run.as_str()],
+        )
+        .unwrap();
+    let mut store = home.store();
+    let receipt = store
+        .notify_orchestrator(
+            run,
+            attempt,
+            token,
+            &agent_run_domain::worker::NotifyRequest {
+                request_id: "n1".into(),
+                kind: agent_run_domain::worker::WorkerMessageKind::Risk,
+                message: "material finding".into(),
+            },
+            2.0,
+        )
+        .unwrap();
+    assert!(!receipt.duplicate);
+    let copy: (String, String, String, String, String, String) = store
+        .conn
+        .query_row(
+            "SELECT author_kind,direction,kind,severity,body,delivery_id FROM pool_entries \
+             WHERE idem_scope=? AND request_id='n1'",
+            rusqlite::params![format!("notify:{}", run.as_str())],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        copy,
+        (
+            "member".into(),
+            "orchestrator_copy".into(),
+            "report".into(),
+            "risk".into(),
+            "material finding".into(),
+            receipt.notification_id.clone(),
+        )
+    );
+    let peer_commands: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM commands WHERE agent_id=? AND kind='pool'",
+            [run2.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(peer_commands, 1);
+    let self_commands: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM commands WHERE agent_id=? AND kind='pool'",
+            [run.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(self_commands, 0);
+    // A retry with the same key replays the original receipt and adds
+    // neither a copy nor a command.
+    let replay = store
+        .notify_orchestrator(
+            run,
+            attempt,
+            token,
+            &agent_run_domain::worker::NotifyRequest {
+                request_id: "n1".into(),
+                kind: agent_run_domain::worker::WorkerMessageKind::Risk,
+                message: "material finding".into(),
+            },
+            40.0,
+        )
+        .unwrap();
+    assert!(replay.duplicate);
+    let copies: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM pool_entries WHERE kind='report'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(copies, 1);
+    let peer_commands: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM commands WHERE agent_id=? AND kind='pool'",
+            [run2.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(peer_commands, 1);
+    // A pool_post reusing the notify's request key lives in its own
+    // idempotency scope and cannot collide with or corrupt the copy.
+    let other = store
+        .pool_write(
+            run,
+            attempt,
+            token,
+            message("n1", "a chat message, not the report"),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(other.seq > 0);
+    let copies: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM pool_entries WHERE kind='report'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(copies, 1);
+}
+
+/// Claim order prefers cancel over steer over pool delivery.
+#[test]
+fn claim_order_prefers_cancel_then_steer_then_pool() {
+    let home = common::Home::new();
+    let (_, members) = pool(&home, &[("done", "it ships")]);
+    let (run, _, _) = &members[0];
+    let (peer_run, peer_attempt, peer_token) = &members[1];
+    let mut store = home.store();
+    // A peer's entry fans one pool command out to this member's tip.
+    store
+        .pool_write(peer_run, peer_attempt, peer_token, message("c1", "x"))
+        .unwrap()
+        .unwrap();
+    store
+        .enqueue(run, "steer", &serde_json::json!({"text":"later"}))
+        .unwrap();
+    store
+        .enqueue(run, "cancel", &serde_json::json!({}))
+        .unwrap();
+    let (_, first, _) = store.claim_command(run).unwrap().unwrap();
+    assert_eq!(first, "cancel");
+    let (_, second, _) = store.claim_command(run).unwrap().unwrap();
+    assert_eq!(second, "steer");
+    let (_, third, _) = store.claim_command(run).unwrap().unwrap();
+    assert_eq!(third, "pool");
+}
+
+/// A failing fan-out insert rolls back the whole write: no entry, no
+/// notification, no delivery outbox row and no command survive, for both a
+/// chat write and a notify team copy; a retry after the fault succeeds once.
+#[test]
+fn forced_fanout_failure_rolls_back_every_row() {
+    let home = common::Home::new();
+    let (_, members) = pool(&home, &[("done", "it ships")]);
+    let (run, attempt, token) = &members[0];
+    let mut store = home.store();
+    store
+        .conn
+        .execute(
+            "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) \
+             VALUES('os-1','claude_uds','sess-1',1.0,1.0)",
+            [],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET orchestrator_session_id='os-1' WHERE id=?",
+            [run.as_str()],
+        )
+        .unwrap();
+    let count = |store: &agent_run_store::Store, table: &str| -> i64 {
+        store
+            .conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    };
+    let before = [
+        count(&store, "pool_entries"),
+        count(&store, "worker_notifications"),
+        count(&store, "deliveries"),
+        count(&store, "commands"),
+    ];
+    store
+        .conn
+        .execute_batch(
+            "CREATE TEMP TRIGGER fail_pool_push BEFORE INSERT ON commands \
+             WHEN NEW.kind='pool' BEGIN SELECT RAISE(ABORT,'forced fanout failure'); END;",
+        )
+        .unwrap();
+    assert!(store
+        .pool_write(run, attempt, token, message("c1", "hello"))
+        .is_err());
+    let request = agent_run_domain::worker::NotifyRequest {
+        request_id: "n9".into(),
+        kind: agent_run_domain::worker::WorkerMessageKind::Notice,
+        message: "report".into(),
+    };
+    assert!(store
+        .notify_orchestrator(run, attempt, token, &request, 2.0)
+        .is_err());
+    let after = [
+        count(&store, "pool_entries"),
+        count(&store, "worker_notifications"),
+        count(&store, "deliveries"),
+        count(&store, "commands"),
+    ];
+    assert_eq!(before, after, "nothing survives a failed fan-out");
+    store
+        .conn
+        .execute_batch("DROP TRIGGER fail_pool_push")
+        .unwrap();
+    let receipt = store
+        .notify_orchestrator(run, attempt, token, &request, 40.0)
+        .unwrap();
+    assert!(!receipt.duplicate);
+    assert_eq!(count(&store, "pool_entries"), before[0] + 1);
+}
+
+/// A peer whose tip already ended is not enqueued (nothing would claim the
+/// command), while the log entry stays for catch-up.
+#[test]
+fn terminal_peer_tip_gets_no_pending_command_but_keeps_the_entry() {
+    let home = common::Home::new();
+    let (_, members) = pool(&home, &[("done", "it ships")]);
+    let (run, attempt, token) = &members[0];
+    let (run2, _, _) = &members[1];
+    let mut store = home.store();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='failed' WHERE id=?",
+            [run2.as_str()],
+        )
+        .unwrap();
+    store
+        .pool_write(run, attempt, token, message("t1", "anyone there"))
+        .unwrap()
+        .unwrap();
+    let pending: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM commands WHERE kind='pool'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(pending, 0);
+    let entries: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM pool_entries WHERE kind='message'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(entries, 1);
+}

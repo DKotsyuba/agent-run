@@ -1834,6 +1834,64 @@ async fn dispatches_worker_report_without_completion_status() {
     );
 }
 
+/// A pool member's report reaches the orchestrator through the same shared
+/// renderer as its peers: stamped sender name, role and stable identity plus
+/// direction, with an oversized body shortened only inside the fixed bound.
+#[tokio::test]
+async fn pool_linked_worker_report_is_rendered_with_the_stamped_sender() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let home = common::Home::new();
+    delivery(&home.path, "ntf_pool", "codex_queue", "pending");
+    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let agent = "ag-20260825-120000-0123456789";
+    let body = "x".repeat(2048);
+    connection
+        .execute_batch("INSERT INTO pools(id,request_namespace,request_id,request_sha256,goal,acceptance_json,state,roster_revision,created_at) VALUES('pool-20260101-000000-0123456789','ns','r',lower(hex(zeroblob(32))),'goal','[]','open',1,1.0)")
+        .unwrap();
+    for sql in [
+        "INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at) VALUES('attempt-pool',?1,1,'finished','{}',1.0)",
+        "INSERT INTO worker_notifications(delivery_id,agent_id,attempt_id,request_id,kind,message,created_at) VALUES('ntf_pool',?1,'attempt-pool','key','risk','raw stored body',1.0)",
+        "INSERT INTO pool_members(agent_id,pool_id,slot,name,role,personal_task,joined_roster_revision) VALUES(?1,'pool-20260101-000000-0123456789',1,'Ada','reviewer','t',1)",
+    ] {
+        connection.execute(sql, params![agent]).unwrap();
+    }
+    connection.execute(
+        "INSERT INTO pool_entries(pool_id,author_kind,author_agent_id,author_name,author_role,direction,kind,severity,roster_revision,body,delivery_id,sender_run_id,sender_attempt_id,idem_scope,request_id,created_at)
+         VALUES('pool-20260101-000000-0123456789','member',?1,'Ada','reviewer','orchestrator_copy','report','risk',1,?2,'ntf_pool',?1,'attempt-pool','notify:x','key',1.0)",
+        params![agent, body],
+    ).unwrap();
+    let listener = tokio::net::UnixListener::bind(home.path.join("ar-cdx-v4-worker.sock")).unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let length = stream.read_u32_le().await.unwrap() as usize;
+        let mut data = vec![0; length];
+        stream.read_exact(&mut data).await.unwrap();
+        let reply = br#"{"outcome":"accepted"}"#;
+        stream.write_u32_le(reply.len() as u32).await.unwrap();
+        stream.write_all(reply).await.unwrap();
+        serde_json::from_slice::<Value>(&data).unwrap()
+    });
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+    let request = tokio::time::timeout(Duration::from_secs(2), peer)
+        .await
+        .unwrap()
+        .unwrap();
+    let message = request["message"].as_str().unwrap();
+    assert!(message.len() <= 2048, "{}", message.len());
+    assert!(message.starts_with("agent-run/pool #1 roster r1\nfrom Ada (reviewer, ag-20260825-120000-0123456789) to orchestrator (team copy)\nkind report severity risk\nuntrusted body:\n"));
+    assert!(message.contains("[truncated; the full text is in the pool log]"));
+    // The stored report stays raw for idempotent replay.
+    let stored: String = connection
+        .query_row(
+            "SELECT message FROM worker_notifications WHERE delivery_id='ntf_pool'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, "raw stored body");
+}
+
 /// Mirrors `tests/test_codex_queue.py::test_send_uses_the_relay_without_a_queue_message_id`.
 #[tokio::test]
 async fn relay_acceptance_has_no_queue_message_identifier() {

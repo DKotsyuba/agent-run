@@ -680,6 +680,20 @@ async fn run_with_steer(
     home: &std::path::Path,
     plan: LaunchPlan,
 ) -> agent_run_domain::domain::AgentId {
+    run_with_command(home, plan, |store, id| {
+        store
+            .enqueue(id, "steer", &json!({"text":"fixture:steer-text"}))
+            .unwrap();
+    })
+    .await
+}
+
+/// [`run_with_steer`] with the caller choosing which commands to enqueue.
+async fn run_with_command(
+    home: &std::path::Path,
+    plan: LaunchPlan,
+    enqueue: impl FnOnce(&mut agent_run_core::state::Store, &agent_run_domain::domain::AgentId),
+) -> agent_run_domain::domain::AgentId {
     let config = agent_run_config::config::Config::load(home).unwrap();
     let mut request: agent_run_domain::domain::StartRequest = serde_json::from_value(json!({
         "runtime":"mock", "model":"fixture", "profile":"review",
@@ -689,9 +703,7 @@ async fn run_with_steer(
     request.validate().unwrap();
     let mut store = agent_run_core::state::Store::open(home).unwrap();
     let (id, _) = store.admit(&request, &config, &json!({}), None).unwrap();
-    store
-        .enqueue(&id, "steer", &json!({"text":"fixture:steer-text"}))
-        .unwrap();
+    enqueue(&mut store, &id);
     drop(store);
     let mut store = agent_run_core::state::Store::open(home).unwrap();
     let record = store.get(&id).unwrap();
@@ -817,4 +829,85 @@ async fn steer_reply_journals_the_delivered_text() {
     let id = run_with_steer(&fixture.path, steer_plan("result", false)).await;
     assert_eq!(command_result(&fixture.path, &id), json!({"accepted":true}));
     assert_eq!(steer_rows(&fixture.path, &id), 1);
+}
+
+/// Admits a one-seat pool around `id` and an operator entry, then queues the
+/// `pool` command a peer write would have produced; returns nothing, the log
+/// entry is the authority the runner re-reads.
+fn queue_pool_push(
+    store: &mut agent_run_core::state::Store,
+    id: &agent_run_domain::domain::AgentId,
+) {
+    store
+        .conn
+        .execute(
+            "INSERT INTO pools(id,request_namespace,request_id,request_sha256,goal,acceptance_json,state,roster_revision,created_at) \
+             VALUES('pool-20260101-000000-0123456789','ns','r',lower(hex(zeroblob(32))),'goal','[]','open',1,1.0)",
+            [],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO pool_members(agent_id,pool_id,slot,name,role,personal_task,joined_roster_revision) \
+             VALUES(?,'pool-20260101-000000-0123456789',1,'Ada','reviewer','t',1)",
+            [id.as_str()],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO pool_entries(pool_id,author_kind,direction,kind,roster_revision,body,idem_scope,request_id,created_at) \
+             VALUES('pool-20260101-000000-0123456789','operator','team','message',1,'please recheck','op','k',1.0)",
+            [],
+        )
+        .unwrap();
+    store.enqueue(id, "pool", &json!({"seq":1})).unwrap();
+}
+
+/// Reads the durable result of the agent's one `pool` command.
+fn pool_result(
+    home: &std::path::Path,
+    id: &agent_run_domain::domain::AgentId,
+) -> serde_json::Value {
+    let store = agent_run_core::state::Store::open(home).unwrap();
+    store
+        .conn
+        .query_row(
+            "SELECT result_json FROM commands WHERE agent_id=? AND kind='pool'",
+            [id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|raw| serde_json::from_str(&raw).unwrap())
+        .unwrap()
+}
+
+/// A correlated native reply is `native_accepted` only: never delivery or
+/// consumption, and the operator-visible journal gains no user row.
+#[tokio::test]
+async fn pool_push_native_reply_is_accepted_not_consumed() {
+    let fixture = common::Home::new();
+    let id = run_with_command(&fixture.path, steer_plan("result", false), queue_pool_push).await;
+    let result = pool_result(&fixture.path, &id);
+    assert_eq!(result["push"], "native_accepted");
+    assert_eq!(result["reason"], "native_replied");
+    assert!(result.get("delivered").is_none() && result.get("accepted").is_none());
+}
+
+/// A correlated native rejection is a proven `rejected`; the turn completes.
+#[tokio::test]
+async fn pool_push_native_rejection_is_rejected() {
+    let fixture = common::Home::new();
+    let id = run_with_command(&fixture.path, steer_plan("error", false), queue_pool_push).await;
+    assert_eq!(pool_result(&fixture.path, &id)["push"], "rejected");
+}
+
+/// Backlog pressure after a possible write is `unknown`, never a guess.
+#[tokio::test]
+async fn pool_push_pressure_after_write_is_unknown() {
+    let fixture = common::Home::new();
+    let id = run_with_command(&fixture.path, steer_plan("result", true), queue_pool_push).await;
+    let result = pool_result(&fixture.path, &id);
+    assert_eq!(result["push"], "unknown");
+    assert_eq!(result["reason"], "uncertain_backlog_pressure");
 }

@@ -321,13 +321,7 @@ pub async fn run(
                 }
                 if command == "steer" {
                     if let Some(text) = commands::steer_text(&payload) {
-                        let accepted = process
-                            .send_before(
-                                &json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":text}]}}),
-                                deadline,
-                            )
-                            .await
-                            .is_ok();
+                        let accepted = send_user_text(process, text, deadline).await;
                         store.complete_command(&record.id, cid, &json!({"accepted":accepted}))?;
                         if accepted {
                             journal(store, &record.id, "user", &process.redact(text), None, None)?;
@@ -339,6 +333,20 @@ pub async fn run(
                             &json!({"accepted":false,"reason":"empty_steer_text"}),
                         )?;
                     }
+                } else if command == "pool" {
+                    // Same stdin path and deadline as steer. A successful
+                    // write is `written` only — never engine acceptance or
+                    // consumption — and any error may follow a partial write,
+                    // so it is `unknown`, not "not delivered". The durable log
+                    // keeps the entry either way.
+                    let result = match commands::pool_push_text(store, &record.id, &payload) {
+                        Ok(text) => match send_user_text(process, &text, deadline).await {
+                            true => commands::pool_result("written", "stdin_write"),
+                            false => commands::pool_result("unknown", "stdin_write_failed"),
+                        },
+                        Err(refusal) => refusal,
+                    };
+                    store.complete_command(&record.id, cid, &result)?;
                 } else {
                     store.complete_command(
                         &record.id,
@@ -709,6 +717,23 @@ pub async fn run(
 /// shared numeric/nullability rules after the terminal event is durable.
 fn runtime_result_usage(result: &Value) -> Value {
     json!({"duration_ms":result["duration_ms"],"duration_api_ms":result["duration_api_ms"],"num_turns":result["num_turns"],"ttft_ms":result["ttft_ms"],"total_cost_usd":result["total_cost_usd"],"usage":result["usage"]})
+}
+
+/// Writes one user text message to the engine's stdin before `deadline`;
+/// shared by operator steering and pool delivery. `false` after a possible
+/// partial write is not proof that nothing was sent.
+async fn send_user_text(
+    process: &mut agent_run_adapters::io::Process,
+    text: &str,
+    deadline: tokio::time::Instant,
+) -> bool {
+    process
+        .send_before(
+            &json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":text}]}}),
+            deadline,
+        )
+        .await
+        .is_ok()
 }
 
 #[cfg(test)]

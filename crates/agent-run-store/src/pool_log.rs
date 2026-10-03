@@ -315,6 +315,12 @@ impl Store {
             None,
             &json!({"seq": seq, "kind": write.kind().as_str()}),
         )?;
+        // Fan out in the same transaction: one pending `pool` command holding
+        // only the sequence number for every current member's tip execution
+        // except the sender. The log stays authoritative; a refused or
+        // uncertain delivery never loses the entry, and replays of the same
+        // key return before this point so nothing is enqueued twice.
+        fanout_entry(&tx, &member.pool_id, &member.seat_agent_id, seq)?;
         tx.commit()?;
         Ok(Ok(PoolWriteReceipt {
             pool_id: member.pool_id.parse()?,
@@ -407,7 +413,7 @@ impl Store {
 }
 
 /// Decodes one journal row into its validated public view shape.
-fn entry_view(row: &rusqlite::Row<'_>) -> rusqlite::Result<PoolEntryView> {
+pub fn entry_view(row: &rusqlite::Row<'_>) -> rusqlite::Result<PoolEntryView> {
     let kind: String = row.get(6)?;
     let decision: Option<String> = row.get(10)?;
     Ok(PoolEntryView {
@@ -700,6 +706,55 @@ fn append_entry(
         other => other.into(),
     })?;
     Ok(tx.last_insert_rowid().max(0) as u64)
+}
+
+/// Enqueues one pending `pool` command per current recipient tip.
+///
+/// The payload carries only the entry's sequence number: the log is the
+/// authority and the runner re-reads the stamped entry before delivery and
+/// re-checks that the recipient is still a current member's tip. The sender
+/// is never pushed to itself. A recipient whose tip already ended is skipped,
+/// because nothing would ever claim the command; it catches up through
+/// `pool_read`. Called inside the writer's transaction so the entry and its
+/// commands commit or roll back together.
+pub(crate) fn fanout_entry(
+    tx: &Transaction<'_>,
+    pool_id: &str,
+    sender_seat: &str,
+    seq: u64,
+) -> Result<()> {
+    let mut statement = tx.prepare(
+        "SELECT m.agent_id FROM pool_members m \
+         WHERE m.pool_id=? AND m.replaced_by IS NULL AND m.agent_id<>?",
+    )?;
+    let seats = statement
+        .query_map(params![pool_id, sender_seat], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for seat in seats {
+        let tip = tip_of(tx, &seat.parse()?)?;
+        let status: String = tx.query_row(
+            "SELECT status FROM agents WHERE id=?",
+            [tip.as_str()],
+            |row| row.get(0),
+        )?;
+        if status
+            .parse::<agent_run_domain::domain::Status>()?
+            .terminal()
+        {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO commands(agent_id,kind,payload_json,state,created_at) \
+             VALUES(?, 'pool', ?, 'pending', ?)",
+            params![
+                tip.as_str(),
+                serde_json::to_string(&json!({"seq": seq}))?,
+                now()
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 /// Computes the derived status: roster, current proposal, per-member vote

@@ -839,13 +839,7 @@ pub async fn run(
                 }
                 if kind == "steer" {
                     if let Some(text) = commands::steer_text(&payload) {
-                        let exchange = process
-                            .rpc_exchange(
-                                "turn/steer",
-                                json!({"threadId":tid,"expectedTurnId":turn_id,"input":[{"type":"text","text":text}]}),
-                                Duration::from_secs(30),
-                            )
-                            .await;
+                        let exchange = turn_steer(process, &tid, &turn_id, text).await;
                         // Only a correlated native reply proves delivery in
                         // either direction: a rejection proves the engine
                         // refused it, and an unsent exchange proves nothing
@@ -891,6 +885,33 @@ pub async fn run(
                             &json!({"accepted":false,"reason":"empty_steer_text"}),
                         )?;
                     }
+                } else if kind == "pool" {
+                    // Same bounded exchange as steer, with explicit finite
+                    // push dispositions: only a correlated native reply is
+                    // `native_accepted` (never delivery or consumption), a
+                    // pre-send failure is `unsent`, and every bounded end
+                    // after a possible write is `unknown`. The durable log
+                    // keeps the entry in every case.
+                    let result = match commands::pool_push_text(store, &record.id, &payload) {
+                        Ok(text) => match turn_steer(process, &tid, &turn_id, &text).await {
+                            Ok(agent_run_adapters::io::RpcDisposition::Replied(_)) => {
+                                commands::pool_result("native_accepted", "native_replied")
+                            }
+                            Ok(agent_run_adapters::io::RpcDisposition::Rejected { .. }) => {
+                                commands::pool_result("rejected", "native_rejected")
+                            }
+                            Ok(agent_run_adapters::io::RpcDisposition::UnsentPressure) => {
+                                commands::pool_result("unsent", "backlog_pressure_unsent")
+                            }
+                            Ok(agent_run_adapters::io::RpcDisposition::Uncertain(reason)) => {
+                                commands::pool_result("unknown", reason.reason())
+                            }
+                            // Only pre-send validation returns Err.
+                            Err(_) => commands::pool_result("unsent", "exchange_not_sent"),
+                        },
+                        Err(refusal) => refusal,
+                    };
+                    store.complete_command(&record.id, cid, &result)?;
                 } else {
                     store.complete_command(
                         &record.id,
@@ -1302,6 +1323,24 @@ pub async fn query(process: &mut Process, method: &str) -> Result<Value> {
     }
     process
         .rpc(method, json!({}), Duration::from_secs(20))
+        .await
+}
+
+/// Sends one text input to the active turn through the bounded native steer
+/// exchange; shared by operator steering and pool delivery so both keep the
+/// same one-second-class 30 s bound and disposition semantics.
+async fn turn_steer(
+    process: &mut agent_run_adapters::io::Process,
+    thread_id: &str,
+    turn_id: &str,
+    text: &str,
+) -> Result<agent_run_adapters::io::RpcDisposition> {
+    process
+        .rpc_exchange(
+            "turn/steer",
+            json!({"threadId":thread_id,"expectedTurnId":turn_id,"input":[{"type":"text","text":text}]}),
+            Duration::from_secs(30),
+        )
         .await
 }
 
