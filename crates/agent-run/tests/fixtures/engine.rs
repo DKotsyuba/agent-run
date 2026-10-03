@@ -42,8 +42,9 @@ fn worker_report(args: &[String]) {
             frame::write(&mut input,&json!({"jsonrpc":"2.0","method":"notifications/initialized"}),socket::MAX_FRAME).await.unwrap();
             frame::write(&mut input,&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),socket::MAX_FRAME).await.unwrap();
             let roster: Value=serde_json::from_slice(&frame::read(&mut output,socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
-            assert_eq!(roster["result"]["tools"].as_array().unwrap().len(),1);
-            assert_eq!(roster["result"]["tools"][0]["name"],"notify_orchestrator");
+            let mut names: Vec<&str>=roster["result"]["tools"].as_array().unwrap().iter().map(|tool|tool["name"].as_str().unwrap()).collect();
+            names.sort_unstable();
+            assert_eq!(names,["notify_orchestrator","pool_post","pool_propose","pool_read","pool_vote"]);
             frame::write(&mut input,&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"notify_orchestrator","arguments":{"request_id":"fixture-report","kind":"risk","message":"Fixture material finding"}}}),socket::MAX_FRAME).await.unwrap();
             let reply: Value=serde_json::from_slice(&frame::read(&mut output,socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
             assert_ne!(reply["result"]["isError"],true,"{reply}");
