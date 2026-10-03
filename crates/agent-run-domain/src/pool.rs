@@ -318,7 +318,7 @@ impl PoolDenial {
             }
             Self::ProposalBudgetExhausted => "the pool's proposal budget is exhausted".into(),
             Self::VoteBudgetExhausted => {
-                "this member's vote budget for the proposal is exhausted; only a block remains"
+                "this member's vote budget for the proposal is exhausted; only a block or revoke remains"
                     .into()
             }
             Self::MalformedChecks => {

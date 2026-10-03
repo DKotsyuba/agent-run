@@ -107,8 +107,21 @@ atomic batch admission exist so far: the store admits every member agent, its
 reservations and the pool roster in one transaction (or none), and the core
 composes each member's task with the common goal, its own seat and every peer's
 stable identity before any member is launched. Replay is keyed by the original
-client request, never by the composed text. No tool, CLI or MCP method starts,
-reads or writes a pool yet, and pool messaging is not connected. The tables retain replaced members, keep one current member per slot, store
+client request, never by the composed text. Pool members carry a fixed private
+worker catalog — `notify_orchestrator`, `pool_post`, `pool_read`,
+`pool_propose` and `pool_vote` — served over one private broker route that
+authenticates the hidden per-attempt capability and stamps the author (kind,
+name, role, stable identity) from durable membership inside the same
+transaction; refusals such as `not_pool_member`, `pool_completed` or
+`stale_proposal` are typed codes, never prose. Members pull their pool: the
+append-only log pages by immutable cursor (optionally holding a bounded wait
+for a new entry), renders each entry as one compact plain-text block through
+the shared renderer, and reports derived status — current roster, current
+proposal and each member's vote validity with its reason. Ordinary chat is
+budgeted while proposals, votes, blocks and revokes stay possible, and
+agreement is reported without completing the pool. Automatic pushes into
+running members, operator-facing pool APIs, replacement and settlement are
+not implemented yet. The tables retain replaced members, keep one current member per slot, store
 an immutable author stamped at send time, and reference agents and deliveries
 without cascades so a later purge can delete pool rows first.
 

@@ -14,11 +14,16 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   with unknown kept distinct from observed success
 - feat(pools): add the cooperative-pool foundation: validated provider-neutral
   domain types, one compact English entry renderer that stamps the author and
-  marks the body untrusted, and the schema below. No pool operation is exposed
-  through the CLI, MCP or any tool yet
+  marks the body untrusted, and the schema below
 - feat(pools): admit a pool's members, reservations and roster atomically in one
   store transaction and compose each member's task with the shared goal and every
-  peer's stable identity before launch; still not exposed through any tool
+  peer's stable identity before launch
+- feat(pools): give members a fixed private tool catalog (notify, chat, read,
+  propose, vote) over one authenticated broker route: authors are stamped from
+  durable membership, refusals are typed codes, reads page the append-only log
+  by cursor with an optional bounded wait and render plain-text entries, and
+  derived vote status is reported without ever completing the pool; pushes,
+  operator pool APIs, replacement and settlement are not implemented yet
 
 Database schema 25 adds the `pools`, `pool_members` and `pool_entries` tables
 with historical membership, one current member per slot and immutable

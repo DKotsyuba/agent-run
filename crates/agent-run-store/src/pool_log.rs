@@ -518,7 +518,10 @@ fn append_message(
         [&member.pool_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    if rows >= CHAT_ROW_BUDGET || bytes >= CHAT_BYTE_BUDGET {
+    // The candidate message itself must still fit: the check is prospective,
+    // so a budget nearly full refuses an addition that would exceed it
+    // instead of letting one more bounded message cross the line.
+    if rows >= CHAT_ROW_BUDGET || bytes + input.message.len() as i64 > CHAT_BYTE_BUDGET {
         return Ok(Err(PoolDenial::ChatBudgetExhausted));
     }
     append_entry(
@@ -611,8 +614,12 @@ fn append_vote(
         params![member.pool_id, member.seat_agent_id, current as i64],
         |row| row.get(0),
     )?;
+    // The final slot is reserved for explicit control — a block or a revoke —
+    // so a member can always object or withdraw a valid ready vote without a
+    // new proposal; the total stays bounded at the budget.
     if spent >= VOTE_ROW_BUDGET
-        || (spent == VOTE_ROW_BUDGET - 1 && input.decision != VoteDecision::Block)
+        || (spent == VOTE_ROW_BUDGET - 1
+            && !matches!(input.decision, VoteDecision::Block | VoteDecision::Revoke))
     {
         return Ok(Err(PoolDenial::VoteBudgetExhausted));
     }

@@ -725,3 +725,190 @@ fn wait_probe_reports_entries_and_refuses_non_members() {
         Err(PoolDenial::NotPoolMemberRead)
     );
 }
+
+/// The byte budget is prospective: an ordinary message that would cross the
+/// cap is refused without a new row, while control writes still land.
+#[test]
+fn byte_budget_refuses_oversized_addition_without_a_row() {
+    let home = common::Home::new();
+    let (_, members) = pool(&home, &[("done", "it ships")]);
+    let (run, attempt, token) = &members[0];
+    let mut store = home.store();
+    let proposal = store
+        .pool_write(
+            run,
+            attempt,
+            token,
+            PoolWrite::Proposal(PoolPropose {
+                request_id: "p".into(),
+                message: "m".into(),
+                snapshot: "s".into(),
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    // Fill the chat bytes to just below the cap with valid rows.
+    let big = "x".repeat(8192);
+    let mut filled = 0usize;
+    while filled + big.len() <= agent_run_store::pool_log::CHAT_BYTE_BUDGET as usize {
+        store
+            .pool_write(run, attempt, token, message(&format!("c{filled}"), &big))
+            .unwrap()
+            .unwrap();
+        filled += big.len();
+    }
+    let remaining = agent_run_store::pool_log::CHAT_BYTE_BUDGET as usize - filled;
+    assert!(remaining < big.len(), "the fixture sits below the byte cap");
+    let rows_before: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM pool_entries WHERE kind='message'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    // An addition that would cross the cap is refused and writes no row.
+    assert_eq!(
+        store
+            .pool_write(run, attempt, token, message("over", &big))
+            .unwrap()
+            .unwrap_err(),
+        PoolDenial::ChatBudgetExhausted
+    );
+    let rows_after: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM pool_entries WHERE kind='message'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows_before, rows_after, "no row was written");
+    // A control write still lands on the same pool.
+    store
+        .pool_write(
+            run,
+            attempt,
+            token,
+            PoolWrite::Vote(PoolVote {
+                request_id: "b".into(),
+                proposal_seq: proposal.seq,
+                decision: VoteDecision::Block,
+                checks: vec![],
+                message: None,
+            }),
+        )
+        .unwrap()
+        .unwrap();
+}
+
+/// The final vote-slot reservation accepts a revoke as well as a block: a
+/// member with seven rows can withdraw its valid ready vote, leaving a
+/// non-ready status and never a completion.
+#[test]
+fn final_vote_slot_accepts_revoke_after_seven_votes() {
+    let home = common::Home::new();
+    let (_, members) = pool(&home, &[("done", "it ships")]);
+    let (run, attempt, token) = &members[0];
+    let mut store = home.store();
+    let proposal = store
+        .pool_write(
+            run,
+            attempt,
+            token,
+            PoolWrite::Proposal(PoolPropose {
+                request_id: "p".into(),
+                message: "m".into(),
+                snapshot: "s".into(),
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    for index in 0..agent_run_store::pool_log::VOTE_ROW_BUDGET - 1 {
+        store
+            .pool_write(
+                run,
+                attempt,
+                token,
+                PoolWrite::Vote(PoolVote {
+                    request_id: format!("v{index}"),
+                    proposal_seq: proposal.seq,
+                    decision: VoteDecision::Ready,
+                    checks: vec![CriterionCheck {
+                        criterion_id: "done".into(),
+                        status: CheckStatus::Met,
+                        evidence: "ok".into(),
+                    }],
+                    message: None,
+                }),
+            )
+            .unwrap()
+            .unwrap();
+    }
+    // A ready vote no longer fits the reserved slot…
+    assert_eq!(
+        store
+            .pool_write(
+                run,
+                attempt,
+                token,
+                PoolWrite::Vote(PoolVote {
+                    request_id: "vr".into(),
+                    proposal_seq: proposal.seq,
+                    decision: VoteDecision::Ready,
+                    checks: vec![CriterionCheck {
+                        criterion_id: "done".into(),
+                        status: CheckStatus::Met,
+                        evidence: "ok".into(),
+                    }],
+                    message: None,
+                })
+            )
+            .unwrap()
+            .unwrap_err(),
+        PoolDenial::VoteBudgetExhausted
+    );
+    // …but a revoke does, withdrawing the member's vote.
+    store
+        .pool_write(
+            run,
+            attempt,
+            token,
+            PoolWrite::Vote(PoolVote {
+                request_id: "w".into(),
+                proposal_seq: proposal.seq,
+                decision: VoteDecision::Revoke,
+                checks: vec![],
+                message: None,
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    let page = store
+        .pool_read(run, attempt, token, 0, None, 50)
+        .unwrap()
+        .unwrap();
+    assert_eq!(page["status"]["members"][0]["why"], "revoked");
+    assert_eq!(page["status"]["members"][0]["counts"], false);
+    assert_eq!(page["status"]["agreed"], false);
+    assert_eq!(page["status"]["state"], "open", "no completion ever fires");
+    // The budget stays finite: nothing more fits, not even another revoke.
+    assert_eq!(
+        store
+            .pool_write(
+                run,
+                attempt,
+                token,
+                PoolWrite::Vote(PoolVote {
+                    request_id: "w2".into(),
+                    proposal_seq: proposal.seq,
+                    decision: VoteDecision::Revoke,
+                    checks: vec![],
+                    message: None,
+                })
+            )
+            .unwrap()
+            .unwrap_err(),
+        PoolDenial::VoteBudgetExhausted
+    );
+}
