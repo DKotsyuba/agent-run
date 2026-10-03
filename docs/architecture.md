@@ -94,11 +94,19 @@ authority, generated-home snapshot, history and cleanup proofs verify. See
 
 SQLite is the source of truth for agents, events, messages, answers, native
 session lineage, deliveries, cleanup evidence, capacity, and statistics. The
-current schema is version 24. Numbered migrations live in `sql/migrations/`
+current schema is version 25. Numbered migrations live in `sql/migrations/`
 and apply transactionally after a pre-version backup. The step to 17 is paired
 with the schema-2 config: ordinary commands and the broker refuse an older
 database with `migration_required` until `agent-run config migrate` runs. A
 binary refuses a database newer than its supported schema.
+
+Schema 25 lays the foundation for cooperative pools (a small roster of
+ordinary executions sharing one goal) with `pools`, `pool_members` and
+`pool_entries`. Only the schema, the validated domain types and the compact entry
+renderer exist so far: no tool, CLI or MCP method starts, reads or writes a pool
+yet. The tables retain replaced members, keep one current member per slot, store
+an immutable author stamped at send time, and reference agents and deliveries
+without cascades so a later purge can delete pool rows first.
 
 Large payloads live under the run directory and are referenced by path, size,
 and SHA-256. A terminal success must be reproducible from stored state and

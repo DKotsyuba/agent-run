@@ -6,6 +6,7 @@ pub mod domain;
 pub mod error;
 pub mod fsm;
 mod legacy_provider;
+pub mod pool;
 mod provider_connection;
 pub mod provider_start;
 pub mod quota_snapshot;

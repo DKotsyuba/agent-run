@@ -50,6 +50,37 @@ impl fmt::Display for WorkerMessageKind {
     }
 }
 
+/// Accepts an idempotency key of 1–128 ASCII letters, digits, `_`, `-` or `.`.
+pub(crate) fn request_key(key: &str) -> Result<()> {
+    if key.is_empty()
+        || key.len() > 128
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    {
+        return Err(Error::Validation(
+            "request_id must be 1–128 safe ASCII bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Accepts nonblank text of at most `max` UTF-8 bytes whose only controls are
+/// newline and tab, so relay frames and terminals cannot be inflated or driven.
+pub(crate) fn bounded_text(label: &str, text: &str, max: usize) -> Result<()> {
+    if text.trim().is_empty()
+        || text.len() > max
+        || text
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        return Err(Error::Validation(format!(
+            "{label} must be 1–{max} UTF-8 bytes without unsupported control characters"
+        )));
+    }
+    Ok(())
+}
+
 /// A single worker report with a caller-chosen idempotency key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -66,28 +97,8 @@ pub struct NotifyRequest {
 impl NotifyRequest {
     /// Rejects unsafe keys, blank or oversized bodies, and controls that inflate relay frames.
     pub fn validate(&self) -> Result<()> {
-        if self.request_id.is_empty()
-            || self.request_id.len() > 128
-            || !self
-                .request_id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-        {
-            return Err(Error::Validation(
-                "request_id must be 1–128 safe ASCII bytes".into(),
-            ));
-        }
-        if self.message.trim().is_empty()
-            || self.message.len() > 2048
-            || self
-                .message
-                .chars()
-                .any(|c| c.is_control() && c != '\n' && c != '\t')
-        {
-            return Err(Error::Validation(
-                "message must be 1–2048 UTF-8 bytes without unsupported control characters".into(),
-            ));
-        }
+        request_key(&self.request_id)?;
+        bounded_text("message", &self.message, 2048)?;
         Ok(())
     }
 }

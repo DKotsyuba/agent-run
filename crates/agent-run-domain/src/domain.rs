@@ -307,13 +307,10 @@ impl StartRequest {
             ("runtime", &self.runtime),
             ("model", &self.model),
             ("profile", &self.profile),
-            ("task", &self.task),
         ] {
             nonblank(name, s)?;
         }
-        if self.task.len() > 512 * 1024 {
-            return Err(invalid("task exceeds 512 KiB"));
-        }
+        task_text(&self.task)?;
         for (name, s) in [("effort", &self.effort), ("account", &self.account)] {
             if let Some(s) = s {
                 nonblank(name, s)?;
@@ -344,6 +341,18 @@ impl StartRequest {
         Ok(())
     }
 }
+/// The largest accepted task text, in UTF-8 bytes.
+pub const MAX_TASK_BYTES: usize = 512 * 1024;
+
+/// Accepts a nonblank NUL-free task of at most [`MAX_TASK_BYTES`] bytes.
+pub fn task_text(task: &str) -> Result<()> {
+    nonblank("task", task)?;
+    if task.len() > MAX_TASK_BYTES {
+        return Err(invalid("task exceeds 512 KiB"));
+    }
+    Ok(())
+}
+
 /// The largest accepted run timeout: 30 days in seconds.
 ///
 /// The bound keeps `created_at + timeout` and every remaining-time duration

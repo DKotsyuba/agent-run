@@ -12,6 +12,14 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   provenance (Claude `is_error`, Codex command/MCP markers), journal Codex tool
   calls once per native id, and expose nullable latest-execution `tool_counts`
   with unknown kept distinct from observed success
+- feat(pools): add the cooperative-pool foundation: validated provider-neutral
+  domain types, one compact English entry renderer that stamps the author and
+  marks the body untrusted, and the schema below. No pool operation is exposed
+  through the CLI, MCP or any tool yet
+
+Database schema 25 adds the `pools`, `pool_members` and `pool_entries` tables
+with historical membership, one current member per slot and immutable
+author-at-send log entries; existing rows are untouched.
 
 Database schema 24 adds nullable `messages.error`/`error_source`,
 `content_complete` and the lineage index on `messages.root_agent_id`; historical
