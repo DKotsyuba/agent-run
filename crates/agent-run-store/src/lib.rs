@@ -14,6 +14,7 @@ pub mod migrations;
 pub mod pool_admission;
 /// Authenticated pool writes, the durable shared log, and derived status.
 pub mod pool_log;
+pub mod pool_replace;
 pub mod process_ownership;
 /// Read projections, stable pages, and cursor-based transcript views.
 pub mod projections;

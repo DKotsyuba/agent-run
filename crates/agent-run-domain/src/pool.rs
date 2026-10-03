@@ -277,6 +277,13 @@ pub enum PoolDenial {
     MalformedChecks,
     /// The pool log is not readable through this membership.
     NotPoolMemberRead,
+    /// No pool has the requested identity.
+    PoolNotFound,
+    /// The member's latest execution is still active, or its cleanup is not
+    /// proven; cancel it, wait for terminal cleanup, then retry.
+    MemberBusy,
+    /// The named member was already replaced; only a current member can be.
+    MemberNotCurrent,
 }
 
 impl PoolDenial {
@@ -292,6 +299,9 @@ impl PoolDenial {
             Self::ProposalBudgetExhausted => "proposal_budget_exhausted",
             Self::VoteBudgetExhausted => "vote_budget_exhausted",
             Self::MalformedChecks => "malformed_checks",
+            Self::PoolNotFound => "pool_not_found",
+            Self::MemberBusy => "member_busy",
+            Self::MemberNotCurrent => "member_not_current",
         }
     }
 
@@ -324,6 +334,12 @@ impl PoolDenial {
             Self::MalformedChecks => {
                 "a ready vote must cover every acceptance criterion exactly once".into()
             }
+            Self::PoolNotFound => "no pool has this identity".into(),
+            Self::MemberBusy => {
+                "the member's execution is still active or its cleanup is unproven; cancel it, wait for terminal cleanup, then retry"
+                    .into()
+            }
+            Self::MemberNotCurrent => "this member was already replaced".into(),
         }
     }
 }

@@ -18,11 +18,15 @@ use agent_run_config::provider_config::ProviderConfig;
 use agent_run_config::role_plan;
 use agent_run_domain::{
     catalog::{AccountStatus, QuotaAdmissionError, QuotaCandidateSet, ResolvedLaunchAuthority},
-    pool::{compose_member_task, PoolId, PoolSeat, PoolStartRequest},
+    pool::{
+        compose_member_task, PoolDenial, PoolId, PoolPost, PoolQuery, PoolReplace, PoolSeat,
+        PoolStartRequest,
+    },
     ProviderStartRequest, Sha256Digest,
 };
 use agent_run_store::{
     pool_admission::{PoolAdmission, PoolAdmissionInput, PoolMemberAdmission},
+    pool_replace::{PoolReplaceInput, PoolReplacement},
     provider_admission::AdmissionInputs,
 };
 
@@ -735,6 +739,255 @@ impl Service {
     ) -> Result<Value> {
         let result = self.admit_pool_trusted(request, candidates)?;
         self.hand_off_pool(result).await
+    }
+
+    /// Appends an operator message to a pool: the author is stamped by the
+    /// broker as the operator, the entry fans out to every current member's
+    /// tip, and the same key replays. Refusals are typed [`PoolDenial`]s.
+    pub fn pool_post(&self, request: PoolPost) -> Result<std::result::Result<Value, PoolDenial>> {
+        request.validate()?;
+        let mut store = Store::open(&self.home)?;
+        Ok(store
+            .pool_operator_post(&request.pool_id, &request.request_id, &request.message)?
+            .map(|receipt| {
+                json!({"pool_id": receipt.pool_id, "seq": receipt.seq,
+                                  "created": !receipt.duplicate})
+            }))
+    }
+
+    /// Reads a pool's derived status and one cursor page of its log for the
+    /// operator, through the projection members read.
+    pub fn pool_status(&self, query: PoolQuery) -> Result<std::result::Result<Value, PoolDenial>> {
+        query.validate()?;
+        Store::open(&self.home)?.pool_operator_read(
+            &query.pool_id,
+            query.after_seq.unwrap_or(0),
+            query.before_seq,
+            query.limit.unwrap_or(agent_run_domain::pool::MAX_PAGE),
+        )
+    }
+
+    /// Admits a member replacement atomically; nothing is launched.
+    pub fn admit_pool_replacement(
+        &self,
+        request: PoolReplace,
+    ) -> Result<std::result::Result<PoolReplacement, PoolDenial>> {
+        self.admit_replacement_with(
+            request,
+            PROVIDER_STALE_RETRIES,
+            &mut |store, catalog, member, _| {
+                let pin = member.account.as_ref().map(|label| label.as_str());
+                crate::capacity::provider_ranking::provider_candidates(
+                    store,
+                    catalog,
+                    &member.provider,
+                    &member.model,
+                    pin,
+                    &std::collections::BTreeSet::new(),
+                )
+            },
+        )
+    }
+
+    /// [`Self::admit_pool_replacement`] over one fixed trusted candidate set.
+    pub fn admit_pool_replacement_trusted(
+        &self,
+        request: PoolReplace,
+        candidates: QuotaCandidateSet,
+    ) -> Result<std::result::Result<PoolReplacement, PoolDenial>> {
+        self.admit_replacement_with(request, 0, &mut |_, _, _, _| Ok(candidates.clone()))
+    }
+
+    /// Shared replacement admission.
+    ///
+    /// 1. The normalized outer request's digest scopes replay: the same key
+    ///    returns the original new identity before any configuration or quota
+    ///    read, even after later replacements; a different request is
+    ///    `Conflict`.
+    /// 2. The pool and the seat are read; an explicit `start` is an ordinary
+    ///    request under the current catalog and grants, an omitted one is the
+    ///    seat's original user spec restored from its frozen request (personal
+    ///    task back, pool-owned binding and key removed), so no resolved
+    ///    credential or automatically chosen account is carried over.
+    /// 3. The new identity is minted, the task composed from the common goal,
+    ///    the new roster and a catch-up line, and prepared like any start.
+    /// 4. [`Store::replace_pool_member`] rechecks everything atomically; a
+    ///    roster that moved meanwhile recomposes, a stale selection retries
+    ///    like a single start.
+    fn admit_replacement_with(
+        &self,
+        mut request: PoolReplace,
+        stale_retries: u32,
+        produce: &mut dyn FnMut(
+            &Store,
+            &agent_run_domain::catalog::ProviderCatalog,
+            &ProviderStartRequest,
+            u32,
+        ) -> Result<QuotaCandidateSet>,
+    ) -> Result<std::result::Result<PoolReplacement, PoolDenial>> {
+        request.validate()?;
+        let sha = agent_run_domain::canonical::sha256_hex(&serde_json::to_value(&request)?, true);
+        if let Some(found) = Store::open(&self.home)?.replay_pool_replacement(
+            &request.pool_id,
+            &request.request_id,
+            &sha,
+        )? {
+            return Ok(found);
+        }
+        let (config, revision) = self.current_provider_config()?;
+        let accounts = Store::open(&self.home)?.list_accounts()?;
+        let catalog = config.resolve_catalog(accounts)?;
+        let new_id = AgentId::new();
+        let (mut submission, mut recomposed) = (0, 0);
+        loop {
+            let store = Store::open(&self.home)?;
+            let context = match store.pool_replace_context(&request.pool_id, &request.agent_id)? {
+                Ok(context) => context,
+                Err(denied) => return Ok(Err(denied)),
+            };
+            let frozen = ProviderLaunchIdentity::read(&store.get(&context.old.agent_id)?)?;
+            let mut start = request.start.clone().unwrap_or_else(|| {
+                let mut original = frozen.provider_request.clone();
+                original.task = context.personal_task.clone();
+                original
+            });
+            start.request_id = None;
+            start.orchestrator = frozen.provider_request.orchestrator.clone();
+            let name = start
+                .display_name
+                .clone()
+                .unwrap_or_else(|| context.old.name.clone());
+            start.display_name = Some(name.clone());
+            let personal = start.task.clone();
+            let seat = PoolSeat {
+                slot: context.old.slot,
+                name: name.clone(),
+                role: context.old.role.clone(),
+                agent_id: new_id.clone(),
+            };
+            let roster: Vec<PoolSeat> = context
+                .seats
+                .iter()
+                .map(|member| {
+                    if member.slot == seat.slot {
+                        seat.clone()
+                    } else {
+                        PoolSeat {
+                            slot: member.slot,
+                            name: member.name.clone(),
+                            role: member.role.clone(),
+                            agent_id: member.agent_id.clone(),
+                        }
+                    }
+                })
+                .collect();
+            let proposal = context.current_proposal.map_or(String::new(), |seq| {
+                format!(" The current proposal is #{seq}.")
+            });
+            start.task = compose_member_task(
+                &context.pool_id,
+                &context.goal,
+                &context.acceptance,
+                &roster,
+                &seat,
+                &format!(
+                    "{personal}\n\nRoster change: you replace {} ({}) in slot {} at roster \
+                     revision {}. The pool log already holds entries up to #{}.{proposal} Call \
+                     pool_read with after_seq=0 first, before acting.",
+                    context.old.name,
+                    context.old.agent_id,
+                    seat.slot,
+                    context.roster_revision + 1,
+                    context.last_seq
+                ),
+            )?;
+            start.validate()?;
+            let prepared = prepare_provider(&config, &revision, &catalog, start)?;
+            let candidates = produce(&store, &catalog, &prepared.request, submission)?;
+            let outcome = Store::open(&self.home)?.replace_pool_member(PoolReplaceInput {
+                pool_id: &request.pool_id,
+                old: &request.agent_id,
+                request_id: &request.request_id,
+                request_sha256: &sha,
+                expected_roster_revision: context.roster_revision,
+                new_id: new_id.clone(),
+                name: &name,
+                personal_task: &personal,
+                catalog: &catalog,
+                inputs: AdmissionInputs {
+                    request: &prepared.request,
+                    effective: &prepared.effective,
+                    authority: &prepared.authority,
+                    candidates: &candidates,
+                    identity: &prepared.identity,
+                    global_cap: config.core.max_active_agents,
+                    harness_cap: prepared.cap,
+                    pinned: prepared.pinned.as_ref(),
+                },
+            });
+            match outcome {
+                Ok(Err(PoolDenial::StaleRoster { .. })) if recomposed < 3 => recomposed += 1,
+                Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
+                    if stale_retries > 0 && submission == stale_retries =>
+                {
+                    return Err(QuotaAdmissionError::SelectionBusy { stale_retries }.into());
+                }
+                Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
+                    if submission < stale_retries =>
+                {
+                    submission += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// Replaces a pool member and hands the new execution to the normal
+    /// detached supervisor after commit. The old retirement is never rolled
+    /// back: a launch failure ends the new member terminally with its exact
+    /// identity visible, and it can itself be replaced.
+    pub async fn replace_pool_member(
+        &self,
+        request: PoolReplace,
+    ) -> Result<std::result::Result<Value, PoolDenial>> {
+        let admitted = self.admit_pool_replacement(request)?;
+        self.hand_off_replacement(admitted).await
+    }
+
+    /// [`Self::replace_pool_member`] over a fixed trusted candidate set.
+    pub async fn replace_pool_member_trusted(
+        &self,
+        request: PoolReplace,
+        candidates: QuotaCandidateSet,
+    ) -> Result<std::result::Result<Value, PoolDenial>> {
+        let admitted = self.admit_pool_replacement_trusted(request, candidates)?;
+        self.hand_off_replacement(admitted).await
+    }
+
+    /// Launches a newly created replacement and renders the public result.
+    async fn hand_off_replacement(
+        &self,
+        admitted: std::result::Result<PoolReplacement, PoolDenial>,
+    ) -> Result<std::result::Result<Value, PoolDenial>> {
+        let replacement = match admitted {
+            Ok(replacement) => replacement,
+            Err(denied) => return Ok(Err(denied)),
+        };
+        if replacement.created {
+            let mut single = json!({"created": true, "agent_id": replacement.new.agent_id});
+            let _ = self.hand_off_provider(&mut single).await;
+        }
+        let store = Store::open(&self.home)?;
+        Ok(Ok(json!({
+            "pool_id": replacement.pool_id,
+            "created": replacement.created,
+            "roster_revision": replacement.roster_revision,
+            "replaced": {"agent_id": replacement.old.agent_id, "name": replacement.old.name,
+                         "role": replacement.old.role},
+            "member": {"agent_id": replacement.new.agent_id, "name": replacement.new.name,
+                       "role": replacement.new.role,
+                       "status": store.get(&replacement.new.agent_id)?.status.as_str()},
+        })))
     }
 
     /// Launches each member of a freshly created pool, then re-reads statuses.

@@ -130,7 +130,22 @@ member's tip of that entry's pool, and records only a finite push disposition:
 write, `rejected`, `unsent`, `refused` (with a typed reason) or `unknown` after
 a possible write. None of them means the member consumed the entry; the log
 remains the source of truth and members catch up through `pool_read`.
-Operator-facing pool APIs, replacement and settlement are not implemented yet. The tables retain replaced members, keep one current member per slot, store
+The core also offers operator operations, not yet exposed through any tool, CLI
+or MCP method: posting a message stamped as the operator (fanned out through the
+same path and chat budget, idempotent by key), reading a pool's status and
+cursor-paged log through the projection members read, and replacing one current
+member. A replacement is refused with `member_busy` unless the member's latest
+execution is terminal and every attempt of its lineage has verified cleanup
+(decided again inside the same immediate transaction as the write); it admits
+the new execution, retires the old seat while keeping its row, installs the new
+seat in the same slot, bumps the roster revision, appends one broker roster
+entry to the peers and records the original request digest, so a repeat of the
+same key returns the same new identity even after later replacements. An omitted
+start restores the seat's original user spec (never the account a prior
+automatic choice picked). The new execution's task names the goal, the current
+roster and a catch-up instruction; peers' frozen prompts are corrected by the
+roster entry, never rewritten. Pool completion and settlement are not
+implemented yet. The tables retain replaced members, keep one current member per slot, store
 an immutable author stamped at send time, and reference agents and deliveries
 without cascades so a later purge can delete pool rows first.
 

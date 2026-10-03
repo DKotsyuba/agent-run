@@ -71,9 +71,23 @@ fn membership(conn: &Connection, root: &AgentId) -> Result<Option<Membership>> {
     let Some((seat_agent_id, pool_id, name, role, roster_revision, state, acceptance)) = row else {
         return Ok(None);
     };
-    let parsed: Value = serde_json::from_str(&acceptance)
+    let criteria = criteria_of(&acceptance)?;
+    Ok(Some(Membership {
+        seat_agent_id,
+        pool_id,
+        name,
+        role,
+        roster_revision,
+        state,
+        acceptance: criteria,
+    }))
+}
+
+/// Decodes stored acceptance criteria into `(id, text)` pairs.
+fn criteria_of(acceptance: &str) -> Result<Vec<(String, String)>> {
+    let parsed: Value = serde_json::from_str(acceptance)
         .map_err(|_| Error::Integrity("pool acceptance is malformed".into()))?;
-    let criteria = parsed
+    parsed
         .as_array()
         .ok_or_else(|| Error::Integrity("pool acceptance is not an array".into()))?
         .iter()
@@ -86,16 +100,7 @@ fn membership(conn: &Connection, root: &AgentId) -> Result<Option<Membership>> {
                 criterion["text"].as_str().unwrap_or_default().to_owned(),
             ))
         })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(Some(Membership {
-        seat_agent_id,
-        pool_id,
-        name,
-        role,
-        roster_revision,
-        state,
-        acceptance: criteria,
-    }))
+        .collect()
 }
 
 /// The current proposal of `pool_id`, when one exists.
@@ -135,8 +140,21 @@ fn latest_vote(
         .optional()?)
 }
 
+/// Whether every attempt of every execution in `root`'s lineage has verified
+/// cleanup proof: the same predicate explicit resume demands of its parent.
+pub(crate) fn lineage_cleanup_complete(conn: &Connection, root: &AgentId) -> Result<bool> {
+    let uncleaned: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM attempts WHERE agent_id IN \
+         (SELECT id FROM agents WHERE root_agent_id=?1 OR id=?1) \
+         AND (cleanup_proof_json IS NULL OR phase!='cleanup_complete')",
+        [root.as_str()],
+        |row| row.get(0),
+    )?;
+    Ok(uncleaned == 0)
+}
+
 /// The lineage tip execution id of `root`, matching the public resolver.
-fn tip_of(conn: &Connection, root: &AgentId) -> Result<AgentId> {
+pub(crate) fn tip_of(conn: &Connection, root: &AgentId) -> Result<AgentId> {
     let id: String = conn.query_row(
         "SELECT id FROM agents WHERE root_agent_id=?1 OR id=?1 \
          ORDER BY sequence DESC,created_at DESC,id DESC LIMIT 1",
@@ -347,48 +365,99 @@ impl Store {
             Ok(member) => member,
             Err(_) => return Ok(Err(PoolDenial::NotPoolMemberRead)),
         };
-        let status = pool_status(&self.conn, &member)?;
-        let (selection, order, cursor) = match before_seq {
-            Some(before) => ("seq<?", "DESC", before as i64),
-            None => ("seq>?", "ASC", after_seq as i64),
+        read_page(&self.conn, &member.pool_id, after_seq, before_seq, limit).map(Ok)
+    }
+
+    /// Reads one bounded page of any pool plus the derived status for the
+    /// operator; `None` when no pool has the identity. The page and status
+    /// come from the same projection members read, so nothing is aggregated
+    /// twice and no internal run or attempt identity is exposed.
+    pub fn pool_operator_read(
+        &self,
+        pool_id: &PoolId,
+        after_seq: u64,
+        before_seq: Option<u64>,
+        limit: u32,
+    ) -> Result<std::result::Result<Value, PoolDenial>> {
+        if !pool_exists(&self.conn, pool_id.as_str())? {
+            return Ok(Err(PoolDenial::PoolNotFound));
+        }
+        read_page(&self.conn, pool_id.as_str(), after_seq, before_seq, limit).map(Ok)
+    }
+
+    /// Appends one operator message to the pool under a broker-stamped
+    /// operator author and fans it out to every current member's tip.
+    ///
+    /// The author is never taken from the caller. The same chat budget and
+    /// body bounds as member chat apply; the key is scoped `op`, so the same
+    /// body replays the original sequence and a different body is `Conflict`.
+    pub fn pool_operator_post(
+        &mut self,
+        pool_id: &PoolId,
+        request_id: &str,
+        message: &str,
+    ) -> Result<std::result::Result<PoolWriteReceipt, PoolDenial>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some((state, roster_revision)) = tx
+            .query_row(
+                "SELECT state,roster_revision FROM pools WHERE id=?",
+                [pool_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)),
+            )
+            .optional()?
+        else {
+            return Ok(Err(PoolDenial::PoolNotFound));
         };
-        let mut statement = self.conn.prepare(&format!(
-            "SELECT seq,author_kind,author_agent_id,author_name,author_role,direction,kind,\
-             severity,proposal_seq,roster_revision,decision,body \
-             FROM pool_entries WHERE pool_id=? AND {selection} ORDER BY seq {order} LIMIT ?"
-        ))?;
-        let rows = statement
-            .query_map(
-                params![member.pool_id, cursor, limit as i64 + 1],
-                entry_view,
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(statement);
-        let complete = rows.len() <= limit as usize;
-        let mut entries: Vec<_> = rows.into_iter().take(limit as usize).collect();
-        if before_seq.is_some() {
-            entries.reverse();
+        let prior: Option<i64> = tx
+            .query_row(
+                "SELECT seq FROM pool_entries WHERE pool_id=? AND idem_scope='op' AND request_id=?",
+                params![pool_id.as_str(), request_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(seq) = prior {
+            if replay_shape_of(&tx, pool_id.as_str(), seq)? == vec![("body", json!(message))] {
+                return Ok(Ok(PoolWriteReceipt {
+                    pool_id: pool_id.clone(),
+                    seq: seq.max(0) as u64,
+                    duplicate: true,
+                }));
+            }
+            return Ok(Err(PoolDenial::Conflict));
         }
-        for entry in &entries {
-            entry
-                .validate()
-                .map_err(|e| Error::Integrity(format!("pool entry is invalid: {e}")))?;
+        if state == "completed" {
+            return Ok(Err(PoolDenial::PoolCompleted));
         }
-        let next_cursor = (!complete)
-            .then(|| entries.last().map(|entry| entry.seq))
-            .flatten();
-        let last_seq = entries.last().map(|entry| entry.seq);
-        Ok(Ok(json!({
-            "pool_id": member.pool_id,
-            "entries": entries,
-            "after_seq": after_seq,
-            "before_seq": before_seq,
-            "limit": limit,
-            "next_cursor": next_cursor,
-            "last_seq": last_seq,
-            "complete": complete,
-            "status": status,
-        })))
+        let (rows, bytes): (i64, i64) = tx.query_row(
+            "SELECT COUNT(*),COALESCE(SUM(length(CAST(body AS BLOB))),0) FROM pool_entries \
+             WHERE pool_id=? AND kind='message'",
+            [pool_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if rows >= CHAT_ROW_BUDGET || bytes + message.len() as i64 > CHAT_BYTE_BUDGET {
+            return Ok(Err(PoolDenial::ChatBudgetExhausted));
+        }
+        tx.execute(
+            "INSERT INTO pool_entries(pool_id,author_kind,direction,kind,roster_revision,body,\
+             idem_scope,request_id,created_at) VALUES(?,'operator','team','message',?,?,'op',?,?)",
+            params![
+                pool_id.as_str(),
+                roster_revision,
+                message,
+                request_id,
+                now()
+            ],
+        )?;
+        let seq = tx.last_insert_rowid().max(0) as u64;
+        fanout_entry(&tx, pool_id.as_str(), "", seq)?;
+        tx.commit()?;
+        Ok(Ok(PoolWriteReceipt {
+            pool_id: pool_id.clone(),
+            seq,
+            duplicate: false,
+        }))
     }
 
     /// Cheap probe for the read long-poll loop: any entry beyond `after_seq`?
@@ -410,6 +479,64 @@ impl Store {
         )?;
         Ok(Ok(exists))
     }
+}
+
+/// Whether a pool with this identity exists.
+fn pool_exists(conn: &Connection, pool_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pools WHERE id=?)",
+        [pool_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// One cursor page of a pool's log plus its derived status.
+fn read_page(
+    conn: &Connection,
+    pool_id: &str,
+    after_seq: u64,
+    before_seq: Option<u64>,
+    limit: u32,
+) -> Result<Value> {
+    let status = pool_status(conn, pool_id)?;
+    let (selection, order, cursor) = match before_seq {
+        Some(before) => ("seq<?", "DESC", before as i64),
+        None => ("seq>?", "ASC", after_seq as i64),
+    };
+    let mut statement = conn.prepare(&format!(
+        "SELECT seq,author_kind,author_agent_id,author_name,author_role,direction,kind,\
+             severity,proposal_seq,roster_revision,decision,body \
+             FROM pool_entries WHERE pool_id=? AND {selection} ORDER BY seq {order} LIMIT ?"
+    ))?;
+    let rows = statement
+        .query_map(params![pool_id, cursor, limit as i64 + 1], entry_view)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let complete = rows.len() <= limit as usize;
+    let mut entries: Vec<_> = rows.into_iter().take(limit as usize).collect();
+    if before_seq.is_some() {
+        entries.reverse();
+    }
+    for entry in &entries {
+        entry
+            .validate()
+            .map_err(|e| Error::Integrity(format!("pool entry is invalid: {e}")))?;
+    }
+    let next_cursor = (!complete)
+        .then(|| entries.last().map(|entry| entry.seq))
+        .flatten();
+    let last_seq = entries.last().map(|entry| entry.seq);
+    Ok(json!({
+            "pool_id": pool_id,
+            "entries": entries,
+            "after_seq": after_seq,
+            "before_seq": before_seq,
+            "limit": limit,
+            "next_cursor": next_cursor,
+            "last_seq": last_seq,
+            "complete": complete,
+            "status": status,
+    }))
 }
 
 /// Decodes one journal row into its validated public view shape.
@@ -760,18 +887,19 @@ pub(crate) fn fanout_entry(
 /// Computes the derived status: roster, current proposal, per-member vote
 /// validity with reasons, and whether unanimity currently holds. Agreement is
 /// explicitly not completion; nothing here ever completes the pool.
-fn pool_status(conn: &Connection, member: &Membership) -> Result<Value> {
-    let (goal, state, roster_revision): (String, String, u32) = conn.query_row(
-        "SELECT goal,state,roster_revision FROM pools WHERE id=?",
-        [&member.pool_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
+fn pool_status(conn: &Connection, pool_id: &str) -> Result<Value> {
+    let (goal, state, roster_revision, acceptance): (String, String, u32, String) = conn
+        .query_row(
+            "SELECT goal,state,roster_revision,acceptance_json FROM pools WHERE id=?",
+            [pool_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
     let mut seats = conn.prepare(
         "SELECT m.agent_id,m.slot,m.name,m.role FROM pool_members m \
          WHERE m.pool_id=? AND m.replaced_by IS NULL ORDER BY m.slot",
     )?;
     let rows = seats
-        .query_map([&member.pool_id], |row| {
+        .query_map([pool_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
@@ -781,9 +909,8 @@ fn pool_status(conn: &Connection, member: &Membership) -> Result<Value> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(seats);
-    let proposal = current_proposal(conn, &member.pool_id)?;
-    let criteria: Vec<Value> = member
-        .acceptance
+    let proposal = current_proposal(conn, pool_id)?;
+    let criteria: Vec<Value> = criteria_of(&acceptance)?
         .iter()
         .map(|(id, text)| json!({"id": id, "text": text}))
         .collect();
@@ -800,7 +927,7 @@ fn pool_status(conn: &Connection, member: &Membership) -> Result<Value> {
         let (vote, why) = match &proposal {
             None => (None, "no_proposal".to_owned()),
             Some((current, _, proposal_roster)) => {
-                let latest = latest_vote(conn, &member.pool_id, &seat_id, *current)?;
+                let latest = latest_vote(conn, pool_id, &seat_id, *current)?;
                 vote_validity(latest, roster_revision, *proposal_roster, &tip, &tip_status)
             }
         };
@@ -810,11 +937,25 @@ fn pool_status(conn: &Connection, member: &Membership) -> Result<Value> {
         members.push(json!({
             "name": name, "role": role, "agent_id": seat_id, "slot": slot,
             "tip_status": tip_status,
+            "cleanup_complete": lineage_cleanup_complete(conn, &seat)?,
             "vote": vote,
             "counts": why == "valid",
             "why": why,
         }));
     }
+    let mut retired = conn.prepare(
+        "SELECT m.agent_id,m.slot,m.name,m.role,m.replaced_by FROM pool_members m \
+         WHERE m.pool_id=? AND m.replaced_by IS NOT NULL ORDER BY m.slot,m.joined_roster_revision",
+    )?;
+    let retired: Vec<Value> = retired
+        .query_map([pool_id], |row| {
+            Ok(json!({
+                "agent_id": row.get::<_, String>(0)?, "slot": row.get::<_, i64>(1)?,
+                "name": row.get::<_, String>(2)?, "role": row.get::<_, String>(3)?,
+                "replaced_by": row.get::<_, String>(4)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
     Ok(json!({
         "state": state,
         "roster_revision": roster_revision,
@@ -824,6 +965,7 @@ fn pool_status(conn: &Connection, member: &Membership) -> Result<Value> {
             "seq": seq, "snapshot": snapshot, "roster_revision": roster,
         })),
         "members": members,
+        "replaced_members": retired,
         "agreed": agreed,
         "note": "agreement is not completion: the pool completes only after every member execution ends successfully with cleanup evidence",
     }))

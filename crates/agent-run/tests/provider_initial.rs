@@ -5074,3 +5074,508 @@ async fn pool_spawn_failure_keeps_the_pool_and_reaches_every_member() {
     assert_eq!(table_rows(&home, "pools"), 1);
     assert_eq!(table_rows(&home, "pool_members"), 2);
 }
+
+/// Ends `id` terminally with released ownership and verified cleanup proof,
+/// as a finished supervisor would leave it.
+fn retire(home: &Path, id: &AgentId) {
+    let store = Store::open(home).unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='failed' WHERE id=?",
+            [id.as_str()],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE attempts SET ownership_active=0,phase='cleanup_complete',cleanup_proof_json='{\"never_spawned\":true}' WHERE agent_id=?",
+            [id.as_str()],
+        )
+        .unwrap();
+}
+
+/// Admits a two-member pool on `glm-user` and returns its identity and members.
+fn admitted_pool(
+    service: &Service,
+    home: &Path,
+    pins: [Option<&str>; 2],
+    trusted: bool,
+) -> (agent_run_domain::pool::PoolId, Vec<AgentId>) {
+    let request = pool_request(
+        home,
+        "replace-pool",
+        false,
+        &[
+            ("lead", "fixture:pool-observe one", pins[0]),
+            ("peer", "fixture:answer two", pins[1]),
+        ],
+    );
+    let admitted = if trusted {
+        service
+            .admit_pool_trusted(request, candidates(committed(home)))
+            .unwrap()
+    } else {
+        service.admit_pool(request).unwrap()
+    };
+    (
+        serde_json::from_value(admitted["pool_id"].clone()).unwrap(),
+        admitted["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| serde_json::from_value(m["agent_id"].clone()).unwrap())
+            .collect(),
+    )
+}
+
+/// A replacement request, optionally with an explicit start.
+fn replace_request(
+    pool: &agent_run_domain::pool::PoolId,
+    old: &AgentId,
+    key: &str,
+    start: Option<serde_json::Value>,
+) -> agent_run_domain::pool::PoolReplace {
+    serde_json::from_value(serde_json::json!({
+        "pool_id": pool, "agent_id": old, "request_id": key, "start": start
+    }))
+    .unwrap()
+}
+
+/// The service-level operator post and status share one stamped projection.
+#[tokio::test]
+async fn pool_operator_post_and_status_through_the_service() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let (pool, ids) = admitted_pool(&service, &home, [Some("work"), Some("work")], true);
+    let post: agent_run_domain::pool::PoolPost = serde_json::from_value(serde_json::json!({
+        "pool_id": pool, "request_id": "op-1", "message": "focus on the failing test"
+    }))
+    .unwrap();
+    let first = service.pool_post(post.clone()).unwrap().unwrap();
+    assert_eq!(first["created"], true);
+    assert_eq!(service.pool_post(post).unwrap().unwrap()["created"], false);
+    let status = service
+        .pool_status(serde_json::from_value(serde_json::json!({"pool_id": pool})).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(status["status"]["state"], "open");
+    assert_eq!(
+        status["status"]["members"][0]["agent_id"],
+        serde_json::json!(ids[0])
+    );
+    assert_eq!(status["status"]["members"][0]["cleanup_complete"], false);
+    assert!(status["entries"][0]["body"]
+        .as_str()
+        .unwrap()
+        .contains("failing test"));
+    assert_eq!(status["entries"][0]["author_kind"], "operator");
+    let text = status.to_string();
+    assert!(!text.contains("attempt") && !text.contains("sender_run"));
+}
+
+/// A replacement needs a terminal, fully cleaned member; then it atomically
+/// retires the old seat, installs the new one, bumps the roster, announces it
+/// to peers only and freezes a task naming the new roster and a catch-up.
+#[tokio::test]
+async fn pool_replace_requires_cleanup_then_replaces_atomically() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let (pool, ids) = admitted_pool(&service, &home, [Some("work"), Some("work")], true);
+    // A ready vote from the peer counts until the roster changes.
+    {
+        let store = Store::open(&home).unwrap();
+        let attempt: String = store
+            .conn
+            .query_row(
+                "SELECT id FROM attempts WHERE agent_id=?",
+                [ids[1].as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE agents SET status='running' WHERE id=?",
+                [ids[1].as_str()],
+            )
+            .unwrap();
+        store.conn.execute(
+            "INSERT INTO pool_entries(pool_id,author_kind,author_agent_id,author_name,author_role,direction,kind,roster_revision,snapshot,body,sender_run_id,sender_attempt_id,idem_scope,request_id,created_at) \
+             SELECT pool_id,'member',agent_id,name,role,'team','proposal',1,'snap','p',agent_id,?2,agent_id,'k1',1.0 FROM pool_members WHERE agent_id=?1",
+            rusqlite::params![ids[1].as_str(), attempt],
+        ).unwrap();
+        store.conn.execute(
+            "INSERT INTO pool_entries(pool_id,author_kind,author_agent_id,author_name,author_role,direction,kind,roster_revision,proposal_seq,decision,checks_json,body,sender_run_id,sender_attempt_id,idem_scope,request_id,created_at) \
+             SELECT pool_id,'member',agent_id,name,role,'team','vote',1,1,'ready','[{\"criterion_id\":\"goal\",\"status\":\"met\"}]','v',agent_id,?2,agent_id,'k2',2.0 FROM pool_members WHERE agent_id=?1",
+            rusqlite::params![ids[1].as_str(), attempt],
+        ).unwrap();
+    }
+    let status_of = || {
+        service
+            .pool_status(serde_json::from_value(serde_json::json!({"pool_id": pool})).unwrap())
+            .unwrap()
+            .unwrap()["status"]
+            .clone()
+    };
+    assert_eq!(status_of()["members"][1]["why"], "valid");
+    let request = replace_request(&pool, &ids[0], "rep-1", None);
+    let busy =
+        |request| service.admit_pool_replacement_trusted(request, candidates(committed(&home)));
+    assert_eq!(
+        busy(request.clone()).unwrap().unwrap_err(),
+        agent_run_domain::pool::PoolDenial::MemberBusy
+    );
+    Store::open(&home)
+        .unwrap()
+        .conn
+        .execute(
+            "UPDATE agents SET status='failed' WHERE id=?",
+            [ids[0].as_str()],
+        )
+        .unwrap();
+    assert_eq!(
+        busy(request.clone()).unwrap().unwrap_err(),
+        agent_run_domain::pool::PoolDenial::MemberBusy,
+        "terminal without cleanup proof is still busy"
+    );
+    retire(&home, &ids[0]);
+    let before = committed(&home);
+    let replaced = busy(request).unwrap().unwrap();
+    assert!(replaced.created && replaced.roster_revision == 2);
+    assert_eq!(committed(&home), before + 1, "revision advances once");
+    assert_ne!(replaced.new.agent_id, ids[0]);
+    assert_eq!(
+        (replaced.new.slot, replaced.new.name.as_str()),
+        (1, "lead 1")
+    );
+    let store = Store::open(&home).unwrap();
+    let successor: Option<String> = store
+        .conn
+        .query_row(
+            "SELECT replaced_by FROM pool_members WHERE agent_id=?",
+            [ids[0].as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(successor.as_deref(), Some(replaced.new.agent_id.as_str()));
+    assert_eq!(table_rows(&home, "pool_members"), 3);
+    // The roster entry is broker-authored and pushed to the peer, not the newcomer.
+    let (author, kind): (String, String) = store
+        .conn
+        .query_row(
+            "SELECT author_kind,kind FROM pool_entries WHERE idem_scope='replace'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((author.as_str(), kind.as_str()), ("broker", "roster"));
+    let pushed = |id: &AgentId| -> i64 {
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM commands WHERE agent_id=? AND kind='pool'",
+                [id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!((pushed(&ids[1]), pushed(&replaced.new.agent_id)), (1, 0));
+    // The new frozen task names the goal, both stable ids and the catch-up,
+    // and the stored request, effective task and identity agree.
+    let row = store.get(&replaced.new.agent_id).unwrap();
+    let identity = row.identity.clone().unwrap();
+    let task = identity["provider_request"]["task"].as_str().unwrap();
+    assert_eq!(row.request.task, task);
+    assert!(task.contains("ship the fix") && task.contains(ids[1].as_str()));
+    assert!(task.contains(replaced.new.agent_id.as_str()) && task.contains("pool_read"));
+    assert!(
+        task.contains("fixture:pool-observe one"),
+        "personal task restored"
+    );
+    assert_eq!(
+        identity["replay_request_sha256"],
+        agent_run_domain::canonical::sha256_hex(&identity["provider_request"], true)
+    );
+    assert!(identity["provider_request"]["request_id"].is_null());
+    // The old vote no longer counts, and the old row is untouched.
+    let status = status_of();
+    assert_eq!(status["roster_revision"], 2);
+    assert_eq!(status["members"][1]["why"], "stale_roster");
+    assert_eq!(
+        status["replaced_members"][0]["agent_id"],
+        serde_json::json!(ids[0])
+    );
+    assert_eq!(
+        status["members"][0]["agent_id"],
+        serde_json::json!(replaced.new.agent_id)
+    );
+}
+
+/// The same key returns the same new identity even after a later replacement
+/// and launches nothing; changed requests, stale ids and unknown pools are
+/// typed refusals.
+#[tokio::test]
+async fn pool_replace_replays_the_same_new_identity() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let (pool, ids) = admitted_pool(&service, &home, [Some("work"), Some("work")], true);
+    retire(&home, &ids[0]);
+    let first_request = replace_request(&pool, &ids[0], "rep-1", None);
+    let go =
+        |request| service.admit_pool_replacement_trusted(request, candidates(committed(&home)));
+    let first = go(first_request.clone()).unwrap().unwrap();
+    retire(&home, &ids[1]);
+    let second = go(replace_request(&pool, &ids[1], "rep-2", None))
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.roster_revision, 3);
+    let agents = rows(&home).0;
+    let replay = go(first_request).unwrap().unwrap();
+    assert!(!replay.created);
+    assert_eq!(replay.new.agent_id, first.new.agent_id);
+    assert_eq!(replay.old.agent_id, ids[0]);
+    assert_eq!(replay.roster_revision, 2);
+    assert_eq!(rows(&home).0, agents, "a replay admits nothing");
+    assert_eq!(
+        go(replace_request(&pool, &ids[0], "rep-1", Some(serde_json::json!({
+            "provider":"glm-user","model":"fixture","profile":"review","task":"other","workdir":home
+        }))))
+        .unwrap()
+        .unwrap_err(),
+        agent_run_domain::pool::PoolDenial::Conflict
+    );
+    assert_eq!(
+        go(replace_request(&pool, &ids[0], "rep-3", None))
+            .unwrap()
+            .unwrap_err(),
+        agent_run_domain::pool::PoolDenial::MemberNotCurrent
+    );
+    let unknown: agent_run_domain::pool::PoolId =
+        "pool-20260101-000000-0000000000".parse().unwrap();
+    assert_eq!(
+        go(replace_request(&unknown, &ids[0], "rep-4", None))
+            .unwrap()
+            .unwrap_err(),
+        agent_run_domain::pool::PoolDenial::PoolNotFound
+    );
+}
+
+/// A failure inside the replacement transaction leaves every row, the roster
+/// and the capacity revision exactly as they were.
+#[tokio::test]
+async fn pool_replace_rolls_back_everything_on_capacity() {
+    let (_temp, home) = home_with("[core]\nmax_active_agents = 2\n", &[]);
+    let service = Service::new(home.clone());
+    let (pool, ids) = admitted_pool(&service, &home, [Some("work"), Some("work")], true);
+    retire(&home, &ids[0]);
+    // Refill the freed slot so the replacement has no capacity.
+    service
+        .admit_provider_trusted(
+            request_for(&home, "glm-user", "filler", Some("work")),
+            candidates(committed(&home)),
+        )
+        .unwrap();
+    let (agents, members, entries, before) = (
+        rows(&home),
+        table_rows(&home, "pool_members"),
+        table_rows(&home, "pool_entries"),
+        committed(&home),
+    );
+    let error = service
+        .admit_pool_replacement_trusted(
+            replace_request(&pool, &ids[0], "cap", None),
+            candidates(before),
+        )
+        .unwrap_err();
+    assert!(matches!(error, agent_run_domain::Error::Capacity));
+    assert_eq!(
+        (
+            rows(&home),
+            table_rows(&home, "pool_members"),
+            table_rows(&home, "pool_entries"),
+            committed(&home)
+        ),
+        (agents, members, entries, before)
+    );
+    let revision: i64 = Store::open(&home)
+        .unwrap()
+        .conn
+        .query_row("SELECT roster_revision FROM pools", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(revision, 1);
+}
+
+/// An omitted start restores the seat's original user spec (no account the
+/// first admission happened to pick, no pool key); an explicit start is an
+/// ordinary new request; the old row's frozen identity never changes.
+#[tokio::test]
+async fn pool_replace_reuses_the_original_spec_without_pinning_the_old_account() {
+    let (_temp, home) = home_with(TWO_ACCOUNTS, &["acct-alt"]);
+    let service = Service::new(home.clone());
+    let (pool, ids) = admitted_pool(&service, &home, [None, None], false);
+    let old_identity = Store::open(&home)
+        .unwrap()
+        .get(&ids[0])
+        .unwrap()
+        .identity
+        .unwrap();
+    assert!(old_identity["provider_request"]["account"].is_null());
+    retire(&home, &ids[0]);
+    let reused = service
+        .admit_pool_replacement(replace_request(&pool, &ids[0], "reuse", None))
+        .unwrap()
+        .unwrap();
+    let store = Store::open(&home).unwrap();
+    let identity = store.get(&reused.new.agent_id).unwrap().identity.unwrap();
+    assert!(
+        identity["provider_request"]["account"].is_null(),
+        "no pinned old account"
+    );
+    assert!(store
+        .get(&reused.new.agent_id)
+        .unwrap()
+        .request
+        .account
+        .is_none());
+    assert_eq!(
+        store.get(&ids[0]).unwrap().identity.unwrap(),
+        old_identity,
+        "history is immutable"
+    );
+    retire(&home, &reused.new.agent_id);
+    let explicit = service
+        .admit_pool_replacement(replace_request(
+            &pool,
+            &reused.new.agent_id,
+            "explicit",
+            Some(serde_json::json!({
+                "provider":"glm-user","model":"fixture","profile":"review",
+                "task":"fixture:answer fresh","workdir":home,"account":"work","display_name":"Renamed"
+            })),
+        ))
+        .unwrap()
+        .unwrap();
+    assert_eq!(explicit.new.name, "Renamed");
+    assert_eq!(explicit.new.role, "lead", "the role label is preserved");
+    let row = store.get(&explicit.new.agent_id).unwrap();
+    assert_eq!(row.identity.unwrap()["provider_request"]["account"], "work");
+    assert!(row.request.task.contains("fixture:answer fresh"));
+}
+
+/// A resumed (non-terminal) tip is busy, and concurrent replacements of one
+/// seat create exactly one successor, never two current members in a slot.
+#[tokio::test]
+async fn pool_replace_races_never_create_parallel_members() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let (pool, ids) = admitted_pool(&service, &home, [Some("work"), Some("work")], true);
+    retire(&home, &ids[0]);
+    {
+        // A resumed child under the same seat makes its tip active again.
+        let store = Store::open(&home).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id,parent_agent_id,sequence) \
+                 VALUES('ag-20260101-000000-0000000077','glm-user','fixture','review','t','t','/tmp','{}','running',9.0,10.0,'cfg',?1,?1,2)",
+                [ids[0].as_str()],
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        service
+            .admit_pool_replacement_trusted(
+                replace_request(&pool, &ids[0], "busy", None),
+                candidates(committed(&home))
+            )
+            .unwrap()
+            .unwrap_err(),
+        agent_run_domain::pool::PoolDenial::MemberBusy
+    );
+    Store::open(&home)
+        .unwrap()
+        .conn
+        .execute(
+            "UPDATE agents SET status='failed' WHERE id='ag-20260101-000000-0000000077'",
+            [],
+        )
+        .unwrap();
+    let outcomes: Vec<_> = (0..4)
+        .map(|n| {
+            let (service, request, revision) = (
+                service.clone(),
+                replace_request(&pool, &ids[0], &format!("race-{n}"), None),
+                committed(&home),
+            );
+            let candidates = candidates(revision);
+            std::thread::spawn(move || service.admit_pool_replacement_trusted(request, candidates))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|o| matches!(o, Ok(Ok(r)) if r.created))
+            .count(),
+        1,
+        "{outcomes:?}"
+    );
+    let current: i64 = Store::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM pool_members WHERE slot=1 AND replaced_by IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(current, 1);
+}
+
+/// The new member's first turn carries its composed task: all current peer
+/// ids, the goal, and a catch-up instruction, with nothing launched before commit.
+#[tokio::test]
+async fn pool_replacement_child_receives_roster_and_catch_up() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let (pool, ids) = admitted_pool(&service, &home, [Some("work"), Some("work")], true);
+    retire(&home, &ids[0]);
+    let replaced = service
+        .admit_pool_replacement_trusted(
+            replace_request(
+                &pool,
+                &ids[0],
+                "observe",
+                Some(serde_json::json!({
+                    "provider":"glm-user","model":"fixture","profile":"review",
+                    "task":"fixture:pool-observe again","workdir":home,"account":"work"
+                })),
+            ),
+            candidates(committed(&home)),
+        )
+        .unwrap()
+        .unwrap();
+    run_to_end(&home, &replaced.new.agent_id).await;
+    let store = Store::open(&home).unwrap();
+    assert_eq!(
+        store.get(&replaced.new.agent_id).unwrap().status,
+        Status::Succeeded
+    );
+    assert_eq!(
+        store.get(&ids[1]).unwrap().status,
+        Status::Starting,
+        "peer never launched"
+    );
+    let received = fs::read_to_string(home.join("pool-observed.txt")).unwrap();
+    assert_eq!(
+        received,
+        store.get(&replaced.new.agent_id).unwrap().request.task
+    );
+    assert!(
+        received.contains(ids[1].as_str()) && received.contains(replaced.new.agent_id.as_str())
+    );
+    assert!(received.contains("ship the fix") && received.contains("pool_read"));
+}

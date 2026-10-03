@@ -27,8 +27,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   for each peer's tip in the same transaction; delivery records only a finite
   disposition (native accepted, written, rejected, unsent, refused, unknown),
   never consumption, and the orchestrator's notice for a pool member's report
-  carries the stamped sender; operator pool APIs, replacement and settlement
-  are not implemented yet
+  carries the stamped sender
+- feat(pools): add core operator operations: post a stamped operator message,
+  read a pool's status and log, and replace a terminal, fully cleaned member
+  atomically with a roster change, a broker roster entry and a replayable result;
+  not yet exposed through any tool, CLI or MCP method, and completion and
+  settlement are not implemented yet
 
 Database schema 25 adds the `pools`, `pool_members` and `pool_entries` tables
 with historical membership, one current member per slot and immutable

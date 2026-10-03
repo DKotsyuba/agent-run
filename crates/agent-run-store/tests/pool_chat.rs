@@ -1254,3 +1254,98 @@ fn terminal_peer_tip_gets_no_pending_command_but_keeps_the_entry() {
         .unwrap();
     assert_eq!(entries, 1);
 }
+
+/// The operator's post is stamped by the broker, fans out to every current
+/// member once, replays by key, conflicts on a changed body, honours the chat
+/// budget and shares the projection members read.
+#[test]
+fn operator_post_is_stamped_fanned_out_and_idempotent() {
+    let home = common::Home::new();
+    let (pool_id, members) = pool(&home, &[("done", "it ships")]);
+    let pool_id: agent_run_domain::pool::PoolId = pool_id.parse().unwrap();
+    let mut store = home.store();
+    let first = store
+        .pool_operator_post(&pool_id, "op-1", "please prioritise tests")
+        .unwrap()
+        .unwrap();
+    assert!(!first.duplicate && first.seq > 0);
+    let (author, direction, kind, agent, sender): (String, String, String, Option<String>, Option<String>) =
+        store
+            .conn
+            .query_row(
+                "SELECT author_kind,direction,kind,author_agent_id,sender_run_id FROM pool_entries WHERE seq=?",
+                [first.seq as i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+    assert_eq!(
+        (
+            author.as_str(),
+            direction.as_str(),
+            kind.as_str(),
+            agent,
+            sender
+        ),
+        ("operator", "team", "message", None, None)
+    );
+    for (run, _, _) in &members {
+        let pending: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM commands WHERE agent_id=? AND kind='pool'",
+                [run.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1, "every current member is pushed once");
+    }
+    let again = store
+        .pool_operator_post(&pool_id, "op-1", "please prioritise tests")
+        .unwrap()
+        .unwrap();
+    assert!(again.duplicate);
+    assert_eq!(again.seq, first.seq);
+    assert_eq!(
+        store
+            .pool_operator_post(&pool_id, "op-1", "different body")
+            .unwrap(),
+        Err(agent_run_domain::pool::PoolDenial::Conflict)
+    );
+    let commands: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM commands WHERE kind='pool'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(commands, 2, "a replay enqueues nothing");
+    let page = store
+        .pool_operator_read(&pool_id, 0, None, 50)
+        .unwrap()
+        .unwrap();
+    assert_eq!(page["entries"][0]["author_kind"], "operator");
+    assert_eq!(page["status"]["state"], "open");
+    assert_eq!(page["status"]["members"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        page["status"]["replaced_members"].as_array().unwrap().len(),
+        0
+    );
+    let text = page.to_string();
+    for private in ["sender_run_id", "attempt_id", "token"] {
+        assert!(!text.contains(private), "{private}");
+    }
+    let unknown: agent_run_domain::pool::PoolId =
+        "pool-20260101-000000-0000000000".parse().unwrap();
+    assert_eq!(
+        store.pool_operator_post(&unknown, "k", "x").unwrap(),
+        Err(agent_run_domain::pool::PoolDenial::PoolNotFound)
+    );
+    assert_eq!(
+        store
+            .pool_operator_read(&unknown, 0, None, 5)
+            .unwrap()
+            .unwrap_err(),
+        agent_run_domain::pool::PoolDenial::PoolNotFound
+    );
+}
