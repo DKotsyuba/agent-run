@@ -173,6 +173,20 @@ failure, delivery and answer facts), never reprinting a page whose only
 movement is observation time. Ctrl-C ends the viewer only; supervised agents
 keep running, and a closed output pipe terminates the process.
 
+Durable steering outcomes are truthful about evidence. `steer` still queues
+one command and returns the same acknowledgement; the command's recorded
+outcome distinguishes a correlated native reply (`accepted:true` — the
+engine accepted the input, which is not a claim the model consumed it), a
+correlated native rejection (`accepted:false`, `native_rejected`), a refusal
+to send under bounded backlog pressure (`accepted:false`,
+`backlog_pressure_unsent` — provably nothing was written), and every bounded
+end after a possible write (`accepted:null` with the finite reason, e.g.
+`uncertain_timeout` or `uncertain_backlog_pressure` — the input may have been
+taken). Interleaved engine notifications are never dropped to make room for
+a control exchange: retention is fixed and bounded, a full backlog stops the
+exchange before reading, and a late correlated reply is recorded as
+metadata only.
+
 `start` and `resume` accept optional `display_name` (CLI `--name`, alias
 `--display-name`): a trimmed, nonblank UTF-8 human label of 1–64 Unicode
 scalar values, with no control or unsafe directional formatting. Punctuation

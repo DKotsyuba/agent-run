@@ -781,13 +781,40 @@ pub async fn run(
                     // command is claimed, return to the supervisor so its
                     // verified process-group cleanup enforces cancellation
                     // and escalates only after the documented grace period.
-                    let _ = process
-                        .rpc(
+                    // The bounded exchange's disposition is recorded as
+                    // metadata only; it never changes the cancel outcome.
+                    let interrupt = process
+                        .rpc_exchange(
                             "turn/interrupt",
                             json!({"threadId":tid,"turnId":turn_id}),
                             Duration::from_secs(1),
                         )
                         .await;
+                    let disposition = match interrupt {
+                        Ok(agent_run_adapters::io::RpcDisposition::Replied(_)) => "replied",
+                        Ok(agent_run_adapters::io::RpcDisposition::Rejected { .. }) => {
+                            "native_rejected"
+                        }
+                        Ok(agent_run_adapters::io::RpcDisposition::UnsentPressure) => {
+                            "backlog_pressure_unsent"
+                        }
+                        Ok(agent_run_adapters::io::RpcDisposition::Uncertain(reason)) => {
+                            if let agent_run_adapters::io::RpcUncertain::Transport(kind) = reason {
+                                store.event(
+                                    &record.id,
+                                    "rpc_transport_failure",
+                                    &json!({"failure_kind":kind}),
+                                )?;
+                            }
+                            reason.reason()
+                        }
+                        Err(_) => "exchange_failed",
+                    };
+                    store.event(
+                        &record.id,
+                        "interrupt_disposition",
+                        &json!({"disposition":disposition}),
+                    )?;
                     store.complete_command(&record.id, cid, &json!({"accepted":true}))?;
                     flush_pending_assistant(
                         process,
@@ -812,15 +839,51 @@ pub async fn run(
                 }
                 if kind == "steer" {
                     if let Some(text) = commands::steer_text(&payload) {
-                        let result=process.rpc("turn/steer",json!({"threadId":tid,"expectedTurnId":turn_id,"input":[{"type":"text","text":text}]}),Duration::from_secs(30)).await;
-                        store.complete_command(
-                            &record.id,
-                            cid,
-                            &json!({"accepted":result.is_ok()}),
-                        )?;
-                        if result.is_ok() {
-                            journal(store, &record.id, "user", text, None, None)?;
-                        }
+                        let exchange = process
+                            .rpc_exchange(
+                                "turn/steer",
+                                json!({"threadId":tid,"expectedTurnId":turn_id,"input":[{"type":"text","text":text}]}),
+                                Duration::from_secs(30),
+                            )
+                            .await;
+                        // Only a correlated native reply proves delivery in
+                        // either direction: a rejection proves the engine
+                        // refused it, and an unsent exchange proves nothing
+                        // was written. Every bounded end after a possible
+                        // write is explicitly unknown — the request may have
+                        // been taken — never a guessed rejection.
+                        let result = match exchange {
+                            Ok(agent_run_adapters::io::RpcDisposition::Replied(_)) => {
+                                journal(store, &record.id, "user", text, None, None)?;
+                                json!({"accepted":true})
+                            }
+                            Ok(agent_run_adapters::io::RpcDisposition::Rejected { .. }) => {
+                                json!({"accepted":false,"reason":"native_rejected"})
+                            }
+                            Ok(agent_run_adapters::io::RpcDisposition::UnsentPressure) => {
+                                json!({"accepted":false,"reason":"backlog_pressure_unsent"})
+                            }
+                            Ok(agent_run_adapters::io::RpcDisposition::Uncertain(reason)) => {
+                                if let agent_run_adapters::io::RpcUncertain::Transport(kind) =
+                                    reason
+                                {
+                                    store.event(
+                                        &record.id,
+                                        "rpc_transport_failure",
+                                        &json!({"failure_kind":kind}),
+                                    )?;
+                                }
+                                store.event(
+                                    &record.id,
+                                    "steer_uncertain",
+                                    &json!({"reason":reason.reason()}),
+                                )?;
+                                json!({"accepted":null,"reason":reason.reason()})
+                            }
+                            // Only pre-send validation can return Err.
+                            Err(error) => Err(error)?,
+                        };
+                        store.complete_command(&record.id, cid, &result)?;
                     } else {
                         store.complete_command(
                             &record.id,
@@ -876,6 +939,17 @@ pub async fn run(
         };
         if v.get("method").is_some() && v.get("id").is_some() {
             process.deny_request(&v).await?;
+            continue;
+        }
+        if v.get("method").is_none() && v.get("id").is_some() {
+            // Only a previously issued numeric response id leaves this branch.
+            // Arbitrary native ids, reply bodies, arguments and session payloads
+            // are discarded; late replies never rewrite a completed command.
+            if let Some(reply_id) = process.rpc_reply_id(&v) {
+                store.event(&record.id, "late_rpc_reply", &json!({"id":reply_id}))?;
+            } else {
+                store.event(&record.id, "unrecognized_rpc_reply", &json!({}))?;
+            }
             continue;
         }
         let Some(method) = v

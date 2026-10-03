@@ -633,3 +633,188 @@ async fn codex_tool_evidence_journals_once_with_native_flags() {
     drop(process.input.take());
     process.reap().await;
 }
+
+/// One steer-exchange script: line 6 answers the steer request with `mode`
+/// (`result` or `error`), optionally flooding 65 notifications first so the
+/// bounded exchange ends in pressure before the late correlated reply.
+fn steer_plan(mode: &str, flood: bool) -> LaunchPlan {
+    let mut script = String::from(
+        r#"n=0; while IFS= read -r line; do n=$((n+1)); case "$n" in
+            1) printf '%s
+' '{"id":1,"result":{}}' ;;
+            3) printf '%s
+' '{"id":2,"result":{"data":[{"id":"fixture"}]}}' ;;
+            4) case "$line" in *'"permissions"'*) printf '%s
+' '{"id":3,"result":{"model":"fixture","cwd":"/private/tmp","runtimeWorkspaceRoots":["/private/tmp"],"sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"never","activePermissionProfile":{"id":":read-only"},"threadId":"thread"}}' ;; *) printf '%s
+' '{"id":3,"result":{"model":"fixture","cwd":"/private/tmp","roots":["/private/tmp"],"writableRoots":[],"sandbox":"read-only","approvalPolicy":"never","threadId":"thread"}}' ;; esac ;;
+            5) printf '%s
+' '{"id":4,"result":{"turn":{"id":"turn"}}}'; sleep 0.4 ;;
+            6) "#,
+    );
+    if flood {
+        for n in 1..=65u64 {
+            script.push_str(&format!(
+                "printf '%s\\n' '{{\"method\":\"item/agentMessage/delta\",\"params\":{{\"threadId\":\"thread\",\"turnId\":\"turn\",\"itemId\":\"flood\",\"delta\":\"{n}\"}}}}'; "
+            ));
+        }
+        script.push_str("sleep 0.4; printf '%s\\n' '{\"id\":5,\"result\":{\"ok\":true}}'; ");
+    } else if mode == "error" {
+        script.push_str(
+            "printf '%s\\n' '{\"id\":5,\"error\":{\"code\":\"ExpectedTurnMismatch\"}}'; ",
+        );
+    } else {
+        script.push_str("printf '%s\\n' '{\"id\":5,\"result\":{\"ok\":true}}'; ");
+    }
+    script.push_str(
+        r#"printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"completed","items":[]}}}' ;;
+        esac; done"#,
+    );
+    let mut plan = fake_plan();
+    plan.args[1] = script.replace("/private/tmp", &scratch());
+    plan
+}
+
+/// Admits one fixture row with a pending steer command and runs it to
+/// completion against `plan`, returning the agent id.
+async fn run_with_steer(
+    home: &std::path::Path,
+    plan: LaunchPlan,
+) -> agent_run_domain::domain::AgentId {
+    let config = agent_run_config::config::Config::load(home).unwrap();
+    let mut request: agent_run_domain::domain::StartRequest = serde_json::from_value(json!({
+        "runtime":"mock", "model":"fixture", "profile":"review",
+        "task":"fixture task", "workdir":scratch()
+    }))
+    .unwrap();
+    request.validate().unwrap();
+    let mut store = agent_run_core::state::Store::open(home).unwrap();
+    let (id, _) = store.admit(&request, &config, &json!({}), None).unwrap();
+    store
+        .enqueue(&id, "steer", &json!({"text":"fixture:steer-text"}))
+        .unwrap();
+    drop(store);
+    let mut store = agent_run_core::state::Store::open(home).unwrap();
+    let record = store.get(&id).unwrap();
+    let app_home = home.join("codex-home");
+    fs::private_dir(&app_home).unwrap();
+    let runtime_home = home.join("runtime");
+    fs::private_dir(&runtime_home).unwrap();
+    let mut process = Process::spawn(&plan).expect("fake app-server starts");
+    let result = codex::run(
+        &mut process,
+        &mut store,
+        &record,
+        &runtime(runtime_home),
+        &profile(),
+        &app_home,
+    )
+    .await
+    .expect("fake turn succeeds");
+    assert_eq!(result.outcome.status, Status::Succeeded);
+    drop(process.input.take());
+    process.reap().await;
+    id
+}
+
+/// Reads one durable command result for the agent.
+fn command_result(
+    home: &std::path::Path,
+    id: &agent_run_domain::domain::AgentId,
+) -> serde_json::Value {
+    let store = agent_run_core::state::Store::open(home).unwrap();
+    store
+        .conn
+        .query_row(
+            "SELECT result_json FROM commands WHERE agent_id=? AND kind='steer'",
+            [id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|raw| serde_json::from_str(&raw).unwrap())
+        .unwrap()
+}
+
+/// Counts journal rows containing the fixture steer text.
+fn steer_rows(home: &std::path::Path, id: &agent_run_domain::domain::AgentId) -> i64 {
+    let store = agent_run_core::state::Store::open(home).unwrap();
+    store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE agent_id=? AND content LIKE '%fixture:steer-text%'",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// Backlog pressure after the steer write is explicitly unknown: the command
+/// result records `accepted:null` with the bounded reason, no user row is
+/// journaled for an unproven delivery, the late correlated reply lands as
+/// metadata only, and the terminal completion still arrives in order.
+#[tokio::test]
+async fn steer_pressure_is_uncertain_and_late_reply_is_metadata() {
+    let fixture = common::Home::new();
+    let id = run_with_steer(&fixture.path, steer_plan("result", true)).await;
+    let result = command_result(&fixture.path, &id);
+    assert_eq!(
+        result,
+        json!({"accepted":null,"reason":"uncertain_backlog_pressure"}),
+        "pressure after a possible write is unknown, not a guessed rejection"
+    );
+    assert_eq!(
+        steer_rows(&fixture.path, &id),
+        0,
+        "unproven text is not journaled"
+    );
+    let store = agent_run_core::state::Store::open(&fixture.path).unwrap();
+    let uncertain: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='steer_uncertain'",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(uncertain, 1);
+    let late: serde_json::Value = store
+        .conn
+        .query_row(
+            "SELECT data_json FROM events WHERE agent_id=? AND kind='late_rpc_reply'",
+            [id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|raw| serde_json::from_str(&raw).unwrap())
+        .unwrap();
+    assert_eq!(late, json!({"id":5}), "the late reply is id-only metadata");
+    let malformed: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='malformed_event'",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(malformed, 0, "a late reply is not a malformed event");
+}
+
+/// A correlated native rejection proves the steer was not accepted and no
+/// user row is journaled; the turn still completes.
+#[tokio::test]
+async fn steer_rejection_is_proven_false() {
+    let fixture = common::Home::new();
+    let id = run_with_steer(&fixture.path, steer_plan("error", false)).await;
+    assert_eq!(
+        command_result(&fixture.path, &id),
+        json!({"accepted":false,"reason":"native_rejected"})
+    );
+    assert_eq!(steer_rows(&fixture.path, &id), 0);
+}
+
+/// A correlated successful reply proves native acceptance only, and the
+/// journaled user row keeps the delivered text.
+#[tokio::test]
+async fn steer_reply_journals_the_delivered_text() {
+    let fixture = common::Home::new();
+    let id = run_with_steer(&fixture.path, steer_plan("result", false)).await;
+    assert_eq!(command_result(&fixture.path, &id), json!({"accepted":true}));
+    assert_eq!(steer_rows(&fixture.path, &id), 1);
+}

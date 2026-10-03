@@ -28,6 +28,68 @@ use tokio::{
 /// Maximum UTF-8 JSON-RPC line retained from an engine before failing closed.
 pub const ENGINE_FRAME: usize = 8 * 1024 * 1024;
 
+/// Fixed capacity of interleaved notifications retained while one RPC waits.
+///
+/// The bound is deliberately not configurable: a control exchange must never
+/// trade unbounded memory for liveness, and a full backlog is a typed
+/// disposition instead of a dropped notification.
+pub const RPC_BACKLOG_LIMIT: usize = 64;
+
+/// Delivery disposition of one engine RPC exchange.
+///
+/// Proven outcomes are separated from merely unknown ones: a correlated
+/// native reply proves acceptance or rejection, a full backlog before the
+/// send proves the request was never written, and every bounded end of the
+/// wait after a possible write is explicitly uncertain — the request may
+/// have reached the engine. Interleaved notifications are retained in order
+/// up to [`RPC_BACKLOG_LIMIT`]; when the backlog is full the exchange stops
+/// before reading, so the next engine event stays in the channel.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RpcDisposition {
+    /// A correlated native reply carried a result.
+    Replied(Value),
+    /// A correlated rejection supplied an integer or bounded nonblank string
+    /// code; malformed envelopes never prove rejection.
+    Rejected { code: String },
+    /// The backlog was already full before the send, so nothing was written.
+    UnsentPressure,
+    /// The send may have completed, but no correlated reply was observed
+    /// before the bounded reason ended the wait.
+    Uncertain(RpcUncertain),
+}
+
+/// The finite reason an in-flight exchange ended without a correlated reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcUncertain {
+    /// The caller's bounded deadline expired.
+    Timeout,
+    /// The backlog filled after the send; the wait stopped with the next
+    /// engine event still unread in the channel.
+    Pressure,
+    /// The transport closed after the send.
+    Closed,
+    /// The trusted reader/ownership observer's finite failure category.
+    Transport(&'static str),
+    /// A correlated envelope was not a valid result or rejection.
+    MalformedReply,
+    /// Writing a request or denial failed; a typed write timeout is Timeout.
+    Send,
+}
+
+impl RpcUncertain {
+    /// The bounded, machine-readable reason name used in durable results.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Timeout => "uncertain_timeout",
+            Self::Pressure => "uncertain_backlog_pressure",
+            Self::Closed => "uncertain_transport_closed",
+            Self::Transport(_) => "uncertain_transport_failure",
+            Self::MalformedReply => "uncertain_malformed_reply",
+            Self::Send => "uncertain_send_failed",
+        }
+    }
+}
+
 /// Synchronous durable checkpoint installed by the supervisor; receives identity metadata only.
 type OwnershipObserver = Box<dyn FnMut(&OwnershipSnapshot) -> Result<()> + Send>;
 
@@ -45,6 +107,33 @@ pub enum Event {
 /// Returns whether an adapter write failed because the child closed its pipe.
 fn is_broken_pipe(error: &Error) -> bool {
     matches!(error, Error::Io(source) if source.kind() == std::io::ErrorKind::BrokenPipe)
+}
+
+/// Validates a positive caller budget and caps running controls at one second.
+/// Startup/discovery methods retain their supplied duration; no new budget is
+/// created while replying to unsolicited requests or collecting diagnostics.
+fn rpc_timeout(method: &str, timeout: Duration) -> Result<Duration> {
+    if timeout.is_zero() {
+        return Err(Error::Validation("RPC timeout must be positive".into()));
+    }
+    Ok(if matches!(method, "turn/steer" | "turn/interrupt") {
+        timeout.min(Duration::from_secs(1))
+    } else {
+        timeout
+    })
+}
+
+/// Classifies only typed write failures: timer expiry is Timeout, a broken
+/// pipe/closed input is Closed, and other failures remain Send uncertainty.
+/// It never guesses native acceptance or parses arbitrary diagnostic words.
+fn rpc_send_uncertainty(error: &Error, input_closed: bool) -> RpcUncertain {
+    if matches!(error, Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut) {
+        RpcUncertain::Timeout
+    } else if is_broken_pipe(error) || input_closed {
+        RpcUncertain::Closed
+    } else {
+        RpcUncertain::Send
+    }
 }
 
 /// Owns an app-server child, its bounded streams, and request correlation state.
@@ -237,11 +326,20 @@ impl Process {
             .ok_or_else(|| Error::Runtime("engine stdin is closed".into()))?;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err(Error::Runtime("engine input delivery timed out".into()));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "engine input delivery timed out",
+            )
+            .into());
         }
         tokio::time::timeout(remaining, frame::write(input, message, ENGINE_FRAME))
             .await
-            .map_err(|_| Error::Runtime("engine input delivery timed out".into()))?
+            .map_err(|_| {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "engine input delivery timed out",
+                ))
+            })?
     }
     /// Writes raw text for non-JSON stream engines while retaining the same deadline.
     pub async fn text(&mut self, text: &str) -> Result<()> {
@@ -330,69 +428,147 @@ impl Process {
             }
         }
     }
-    /// Sends one request, correlates its response, and retains interleaved notifications.
-    ///
-    /// Control requests are capped at one second so a nonresponsive engine cannot
-    /// delay cancellation or supervisor lifecycle work. Server-originated requests
-    /// are declined before normal notification ordering resumes.
+    /// Sends one request, correlates its reply and retains interleaved events.
+    /// Control methods keep their one-second cap. Startup callers retain timeout,
+    /// closed-stream and finite reader/ownership diagnostics. Closed diagnostics
+    /// use only the original remaining budget; no deadline is renewed.
     pub async fn rpc(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
-        if timeout.is_zero() {
-            return Err(Error::Validation("RPC timeout must be positive".into()));
+        let deadline = tokio::time::Instant::now() + rpc_timeout(method, timeout)?;
+        match self.rpc_exchange_until(method, params, deadline).await? {
+            RpcDisposition::Replied(result) => Ok(result),
+            RpcDisposition::Rejected { code } => Err(Error::Runtime(format!(
+                "app-server rejected {method} ({code})"
+            ))),
+            RpcDisposition::UnsentPressure => Err(Error::Runtime(
+                "app-server control backlog is full; request not sent".into(),
+            )),
+            RpcDisposition::Uncertain(RpcUncertain::Timeout) => {
+                Err(Error::Runtime("app-server RPC timed out".into()))
+            }
+            RpcDisposition::Uncertain(RpcUncertain::Pressure) => Err(Error::Runtime(format!(
+                "app-server backlog filled while waiting for {method}"
+            ))),
+            RpcDisposition::Uncertain(RpcUncertain::Closed) => {
+                Err(self.closed_error(method, deadline).await)
+            }
+            RpcDisposition::Uncertain(RpcUncertain::Transport(kind)) => {
+                Err(Error::Runtime(kind.into()))
+            }
+            RpcDisposition::Uncertain(RpcUncertain::MalformedReply) => {
+                Err(Error::Runtime("RPC result is missing or malformed".into()))
+            }
+            RpcDisposition::Uncertain(reason) => Err(Error::Runtime(format!(
+                "app-server RPC for {method} ended {}",
+                reason.reason()
+            ))),
         }
-        let timeout = if matches!(method, "turn/steer" | "turn/interrupt") {
-            timeout.min(Duration::from_secs(1))
-        } else {
-            timeout
-        };
-        let deadline = tokio::time::Instant::now() + timeout;
+    }
+
+    /// Runs one lossless bounded exchange. Zero timeout rejects before writing;
+    /// running controls are capped at one second. Only correlated results/errors
+    /// prove acceptance/rejection. Preflight pressure proves no write; all ends
+    /// after a possible send, including denial failure, are explicitly uncertain.
+    /// The fixed backlog is checked before receive, leaving event 65 unread.
+    pub async fn rpc_exchange(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<RpcDisposition> {
+        let deadline = tokio::time::Instant::now() + rpc_timeout(method, timeout)?;
+        self.rpc_exchange_until(method, params, deadline).await
+    }
+
+    /// Executes a request using the caller's unchanged absolute deadline,
+    /// including replies to unsolicited requests. IDs are allocated only after
+    /// unsent pressure refusal. No post-send transport/protocol failure aborts
+    /// a running control; its uncertainty is returned for durable recording.
+    async fn rpc_exchange_until(
+        &mut self,
+        method: &str,
+        params: Value,
+        deadline: tokio::time::Instant,
+    ) -> Result<RpcDisposition> {
+        if self.backlog.len() >= RPC_BACKLOG_LIMIT {
+            return Ok(RpcDisposition::UnsentPressure);
+        }
         let id = self.next_id;
         self.next_id += 1;
         if let Err(error) = self
             .send_until(&json!({"id":id,"method":method,"params":params}), deadline)
             .await
         {
-            return match error {
-                closed if is_broken_pipe(&closed) => Err(self.closed_error(method, deadline).await),
-                other => Err(other),
-            };
+            return Ok(RpcDisposition::Uncertain(rpc_send_uncertainty(
+                &error,
+                self.input.is_none(),
+            )));
         }
         loop {
-            let event = tokio::time::timeout_at(deadline, self.receive())
-                .await
-                .map_err(|_| Error::Runtime("app-server RPC timed out".into()))?;
+            if self.backlog.len() >= RPC_BACKLOG_LIMIT {
+                return Ok(RpcDisposition::Uncertain(RpcUncertain::Pressure));
+            }
+            let event = match tokio::time::timeout_at(deadline, self.receive()).await {
+                Ok(event) => event,
+                Err(_) => return Ok(RpcDisposition::Uncertain(RpcUncertain::Timeout)),
+            };
             match event {
                 Event::Json(v)
                     if v.get("id").and_then(Value::as_u64) == Some(id)
                         && v.get("method").is_none() =>
                 {
                     if let Some(error) = v.get("error") {
-                        let code = error
-                            .get("code")
-                            .map(Value::to_string)
-                            .unwrap_or_else(|| "unknown".into());
-                        return Err(Error::Runtime(format!(
-                            "app-server rejected {method} ({})",
-                            code.chars().take(64).collect::<String>()
-                        )));
+                        let code = error.get("code").filter(|code| {
+                            code.as_i64().is_some()
+                                || code.as_u64().is_some()
+                                || code.as_str().is_some_and(|code| {
+                                    !code.trim().is_empty()
+                                        && code.chars().count() <= 64
+                                        && !code.chars().any(char::is_control)
+                                })
+                        });
+                        if v.get("result").is_some() || code.is_none() {
+                            return Ok(RpcDisposition::Uncertain(RpcUncertain::MalformedReply));
+                        }
+                        let code = code.expect("validated rejection code").to_string();
+                        return Ok(RpcDisposition::Rejected {
+                            code: code.chars().take(64).collect(),
+                        });
                     }
-                    return v
-                        .get("result")
-                        .cloned()
-                        .ok_or_else(|| Error::Runtime("RPC result is missing".into()));
+                    return Ok(match v.get("result") {
+                        Some(result) => RpcDisposition::Replied(result.clone()),
+                        None => RpcDisposition::Uncertain(RpcUncertain::MalformedReply),
+                    });
                 }
                 Event::Json(v) if v.get("method").is_some() && v.get("id").is_some() => {
-                    self.deny_request(&v).await?;
-                }
-                Event::Json(v) => {
-                    if self.backlog.len() >= 64 {
-                        return Err(Error::Runtime("app-server startup event overflow".into()));
+                    if let Err(error) = self.deny_request_before(&v, deadline).await {
+                        return Ok(RpcDisposition::Uncertain(rpc_send_uncertainty(
+                            &error,
+                            self.input.is_none(),
+                        )));
                     }
-                    self.backlog.push_back(Event::Json(v));
                 }
-                Event::Eof => return Err(self.closed_error(method, deadline).await),
-                Event::Failure(kind) => return Err(Error::Runtime(kind.into())),
+                Event::Json(v) => self.backlog.push_back(Event::Json(v)),
+                Event::Eof => return Ok(RpcDisposition::Uncertain(RpcUncertain::Closed)),
+                Event::Failure(kind) => {
+                    return Ok(RpcDisposition::Uncertain(RpcUncertain::Transport(kind)))
+                }
             }
         }
+    }
+
+    /// Returns only an issued, bounded numeric response ID, never arbitrary
+    /// native JSON. The envelope must carry result/error and no method. This
+    /// identifies late/duplicate replies without claiming model consumption.
+    pub fn rpc_reply_id(&self, value: &Value) -> Option<u64> {
+        if value.get("method").is_some()
+            || (value.get("result").is_none() && value.get("error").is_none())
+        {
+            return None;
+        }
+        value
+            .get("id")?
+            .as_u64()
+            .filter(|id| *id > 0 && *id < self.next_id)
     }
     /// Describes an early child exit using only bounded, redacted diagnostics.
     ///
@@ -435,8 +611,21 @@ impl Process {
             "app-server closed the stream while waiting for {method}: {code}{detail}"
         ))
     }
-    /// Declines an unsolicited server request without granting process authority.
+    /// Declines an unsolicited server request with the historical 15-second
+    /// write budget. It never grants native permissions or process authority.
     pub async fn deny_request(&mut self, v: &Value) -> Result<()> {
+        self.deny_request_before(v, tokio::time::Instant::now() + Duration::from_secs(15))
+            .await
+    }
+
+    /// Sends a native refusal within the caller's absolute deadline. Protocol
+    /// selection is shared with ordinary denial; typed timeout/I/O errors
+    /// propagate, and neither serialization nor write renews the RPC budget.
+    pub async fn deny_request_before(
+        &mut self,
+        v: &Value,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
         let method = v.get("method").and_then(Value::as_str).unwrap_or("");
         let response = if method == "item/permissions/requestApproval" {
             json!({"id":v["id"],"result":{"permissions":{},"scope":"turn"}})
@@ -445,7 +634,7 @@ impl Process {
         } else {
             json!({"id":v["id"],"error":{"code":-32601,"message":"interactive request unavailable in durable headless execution"}})
         };
-        self.send(&response).await
+        self.send_until(&response, deadline).await
     }
     /// Waits briefly for child exit and bounded reader cleanup before releasing pipes.
     pub async fn reap(&mut self) -> Option<i32> {
