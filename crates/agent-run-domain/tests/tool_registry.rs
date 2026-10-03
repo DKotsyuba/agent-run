@@ -58,12 +58,21 @@ fn registry_matches_python_golden_field_by_field() {
                     serde_json::json!({"type": ["string", "null"]});
             }
         }
-        // Schema-2 cutover: public start names a configured provider instead of
-        // a legacy runtime; nothing else in its input schema changes.
+        // Schema-2 cutover changes the runtime selector to provider; the
+        // optional human-label input is the exact additive delta below.
         if definition.name == "start" {
             rename_runtime_to_provider(&mut expected);
         }
         extend_stable_identity(&mut expected);
+        if matches!(definition.name.as_str(), "start" | "resume") {
+            let description = if definition.name == "start" {
+                "Optional human display label for the agent, shown in list views and inherited by resumes that omit it. At most 64 Unicode characters, no control or bidi formatting; null or omission means unnamed."
+            } else {
+                "Optional replacement display label; omission inherits the previous run's label. Same 64-character control-free bound as start."
+            };
+            expected["inputSchema"]["properties"]["display_name"] =
+                serde_json::json!({"description":description,"type":["string","null"]});
+        }
         if definition.name != "start" {
             assert_eq!(actual["description"], expected["description"]);
         }

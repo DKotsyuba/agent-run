@@ -558,6 +558,61 @@ fn migration_registry_is_contiguous() {
     assert_eq!(versions, (2..=VERSION).collect::<Vec<_>>());
 }
 
+/// Migration 023 preserves every v22 row and existing statistics, leaves old
+/// labels null, accepts UTF-8 labels, and reaches the same schema as fresh stores.
+#[test]
+fn migration_023_adds_nullable_display_names_without_rewriting_history() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("state.db");
+    let build = build_fixture(&path, 22);
+    let before = agent_count(&build);
+    let stats: i64 = build
+        .query_row("SELECT COUNT(*) FROM run_stats", [], |row| row.get(0))
+        .unwrap();
+    drop(build);
+    let store = Store::open(home.path()).unwrap();
+    assert_eq!(user_version(&store.conn), 23);
+    assert_eq!(agent_count(&store.conn), before);
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM agents WHERE display_name IS NULL",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM run_stats", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        stats
+    );
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET display_name=? WHERE id=(SELECT id FROM agents LIMIT 1)",
+            ["工程師 🦀"],
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT display_name FROM agents WHERE display_name IS NOT NULL",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "工程師 🦀"
+    );
+    assert_eq!(schema_objects(&store.conn), fresh_schema_objects());
+}
+
 /// Migration 022 adds the runtime storage layout registry on a v21 store
 /// without touching existing rows, and the table's constraints hold after
 /// the upgrade exactly as on a fresh schema.

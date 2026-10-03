@@ -119,6 +119,7 @@ fn record(request: StartRequest) -> Record {
         sequence: 0,
         resume_of_runtime_session_id: None,
         identity: None,
+        display_name: None,
     }
 }
 

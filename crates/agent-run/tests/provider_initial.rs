@@ -1525,6 +1525,7 @@ async fn provider_effort_and_timeout_are_bounded_before_admission() {
             Some(1e308),
             Some("resume-huge".into()),
             None,
+            None,
         )
         .unwrap_err();
     assert_eq!(refused.machine_code().as_str(), "ValidationError");
@@ -1618,6 +1619,7 @@ async fn provider_resume_checks_frozen_default_effort() {
         None,
         Some("default-effort-revoked".into()),
         None,
+        None,
     );
     assert!(refused.is_err(), "resume ignored frozen effective effort");
 }
@@ -1708,6 +1710,7 @@ async fn provider_resume_continues_the_proven_native_session() {
             "fixture:answer".into(),
             None,
             Some(request_id.into()),
+            None,
             Some(orchestrator.clone()),
         )
     };
@@ -1833,6 +1836,7 @@ async fn provider_resume_continues_the_proven_native_session() {
             "fixture:answer".into(),
             None,
             Some("resume-3".into()),
+            None,
             Some(orchestrator.clone()),
         )
         .unwrap_err()
@@ -1897,6 +1901,7 @@ async fn provider_resume_honors_new_model_restrictions() {
         None,
         Some("revoked-resume".into()),
         None,
+        None,
     );
     assert!(
         resumed.is_err(),
@@ -1930,6 +1935,7 @@ async fn concurrent_provider_resumes_admit_one_child() {
                         "fixture:answer".into(),
                         None,
                         Some(format!("race-{index}")),
+                        None,
                         Some(
                             serde_json::from_value(serde_json::json!({
                                 "transport":"fixture","external_session_id":"test-session"
@@ -1998,6 +2004,7 @@ async fn provider_resume_enforces_current_alias_role_and_cap() {
                 "fixture:answer".into(),
                 None,
                 Some(request_id.into()),
+                None,
                 None,
             )
             .map_err(|error| error.to_string())
@@ -2090,6 +2097,7 @@ async fn provider_resume_enforces_mcp_caps_and_keeps_frozen_global_selection() {
             None,
             Some(key.into()),
             None,
+            None,
         )
     };
     let original = fs::read_to_string(home.join("config.toml")).unwrap();
@@ -2152,6 +2160,7 @@ async fn cancelled_resume_never_spawns_or_touches_history() {
             "fixture:answer".into(),
             None,
             Some("cancelled-child".into()),
+            None,
             None,
         )
         .unwrap();
@@ -2322,6 +2331,7 @@ async fn handoff_refuses_a_seal_for_another_history_root() {
             "fixture:answer".into(),
             None,
             Some("root-child".into()),
+            None,
             None,
         )
         .unwrap();
@@ -2556,6 +2566,142 @@ async fn codex_run(home: &Path, request_id: &str, account: Option<&str>) -> Agen
     id
 }
 
+/// Offline Codex start/resume runs prove normalized names and replay conflicts,
+/// launch-time native usage baselines, exact deltas, complete lineage sums and
+/// public stable identity without leaking internal execution IDs in usage.
+#[tokio::test]
+async fn codex_resume_usage_and_display_names_are_durable() {
+    let (_temp, home) = codex_home_with(&["healthy"]);
+    let service = Service::new(home.clone());
+    let mut request = request_for(&home, "codex-user", "metadata-parent", Some("a"));
+    request.task = "fixture:usage".into();
+    request.display_name = Some("  工程師 / review  ".into());
+    let admitted = service.admit_provider(request.clone()).unwrap();
+    let parent_id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    assert_eq!(admitted["agent"]["name"], "工程師 / review");
+    request.display_name = Some("工程師 / review".into());
+    assert_eq!(
+        service.admit_provider(request.clone()).unwrap()["created"],
+        false
+    );
+    request.display_name = Some("Another label".into());
+    assert!(matches!(
+        service.admit_provider(request),
+        Err(agent_run::Error::Conflict)
+    ));
+    run_to_end(&home, &parent_id).await;
+    let parent = Store::open(&home).unwrap().get(&parent_id).unwrap();
+    assert_eq!(
+        parent.status,
+        Status::Succeeded,
+        "{:?}",
+        parent.failure_text
+    );
+    let child = service
+        .admit_provider_resume(
+            &parent,
+            "fixture:usage".into(),
+            None,
+            Some("metadata-child".into()),
+            None,
+            None,
+        )
+        .unwrap();
+    let child_id: AgentId = serde_json::from_value(child["agent_id"].clone()).unwrap();
+    assert_eq!(child["agent"]["name"], "工程師 / review");
+    assert_eq!(
+        service
+            .admit_provider_resume(
+                &parent,
+                "fixture:usage".into(),
+                None,
+                Some("metadata-child".into()),
+                Some("工程師 / review".into()),
+                None
+            )
+            .unwrap()["created"],
+        false
+    );
+    assert!(matches!(
+        service.admit_provider_resume(
+            &parent,
+            "fixture:usage".into(),
+            None,
+            Some("metadata-child".into()),
+            Some("Changed".into()),
+            None
+        ),
+        Err(agent_run::Error::Conflict)
+    ));
+    run_to_end(&home, &child_id).await;
+    let store = Store::open(&home).unwrap();
+    assert_eq!(store.get(&child_id).unwrap().status, Status::Succeeded);
+    let baseline = store
+        .last_event(&child_id, "resume_usage_baseline")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store.get(&child_id).unwrap().resume_of_runtime_session_id,
+        parent.runtime_session_id
+    );
+    assert_eq!(
+        baseline,
+        store
+            .last_event(&parent_id, "thread/tokenUsage/updated")
+            .unwrap()
+            .unwrap()
+    );
+    assert_eq!(baseline["tokenUsage"]["total"]["inputTokens"], 100);
+    let usage = store.usage_view(&child_id).unwrap().unwrap();
+    assert_eq!(usage.input_tokens, Some(100));
+    assert_eq!(usage.output_tokens, Some(20));
+    assert_eq!(usage.num_turns, None);
+    assert_eq!(usage.cache_write_tokens, None);
+    let cumulative = store.usage_cumulative(&parent_id).unwrap();
+    assert_eq!(cumulative.input_tokens, Some(200));
+    assert_eq!(cumulative.output_tokens, Some(40));
+    assert_eq!(cumulative.num_turns, None);
+    assert_eq!(cumulative.executions, 2);
+    let page = service.list_public(Default::default()).await.unwrap();
+    assert_eq!(
+        page["items"][0]["agent_id"],
+        serde_json::to_value(&parent_id).unwrap()
+    );
+    assert_eq!(page["items"][0]["name"], "工程師 / review");
+    assert_eq!(page["items"][0]["usage"]["input_tokens"], 100);
+    for field in ["usage", "usage_cumulative"] {
+        let object = page["items"][0][field].as_object().unwrap();
+        for private in [
+            "agent_id",
+            "run_id",
+            "parent_agent_id",
+            "root_agent_id",
+            "attempt_id",
+        ] {
+            assert!(!object.contains_key(private), "{field}: {object:?}");
+        }
+    }
+    let child_row = store.get(&child_id).unwrap();
+    drop(store);
+    let renamed = service
+        .admit_provider_resume(
+            &child_row,
+            "fixture:usage".into(),
+            None,
+            Some("metadata-renamed".into()),
+            Some("Мария: follow-up".into()),
+            None,
+        )
+        .unwrap();
+    assert_eq!(renamed["agent"]["name"], "Мария: follow-up");
+    let renamed_id: AgentId = serde_json::from_value(renamed["agent_id"].clone()).unwrap();
+    run_to_end(&home, &renamed_id).await;
+    assert_eq!(
+        Store::open(&home).unwrap().get(&renamed_id).unwrap().status,
+        Status::Succeeded
+    );
+}
+
 /// (number, account, state, ownership, finished) of every attempt, in order.
 fn attempts(home: &Path, id: &AgentId) -> Vec<(u32, String, String, i64, bool)> {
     Store::open(home)
@@ -2718,6 +2864,7 @@ async fn inherited_identical_text_cannot_prove_an_explicit_child_task() {
             "fixture:original-task".into(),
             None,
             Some("child-1".into()),
+            None,
             None,
         )
         .unwrap();
@@ -4335,6 +4482,7 @@ async fn private_launch_is_guarded_before_the_first_publication() {
             "fixture:answer".into(),
             None,
             Some("resume-1".into()),
+            None,
             Some(orchestrator),
         )
         .unwrap();
@@ -4611,6 +4759,7 @@ async fn provider_resume_timeout_is_scaled_once_without_compounding() {
             None,
             Some("resume-multiplier-inherited".into()),
             None,
+            None,
         )
         .unwrap();
     let child: AgentId = serde_json::from_value(inherited["agent_id"].clone()).unwrap();
@@ -4629,6 +4778,7 @@ async fn provider_resume_timeout_is_scaled_once_without_compounding() {
             "fixture:answer".into(),
             Some(600.0),
             Some("resume-multiplier-explicit".into()),
+            None,
             None,
         )
         .unwrap();

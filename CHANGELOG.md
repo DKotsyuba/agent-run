@@ -4,6 +4,18 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-10-03
+
+- feat(agents): accept optional human display labels on start and resume, inherit
+  omitted labels, and show them in agent lists, the TUI and compact MCP output
+- feat(usage): expose nullable native usage for the latest execution and complete
+  lineage totals; record comparable Codex resume baselines before launch so
+  resumed counters report deltas without inventing missing measurements or turns
+
+Database schema 23 adds nullable `agents.display_name`; historical rows remain
+unnamed. Upgrade existing homes through the paired `agent-run config migrate`
+procedure before restarting the broker. Configuration schema remains 2.
+
 ## [0.19.5] - 2026-10-02
 
 - fix(mcp): answer `tools/list` on both the operator and the worker MCP surface

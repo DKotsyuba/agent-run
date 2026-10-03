@@ -56,6 +56,7 @@ CREATE TABLE agents (
   startup_owner_birth_time REAL,
   selection_intent TEXT CHECK (selection_intent IN ('auto', 'pinned')),
   requested_account_id TEXT,
+  display_name TEXT,
   UNIQUE (orchestrator_session_id, request_id)
 );
 CREATE UNIQUE INDEX agents_parent_agent_id_unique
@@ -455,4 +456,4 @@ CREATE INDEX idx_events_attempt ON events(attempt_id) WHERE attempt_id IS NOT NU
 CREATE INDEX idx_messages_attempt ON messages(attempt_id) WHERE attempt_id IS NOT NULL;
 CREATE INDEX idx_deliveries_terminal_event ON deliveries(terminal_event_seq) WHERE terminal_event_seq IS NOT NULL;
 
-PRAGMA user_version = 22;
+PRAGMA user_version = 23;

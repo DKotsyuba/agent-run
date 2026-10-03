@@ -202,6 +202,9 @@ fn agent_fields(view: &Value) -> Value {
             "succeeded" | "failed" | "lost" | "timed_out" | "cancelled"),
         "runtime": view["runtime"], "model": view["model"], "profile": view["profile"],
         "phase": text("phase"), "effort": text("effort"),
+        "name": text("name"),
+        "usage": usage_line(&view["usage"]),
+        "usage_lineage": lineage_line(&view["usage_cumulative"]),
         "mcp": view["mcp"].as_array().into_iter().flatten().take(8).map(|server| json!({
             "name": server["name"], "source": server["source"],
             "tools": server["allowed_tools"].as_array().map(|tools| tools.len().to_string()).unwrap_or_else(|| "all".into()),
@@ -231,6 +234,65 @@ fn start_context(value: &Value) -> Value {
     fields["agent_id"] = value["agent_id"].clone();
     fields["created"] = value["created"].clone();
     fields
+}
+
+/// One compact human usage line from a latest-execution usage object.
+///
+/// Unreported numbers render as `?` so an honest null is never mistaken for
+/// a measured zero; an absent object (no statistics row yet, typically while
+/// the run executes) and an explicitly sourceless row both stay distinct.
+fn usage_line(usage: &Value) -> String {
+    let Some(object) = usage.as_object() else {
+        return String::new();
+    };
+    if object.get("usage_source").and_then(Value::as_str) == Some("none") {
+        return "no native usage reported".to_owned();
+    }
+    let number = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_i64)
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".to_owned())
+    };
+    let turns = object
+        .get("num_turns")
+        .and_then(Value::as_i64)
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    format!(
+        "in {} out {} cache r{}/w{} turns {} ({})",
+        number("input_tokens"),
+        number("output_tokens"),
+        number("cache_read_tokens"),
+        number("cache_write_tokens"),
+        turns,
+        object
+            .get("usage_source")
+            .and_then(Value::as_str)
+            .unwrap_or("?"),
+    )
+}
+
+/// One compact lineage-aggregate line; empty when no aggregate is attached.
+///
+/// Incomplete evidence is named as such rather than shown as partial totals.
+fn lineage_line(cumulative: &Value) -> String {
+    let Some(object) = cumulative.as_object() else {
+        return String::new();
+    };
+    let executions = object
+        .get("executions")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let input = object.get("input_tokens").and_then(Value::as_i64);
+    let output = object.get("output_tokens").and_then(Value::as_i64);
+    match (input, output) {
+        (Some(input), Some(output)) => {
+            format!("lineage in {input} out {output} over {executions} execution(s)")
+        }
+        _ => format!("lineage incomplete over {executions} execution(s)"),
+    }
 }
 
 /// List context: exact total, returned page, and continuation facts.
@@ -506,6 +568,38 @@ fn prose(text: &str) -> String {
 mod tests {
     use super::{error_result, success_result};
     use serde_json::{json, Value};
+
+    /// Compact start/resume/list output preserves labels, observed zero and
+    /// unknown metrics, names incomplete lineage evidence and hides execution IDs.
+    #[test]
+    fn display_names_and_usage_remain_honest_in_compact_output() {
+        let mut agent = agent_view();
+        agent["name"] = json!("工程師 / review");
+        agent["usage"] = json!({"input_tokens":0,"output_tokens":null,
+            "cache_read_tokens":0,"cache_write_tokens":null,"num_turns":null,
+            "usage_source":"token_usage_updated","run_id":"private-execution"});
+        agent["usage_cumulative"] =
+            json!({"executions":2,"input_tokens":null,"output_tokens":null});
+        for tool in ["start", "resume"] {
+            let page = text(
+                tool,
+                &json!({"agent_id":"ag-1","sequence":1,"created":true,"agent":agent}),
+            );
+            assert!(page.contains("Name: 工程師 / review"), "{page}");
+            assert!(!page.contains("private-execution"), "{page}");
+        }
+        let page = text(
+            "list_agents",
+            &json!({"items":[agent],"total":1,"offset":0,"limit":20,"complete":true}),
+        );
+        assert!(page.contains("name: 工程師 / review"), "{page}");
+        assert!(page.contains("in 0 out ? cache r0/w? turns ?"), "{page}");
+        assert!(
+            page.contains("lineage incomplete over 2 execution(s)"),
+            "{page}"
+        );
+        assert!(!page.contains("private-execution"), "{page}");
+    }
 
     /// Minimal agent view proving sparse optional metadata remains renderable.
     fn agent_view() -> Value {

@@ -354,7 +354,10 @@ fn native_history(session: &str, task: &str) {
 /// user input is recorded (meta-only history), and with `rewrite` the whole
 /// rollout is replaced by a structurally valid meta-only file before that
 /// failure (earlier turns vanish). Otherwise it completes with an agent
-/// message naming the thread.
+/// message naming the thread. The task marker `fixture:usage` also emits native
+/// cumulative token counters scaled by the number of recorded user turns;
+/// resumed processes therefore preserve the thread total without claiming a
+/// native turn counter.
 fn app_server() {
     let home = std::path::PathBuf::from(std::env::var_os("CODEX_HOME").expect("CODEX_HOME"));
     let exhausted = std::fs::read_to_string(home.join("auth.json"))
@@ -473,6 +476,24 @@ fn app_server() {
                         &rollout,
                         &json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":text}}),
                     );
+                    if input.contains("fixture:usage") {
+                        let history = std::fs::read_to_string(&rollout).expect("usage rollout");
+                        let observed = history
+                            .lines()
+                            .filter(|line| {
+                                serde_json::from_str::<Value>(line)
+                                    .ok()
+                                    .is_some_and(|entry| entry["payload"]["role"] == "user")
+                            })
+                            .count() as u64;
+                        emit(json!({"method":"thread/tokenUsage/updated","params":{
+                            "threadId":thread,"tokenUsage":{"total":{
+                                "inputTokens":100 * observed,"outputTokens":20 * observed,
+                                "cachedInputTokens":10 * observed,"reasoningOutputTokens":5 * observed,
+                                "totalTokens":120 * observed
+                            }}
+                        }}));
+                    }
                     emit(
                         json!({"method":"turn/completed","params":{"threadId":thread,"turn":{"id":turn,"status":"completed","items":[{"type":"agentMessage","id":format!("msg-{turns}"),"text":text}]}}}),
                     );

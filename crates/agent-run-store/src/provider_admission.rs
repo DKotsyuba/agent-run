@@ -408,6 +408,7 @@ impl Store {
             || effective.runtime != request.provider.as_str()
             || effective.model != request.model
             || effective.task != request.task
+            || effective.display_name != request.display_name
             || global_cap == 0
             || harness_cap == Some(0)
             || identity["provider_identity_version"] != 2
@@ -475,8 +476,8 @@ impl Store {
             None => (id.clone(), 1, None),
         };
         let inserted = tx.execute(
-            "INSERT INTO agents(id,request_id,orchestrator_session_id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,parent_agent_id,root_agent_id,sequence,resume_of_runtime_session_id,identity_json,selection_intent,requested_account_id) \
-             VALUES(?,?,?,?,?,?,?,?,?,?,'starting',?,?,'pending:provider-v2',?,?,?,?,?,?,?)",
+            "INSERT INTO agents(id,request_id,orchestrator_session_id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,parent_agent_id,root_agent_id,sequence,resume_of_runtime_session_id,identity_json,selection_intent,requested_account_id,display_name) \
+             VALUES(?,?,?,?,?,?,?,?,?,?,'starting',?,?,'pending:provider-v2',?,?,?,?,?,?,?,?)",
             params![id.as_str(), request.request_id, session, request.provider.as_str(),
                 request.model, request.profile, request.task, summary,
                 effective.workdir.to_string_lossy(), serde_json::to_string(effective)?,
@@ -484,7 +485,8 @@ impl Store {
                 resume.map(|resume| resume.parent.as_str()), root.as_str(), sequence, resumed,
                 serde_json::to_string(identity)?,
                 if pinned.is_some() { "pinned" } else { "auto" },
-                pinned.map(AccountId::as_str)],
+                pinned.map(AccountId::as_str),
+                effective.display_name],
         );
         match inserted {
             Err(rusqlite::Error::SqliteFailure(error, _))

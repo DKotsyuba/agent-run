@@ -154,6 +154,27 @@ mod tests {
         assert!(expanded.contains("✗"), "finished card visible: {expanded}");
     }
 
+    /// Named cards lead with the human label while retaining the task and stable ID.
+    #[test]
+    fn cards_show_human_display_names() {
+        let mut app = App::new();
+        let mut agent = agent_view(STABLE, RUN, "running");
+        agent.name = Some("Мария / review".into());
+        app.apply_sessions(
+            &serde_json::from_value(serde_json::json!({
+                "items":[agent], "total":1, "offset":0, "limit":200,
+                "next_offset":null, "complete":true, "revision":1, "observed_at":1.0
+            }))
+            .unwrap(),
+        );
+        let screen = render_to_string(&app, 120, 24);
+        assert!(
+            screen.contains("Мария / review — ship the thing"),
+            "{screen}"
+        );
+        assert!(screen.contains(&format!("{:.23}", STABLE)), "{screen}");
+    }
+
     #[test]
     fn cards_show_workdir_shortened_and_padded() {
         let mut app = App::new();

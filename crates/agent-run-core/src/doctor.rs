@@ -628,6 +628,7 @@ fn roles(config: &Config, home: &Path, findings: &mut Vec<Finding>) -> bool {
             write: false,
             fast: false,
             effort: None,
+            display_name: None,
             timeout_seconds: None,
             read_roots: Vec::new(),
             output_schema: None,

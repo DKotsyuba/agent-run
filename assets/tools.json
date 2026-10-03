@@ -28,6 +28,13 @@
             "null"
           ]
         },
+        "display_name": {
+          "description": "Optional human display label for the agent, shown in list views and inherited by resumes that omit it. At most 64 Unicode characters, no control or bidi formatting; null or omission means unnamed.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "effort": {
           "type": [
             "string",
@@ -289,6 +296,13 @@
         "agent_id": {
           "type": "string",
           "description": "Stable agent ID returned by start; remains unchanged across resumes."
+        },
+        "display_name": {
+          "description": "Optional replacement display label; omission inherits the previous run's label. Same 64-character control-free bound as start.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "orchestrator": {
           "anyOf": [

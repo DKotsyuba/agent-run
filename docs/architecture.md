@@ -94,7 +94,7 @@ authority, generated-home snapshot, history and cleanup proofs verify. See
 
 SQLite is the source of truth for agents, events, messages, answers, native
 session lineage, deliveries, cleanup evidence, capacity, and statistics. The
-current schema is version 22. Numbered migrations live in `sql/migrations/`
+current schema is version 23. Numbered migrations live in `sql/migrations/`
 and apply transactionally after a pre-version backup. The step to 17 is paired
 with the schema-2 config: ordinary commands and the broker refuse an older
 database with `migration_required` until `agent-run config migrate` runs. A

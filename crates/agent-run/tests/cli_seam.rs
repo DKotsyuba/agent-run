@@ -172,6 +172,8 @@ async fn test_start_decodes_the_full_request_and_returns_immediately() {
         read_root.to_str().unwrap(),
         "--output-schema",
         "{\"type\":\"object\"}",
+        "--name",
+        "  工程師 / review  ",
         "--request-id",
         "request-1",
         "--session-transport",
@@ -192,6 +194,7 @@ async fn test_start_decodes_the_full_request_and_returns_immediately() {
     .await
     .unwrap();
     let request = &broker.calls.lock().unwrap()[0].1;
+    assert_eq!(request["display_name"], "工程師 / review");
     assert_eq!(request["fast"], true);
     assert_eq!(request["effort"], "high");
     assert_eq!(request["timeout_seconds"], 42.0);
@@ -201,6 +204,41 @@ async fn test_start_decodes_the_full_request_and_returns_immediately() {
         output.lock().unwrap()[0],
         json!({"agent_id":AGENT_ID,"created":true})
     );
+}
+
+/// Both CLI name spellings reach the resident resume request; omission remains
+/// absent so the service can inherit the prior label.
+#[tokio::test]
+async fn resume_display_name_alias_reaches_broker() {
+    let temp = tempdir().unwrap();
+    for alias in ["--name", "--display-name"] {
+        let broker = Arc::new(FakeBroker::new(vec![
+            json!({"agent_id":AGENT_ID,"created":true}),
+        ]));
+        agent_run::cli::run_with(
+            parse(&[
+                "--home",
+                temp.path().to_str().unwrap(),
+                "resume",
+                AGENT_ID,
+                "--task",
+                "continue",
+                alias,
+                "Мария / review",
+            ]),
+            dependencies(
+                Arc::new(FakeService::new(Vec::new(), false)),
+                broker.clone(),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            broker.calls.lock().unwrap()[0].1["display_name"],
+            "Мария / review"
+        );
+    }
 }
 
 /// Mirrors `tests/test_cli.py::test_start_account_flag_reaches_request`.
@@ -1399,6 +1437,7 @@ async fn test_transcript_text_pipe_receives_fragments_before_the_agent_finishes(
         write: false,
         fast: false,
         effort: None,
+        display_name: None,
         timeout_seconds: None,
         read_roots: vec![],
         output_schema: None,

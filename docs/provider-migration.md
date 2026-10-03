@@ -2,7 +2,7 @@
 
 ## Existing schema-2 homes
 
-When upgrading a schema-2 home to database schema 22, prepare a complete replacement
+When upgrading a schema-2 home to database schema 23, prepare a complete replacement
 configuration using external quota commands as described in
 [quota collectors](quota-collectors.md). Run the **new candidate binary** while
 the old broker and other agent-run writers are stopped:

@@ -270,13 +270,16 @@ async fn broker_client_starts_through_the_real_schema2_dispatcher() {
 }
 
 /// Stable references survive repeated native resumes and old-request replay;
-/// exact historical reads remain available through both socket and CLI.
+/// exact historical reads remain available through both socket and CLI. Names
+/// normalize on start, inherit on resume, can be replaced through MCP and
+/// appear in all public list transports; changed-name replays return Conflict.
 #[tokio::test]
 async fn stable_agent_identity_survives_resume_history_and_concurrent_controls() {
     let broker = Broker::start();
     let client = BrokerClient::new(broker.home.join("api.sock"));
     let mut request = broker.request("fixture:answer", "stable-start");
     request.timeout_seconds = Some(10.0);
+    request.display_name = Some("  Мария / review  ".into());
     let started = client
         .call("start", Some(serde_json::to_value(request).unwrap()))
         .await
@@ -284,12 +287,31 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
     let agent = started["agent_id"].as_str().unwrap().to_owned();
     let mut runs = vec![agent.clone()];
     assert!(started.get("run_id").is_none());
+    assert_eq!(started["agent"]["name"], "Мария / review");
     broker.wait_terminal(&runs[0]);
+    let parent = agent_run::state::Store::open(&broker.home)
+        .unwrap()
+        .get(&agent.parse().unwrap())
+        .unwrap();
+    assert_eq!(
+        parent.status,
+        agent_run::domain::Status::Succeeded,
+        "{:?}",
+        parent.failure_text
+    );
+    assert!(
+        parent.runtime_session_id.is_some(),
+        "{:?}",
+        parent.failure_text
+    );
     for number in 1..=2 {
-        let arguments = json!({
+        let mut arguments = json!({
             "agent_id":agent, "task":"fixture:answer", "timeout_seconds":10.0,
             "request_id":format!("stable-resume-{number}")
         });
+        if number == 2 {
+            arguments["display_name"] = json!("工程師: next");
+        }
         let continued = if number == 2 {
             let reply = mcp_tool(&broker.home, "resume", arguments).await;
             assert_ne!(reply["result"]["isError"], true, "{reply}");
@@ -298,10 +320,12 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
             let text = reply["result"]["content"][0]["text"].as_str().unwrap();
             assert!(text.contains(&format!("- Agent: {agent}")), "{text}");
             assert!(!text.contains("- Run:"), "{text}");
+            assert!(text.contains("Name: 工程師: next"), "{text}");
             identity
         } else {
             let result = client.call("resume", Some(arguments)).await.unwrap();
             assert_eq!(result["agent"]["agent_id"], agent);
+            assert_eq!(result["agent"]["name"], "Мария / review");
             result
         };
         assert_eq!(continued["agent_id"], agent);
@@ -319,6 +343,23 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
         broker.wait_terminal(&run);
         runs.push(run);
     }
+    let list = client.call("list_agents", Some(json!({}))).await.unwrap();
+    assert_eq!(list["items"][0]["name"], "工程師: next");
+    assert_eq!(list["items"][0]["usage"]["input_tokens"], 2);
+    for field in ["usage", "usage_cumulative"] {
+        let object = list["items"][0][field].as_object().unwrap();
+        for private in ["agent_id", "run_id", "attempt_id", "root_agent_id"] {
+            assert!(!object.contains_key(private), "{object:?}");
+        }
+    }
+    let cli_list = cli(&broker.home, &["agents"]);
+    assert!(cli_list.status.success(), "{cli_list:?}");
+    let cli_page: Value = serde_json::from_slice(&cli_list.stdout).unwrap();
+    assert_eq!(cli_page["items"][0]["name"], "工程師: next");
+    let mcp_list = mcp_tool(&broker.home, "list_agents", json!({})).await;
+    let text = mcp_list["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("name: 工程師: next"), "{text}");
+    assert!(text.contains("usage: in 2 out 3"), "{text}");
     let store = agent_run::state::Store::open(&broker.home).unwrap();
     let native = store
         .get(&runs[0].parse().unwrap())
@@ -367,6 +408,21 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
         )
         .await;
     assert!(conflicting.is_err());
+    let changed_name = client
+        .call(
+            "resume",
+            Some(json!({
+                "agent_id":agent, "task":"fixture:answer", "timeout_seconds":10.0,
+                "request_id":"stable-resume-1", "display_name":"changed"
+            })),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&changed_name, Error::Broker { broker_error_code: Some(code), .. } if code == "RequestConflict"),
+        "{changed_name:?}"
+    );
+    assert_eq!(changed_name.public().kind, "RequestConflict");
     let count: i64 = store
         .conn
         .query_row("SELECT COUNT(*) FROM agents", [], |row| row.get(0))

@@ -470,6 +470,10 @@ pub struct Start {
     pub account: Option<String>,
     #[arg(long)]
     pub request_id: Option<String>,
+    /// Optional human display label shown in list views; at most 64 Unicode
+    /// characters, no control or bidi formatting. `--display-name` is an alias.
+    #[arg(long = "name", alias = "display-name")]
+    pub display_name: Option<String>,
     #[arg(long)]
     pub wait: bool,
     #[command(flatten)]
@@ -496,6 +500,10 @@ pub struct Resume {
     pub timeout_seconds: Option<f64>,
     #[arg(long)]
     pub request_id: Option<String>,
+    /// Optional replacement display label; omission inherits the previous
+    /// run's label. `--display-name` is an alias.
+    #[arg(long = "name", alias = "display-name")]
+    pub display_name: Option<String>,
     #[command(flatten)]
     pub session: SessionArgs,
 }
@@ -1271,6 +1279,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                     "orchestrator": a.session.resolve()?,
                     "request_id": a.request_id,
                     "account": a.account,
+                    "display_name": a.display_name,
                 }))
                 .map_err(|_| invalid("invalid provider start arguments"))?;
             request.validate()?;
@@ -1305,6 +1314,9 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             let mut arguments = json!({"agent_id":a.agent_id,"task":task,"timeout_seconds":a.timeout_seconds,"request_id":a.request_id,"orchestrator":a.session.resolve()?});
             if let Some(run_id) = a.run_id {
                 arguments["run_id"] = json!(run_id);
+            }
+            if let Some(display_name) = a.display_name {
+                arguments["display_name"] = json!(display_name);
             }
             let result = dependencies.broker.call("resume", arguments).await?;
             (dependencies.output)(&admission_output(&result)?)?;

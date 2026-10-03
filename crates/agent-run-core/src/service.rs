@@ -771,13 +771,18 @@ impl Service {
     /// legacy revisions remain pending until their supervisor rematerializes them.
     /// On a schema-2 home a schema-1 run refuses with
     /// `legacy_continuation_unavailable` and writes nothing; a provider run
-    /// continues through [`Self::admit_provider_resume`].
+    /// continues through [`Self::admit_provider_resume`]. `display_name` inherits
+    /// when absent and otherwise replaces the label after normalization; it
+    /// participates in request-id replay. The supplied task becomes the next
+    /// native turn; timeout and orchestrator overrides keep existing bounds.
+    /// Admission is durable before supervisor handoff; replay launches nothing.
     pub async fn resume(
         &self,
         id: &AgentId,
         task: String,
         timeout: Option<f64>,
         request_id: Option<String>,
+        display_name: Option<String>,
         orchestrator: Option<OrchestratorRef>,
     ) -> Result<Value> {
         let parent = Store::open(&self.home)?.get(id)?;
@@ -794,8 +799,14 @@ impl Service {
             .as_ref()
             .is_some_and(|identity| identity["provider_identity_version"] == 2);
         if provider_row {
-            let mut result =
-                self.admit_provider_resume(&parent, task, timeout, request_id, orchestrator)?;
+            let mut result = self.admit_provider_resume(
+                &parent,
+                task,
+                timeout,
+                request_id,
+                display_name,
+                orchestrator,
+            )?;
             self.hand_off_provider(&mut result).await?;
             return Ok(result);
         }
@@ -832,6 +843,10 @@ impl Service {
         let mut request = parent.request.clone();
         request.task = task;
         request.request_id = request_id;
+        // An omitted label inherits the parent's; an explicit one replaces it.
+        if display_name.is_some() {
+            request.display_name = display_name;
+        }
         // A newly requested timeout is scaled once; an inherited one is the
         // parent's already-effective allowance and is reused unscaled, so the
         // configured margin never compounds across a lineage.
@@ -890,23 +905,33 @@ impl Service {
     /// parent's own account.
     ///
     /// Refuses with `continuation_unavailable` when the sealed assets or the
-    /// native history cannot be proved (see [`crate::continuity::prove`]),
+    /// native history cannot be proved by `verify_recorded_history`,
     /// and with a validation error when the current configuration no longer
     /// offers the provider, harness, connection or model. Admission itself
     /// proves the parent terminal, quiescent and cleaned up, and admits at
-    /// most one child per parent.
+    /// most one child per parent. `display_name` inherits the frozen label when
+    /// absent, or supplies a normalized replacement; a changed label with the
+    /// same request id is `Conflict`. Task, timeout and orchestrator overrides
+    /// remain subject to their normal validation. Returns a durable admission
+    /// snapshot; this method does not launch the supervisor.
     pub fn admit_provider_resume(
         &self,
         parent: &Record,
         task: String,
         timeout: Option<f64>,
         request_id: Option<String>,
+        display_name: Option<String>,
         orchestrator: Option<OrchestratorRef>,
     ) -> Result<Value> {
         let frozen = ProviderLaunchIdentity::read(parent)?;
         let mut request = frozen.provider_request.clone();
         request.task = task;
         request.request_id = request_id;
+        // An omitted label inherits the parent's frozen one; an explicit
+        // label replaces it and becomes part of the replay identity.
+        if display_name.is_some() {
+            request.display_name = display_name;
+        }
         request.timeout_seconds = timeout.or(frozen.provider_request.timeout_seconds);
         if orchestrator.is_some() {
             request.orchestrator = orchestrator;
@@ -1044,6 +1069,7 @@ impl Service {
         let mut effective = parent.request.clone();
         effective.task = request.task.clone();
         effective.request_id = request.request_id.clone();
+        effective.display_name = request.display_name.clone();
         // A resume's newly requested timeout is scaled once by the current
         // configuration; an inherited one keeps the parent's already-effective
         // allowance (never the frozen pre-margin base), so the margin is
@@ -1272,6 +1298,12 @@ impl Service {
             tokio::time::sleep(sleep).await;
         }
     }
+    /// Projects the exact execution `row` using committed evidence in `store`.
+    /// Includes the admitted human name, nullable recorded native usage and
+    /// complete lineage totals, plus lifecycle, delivery and process observations
+    /// at the current UTC time. Missing measurements remain null. No state is
+    /// written and no process is launched; store/serialization errors propagate.
+    /// Public transports subsequently normalize execution identity to the root.
     pub fn view(&self, store: &Store, row: &Record) -> Result<Value> {
         let observed = now();
         let progress = store.last_progress(&row.id)?;
@@ -1299,9 +1331,10 @@ impl Service {
             .identity
             .as_ref()
             .and_then(|i| i.get("effective_policy"));
-        let mut view = json!({"agent_id":row.id,"runtime":row.request.runtime,"model":row.request.model,"profile":row.request.profile,"task_summary":row.request.task.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect::<String>(),"status":row.status,
+        let mut view = json!({"agent_id":row.id,"name":row.display_name,"runtime":row.request.runtime,"model":row.request.model,"profile":row.request.profile,"task_summary":row.request.task.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect::<String>(),"status":row.status,
             "created_at":row.created_at,"started_at":row.started_at,"finished_at":row.finished_at,"elapsed_seconds":(row.finished_at.unwrap_or(observed)-row.started_at.unwrap_or(row.created_at)).max(0.0),"last_progress_at":progress,"silence_seconds":if row.status.terminal(){None}else{Some((observed-progress.or(row.started_at).unwrap_or(row.created_at)).max(0.0))},"warned":false,"failure_kind":row.failure_kind,"failure_text":row.failure_text,"answer_available":row.answer_path.is_some(),"answer_bytes":row.answer_bytes,"answer_sha256":row.answer_sha256,"effort":row.request.effort,
-            "delivery":store.delivery_status(&row.id)?,"parent_agent_id":row.parent_agent_id,"root_agent_id":row.root_agent_id,"sequence":row.sequence,"cleanup":store.last_event(&row.id,"process_cleanup")?,"policy":policy,"phase":phase,"phase_started_at":row.finished_at.or(row.started_at).unwrap_or(row.created_at),"process_state":process::observe(row.supervisor_pid,row.supervisor_identity.as_deref(),row.supervisor_birth_time),"observed_at":observed,"runtime_outcome":if row.status.terminal(){Some(row.status.as_str())}else{None},"acceptance":"pending","workdir":row.request.workdir.display().to_string()});
+            "delivery":store.delivery_status(&row.id)?,"parent_agent_id":row.parent_agent_id,"root_agent_id":row.root_agent_id,"sequence":row.sequence,"cleanup":store.last_event(&row.id,"process_cleanup")?,"policy":policy,"phase":phase,"phase_started_at":row.finished_at.or(row.started_at).unwrap_or(row.created_at),"process_state":process::observe(row.supervisor_pid,row.supervisor_identity.as_deref(),row.supervisor_birth_time),"observed_at":observed,"runtime_outcome":if row.status.terminal(){Some(row.status.as_str())}else{None},"acceptance":"pending","workdir":row.request.workdir.display().to_string(),
+            "usage":store.usage_view(&row.id)?,"usage_cumulative":store.usage_cumulative(&row.root_agent_id)?});
         let mcp = agent_run_store::projections::selected_mcp(row.identity.as_ref());
         if !mcp.is_empty() {
             view["mcp"] = serde_json::to_value(mcp)?;

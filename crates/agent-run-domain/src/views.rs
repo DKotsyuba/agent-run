@@ -71,6 +71,9 @@ pub struct AgentView {
     pub mcp: Vec<McpSelectionView>,
     /// Stable logical agent id, unchanged across resumes.
     pub agent_id: AgentId,
+    /// Optional human display label stored at admission; `null` when unnamed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Legacy execution identity, absent from current public projections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<AgentId>,
@@ -140,6 +143,81 @@ pub struct AgentView {
     /// Working directory the run was admitted with, when recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
+    /// Latest observed native usage of this execution, or `null` before any
+    /// statistics row exists (for example while the run is still executing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageView>,
+    /// Aggregate native usage across the lineage's executions; each metric
+    /// is `null` while any contributing execution has no recorded statistics
+    /// row or did not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_cumulative: Option<UsageCumulativeView>,
+}
+
+/// Latest observed native usage of one execution, straight from `run_stats`.
+///
+/// Every numeric field is the harness-reported measurement or `null` when the
+/// source did not report it; `usage_source` names the protocol that supplied
+/// the row and is `"none"` when no native measurement exists. Only these
+/// allowlisted fields are public: internal execution identifiers never appear.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageView {
+    /// Prompt/input token count, when reported.
+    pub input_tokens: Option<i64>,
+    /// Generated/output token count, when reported.
+    pub output_tokens: Option<i64>,
+    /// Read-from-cache token count, when reported.
+    pub cache_read_tokens: Option<i64>,
+    /// Written-to-cache token count, when reported.
+    pub cache_write_tokens: Option<i64>,
+    /// Reasoning/thinking token count, when reported.
+    pub reasoning_tokens: Option<i64>,
+    /// Runtime-reported total token count, when reported.
+    pub total_tokens: Option<i64>,
+    /// Runtime-reported model turn count, when reported.
+    pub num_turns: Option<i64>,
+    /// First-token latency in milliseconds, when reported.
+    pub ttft_ms: Option<f64>,
+    /// API duration in milliseconds, when reported.
+    pub api_duration_ms: Option<f64>,
+    /// Runtime-reported USD cost, when reported.
+    pub cost_usd: Option<f64>,
+    /// Protocol that supplied the row: `runtime_result`, `token_usage_updated`
+    /// or `none`.
+    pub usage_source: String,
+    /// UTC epoch seconds when the row was last recomputed.
+    pub recorded_at: f64,
+}
+
+/// Aggregate usage across every execution of one logical agent lineage.
+///
+/// A metric is present only when the complete one-based lineage remains and
+/// every execution has a recorded measurement. Missing or pruned history and
+/// unreported metrics stay `null` instead of becoming partial totals.
+/// `executions` counts retained lineage rows; an absent lineage has zero rows
+/// and null totals. No internal execution identifiers are included.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageCumulativeView {
+    /// Summed prompt/input tokens, when complete.
+    pub input_tokens: Option<i64>,
+    /// Summed generated/output tokens, when complete.
+    pub output_tokens: Option<i64>,
+    /// Summed read-from-cache tokens, when complete.
+    pub cache_read_tokens: Option<i64>,
+    /// Summed written-to-cache tokens, when complete.
+    pub cache_write_tokens: Option<i64>,
+    /// Summed reasoning tokens, when complete.
+    pub reasoning_tokens: Option<i64>,
+    /// Summed runtime-reported totals, when complete.
+    pub total_tokens: Option<i64>,
+    /// Summed model turn counts, when complete.
+    pub num_turns: Option<i64>,
+    /// Summed runtime-reported USD cost, when complete.
+    pub cost_usd: Option<f64>,
+    /// Number of lineage executions the aggregate considered.
+    pub executions: u64,
 }
 
 /// The durable start result, including the immediately committed agent snapshot.

@@ -187,6 +187,48 @@ pub fn external_id(label: &str, s: &str) -> Result<()> {
     Ok(())
 }
 
+/// The largest accepted display label length, in Unicode scalar values.
+pub const MAX_DISPLAY_NAME_CHARS: usize = 64;
+
+/// Normalizes one optional human display label for durable storage.
+///
+/// The label is a human-facing UTF-8 string, not an identifier: it is trimmed,
+/// must stay nonblank, hold at most [`MAX_DISPLAY_NAME_CHARS`] Unicode scalar
+/// values, and contain no control, bidirectional-embedding, or other format
+/// characters that a terminal or list view could render as executable
+/// formatting. Anything else is a validation error; the label is never
+/// derived from task text and confers no authority.
+pub fn display_name(label: &str) -> Result<String> {
+    let trimmed = label.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return Err(invalid("display name must be a nonblank NUL-free string"));
+    }
+    if trimmed.chars().count() > MAX_DISPLAY_NAME_CHARS {
+        return Err(invalid("display name exceeds 64 characters"));
+    }
+    if trimmed.chars().any(is_unsafe_label_char) {
+        return Err(invalid(
+            "display name must not contain control, bidi or format characters",
+        ));
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// Reports one character a display label must not carry: C0/C1 controls and
+/// the directional isolates, overrides, and invisible format marks whose
+/// rendering could mislabel or execute in terminal output.
+fn is_unsafe_label_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00ad}'
+                | '\u{200e}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{feff}'
+        )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrchestratorRef {
@@ -205,6 +247,10 @@ impl OrchestratorRef {
         Ok(())
     }
 }
+/// Historical runtime request and provider storage projection for one execution.
+/// Callers validate before admission; canonical paths and normalized optional
+/// labels participate in replay identity. An absent label stays omitted in JSON
+/// to preserve pre-label fingerprints. Requests grant no authority on their own.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartRequest {
@@ -219,6 +265,10 @@ pub struct StartRequest {
     pub fast: bool,
     #[serde(default)]
     pub effort: Option<String>,
+    /// Optional human display label for the agent; normalized in place by
+    /// [`display_name`] during validation so equal labels replay identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     /// The run's whole-run deadline in seconds from admission, at most
     /// [`MAX_TIMEOUT_SECONDS`]; absence takes the configured default.
     #[serde(default)]
@@ -247,6 +297,11 @@ fn unique_constraints<'de, D: serde::Deserializer<'de>>(
     Ok(b)
 }
 impl StartRequest {
+    /// Validates admission inputs and canonicalizes existing directory paths and
+    /// the optional human label in place. Task text is nonblank and at most
+    /// 512 KiB; timeout, namespace and request-id bounds use shared validators.
+    /// Duplicate canonical read roots are rejected. Validation and path errors
+    /// propagate before any durable admission; no process or database is touched.
     pub fn validate(&mut self) -> Result<()> {
         for (name, s) in [
             ("runtime", &self.runtime),
@@ -263,6 +318,9 @@ impl StartRequest {
             if let Some(s) = s {
                 nonblank(name, s)?;
             }
+        }
+        if let Some(label) = &self.display_name {
+            self.display_name = Some(display_name(label)?);
         }
         if let Some(v) = self.timeout_seconds {
             timeout_seconds(v)?;

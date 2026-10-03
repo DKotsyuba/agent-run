@@ -111,7 +111,7 @@ async fn python_test_python_created_codex_run_is_explicitly_refused() {
         Err(Error::Unsupported(_))
     ));
     let error = Service::new(home.path.clone())
-        .resume(&id, "continue".into(), None, None, None)
+        .resume(&id, "continue".into(), None, None, None, None)
         .await
         .unwrap_err();
     assert!(matches!(error, Error::Unsupported(message) if message.contains("Python-created")));
@@ -133,7 +133,7 @@ async fn python_test_resume_without_native_session_is_refused() {
         .unwrap();
 
     let error = Service::new(home.path.clone())
-        .resume(&id, "continue".into(), None, None, None)
+        .resume(&id, "continue".into(), None, None, None, None)
         .await
         .unwrap_err();
     assert!(matches!(error, Error::Validation(message) if message.contains("native session ID")));

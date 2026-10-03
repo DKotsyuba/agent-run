@@ -80,6 +80,9 @@ struct Resume {
     /// Idempotency key in the caller's namespace, reused for transport retries.
     request_id: Option<String>,
     #[serde(default)]
+    /// Optional replacement display label; omission inherits the parent's.
+    display_name: Option<String>,
+    #[serde(default)]
     /// Optional delivery destination override; omission inherits the parent.
     orchestrator: Option<OrchestratorRef>,
 }
@@ -147,6 +150,7 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
                     a.task,
                     a.timeout_seconds,
                     a.request_id,
+                    a.display_name,
                     a.orchestrator,
                 )
                 .await

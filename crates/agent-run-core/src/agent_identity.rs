@@ -169,6 +169,7 @@ impl crate::service::Service {
         task: String,
         timeout: Option<f64>,
         request_id: Option<String>,
+        display_name: Option<String>,
         orchestrator: Option<crate::domain::OrchestratorRef>,
     ) -> Result<Value> {
         let parent = {
@@ -193,8 +194,15 @@ impl crate::service::Service {
             }
         };
         admission(
-            self.resume(&parent.id, task, timeout, request_id, orchestrator)
-                .await?,
+            self.resume(
+                &parent.id,
+                task,
+                timeout,
+                request_id,
+                display_name,
+                orchestrator,
+            )
+            .await?,
         )
     }
 }

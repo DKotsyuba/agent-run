@@ -160,6 +160,27 @@ as soon as a committed event advances it. The returned `revision` becomes the
 next cursor, so terminal completion is observable without a notification
 worker or polling at a fixed interval.
 
+`start` and `resume` accept optional `display_name` (CLI `--name`, alias
+`--display-name`): a trimmed, nonblank UTF-8 human label of 1–64 Unicode
+scalar values, with no control or unsafe directional formatting. Punctuation
+and non-ASCII text are accepted. Omitted or null start labels mean unnamed;
+omitted or null resume labels inherit the parent, and an explicit label replaces
+it. The normalized label participates in request-id replay: changing it with the
+same key returns `Conflict`. Public agent views expose it as nullable `name`;
+labels confer no authority and are never inferred from task text.
+
+Views expose nullable `usage` from the latest execution's existing `run_stats`
+row and `usage_cumulative` across lineage executions. Missing or pruned history, missing rows or
+unreported metrics remain null; an explicitly observed zero stays zero. Each
+cumulative metric is available only when every lineage execution reported it.
+Usage objects contain measurements, source and recording time, never internal
+execution IDs. Codex resumes record a comparable parent-thread baseline before
+launch and subtract it from native cumulative counters; absent, foreign-session,
+foreign-model or decreasing counters remain unknown. Codex turn counts are null
+unless the native protocol reports a counter, never inferred from messages,
+turn IDs, tools or execution count. Compact MCP output uses `?` for unknown
+measurements and names incomplete lineage evidence.
+
 Agent views returned by `list_agents` include
 `effort` — the reasoning effort requested at launch, or `null` when the
 request did not set one.
@@ -277,6 +298,6 @@ rendered as `RuntimeError`.
   an agent-run upgrade instead of caching schemas across versions.
 - Restart `api serve` after switching the verified sealed release at
   `~/.agent-run/standalone/current`.
-- The current database schema is version 22, reached through the paired
+- The current database schema is version 23, reached through the paired
   `agent-run config migrate`. Older resident processes refuse a newer database
   and must be restarted after an upgrade migrates it.

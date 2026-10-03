@@ -100,6 +100,9 @@ pub struct Record {
     pub sequence: u32,
     pub resume_of_runtime_session_id: Option<String>,
     pub identity: Option<Value>,
+    /// Optional human display label admitted with the request; `None` is the
+    /// ordinary unnamed state, including all historical rows.
+    pub display_name: Option<String>,
 }
 
 /// Captures persisted supervisor identity fields for immutable ownership checks.
@@ -180,6 +183,7 @@ impl Record {
                 .get::<_, Option<String>>("identity_json")?
                 .map(parse)
                 .transpose()?,
+            display_name: row.get("display_name")?,
         })
     }
 }
