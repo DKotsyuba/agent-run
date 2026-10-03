@@ -54,6 +54,86 @@ fn worker_report(args: &[String]) {
         }).await.expect("bounded worker MCP fixture");
     });
 }
+/// Scripted pool member over the real private worker MCP boundary: confirms the
+/// five-tool catalog, reads the pool log, the lead proposes, every member votes
+/// ready on the current proposal, and the child then exits. Bounded to twenty
+/// seconds so a lost peer still ends this child finitely.
+fn pool_script(args: &[String], lead: bool) {
+    let config: Value = serde_json::from_str(
+        &std::fs::read_to_string(argument(args, "--mcp-config").expect("worker config path"))
+            .unwrap(),
+    )
+    .unwrap();
+    let server = &config["mcpServers"]["agent_run_worker"];
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        use agent_run::transport::{frame, socket};
+        use std::process::Stdio;
+        use tokio::io::BufReader;
+        let mut child = tokio::process::Command::new(server["command"].as_str().unwrap())
+            .args(server["args"].as_array().unwrap().iter().map(|arg| arg.as_str().unwrap()))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut next_id = 0u64;
+            let mut request = |method: &str, params: Value| {
+                next_id += 1;
+                json!({"jsonrpc":"2.0","id":next_id,"method":method,"params":params})
+            };
+            frame::write(&mut input, &request("initialize", json!({"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"pool-fixture","version":"1"}})), socket::MAX_FRAME).await.unwrap();
+            frame::read(&mut output, socket::MAX_FRAME).await.unwrap().unwrap();
+            frame::write(&mut input, &json!({"jsonrpc":"2.0","method":"notifications/initialized"}), socket::MAX_FRAME).await.unwrap();
+            frame::write(&mut input, &request("tools/list", json!({})), socket::MAX_FRAME).await.unwrap();
+            let roster: Value = serde_json::from_slice(&frame::read(&mut output, socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
+            let mut names: Vec<_> = roster["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_owned()).collect();
+            names.sort();
+            assert_eq!(names, ["notify_orchestrator", "pool_post", "pool_propose", "pool_read", "pool_vote"]);
+            let mut call = |name: &str, arguments: Value| {
+                request("tools/call", json!({"name":name,"arguments":arguments}))
+            };
+            let (mut proposed, mut voted) = (false, false);
+            let mut transcript = String::new();
+            while !voted {
+                frame::write(&mut input, &call("pool_read", json!({"after_seq":0,"limit":50,"wait_seconds":1})), socket::MAX_FRAME).await.unwrap();
+                let reply: Value = serde_json::from_slice(&frame::read(&mut output, socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
+                let text = reply["result"]["content"][0]["text"].as_str().unwrap_or_default().to_owned();
+                transcript.push_str(&text);
+                let proposal = text.split("Current proposal #").nth(1).and_then(|rest| {
+                    rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u64>().ok()
+                });
+                match proposal {
+                    None if lead && !proposed => {
+                        frame::write(&mut input, &call("pool_propose", json!({"request_id":"fixture-proposal","message":"fixture result is ready","snapshot":"commit abc123"})), socket::MAX_FRAME).await.unwrap();
+                        let reply: Value = serde_json::from_slice(&frame::read(&mut output, socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
+                        assert_ne!(reply["result"]["isError"], true, "{reply}");
+                        proposed = true;
+                    }
+                    Some(seq) => {
+                        frame::write(&mut input, &call("pool_vote", json!({"request_id":"fixture-vote","proposal_seq":seq,"decision":"ready","checks":[{"criterion_id":"goal","status":"met","evidence":"fixture verified"}]})), socket::MAX_FRAME).await.unwrap();
+                        let reply: Value = serde_json::from_slice(&frame::read(&mut output, socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
+                        assert_ne!(reply["result"]["isError"], true, "{reply}");
+                        voted = true;
+                    }
+                    None => {}
+                }
+            }
+            std::fs::write(if lead { "pool-script-lead.txt" } else { "pool-script-peer.txt" }, transcript).unwrap();
+            drop(input);
+            assert!(child.wait().await.unwrap().success());
+        })
+        .await
+        .expect("bounded pool member fixture");
+    });
+}
 /// Blocks until the marker file exists in the current workdir, bounded to
 /// twenty seconds so a lost test driver still ends this child finitely.
 fn wait_marker(name: &str) {
@@ -207,6 +287,9 @@ fn main() {
     }
     if task == "fixture:slow" {
         std::thread::sleep(Duration::from_secs(3));
+    }
+    if task.contains("fixture:pool-script") {
+        pool_script(&args, task.contains("fixture:pool-script lead"));
     }
     if task == "fixture:worker-notify" {
         worker_report(&args);

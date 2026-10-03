@@ -265,6 +265,48 @@ pub enum Command {
     Doctor,
     Start(Start),
     Resume(Resume),
+    /// Start a cooperative pool from one JSON request (`-` reads stdin).
+    StartPool {
+        /// JSON file or `-`: request_id, goal, optional acceptance, members.
+        #[arg(long)]
+        spec: String,
+        #[command(flatten)]
+        session: SessionArgs,
+    },
+    /// Post a message, stamped as from the operator, to every pool member.
+    PoolPost {
+        #[arg(long)]
+        pool_id: String,
+        #[arg(long)]
+        request_id: String,
+        /// Message text; `-` reads standard input.
+        #[arg(long)]
+        text: String,
+    },
+    /// Replace one terminal, fully cleaned pool member.
+    PoolReplace {
+        #[arg(long)]
+        pool_id: String,
+        /// Stable agent id of the current member.
+        #[arg(long)]
+        agent_id: String,
+        #[arg(long)]
+        request_id: String,
+        /// Optional JSON file or `-` with an explicit replacement start.
+        #[arg(long)]
+        spec: Option<String>,
+    },
+    /// Read a pool's status and one cursor page of its log.
+    Pool {
+        #[arg(long)]
+        pool_id: String,
+        #[arg(long)]
+        after_seq: Option<u64>,
+        #[arg(long)]
+        before_seq: Option<u64>,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
     Bind(Bind),
     Cancel {
         /// Stable agent id, or a historical run alias for that agent.
@@ -549,7 +591,11 @@ pub struct Resume {
 #[derive(Args, Debug)]
 pub struct Bind {
     /// Stable agent whose selected execution should be bound.
-    pub agent_id: AgentId,
+    #[arg(required_unless_present = "pool", conflicts_with = "pool")]
+    pub agent_id: Option<AgentId>,
+    /// Bind a whole pool and every current member together instead of one agent.
+    #[arg(long)]
+    pub pool: Option<String>,
     /// Legacy execution selector, retained for older callers.
     #[arg(long, hide = true)]
     pub run_id: Option<AgentId>,
@@ -880,6 +926,26 @@ fn read_stdin(max: usize) -> Result<String> {
         return Err(invalid("stdin exceeds the maximum input size"));
     }
     String::from_utf8(bytes).map_err(|_| invalid("input must be UTF-8"))
+}
+
+/// Reads one bounded JSON object from a file, or from standard input for `-`.
+fn spec_json(source: &str) -> Result<Value> {
+    const MAX: usize = 1024 * 1024;
+    let text = if source == "-" {
+        read_stdin(MAX)?
+    } else {
+        let bytes = std::fs::read(source).map_err(|_| invalid("spec file is unreadable"))?;
+        if bytes.len() > MAX {
+            return Err(invalid("spec file exceeds the maximum input size"));
+        }
+        String::from_utf8(bytes).map_err(|_| invalid("spec must be UTF-8"))?
+    };
+    let value: Value =
+        serde_json::from_str(&text).map_err(|_| invalid("spec must be a JSON object"))?;
+    if !value.is_object() {
+        return Err(invalid("spec must be a JSON object"));
+    }
+    Ok(value)
 }
 
 /// Reads a task argument, interpreting exactly `-` as bounded standard input.
@@ -1503,13 +1569,76 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 external_turn_id: a.session_turn_id,
             };
             let mut store = Store::open(&home)?;
+            if let Some(pool) = &a.pool {
+                let pool: agent_run_domain::pool::PoolId = pool.parse()?;
+                store.bind_pool(&pool, &reference, crate::domain::now())?;
+                (dependencies.output)(&json!({"pool_id": pool, "bound": true}))?;
+                return Ok(0);
+            }
+            let agent_id = a
+                .agent_id
+                .ok_or_else(|| invalid("agent id or --pool is required"))?;
             let run =
-                agent_run_core::agent_identity::resolve(&store, &a.agent_id, a.run_id.as_ref())?;
+                agent_run_core::agent_identity::resolve(&store, &agent_id, a.run_id.as_ref())?;
             hooks::bind::bind(&mut store, run.id.clone(), reference, crate::domain::now())?;
             (dependencies.output)(&agent_run_core::agent_identity::result(
                 &run,
                 store.delivery_status(&run.id)?,
             )?)?;
+        }
+        Command::StartPool { spec, session } => {
+            let mut request = spec_json(&spec)?;
+            if let Some(reference) = session.resolve()? {
+                request["orchestrator"] = serde_json::to_value(reference)?;
+            }
+            let result = dependencies.broker.call("start_pool", request).await?;
+            (dependencies.output)(&result)?;
+        }
+        Command::PoolPost {
+            pool_id,
+            request_id,
+            text,
+        } => {
+            let message = task_text(&text, 16 * 1024)?;
+            let result = dependencies
+                .broker
+                .call(
+                    "pool_post",
+                    json!({"pool_id": pool_id, "request_id": request_id, "message": message}),
+                )
+                .await?;
+            (dependencies.output)(&result)?;
+        }
+        Command::PoolReplace {
+            pool_id,
+            agent_id,
+            request_id,
+            spec,
+        } => {
+            let start = spec.as_deref().map(spec_json).transpose()?;
+            let result = dependencies
+                .broker
+                .call(
+                    "pool_replace",
+                    json!({"pool_id": pool_id, "agent_id": agent_id, "request_id": request_id, "start": start}),
+                )
+                .await?;
+            (dependencies.output)(&result)?;
+        }
+        Command::Pool {
+            pool_id,
+            after_seq,
+            before_seq,
+            limit,
+        } => {
+            let result = dependencies
+                .broker
+                .call(
+                    "pool",
+                    json!({"pool_id": pool_id, "after_seq": after_seq, "before_seq": before_seq, "limit": limit}),
+                )
+                .await?;
+            (dependencies.output)(&result)?;
         }
         Command::Context(a) => {
             let reference = OrchestratorRef {
@@ -1539,8 +1668,12 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 }
                 Hook::Bind(transport) => {
                     let mut store = Store::open(&home)?;
-                    let result =
-                        hooks::bind::run_hook(&mut store, &payload, &transport.transport, None)?;
+                    let result = hooks::bind::run_hook_bound(
+                        &mut store,
+                        &payload,
+                        &transport.transport,
+                        None,
+                    )?;
                     (dependencies.output)(
                         &json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":result.message()}}),
                     )?;

@@ -128,32 +128,10 @@ impl WorkerProxy {
             return super::mcp_text::error_result(code, message);
         }
         if tool == agent_run_domain::worker::WorkerTool::PoolRead {
-            let mut page = value;
-            page["entry_count"] = json!(page["entries"].as_array().map(Vec::len).unwrap_or(0));
-            if let Some(entries) = page["entries"].as_array_mut() {
-                let mut rendered = Vec::with_capacity(entries.len());
-                for entry in entries.drain(..) {
-                    match serde_json::from_value::<agent_run_domain::pool::PoolEntryView>(entry) {
-                        Ok(view) => match agent_run_domain::pool::render_entry(&view) {
-                            Ok(text) => rendered.push(text),
-                            Err(error) => {
-                                return super::mcp_text::error_result(
-                                    "RuntimeError",
-                                    &format!("pool entry presentation failed: {error}"),
-                                )
-                            }
-                        },
-                        Err(_) => {
-                            return super::mcp_text::error_result(
-                                "RuntimeError",
-                                "pool entry failed validation",
-                            )
-                        }
-                    }
-                }
-                page["entries"] = serde_json::json!(rendered);
-            }
-            return super::mcp_text::success_result("pool_read", &page);
+            return match super::mcp_text::pool_page(value) {
+                Ok(page) => super::mcp_text::success_result("pool_read", &page),
+                Err(message) => super::mcp_text::error_result("RuntimeError", &message),
+            };
         }
         super::mcp_text::success_result(tool.as_str(), &value)
     }
@@ -287,8 +265,17 @@ mod tests {
             attempt_id: "attempt".into(),
             token: "a".repeat(64),
         };
-        assert_eq!(tools().len(), 1);
-        assert_eq!(tools()[0].name, "notify_orchestrator");
+        let names: Vec<_> = tools().iter().map(|tool| tool.name.to_string()).collect();
+        assert_eq!(
+            names,
+            [
+                "notify_orchestrator",
+                "pool_post",
+                "pool_read",
+                "pool_propose",
+                "pool_vote"
+            ]
+        );
         for name in [
             "start",
             "resume",
@@ -321,7 +308,7 @@ mod tests {
         assert!(!rendered.contains(&proxy.token));
         let calls = broker.0.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, agent_run_domain::worker::METHOD);
+        assert_eq!(calls[0].0, agent_run_domain::worker::TOOL_METHOD);
         assert_eq!(calls[0].1["run_id"], proxy.run_id.as_str());
         assert_eq!(calls[0].1["attempt_id"], "attempt");
         assert_eq!(calls[0].1["token"], proxy.token);

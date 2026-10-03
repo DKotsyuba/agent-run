@@ -287,6 +287,21 @@ pub enum PoolDenial {
 }
 
 impl PoolDenial {
+    /// Converts an operator-side refusal into the shared public error whose
+    /// machine code fits (not found, state conflict, request conflict or
+    /// validation); the stable denial code leads the message.
+    pub fn into_error(self) -> crate::Error {
+        let message = format!("{}: {}", self.code(), self.message());
+        match self {
+            Self::PoolNotFound => crate::Error::NotFound(message),
+            Self::Conflict => crate::Error::Conflict,
+            Self::MemberBusy | Self::PoolCompleted | Self::StaleRoster { .. } => {
+                crate::Error::Transition(message)
+            }
+            _ => crate::Error::Validation(message),
+        }
+    }
+
     /// The stable wire code; consumers match this, never the message text.
     pub const fn code(&self) -> &'static str {
         match self {

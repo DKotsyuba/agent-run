@@ -42,3 +42,19 @@ Older exact-ID hook payloads retain their original binding behavior.
 
 Reconnect MCP clients together with the broker upgrade so the renderer and
 binding hook agree on the receipt format. The database schema is unchanged.
+
+## Cooperative pools
+
+`start_pool` starts two to five agents that share one goal and acceptance
+criteria; each also gets its own task, a role label (descriptive only) and every
+peer's stable `agent_id` in its frozen first prompt. Members talk through private
+pool tools they receive automatically; you can `pool_post` guidance (stamped as
+from you, never changing goal or grants), read `pool`, and `pool_replace` a
+terminal, fully cleaned member. The pool is complete only when every member voted
+ready on the same current proposal, every member ended successfully and cleanup
+is verified; that is a formal check, so judge the result yourself. One common
+`agent-run/pool-completion` notice arrives for the whole pool, bound through the
+post-tool hook on a direct `start_pool` call (or `orchestrator`, or `agent-run
+bind --pool <id>`); until bound it waits. A completed pool's record stays frozen
+even if a member is resumed later. Pool history is kept until every member has
+expired.

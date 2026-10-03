@@ -5579,3 +5579,50 @@ async fn pool_replacement_child_receives_roster_and_catch_up() {
     );
     assert!(received.contains("ship the fix") && received.contains("pool_read"));
 }
+
+/// A pool bound after its first start still gives its replacement and resumed
+/// members the pool's actual shared session, never the unbound reference frozen
+/// at the original start.
+#[tokio::test]
+async fn pool_replacement_inherits_the_actual_shared_binding() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let (pool, ids) = admitted_pool(&service, &home, [Some("work"), Some("work")], true);
+    let reference = agent_run_domain::domain::OrchestratorRef {
+        transport: "claude_uds".into(),
+        external_session_id: "late-chat".into(),
+        external_turn_id: None,
+    };
+    let session = Store::open(&home)
+        .unwrap()
+        .bind_pool(&pool, &reference, 5.0)
+        .unwrap();
+    retire(&home, &ids[0]);
+    let replaced = service
+        .admit_pool_replacement_trusted(
+            replace_request(&pool, &ids[0], "bound-later", None),
+            candidates(committed(&home)),
+        )
+        .unwrap()
+        .unwrap();
+    let store = Store::open(&home).unwrap();
+    let row = store.get(&replaced.new.agent_id).unwrap();
+    assert_eq!(
+        row.orchestrator_session_id.as_deref(),
+        Some(session.as_str())
+    );
+    assert_eq!(
+        row.request
+            .orchestrator
+            .as_ref()
+            .map(|o| o.external_session_id.as_str()),
+        Some("late-chat")
+    );
+    assert_eq!(
+        store
+            .member_pool_binding(&ids[1])
+            .unwrap()
+            .map(|o| o.external_session_id),
+        Some("late-chat".to_owned())
+    );
+}

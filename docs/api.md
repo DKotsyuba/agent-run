@@ -126,6 +126,18 @@ Discover the authoritative surface at runtime:
   hardcoded list.
 - `ping` (no params) — `{"ok": true}`; liveness probe.
 
+Cooperative pools use four strict methods from the same table: `start_pool`
+(two to five ordinary start requests sharing one goal and acceptance criteria,
+admitted atomically; returns the stable `pool_id` and each member's `agent_id`,
+name, role and status), `pool_post` (an operator message stamped as the
+orchestrator), `pool_replace` (replace a terminal, fully cleaned member; same
+`request_id` returns the same new member) and `pool` (status plus a cursor-paged
+log). The first three ride the control lane. Refusals use the shared error codes
+with the pool code leading the message (`member_busy`, `pool_completed`,
+`pool_not_found`, ...). A pool completes only by formal verification (every
+member voted ready on one proposal, ended successfully, cleanup verified) and
+delivers exactly one common notice; that is not proof the result is correct.
+
 Over MCP, every tool result renders as one compact plain-text page (see
 `assets/mcp/*.txt.j2`) instead of the structured JSON below; `start`/`resume`
 additionally keep `structuredContent` `{"agent_id": ..., "sequence": ...}` so

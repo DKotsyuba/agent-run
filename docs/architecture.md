@@ -130,8 +130,9 @@ member's tip of that entry's pool, and records only a finite push disposition:
 write, `rejected`, `unsent`, `refused` (with a typed reason) or `unknown` after
 a possible write. None of them means the member consumed the entry; the log
 remains the source of truth and members catch up through `pool_read`.
-The core also offers operator operations, not yet exposed through any tool, CLI
-or MCP method: posting a message stamped as the operator (fanned out through the
+The operator operations (public tools `start_pool`, `pool_post`, `pool_replace`
+and `pool`, one CLI command each, MCP and the broker socket from the one shared
+tool table; the private worker catalog stays the fixed five tools): posting a message stamped as the operator (fanned out through the
 same path and chat budget, idempotent by key), reading a pool's status and
 cursor-paged log through the projection members read, and replacing one current
 member. A replacement is refused with `member_busy` unless the member's latest
@@ -174,9 +175,25 @@ shortened with an explicit marker naming the full proposal entry in the pool
 log. An unbound pool still completes: its notice stays `waiting_binding`
 (exempt from the one-hour binding window and not activated by binding a single
 member) until the pool itself is bound, which the store's `bind_pool` does for
-the pool and every current member tip. No tool, CLI or MCP method calls
-`bind_pool` or exposes completion yet, and retention of completed pools is a
-later stage. The tables retain replaced members, keep one current member per slot, store
+the pool and every current member tip. `agent-run bind --pool <id>` and the
+post-tool hook (a structured `start_pool` reply, recognized before any
+single-agent receipt) call it; a conflict with an existing binding changes
+nothing, and the binding is immutable. Replacements and resumed members join the
+pool's actual stored session, not the reference frozen at the first start.
+
+Retention treats a pool as a unit. Every member lineage, replaced members
+included, stays stored (with its native history, seals and cleanup evidence)
+until every execution of every member has expired by the ordinary rule
+(fourteen days, or ranked outside the newest hundred logical sessions), none
+owns an attempt or lacks verified cleanup, and no linked notice is pending,
+retrying or being sent. Then pool entries, members and the pool row are purged
+before the underlying agent, delivery and session rows, as the foreign keys
+require; a common notice still `waiting_binding` at that point is expired
+explicitly (`pool_binding_expired`) rather than lingering. The read-only
+preflight uses the same predicate, so protected-only pools never wake the
+writer. The maintenance sweep for completion likewise evaluates readiness
+read-only and takes the writer lock only for a pool that can actually complete.
+The tables retain replaced members, keep one current member per slot, store
 an immutable author stamped at send time, and reference agents and deliveries
 without cascades so a later purge can delete pool rows first.
 

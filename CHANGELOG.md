@@ -30,16 +30,27 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   carries the stamped sender
 - feat(pools): add core operator operations: post a stamped operator message,
   read a pool's status and log, and replace a terminal, fully cleaned member
-  atomically with a roster change, a broker roster entry and a replayable result;
-  not yet exposed through any tool, CLI or MCP method
+  atomically with a roster change, a broker roster entry and a replayable result
 - feat(pools): complete a pool only when every current member voted ready on the
   current proposal, ended successfully and has verified cleanup, in one
   transaction that freezes one completion record and queues exactly one common
   notice (Desktop relay `pool_completion`, Claude inbox text) naming no run,
   attempt or session identity; unbound pools keep the notice waiting until a pool
-  binding exists (store `bind_pool`, not yet exposed); completed pools stay frozen
-  if a member is resumed later, and retention of completed pools is not
-  implemented yet
+  binding exists; completed pools stay frozen if a member is resumed later
+
+- feat(pools): expose cooperative pools through the one shared tool table: MCP
+  tools `start_pool`, `pool_post`, `pool_replace` and `pool` with compact
+  per-tool pages (goal, criteria and proposal snapshot print only on a
+  from-the-start read or when new), matching CLI commands (`start-pool`,
+  `pool-post`, `pool-replace`, `pool`, `bind --pool`) and broker socket methods
+  on the control lane; whole-pool binding through the post-tool hook receipt or
+  `bind --pool`, inherited by replacements and resumed members; the private
+  worker catalog stays the fixed five tools
+- fix(pools): retain every member lineage of a pool (replaced members, pending
+  and retrying linked notices, unproven cleanup) until the whole pool has
+  expired, then purge pool rows before agents; protected-only pools no longer
+  wake the maintenance writer, and settlement sweeps check readiness read-only
+- docs(pools): the completion notice marks a goal cut to its excerpt
 
 Database schema 25 adds the `pools`, `pool_members` and `pool_entries` tables
 with historical membership, one current member per slot and immutable

@@ -1,4 +1,4 @@
-agent-run pool {{ pool_id }} — {{ status.state }}, roster r{{ status.roster_revision }}{% if status.agreed %}, all current members valid-ready (agreement is not completion){% else %}, not yet unanimous{% endif %}
+agent-run pool {{ pool_id }} — {{ status.state }}, roster r{{ status.roster_revision }}{% if status.state == "completed" %}, frozen record{% elif status.agreed %}, all current members valid-ready (agreement is not completion){% else %}, not yet unanimous{% endif %}{{ "" }}
 {% if show_goal %}
 Goal: {{ status.goal }}
 Acceptance criteria:
@@ -16,7 +16,10 @@ No proposal yet.
 {% endif %}
 Members:
 {% for member in status.members %}
-- {{ member.name }} ({{ member.role }}, {{ member.agent_id }}): {{ member.tip_status }}, vote {{ member.why }}{% if member.vote and member.vote.decision %} [{{ member.vote.decision }}]{% endif %}{{ "" }}
+- {{ member.name }} ({{ member.role }}, {{ member.agent_id }}): {{ member.tip_status }}{% if member.cleanup_complete %}, cleaned up{% endif %}, vote {{ member.why }}{% if member.vote and member.vote.decision %} [{{ member.vote.decision }}]{% endif %}{{ "" }}
+{% endfor %}
+{% for retired in status.replaced_members %}
+- replaced: {{ retired.name }} ({{ retired.role }}, {{ retired.agent_id }}) by {{ retired.replaced_by }}
 {% endfor %}
 {{ status.note }}
 Entries (after #{{ after_seq }}{% if before_seq %}, before #{{ before_seq }}{% endif %}, {{ entry_count }} shown):

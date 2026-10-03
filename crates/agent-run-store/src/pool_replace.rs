@@ -14,7 +14,7 @@ use crate::{
 };
 use agent_run_domain::{
     catalog::ProviderCatalog,
-    domain::{now, AgentId, Status},
+    domain::{now, AgentId, OrchestratorRef, Status},
     pool::{AcceptanceCriterion, PoolDenial, PoolId},
     Error, Result,
 };
@@ -186,6 +186,43 @@ fn replayed(
 }
 
 impl Store {
+    /// The orchestrator reference a pool is actually bound to, from its stored
+    /// session row, or `None` while the pool is unbound. Replacements and
+    /// resumes inherit this, never the reference frozen at the original start.
+    pub fn pool_binding(&self, pool_id: &PoolId) -> Result<Option<OrchestratorRef>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT s.transport,s.external_session_id,s.external_turn_id FROM pools p \
+                 JOIN orchestrator_sessions s ON s.id=p.orchestrator_session_id WHERE p.id=?",
+                [pool_id.as_str()],
+                |row| {
+                    Ok(OrchestratorRef {
+                        transport: row.get(0)?,
+                        external_session_id: row.get(1)?,
+                        external_turn_id: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// The actual shared binding of the pool in which `root` holds a seat.
+    pub fn member_pool_binding(&self, root: &AgentId) -> Result<Option<OrchestratorRef>> {
+        let pool: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT pool_id FROM pool_members WHERE agent_id=?",
+                [root.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match pool {
+            Some(pool) => self.pool_binding(&pool.parse()?),
+            None => Ok(None),
+        }
+    }
+
     /// Returns an existing replacement for the same scoped key: its original
     /// result when the normalized request digest matches, `Conflict` when it
     /// does not, `None` when the key is unused.

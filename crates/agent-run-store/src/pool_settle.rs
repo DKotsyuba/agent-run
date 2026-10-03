@@ -67,12 +67,17 @@ fn notice_text(
         .map(|(id, name, role)| format!("{name} ({role}, {id})"))
         .collect::<Vec<_>>()
         .join("; ");
+    let excerpt = cut(goal, 512);
+    let goal_text = if excerpt.len() < goal.len() {
+        format!("{excerpt} [goal excerpt; the full goal is in the pool record]")
+    } else {
+        excerpt.to_owned()
+    };
     let head = format!(
         "Pool {pool_id} is complete: every current member voted ready on the same proposal, \
          finished successfully and was cleaned up. Only these formal checks were verified; \
-         whether the result is right is for the orchestrator to judge.\nGoal: {}\nMembers: \
-         {members}\nAccepted result (proposal #{proposal}, roster revision {revision}):\n",
-        cut(goal, 512)
+         whether the result is right is for the orchestrator to judge.\nGoal: {goal_text}\nMembers: \
+         {members}\nAccepted result (proposal #{proposal}, roster revision {revision}):\n"
     );
     let marker =
         format!("\n[truncated; the full result is proposal entry #{proposal} in the pool log]");
@@ -83,11 +88,37 @@ fn notice_text(
     format!("{head}{}{marker}", cut(snapshot, room))
 }
 
-/// Decides and writes the completion inside the caller's transaction.
+/// Everything a verified completion records, read from one consistent snapshot.
+struct Ready {
+    goal: String,
+    revision: u32,
+    criteria: Vec<(String, String)>,
+    proposal: u64,
+    snapshot: String,
+    members: Vec<Value>,
+    tips: Vec<Value>,
+    roster: Vec<(String, String, String)>,
+    anchor: AgentId,
+    session: Option<String>,
+}
+
+/// What one read of a pool shows.
+enum Evaluation {
+    /// No such pool.
+    Missing,
+    /// Already completed, with its recorded notice.
+    Completed(PoolCompletion),
+    /// At least one condition is missing.
+    NotReady,
+    /// Every condition holds on this snapshot.
+    Ready(Box<Ready>),
+}
+
+/// Checks every completion condition against one snapshot without writing.
 ///
-/// Returns `None` while any condition is missing: nothing is written and the
-/// pool stays open (derived draining or agreed-but-running are not states).
-fn settle_in_tx(tx: &Transaction<'_>, pool_id: &PoolId) -> Result<Option<PoolCompletion>> {
+/// Used read-only as the cheap preflight of the maintenance sweep and again,
+/// inside the immediate transaction, as the deciding read.
+fn evaluate(tx: &Connection, pool_id: &PoolId) -> Result<Evaluation> {
     let pool = pool_id.as_str();
     #[allow(clippy::type_complexity)]
     let row: Option<(String, String, u32, String, Option<String>, Option<String>)> = tx
@@ -99,21 +130,24 @@ fn settle_in_tx(tx: &Transaction<'_>, pool_id: &PoolId) -> Result<Option<PoolCom
         )
         .optional()?;
     let Some((state, goal, revision, acceptance, session, delivery)) = row else {
-        return Ok(None);
+        return Ok(Evaluation::Missing);
     };
     if state == "completed" {
-        return Ok(delivery.map(|delivery_id| PoolCompletion {
-            pool_id: pool_id.clone(),
-            delivery_id,
-            bound: session.is_some(),
-            created: false,
-        }));
+        return Ok(match delivery {
+            Some(delivery_id) => Evaluation::Completed(PoolCompletion {
+                pool_id: pool_id.clone(),
+                delivery_id,
+                bound: session.is_some(),
+                created: false,
+            }),
+            None => Evaluation::NotReady,
+        });
     }
     let Some((proposal, snapshot, proposal_revision)) = current_proposal(tx, pool)? else {
-        return Ok(None);
+        return Ok(Evaluation::NotReady);
     };
     if proposal_revision != revision {
-        return Ok(None);
+        return Ok(Evaluation::NotReady);
     }
     let criteria = criteria_of(&acceptance)?;
     let mut seats = tx.prepare(
@@ -131,7 +165,7 @@ fn settle_in_tx(tx: &Transaction<'_>, pool_id: &PoolId) -> Result<Option<PoolCom
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if seats.len() < 2 {
-        return Ok(None);
+        return Ok(Evaluation::NotReady);
     }
     let mut members = Vec::new();
     let mut tips = Vec::new();
@@ -166,7 +200,7 @@ fn settle_in_tx(tx: &Transaction<'_>, pool_id: &PoolId) -> Result<Option<PoolCom
             || !exact
             || !lineage_cleanup_complete(tx, &root)?
         {
-            return Ok(None);
+            return Ok(Evaluation::NotReady);
         }
         let vote_seq: i64 = tx.query_row(
             "SELECT seq FROM pool_entries WHERE pool_id=? AND author_agent_id=? AND proposal_seq=? \
@@ -182,6 +216,43 @@ fn settle_in_tx(tx: &Transaction<'_>, pool_id: &PoolId) -> Result<Option<PoolCom
         roster.push((seat.clone(), name.clone(), role.clone()));
     }
     let anchor: AgentId = tips[0]["tip"].as_str().unwrap_or_default().parse()?;
+    Ok(Evaluation::Ready(Box::new(Ready {
+        goal,
+        revision,
+        criteria,
+        proposal,
+        snapshot,
+        members,
+        tips,
+        roster,
+        anchor,
+        session,
+    })))
+}
+
+/// Decides and writes the completion inside the caller's transaction.
+///
+/// Returns `None` while any condition is missing: nothing is written and the
+/// pool stays open (derived draining or agreed-but-running are not states).
+fn settle_in_tx(tx: &Transaction<'_>, pool_id: &PoolId) -> Result<Option<PoolCompletion>> {
+    let pool = pool_id.as_str();
+    let ready = match evaluate(tx, pool_id)? {
+        Evaluation::Missing | Evaluation::NotReady => return Ok(None),
+        Evaluation::Completed(done) => return Ok(Some(done)),
+        Evaluation::Ready(ready) => *ready,
+    };
+    let Ready {
+        goal,
+        revision,
+        criteria,
+        proposal,
+        snapshot,
+        members,
+        tips,
+        roster,
+        anchor,
+        session,
+    } = ready;
     let notice = notice_text(
         pool,
         &goal,
@@ -240,6 +311,14 @@ impl Store {
     /// transaction. Repeats and concurrent callers record at most one event
     /// and one delivery; `None` means the pool is not (yet) complete.
     pub fn settle_pool(&mut self, pool_id: &PoolId) -> Result<Option<PoolCompletion>> {
+        // Read-only preflight: pools that are running, unproven or unvoted
+        // never take the writer lock. The deciding read repeats inside the
+        // immediate transaction, so a race can only skip, never mis-complete.
+        match evaluate(&self.conn, pool_id)? {
+            Evaluation::Missing | Evaluation::NotReady => return Ok(None),
+            Evaluation::Completed(done) => return Ok(Some(done)),
+            Evaluation::Ready(_) => {}
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -297,7 +376,8 @@ impl Store {
         drop(statement);
         let mut completed = 0;
         for id in ids {
-            if self.settle_pool(&id.parse()?)?.is_some_and(|c| c.created) {
+            let pool: PoolId = id.parse()?;
+            if self.settle_pool(&pool)?.is_some_and(|c| c.created) {
                 completed += 1;
             }
         }

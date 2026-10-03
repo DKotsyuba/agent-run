@@ -40,6 +40,19 @@ const TEMPLATES: &[(&str, &str)] = &[
     ),
     ("start", include_str!("../../../../assets/mcp/start.txt.j2")),
     (
+        "start_pool",
+        include_str!("../../../../assets/mcp/start_pool.txt.j2"),
+    ),
+    (
+        "operator_pool_post",
+        include_str!("../../../../assets/mcp/operator_pool_post.txt.j2"),
+    ),
+    (
+        "pool_replace",
+        include_str!("../../../../assets/mcp/pool_replace.txt.j2"),
+    ),
+    ("pool", include_str!("../../../../assets/mcp/pool.txt.j2")),
+    (
         "resume",
         include_str!("../../../../assets/mcp/resume.txt.j2"),
     ),
@@ -154,6 +167,58 @@ pub fn success_result(tool: &str, value: &Value) -> CallToolResult {
         result.structured_content = Some(identity);
     }
     result
+}
+
+/// Presents one operator-facing (public server) tool result.
+///
+/// The public `pool_post` shares its name with the private worker tool, so it
+/// renders through its own `operator_pool_post` template; `pool` pages get
+/// their entries pre-rendered by the one shared formatter; `start_pool` keeps
+/// the tiny structured `{"pool_id": ...}` the whole-pool binding hook reads.
+pub fn public_success_result(tool: &str, value: &Value) -> CallToolResult {
+    match tool {
+        "pool_post" => success_result("operator_pool_post", value),
+        "pool" => match pool_page(value.clone()) {
+            Ok(page) => success_result("pool", &page),
+            Err(message) => error_result("RuntimeError", &message),
+        },
+        "start_pool" => {
+            let mut result = success_result("start_pool", value);
+            result.structured_content = Some(json!({"pool_id": value["pool_id"]}));
+            result
+        }
+        _ => success_result(tool, value),
+    }
+}
+
+/// Prepares one pool page for its template: every entry rendered through the
+/// shared formatter, the shown count, and which context blocks to print.
+///
+/// The goal, criteria and proposal snapshot print only for an explicit
+/// from-the-start read (`after_seq` 0, no `before_seq`) and, for the proposal,
+/// when it is newer than the cursor, so an unchanged context is never
+/// repeated on every empty wait or incremental read.
+pub fn pool_page(mut page: Value) -> std::result::Result<Value, String> {
+    let entries = page["entries"].as_array().cloned().unwrap_or_default();
+    let mut rendered = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let view = serde_json::from_value::<agent_run_domain::pool::PoolEntryView>(entry)
+            .map_err(|_| "pool entry failed validation".to_owned())?;
+        rendered.push(
+            agent_run_domain::pool::render_entry(&view)
+                .map_err(|error| format!("pool entry presentation failed: {error}"))?,
+        );
+    }
+    let after = page["after_seq"].as_u64().unwrap_or(0);
+    let from_start = after == 0 && page["before_seq"].is_null();
+    let newer = page["status"]["current_proposal"]["seq"]
+        .as_u64()
+        .is_some_and(|seq| seq > after);
+    page["entry_count"] = json!(rendered.len());
+    page["entries"] = json!(rendered);
+    page["show_goal"] = json!(from_start);
+    page["show_proposal"] = json!(from_start || newer);
+    Ok(page)
 }
 
 /// Builds the MCP failure result as one short typed text line.
@@ -595,7 +660,8 @@ fn prose(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{error_result, success_result};
+    use super::{error_result, public_success_result, success_result};
+    use rmcp::model::CallToolResult;
     use serde_json::{json, Value};
 
     /// Compact start/resume/list output preserves labels, observed zero and
@@ -1056,6 +1122,93 @@ mod tests {
         assert_eq!(
             content[0]["text"],
             "agent-run error ValidationError: unknown arguments: ['x'] second line\n"
+        );
+    }
+
+    /// Renders one public (operator) tool success and returns its text and result.
+    fn public_text(tool: &str, value: &Value) -> (String, CallToolResult) {
+        let result = public_success_result(tool, value);
+        let content = serde_json::to_value(&result.content).unwrap();
+        let page = content[0]["text"].as_str().unwrap().to_owned();
+        assert_eq!(result.is_error, Some(false), "{tool}: {page}");
+        (page, result)
+    }
+
+    /// Every operator pool tool renders one compact page with all its facts;
+    /// `start_pool` keeps only the tiny structured pool receipt for binding,
+    /// and the operator `pool_post` never reuses the private worker page.
+    #[test]
+    fn operator_pool_tools_render_compact_pages_with_field_parity() {
+        let started = json!({
+            "pool_id": "pool-20261003-120000-0123456789", "created": true, "bound": false,
+            "roster_revision": 1, "members": [
+                {"agent_id":"ag-a","name":"Ada","role":"reviewer","status":"starting"},
+                {"agent_id":"ag-b","name":"Bob","role":"tester","status":"starting"}]
+        });
+        let (page, result) = public_text("start_pool", &started);
+        for fact in [
+            "pool-20261003-120000-0123456789",
+            "created",
+            "r1",
+            "not bound",
+            "Ada (reviewer, ag-a): starting",
+            "Bob (tester, ag-b)",
+        ] {
+            assert!(page.contains(fact), "{fact}: {page}");
+        }
+        assert_eq!(
+            result.structured_content,
+            Some(json!({"pool_id": "pool-20261003-120000-0123456789"}))
+        );
+        assert!(page.len() < 900, "compact: {}", page.len());
+        let (post, _) = public_text("pool_post", &json!({"pool_id":"p","seq":4,"created":true}));
+        assert!(
+            post.contains("#4") && post.contains("orchestrator") && !post.contains("pool_read")
+        );
+        let (replaced, _) = public_text(
+            "pool_replace",
+            &json!({"pool_id":"p","created":true,"roster_revision":2,
+                    "replaced":{"agent_id":"ag-a","name":"Ada","role":"reviewer"},
+                    "member":{"agent_id":"ag-n","name":"Ada","role":"reviewer","status":"starting"}}),
+        );
+        for fact in ["r2", "ag-a", "ag-n", "starting"] {
+            assert!(replaced.contains(fact), "{fact}: {replaced}");
+        }
+    }
+
+    /// The goal and the proposal snapshot print only on a from-the-start read
+    /// or when the proposal is newer than the cursor; an incremental or empty
+    /// read never repeats them, and entries use the one shared formatter.
+    #[test]
+    fn pool_pages_print_unchanged_context_only_when_needed() {
+        let status = json!({"state":"open","roster_revision":1,"goal":"UNIQUE-GOAL-TEXT",
+            "criteria":[{"id":"goal","text":"met"}],
+            "current_proposal":{"seq":3,"snapshot":"UNIQUE-SNAPSHOT","roster_revision":1},
+            "members":[{"name":"Ada","role":"r","agent_id":"ag-a","tip_status":"running",
+                        "cleanup_complete":false,"vote":null,"why":"missing"}],
+            "replaced_members":[], "agreed":false, "note":"n"});
+        let entry = json!({"seq":4,"roster_revision":1,"author_kind":"operator","direction":"team",
+                           "kind":"message","body":"hello"});
+        let page = |after: u64, entries: Vec<Value>| {
+            json!({
+            "pool_id":"p","entries":entries,"after_seq":after,"before_seq":null,"limit":50,
+            "next_cursor":null,"last_seq":null,"complete":true,"status":status.clone()})
+        };
+        let (full, _) = public_text("pool", &page(0, vec![entry.clone()]));
+        assert!(
+            full.contains("UNIQUE-GOAL-TEXT") && full.contains("UNIQUE-SNAPSHOT"),
+            "{full}"
+        );
+        assert!(full.contains("from orchestrator to team") && full.contains("hello"));
+        let (empty_wait, _) = public_text("pool", &page(4, vec![]));
+        assert!(
+            !empty_wait.contains("UNIQUE-GOAL-TEXT") && !empty_wait.contains("UNIQUE-SNAPSHOT"),
+            "{empty_wait}"
+        );
+        assert!(empty_wait.contains("Current proposal #3 unchanged"));
+        let (new_proposal, _) = public_text("pool", &page(2, vec![]));
+        assert!(
+            new_proposal.contains("UNIQUE-SNAPSHOT") && !new_proposal.contains("UNIQUE-GOAL-TEXT")
         );
     }
 }

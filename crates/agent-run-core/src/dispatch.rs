@@ -174,6 +174,31 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
             let a: Transcript = args(raw)?;
             service.transcript_with_options(&a.agent_id, a.run_id.as_ref(), &a.page)
         }
+        "start_pool" => {
+            service
+                .start_pool(args::<agent_run_domain::pool::PoolStartRequest>(raw)?)
+                .await
+        }
+        "pool_post" => {
+            let request: agent_run_domain::pool::PoolPost = args(raw)?;
+            let service = service.clone();
+            tokio::task::spawn_blocking(move || service.pool_post(request))
+                .await
+                .map_err(|_| crate::Error::Runtime("pool post failed".into()))??
+                .map_err(agent_run_domain::pool::PoolDenial::into_error)
+        }
+        "pool_replace" => service
+            .replace_pool_member(args::<agent_run_domain::pool::PoolReplace>(raw)?)
+            .await?
+            .map_err(agent_run_domain::pool::PoolDenial::into_error),
+        "pool" => {
+            let query: agent_run_domain::pool::PoolQuery = args(raw)?;
+            let service = service.clone();
+            tokio::task::spawn_blocking(move || service.pool_status(query))
+                .await
+                .map_err(|_| crate::Error::Runtime("pool read failed".into()))??
+                .map_err(agent_run_domain::pool::PoolDenial::into_error)
+        }
         "list_agents" => service.list_public(args::<Query>(raw)?).await,
         "doc" => {
             let a: Doc = args(raw)?;

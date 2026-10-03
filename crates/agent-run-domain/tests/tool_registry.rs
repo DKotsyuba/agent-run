@@ -3,6 +3,16 @@
 use agent_run_domain::{registry, tool, tools_json, ArgumentDefault};
 use serde_json::Value;
 
+/// Tools added after the frozen Python table: the guide read and the four
+/// cooperative-pool operator tools, pinned by their own tests.
+const ADDITIVE: [&str; 5] = [
+    "delegation_guide",
+    "start_pool",
+    "pool_post",
+    "pool_replace",
+    "pool",
+];
+
 /// Parses the captured Python discovery payload shared by all registry assertions.
 fn golden() -> Vec<Value> {
     serde_json::from_str(include_str!("../../../tests/fixtures/baseline/tools.json"))
@@ -20,14 +30,14 @@ fn registry_matches_python_golden_field_by_field() {
     let expected = golden();
     let actual: Vec<Value> = tools_json()
         .into_iter()
-        .filter(|tool| tool["name"] != "delegation_guide")
+        .filter(|tool| !ADDITIVE.contains(&tool["name"].as_str().unwrap_or_default()))
         .collect();
-    assert_eq!(tools_json().len(), 12);
+    assert_eq!(tools_json().len(), 16);
     assert_eq!(actual.len(), expected.len());
 
     for (definition, (actual, mut expected)) in registry()
         .iter()
-        .filter(|definition| definition.name != "delegation_guide")
+        .filter(|definition| !ADDITIVE.contains(&definition.name.as_str()))
         .zip(actual.iter().zip(expected))
     {
         assert_eq!(actual["name"], expected["name"]);
@@ -226,4 +236,54 @@ fn rename_runtime_to_provider(tool: &mut Value) {
             *name = Value::from("provider");
         }
     }
+}
+
+/// The cooperative-pool tools are strict objects sharing the one registry,
+/// each declaring its required inputs and a typed error set; none of them
+/// accepts an author, a pool owner on the worker side, or a caller-supplied
+/// runtime alias.
+#[test]
+fn pool_tools_are_strict_registry_entries() {
+    for (name, required) in [
+        ("start_pool", &["request_id", "goal", "members"][..]),
+        ("pool_post", &["pool_id", "request_id", "message"][..]),
+        ("pool_replace", &["pool_id", "agent_id", "request_id"][..]),
+        ("pool", &["pool_id"][..]),
+    ] {
+        let definition = tool(name).unwrap_or_else(|| panic!("{name} registered"));
+        assert_eq!(
+            definition.input_schema["additionalProperties"], false,
+            "{name}"
+        );
+        let mut required = required.to_vec();
+        required.sort_unstable();
+        let mut declared: Vec<_> = definition
+            .arguments()
+            .into_iter()
+            .filter(|a| a.required)
+            .map(|a| a.name)
+            .collect();
+        declared.sort_unstable();
+        assert_eq!(declared, required, "{name}");
+        assert!(!definition.error_classes().is_empty());
+        let properties = definition.input_schema["properties"].as_object().unwrap();
+        for forbidden in [
+            "author",
+            "author_kind",
+            "runtime",
+            "run_id",
+            "attempt_id",
+            "token",
+        ] {
+            assert!(
+                !properties.contains_key(forbidden),
+                "{name} must not accept {forbidden}"
+            );
+        }
+    }
+    let members = &tool("start_pool").unwrap().input_schema["properties"]["members"];
+    assert_eq!(
+        (members["minItems"].as_i64(), members["maxItems"].as_i64()),
+        (Some(2), Some(5))
+    );
 }

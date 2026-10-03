@@ -855,7 +855,7 @@ impl Service {
                 original
             });
             start.request_id = None;
-            start.orchestrator = frozen.provider_request.orchestrator.clone();
+            start.orchestrator = store.pool_binding(&request.pool_id)?;
             let name = start
                 .display_name
                 .clone()
@@ -1344,6 +1344,12 @@ impl Service {
         request.timeout_seconds = timeout.or(frozen.provider_request.timeout_seconds);
         if orchestrator.is_some() {
             request.orchestrator = orchestrator;
+        } else if let Some(shared) =
+            Store::open(&self.home)?.member_pool_binding(&parent.root_agent_id)?
+        {
+            // A pool member's new execution joins the pool's actual shared
+            // binding, which may have been established after the first start.
+            request.orchestrator = Some(shared);
         }
         request.validate()?;
         // Replay of the original resume intent precedes every mutable read.
