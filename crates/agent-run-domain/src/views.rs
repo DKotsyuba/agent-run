@@ -71,6 +71,9 @@ pub struct AgentView {
     pub mcp: Vec<McpSelectionView>,
     /// Stable logical agent id, unchanged across resumes.
     pub agent_id: AgentId,
+    /// Optional human display label stored at admission; `null` when unnamed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Legacy execution identity, absent from current public projections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<AgentId>,
@@ -140,6 +143,99 @@ pub struct AgentView {
     /// Working directory the run was admitted with, when recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
+    /// Latest observed native usage of this execution, or `null` before any
+    /// statistics row exists (for example while the run is still executing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageView>,
+    /// Aggregate native usage across the lineage's executions; each metric
+    /// is `null` while any contributing execution has no recorded statistics
+    /// row or did not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_cumulative: Option<UsageCumulativeView>,
+    /// Latest-execution native invocation counts; historical coverage is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_counts: Option<ToolCountsView>,
+}
+
+/// Observed native tool invocations of the latest execution only.
+/// Historical or incomplete encoder coverage leaves all counts unknown.
+/// IDs deduplicate started/completed/fragments within their native attempt.
+/// Failures remain null while any result is absent, unreported or contradictory.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolCountsView {
+    /// Unique native invocations, or null when IDs/coverage are incomplete.
+    pub calls: Option<u64>,
+    /// Explicitly failed invocations; null while any result is unknown.
+    pub failed: Option<u64>,
+    /// Invocations without a consistent explicit result, when coverage is known.
+    pub unknown_results: Option<u64>,
+}
+
+/// Latest observed native usage of one execution, straight from `run_stats`.
+///
+/// Every numeric field is the harness-reported measurement or `null` when the
+/// source did not report it; `usage_source` names the protocol that supplied
+/// the row and is `"none"` when no native measurement exists. Only these
+/// allowlisted fields are public: internal execution identifiers never appear.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageView {
+    /// Prompt/input token count, when reported.
+    pub input_tokens: Option<i64>,
+    /// Generated/output token count, when reported.
+    pub output_tokens: Option<i64>,
+    /// Read-from-cache token count, when reported.
+    pub cache_read_tokens: Option<i64>,
+    /// Written-to-cache token count, when reported.
+    pub cache_write_tokens: Option<i64>,
+    /// Reasoning/thinking token count, when reported.
+    pub reasoning_tokens: Option<i64>,
+    /// Runtime-reported total token count, when reported.
+    pub total_tokens: Option<i64>,
+    /// Runtime-reported model turn count, when reported.
+    pub num_turns: Option<i64>,
+    /// First-token latency in milliseconds, when reported.
+    pub ttft_ms: Option<f64>,
+    /// API duration in milliseconds, when reported.
+    pub api_duration_ms: Option<f64>,
+    /// Runtime-reported USD cost, when reported.
+    pub cost_usd: Option<f64>,
+    /// Protocol that supplied the row: `runtime_result`, `token_usage_updated`
+    /// or `none`.
+    pub usage_source: String,
+    /// UTC epoch seconds when the row was last recomputed.
+    pub recorded_at: f64,
+}
+
+/// Aggregate usage across every execution of one logical agent lineage.
+///
+/// A metric is present only when the complete one-based lineage remains and
+/// every execution has a recorded measurement. Missing or pruned history and
+/// unreported metrics stay `null` instead of becoming partial totals.
+/// `executions` counts retained lineage rows; an absent lineage has zero rows
+/// and null totals. No internal execution identifiers are included.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageCumulativeView {
+    /// Summed prompt/input tokens, when complete.
+    pub input_tokens: Option<i64>,
+    /// Summed generated/output tokens, when complete.
+    pub output_tokens: Option<i64>,
+    /// Summed read-from-cache tokens, when complete.
+    pub cache_read_tokens: Option<i64>,
+    /// Summed written-to-cache tokens, when complete.
+    pub cache_write_tokens: Option<i64>,
+    /// Summed reasoning tokens, when complete.
+    pub reasoning_tokens: Option<i64>,
+    /// Summed runtime-reported totals, when complete.
+    pub total_tokens: Option<i64>,
+    /// Summed model turn counts, when complete.
+    pub num_turns: Option<i64>,
+    /// Summed runtime-reported USD cost, when complete.
+    pub cost_usd: Option<f64>,
+    /// Number of lineage executions the aggregate considered.
+    pub executions: u64,
 }
 
 /// The durable start result, including the immediately committed agent snapshot.
@@ -182,7 +278,7 @@ pub struct CommandView {
 }
 
 /// One transcript message with raw content references left opaque.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessageView {
     /// Per-agent transcript sequence cursor.
@@ -197,6 +293,33 @@ pub struct MessageView {
     pub content: String,
     /// Opaque raw-stream reference, never auto-expanded.
     pub raw_ref: Option<String>,
+    /// Native tool-result failure flag; absent/null means unreported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<bool>,
+    /// Allowlisted native field supplying error; absent for unknown evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_source: Option<String>,
+    /// First included sequence in a block; absent for raw rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_seq: Option<i64>,
+    /// Last included sequence in a block; seq is this same forward cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seq: Option<i64>,
+    /// Whether a prior fragment of this block lies outside this page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_before: Option<bool>,
+    /// Whether a later fragment of this block lies outside this page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_after: Option<bool>,
+    /// Whether original content is fully inline; historical coverage is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_complete: Option<bool>,
+    /// UTF-8 bytes explicitly omitted from an oversized legacy inline row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted_bytes: Option<usize>,
+    /// Safe boundary flag, separating executions/attempts without exposing IDs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starts_block: Option<bool>,
 }
 
 /// Cursor page of transcript messages; `complete` does not imply a terminal agent.
@@ -216,8 +339,23 @@ pub struct TranscriptPage {
     pub limit: usize,
     /// Next cursor, or `null` when this page is complete.
     pub next_cursor: Option<i64>,
-    /// Whether no further transcript rows follow this page.
+    /// No further rows in the indicated direction; never implies terminal state.
     pub complete: bool,
+    /// Blocks when grouping was requested; absent for compatible raw pages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<crate::transcript::TranscriptView>,
+    /// Forward or backward paging; absent means historical forward semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    /// Exclusive upper sequence used by a reverse block request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_cursor: Option<i64>,
+    /// Exclusive upper sequence to request older blocks; absent at the beginning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_cursor: Option<i64>,
+    /// Last included sequence for a subsequent forward read, even on a complete page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_cursor: Option<i64>,
 }
 
 /// Verified answer metadata and optional bounded inline text.
@@ -271,6 +409,12 @@ pub struct AgentPage {
     pub complete: bool,
     /// Committed store revision observed for the page.
     pub revision: i64,
+    /// Committed transcript watermark observed for the page; zero for
+    /// historical pages that predate the field. Journal progress does not
+    /// advance `revision`, so followers pass it back as
+    /// `after_message_revision` to also wake on transcript changes.
+    #[serde(default)]
+    pub message_revision: i64,
     /// UTC epoch seconds when the page was built.
     pub observed_at: f64,
 }

@@ -800,3 +800,109 @@ fn context_warning_and_silence_use_events_and_latest_message_time() {
         recovered.text
     );
 }
+
+/// A structured `start_pool` receipt binds the whole pool and every current
+/// member tip atomically and activates the pool's waiting common notice once;
+/// a conflicting member binding changes nothing; other pool replies and a lone
+/// member binding never bind the pool.
+#[test]
+fn start_pool_receipt_binds_the_whole_pool_atomically() {
+    let home = common::Home::new();
+    let config = agent_run_config::config::Config::load(&home.path).unwrap();
+    let mut request = home.request();
+    request.workdir = home.path.clone();
+    request.validate().unwrap();
+    let mut store = agent_run_core::state::Store::open(&home.path).unwrap();
+    let members: Vec<AgentId> = (0..2)
+        .map(|_| store.admit(&request, &config, &json!({}), None).unwrap().0)
+        .collect();
+    let pool = "pool-20260101-000000-0123456789";
+    store
+        .conn
+        .execute(
+            "INSERT INTO pools(id,request_namespace,request_id,request_sha256,goal,acceptance_json,state,roster_revision,created_at) VALUES(?,'ns','r',lower(hex(zeroblob(32))),'goal','[]','open',1,1.0)",
+            [pool],
+        )
+        .unwrap();
+    for (slot, id) in members.iter().enumerate() {
+        store
+            .conn
+            .execute(
+                "INSERT INTO pool_members(agent_id,pool_id,slot,name,role,personal_task,joined_roster_revision) VALUES(?,?,?,?,'r','t',1)",
+                rusqlite::params![id.as_str(), pool, slot + 1, format!("m{slot}")],
+            )
+            .unwrap();
+    }
+    let receipt = |tool_response: serde_json::Value| json!({"hook_event_name":"PostToolUse","session_id":"chat-1","tool_response":tool_response});
+    // Replies of the other pool tools, and a roster-less object, never bind.
+    for response in [
+        json!({"pool_id": pool, "created": true, "state": "open"}),
+        json!({"content":[{"type":"text","text":"agent-run pool"}]}),
+    ] {
+        assert!(bind::normalize(&receipt(response), true, "claude_uds")
+            .map(|p| p.pool_id)
+            .unwrap_or(None)
+            .is_none());
+    }
+    // A conflicting binding of one member makes the pool binding fail whole.
+    let other = OrchestratorRef {
+        transport: "claude_uds".into(),
+        external_session_id: "someone-else".into(),
+        external_turn_id: None,
+    };
+    store.bind_orchestrator(&members[1], &other, 1.0).unwrap();
+    let structured = json!({"structuredContent": {"pool_id": pool}});
+    assert!(bind::run_hook_bound(
+        &mut store,
+        &receipt(structured.clone()),
+        "claude_uds",
+        Some(2.0)
+    )
+    .is_err());
+    let bound: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM pools WHERE orchestrator_session_id IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(bound, 0, "a failed whole-pool binding changes nothing");
+    let first_bound: Option<String> = store
+        .conn
+        .query_row(
+            "SELECT orchestrator_session_id FROM agents WHERE id=?",
+            [members[0].as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(first_bound.is_none());
+    // Without the conflict the structured receipt binds everything.
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET orchestrator_session_id=NULL WHERE id=?",
+            [members[1].as_str()],
+        )
+        .unwrap();
+    let done =
+        bind::run_hook_bound(&mut store, &receipt(structured), "claude_uds", Some(3.0)).unwrap();
+    assert!(matches!(&done, bind::HookBound::Pool(p) if p.pool_id == pool));
+    assert!(done.message().contains("all its members are bound"));
+    let sessions: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(DISTINCT orchestrator_session_id) FROM agents WHERE orchestrator_session_id IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(sessions, 1);
+    // The raw normalized form accepts exactly one of pool_id or agent_id.
+    assert!(bind::normalize(
+        &json!({"transport":"claude_uds","external_session_id":"s","pool_id":pool,"agent_id":members[0]}),
+        true,
+        "claude_uds"
+    )
+    .is_err());
+}

@@ -3,6 +3,16 @@
 use agent_run_domain::{registry, tool, tools_json, ArgumentDefault};
 use serde_json::Value;
 
+/// Tools added after the frozen Python table: the guide read and the four
+/// cooperative-pool operator tools, pinned by their own tests.
+const ADDITIVE: [&str; 5] = [
+    "delegation_guide",
+    "start_pool",
+    "pool_post",
+    "pool_replace",
+    "pool",
+];
+
 /// Parses the captured Python discovery payload shared by all registry assertions.
 fn golden() -> Vec<Value> {
     serde_json::from_str(include_str!("../../../tests/fixtures/baseline/tools.json"))
@@ -20,14 +30,14 @@ fn registry_matches_python_golden_field_by_field() {
     let expected = golden();
     let actual: Vec<Value> = tools_json()
         .into_iter()
-        .filter(|tool| tool["name"] != "delegation_guide")
+        .filter(|tool| !ADDITIVE.contains(&tool["name"].as_str().unwrap_or_default()))
         .collect();
-    assert_eq!(tools_json().len(), 12);
+    assert_eq!(tools_json().len(), 16);
     assert_eq!(actual.len(), expected.len());
 
     for (definition, (actual, mut expected)) in registry()
         .iter()
-        .filter(|definition| definition.name != "delegation_guide")
+        .filter(|definition| !ADDITIVE.contains(&definition.name.as_str()))
         .zip(actual.iter().zip(expected))
     {
         assert_eq!(actual["name"], expected["name"]);
@@ -58,12 +68,42 @@ fn registry_matches_python_golden_field_by_field() {
                     serde_json::json!({"type": ["string", "null"]});
             }
         }
-        // Schema-2 cutover: public start names a configured provider instead of
-        // a legacy runtime; nothing else in its input schema changes.
+        // Schema-2 cutover changes the runtime selector to provider; the
+        // optional human-label input is the exact additive delta below.
         if definition.name == "start" {
             rename_runtime_to_provider(&mut expected);
         }
         extend_stable_identity(&mut expected);
+        if matches!(definition.name.as_str(), "start" | "resume") {
+            let description = if definition.name == "start" {
+                "Optional human display label for the agent, shown in list views and inherited by resumes that omit it. At most 64 Unicode characters, no control or bidi formatting; null or omission means unnamed."
+            } else {
+                "Optional replacement display label; omission inherits the previous run's label. Same 64-character control-free bound as start."
+            };
+            expected["inputSchema"]["properties"]["display_name"] =
+                serde_json::json!({"description":description,"type":["string","null"]});
+        }
+        if definition.name == "list_agents" {
+            // The follow watermark is the exact additive delta over the frozen
+            // baseline: one optional transcript-revision cursor.
+            expected["inputSchema"]["properties"]["after_message_revision"] = serde_json::json!({
+                "description": "Optional transcript watermark from a prior page's message_revision; journal-only progress (transcript rows, native tool counts) wakes the wait without advancing the event revision. Omission keeps the historical event-only wake.",
+                "type": ["integer", "null"]
+            });
+        }
+        if definition.name == "transcript" {
+            // The block-view options are the exact additive delta over the
+            // frozen baseline: two bounded reverse selectors and one enum.
+            expected["inputSchema"]["properties"]["view"] = serde_json::json!({
+                "type":"string","enum":["raw","blocks"],"default":"raw"
+            });
+            expected["inputSchema"]["properties"]["tail_blocks"] = serde_json::json!({
+                "type":["integer","null"],"minimum":1,"maximum":200
+            });
+            expected["inputSchema"]["properties"]["before_cursor"] = serde_json::json!({
+                "type":["integer","null"],"minimum":1
+            });
+        }
         if definition.name != "start" {
             assert_eq!(actual["description"], expected["description"]);
         }
@@ -109,7 +149,7 @@ fn extend_stable_identity(value: &mut Value) {
         "resume" => value["description"] = "Continue the latest terminal execution of a stable agent in the same native context. agent_id stays constant. Concurrent continuations cannot create parallel active runs. Reuse request_id for an identical retry, including after later resumes. Identity, permissions, native-history and cleanup checks remain mandatory.".into(),
         "list_agents" => value["description"] = "List a bounded page of logical agents with an exact total. Each agent appears once with its stable agent_id and latest execution state; filters and pagination apply to these latest views.".into(),
         "answer" => value["description"] = "Read the latest execution’s verified bounded answer using the stable agent_id. Use transcript for retained earlier conversation history.".into(),
-        "transcript" => value["description"] = "Read a bounded cursor page of retained conversation history across all resumes of the stable agent_id. Continue with the same agent_id and next_cursor; raw_ref stays an opaque reference.".into(),
+        "transcript" => value["description"] = "Read a bounded cursor page of retained conversation history across all resumes of the stable agent_id. Raw rows remain the default; view=blocks groups only consecutive known native identities. tail_blocks returns the last 1..200 blocks; use previous_cursor as before_cursor for older pages, or next_cursor as cursor for forward pages. Partial blocks and omitted inline content are explicit; raw_ref stays opaque.".into(),
         _ => {}
     }
 }
@@ -196,4 +236,54 @@ fn rename_runtime_to_provider(tool: &mut Value) {
             *name = Value::from("provider");
         }
     }
+}
+
+/// The cooperative-pool tools are strict objects sharing the one registry,
+/// each declaring its required inputs and a typed error set; none of them
+/// accepts an author, a pool owner on the worker side, or a caller-supplied
+/// runtime alias.
+#[test]
+fn pool_tools_are_strict_registry_entries() {
+    for (name, required) in [
+        ("start_pool", &["request_id", "goal", "members"][..]),
+        ("pool_post", &["pool_id", "request_id", "message"][..]),
+        ("pool_replace", &["pool_id", "agent_id", "request_id"][..]),
+        ("pool", &["pool_id"][..]),
+    ] {
+        let definition = tool(name).unwrap_or_else(|| panic!("{name} registered"));
+        assert_eq!(
+            definition.input_schema["additionalProperties"], false,
+            "{name}"
+        );
+        let mut required = required.to_vec();
+        required.sort_unstable();
+        let mut declared: Vec<_> = definition
+            .arguments()
+            .into_iter()
+            .filter(|a| a.required)
+            .map(|a| a.name)
+            .collect();
+        declared.sort_unstable();
+        assert_eq!(declared, required, "{name}");
+        assert!(!definition.error_classes().is_empty());
+        let properties = definition.input_schema["properties"].as_object().unwrap();
+        for forbidden in [
+            "author",
+            "author_kind",
+            "runtime",
+            "run_id",
+            "attempt_id",
+            "token",
+        ] {
+            assert!(
+                !properties.contains_key(forbidden),
+                "{name} must not accept {forbidden}"
+            );
+        }
+    }
+    let members = &tool("start_pool").unwrap().input_schema["properties"]["members"];
+    assert_eq!(
+        (members["minItems"].as_i64(), members["maxItems"].as_i64()),
+        (Some(2), Some(5))
+    );
 }

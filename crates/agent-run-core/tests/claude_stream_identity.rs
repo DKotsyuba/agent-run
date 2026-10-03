@@ -213,3 +213,68 @@ async fn tool_boundary_keeps_order_and_message_identity() {
         ]
     );
 }
+
+/// Streamed tool_use starts journal one call per native id, and tool results
+/// carry the native failure flag with its allowlisted provenance; the
+/// unresulted second call keeps its result unknown without inventing one.
+#[tokio::test]
+async fn tool_results_carry_native_error_evidence() {
+    let home = common::Home::new();
+    let (id, _) = home
+        .store()
+        .admit(&home.request(), &home.config, &json!({}), None)
+        .unwrap();
+    let mut store = home.store();
+    let record = store.get(&id).unwrap();
+    let lines = [
+        stream_event(
+            json!({"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_1","name":"shell"}}),
+        ),
+        json!({"type":"assistant","message":{"id":"msg_one","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"shell","input":{"cmd":"ls"}}]}}),
+        json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":"boom"}]}}),
+        stream_event(
+            json!({"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_2","name":"web"}}),
+        ),
+        json!({"type":"result","subtype":"success","is_error":false,"result":"done","usage":{}}),
+    ];
+    let mut process = Process::spawn(&fake_engine(&home.path, &lines)).expect("fake engine");
+    let result = stream::run(&mut process, &mut store, &record, None)
+        .await
+        .expect("stream completes");
+    assert_eq!(result.outcome.status, Status::Succeeded);
+    let page = store.transcript(&id, 0, 1000).unwrap();
+    let messages = page["messages"].as_array().unwrap();
+    let results: Vec<&Value> = messages
+        .iter()
+        .filter(|message| message["role"] == "tool_result")
+        .collect();
+    assert_eq!(results.len(), 1, "{messages:?}");
+    assert_eq!(results[0]["raw_ref"], "toolu_1");
+    assert_eq!(results[0]["name"], "shell");
+    assert_eq!(results[0]["error"], true);
+    assert_eq!(results[0]["error_source"], "claude.is_error");
+    // One call block groups the start row and the input row under one id.
+    let blocks = store
+        .transcript_query(
+            &id,
+            &agent_run_domain::transcript::TranscriptQuery {
+                view: agent_run_domain::transcript::TranscriptView::Blocks,
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+    let block_messages = blocks["messages"].as_array().unwrap();
+    let call_block = block_messages
+        .iter()
+        .find(|message| message["raw_ref"] == "toolu_1" && message["role"] == "tool_call")
+        .expect("call block");
+    assert_eq!(
+        call_block["content"], "{\"cmd\":\"ls\"}",
+        "start and input rows join one block: {call_block:?}"
+    );
+    let counts = store.tool_counts(&id).unwrap();
+    assert_eq!(counts.calls, Some(2));
+    assert_eq!(counts.failed, None, "the unresulted call keeps failed null");
+    assert_eq!(counts.unknown_results, Some(1));
+}

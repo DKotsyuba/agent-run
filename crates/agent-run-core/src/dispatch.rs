@@ -9,6 +9,7 @@ use crate::{
 pub use agent_run_domain::tools::{is_tool, tool, tools_json};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::time::Duration;
 /// Returns the one domain-owned, Python-compatible public discovery table.
 pub fn tools() -> Vec<Value> {
     tools_json()
@@ -51,16 +52,9 @@ struct Transcript {
     /// Optional historical execution, otherwise the latest run.
     #[serde(default)]
     run_id: Option<AgentId>,
-    #[serde(default)]
-    /// Exclusive journal cursor, zero for the first page.
-    cursor: i64,
-    #[serde(default = "transcript_limit")]
-    /// Bounded maximum number of returned messages.
-    limit: usize,
-}
-/// Default bounded MCP transcript page size.
-fn transcript_limit() -> usize {
-    200
+    /// Shared representation, bounds and exclusive cursor options.
+    #[serde(flatten)]
+    page: agent_run_domain::transcript::TranscriptQuery,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -79,6 +73,9 @@ struct Resume {
     #[serde(default)]
     /// Idempotency key in the caller's namespace, reused for transport retries.
     request_id: Option<String>,
+    #[serde(default)]
+    /// Optional replacement display label; omission inherits the parent's.
+    display_name: Option<String>,
     #[serde(default)]
     /// Optional delivery destination override; omission inherits the parent.
     orchestrator: Option<OrchestratorRef>,
@@ -130,6 +127,12 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
             .await
             .map_err(|_| crate::Error::Runtime("worker notification failed".into()))?
         }
+        agent_run_domain::worker::TOOL_METHOD => {
+            let call: agent_run_domain::worker::WorkerToolCall = args(raw)?;
+            let tool = agent_run_domain::worker::WorkerTool::parse(&call.tool)
+                .ok_or_else(|| invalid("unknown worker tool"))?;
+            worker_tool_call(service, call, tool).await
+        }
         // Public initial start is provider + explicit model only; a legacy
         // `runtime` payload is an unknown field (ValidationError).
         "start" => {
@@ -147,6 +150,7 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
                     a.task,
                     a.timeout_seconds,
                     a.request_id,
+                    a.display_name,
                     a.orchestrator,
                 )
                 .await
@@ -168,11 +172,32 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
         }
         "transcript" => {
             let a: Transcript = args(raw)?;
-            if a.run_id.is_none() {
-                return service.transcript_public(&a.agent_id, a.cursor, a.limit);
-            }
-            let row = service.resolve_run(&a.agent_id, a.run_id.as_ref())?;
-            agent_identity::result(&row, service.transcript(&row.id, a.cursor, a.limit)?)
+            service.transcript_with_options(&a.agent_id, a.run_id.as_ref(), &a.page)
+        }
+        "start_pool" => {
+            service
+                .start_pool(args::<agent_run_domain::pool::PoolStartRequest>(raw)?)
+                .await
+        }
+        "pool_post" => {
+            let request: agent_run_domain::pool::PoolPost = args(raw)?;
+            let service = service.clone();
+            tokio::task::spawn_blocking(move || service.pool_post(request))
+                .await
+                .map_err(|_| crate::Error::Runtime("pool post failed".into()))??
+                .map_err(agent_run_domain::pool::PoolDenial::into_error)
+        }
+        "pool_replace" => service
+            .replace_pool_member(args::<agent_run_domain::pool::PoolReplace>(raw)?)
+            .await?
+            .map_err(agent_run_domain::pool::PoolDenial::into_error),
+        "pool" => {
+            let query: agent_run_domain::pool::PoolQuery = args(raw)?;
+            let service = service.clone();
+            tokio::task::spawn_blocking(move || service.pool_status(query))
+                .await
+                .map_err(|_| crate::Error::Runtime("pool read failed".into()))??
+                .map_err(agent_run_domain::pool::PoolDenial::into_error)
         }
         "list_agents" => service.list_public(args::<Query>(raw)?).await,
         "doc" => {
@@ -233,4 +258,157 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
 /// Returns one packaged operator-guide topic using the transport-neutral registry.
 pub fn doc(topic: &str) -> Result<&'static str> {
     crate::doc::topic_text(topic)
+}
+
+/// Maximum seconds one private `pool_read` may hold for a new entry, kept
+/// below the broker socket's per-request deadline so the wait never outlives
+/// its transport.
+const POOL_READ_WAIT_SECONDS: f64 = 25.0;
+
+/// Routes one authenticated private worker tool through the shared broker.
+///
+/// Every tool authenticates the hidden capability server-side; pool denials
+/// are returned in-band as one typed `{error: {code, message}}` object so the
+/// worker transport can render a typed refusal instead of guessing from
+/// prose. The read wait is bounded, holds no database lock across awaits,
+/// and ends as soon as the attempt stops being usable.
+async fn worker_tool_call(
+    service: &Service,
+    call: agent_run_domain::worker::WorkerToolCall,
+    tool: agent_run_domain::worker::WorkerTool,
+) -> Result<Value> {
+    use agent_run_domain::pool::{PoolDenial, PoolMessage, PoolPropose, PoolReadRequest, PoolVote};
+    use agent_run_domain::worker::WorkerTool;
+    let denial = |denial: PoolDenial| {
+        Ok(json!({"error": {"code": denial.code(), "message": denial.message()}}))
+    };
+    match tool {
+        WorkerTool::Notify => {
+            let input: agent_run_domain::worker::NotifyRequest = serde_json::from_value(call.input)
+                .map_err(|_| invalid("unknown, missing, or incorrectly typed report argument"))?;
+            let home = service.home.clone();
+            let (run_id, attempt_id, token) = (
+                call.run_id.clone(),
+                call.attempt_id.clone(),
+                call.token.clone(),
+            );
+            let receipt = tokio::task::spawn_blocking(move || {
+                crate::state::Store::open(&home)?.notify_orchestrator(
+                    &run_id,
+                    &attempt_id,
+                    &token,
+                    &input,
+                    crate::domain::now(),
+                )
+            })
+            .await
+            .map_err(|_| crate::Error::Runtime("worker notification failed".into()))??;
+            Ok(serde_json::to_value(receipt)?)
+        }
+        WorkerTool::PoolPost | WorkerTool::PoolPropose | WorkerTool::PoolVote => {
+            let write = match tool {
+                WorkerTool::PoolPost => agent_run_store::pool_log::PoolWrite::Message(
+                    serde_json::from_value::<PoolMessage>(call.input)
+                        .map_err(|_| invalid("invalid pool_post arguments"))?,
+                ),
+                WorkerTool::PoolPropose => agent_run_store::pool_log::PoolWrite::Proposal(
+                    serde_json::from_value::<PoolPropose>(call.input)
+                        .map_err(|_| invalid("invalid pool_propose arguments"))?,
+                ),
+                _ => agent_run_store::pool_log::PoolWrite::Vote(
+                    serde_json::from_value::<PoolVote>(call.input)
+                        .map_err(|_| invalid("invalid pool_vote arguments"))?,
+                ),
+            };
+            let home = service.home.clone();
+            let (run_id, attempt_id, token) = (
+                call.run_id.clone(),
+                call.attempt_id.clone(),
+                call.token.clone(),
+            );
+            let outcome = tokio::task::spawn_blocking(move || {
+                crate::state::Store::open(&home)?.pool_write(&run_id, &attempt_id, &token, write)
+            })
+            .await
+            .map_err(|_| crate::Error::Runtime("worker pool write failed".into()))??;
+            match outcome {
+                Ok(receipt) => Ok(json!({
+                    "pool_id": receipt.pool_id,
+                    "seq": receipt.seq,
+                    "duplicate": receipt.duplicate,
+                    "recorded": true,
+                    "note": "recorded durably and readable through pool_read; not pushed or read by anyone",
+                })),
+                Err(reason) => denial(reason),
+            }
+        }
+        WorkerTool::PoolRead => {
+            let request: PoolReadRequest = serde_json::from_value(call.input)
+                .map_err(|_| invalid("invalid pool_read arguments"))?;
+            request.validate()?;
+            let after_seq = request.after_seq.unwrap_or(0).min(i64::MAX as u64);
+            let limit = request.limit.unwrap_or(50);
+            // The bounded optional wait: one short store probe per interval,
+            // never a lock across awaits, ended by data, deadline or a
+            // stopped attempt. A reverse page never waits.
+            let deadline = tokio::time::Instant::now()
+                + Duration::from_secs_f64(
+                    request
+                        .wait_seconds
+                        .unwrap_or(0.0)
+                        .min(POOL_READ_WAIT_SECONDS),
+                );
+            loop {
+                let home = service.home.clone();
+                let (run_id, attempt_id, token) = (
+                    call.run_id.clone(),
+                    call.attempt_id.clone(),
+                    call.token.clone(),
+                );
+                let probe_after = after_seq;
+                let ready = tokio::task::spawn_blocking(move || {
+                    crate::state::Store::open(&home)?.pool_has_entries_after(
+                        &run_id,
+                        &attempt_id,
+                        &token,
+                        probe_after,
+                    )
+                })
+                .await
+                .map_err(|_| crate::Error::Runtime("worker pool read failed".into()))??;
+                match ready {
+                    Err(reason) => return denial(reason),
+                    Ok(true) => break,
+                    Ok(false) => {
+                        if tokio::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                    }
+                }
+            }
+            let home = service.home.clone();
+            let (run_id, attempt_id, token) = (
+                call.run_id.clone(),
+                call.attempt_id.clone(),
+                call.token.clone(),
+            );
+            let page = tokio::task::spawn_blocking(move || {
+                crate::state::Store::open(&home)?.pool_read(
+                    &run_id,
+                    &attempt_id,
+                    &token,
+                    after_seq,
+                    request.before_seq.map(|before| before.min(i64::MAX as u64)),
+                    limit,
+                )
+            })
+            .await
+            .map_err(|_| crate::Error::Runtime("worker pool read failed".into()))??;
+            match page {
+                Ok(page) => Ok(page),
+                Err(reason) => denial(reason),
+            }
+        }
+    }
 }

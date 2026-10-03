@@ -936,12 +936,12 @@ async fn claude_uds_endless_receipt_stream_stays_bounded_and_unaccepted() {
     assert!(leftovers.is_empty(), "reply sockets leaked: {leftovers:?}");
 }
 
-/// A receiver that resets right after the buffered write cannot retry
-/// forever: every uncertain attempt (ambiguous or unconfirmed) counts toward
-/// the same cap and the notice leaves the schedule terminally failed.
+/// A receiver that resets right after the buffered write may already have the
+/// message, so the notice is never re-sent: one attempt, terminally failed
+/// and ambiguous, off the schedule.
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn claude_uds_reset_after_write_stops_retrying_at_the_uncertain_cap() {
+async fn claude_uds_reset_after_write_is_not_retried() {
     use std::os::fd::AsRawFd;
 
     let home = common::Home::new();
@@ -953,7 +953,7 @@ async fn claude_uds_reset_after_write_stops_retrying_at_the_uncertain_cap() {
     std::env::set_var("AGENT_RUN_CLAUDE_SESSION_REGISTRY", &registry);
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let peer = tokio::spawn(async move {
-        for _ in 0..3 {
+        for _ in 0..1 {
             let (stream, _) = listener.accept().await.unwrap();
             let linger = libc::linger {
                 l_onoff: 1,
@@ -993,45 +993,29 @@ async fn claude_uds_reset_after_write_stops_retrying_at_the_uncertain_cap() {
         )
         .unwrap();
     drop(connection);
-    for _ in 0..2 {
-        assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
-        let (state, error): (String, String) = Connection::open(home.path.join("state.db"))
-            .unwrap()
-            .query_row(
-                "SELECT state,last_error FROM deliveries WHERE id='ntf_reset'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(state, "retry_wait");
-        assert!(matches!(
-            error.as_str(),
-            "uds_ambiguous" | "uds_unconfirmed"
-        ));
-        make_due(&home.path, "ntf_reset");
-    }
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
     peer.await.unwrap();
-    let row: (String, u32, Option<f64>) = Connection::open(home.path.join("state.db"))
+    let row: (String, u32, Option<f64>, bool) = Connection::open(home.path.join("state.db"))
         .unwrap()
         .query_row(
-            "SELECT state,attempts,next_attempt_at FROM deliveries WHERE id='ntf_reset'",
+            "SELECT state,attempts,next_attempt_at,ambiguous_result FROM deliveries WHERE id='ntf_reset'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap();
-    assert_eq!((row.0.as_str(), row.1), ("failed", 3));
-    assert_eq!(row.2, None, "capped notice leaves the schedule");
+    assert_eq!((row.0.as_str(), row.1, row.3), ("failed", 1, true));
+    assert_eq!(row.2, None, "an ambiguous send leaves the schedule");
 }
 
 /// A dispatcher-level regression for the delivery-confirmation bug: a Claude
-/// inbox that accepts the write but stays silent must never reach `delivered`,
-/// must persist one immutable evidence row per attempt (so `last_attempt` is
-/// observable), and must stop retrying after the unconfirmed cap instead of
-/// duplicating the notice forever. The endpoint is a private temporary fake.
+/// inbox that accepts the write but stays silent must never reach `delivered`
+/// (the native inbox sends no receipt for an immediately accepted message, so
+/// the send may already have arrived), must persist one immutable evidence row
+/// (so `last_attempt` is observable), and must not be re-sent: it ends failed
+/// and ambiguous after the single attempt. The endpoint is a private fake.
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
+async fn claude_uds_unconfirmed_write_is_not_retried_and_fails_ambiguous() {
     use tokio::io::AsyncReadExt;
 
     let home = common::Home::new();
@@ -1043,8 +1027,8 @@ async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
     std::env::set_var("AGENT_RUN_CLAUDE_SESSION_REGISTRY", &registry);
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let peer = tokio::spawn(async move {
-        // Three accepted-and-read connections: every retry is written in full.
-        for _ in 0..3 {
+        // One accepted-and-read connection: the notice is written exactly once.
+        for _ in 0..1 {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut received = String::new();
             stream.read_to_string(&mut received).await.unwrap();
@@ -1070,23 +1054,6 @@ async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
             [],
         )
         .unwrap();
-    for attempt in 1..=2 {
-        assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
-        let row: (String, u32, Option<String>, bool) = Connection::open(home.path.join("state.db"))
-            .unwrap()
-            .query_row(
-                "SELECT state,attempts,last_error,ambiguous_result FROM deliveries WHERE id='ntf_unconfirmed'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(row.1, attempt, "one attempt per dispatch");
-        assert_eq!(row.0, "retry_wait", "unconfirmed never looks delivered");
-        assert_eq!(row.2.as_deref(), Some("uds_unconfirmed"));
-        assert!(row.3, "unconfirmed stays flagged ambiguous");
-        make_due(&home.path, "ntf_unconfirmed");
-    }
-    // The capped third attempt ends terminally failed, still ambiguous.
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
     peer.await.unwrap();
     let connection = Connection::open(home.path.join("state.db")).unwrap();
@@ -1097,9 +1064,9 @@ async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .unwrap();
-    assert_eq!((row.0.as_str(), row.1), ("failed", 3));
+    assert_eq!((row.0.as_str(), row.1), ("failed", 1));
     assert_eq!(row.2.as_deref(), Some("uds_unconfirmed"));
-    assert_eq!(row.3, None, "capped notice leaves the schedule");
+    assert_eq!(row.3, None, "an ambiguous send leaves the schedule");
     assert!(row.4);
     let evidence: (i64, String) = connection
         .query_row(
@@ -1108,7 +1075,7 @@ async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(evidence.0, 3, "one immutable evidence row per attempt");
+    assert_eq!(evidence.0, 1, "one immutable evidence row per attempt");
     assert!(evidence.1.contains("\"classifier\":\"uds_unconfirmed\""));
     assert!(!evidence.1.contains("session-1"), "no session id persisted");
     assert!(
@@ -1123,6 +1090,120 @@ async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
         .unwrap();
     assert_eq!(status["state"], "failed");
     assert_eq!(status["last_attempt"]["classifier"], "uds_unconfirmed");
+}
+
+/// A Claude send that provably wrote nothing (the session is gone from the
+/// registry) stays an ordinary retried attempt: only possibly-sent outcomes
+/// stop retrying, so a notice is not lost to a transient gap.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn claude_uds_known_unsent_attempt_still_retries() {
+    let home = common::Home::new();
+    let registry = home.path.join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    let _guard = REGISTRY_OVERRIDE.lock().unwrap();
+    std::env::set_var("AGENT_RUN_CLAUDE_SESSION_REGISTRY", &registry);
+    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    for sql in [
+        "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) VALUES('sess','claude_uds','session-gone',1.0,1.0)",
+        "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary','/tmp','{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',1.0,1.0,'fixture','ag-20260825-120000-0123456789')",
+        "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,next_attempt_at) VALUES('ntf_gone','ag-20260825-120000-0123456789','sess','pending',0)",
+    ] {
+        connection.execute(sql, []).unwrap();
+    }
+    for attempt in 1..=2 {
+        assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+        let row: (String, u32, Option<String>) = connection
+            .query_row(
+                "SELECT state,attempts,last_error FROM deliveries WHERE id='ntf_gone'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((row.0.as_str(), row.1), ("retry_wait", attempt));
+        assert_eq!(row.2.as_deref(), Some("uds_session_gone"));
+        make_due(&home.path, "ntf_gone");
+    }
+}
+
+/// Cutover from the old bounded-retry policy: a queued Claude notice whose
+/// previous attempt was possibly sent (`uds_unconfirmed` or `uds_ambiguous`)
+/// is ended failed-ambiguous at claim time WITHOUT a new send, as is a crashed
+/// `sending` row with no evidence for its current attempt, so an upgraded or
+/// restarted broker never re-sends what may already have arrived; each such row
+/// costs one dispatch tick, after which a fresh notice behind it is attempted
+/// exactly once.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn legacy_possibly_sent_claude_retry_is_not_resent_after_cutover() {
+    let home = common::Home::new();
+    let registry = home.path.join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    let socket = home.path.join("inbox.sock");
+    claude_descriptor(&registry, "session-1", &socket);
+    let _guard = REGISTRY_OVERRIDE.lock().unwrap();
+    std::env::set_var("AGENT_RUN_CLAUDE_SESSION_REGISTRY", &registry);
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let inbox = socket.clone();
+    let peer = tokio::spawn(async move {
+        // Only the fresh notice may ever connect.
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let frame = native_inbox_connection(&mut stream, &inbox, None).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), listener.accept())
+                .await
+                .is_err(),
+            "no legacy notice was re-sent"
+        );
+        frame
+    });
+    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    for sql in [
+        "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) VALUES('sess','claude_uds','session-1',1.0,1.0)",
+        "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary','/tmp','{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',1.0,1.0,'fixture','ag-20260825-120000-0123456789')",
+        "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,attempts,next_attempt_at) VALUES('ntf_a_legacy_unconfirmed','ag-20260825-120000-0123456789','sess','retry_wait',1,0)",
+        "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,attempts,next_attempt_at) VALUES('ntf_b_legacy_ambiguous','ag-20260825-120000-0123456789','sess','retry_wait',2,0)",
+        "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,attempts,lease_owner,lease_until) VALUES('ntf_a2_crash_no_evidence','ag-20260825-120000-0123456789','sess','sending',1,'dead-dispatcher',1.0)",
+        "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,attempts,lease_owner,lease_until) VALUES('ntf_a3_crash_after_unsent','ag-20260825-120000-0123456789','sess','sending',2,'dead-dispatcher',1.0)",
+        "INSERT INTO delivery_attempt_evidence(delivery_id,attempt,recorded_at,evidence_json) VALUES('ntf_a3_crash_after_unsent',1,1.0,'{\"classifier\":\"uds_session_gone\"}')",        "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,next_attempt_at) VALUES('ntf_c_fresh','ag-20260825-120000-0123456789','sess','pending',0)",
+        "INSERT INTO delivery_attempt_evidence(delivery_id,attempt,recorded_at,evidence_json) VALUES('ntf_a_legacy_unconfirmed',1,1.0,'{\"classifier\":\"uds_unconfirmed\"}')",
+        "INSERT INTO delivery_attempt_evidence(delivery_id,attempt,recorded_at,evidence_json) VALUES('ntf_b_legacy_ambiguous',1,1.0,'{\"classifier\":\"uds_session_gone\"}')",
+        "INSERT INTO delivery_attempt_evidence(delivery_id,attempt,recorded_at,evidence_json) VALUES('ntf_b_legacy_ambiguous',2,2.0,'{\"classifier\":\"uds_ambiguous\"}')",
+    ] {
+        connection.execute(sql, []).unwrap();
+    }
+    // Due order is the two legacy rows and the fresh notice (all due at 0),
+    // then the two crashed `sending` rows (lease past). Each unsafe row is
+    // ended per tick without any send (count 0); the fresh notice is attempted
+    // exactly once (count 1); the peer fails if any other row connects.
+    for expected in [0, 0, 1, 0, 0] {
+        assert_eq!(dispatch_once(&home.path).await.unwrap(), expected);
+    }
+    let frame = peer.await.unwrap();
+    assert_eq!(
+        frame["msg_id"], "ntf_c_fresh",
+        "only the fresh notice was sent"
+    );
+    for (id, attempts, error) in [
+        ("ntf_a_legacy_unconfirmed", 1, "uds_unconfirmed"),
+        ("ntf_a2_crash_no_evidence", 1, "uds_unconfirmed"),
+        // Attempt 2 crashed with no evidence of its own: the older known-unsent
+        // attempt 1 does not make a resend safe.
+        ("ntf_a3_crash_after_unsent", 2, "uds_unconfirmed"),
+        ("ntf_b_legacy_ambiguous", 2, "uds_ambiguous"),
+    ] {
+        let row: (String, u32, Option<String>, Option<f64>, bool) = connection
+            .query_row(
+                "SELECT state,attempts,last_error,next_attempt_at,ambiguous_result FROM deliveries WHERE id=?",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!((row.0.as_str(), row.1), ("failed", attempts), "{id}");
+        assert_eq!(row.2.as_deref(), Some(error));
+        assert_eq!(row.3, None);
+        assert!(row.4, "{id} stays flagged ambiguous");
+    }
 }
 
 /// A dispatcher-level happy path: a correlated native hold-receipt moves the
@@ -1832,6 +1913,263 @@ async fn dispatches_worker_report_without_completion_status() {
             .unwrap(),
         2
     );
+}
+
+/// A pool member's report reaches the orchestrator through the same shared
+/// renderer as its peers: stamped sender name, role and stable identity plus
+/// direction, with an oversized body shortened only inside the fixed bound.
+#[tokio::test]
+async fn pool_linked_worker_report_is_rendered_with_the_stamped_sender() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let home = common::Home::new();
+    delivery(&home.path, "ntf_pool", "codex_queue", "pending");
+    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let agent = "ag-20260825-120000-0123456789";
+    let body = "x".repeat(2048);
+    connection
+        .execute_batch("INSERT INTO pools(id,request_namespace,request_id,request_sha256,goal,acceptance_json,state,roster_revision,created_at) VALUES('pool-20260101-000000-0123456789','ns','r',lower(hex(zeroblob(32))),'goal','[]','open',1,1.0)")
+        .unwrap();
+    for sql in [
+        "INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at) VALUES('attempt-pool',?1,1,'finished','{}',1.0)",
+        "INSERT INTO worker_notifications(delivery_id,agent_id,attempt_id,request_id,kind,message,created_at) VALUES('ntf_pool',?1,'attempt-pool','key','risk','raw stored body',1.0)",
+        "INSERT INTO pool_members(agent_id,pool_id,slot,name,role,personal_task,joined_roster_revision) VALUES(?1,'pool-20260101-000000-0123456789',1,'Ada','reviewer','t',1)",
+    ] {
+        connection.execute(sql, params![agent]).unwrap();
+    }
+    connection.execute(
+        "INSERT INTO pool_entries(pool_id,author_kind,author_agent_id,author_name,author_role,direction,kind,severity,roster_revision,body,delivery_id,sender_run_id,sender_attempt_id,idem_scope,request_id,created_at)
+         VALUES('pool-20260101-000000-0123456789','member',?1,'Ada','reviewer','orchestrator_copy','report','risk',1,?2,'ntf_pool',?1,'attempt-pool','notify:x','key',1.0)",
+        params![agent, body],
+    ).unwrap();
+    let listener = tokio::net::UnixListener::bind(home.path.join("ar-cdx-v4-worker.sock")).unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let length = stream.read_u32_le().await.unwrap() as usize;
+        let mut data = vec![0; length];
+        stream.read_exact(&mut data).await.unwrap();
+        let reply = br#"{"outcome":"accepted"}"#;
+        stream.write_u32_le(reply.len() as u32).await.unwrap();
+        stream.write_all(reply).await.unwrap();
+        serde_json::from_slice::<Value>(&data).unwrap()
+    });
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+    let request = tokio::time::timeout(Duration::from_secs(2), peer)
+        .await
+        .unwrap()
+        .unwrap();
+    let message = request["message"].as_str().unwrap();
+    assert!(message.len() <= 2048, "{}", message.len());
+    assert!(message.starts_with("agent-run/pool #1 roster r1\nfrom Ada (reviewer, ag-20260825-120000-0123456789) to orchestrator (team copy)\nkind report severity risk\nuntrusted body:\n"));
+    assert!(message.contains("[truncated; the full text is in the pool log]"));
+    // The stored report stays raw for idempotent replay.
+    let stored: String = connection
+        .query_row(
+            "SELECT message FROM worker_notifications WHERE delivery_id='ntf_pool'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, "raw stored body");
+}
+
+/// Inserts one completed pool anchored on the fixture agent: its frozen
+/// completion event, the linked delivery and the pool row.
+fn completed_pool(home: &Path, delivery_id: &str, notice: &str) {
+    let connection = Connection::open(home.join("state.db")).unwrap();
+    let agent = "ag-20260825-120000-0123456789";
+    connection
+        .execute(
+            "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?,1.0,'pool_completed',?)",
+            params![agent, json!({"notice": notice}).to_string()],
+        )
+        .unwrap();
+    let event = connection.last_insert_rowid();
+    connection
+        .execute(
+            "UPDATE deliveries SET terminal_event_seq=? WHERE id=?",
+            params![event, delivery_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO pools(id,request_namespace,request_id,request_sha256,goal,acceptance_json,state,roster_revision,completed_at,completion_delivery_id,created_at) \
+             VALUES('pool-20261003-120000-0123456789','ns','r',lower(hex(zeroblob(32))),'goal','[]','completed',1,2.0,?,1.0)",
+            [delivery_id],
+        )
+        .unwrap();
+}
+
+/// The common pool conclusion travels the existing outbox to a v4 desktop
+/// relay as the one `pool_completion` operation: no agent, run or session
+/// identity on the wire, the frozen text intact, and accepted only after the
+/// relay's own correlated reply.
+#[tokio::test]
+async fn pool_completion_is_dispatched_as_one_common_conclusion() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let home = common::Home::new();
+    delivery(&home.path, "ntf_poolc", "codex_queue", "pending");
+    let text = "Pool pool-20261003-120000-0123456789 is complete.\nMembers: Ada (reviewer, ag-20260825-120000-0123456789)";
+    completed_pool(&home.path, "ntf_poolc", text);
+    let listener = tokio::net::UnixListener::bind(home.path.join("ar-cdx-v4-pool.sock")).unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let length = stream.read_u32_le().await.unwrap() as usize;
+        let mut data = vec![0; length];
+        stream.read_exact(&mut data).await.unwrap();
+        let reply = br#"{"outcome":"accepted"}"#;
+        stream.write_u32_le(reply.len() as u32).await.unwrap();
+        stream.write_all(reply).await.unwrap();
+        serde_json::from_slice::<Value>(&data).unwrap()
+    });
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+    let request = tokio::time::timeout(Duration::from_secs(2), peer)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        request,
+        json!({"version":4,"op":"pool_completion","thread_id":"thread",
+               "notification_id":"ntf_poolc","pool_id":"pool-20261003-120000-0123456789",
+               "message":text})
+    );
+    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let (state, evidence): (String, i64) = (
+        connection
+            .query_row(
+                "SELECT state FROM deliveries WHERE id='ntf_poolc'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM delivery_attempt_evidence WHERE delivery_id='ntf_poolc'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+    );
+    assert_eq!((state.as_str(), evidence), ("delivered", 1));
+}
+
+/// Claude receives the same frozen conclusion as plain inbox text with the
+/// trusted pool framing, and only a correlated hold receipt confirms it.
+#[tokio::test]
+async fn pool_completion_reaches_a_claude_inbox_with_pool_framing() {
+    let temporary = tempfile::tempdir().unwrap();
+    let registry = temporary.path().join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    let socket = temporary.path().join("inbox.sock");
+    claude_descriptor(&registry, "session-1", &socket);
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let inbox = socket.clone();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        native_inbox_connection(&mut stream, &inbox, Some(("ntf_poolc", "held"))).await
+    });
+    let notice = agent_run_domain::pool::PoolNotice {
+        notification_id: "ntf_poolc".into(),
+        pool_id: "pool-20261003-120000-0123456789".parse().unwrap(),
+        message: "Pool is complete.".into(),
+    };
+    let evidence = claude::send_pool(&registry, "session-1", &notice).await;
+    let frame = peer.await.unwrap();
+    let content = frame["message"]["content"].as_str().unwrap();
+    assert!(content.starts_with("agent-run/pool-completion\nnotification_id: ntf_poolc\n"));
+    assert!(
+        content.contains("Broker conclusion for the whole pool")
+            && content.ends_with("Pool is complete.")
+    );
+    assert!(!content.contains("run_id") && !content.contains("agent_id"));
+    assert_eq!(evidence.classifier, "uds_receipt_held");
+}
+
+/// The largest legal pool notice made of multi-byte text still reaches a
+/// Claude inbox: only the body is shortened, with the explicit marker, to the
+/// actual rendered bound; the header and notification id are intact and the
+/// receipt correlates to that id. The frozen stored message is unchanged.
+#[tokio::test]
+async fn max_pool_notice_is_truncated_to_the_claude_rendered_bound() {
+    let temporary = tempfile::tempdir().unwrap();
+    let registry = temporary.path().join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    let socket = temporary.path().join("inbox.sock");
+    claude_descriptor(&registry, "session-1", &socket);
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let inbox = socket.clone();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        native_inbox_connection(&mut stream, &inbox, Some(("ntf_maxpool", "held"))).await
+    });
+    let notice = agent_run_domain::pool::PoolNotice {
+        notification_id: "ntf_maxpool".into(),
+        pool_id: "pool-20261003-120000-0123456789".parse().unwrap(),
+        message: "é\"\n".repeat(1024),
+    };
+    assert!(notice.validate().is_ok() && notice.message.len() == 4096);
+    let evidence = claude::send_pool(&registry, "session-1", &notice).await;
+    let frame = peer.await.unwrap();
+    assert_eq!(frame["msg_id"], "ntf_maxpool");
+    let content = frame["message"]["content"].as_str().unwrap();
+    assert!(content.len() <= 4096, "{}", content.len());
+    assert!(content.starts_with(
+        "agent-run/pool-completion\nnotification_id: ntf_maxpool\npool_id: pool-20261003-120000-0123456789\n"
+    ));
+    assert!(content.ends_with(agent_run_domain::pool::TRUNCATION_MARKER));
+    assert!(content.contains("é\"\né\"\n"));
+    assert_eq!(evidence.classifier, "uds_receipt_held");
+    assert_eq!(notice.message.len(), 4096, "frozen message unchanged");
+}
+
+/// An escaping-heavy maximal pool notice whose JSON frame would exceed the
+/// relay bound is shortened (body only, explicit marker) before connecting, so
+/// the frame is written whole, correlated and accepted instead of failing
+/// pre-send as a false ambiguity.
+#[tokio::test]
+async fn escaping_heavy_pool_notice_fits_the_relay_frame_bound() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let home = tempfile::tempdir().unwrap();
+    let listener = tokio::net::UnixListener::bind(home.path().join("ar-cdx-v4-big.sock")).unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let length = stream.read_u32_le().await.unwrap() as usize;
+        let mut data = vec![0; length];
+        stream.read_exact(&mut data).await.unwrap();
+        let reply = br#"{"outcome":"accepted"}"#;
+        stream.write_u32_le(reply.len() as u32).await.unwrap();
+        stream.write_all(reply).await.unwrap();
+        (length, serde_json::from_slice::<Value>(&data).unwrap())
+    });
+    // Each "\n\"\\" is three bytes and six escaped bytes: 4098 bytes expand past 8192.
+    let message = format!("x{}", "\n\"\\".repeat(1365));
+    let notice = agent_run_domain::pool::PoolNotice {
+        notification_id: "ntf_bigrelay".into(),
+        pool_id: "pool-20261003-120000-0123456789".parse().unwrap(),
+        message: message.clone(),
+    };
+    assert!(notice.validate().is_ok());
+    assert!(
+        serde_json::to_vec(&json!({"message": &message}))
+            .unwrap()
+            .len()
+            > 8192 - 200
+    );
+    let evidence = agent_run_core::delivery::relay::send_pool(home.path(), "thread", &notice).await;
+    let (length, request) = peer.await.unwrap();
+    assert_eq!(evidence.classifier, "relay_accepted");
+    assert!(length <= 8192, "{length}");
+    assert_eq!(request["notification_id"], "ntf_bigrelay");
+    assert_eq!(request["pool_id"], "pool-20261003-120000-0123456789");
+    assert_eq!(request["op"], "pool_completion");
+    let sent = request["message"].as_str().unwrap();
+    assert!(
+        sent.starts_with("x\n\"\\") && sent.ends_with(agent_run_domain::pool::TRUNCATION_MARKER)
+    );
+    assert!(sent.len() < message.len());
+    assert_eq!(notice.message, message, "frozen message unchanged");
 }
 
 /// Mirrors `tests/test_codex_queue.py::test_send_uses_the_relay_without_a_queue_message_id`.

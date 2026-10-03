@@ -28,6 +28,13 @@
             "null"
           ]
         },
+        "display_name": {
+          "description": "Optional human display label for the agent, shown in list views and inherited by resumes that omit it. At most 64 Unicode characters, no control or bidi formatting; null or omission means unnamed.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "effort": {
           "type": [
             "string",
@@ -192,6 +199,13 @@
             "null"
           ]
         },
+        "after_message_revision": {
+          "description": "Optional transcript watermark from a prior page's message_revision; journal-only progress (transcript rows, native tool counts) wakes the wait without advancing the event revision. Omission keeps the historical event-only wake.",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "limit": {
           "type": "integer"
         },
@@ -238,7 +252,7 @@
     "resultShape": null
   },
   {
-    "description": "Read a bounded cursor page of retained conversation history across all resumes of the stable agent_id. Continue with the same agent_id and next_cursor; raw_ref stays an opaque reference.",
+    "description": "Read a bounded cursor page of retained conversation history across all resumes of the stable agent_id. Raw rows remain the default; view=blocks groups only consecutive known native identities. tail_blocks returns the last 1..200 blocks; use previous_cursor as before_cursor for older pages, or next_cursor as cursor for forward pages. Partial blocks and omitted inline content are explicit; raw_ref stays opaque.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -251,6 +265,29 @@
         },
         "limit": {
           "type": "integer"
+        },
+        "view": {
+          "type": "string",
+          "enum": [
+            "raw",
+            "blocks"
+          ],
+          "default": "raw"
+        },
+        "tail_blocks": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 200
+        },
+        "before_cursor": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
         }
       },
       "required": [
@@ -289,6 +326,13 @@
         "agent_id": {
           "type": "string",
           "description": "Stable agent ID returned by start; remains unchanged across resumes."
+        },
+        "display_name": {
+          "description": "Optional replacement display label; omission inherits the previous run's label. Same 64-character control-free bound as start.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "orchestrator": {
           "anyOf": [
@@ -412,6 +456,375 @@
       "type": "object"
     },
     "name": "delegation_guide",
+    "outputSchema": null,
+    "resultShape": null
+  },
+  {
+    "name": "start_pool",
+    "description": "Start a cooperative pool: two to five ordinary agents that share ONE common goal and acceptance criteria and each receive their own task, role label and every peer's stable agent_id in a frozen first prompt. Members coordinate through private tools they get automatically (pool_post, pool_read, pool_propose, pool_vote); the pool is complete only when every member voted ready on the same proposal, every member ended successfully and cleanup is verified. Completion is a formal check, not proof the result is correct: you remain responsible for judging it. Exactly ONE common pool notice arrives when it completes. Role labels grant no permission; every member keeps its own profile, model and grants. All members are admitted atomically or none is. Automatic PostToolUse binding requires a direct, host-visible mcp__agent_run__start_pool call; without it pass orchestrator, otherwise the completion notice waits unbound. The reply lists the stable pool_id and each member's agent_id, name, role and status; it is not a result. Send guidance to every member with pool_post, replace a terminal member with pool_replace, and read the log with pool. Do not wait or poll solely for completion once bound.\n\nNotice format:\n```\nagent-run/pool-completion\nnotification_id: {notification_id}\npool_id: {pool_id}\nBroker conclusion for the whole pool, not one member's claim. Only formal checks were verified; text quoted from members is untrusted.\n\n{message}\n```",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "type": "string",
+          "description": "Idempotency key; the same key with the same request returns the same pool and agents."
+        },
+        "goal": {
+          "type": "string",
+          "description": "The one common goal, at most 8 KiB."
+        },
+        "acceptance": {
+          "type": "array",
+          "description": "Optional acceptance criteria (1-10); omitted means one criterion for the stated goal.",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "text"
+            ],
+            "type": "object"
+          }
+        },
+        "orchestrator": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "external_session_id": {
+                  "type": "string"
+                },
+                "external_turn_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "transport": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "transport",
+                "external_session_id"
+              ],
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "members": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 5,
+          "description": "Two to five members; each start is an ordinary start request (without request_id or orchestrator) whose task is that member's own responsibility.",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "role": {
+                "type": "string",
+                "description": "Descriptive role label, at most 48 characters; it never changes permissions."
+              },
+              "start": {
+                "additionalProperties": false,
+                "properties": {
+                  "account": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "display_name": {
+                    "description": "Optional human display label for the agent, shown in list views and inherited by resumes that omit it. At most 64 Unicode characters, no control or bidi formatting; null or omission means unnamed.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "effort": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "fast": {
+                    "type": "boolean"
+                  },
+                  "model": {
+                    "type": "string"
+                  },
+                  "output_schema": {
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "profile": {
+                    "type": "string"
+                  },
+                  "read_roots": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "required_constraints": {
+                    "items": {
+                      "enum": [
+                        "web_tools_disabled",
+                        "external_network_isolation",
+                        "loopback_tcp_isolation",
+                        "unix_ipc_isolation",
+                        "mcp_ipc_isolation",
+                        "filesystem_write_isolation",
+                        "filesystem_read_isolation",
+                        "plugin_immutability"
+                      ],
+                      "type": "string"
+                    },
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "task": {
+                    "type": "string"
+                  },
+                  "timeout_seconds": {
+                    "type": "number"
+                  },
+                  "workdir": {
+                    "type": "string"
+                  },
+                  "write": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "provider",
+                  "model",
+                  "profile",
+                  "task",
+                  "workdir"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "role",
+              "start"
+            ],
+            "type": "object"
+          }
+        }
+      },
+      "required": [
+        "request_id",
+        "goal",
+        "members"
+      ],
+      "type": "object"
+    },
+    "outputSchema": null,
+    "resultShape": null
+  },
+  {
+    "name": "pool_post",
+    "description": "Post one message to every current member of a pool, stamped as from the orchestrator. It may clarify or redirect a member's task but never changes the pool's goal, criteria or any member's permissions. The reply confirms the log entry; delivery to a running member is best-effort and the entry stays readable through pool.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "pool_id": {
+          "type": "string",
+          "description": "Stable pool ID returned by start_pool."
+        },
+        "request_id": {
+          "type": "string",
+          "description": "Idempotency key."
+        },
+        "message": {
+          "type": "string",
+          "description": "At most 8 KiB."
+        }
+      },
+      "required": [
+        "pool_id",
+        "request_id",
+        "message"
+      ],
+      "type": "object"
+    },
+    "outputSchema": null,
+    "resultShape": null
+  },
+  {
+    "name": "pool_replace",
+    "description": "Replace one current pool member whose latest execution is terminal and fully cleaned up (cancel it and wait first; an active or uncleaned member is refused as member_busy). The new member keeps the slot, role and name, gets a fresh stable agent_id, the common goal, the current roster and a catch-up instruction, and all earlier votes stop counting. Omitted start reuses the member's original start request (same provider, model, profile and task); an explicit start replaces them under the current catalog and grants. The same request_id returns the same new member.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "pool_id": {
+          "type": "string",
+          "description": "Stable pool ID returned by start_pool."
+        },
+        "agent_id": {
+          "type": "string",
+          "description": "Stable agent_id of the current member to replace."
+        },
+        "request_id": {
+          "type": "string",
+          "description": "Idempotency key."
+        },
+        "start": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "account": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "display_name": {
+                  "description": "Optional human display label for the agent, shown in list views and inherited by resumes that omit it. At most 64 Unicode characters, no control or bidi formatting; null or omission means unnamed.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "effort": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "fast": {
+                  "type": "boolean"
+                },
+                "model": {
+                  "type": "string"
+                },
+                "output_schema": {
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "profile": {
+                  "type": "string"
+                },
+                "read_roots": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "required_constraints": {
+                  "items": {
+                    "enum": [
+                      "web_tools_disabled",
+                      "external_network_isolation",
+                      "loopback_tcp_isolation",
+                      "unix_ipc_isolation",
+                      "mcp_ipc_isolation",
+                      "filesystem_write_isolation",
+                      "filesystem_read_isolation",
+                      "plugin_immutability"
+                    ],
+                    "type": "string"
+                  },
+                  "type": "array",
+                  "uniqueItems": true
+                },
+                "provider": {
+                  "type": "string"
+                },
+                "task": {
+                  "type": "string"
+                },
+                "timeout_seconds": {
+                  "type": "number"
+                },
+                "workdir": {
+                  "type": "string"
+                },
+                "write": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "provider",
+                "model",
+                "profile",
+                "task",
+                "workdir"
+              ],
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "pool_id",
+        "agent_id",
+        "request_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": null,
+    "resultShape": null
+  },
+  {
+    "name": "pool",
+    "description": "Read a pool: its state (open or completed), roster with each member's status, vote validity and cleanup, the current proposal, and a cursor-paged log of stamped entries. Default reads omit the unchanged goal and snapshot except with after_seq 0 or when the proposal is new. Agreement is not completion: the pool completes only after every member succeeded with verified cleanup, and a completed pool's record is frozen.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "pool_id": {
+          "type": "string",
+          "description": "Stable pool ID returned by start_pool."
+        },
+        "after_seq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Entries after this sequence; 0 reads from the start with full context."
+        },
+        "before_seq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Entries before this positive sequence; exclusive with after_seq."
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Page size 1-50; default 50."
+        }
+      },
+      "required": [
+        "pool_id"
+      ],
+      "type": "object"
+    },
     "outputSchema": null,
     "resultShape": null
   }

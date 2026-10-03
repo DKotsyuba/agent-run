@@ -18,12 +18,24 @@ use agent_run_config::provider_config::ProviderConfig;
 use agent_run_config::role_plan;
 use agent_run_domain::{
     catalog::{AccountStatus, QuotaAdmissionError, QuotaCandidateSet, ResolvedLaunchAuthority},
+    pool::{
+        compose_member_task, PoolDenial, PoolId, PoolPost, PoolQuery, PoolReplace, PoolSeat,
+        PoolStartRequest,
+    },
     ProviderStartRequest, Sha256Digest,
+};
+use agent_run_store::{
+    pool_admission::{PoolAdmission, PoolAdmissionInput, PoolMemberAdmission},
+    pool_replace::{PoolReplaceInput, PoolReplacement},
+    provider_admission::AdmissionInputs,
 };
 
 /// Most `selection_stale` recalculations after the initial selection in
 /// [`Service::admit_provider`]: four admission submissions in total.
 pub const PROVIDER_STALE_RETRIES: u32 = 3;
+
+/// Open pools the maintenance sweep inspects per pass.
+const POOL_SWEEP_LIMIT: usize = 20;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -189,6 +201,12 @@ pub struct Query {
     #[serde(default = "default_limit")]
     pub limit: usize,
     pub after_revision: Option<i64>,
+    /// Committed transcript watermark to wake on journal-only progress.
+    /// Journal rows never advance `after_revision`'s event revision, so an
+    /// observer that must also see transcript and tool-count changes passes
+    /// the page's `message_revision` here. Omission keeps the historical
+    /// event-only wake behavior.
+    pub after_message_revision: Option<i64>,
     pub wait_seconds: f64,
 }
 fn default_limit() -> usize {
@@ -202,6 +220,7 @@ impl Default for Query {
             offset: 0,
             limit: 100,
             after_revision: None,
+            after_message_revision: None,
             wait_seconds: 0.0,
         }
     }
@@ -214,6 +233,7 @@ impl Query {
             || !self.wait_seconds.is_finite()
             || !(0.0..=60.0).contains(&self.wait_seconds)
             || self.after_revision.is_some_and(|n| n < 0)
+            || self.after_message_revision.is_some_and(|n| n < 0)
         {
             return Err(invalid("invalid agent page or wait arguments"));
         }
@@ -440,116 +460,15 @@ impl Service {
         let (config, revision) = self.current_provider_config()?;
         let accounts = Store::open(&self.home)?.list_accounts()?;
         let catalog = config.resolve_catalog(accounts)?;
-        let provider = catalog
-            .provider(&request.provider)
-            .ok_or_else(|| invalid("provider is not configured"))?;
-        let offering = provider
-            .models
-            .iter()
-            .find(|model| model.id == request.model)
-            .ok_or_else(|| invalid("model is not offered by provider"))?;
-        let effective_effort = request
-            .effort
-            .clone()
-            .or_else(|| offering.params.get("effort").cloned());
-        offering.permits_effort(effective_effort.as_deref())?;
-        // Harness options run through the existing launch mechanisms: fast
-        // is the codex service tier, output_schema the claude answer schema.
-        if request.fast && provider.harness != agent_run_domain::catalog::HarnessId::Codex {
-            return Err(invalid("fast mode is supported only by the codex harness"));
-        }
-        if request.output_schema.is_some()
-            && provider.harness != agent_run_domain::catalog::HarnessId::ClaudeCode
-        {
-            return Err(invalid(
-                "output_schema is supported only by the claude-code harness",
-            ));
-        }
-        let pinned = request
-            .account
-            .as_ref()
-            .map(|label| {
-                provider
-                    .binding(label.as_str())
-                    .ok_or_else(|| invalid("account label is not bound to provider"))
-                    .map(|binding| binding.account.clone())
-            })
-            .transpose()?;
-        let mut profile = profiles::load_provider(&config, &request)?;
-        profile
-            .required_constraints
-            .extend(offering.restrictions.iter().copied());
-        let role = role_plan::resolve_role_plan(
-            &profile,
-            config.skills_dir(),
-            &config.mcp,
-            if request.account.is_some() {
-                "account"
-            } else {
-                "global"
-            },
-            request.account.as_ref().map(|label| label.as_str()),
-        )?;
-        let mut effective = request.storage_projection();
-        effective.effort = effective_effort.clone();
-        effective.write = profile.write;
-        effective.read_roots = profile.read_roots.clone();
-        effective.required_constraints = profile.required_constraints.clone();
-        effective.timeout_seconds = Some(
-            config
-                .core
-                .effective_timeout_seconds(effective.timeout_seconds)?,
-        );
-        let eligible_accounts = provider
-            .bindings
-            .iter()
-            .filter(|binding| {
-                binding
-                    .models
-                    .as_ref()
-                    .is_none_or(|models| models.contains(&request.model))
-            })
-            .filter(|binding| {
-                catalog
-                    .account(&binding.account)
-                    .is_some_and(|record| record.status == AccountStatus::Enabled)
-            })
-            .map(|binding| binding.account.clone())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let authority = ResolvedLaunchAuthority {
-            provider: request.provider.clone(),
-            harness: provider.harness,
-            connection: provider.connection.clone(),
-            model: request.model.clone(),
-            effort: effective_effort,
-            profile: profile.name,
-            workdir: request.workdir.clone(),
-            role_payload: role.to_payload(),
-            assets_sha256: Sha256Digest::from_str(&"0".repeat(64))?,
-            eligible_accounts,
-        };
-        let identity = ProviderLaunchIdentity {
-            provider_identity_version: 2,
-            replay_request_sha256: agent_run_domain::canonical::sha256_hex(
-                &serde_json::to_value(&request)?,
-                true,
-            ),
-            provider_request: request.clone(),
-            provider_config_sha256: revision,
-            provider_config: config.clone(),
-            provider_config_snapshot: config.snapshot()?,
-            authority: authority.clone(),
-            runtime_home: None,
-            snapshot_sha256: None,
-        };
-        let cap = config
-            .harnesses
-            .get(&provider.harness)
-            .ok_or_else(|| invalid("provider harness is not configured"))?
-            .max_active_agents;
-        let identity = serde_json::to_value(identity)?;
+        let Prepared {
+            request,
+            effective,
+            authority,
+            identity,
+            cap,
+            pinned,
+        } = prepare_provider(&config, &revision, &catalog, request)?;
+        let global_cap = config.core.max_active_agents;
         let mut submission = 0;
         let admission = loop {
             let candidates = produce(&Store::open(&self.home)?, &catalog, &request, submission)?;
@@ -560,7 +479,7 @@ impl Service {
                 &authority,
                 &candidates,
                 &identity,
-                config.core.max_active_agents,
+                global_cap,
                 cap,
                 pinned.as_ref(),
             ) {
@@ -639,6 +558,496 @@ impl Service {
         self.hand_off_provider(&mut result).await?;
         Ok(result)
     }
+    /// Admits a whole cooperative pool atomically, choosing every account from
+    /// persisted quota evidence; nothing is spawned. See
+    /// [`Self::admit_pool_with`].
+    pub fn admit_pool(&self, request: PoolStartRequest) -> Result<Value> {
+        self.admit_pool_with(
+            request,
+            PROVIDER_STALE_RETRIES,
+            &mut |store, catalog, member, _| {
+                let pin = member.account.as_ref().map(|label| label.as_str());
+                crate::capacity::provider_ranking::provider_candidates(
+                    store,
+                    catalog,
+                    &member.provider,
+                    &member.model,
+                    pin,
+                    &std::collections::BTreeSet::new(),
+                )
+            },
+        )
+    }
+
+    /// [`Self::admit_pool`] with one fixed trusted candidate set for every
+    /// member, so offline tests can drive the real supervisor. A fixed set
+    /// cannot become fresh: `selection_stale` returns without retry.
+    pub fn admit_pool_trusted(
+        &self,
+        request: PoolStartRequest,
+        candidates: QuotaCandidateSet,
+    ) -> Result<Value> {
+        self.admit_pool_with(request, 0, &mut |_, _, _, _| Ok(candidates.clone()))
+    }
+
+    /// Shared pool admission.
+    ///
+    /// 1. The outer client request is validated and normalized; its digest
+    ///    (never the composed member tasks, which carry fresh identities)
+    ///    scopes replay, so a repeat returns the original pool and stable
+    ///    identities before any configuration or quota read, and a different
+    ///    request under the same key is `Conflict`.
+    /// 2. One configuration and catalog snapshot serves every member. The pool
+    ///    and every agent identity are minted, each member's actual task is
+    ///    composed from the common goal, its own seat and all peers, and each
+    ///    composed request is prepared through the same mechanism as a single
+    ///    start, so the stored task, effective request and frozen identity
+    ///    agree exactly.
+    /// 3. Candidates are produced outside any write transaction for every
+    ///    member, then [`Store::admit_pool`] commits all rows or none.
+    ///    `selection_stale` retries like a single start, over the whole batch.
+    ///
+    /// The result lists only stable identities, names, roles and statuses.
+    fn admit_pool_with(
+        &self,
+        mut request: PoolStartRequest,
+        stale_retries: u32,
+        produce: &mut dyn FnMut(
+            &Store,
+            &agent_run_domain::catalog::ProviderCatalog,
+            &ProviderStartRequest,
+            u32,
+        ) -> Result<QuotaCandidateSet>,
+    ) -> Result<Value> {
+        request.validate()?;
+        let sha = agent_run_domain::canonical::sha256_hex(&serde_json::to_value(&request)?, true);
+        let namespace = match &request.orchestrator {
+            None => "global".to_owned(),
+            Some(reference) => agent_run_domain::canonical::sha256_hex(
+                &json!([reference.transport, reference.external_session_id]),
+                true,
+            ),
+        };
+        if let Some(found) =
+            Store::open(&self.home)?.replay_pool(&namespace, &request.request_id, &sha)?
+        {
+            return self.pool_view(&Store::open(&self.home)?, &found);
+        }
+        let (config, revision) = self.current_provider_config()?;
+        let accounts = Store::open(&self.home)?.list_accounts()?;
+        let catalog = config.resolve_catalog(accounts)?;
+        let pool_id = PoolId::new();
+        let seats: Vec<PoolSeat> = request
+            .members
+            .iter()
+            .enumerate()
+            .map(|(index, member)| PoolSeat {
+                slot: index as u8 + 1,
+                name: member.start.display_name.clone().unwrap_or_default(),
+                role: member.role.clone(),
+                agent_id: AgentId::new(),
+            })
+            .collect();
+        let mut prepared = Vec::new();
+        for (member, seat) in request.members.iter().zip(&seats) {
+            let mut start = member.start.clone();
+            start.task = compose_member_task(
+                &pool_id,
+                &request.goal,
+                &request.acceptance,
+                &seats,
+                seat,
+                &member.start.task,
+            )?;
+            start.orchestrator = request.orchestrator.clone();
+            start.validate()?;
+            prepared.push(prepare_provider(&config, &revision, &catalog, start)?);
+        }
+        let mut submission = 0;
+        let admission = loop {
+            let mut sets = Vec::new();
+            let store = Store::open(&self.home)?;
+            for member in &prepared {
+                sets.push(produce(&store, &catalog, &member.request, submission)?);
+            }
+            let members = request
+                .members
+                .iter()
+                .zip(&seats)
+                .zip(&prepared)
+                .zip(&sets)
+                .map(
+                    |(((member, seat), prepared), candidates)| PoolMemberAdmission {
+                        id: seat.agent_id.clone(),
+                        slot: seat.slot,
+                        name: seat.name.clone(),
+                        role: seat.role.clone(),
+                        personal_task: member.start.task.clone(),
+                        inputs: AdmissionInputs {
+                            request: &prepared.request,
+                            effective: &prepared.effective,
+                            authority: &prepared.authority,
+                            candidates,
+                            identity: &prepared.identity,
+                            global_cap: config.core.max_active_agents,
+                            harness_cap: prepared.cap,
+                            pinned: prepared.pinned.as_ref(),
+                        },
+                    },
+                )
+                .collect();
+            let outcome = Store::open(&self.home)?.admit_pool(PoolAdmissionInput {
+                pool_id: &pool_id,
+                request_namespace: &namespace,
+                request_id: &request.request_id,
+                request_sha256: &sha,
+                goal: &request.goal,
+                acceptance: &request.acceptance,
+                catalog: &catalog,
+                members,
+            });
+            match outcome {
+                Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
+                    if stale_retries > 0 && submission == stale_retries =>
+                {
+                    return Err(QuotaAdmissionError::SelectionBusy { stale_retries }.into());
+                }
+                Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
+                    if submission < stale_retries =>
+                {
+                    submission += 1;
+                }
+                result => break result?,
+            }
+        };
+        self.pool_view(&Store::open(&self.home)?, &admission)
+    }
+
+    /// Admits a pool through [`Self::admit_pool`] and hands every newly
+    /// admitted member to the normal detached supervisor in slot order.
+    ///
+    /// All stable identities are durable before the first launch. A member
+    /// whose launch fails ends terminally with its exact identity visible and
+    /// the remaining members are still launched; a replay launches nothing.
+    pub async fn start_pool(&self, request: PoolStartRequest) -> Result<Value> {
+        let result = self.admit_pool(request)?;
+        self.hand_off_pool(result).await
+    }
+
+    /// [`Self::start_pool`] over a fixed trusted candidate set.
+    pub async fn start_pool_trusted(
+        &self,
+        request: PoolStartRequest,
+        candidates: QuotaCandidateSet,
+    ) -> Result<Value> {
+        let result = self.admit_pool_trusted(request, candidates)?;
+        self.hand_off_pool(result).await
+    }
+
+    /// Appends an operator message to a pool: the author is stamped by the
+    /// broker as the operator, the entry fans out to every current member's
+    /// tip, and the same key replays. Refusals are typed [`PoolDenial`]s.
+    pub fn pool_post(&self, request: PoolPost) -> Result<std::result::Result<Value, PoolDenial>> {
+        request.validate()?;
+        let mut store = Store::open(&self.home)?;
+        Ok(store
+            .pool_operator_post(&request.pool_id, &request.request_id, &request.message)?
+            .map(|receipt| {
+                json!({"pool_id": receipt.pool_id, "seq": receipt.seq,
+                                  "created": !receipt.duplicate})
+            }))
+    }
+
+    /// Reads a pool's derived status and one cursor page of its log for the
+    /// operator, through the projection members read.
+    pub fn pool_status(&self, query: PoolQuery) -> Result<std::result::Result<Value, PoolDenial>> {
+        query.validate()?;
+        Store::open(&self.home)?.pool_operator_read(
+            &query.pool_id,
+            query.after_seq.unwrap_or(0),
+            query.before_seq,
+            query.limit.unwrap_or(agent_run_domain::pool::MAX_PAGE),
+        )
+    }
+
+    /// Admits a member replacement atomically; nothing is launched.
+    pub fn admit_pool_replacement(
+        &self,
+        request: PoolReplace,
+    ) -> Result<std::result::Result<PoolReplacement, PoolDenial>> {
+        self.admit_replacement_with(
+            request,
+            PROVIDER_STALE_RETRIES,
+            &mut |store, catalog, member, _| {
+                let pin = member.account.as_ref().map(|label| label.as_str());
+                crate::capacity::provider_ranking::provider_candidates(
+                    store,
+                    catalog,
+                    &member.provider,
+                    &member.model,
+                    pin,
+                    &std::collections::BTreeSet::new(),
+                )
+            },
+        )
+    }
+
+    /// [`Self::admit_pool_replacement`] over one fixed trusted candidate set.
+    pub fn admit_pool_replacement_trusted(
+        &self,
+        request: PoolReplace,
+        candidates: QuotaCandidateSet,
+    ) -> Result<std::result::Result<PoolReplacement, PoolDenial>> {
+        self.admit_replacement_with(request, 0, &mut |_, _, _, _| Ok(candidates.clone()))
+    }
+
+    /// Shared replacement admission.
+    ///
+    /// 1. The normalized outer request's digest scopes replay: the same key
+    ///    returns the original new identity before any configuration or quota
+    ///    read, even after later replacements; a different request is
+    ///    `Conflict`.
+    /// 2. The pool and the seat are read; an explicit `start` is an ordinary
+    ///    request under the current catalog and grants, an omitted one is the
+    ///    seat's original user spec restored from its frozen request (personal
+    ///    task back, pool-owned binding and key removed), so no resolved
+    ///    credential or automatically chosen account is carried over.
+    /// 3. The new identity is minted, the task composed from the common goal,
+    ///    the new roster and a catch-up line, and prepared like any start.
+    /// 4. [`Store::replace_pool_member`] rechecks everything atomically; a
+    ///    roster that moved meanwhile recomposes, a stale selection retries
+    ///    like a single start.
+    fn admit_replacement_with(
+        &self,
+        mut request: PoolReplace,
+        stale_retries: u32,
+        produce: &mut dyn FnMut(
+            &Store,
+            &agent_run_domain::catalog::ProviderCatalog,
+            &ProviderStartRequest,
+            u32,
+        ) -> Result<QuotaCandidateSet>,
+    ) -> Result<std::result::Result<PoolReplacement, PoolDenial>> {
+        request.validate()?;
+        let sha = agent_run_domain::canonical::sha256_hex(&serde_json::to_value(&request)?, true);
+        if let Some(found) = Store::open(&self.home)?.replay_pool_replacement(
+            &request.pool_id,
+            &request.request_id,
+            &sha,
+        )? {
+            return Ok(found);
+        }
+        let (config, revision) = self.current_provider_config()?;
+        let accounts = Store::open(&self.home)?.list_accounts()?;
+        let catalog = config.resolve_catalog(accounts)?;
+        let new_id = AgentId::new();
+        let (mut submission, mut recomposed) = (0, 0);
+        loop {
+            let store = Store::open(&self.home)?;
+            let context = match store.pool_replace_context(&request.pool_id, &request.agent_id)? {
+                Ok(context) => context,
+                Err(denied) => return Ok(Err(denied)),
+            };
+            let frozen = ProviderLaunchIdentity::read(&store.get(&context.old.agent_id)?)?;
+            let mut start = request.start.clone().unwrap_or_else(|| {
+                let mut original = frozen.provider_request.clone();
+                original.task = context.personal_task.clone();
+                original
+            });
+            start.request_id = None;
+            start.orchestrator = store.pool_binding(&request.pool_id)?;
+            let name = start
+                .display_name
+                .clone()
+                .unwrap_or_else(|| context.old.name.clone());
+            start.display_name = Some(name.clone());
+            let personal = start.task.clone();
+            let seat = PoolSeat {
+                slot: context.old.slot,
+                name: name.clone(),
+                role: context.old.role.clone(),
+                agent_id: new_id.clone(),
+            };
+            let roster: Vec<PoolSeat> = context
+                .seats
+                .iter()
+                .map(|member| {
+                    if member.slot == seat.slot {
+                        seat.clone()
+                    } else {
+                        PoolSeat {
+                            slot: member.slot,
+                            name: member.name.clone(),
+                            role: member.role.clone(),
+                            agent_id: member.agent_id.clone(),
+                        }
+                    }
+                })
+                .collect();
+            let proposal = context.current_proposal.map_or(String::new(), |seq| {
+                format!(" The current proposal is #{seq}.")
+            });
+            start.task = compose_member_task(
+                &context.pool_id,
+                &context.goal,
+                &context.acceptance,
+                &roster,
+                &seat,
+                &format!(
+                    "{personal}\n\nRoster change: you replace {} ({}) in slot {} at roster \
+                     revision {}. The pool log already holds entries up to #{}.{proposal} Call \
+                     pool_read with after_seq=0 first, before acting.",
+                    context.old.name,
+                    context.old.agent_id,
+                    seat.slot,
+                    context.roster_revision + 1,
+                    context.last_seq
+                ),
+            )?;
+            start.validate()?;
+            let prepared = prepare_provider(&config, &revision, &catalog, start)?;
+            let candidates = produce(&store, &catalog, &prepared.request, submission)?;
+            let outcome = Store::open(&self.home)?.replace_pool_member(PoolReplaceInput {
+                pool_id: &request.pool_id,
+                old: &request.agent_id,
+                request_id: &request.request_id,
+                request_sha256: &sha,
+                expected_roster_revision: context.roster_revision,
+                new_id: new_id.clone(),
+                name: &name,
+                personal_task: &personal,
+                catalog: &catalog,
+                inputs: AdmissionInputs {
+                    request: &prepared.request,
+                    effective: &prepared.effective,
+                    authority: &prepared.authority,
+                    candidates: &candidates,
+                    identity: &prepared.identity,
+                    global_cap: config.core.max_active_agents,
+                    harness_cap: prepared.cap,
+                    pinned: prepared.pinned.as_ref(),
+                },
+            });
+            match outcome {
+                Ok(Err(PoolDenial::StaleRoster { .. })) if recomposed < 3 => recomposed += 1,
+                Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
+                    if stale_retries > 0 && submission == stale_retries =>
+                {
+                    return Err(QuotaAdmissionError::SelectionBusy { stale_retries }.into());
+                }
+                Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
+                    if submission < stale_retries =>
+                {
+                    submission += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// Replaces a pool member and hands the new execution to the normal
+    /// detached supervisor after commit. The old retirement is never rolled
+    /// back: a launch failure ends the new member terminally with its exact
+    /// identity visible, and it can itself be replaced.
+    pub async fn replace_pool_member(
+        &self,
+        request: PoolReplace,
+    ) -> Result<std::result::Result<Value, PoolDenial>> {
+        let admitted = self.admit_pool_replacement(request)?;
+        self.hand_off_replacement(admitted).await
+    }
+
+    /// [`Self::replace_pool_member`] over a fixed trusted candidate set.
+    pub async fn replace_pool_member_trusted(
+        &self,
+        request: PoolReplace,
+        candidates: QuotaCandidateSet,
+    ) -> Result<std::result::Result<Value, PoolDenial>> {
+        let admitted = self.admit_pool_replacement_trusted(request, candidates)?;
+        self.hand_off_replacement(admitted).await
+    }
+
+    /// Launches a newly created replacement and renders the public result.
+    async fn hand_off_replacement(
+        &self,
+        admitted: std::result::Result<PoolReplacement, PoolDenial>,
+    ) -> Result<std::result::Result<Value, PoolDenial>> {
+        let replacement = match admitted {
+            Ok(replacement) => replacement,
+            Err(denied) => return Ok(Err(denied)),
+        };
+        if replacement.created {
+            let mut single = json!({"created": true, "agent_id": replacement.new.agent_id});
+            let _ = self.hand_off_provider(&mut single).await;
+        }
+        let store = Store::open(&self.home)?;
+        Ok(Ok(json!({
+            "pool_id": replacement.pool_id,
+            "created": replacement.created,
+            "roster_revision": replacement.roster_revision,
+            "replaced": {"agent_id": replacement.old.agent_id, "name": replacement.old.name,
+                         "role": replacement.old.role},
+            "member": {"agent_id": replacement.new.agent_id, "name": replacement.new.name,
+                       "role": replacement.new.role,
+                       "status": store.get(&replacement.new.agent_id)?.status.as_str()},
+        })))
+    }
+
+    /// Launches each member of a freshly created pool, then re-reads statuses.
+    async fn hand_off_pool(&self, mut result: Value) -> Result<Value> {
+        if result["created"] == true {
+            let members = result["members"].as_array().cloned().unwrap_or_default();
+            for member in &members {
+                let mut single = json!({"created": true, "agent_id": member["agent_id"]});
+                // A failure of one member is recorded on that member; it must
+                // not abandon the members after it.
+                let _ = self.hand_off_provider(&mut single).await;
+            }
+            let store = Store::open(&self.home)?;
+            for member in result["members"].as_array_mut().into_iter().flatten() {
+                let id: AgentId = serde_json::from_value(member["agent_id"].clone())?;
+                member["status"] = json!(store.get(&id)?.status.as_str());
+            }
+        }
+        Ok(result)
+    }
+
+    /// Renders the public pool admission: stable identities, names, roles and
+    /// current statuses only.
+    ///
+    /// `bound` reflects the durable shared binding stored on the pool row,
+    /// not the shape of the request that happened to be replayed, and a
+    /// replaced or pruned original member reports `status: null` instead of
+    /// failing the whole view.
+    fn pool_view(&self, store: &Store, pool: &PoolAdmission) -> Result<Value> {
+        let bound: bool = store.conn.query_row(
+            "SELECT orchestrator_session_id IS NOT NULL FROM pools WHERE id=?",
+            [pool.pool_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let roster_revision: u32 = store.conn.query_row(
+            "SELECT roster_revision FROM pools WHERE id=?",
+            [pool.pool_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let members = pool
+            .members
+            .iter()
+            .map(|member| {
+                Ok(json!({
+                    "agent_id": member.agent_id,
+                    "name": member.name,
+                    "role": member.role,
+                    "status": store.get(&member.agent_id).ok().map(|row| row.status.as_str()),
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(json!({
+            "pool_id": pool.pool_id, "created": pool.created, "bound": bound,
+            "roster_revision": roster_revision, "members": members,
+        }))
+    }
+
     pub async fn start(&self, mut request: StartRequest) -> Result<Value> {
         request.validate()?;
         if request.runtime == "opencode" {
@@ -771,13 +1180,18 @@ impl Service {
     /// legacy revisions remain pending until their supervisor rematerializes them.
     /// On a schema-2 home a schema-1 run refuses with
     /// `legacy_continuation_unavailable` and writes nothing; a provider run
-    /// continues through [`Self::admit_provider_resume`].
+    /// continues through [`Self::admit_provider_resume`]. `display_name` inherits
+    /// when absent and otherwise replaces the label after normalization; it
+    /// participates in request-id replay. The supplied task becomes the next
+    /// native turn; timeout and orchestrator overrides keep existing bounds.
+    /// Admission is durable before supervisor handoff; replay launches nothing.
     pub async fn resume(
         &self,
         id: &AgentId,
         task: String,
         timeout: Option<f64>,
         request_id: Option<String>,
+        display_name: Option<String>,
         orchestrator: Option<OrchestratorRef>,
     ) -> Result<Value> {
         let parent = Store::open(&self.home)?.get(id)?;
@@ -794,8 +1208,14 @@ impl Service {
             .as_ref()
             .is_some_and(|identity| identity["provider_identity_version"] == 2);
         if provider_row {
-            let mut result =
-                self.admit_provider_resume(&parent, task, timeout, request_id, orchestrator)?;
+            let mut result = self.admit_provider_resume(
+                &parent,
+                task,
+                timeout,
+                request_id,
+                display_name,
+                orchestrator,
+            )?;
             self.hand_off_provider(&mut result).await?;
             return Ok(result);
         }
@@ -832,6 +1252,10 @@ impl Service {
         let mut request = parent.request.clone();
         request.task = task;
         request.request_id = request_id;
+        // An omitted label inherits the parent's; an explicit one replaces it.
+        if display_name.is_some() {
+            request.display_name = display_name;
+        }
         // A newly requested timeout is scaled once; an inherited one is the
         // parent's already-effective allowance and is reused unscaled, so the
         // configured margin never compounds across a lineage.
@@ -890,26 +1314,42 @@ impl Service {
     /// parent's own account.
     ///
     /// Refuses with `continuation_unavailable` when the sealed assets or the
-    /// native history cannot be proved (see [`crate::continuity::prove`]),
+    /// native history cannot be proved by `verify_recorded_history`,
     /// and with a validation error when the current configuration no longer
     /// offers the provider, harness, connection or model. Admission itself
     /// proves the parent terminal, quiescent and cleaned up, and admits at
-    /// most one child per parent.
+    /// most one child per parent. `display_name` inherits the frozen label when
+    /// absent, or supplies a normalized replacement; a changed label with the
+    /// same request id is `Conflict`. Task, timeout and orchestrator overrides
+    /// remain subject to their normal validation. Returns a durable admission
+    /// snapshot; this method does not launch the supervisor.
     pub fn admit_provider_resume(
         &self,
         parent: &Record,
         task: String,
         timeout: Option<f64>,
         request_id: Option<String>,
+        display_name: Option<String>,
         orchestrator: Option<OrchestratorRef>,
     ) -> Result<Value> {
         let frozen = ProviderLaunchIdentity::read(parent)?;
         let mut request = frozen.provider_request.clone();
         request.task = task;
         request.request_id = request_id;
+        // An omitted label inherits the parent's frozen one; an explicit
+        // label replaces it and becomes part of the replay identity.
+        if display_name.is_some() {
+            request.display_name = display_name;
+        }
         request.timeout_seconds = timeout.or(frozen.provider_request.timeout_seconds);
         if orchestrator.is_some() {
             request.orchestrator = orchestrator;
+        } else if let Some(shared) =
+            Store::open(&self.home)?.member_pool_binding(&parent.root_agent_id)?
+        {
+            // A pool member's new execution joins the pool's actual shared
+            // binding, which may have been established after the first start.
+            request.orchestrator = Some(shared);
         }
         request.validate()?;
         // Replay of the original resume intent precedes every mutable read.
@@ -1044,6 +1484,7 @@ impl Service {
         let mut effective = parent.request.clone();
         effective.task = request.task.clone();
         effective.request_id = request.request_id.clone();
+        effective.display_name = request.display_name.clone();
         // A resume's newly requested timeout is scaled once by the current
         // configuration; an inherited one keeps the parent's already-effective
         // allowance (never the frozen pre-margin base), so the margin is
@@ -1191,14 +1632,26 @@ impl Service {
     /// Share revision waiting and pagination with the stable public agent list.
     pub(crate) async fn list_selected(&self, query: Query, latest: bool) -> Result<Value> {
         query.validate()?;
-        let until = tokio::time::Instant::now() + Duration::from_secs_f64(query.wait_seconds);
+        let started = tokio::time::Instant::now();
+        let until = started + Duration::from_secs_f64(query.wait_seconds);
         loop {
             let value = {
                 let store = Store::open(&self.home)?;
                 let revision = store.revision()?;
-                if query.after_revision.is_some_and(|r| revision <= r)
-                    && tokio::time::Instant::now() < until
-                {
+                let message_revision = store.message_revision()?;
+                // Journal rows never advance the event revision, so a
+                // transcript watermark explicitly opts into waking on
+                // transcript and tool-count progress. Pure journal wakes are
+                // paced: they take effect at most one second after the wait
+                // began, which bounds snapshot rebuilds to once per second
+                // per follower during heavy streaming, while event wakes keep
+                // their immediate historical behavior.
+                let events_advanced = query.after_revision.is_none_or(|r| revision > r);
+                let journal_advanced = query
+                    .after_message_revision
+                    .is_some_and(|m| message_revision > m)
+                    && started.elapsed() >= Duration::from_secs(1);
+                if tokio::time::Instant::now() < until && !events_advanced && !journal_advanced {
                     None
                 } else {
                     let list = if latest {
@@ -1219,7 +1672,7 @@ impl Service {
                         .collect::<Result<Vec<_>>>()?;
                     let next = query.offset.saturating_add(items.len());
                     Some(
-                        json!({"items":items,"total":total,"offset":query.offset,"limit":query.limit,"next_offset":if next<total as usize{Some(next)}else{None},"complete":next>=total as usize,"revision":revision,"observed_at":now()}),
+                        json!({"items":items,"total":total,"offset":query.offset,"limit":query.limit,"next_offset":if next<total as usize{Some(next)}else{None},"complete":next>=total as usize,"revision":revision,"message_revision":message_revision,"observed_at":now()}),
                     )
                 }
             };
@@ -1272,6 +1725,12 @@ impl Service {
             tokio::time::sleep(sleep).await;
         }
     }
+    /// Projects the exact execution `row` using committed evidence in `store`.
+    /// Includes the admitted human name, nullable recorded native usage and
+    /// complete lineage totals, plus lifecycle, delivery and process observations
+    /// at the current UTC time. Missing measurements remain null. No state is
+    /// written and no process is launched; store/serialization errors propagate.
+    /// Public transports subsequently normalize execution identity to the root.
     pub fn view(&self, store: &Store, row: &Record) -> Result<Value> {
         let observed = now();
         let progress = store.last_progress(&row.id)?;
@@ -1299,9 +1758,10 @@ impl Service {
             .identity
             .as_ref()
             .and_then(|i| i.get("effective_policy"));
-        let mut view = json!({"agent_id":row.id,"runtime":row.request.runtime,"model":row.request.model,"profile":row.request.profile,"task_summary":row.request.task.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect::<String>(),"status":row.status,
+        let mut view = json!({"agent_id":row.id,"name":row.display_name,"runtime":row.request.runtime,"model":row.request.model,"profile":row.request.profile,"task_summary":row.request.task.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect::<String>(),"status":row.status,
             "created_at":row.created_at,"started_at":row.started_at,"finished_at":row.finished_at,"elapsed_seconds":(row.finished_at.unwrap_or(observed)-row.started_at.unwrap_or(row.created_at)).max(0.0),"last_progress_at":progress,"silence_seconds":if row.status.terminal(){None}else{Some((observed-progress.or(row.started_at).unwrap_or(row.created_at)).max(0.0))},"warned":false,"failure_kind":row.failure_kind,"failure_text":row.failure_text,"answer_available":row.answer_path.is_some(),"answer_bytes":row.answer_bytes,"answer_sha256":row.answer_sha256,"effort":row.request.effort,
-            "delivery":store.delivery_status(&row.id)?,"parent_agent_id":row.parent_agent_id,"root_agent_id":row.root_agent_id,"sequence":row.sequence,"cleanup":store.last_event(&row.id,"process_cleanup")?,"policy":policy,"phase":phase,"phase_started_at":row.finished_at.or(row.started_at).unwrap_or(row.created_at),"process_state":process::observe(row.supervisor_pid,row.supervisor_identity.as_deref(),row.supervisor_birth_time),"observed_at":observed,"runtime_outcome":if row.status.terminal(){Some(row.status.as_str())}else{None},"acceptance":"pending","workdir":row.request.workdir.display().to_string()});
+            "delivery":store.delivery_status(&row.id)?,"parent_agent_id":row.parent_agent_id,"root_agent_id":row.root_agent_id,"sequence":row.sequence,"cleanup":store.last_event(&row.id,"process_cleanup")?,"policy":policy,"phase":phase,"phase_started_at":row.finished_at.or(row.started_at).unwrap_or(row.created_at),"process_state":process::observe(row.supervisor_pid,row.supervisor_identity.as_deref(),row.supervisor_birth_time),"observed_at":observed,"runtime_outcome":if row.status.terminal(){Some(row.status.as_str())}else{None},"acceptance":"pending","workdir":row.request.workdir.display().to_string(),
+            "usage":store.usage_view(&row.id)?,"usage_cumulative":store.usage_cumulative(&row.root_agent_id)?,"tool_counts":store.tool_counts(&row.id)?});
         let mcp = agent_run_store::projections::selected_mcp(row.identity.as_ref());
         if !mcp.is_empty() {
             view["mcp"] = serde_json::to_value(mcp)?;
@@ -1314,7 +1774,15 @@ impl Service {
     /// never treats unavailable OS evidence as a terminal outcome.
     pub fn reconcile(&self) -> Result<usize> {
         let mut store = Store::open(&self.home)?;
-        Ok(reconcile::reconcile(&mut store, 100)?.len())
+        let reconciled = reconcile::reconcile(&mut store, 100)?.len();
+        // Bounded pool convergence for crashes, reconciled losses and cleanup
+        // proof that landed after the terminal write; a failure never hides
+        // the reconciliation result.
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs() as usize);
+        let _ = store.settle_open_pools(POOL_SWEEP_LIMIT, seed);
+        Ok(reconciled)
     }
     /// Returns the active cached config revision after the request-boundary
     /// digest check; an invalid edit keeps the last valid revision active.
@@ -1608,4 +2076,150 @@ pub(crate) fn verify_recorded_history(
         ));
     }
     crate::continuity::verify(&seal, frozen.authority.harness, session)
+}
+
+/// Everything the store needs to admit one provider request, derived without
+/// touching the database.
+pub(crate) struct Prepared {
+    /// The validated request exactly as frozen into the identity.
+    pub(crate) request: ProviderStartRequest,
+    /// Effective storage request.
+    pub(crate) effective: StartRequest,
+    /// Resolved launch authority.
+    pub(crate) authority: ResolvedLaunchAuthority,
+    /// Serialized frozen launch identity.
+    pub(crate) identity: Value,
+    /// Per-harness active-run cap.
+    pub(crate) cap: Option<usize>,
+    /// Account pinned by the request label.
+    pub(crate) pinned: Option<agent_run_domain::AccountId>,
+}
+
+/// Resolves role, authority, effective request and frozen identity for one
+/// provider request from an already loaded configuration and catalog, with no
+/// database access. Shared by single starts and pool admission so both freeze
+/// exactly the same facts.
+pub(crate) fn prepare_provider(
+    config: &ProviderConfig,
+    revision: &str,
+    catalog: &agent_run_domain::catalog::ProviderCatalog,
+    request: ProviderStartRequest,
+) -> Result<Prepared> {
+    let provider = catalog
+        .provider(&request.provider)
+        .ok_or_else(|| invalid("provider is not configured"))?;
+    let offering = provider
+        .models
+        .iter()
+        .find(|model| model.id == request.model)
+        .ok_or_else(|| invalid("model is not offered by provider"))?;
+    let effective_effort = request
+        .effort
+        .clone()
+        .or_else(|| offering.params.get("effort").cloned());
+    offering.permits_effort(effective_effort.as_deref())?;
+    // Harness options run through the existing launch mechanisms: fast
+    // is the codex service tier, output_schema the claude answer schema.
+    if request.fast && provider.harness != agent_run_domain::catalog::HarnessId::Codex {
+        return Err(invalid("fast mode is supported only by the codex harness"));
+    }
+    if request.output_schema.is_some()
+        && provider.harness != agent_run_domain::catalog::HarnessId::ClaudeCode
+    {
+        return Err(invalid(
+            "output_schema is supported only by the claude-code harness",
+        ));
+    }
+    let pinned = request
+        .account
+        .as_ref()
+        .map(|label| {
+            provider
+                .binding(label.as_str())
+                .ok_or_else(|| invalid("account label is not bound to provider"))
+                .map(|binding| binding.account.clone())
+        })
+        .transpose()?;
+    let mut profile = profiles::load_provider(config, &request)?;
+    profile
+        .required_constraints
+        .extend(offering.restrictions.iter().copied());
+    let role = role_plan::resolve_role_plan(
+        &profile,
+        config.skills_dir(),
+        &config.mcp,
+        if request.account.is_some() {
+            "account"
+        } else {
+            "global"
+        },
+        request.account.as_ref().map(|label| label.as_str()),
+    )?;
+    let mut effective = request.storage_projection();
+    effective.effort = effective_effort.clone();
+    effective.write = profile.write;
+    effective.read_roots = profile.read_roots.clone();
+    effective.required_constraints = profile.required_constraints.clone();
+    effective.timeout_seconds = Some(
+        config
+            .core
+            .effective_timeout_seconds(effective.timeout_seconds)?,
+    );
+    let eligible_accounts = provider
+        .bindings
+        .iter()
+        .filter(|binding| {
+            binding
+                .models
+                .as_ref()
+                .is_none_or(|models| models.contains(&request.model))
+        })
+        .filter(|binding| {
+            catalog
+                .account(&binding.account)
+                .is_some_and(|record| record.status == AccountStatus::Enabled)
+        })
+        .map(|binding| binding.account.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let authority = ResolvedLaunchAuthority {
+        provider: request.provider.clone(),
+        harness: provider.harness,
+        connection: provider.connection.clone(),
+        model: request.model.clone(),
+        effort: effective_effort,
+        profile: profile.name,
+        workdir: request.workdir.clone(),
+        role_payload: role.to_payload(),
+        assets_sha256: Sha256Digest::from_str(&"0".repeat(64))?,
+        eligible_accounts,
+    };
+    let identity = ProviderLaunchIdentity {
+        provider_identity_version: 2,
+        replay_request_sha256: agent_run_domain::canonical::sha256_hex(
+            &serde_json::to_value(&request)?,
+            true,
+        ),
+        provider_request: request.clone(),
+        provider_config_sha256: revision.to_owned(),
+        provider_config: config.clone(),
+        provider_config_snapshot: config.snapshot()?,
+        authority: authority.clone(),
+        runtime_home: None,
+        snapshot_sha256: None,
+    };
+    let cap = config
+        .harnesses
+        .get(&provider.harness)
+        .ok_or_else(|| invalid("provider harness is not configured"))?
+        .max_active_agents;
+    Ok(Prepared {
+        request,
+        effective,
+        authority,
+        identity: serde_json::to_value(identity)?,
+        cap,
+        pinned,
+    })
 }

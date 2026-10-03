@@ -392,91 +392,162 @@ impl Store {
             }
             None => None,
         };
-        candidates.validate()?;
-        authority.validate()?;
-        let definition = catalog
-            .provider(&request.provider)
-            .ok_or_else(|| invalid("provider is not configured"))?;
-        if candidates.provider != request.provider
-            || candidates.model != request.model
-            || authority.provider != request.provider
-            || authority.model != request.model
-            || authority.harness != definition.harness
-            || authority.connection != definition.connection
-            || authority.profile != request.profile
-            || authority.workdir != effective.workdir
-            || effective.runtime != request.provider.as_str()
-            || effective.model != request.model
-            || effective.task != request.task
-            || global_cap == 0
-            || harness_cap == Some(0)
-            || identity["provider_identity_version"] != 2
-            || identity["provider_request"] != serde_json::to_value(request)?
-            || identity["authority"] != serde_json::to_value(authority)?
-            || identity["replay_request_sha256"]
-                != canonical::sha256_hex(&serde_json::to_value(request)?, true)
-            || !matches!(
-                (&candidates.intent, pinned),
-                (SelectionIntent::Auto, None) | (SelectionIntent::Pinned(_), Some(_))
-            )
-            || pinned.is_some_and(|account| !matches!(&candidates.intent, SelectionIntent::Pinned(id) if id == account))
-        {
-            return Err(invalid("provider admission inputs disagree"));
-        }
-        let revision = Store::quota_capacity_revision_in(&tx)?;
-        if revision != candidates.capacity_revision {
-            return Err(QuotaAdmissionError::SelectionStale {
-                committed_capacity_revision: candidates.capacity_revision,
-                current_capacity_revision: revision,
-            }
-            .into());
-        }
-        let global: i64 = tx.query_row(
-            &format!("SELECT COUNT(*) FROM agents WHERE status IN {ACTIVE_SQL}"),
-            [],
-            |row| row.get(0),
+        let inputs = AdmissionInputs {
+            request,
+            effective,
+            authority,
+            candidates,
+            identity,
+            global_cap,
+            harness_cap,
+            pinned,
+        };
+        let admission = admit_in_tx(
+            &tx,
+            catalog,
+            AgentId::new(),
+            &inputs,
+            resume.zip(lineage.as_ref()),
         )?;
-        let harness: i64 = tx.query_row(
+        Store::advance_quota_capacity_revision(&tx)?;
+        tx.commit()?;
+        Ok(admission)
+    }
+}
+
+/// Borrowed, trusted inputs of one provider admission.
+pub struct AdmissionInputs<'a> {
+    /// Strict provider request exactly as frozen into the identity.
+    pub request: &'a ProviderStartRequest,
+    /// Effective storage request derived from it.
+    pub effective: &'a StartRequest,
+    /// Resolved launch authority.
+    pub authority: &'a ResolvedLaunchAuthority,
+    /// Trusted ranked candidates for the committed capacity revision.
+    pub candidates: &'a QuotaCandidateSet,
+    /// Frozen non-secret launch identity.
+    pub identity: &'a Value,
+    /// Global active-run cap.
+    pub global_cap: usize,
+    /// Optional per-harness active-run cap.
+    pub harness_cap: Option<usize>,
+    /// Account pinned by the request label, if any.
+    pub pinned: Option<&'a AccountId>,
+}
+
+/// Writes one agent admission inside the caller's immediate transaction.
+///
+/// `id` is injected so a batch can reserve every stable identity before any
+/// row exists. The inputs are re-verified against each other, the candidate
+/// revision against the committed one, and the global and harness caps and
+/// reservations against rows already written in this transaction, so earlier
+/// batch members count. The caller commits and advances the quota capacity
+/// revision exactly once; this function does neither.
+pub(crate) fn admit_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    catalog: &ProviderCatalog,
+    id: AgentId,
+    inputs: &AdmissionInputs<'_>,
+    lineage: Option<(ProviderResume<'_>, &lineage::ResumeLineage)>,
+) -> Result<ProviderAdmission> {
+    let AdmissionInputs {
+        request,
+        effective,
+        authority,
+        candidates,
+        identity,
+        global_cap,
+        harness_cap,
+        pinned,
+    } = *inputs;
+    let resume = lineage.map(|(resume, _)| resume);
+    candidates.validate()?;
+    authority.validate()?;
+    let definition = catalog
+        .provider(&request.provider)
+        .ok_or_else(|| invalid("provider is not configured"))?;
+    if candidates.provider != request.provider
+        || candidates.model != request.model
+        || authority.provider != request.provider
+        || authority.model != request.model
+        || authority.harness != definition.harness
+        || authority.connection != definition.connection
+        || authority.profile != request.profile
+        || authority.workdir != effective.workdir
+        || effective.runtime != request.provider.as_str()
+        || effective.model != request.model
+        || effective.task != request.task
+        || effective.display_name != request.display_name
+        || global_cap == 0
+        || harness_cap == Some(0)
+        || identity["provider_identity_version"] != 2
+        || identity["provider_request"] != serde_json::to_value(request)?
+        || identity["authority"] != serde_json::to_value(authority)?
+        || identity["replay_request_sha256"]
+            != canonical::sha256_hex(&serde_json::to_value(request)?, true)
+        || !matches!(
+            (&candidates.intent, pinned),
+            (SelectionIntent::Auto, None) | (SelectionIntent::Pinned(_), Some(_))
+        )
+        || pinned.is_some_and(
+            |account| !matches!(&candidates.intent, SelectionIntent::Pinned(id) if id == account),
+        )
+    {
+        return Err(invalid("provider admission inputs disagree"));
+    }
+    let revision = Store::quota_capacity_revision_in(tx)?;
+    if revision != candidates.capacity_revision {
+        return Err(QuotaAdmissionError::SelectionStale {
+            committed_capacity_revision: candidates.capacity_revision,
+            current_capacity_revision: revision,
+        }
+        .into());
+    }
+    let global: i64 = tx.query_row(
+        &format!("SELECT COUNT(*) FROM agents WHERE status IN {ACTIVE_SQL}"),
+        [],
+        |row| row.get(0),
+    )?;
+    let harness: i64 = tx.query_row(
             &format!("SELECT COUNT(*) FROM agents WHERE status IN {ACTIVE_SQL} AND json_extract(identity_json,'$.authority.harness')=?"),
             [authority.harness.as_str()], |row| row.get(0),
         )?;
-        if global >= global_cap as i64 || harness_cap.is_some_and(|cap| harness >= cap as i64) {
-            return Err(Error::Capacity);
-        }
-        let candidate = choose(
-            &tx,
-            catalog,
-            &request.provider,
-            &request.model,
-            authority,
-            candidates,
-            pinned,
-            resume.map(|resume| resume.prefer),
-            &std::collections::BTreeSet::new(),
-        )?;
-        let at = now();
-        let session = admission::upsert_session(&tx, effective, at)?;
-        let id = AgentId::new();
-        let attempt_id = format!("att_{}", uuid::Uuid::new_v4().simple());
-        let summary: String = request
-            .task
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(160)
-            .collect();
-        let (root, sequence, resumed) = match &lineage {
-            Some(lineage) => (
-                lineage.root_agent_id.clone(),
-                lineage.sequence,
-                Some(lineage.runtime_session_id.as_str()),
-            ),
-            None => (id.clone(), 1, None),
-        };
-        let inserted = tx.execute(
-            "INSERT INTO agents(id,request_id,orchestrator_session_id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,parent_agent_id,root_agent_id,sequence,resume_of_runtime_session_id,identity_json,selection_intent,requested_account_id) \
-             VALUES(?,?,?,?,?,?,?,?,?,?,'starting',?,?,'pending:provider-v2',?,?,?,?,?,?,?)",
+    if global >= global_cap as i64 || harness_cap.is_some_and(|cap| harness >= cap as i64) {
+        return Err(Error::Capacity);
+    }
+    let candidate = choose(
+        tx,
+        catalog,
+        &request.provider,
+        &request.model,
+        authority,
+        candidates,
+        pinned,
+        resume.map(|resume| resume.prefer),
+        &std::collections::BTreeSet::new(),
+    )?;
+    let at = now();
+    let session = admission::upsert_session(tx, effective, at)?;
+    let attempt_id = format!("att_{}", uuid::Uuid::new_v4().simple());
+    let summary: String = request
+        .task
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(160)
+        .collect();
+    let (root, sequence, resumed) = match lineage {
+        Some((_, lineage)) => (
+            lineage.root_agent_id.clone(),
+            lineage.sequence,
+            Some(lineage.runtime_session_id.as_str()),
+        ),
+        None => (id.clone(), 1, None),
+    };
+    let inserted = tx.execute(
+            "INSERT INTO agents(id,request_id,orchestrator_session_id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,parent_agent_id,root_agent_id,sequence,resume_of_runtime_session_id,identity_json,selection_intent,requested_account_id,display_name) \
+             VALUES(?,?,?,?,?,?,?,?,?,?,'starting',?,?,'pending:provider-v2',?,?,?,?,?,?,?,?)",
             params![id.as_str(), request.request_id, session, request.provider.as_str(),
                 request.model, request.profile, request.task, summary,
                 effective.workdir.to_string_lossy(), serde_json::to_string(effective)?,
@@ -484,71 +555,69 @@ impl Store {
                 resume.map(|resume| resume.parent.as_str()), root.as_str(), sequence, resumed,
                 serde_json::to_string(identity)?,
                 if pinned.is_some() { "pinned" } else { "auto" },
-                pinned.map(AccountId::as_str)],
+                pinned.map(AccountId::as_str),
+                effective.display_name],
         );
-        match inserted {
-            Err(rusqlite::Error::SqliteFailure(error, _))
-                if error.code == rusqlite::ErrorCode::ConstraintViolation && resume.is_some() =>
-            {
-                return Err(invalid(format!(
-                    "agent {} has already been resumed",
-                    resume
-                        .map(|resume| resume.parent.as_str())
-                        .unwrap_or_default()
-                )));
-            }
-            other => {
-                other?;
-            }
+    match inserted {
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if error.code == rusqlite::ErrorCode::ConstraintViolation && resume.is_some() =>
+        {
+            return Err(invalid(format!(
+                "agent {} has already been resumed",
+                resume
+                    .map(|resume| resume.parent.as_str())
+                    .unwrap_or_default()
+            )));
         }
-        if let Ok(owner) = process::inspect(std::process::id() as i32) {
-            tx.execute(
-                "UPDATE agents SET startup_owner_pid_identity=?,startup_owner_birth_time=? WHERE id=?",
-                params![serde_json::to_string(&owner)?, owner.birth, id.as_str()],
-            )?;
+        other => {
+            other?;
         }
+    }
+    if let Ok(owner) = process::inspect(std::process::id() as i32) {
         tx.execute(
+            "UPDATE agents SET startup_owner_pid_identity=?,startup_owner_birth_time=? WHERE id=?",
+            params![serde_json::to_string(&owner)?, owner.birth, id.as_str()],
+        )?;
+    }
+    tx.execute(
             "INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,selected_account_id,phase,ownership_active) \
              VALUES(?,?,1,'prepared','{}',?,?,'prepared',1)",
             params![attempt_id, id.as_str(), at, candidate.account.as_str()],
         )?;
-        if identity
-            .pointer("/provider_config/services")
-            .and_then(Value::as_object)
-            .is_some_and(|services| !services.is_empty())
-        {
-            tx.execute(
-                "INSERT INTO agent_service_gates(agent_id,state) VALUES (?,'pending')",
-                [id.as_str()],
-            )?;
-        }
-        for key in &candidate.physical_keys {
-            tx.execute(
-                "INSERT INTO attempt_quota_keys(attempt_id,quota_key) VALUES(?,?)",
-                params![attempt_id, key.as_str()],
-            )?;
-        }
-        Store::advance_quota_capacity_revision(&tx)?;
-        tx_event(&tx, &id, "created", None, Some(Status::Created), &json!({}))?;
-        tx_event(
-            &tx,
-            &id,
-            "start_accepted",
-            Some(Status::Created),
-            Some(Status::Starting),
-            &match resume {
-                Some(resume) => json!({"durable_admission":true,"resume_of":resume.parent}),
-                None => json!({"durable_admission":true}),
-            },
+    if identity
+        .pointer("/provider_config/services")
+        .and_then(Value::as_object)
+        .is_some_and(|services| !services.is_empty())
+    {
+        tx.execute(
+            "INSERT INTO agent_service_gates(agent_id,state) VALUES (?,'pending')",
+            [id.as_str()],
         )?;
-        tx.commit()?;
-        Ok(ProviderAdmission {
-            agent_id: id,
-            attempt_id,
-            account_id: candidate.account.clone(),
-            created: true,
-        })
     }
+    for key in &candidate.physical_keys {
+        tx.execute(
+            "INSERT INTO attempt_quota_keys(attempt_id,quota_key) VALUES(?,?)",
+            params![attempt_id, key.as_str()],
+        )?;
+    }
+    tx_event(tx, &id, "created", None, Some(Status::Created), &json!({}))?;
+    tx_event(
+        tx,
+        &id,
+        "start_accepted",
+        Some(Status::Created),
+        Some(Status::Starting),
+        &match resume {
+            Some(resume) => json!({"durable_admission":true,"resume_of":resume.parent}),
+            None => json!({"durable_admission":true}),
+        },
+    )?;
+    Ok(ProviderAdmission {
+        agent_id: id,
+        attempt_id,
+        account_id: candidate.account.clone(),
+        created: true,
+    })
 }
 
 /// Chooses one candidate inside an admission or allocation transaction.

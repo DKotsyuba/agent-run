@@ -4,6 +4,84 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- feat(transcript): add the optional `blocks` view and bounded `tail_blocks`/
+  `before_cursor` paging over the existing transcript API; raw rows, cursors and
+  ordering stay unchanged, unknown identities never merge, and omitted or
+  spooled content is reported explicitly instead of dropped
+- feat(evidence): persist native tool-result failure flags with allowlisted
+  provenance (Claude `is_error`, Codex command/MCP markers), journal Codex tool
+  calls once per native id, and expose nullable latest-execution `tool_counts`
+  with unknown kept distinct from observed success
+- feat(pools): add the cooperative-pool foundation: validated provider-neutral
+  domain types, one compact English entry renderer that stamps the author and
+  marks the body untrusted, and the schema below
+- feat(pools): admit a pool's members, reservations and roster atomically in one
+  store transaction and compose each member's task with the shared goal and every
+  peer's stable identity before launch
+- feat(pools): give members a fixed private tool catalog (notify, chat, read,
+  propose, vote) over one authenticated broker route: authors are stamped from
+  durable membership, refusals are typed codes, reads page the append-only log
+  by cursor with an optional bounded wait and render plain-text entries, and
+  derived vote status is reported without ever completing the pool
+- feat(pools): enqueue every new pool entry, and a member's notify team copy,
+  for each peer's tip in the same transaction; delivery records only a finite
+  disposition (native accepted, written, rejected, unsent, refused, unknown),
+  never consumption, and the orchestrator's notice for a pool member's report
+  carries the stamped sender
+- feat(pools): add core operator operations: post a stamped operator message,
+  read a pool's status and log, and replace a terminal, fully cleaned member
+  atomically with a roster change, a broker roster entry and a replayable result
+- feat(pools): complete a pool only when every current member voted ready on the
+  current proposal, ended successfully and has verified cleanup, in one
+  transaction that freezes one completion record and queues exactly one common
+  notice (Desktop relay `pool_completion`, Claude inbox text) naming no run,
+  attempt or session identity; unbound pools keep the notice waiting until a pool
+  binding exists; completed pools stay frozen if a member is resumed later
+
+- feat(pools): expose cooperative pools through the one shared tool table: MCP
+  tools `start_pool`, `pool_post`, `pool_replace` and `pool` with compact
+  per-tool pages (goal, criteria and proposal snapshot print only on a
+  from-the-start read or when new), matching CLI commands (`start-pool`,
+  `pool-post`, `pool-replace`, `pool`, `bind --pool`) and broker socket methods
+  on the control lane; whole-pool binding through the post-tool hook receipt or
+  `bind --pool`, inherited by replacements and resumed members; the private
+  worker catalog stays the fixed five tools
+- fix(delivery): stop duplicating Claude notices. The inbox sends no receipt for
+  an immediately accepted message, so a silent or interrupted send may already
+  have arrived and exactly-once cannot be proved. A possibly-sent Claude attempt
+  (`uds_unconfirmed`, or `uds_ambiguous` including any write error or timeout
+  after sending began) now ends `failed` with `ambiguous: true` after one
+  attempt instead of retrying up to three times; known-unsent attempts still
+  retry, and older queued `retry_wait` rows of that kind are ended without a
+  resend
+- fix(pools): retain every member lineage of a pool (replaced members, pending
+  and retrying linked notices, unproven cleanup) until the whole pool has
+  expired, then purge pool rows before agents; protected-only pools no longer
+  wake the maintenance writer, and settlement sweeps check readiness read-only
+- docs(pools): the completion notice marks a goal cut to its excerpt
+
+Database schema 25 adds the `pools`, `pool_members` and `pool_entries` tables
+with historical membership, one current member per slot and immutable
+author-at-send log entries; existing rows are untouched.
+
+Database schema 24 adds nullable `messages.error`/`error_source`,
+`content_complete` and the lineage index on `messages.root_agent_id`; historical
+rows keep unknown evidence and no backfill invents it. Upgrade existing homes
+through the paired `agent-run config migrate` procedure before restarting the
+broker. Configuration schema remains 2.
+
+## [0.20.0] - 2026-10-03
+
+- feat(agents): accept optional human display labels on start and resume, inherit
+  omitted labels, and show them in agent lists, the TUI and compact MCP output
+- feat(usage): expose nullable native usage for the latest execution and complete
+  lineage totals; record comparable Codex resume baselines before launch so
+  resumed counters report deltas without inventing missing measurements or turns
+
+Database schema 23 adds nullable `agents.display_name`; historical rows remain
+unnamed. Upgrade existing homes through the paired `agent-run config migrate`
+procedure before restarting the broker. Configuration schema remains 2.
+
 ## [0.19.5] - 2026-10-02
 
 - fix(mcp): answer `tools/list` on both the operator and the worker MCP surface

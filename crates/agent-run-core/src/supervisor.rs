@@ -1220,6 +1220,14 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 session,
             )?;
         }
+        // A resumed execution records its thread's usage baseline once, before
+        // the first launch, so its terminal statistics report this execution's
+        // delta instead of the whole native thread's cumulative total. The
+        // store guards applicability (parent session, runtime and model) and
+        // keeps every measurement null when no comparable baseline exists.
+        if identity.authority.harness == HarnessId::Codex {
+            store.record_resume_usage_baseline(id)?;
+        }
         #[cfg(feature = "test-fixtures")]
         spawn_barrier(home, &attempt_id, store)?;
         // A switched attempt re-checks, at the handoff itself, that its

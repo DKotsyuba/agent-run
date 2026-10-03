@@ -27,6 +27,38 @@ pub const HISTORY_SESSIONS: i64 = 100;
 /// Maximum rows removed from each large journal in one transaction.
 const ROW_BATCH: i64 = 2_000;
 
+/// SQL for one agent `x` that retention may treat as expired for a pool:
+/// terminal with a known finish time older than the cutoff (`?1`) or in a
+/// count-expired lineage (`retention_roots`), with no owned attempt, no attempt
+/// lacking verified cleanup, and no linked notice still queued or being sent.
+/// Notices that are `waiting_binding` do not protect: they have no recipient
+/// to wait for once the whole pool is otherwise expired (see
+/// [`POOL_RELEASABLE`]).
+const POOL_AGENT_EXPIRED: &str = "(x.status IN ('succeeded','failed','timed_out','cancelled','lost') \
+     AND x.finished_at IS NOT NULL \
+     AND (x.finished_at < ?1 OR COALESCE(NULLIF(x.root_agent_id,''),x.id) IN (SELECT root FROM retention_roots)) \
+     AND NOT EXISTS (SELECT 1 FROM attempts t WHERE t.agent_id=x.id \
+          AND (t.ownership_active=1 OR t.cleanup_proof_json IS NULL OR t.phase!='cleanup_complete')) \
+     AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.agent_id=x.id \
+          AND d.state IN ('pending','retry_wait','sending')))";
+
+/// SQL predicate on a `pools` row `p`: every execution of every member lineage,
+/// including replaced members, is expired by the ordinary age or count rule.
+/// Until then every member root of the pool is protected from collection.
+fn pool_releasable() -> String {
+    format!(
+        "NOT EXISTS (SELECT 1 FROM agents x WHERE COALESCE(NULLIF(x.root_agent_id,''),x.id) IN \
+         (SELECT m.agent_id FROM pool_members m WHERE m.pool_id=p.id) AND NOT {POOL_AGENT_EXPIRED})"
+    )
+}
+
+/// SQL defining `retention_roots` as a CTE with the count-expired lineages
+/// (everything ranked outside the newest [`HISTORY_SESSIONS`], bound as `?2`),
+/// for read-only queries that mirror the batch's temp table.
+const ROOTS_CTE: &str = "WITH retention_roots(root) AS (SELECT session FROM ( \
+     SELECT COALESCE(NULLIF(root_agent_id,''),id) AS session, MAX(created_at) AS latest \
+     FROM agents GROUP BY session ORDER BY latest DESC, session LIMIT -1 OFFSET ?2))";
+
 /// Safe structured SQLite result-code detail extracted from one store error.
 ///
 /// Only numeric result codes and static code names are captured. SQLite
@@ -410,19 +442,29 @@ impl Store {
     /// batch would delete nothing, so callers skip taking the database
     /// writer lock at all; WAL readers never block a concurrent writer.
     fn prune_work_pending(&self, cutoff: f64) -> Result<bool> {
+        let releasable = pool_releasable();
         let pending: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM workflow_runs
+            &format!(
+                "{ROOTS_CTE}
+             SELECT EXISTS(SELECT 1 FROM workflow_runs
                 WHERE status IN ('succeeded','failed','cancelled','lost') AND finished_at < ?1)
-             OR EXISTS(SELECT 1 FROM agents
-                WHERE status IN ('succeeded','failed','timed_out','cancelled','lost')
-                  AND finished_at < ?1)
+             OR EXISTS(SELECT 1 FROM agents a
+                WHERE a.status IN ('succeeded','failed','timed_out','cancelled','lost')
+                  AND (a.finished_at < ?1
+                       OR (a.finished_at IS NOT NULL
+                           AND COALESCE(NULLIF(a.root_agent_id,''),a.id) IN (SELECT root FROM retention_roots)))
+                  AND NOT EXISTS (SELECT 1 FROM pool_members m
+                                  WHERE m.agent_id=COALESCE(NULLIF(a.root_agent_id,''),a.id)))
+             OR EXISTS(SELECT 1 FROM pools p WHERE {releasable})
              OR EXISTS(SELECT 1 FROM capacity_samples WHERE observed_at < ?1)
              OR EXISTS(SELECT 1 FROM capacity_route_snapshots WHERE valid_until < ?1)
              OR EXISTS(SELECT 1 FROM managed_service_generations
                 WHERE state='stopped' AND COALESCE(checked_at,created_at) < ?1)
-             OR EXISTS(SELECT 1 FROM orchestrator_sessions WHERE last_seen_at < ?1)
-             OR (SELECT count(DISTINCT COALESCE(NULLIF(root_agent_id,''),id))
-                   FROM agents) > ?2",
+             OR EXISTS(SELECT 1 FROM orchestrator_sessions s WHERE s.last_seen_at < ?1
+                AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.orchestrator_session_id=s.id)
+                AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.orchestrator_session_id=s.id)
+                AND NOT EXISTS (SELECT 1 FROM pools q WHERE q.orchestrator_session_id=s.id))"
+            ),
             params![cutoff, HISTORY_SESSIONS],
             |row| row.get(0),
         )?;
@@ -470,6 +512,8 @@ impl Store {
              CREATE TEMP TABLE IF NOT EXISTS retention_services(id TEXT PRIMARY KEY);
              CREATE TEMP TABLE IF NOT EXISTS retention_sessions(id TEXT PRIMARY KEY);
              CREATE TEMP TABLE IF NOT EXISTS retention_roots(root TEXT PRIMARY KEY);
+             CREATE TEMP TABLE IF NOT EXISTS retention_pools(id TEXT PRIMARY KEY);
+             DELETE FROM retention_pools;
              DELETE FROM retention_agents; DELETE FROM retention_workflows;
              DELETE FROM retention_services; DELETE FROM retention_sessions;
              DELETE FROM retention_roots;",
@@ -490,6 +534,31 @@ impl Store {
                 ORDER BY latest DESC, session LIMIT -1 OFFSET ?)",
             [HISTORY_SESSIONS],
         )?;
+        // Pools: a pool whose every member lineage (replaced members included)
+        // has expired is released as a unit. Its log, roster and pool rows are
+        // purged before any underlying agent, delivery or session row, as the
+        // foreign keys require, and a common notice still waiting for a
+        // binding is expired explicitly instead of lingering forever. Pools
+        // that are not releasable keep every member root stored, below.
+        let mut deleted = 0;
+        let releasable = pool_releasable();
+        tx.execute(
+            &format!("INSERT INTO retention_pools SELECT p.id FROM pools p WHERE {releasable} ORDER BY p.id LIMIT 32"),
+            [cutoff],
+        )?;
+        deleted += tx.execute(
+            "UPDATE deliveries SET state='expired',lease_owner=NULL,lease_until=NULL,next_attempt_at=NULL,\
+             last_error='pool_binding_expired' WHERE state='waiting_binding' AND id IN \
+             (SELECT completion_delivery_id FROM pools WHERE id IN retention_pools)",
+            [],
+        )?;
+        for table in ["pool_entries", "pool_members"] {
+            deleted += tx.execute(
+                &format!("DELETE FROM {table} WHERE pool_id IN retention_pools"),
+                [],
+            )?;
+        }
+        deleted += tx.execute("DELETE FROM pools WHERE id IN retention_pools", [])?;
         tx.execute(
             "INSERT INTO retention_workflows
              SELECT w.id FROM workflow_runs w
@@ -503,7 +572,6 @@ impl Store {
              LIMIT 32",
             params![cutoff, at],
         )?;
-        let mut deleted = 0;
         for table in ["workflow_deliveries", "workflow_steps"] {
             deleted += tx.execute(
                 &format!("DELETE FROM {table} WHERE run_id IN retention_workflows"),
@@ -522,6 +590,7 @@ impl Store {
                       AND COALESCE(NULLIF(a.root_agent_id,''),a.id) IN retention_roots))
              AND NOT EXISTS (SELECT 1 FROM attempts t WHERE t.agent_id=a.id AND t.ownership_active=1)
              AND NOT EXISTS (SELECT 1 FROM agents child WHERE child.parent_agent_id=a.id)
+             AND NOT EXISTS (SELECT 1 FROM pool_members pm WHERE pm.agent_id=COALESCE(NULLIF(a.root_agent_id,''),a.id))
              AND NOT EXISTS (SELECT 1 FROM workflow_steps s WHERE s.agent_id=a.id)
              AND NOT EXISTS (SELECT 1 FROM managed_service_leases l WHERE l.agent_id=a.id AND l.released_at IS NULL)
              AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.agent_id=a.id AND d.state='sending'
@@ -625,6 +694,7 @@ impl Store {
             AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.orchestrator_session_id=s.id)
             AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.orchestrator_session_id=s.id)
             AND NOT EXISTS (SELECT 1 FROM workflow_runs w WHERE w.orchestrator_session_id=s.id)
+            AND NOT EXISTS (SELECT 1 FROM pools q WHERE q.orchestrator_session_id=s.id)
             AND NOT EXISTS (SELECT 1 FROM workflow_deliveries d WHERE d.orchestrator_session_id=s.id)
             LIMIT 32", [cutoff])?;
         deleted += tx.execute(

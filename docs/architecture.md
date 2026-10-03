@@ -94,11 +94,108 @@ authority, generated-home snapshot, history and cleanup proofs verify. See
 
 SQLite is the source of truth for agents, events, messages, answers, native
 session lineage, deliveries, cleanup evidence, capacity, and statistics. The
-current schema is version 22. Numbered migrations live in `sql/migrations/`
+current schema is version 25. Numbered migrations live in `sql/migrations/`
 and apply transactionally after a pre-version backup. The step to 17 is paired
 with the schema-2 config: ordinary commands and the broker refuse an older
 database with `migration_required` until `agent-run config migrate` runs. A
 binary refuses a database newer than its supported schema.
+
+Schema 25 lays the foundation for cooperative pools (a small roster of
+ordinary executions sharing one goal) with `pools`, `pool_members` and
+`pool_entries`. The schema, the validated domain types, the compact entry renderer and
+atomic batch admission exist so far: the store admits every member agent, its
+reservations and the pool roster in one transaction (or none), and the core
+composes each member's task with the common goal, its own seat and every peer's
+stable identity before any member is launched. Replay is keyed by the original
+client request, never by the composed text. Pool members carry a fixed private
+worker catalog — `notify_orchestrator`, `pool_post`, `pool_read`,
+`pool_propose` and `pool_vote` — served over one private broker route that
+authenticates the hidden per-attempt capability and stamps the author (kind,
+name, role, stable identity) from durable membership inside the same
+transaction; refusals such as `not_pool_member`, `pool_completed` or
+`stale_proposal` are typed codes, never prose. Members pull their pool: the
+append-only log pages by immutable cursor (optionally holding a bounded wait
+for a new entry), renders each entry as one compact plain-text block through
+the shared renderer, and reports derived status — current roster, current
+proposal and each member's vote validity with its reason. Ordinary chat is
+budgeted while proposals, votes, blocks and revokes stay possible, and
+agreement is reported without completing the pool. Every appended entry also enqueues
+one `pool` command, holding only its sequence number, for each current peer's
+tip in the same transaction (a member's `notify_orchestrator` report likewise
+writes one linked team-copy entry, and the orchestrator's notice is rendered
+from that entry with the same stamped sender, direction and stable identity). The command
+claims after cancel and steer, re-checks that the recipient is still a current
+member's tip of that entry's pool, and records only a finite push disposition:
+`native_accepted` for a correlated Codex reply, `written` for a Claude/GLM stdin
+write, `rejected`, `unsent`, `refused` (with a typed reason) or `unknown` after
+a possible write. None of them means the member consumed the entry; the log
+remains the source of truth and members catch up through `pool_read`.
+The operator operations (public tools `start_pool`, `pool_post`, `pool_replace`
+and `pool`, one CLI command each, MCP and the broker socket from the one shared
+tool table; the private worker catalog stays the fixed five tools): posting a message stamped as the operator (fanned out through the
+same path and chat budget, idempotent by key), reading a pool's status and
+cursor-paged log through the projection members read, and replacing one current
+member. A replacement is refused with `member_busy` unless the member's latest
+execution is terminal and every attempt of its lineage has verified cleanup
+(decided again inside the same immediate transaction as the write); it admits
+the new execution, retires the old seat while keeping its row, installs the new
+seat in the same slot, bumps the roster revision, appends one broker roster
+entry to the peers and records the original request digest, so a repeat of the
+same key returns the same new identity even after later replacements. An omitted
+start restores the seat's original user spec (never the account a prior
+automatic choice picked). The new execution's task names the goal, the current
+roster and a catch-up instruction; peers' frozen prompts are corrected by the
+roster entry, never rewritten.
+
+A pool completes only by formal verification at one consistent moment inside one
+immediate transaction: the current proposal has a valid ready vote, covering
+every acceptance criterion, from every current member for the current roster
+revision; every current member's latest execution `succeeded`; and every attempt
+of every member lineage has verified cleanup. Agreement while anyone still runs,
+a failed, timed-out, cancelled or lost member, uncleared ownership, a missing,
+revoked, blocking or stale vote, or a roster that moved never completes the
+pool; no timer or heuristic infers success, and agent-run never judges whether
+the result is right. Completion freezes one immutable `pool_completed` event on
+a member row (goal, criteria, accepted proposal, stable roster, votes and proofs,
+plus the compact notice text) and one linked outbox row, then marks the pool
+completed, all in the same transaction, so concurrent or repeated settlement
+records exactly one of each. It is attempted after votes, after every supervisor
+terminal path through `complete_terminal`, and by the bounded maintenance sweep
+(at most twenty open pools per pass, rotating) that also converges cleanup proof
+which arrives after the terminal write. A completed pool's status is read from
+the frozen record: a member resumed later does not change it or mint another
+notice, and the closed pool refuses further writes and replacements.
+
+The notice is a broker conclusion for the whole pool, delivered over the
+existing outbox as a typed pool payload (the Desktop relay's `pool_completion`
+operation, rendered by the frontend's fixed template, and the Claude inbox as
+text). It names the stable pool ID, goal, accepted result and roster, never a
+run, attempt or session identity; a result longer than the 4096-byte bound is
+shortened with an explicit marker naming the full proposal entry in the pool
+log. An unbound pool still completes: its notice stays `waiting_binding`
+(exempt from the one-hour binding window and not activated by binding a single
+member) until the pool itself is bound, which the store's `bind_pool` does for
+the pool and every current member tip. `agent-run bind --pool <id>` and the
+post-tool hook (a structured `start_pool` reply, recognized before any
+single-agent receipt) call it; a conflict with an existing binding changes
+nothing, and the binding is immutable. Replacements and resumed members join the
+pool's actual stored session, not the reference frozen at the first start.
+
+Retention treats a pool as a unit. Every member lineage, replaced members
+included, stays stored (with its native history, seals and cleanup evidence)
+until every execution of every member has expired by the ordinary rule
+(fourteen days, or ranked outside the newest hundred logical sessions), none
+owns an attempt or lacks verified cleanup, and no linked notice is pending,
+retrying or being sent. Then pool entries, members and the pool row are purged
+before the underlying agent, delivery and session rows, as the foreign keys
+require; a common notice still `waiting_binding` at that point is expired
+explicitly (`pool_binding_expired`) rather than lingering. The read-only
+preflight uses the same predicate, so protected-only pools never wake the
+writer. The maintenance sweep for completion likewise evaluates readiness
+read-only and takes the writer lock only for a pool that can actually complete.
+The tables retain replaced members, keep one current member per slot, store
+an immutable author stamped at send time, and reference agents and deliveries
+without cascades so a later purge can delete pool rows first.
 
 Large payloads live under the run directory and are referenced by path, size,
 and SHA-256. A terminal success must be reproducible from stored state and

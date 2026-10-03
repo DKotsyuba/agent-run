@@ -30,6 +30,8 @@ const V3_KEYS = ["agent_id", "effort", "failure_kind", "model", "notification_id
 const V4_KEYS = ["agent_id", "effort", "failure_kind", "model", "notification_id", "op", "run_id", "runtime", "status", "thread_id", "version"];
 /** Strict v4 worker report keys; the frontend never accepts arbitrary host methods. @type {string[]} */
 const WORKER_KEYS = ["agent_id", "kind", "message", "notification_id", "op", "run_id", "thread_id", "version"];
+/** Strict v4 pool-completion keys; one broker conclusion for a whole pool. @type {string[]} */
+const POOL_KEYS = ["message", "notification_id", "op", "pool_id", "thread_id", "version"];
 /** Launch metadata bound in code points, matching the Rust notice contract. @type {number} */
 const META_LIMIT = 128;
 
@@ -252,11 +254,32 @@ function workerMessage(request) {
 }
 
 /**
- * Select one of the two fixed typed renderers without routing worker fields to tools.
+ * Validate and render one frozen common pool conclusion under trusted framing.
+ * @param {unknown} request Decoded v4 relay value.
+ * @returns {string} Trusted framing around the broker's frozen pool text.
+ * @throws {Error} If fields, identifiers, text, or size violate the fixed contract.
+ */
+function poolCompletion(request) {
+  if (!request || typeof request !== "object" || Array.isArray(request) ||
+      JSON.stringify(Object.keys(request).sort()) !== JSON.stringify(POOL_KEYS) ||
+      request.version !== 4 || request.op !== "pool_completion") throw new Error("invalid pool request");
+  if (typeof request.thread_id !== "string" || !request.thread_id.trim() ||
+      [...request.thread_id].length > 512 || request.thread_id.includes("\0") ||
+      typeof request.notification_id !== "string" || !/^ntf_[A-Za-z0-9_-]+$/.test(request.notification_id) ||
+      typeof request.pool_id !== "string" || !/^pool-\d{8}-\d{6}-[0-9a-f]{10}$/.test(request.pool_id) ||
+      typeof request.message !== "string" || !request.message.trim() ||
+      Buffer.byteLength(request.message, "utf8") > 4096 ||
+      /[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(request.message)) throw new Error("invalid pool completion");
+  return renderTemplate(request, NOTICE_CONTRACT.pool_template);
+}
+
+/**
+ * Select one of the fixed typed renderers without routing worker fields to tools.
  * @param {unknown} request Decoded relay request.
  * @returns {string} Trusted framing with validated facts or bounded worker prose.
  */
 function renderRequest(request) {
+  if (request && request.op === "pool_completion") return poolCompletion(request);
   return request && request.op === "worker_message" ? workerMessage(request) : notice(request);
 }
 

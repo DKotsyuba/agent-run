@@ -15,9 +15,9 @@ fn service() -> Service {
 }
 /// Mirrors `test_dispatch.py::test_tools_table_is_exactly_pinned`.
 #[test]
-fn packaged_table_has_exactly_the_shared_twelve_tools() {
+fn packaged_table_has_exactly_the_shared_sixteen_tools() {
     let tools = dispatch::tools();
-    assert_eq!(tools.len(), 12);
+    assert_eq!(tools.len(), 16);
     let names: std::collections::BTreeSet<_> =
         tools.iter().map(|v| v["name"].as_str().unwrap()).collect();
     assert_eq!(
@@ -44,7 +44,7 @@ async fn ping_and_discovery_do_not_require_database_access() {
     )
     .await
     .unwrap();
-    assert_eq!(response["result"].as_array().unwrap().len(), 12);
+    assert_eq!(response["result"].as_array().unwrap().len(), 16);
 }
 /// Mirrors `test_api_socket.py::test_unknown_method_and_validation_error`.
 #[tokio::test]
@@ -161,12 +161,17 @@ async fn framing_does_not_consume_the_next_message() {
 #[test]
 fn list_query_bounds_reject_nonfinite_or_negative_waits() {
     let decoded: Query = serde_json::from_value(json!({
-        "after_revision": 12, "wait_seconds": 1.5, "limit": 7
+        "after_revision": 12, "after_message_revision": 34, "wait_seconds": 1.5, "limit": 7
     }))
     .expect("dispatch list query decodes Python long-poll fields");
     assert_eq!(
-        (decoded.after_revision, decoded.wait_seconds, decoded.limit),
-        (Some(12), 1.5, 7)
+        (
+            decoded.after_revision,
+            decoded.after_message_revision,
+            decoded.wait_seconds,
+            decoded.limit
+        ),
+        (Some(12), Some(34), 1.5, 7)
     );
     assert!(Query {
         wait_seconds: f64::NAN,

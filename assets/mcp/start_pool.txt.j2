@@ -1,0 +1,10 @@
+agent-run start_pool accepted (asynchronous cooperative pool)
+
+- Pool: {{ pool_id }} — stable; this response is NOT a completion
+- Admission: {{ "created" if created else "replayed" }}; roster r{{ roster_revision }}
+- Notice binding: {{ "bound" if bound else "not bound; the one common pool notice waits until the pool is bound" }}
+Members:
+{% for member in members %}
+- {{ member.name }} ({{ member.role }}, {{ member.agent_id }}): {{ member.status }}
+{% endfor %}
+Completion needs every member to vote ready on one proposal, end successfully and be cleaned up; that is a formal check, not proof the result is right. Use pool to read, pool_post to guide, pool_replace for a terminal member.

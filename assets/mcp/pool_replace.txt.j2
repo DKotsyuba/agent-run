@@ -1,0 +1,5 @@
+agent-run pool_replace {{ "accepted" if created else "replayed" }} — roster r{{ roster_revision }}
+- Pool: {{ pool_id }}
+- Replaced: {{ replaced.name }} ({{ replaced.role }}, {{ replaced.agent_id }})
+- Now: {{ member.name }} ({{ member.role }}, {{ member.agent_id }}): {{ member.status }}
+Earlier votes no longer count; peers were told through the log. The new member reads the pool log on startup.

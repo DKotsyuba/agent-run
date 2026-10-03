@@ -6,7 +6,7 @@ use crate::{
 };
 use agent_run_domain::{
     domain::AgentId,
-    worker::{NotifyRequest, WorkerCall, ENV_NAMES, METHOD},
+    worker::{NotifyRequest, WorkerToolCall, ENV_NAMES},
 };
 use rmcp::{
     model::{
@@ -40,47 +40,113 @@ fn tools() -> Vec<Tool> {
 }
 
 impl WorkerProxy {
-    /// Validate model arguments locally, attach immutable context and queue through
-    /// the broker. Unknown tools/arguments cannot reach an operator dispatch path.
+    /// Validate model arguments locally, attach immutable hidden context and
+    /// route one fixed catalog tool through the private broker method. Unknown
+    /// tools/arguments cannot reach an operator dispatch path, and denials
+    /// arrive typed instead of guessed from prose.
     async fn call(&self, name: &str, arguments: Value) -> rmcp::model::CallToolResult {
-        if name != "notify_orchestrator" {
-            return super::mcp_text::error_result(
-                "unknown_tool",
-                "worker MCP exposes only notify_orchestrator",
-            );
-        }
-        let input = match serde_json::from_value::<NotifyRequest>(arguments) {
-            Ok(input) => input,
-            Err(_) => {
+        let tool = match agent_run_domain::worker::WorkerTool::parse(name) {
+            Some(tool) => tool,
+            None => {
                 return super::mcp_text::error_result(
-                    "ValidationError",
-                    "unknown, missing, or incorrectly typed report argument",
+                    "unknown_tool",
+                    "worker MCP exposes only its fixed tool catalog",
                 )
             }
         };
-        if let Err(error) = input.validate() {
-            return super::mcp_text::error_result(error.public().kind, &error.public().message);
-        }
-        let call = WorkerCall {
+        // Local argument shape checks keep obviously malformed calls off the
+        // broker; the broker revalidates everything authoritatively.
+        let validated: std::result::Result<Value, crate::Error> = match tool {
+            agent_run_domain::worker::WorkerTool::Notify => {
+                match serde_json::from_value::<NotifyRequest>(arguments) {
+                    Ok(input) => match input.validate() {
+                        Ok(()) => serde_json::to_value(input).map_err(|_| invalid_report()),
+                        Err(error) => Err(error),
+                    },
+                    Err(_) => Err(invalid_report()),
+                }
+            }
+            agent_run_domain::worker::WorkerTool::PoolRead => {
+                match serde_json::from_value::<agent_run_domain::pool::PoolReadRequest>(arguments) {
+                    Ok(input) => match input.validate() {
+                        Ok(()) => {
+                            serde_json::to_value(input).map_err(|_| invalid_arguments("pool_read"))
+                        }
+                        Err(error) => Err(error),
+                    },
+                    Err(_) => Err(invalid_arguments("pool_read")),
+                }
+            }
+            _ => Ok(arguments),
+        };
+        let arguments = match validated {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                return super::mcp_text::error_result(error.public().kind, &error.public().message)
+            }
+        };
+        let call = WorkerToolCall {
             run_id: self.run_id.clone(),
             attempt_id: self.attempt_id.clone(),
             token: self.token.clone(),
-            input,
+            tool: tool.as_str().to_owned(),
+            input: arguments,
         };
         let broker = self.broker.clone();
-        // A disconnected worker wait does not cancel an in-flight durable enqueue.
-        // Retrying with the same request_id resolves the uncertain result.
-        let result =
-            tokio::spawn(async move { broker.call(METHOD, serde_json::to_value(call)?).await })
-                .await;
+        // A disconnected worker wait does not cancel an in-flight durable
+        // write. Retrying with the same request_id resolves the uncertain
+        // result idempotently.
+        let result = tokio::spawn(async move {
+            broker
+                .call(
+                    agent_run_domain::worker::TOOL_METHOD,
+                    serde_json::to_value(call)?,
+                )
+                .await
+        })
+        .await;
         match result {
-            Ok(Ok(value)) => super::mcp_text::success_result("notify_orchestrator", &value),
+            Ok(Ok(value)) => self.render(tool, value),
             Ok(Err(error)) => {
                 super::mcp_text::error_result(error.public().kind, &error.public().message)
             }
-            Err(_) => super::mcp_text::error_result("RuntimeError", "worker notification failed"),
+            Err(_) => super::mcp_text::error_result("RuntimeError", "worker call failed"),
         }
     }
+
+    /// Renders one broker answer: typed in-band denials as compact errors,
+    /// pool reads with each entry pre-rendered through the one shared
+    /// formatter, and everything else through the compact tool templates.
+    fn render(
+        &self,
+        tool: agent_run_domain::worker::WorkerTool,
+        value: Value,
+    ) -> rmcp::model::CallToolResult {
+        if let Some(error) = value.get("error").filter(|e| e.is_object()) {
+            let code = error["code"].as_str().unwrap_or("RuntimeError");
+            let message = error["message"].as_str().unwrap_or("pool call refused");
+            return super::mcp_text::error_result(code, message);
+        }
+        if tool == agent_run_domain::worker::WorkerTool::PoolRead {
+            return match super::mcp_text::pool_page(value) {
+                Ok(page) => super::mcp_text::success_result("pool_read", &page),
+                Err(message) => super::mcp_text::error_result("RuntimeError", &message),
+            };
+        }
+        super::mcp_text::success_result(tool.as_str(), &value)
+    }
+}
+
+/// The historical report-argument rejection text.
+fn invalid_report() -> crate::Error {
+    crate::Error::Validation("unknown, missing, or incorrectly typed report argument".into())
+}
+
+/// One bounded per-tool argument rejection.
+fn invalid_arguments(tool: &str) -> crate::Error {
+    crate::Error::Validation(format!(
+        "unknown, missing, or incorrectly typed {tool} argument"
+    ))
 }
 
 impl ServerHandler for WorkerProxy {
@@ -199,9 +265,25 @@ mod tests {
             attempt_id: "attempt".into(),
             token: "a".repeat(64),
         };
-        assert_eq!(tools().len(), 1);
-        assert_eq!(tools()[0].name, "notify_orchestrator");
-        for name in ["start", "resume", "cancel", "steer", "tools", METHOD] {
+        let names: Vec<_> = tools().iter().map(|tool| tool.name.to_string()).collect();
+        assert_eq!(
+            names,
+            [
+                "notify_orchestrator",
+                "pool_post",
+                "pool_read",
+                "pool_propose",
+                "pool_vote"
+            ]
+        );
+        for name in [
+            "start",
+            "resume",
+            "cancel",
+            "steer",
+            "tools",
+            agent_run_domain::worker::METHOD,
+        ] {
             assert!(proxy.get_tool(name).is_none());
             assert_eq!(proxy.call(name, json!({})).await.is_error, Some(true));
         }
@@ -226,7 +308,7 @@ mod tests {
         assert!(!rendered.contains(&proxy.token));
         let calls = broker.0.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, METHOD);
+        assert_eq!(calls[0].0, agent_run_domain::worker::TOOL_METHOD);
         assert_eq!(calls[0].1["run_id"], proxy.run_id.as_str());
         assert_eq!(calls[0].1["attempt_id"], "attempt");
         assert_eq!(calls[0].1["token"], proxy.token);

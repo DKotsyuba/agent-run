@@ -154,6 +154,25 @@ impl crate::service::Service {
         result(&row, store.transcript_lineage(&row.id, cursor, limit)?)
     }
 
+    /// Reads validated raw or block history for a stable selection. An explicit
+    /// run pins one execution; omission reads its retained lineage. Resolves once,
+    /// keeps cursors global and removes internal execution IDs from the envelope.
+    /// No process is launched; validation, store and selection errors propagate.
+    pub fn transcript_with_options(
+        &self,
+        id: &AgentId,
+        run_id: Option<&AgentId>,
+        query: &agent_run_domain::transcript::TranscriptQuery,
+    ) -> Result<Value> {
+        query.validate()?;
+        let store = Store::open(&self.home)?;
+        let row = resolve(&store, id, run_id)?;
+        result(
+            &row,
+            store.transcript_query(&row.id, query, run_id.is_none())?,
+        )
+    }
+
     /// Continue the current run of a stable agent, preserving request-id replay.
     ///
     /// A replay resolves its original parent before checking terminal status,
@@ -169,6 +188,7 @@ impl crate::service::Service {
         task: String,
         timeout: Option<f64>,
         request_id: Option<String>,
+        display_name: Option<String>,
         orchestrator: Option<crate::domain::OrchestratorRef>,
     ) -> Result<Value> {
         let parent = {
@@ -193,8 +213,15 @@ impl crate::service::Service {
             }
         };
         admission(
-            self.resume(&parent.id, task, timeout, request_id, orchestrator)
-                .await?,
+            self.resume(
+                &parent.id,
+                task,
+                timeout,
+                request_id,
+                display_name,
+                orchestrator,
+            )
+            .await?,
         )
     }
 }

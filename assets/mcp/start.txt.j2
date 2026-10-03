@@ -4,6 +4,9 @@ agent-run start accepted (asynchronous durable run)
 - Admission: {{ "created" if created else "replayed" }}
 - Status: {{ status }}{% if phase %} ({{ phase }}){% endif %}{{ "" }}
 - Route: {{ runtime }}/{{ model }} profile {{ profile }}
+{% if name %}
+- Name: {{ name }}
+{% endif %}
 {% if mcp %}
 - MCP selected (availability not verified): {% for server in mcp %}{{ server.name }} ({{ server.source }}, tools={{ server.tools }}){{ "; " if not loop.last else "" }}{% endfor %}{{ "; +" ~ mcp_more ~ " servers" if mcp_more else "" }}{{ "\n" }}
 {% endif %}

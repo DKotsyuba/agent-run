@@ -167,13 +167,23 @@ fn extend_start_description(value: &mut Value) {
 /// registry entry with null result declarations omitted, as the SDK omits
 /// nulls on the wire. The frozen Python fixture has no such tool; parity
 /// expectations account for the addition explicitly instead of editing it.
-fn delegation_guide_wire() -> Value {
-    let mut value =
-        serde_json::to_value(agent_run_domain::tool("delegation_guide").unwrap()).unwrap();
-    value.as_object_mut().unwrap().retain(|key, value| {
-        !matches!(key.as_str(), "outputSchema" | "resultShape") || !value.is_null()
-    });
-    value
+fn additive_wires() -> Vec<Value> {
+    [
+        "delegation_guide",
+        "start_pool",
+        "pool_post",
+        "pool_replace",
+        "pool",
+    ]
+    .into_iter()
+    .map(|name| {
+        let mut value = serde_json::to_value(agent_run_domain::tool(name).unwrap()).unwrap();
+        value.as_object_mut().unwrap().retain(|key, value| {
+            !matches!(key.as_str(), "outputSchema" | "resultShape") || !value.is_null()
+        });
+        value
+    })
+    .collect()
 }
 
 /// Appends the additive `delegation_guide` entry to every captured tools
@@ -183,7 +193,7 @@ fn append_delegation_guide(value: &mut Value) {
     match value {
         Value::Object(object) => {
             if let Some(Value::Array(tools)) = object.get_mut("tools") {
-                tools.push(delegation_guide_wire());
+                tools.extend(additive_wires());
             }
             object.values_mut().for_each(append_delegation_guide);
         }
@@ -312,10 +322,7 @@ fn mcp_tools_list_matches_the_packaged_python_table() {
     extend_start_description(&mut expected);
     // This fixture is the bare tool array (no "tools" wrapper), so the
     // additive entry is appended directly, in registry declaration order.
-    expected
-        .as_array_mut()
-        .unwrap()
-        .push(delegation_guide_wire());
+    expected.as_array_mut().unwrap().extend(additive_wires());
     for tool in expected.as_array_mut().unwrap() {
         tool.as_object_mut().unwrap().retain(|key, value| {
             !matches!(key.as_str(), "outputSchema" | "resultShape") || !value.is_null()

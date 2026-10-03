@@ -154,6 +154,27 @@ mod tests {
         assert!(expanded.contains("✗"), "finished card visible: {expanded}");
     }
 
+    /// Named cards lead with the human label while retaining the task and stable ID.
+    #[test]
+    fn cards_show_human_display_names() {
+        let mut app = App::new();
+        let mut agent = agent_view(STABLE, RUN, "running");
+        agent.name = Some("Мария / review".into());
+        app.apply_sessions(
+            &serde_json::from_value(serde_json::json!({
+                "items":[agent], "total":1, "offset":0, "limit":200,
+                "next_offset":null, "complete":true, "revision":1, "observed_at":1.0
+            }))
+            .unwrap(),
+        );
+        let screen = render_to_string(&app, 120, 24);
+        assert!(
+            screen.contains("Мария / review — ship the thing"),
+            "{screen}"
+        );
+        assert!(screen.contains(&format!("{:.23}", STABLE)), "{screen}");
+    }
+
     #[test]
     fn cards_show_workdir_shortened_and_padded() {
         let mut app = App::new();
@@ -337,9 +358,9 @@ mod tests {
         let page: TranscriptPage = serde_json::from_value(serde_json::json!({
             "agent_id": STABLE, "run_id": RUN,
             "messages": [
-                {"seq": 1, "at": 100.0, "role": "assistant", "name": null, "content": "The me", "raw_ref": null},
-                {"seq": 2, "at": 100.0, "role": "assistant", "name": null, "content": "asurem", "raw_ref": null},
-                {"seq": 3, "at": 100.0, "role": "assistant", "name": null, "content": "ent is decisive", "raw_ref": null},
+                {"seq": 1, "at": 100.0, "role": "assistant", "name": null, "content": "The me", "raw_ref": "msg_1"},
+                {"seq": 2, "at": 100.0, "role": "assistant", "name": null, "content": "asurem", "raw_ref": "msg_1"},
+                {"seq": 3, "at": 100.0, "role": "assistant", "name": null, "content": "ent is decisive", "raw_ref": "msg_1"},
             ],
             "cursor": 0, "limit": 500, "next_cursor": null, "complete": true,
         }))
@@ -396,9 +417,9 @@ mod tests {
             "agent_id": STABLE, "run_id": RUN,
             "messages": [
                 {"seq": 1, "at": 100.0, "role": "tool_call", "name": "Bash",
-                 "content": "{\"command\":\"ls\"}", "raw_ref": null},
-                {"seq": 2, "at": 101.0, "role": "tool_result", "name": null,
-                 "content": "ok", "raw_ref": null},
+                 "content": "{\"command\":\"ls\"}", "raw_ref": "toolu_1"},
+                {"seq": 2, "at": 101.0, "role": "tool_result", "name": "Bash",
+                 "content": "ok", "raw_ref": "toolu_1"},
                 message(3, "assistant", "done"),
             ],
             "cursor": 0, "limit": 500, "next_cursor": null, "complete": true,

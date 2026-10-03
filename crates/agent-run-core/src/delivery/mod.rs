@@ -21,11 +21,6 @@ const LEASE_SECONDS: f64 = 30.0;
 const MAX_TAIL_BYTES: usize = 4096;
 const MAX_EVIDENCE_BYTES: usize = 16 * 1024;
 const DEFAULT_MAX_BATCH: usize = 1000;
-/// Claude inbox attempts whose outcome stays uncertain (unconfirmed or
-/// ambiguous) before the notice stops retrying; a configured `max_attempts`
-/// of zero means unlimited retries, so without this cap one fire-and-forget
-/// notice would duplicate forever.
-const CLAUDE_UNCERTAIN_MAX_ATTEMPTS: u32 = 3;
 /// Version of the frozen completion-notice payload.
 pub const NOTICE_VERSION: u32 = 1;
 
@@ -370,6 +365,8 @@ enum Payload {
     Completion(Notice),
     /// Untrusted worker report with no lifecycle effect.
     Worker(WorkerNotice),
+    /// The broker's one common conclusion of a completed pool.
+    Pool(agent_run_domain::pool::PoolNotice),
 }
 
 /// Counts one bounded outbox drain and reports whether another process owns it.
@@ -431,7 +428,7 @@ fn dispatcher_lock(home: &Path) -> Result<Option<DispatcherLock>> {
 fn expire_unbound(tx: &rusqlite::Transaction<'_>, time: f64) -> Result<()> {
     tx.execute(
         "UPDATE deliveries SET state='expired',lease_owner=NULL,lease_until=NULL,next_attempt_at=NULL \
-         WHERE state='waiting_binding' AND agent_id IN (SELECT id FROM agents WHERE status IN ('succeeded','failed','timed_out','cancelled','lost')) \
+         WHERE state='waiting_binding' AND id NOT IN (SELECT completion_delivery_id FROM pools WHERE completion_delivery_id IS NOT NULL) AND agent_id IN (SELECT id FROM agents WHERE status IN ('succeeded','failed','timed_out','cancelled','lost')) \
          AND terminal_event_seq IN (SELECT seq FROM events WHERE at<=?)",
         [time - 3600.0],
     )?;
@@ -439,6 +436,13 @@ fn expire_unbound(tx: &rusqlite::Transaction<'_>, time: f64) -> Result<()> {
 }
 
 /// Atomically selects and leases one due bound delivery for this dispatcher identity.
+///
+/// A queued Claude notice whose previous attempt was possibly sent
+/// (`uds_unconfirmed` or `uds_ambiguous`, a `retry_wait` row written before the
+/// at-most-once policy, or no evidence for the current attempt after a
+/// dispatcher crash, such as an expired `sending` lease) is ended failed-ambiguous without a new
+/// send and this claim returns `None`; the finished row leaves the schedule,
+/// so the next dispatch tick makes progress.
 fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
     let mut store = Store::open(home)?;
     let tx = store
@@ -472,6 +476,35 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
         [session_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
+    if transport == "claude_uds" && attempts > 0 {
+        // Evidence for exactly the current attempt count decides. Missing
+        // evidence (a dispatcher that crashed around the write, e.g. an
+        // expired `sending` lease) is an unknown outcome and is treated as
+        // possibly sent; only explicit known-unsent evidence stays retryable.
+        let last: Option<String> = tx
+            .query_row(
+                "SELECT json_extract(evidence_json,'$.classifier') FROM delivery_attempt_evidence \
+                 WHERE delivery_id=? AND attempt=?",
+                params![delivery_id, attempts],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let classifier = match last.as_deref() {
+            Some(known @ ("uds_unconfirmed" | "uds_ambiguous")) => Some(known),
+            None => Some("uds_unconfirmed"),
+            Some(_) => None,
+        };
+        if let Some(classifier) = classifier {
+            tx.execute(
+                "UPDATE deliveries SET state='failed',lease_owner=NULL,lease_until=NULL,\
+                 next_attempt_at=NULL,last_error=?,ambiguous_result=1 WHERE id=?",
+                params![classifier, delivery_id],
+            )?;
+            tx.commit()?;
+            return Ok(None);
+        }
+    }
     let worker: Option<(String, String)> = tx
         .query_row(
             "SELECT kind,message FROM worker_notifications WHERE delivery_id=?",
@@ -509,13 +542,50 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
         [&agent_id],
         |row| row.get(0),
     )?;
-    let payload = if let Some((kind, message)) = worker {
+    // A pool's one common completion is anchored on a member's row but is not
+    // that member's lifecycle notice: its frozen text lives in the immutable
+    // completion event and names no run, attempt or session.
+    let pool: Option<(String, String)> = tx
+        .query_row(
+            "SELECT p.id,json_extract(e.data_json,'$.notice') FROM pools p \
+             JOIN deliveries d ON d.id=p.completion_delivery_id \
+             JOIN events e ON e.seq=d.terminal_event_seq WHERE p.completion_delivery_id=?",
+            [&delivery_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let payload = if let Some((pool_id, message)) = pool {
+        let notice = agent_run_domain::pool::PoolNotice {
+            notification_id: delivery_id.clone(),
+            pool_id: pool_id.parse()?,
+            message,
+        };
+        notice.validate()?;
+        Payload::Pool(notice)
+    } else if let Some((kind, message)) = worker {
         let kind = match kind.as_str() {
             "notice" => WorkerMessageKind::Notice,
             "risk" => WorkerMessageKind::Risk,
             "question" => WorkerMessageKind::Question,
             "blocker" => WorkerMessageKind::Blocker,
             _ => return Err(invalid("invalid stored worker kind")),
+        };
+        // A pool member's report carries its immutable linked pool entry: the
+        // orchestrator then sees the same stamped sender, direction and
+        // stable identity as peers, from the one shared renderer. The stored
+        // worker message stays raw for idempotent replay.
+        let message = match tx
+            .query_row(
+                "SELECT seq,author_kind,author_agent_id,author_name,author_role,direction,kind,\
+                 severity,proposal_seq,roster_revision,decision,body \
+                 FROM pool_entries WHERE delivery_id=?",
+                [&delivery_id],
+                agent_run_store::pool_log::entry_view,
+            )
+            .optional()?
+        {
+            Some(entry) => pool_decorated(&agent_run_domain::pool::render_entry(&entry)?),
+            None => message,
         };
         let notice = WorkerNotice {
             notification_id: delivery_id.clone(),
@@ -568,9 +638,11 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
 ///
 /// A Claude inbox attempt is never accepted on write alone (see
 /// [`claude::send`]); its uncertain observations (`uds_unconfirmed` or
-/// `uds_ambiguous`) retry with backoff until [`CLAUDE_UNCERTAIN_MAX_ATTEMPTS`]
-/// and then fail terminally with the ambiguous flag set, so one notice can
-/// neither look delivered without a confirmation nor duplicate forever.
+/// `uds_ambiguous`) follow a send that may already have reached the session,
+/// and the native inbox sends no receipt for an immediately accepted message,
+/// so exactly-once cannot be proved. They end terminally `failed` with the
+/// ambiguous flag at once (at-most-once) instead of retrying into duplicates;
+/// known-unsent outcomes (session gone, unavailable, rejected) still retry.
 fn complete(home: &Path, claim: &Claim, evidence: &Evidence) -> Result<()> {
     let delivery = match ProviderConfig::load(home) {
         Ok((config, _)) => config.delivery,
@@ -592,14 +664,13 @@ fn complete(home: &Path, claim: &Claim, evidence: &Evidence) -> Result<()> {
     let accepted = evidence.accepted();
     let ambiguous = evidence.ambiguous();
     let exhausted = delivery.max_attempts > 0 && claim.attempt >= delivery.max_attempts;
-    let uncertain_exhausted = claim.transport == "claude_uds"
+    let possibly_sent = claim.transport == "claude_uds"
         && matches!(
             evidence.classifier.as_str(),
             "uds_unconfirmed" | "uds_ambiguous"
-        )
-        && claim.attempt >= CLAUDE_UNCERTAIN_MAX_ATTEMPTS;
-    let failed = !accepted
-        && (exhausted || uncertain_exhausted || evidence.classifier == "unsupported_transport");
+        );
+    let failed =
+        !accepted && (exhausted || possibly_sent || evidence.classifier == "unsupported_transport");
     let state = if accepted {
         "delivered"
     } else if failed {
@@ -654,6 +725,12 @@ async fn dispatch_one(home: &Path) -> Result<Option<(String, bool)>> {
         }
         ("claude_uds", Payload::Worker(notice)) => {
             claude::send_worker(&claude_registry(), &claim.session, notice).await
+        }
+        ("codex_queue", Payload::Pool(notice)) => {
+            relay::send_pool(home, &claim.session, notice).await
+        }
+        ("claude_uds", Payload::Pool(notice)) => {
+            claude::send_pool(&claude_registry(), &claim.session, notice).await
         }
         _ => Evidence::new("unsupported_transport", false, false),
     };
@@ -717,6 +794,25 @@ fn claude_registry() -> std::path::PathBuf {
                 .map(|home| std::path::PathBuf::from(home).join(".claude/sessions"))
         })
         .unwrap_or_default()
+}
+
+/// Fits a rendered pool entry into the worker notice's fixed 2048-byte bound
+/// by shortening only the untrusted body, never the stamped header. The full
+/// body stays in the pool log and the stored report.
+fn pool_decorated(rendered: &str) -> String {
+    const LIMIT: usize = 2048;
+    const MARKER: &str = "\n[truncated; the full text is in the pool log]";
+    if rendered.len() <= LIMIT {
+        return rendered.to_owned();
+    }
+    let split = rendered
+        .find("untrusted body:\n")
+        .map_or(0, |i| i + "untrusted body:\n".len());
+    let mut end = LIMIT.saturating_sub(MARKER.len()).max(split);
+    while !rendered.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{MARKER}", &rendered[..end])
 }
 
 #[cfg(test)]

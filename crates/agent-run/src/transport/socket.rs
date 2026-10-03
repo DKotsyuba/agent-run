@@ -285,7 +285,15 @@ const MAX_PENDING_REQUESTS: usize = 64;
 const CONTROL_FRAME_DEADLINE: Duration = Duration::from_millis(500);
 /// Interval between content-digest checks for a running broker's configuration.
 const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
-const CONTROL_METHODS: &[&str] = &["start", "resume", "cancel", "steer"];
+const CONTROL_METHODS: &[&str] = &[
+    "start",
+    "resume",
+    "cancel",
+    "steer",
+    "start_pool",
+    "pool_post",
+    "pool_replace",
+];
 /// Steady database maintenance interval: expiry found no work and compaction
 /// reclaimed no pages, so nothing eligible remains.
 const DATABASE_STEADY: Duration = Duration::from_secs(3600);
@@ -544,7 +552,14 @@ pub async fn respond(service: &Service, v: Value) -> Option<Value> {
         };
     }
     let known = dispatch::is_tool(method)
-        || ["tools", "ping", "wait", agent_run_domain::worker::METHOD].contains(&method);
+        || [
+            "tools",
+            "ping",
+            "wait",
+            agent_run_domain::worker::METHOD,
+            agent_run_domain::worker::TOOL_METHOD,
+        ]
+        .contains(&method);
     let response = if !known {
         err(id, -32601, "method not found", None)
     } else {

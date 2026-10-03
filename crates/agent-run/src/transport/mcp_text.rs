@@ -22,7 +22,36 @@ const TEMPLATES: &[(&str, &str)] = &[
         "notify_orchestrator",
         include_str!("../../../../assets/mcp/notify_orchestrator.txt.j2"),
     ),
+    (
+        "pool_post",
+        include_str!("../../../../assets/mcp/pool_post.txt.j2"),
+    ),
+    (
+        "pool_read",
+        include_str!("../../../../assets/mcp/pool_read.txt.j2"),
+    ),
+    (
+        "pool_propose",
+        include_str!("../../../../assets/mcp/pool_propose.txt.j2"),
+    ),
+    (
+        "pool_vote",
+        include_str!("../../../../assets/mcp/pool_vote.txt.j2"),
+    ),
     ("start", include_str!("../../../../assets/mcp/start.txt.j2")),
+    (
+        "start_pool",
+        include_str!("../../../../assets/mcp/start_pool.txt.j2"),
+    ),
+    (
+        "operator_pool_post",
+        include_str!("../../../../assets/mcp/operator_pool_post.txt.j2"),
+    ),
+    (
+        "pool_replace",
+        include_str!("../../../../assets/mcp/pool_replace.txt.j2"),
+    ),
+    ("pool", include_str!("../../../../assets/mcp/pool.txt.j2")),
     (
         "resume",
         include_str!("../../../../assets/mcp/resume.txt.j2"),
@@ -140,6 +169,58 @@ pub fn success_result(tool: &str, value: &Value) -> CallToolResult {
     result
 }
 
+/// Presents one operator-facing (public server) tool result.
+///
+/// The public `pool_post` shares its name with the private worker tool, so it
+/// renders through its own `operator_pool_post` template; `pool` pages get
+/// their entries pre-rendered by the one shared formatter; `start_pool` keeps
+/// the tiny structured `{"pool_id": ...}` the whole-pool binding hook reads.
+pub fn public_success_result(tool: &str, value: &Value) -> CallToolResult {
+    match tool {
+        "pool_post" => success_result("operator_pool_post", value),
+        "pool" => match pool_page(value.clone()) {
+            Ok(page) => success_result("pool", &page),
+            Err(message) => error_result("RuntimeError", &message),
+        },
+        "start_pool" => {
+            let mut result = success_result("start_pool", value);
+            result.structured_content = Some(json!({"pool_id": value["pool_id"]}));
+            result
+        }
+        _ => success_result(tool, value),
+    }
+}
+
+/// Prepares one pool page for its template: every entry rendered through the
+/// shared formatter, the shown count, and which context blocks to print.
+///
+/// The goal, criteria and proposal snapshot print only for an explicit
+/// from-the-start read (`after_seq` 0, no `before_seq`) and, for the proposal,
+/// when it is newer than the cursor, so an unchanged context is never
+/// repeated on every empty wait or incremental read.
+pub fn pool_page(mut page: Value) -> std::result::Result<Value, String> {
+    let entries = page["entries"].as_array().cloned().unwrap_or_default();
+    let mut rendered = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let view = serde_json::from_value::<agent_run_domain::pool::PoolEntryView>(entry)
+            .map_err(|_| "pool entry failed validation".to_owned())?;
+        rendered.push(
+            agent_run_domain::pool::render_entry(&view)
+                .map_err(|error| format!("pool entry presentation failed: {error}"))?,
+        );
+    }
+    let after = page["after_seq"].as_u64().unwrap_or(0);
+    let from_start = after == 0 && page["before_seq"].is_null();
+    let newer = page["status"]["current_proposal"]["seq"]
+        .as_u64()
+        .is_some_and(|seq| seq > after);
+    page["entry_count"] = json!(rendered.len());
+    page["entries"] = json!(rendered);
+    page["show_goal"] = json!(from_start);
+    page["show_proposal"] = json!(from_start || newer);
+    Ok(page)
+}
+
 /// Builds the MCP failure result as one short typed text line.
 ///
 /// The kind and (whitespace-normalized) message stay machine-greppable;
@@ -202,6 +283,13 @@ fn agent_fields(view: &Value) -> Value {
             "succeeded" | "failed" | "lost" | "timed_out" | "cancelled"),
         "runtime": view["runtime"], "model": view["model"], "profile": view["profile"],
         "phase": text("phase"), "effort": text("effort"),
+        "name": text("name"),
+        "usage": usage_line(&view["usage"]),
+        "usage_lineage": lineage_line(&view["usage_cumulative"]),
+        "tool_counts": view["tool_counts"].as_object().map(|counts| {
+            let number = |key: &str| counts.get(key).and_then(Value::as_u64).map(|n| n.to_string()).unwrap_or_else(|| "?".into());
+            format!("{} native calls, {} failed, {} unknown results (latest execution)", number("calls"), number("failed"), number("unknown_results"))
+        }),
         "mcp": view["mcp"].as_array().into_iter().flatten().take(8).map(|server| json!({
             "name": server["name"], "source": server["source"],
             "tools": server["allowed_tools"].as_array().map(|tools| tools.len().to_string()).unwrap_or_else(|| "all".into()),
@@ -233,6 +321,65 @@ fn start_context(value: &Value) -> Value {
     fields
 }
 
+/// One compact human usage line from a latest-execution usage object.
+///
+/// Unreported numbers render as `?` so an honest null is never mistaken for
+/// a measured zero; an absent object (no statistics row yet, typically while
+/// the run executes) and an explicitly sourceless row both stay distinct.
+fn usage_line(usage: &Value) -> String {
+    let Some(object) = usage.as_object() else {
+        return String::new();
+    };
+    if object.get("usage_source").and_then(Value::as_str) == Some("none") {
+        return "no native usage reported".to_owned();
+    }
+    let number = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_i64)
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".to_owned())
+    };
+    let turns = object
+        .get("num_turns")
+        .and_then(Value::as_i64)
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    format!(
+        "in {} out {} cache r{}/w{} turns {} ({})",
+        number("input_tokens"),
+        number("output_tokens"),
+        number("cache_read_tokens"),
+        number("cache_write_tokens"),
+        turns,
+        object
+            .get("usage_source")
+            .and_then(Value::as_str)
+            .unwrap_or("?"),
+    )
+}
+
+/// One compact lineage-aggregate line; empty when no aggregate is attached.
+///
+/// Incomplete evidence is named as such rather than shown as partial totals.
+fn lineage_line(cumulative: &Value) -> String {
+    let Some(object) = cumulative.as_object() else {
+        return String::new();
+    };
+    let executions = object
+        .get("executions")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let input = object.get("input_tokens").and_then(Value::as_i64);
+    let output = object.get("output_tokens").and_then(Value::as_i64);
+    match (input, output) {
+        (Some(input), Some(output)) => {
+            format!("lineage in {input} out {output} over {executions} execution(s)")
+        }
+        _ => format!("lineage incomplete over {executions} execution(s)"),
+    }
+}
+
 /// List context: exact total, returned page, and continuation facts.
 fn list_context(value: &Value) -> Value {
     json!({
@@ -250,11 +397,20 @@ fn transcript_context(value: &Value) -> Value {
     json!({
         "agent_id": value["agent_id"],
         "next_cursor": value["next_cursor"].as_i64(),
+        "previous_cursor": value["previous_cursor"].as_i64(),
+        "direction": value["direction"].as_str().unwrap_or("forward"),
+        "view": value["view"].as_str().unwrap_or("raw"),
         "complete": value["complete"].as_bool().unwrap_or(true),
         "messages": value["messages"].as_array().into_iter().flatten().map(|message| {
             json!({
                 "seq": message["seq"], "role": message["role"],
                 "name": message["name"].as_str(), "content": message["content"],
+                "first_seq": message["first_seq"], "last_seq": message["last_seq"],
+                "raw_ref":message["raw_ref"], "partial_before":message["partial_before"],
+                "partial_after":message["partial_after"], "omitted_bytes":message["omitted_bytes"],
+                "content_complete":message["content_complete"],
+                "error":message["error"].as_bool().map(|failed| if failed {"error"} else {"ok"}).unwrap_or("unknown"),
+                "error_source":message["error_source"],
             })
         }).collect::<Vec<_>>(),
         "count": value["messages"].as_array().map(Vec::len),
@@ -504,8 +660,41 @@ fn prose(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{error_result, success_result};
+    use super::{error_result, public_success_result, success_result};
+    use rmcp::model::CallToolResult;
     use serde_json::{json, Value};
+
+    /// Compact start/resume/list output preserves labels, observed zero and
+    /// unknown metrics, names incomplete lineage evidence and hides execution IDs.
+    #[test]
+    fn display_names_and_usage_remain_honest_in_compact_output() {
+        let mut agent = agent_view();
+        agent["name"] = json!("工程師 / review");
+        agent["usage"] = json!({"input_tokens":0,"output_tokens":null,
+            "cache_read_tokens":0,"cache_write_tokens":null,"num_turns":null,
+            "usage_source":"token_usage_updated","run_id":"private-execution"});
+        agent["usage_cumulative"] =
+            json!({"executions":2,"input_tokens":null,"output_tokens":null});
+        for tool in ["start", "resume"] {
+            let page = text(
+                tool,
+                &json!({"agent_id":"ag-1","sequence":1,"created":true,"agent":agent}),
+            );
+            assert!(page.contains("Name: 工程師 / review"), "{page}");
+            assert!(!page.contains("private-execution"), "{page}");
+        }
+        let page = text(
+            "list_agents",
+            &json!({"items":[agent],"total":1,"offset":0,"limit":20,"complete":true}),
+        );
+        assert!(page.contains("name: 工程師 / review"), "{page}");
+        assert!(page.contains("in 0 out ? cache r0/w? turns ?"), "{page}");
+        assert!(
+            page.contains("lineage incomplete over 2 execution(s)"),
+            "{page}"
+        );
+        assert!(!page.contains("private-execution"), "{page}");
+    }
 
     /// Minimal agent view proving sparse optional metadata remains renderable.
     fn agent_view() -> Value {
@@ -710,8 +899,10 @@ mod tests {
             page.contains("[2] tool_call (shell): {\"cmd\":1}"),
             "{page}"
         );
-        assert!(page.contains("continues at cursor 4"), "{page}");
-        assert!(page.contains("next_cursor: 4"), "{page}");
+        assert!(
+            page.contains("next_cursor: 4 — request the next page with this cursor"),
+            "{page}"
+        );
     }
 
     /// answer shows availability honestly and keeps retrieval facts.
@@ -931,6 +1122,93 @@ mod tests {
         assert_eq!(
             content[0]["text"],
             "agent-run error ValidationError: unknown arguments: ['x'] second line\n"
+        );
+    }
+
+    /// Renders one public (operator) tool success and returns its text and result.
+    fn public_text(tool: &str, value: &Value) -> (String, CallToolResult) {
+        let result = public_success_result(tool, value);
+        let content = serde_json::to_value(&result.content).unwrap();
+        let page = content[0]["text"].as_str().unwrap().to_owned();
+        assert_eq!(result.is_error, Some(false), "{tool}: {page}");
+        (page, result)
+    }
+
+    /// Every operator pool tool renders one compact page with all its facts;
+    /// `start_pool` keeps only the tiny structured pool receipt for binding,
+    /// and the operator `pool_post` never reuses the private worker page.
+    #[test]
+    fn operator_pool_tools_render_compact_pages_with_field_parity() {
+        let started = json!({
+            "pool_id": "pool-20261003-120000-0123456789", "created": true, "bound": false,
+            "roster_revision": 1, "members": [
+                {"agent_id":"ag-a","name":"Ada","role":"reviewer","status":"starting"},
+                {"agent_id":"ag-b","name":"Bob","role":"tester","status":"starting"}]
+        });
+        let (page, result) = public_text("start_pool", &started);
+        for fact in [
+            "pool-20261003-120000-0123456789",
+            "created",
+            "r1",
+            "not bound",
+            "Ada (reviewer, ag-a): starting",
+            "Bob (tester, ag-b)",
+        ] {
+            assert!(page.contains(fact), "{fact}: {page}");
+        }
+        assert_eq!(
+            result.structured_content,
+            Some(json!({"pool_id": "pool-20261003-120000-0123456789"}))
+        );
+        assert!(page.len() < 900, "compact: {}", page.len());
+        let (post, _) = public_text("pool_post", &json!({"pool_id":"p","seq":4,"created":true}));
+        assert!(
+            post.contains("#4") && post.contains("orchestrator") && !post.contains("pool_read")
+        );
+        let (replaced, _) = public_text(
+            "pool_replace",
+            &json!({"pool_id":"p","created":true,"roster_revision":2,
+                    "replaced":{"agent_id":"ag-a","name":"Ada","role":"reviewer"},
+                    "member":{"agent_id":"ag-n","name":"Ada","role":"reviewer","status":"starting"}}),
+        );
+        for fact in ["r2", "ag-a", "ag-n", "starting"] {
+            assert!(replaced.contains(fact), "{fact}: {replaced}");
+        }
+    }
+
+    /// The goal and the proposal snapshot print only on a from-the-start read
+    /// or when the proposal is newer than the cursor; an incremental or empty
+    /// read never repeats them, and entries use the one shared formatter.
+    #[test]
+    fn pool_pages_print_unchanged_context_only_when_needed() {
+        let status = json!({"state":"open","roster_revision":1,"goal":"UNIQUE-GOAL-TEXT",
+            "criteria":[{"id":"goal","text":"met"}],
+            "current_proposal":{"seq":3,"snapshot":"UNIQUE-SNAPSHOT","roster_revision":1},
+            "members":[{"name":"Ada","role":"r","agent_id":"ag-a","tip_status":"running",
+                        "cleanup_complete":false,"vote":null,"why":"missing"}],
+            "replaced_members":[], "agreed":false, "note":"n"});
+        let entry = json!({"seq":4,"roster_revision":1,"author_kind":"operator","direction":"team",
+                           "kind":"message","body":"hello"});
+        let page = |after: u64, entries: Vec<Value>| {
+            json!({
+            "pool_id":"p","entries":entries,"after_seq":after,"before_seq":null,"limit":50,
+            "next_cursor":null,"last_seq":null,"complete":true,"status":status.clone()})
+        };
+        let (full, _) = public_text("pool", &page(0, vec![entry.clone()]));
+        assert!(
+            full.contains("UNIQUE-GOAL-TEXT") && full.contains("UNIQUE-SNAPSHOT"),
+            "{full}"
+        );
+        assert!(full.contains("from orchestrator to team") && full.contains("hello"));
+        let (empty_wait, _) = public_text("pool", &page(4, vec![]));
+        assert!(
+            !empty_wait.contains("UNIQUE-GOAL-TEXT") && !empty_wait.contains("UNIQUE-SNAPSHOT"),
+            "{empty_wait}"
+        );
+        assert!(empty_wait.contains("Current proposal #3 unchanged"));
+        let (new_proposal, _) = public_text("pool", &page(2, vec![]));
+        assert!(
+            new_proposal.contains("UNIQUE-SNAPSHOT") && !new_proposal.contains("UNIQUE-GOAL-TEXT")
         );
     }
 }

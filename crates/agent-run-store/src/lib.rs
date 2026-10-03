@@ -11,6 +11,11 @@ pub mod journal;
 /// Resume-parent proof and one-child lineage admission helpers.
 pub mod lineage;
 pub mod migrations;
+pub mod pool_admission;
+/// Authenticated pool writes, the durable shared log, and derived status.
+pub mod pool_log;
+pub mod pool_replace;
+pub mod pool_settle;
 pub mod process_ownership;
 /// Read projections, stable pages, and cursor-based transcript views.
 pub mod projections;
@@ -25,6 +30,8 @@ pub mod run_stats;
 pub mod runtime_storage;
 /// Atomic terminal lifecycle transitions and their durable completion notices.
 pub mod terminal;
+/// Indexed bounded transcript blocks and native tool evidence views.
+pub mod transcript;
 /// Authenticated, bounded worker reports and their durable outbox rows.
 pub mod worker;
 use agent_run_domain::{
@@ -100,6 +107,9 @@ pub struct Record {
     pub sequence: u32,
     pub resume_of_runtime_session_id: Option<String>,
     pub identity: Option<Value>,
+    /// Optional human display label admitted with the request; `None` is the
+    /// ordinary unnamed state, including all historical rows.
+    pub display_name: Option<String>,
 }
 
 /// Captures persisted supervisor identity fields for immutable ownership checks.
@@ -180,6 +190,7 @@ impl Record {
                 .get::<_, Option<String>>("identity_json")?
                 .map(parse)
                 .transpose()?,
+            display_name: row.get("display_name")?,
         })
     }
 }
@@ -218,7 +229,7 @@ pub(crate) fn tx_event(
 /// Session identity deliberately excludes the external turn: later turns of
 /// one chat update liveness and turn metadata without splitting its durable
 /// agent and receipt scope.
-fn session_for_reference(
+pub(crate) fn session_for_reference(
     tx: &Transaction<'_>,
     reference: &domain::OrchestratorRef,
     at: f64,
@@ -494,7 +505,7 @@ impl Store {
                 params![session_id, id.as_str()],
             )?;
             tx.execute(
-                "UPDATE deliveries SET orchestrator_session_id=?,state='pending',next_attempt_at=? WHERE agent_id=? AND state='waiting_binding'",
+                "UPDATE deliveries SET orchestrator_session_id=?,state='pending',next_attempt_at=? WHERE agent_id=? AND state='waiting_binding' AND id NOT IN (SELECT completion_delivery_id FROM pools WHERE completion_delivery_id IS NOT NULL)",
                 params![session_id, at, id.as_str()],
             )?;
         }
@@ -969,6 +980,8 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+    /// Appends historical raw text, preserving empty-text no-op behavior.
+    /// Ownership and spool guards are shared with native evidence writes.
     pub fn message(
         &self,
         id: &AgentId,
@@ -980,13 +993,42 @@ impl Store {
         if text.is_empty() {
             return Ok(());
         }
+        self.message_with_error(id, role, text, name, raw_ref, None)
+    }
+
+    /// Writes one native transcript row, including an empty tool output. Error
+    /// evidence is allowed only on tool results and names an allowlisted native
+    /// field; None stays unknown. Content above 32 KiB uses the owned spool guard.
+    /// Attempt and stable root are internal only. SQLite errors propagate.
+    pub fn message_with_error(
+        &self,
+        id: &AgentId,
+        role: &str,
+        text: &str,
+        name: Option<&str>,
+        raw_ref: Option<&str>,
+        error: Option<(bool, &str)>,
+    ) -> Result<()> {
+        if error.is_some_and(|(_, source)| {
+            role != "tool_result"
+                || ![
+                    "claude.is_error",
+                    "codex.command.exitCode",
+                    "codex.command.status",
+                    "codex.mcp.status",
+                    "codex.mcp.error",
+                ]
+                .contains(&source)
+        }) {
+            return Err(invalid("invalid native tool error evidence"));
+        }
         if !["user", "assistant", "system", "tool_call", "tool_result"].contains(&role) {
             return Err(invalid("unknown transcript role"));
         }
         let (content, raw_ref) = journal::message_storage(&self.home, id, text, raw_ref)?;
         self.conn.execute(
             &format!(
-                "INSERT INTO messages(agent_id,attempt_id,at,role,name,content,raw_ref) VALUES(?1,{ATTEMPT_OF},?3,?4,?5,?6,?7)"
+                "INSERT INTO messages(agent_id,attempt_id,at,role,name,content,raw_ref,error,error_source,content_complete,root_agent_id) VALUES(?1,{ATTEMPT_OF},?3,?4,?5,?6,?7,?8,?9,?10,(SELECT COALESCE(NULLIF(root_agent_id,''),id) FROM agents WHERE id=?1))"
             ),
             params![
                 id.as_str(),
@@ -995,7 +1037,10 @@ impl Store {
                 role,
                 name,
                 content,
-                raw_ref
+                raw_ref,
+                error.map(|(failed, _)| failed),
+                error.map(|(_, source)| source),
+                text.len() <= journal::MAX_INLINE_MESSAGE_BYTES,
             ],
         )?;
         Ok(())
@@ -1024,7 +1069,7 @@ impl Store {
         run_stats::backfill(self)
     }
     pub fn enqueue(&mut self, id: &AgentId, kind: &str, payload: &Value) -> Result<Value> {
-        if !["cancel", "steer"].contains(&kind) {
+        if !["cancel", "steer", "pool"].contains(&kind) {
             return Err(invalid("unknown command kind"));
         }
         let tx = self
@@ -1053,6 +1098,19 @@ impl Store {
         Ok(self
             .conn
             .query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |r| r.get(0))?)
+    }
+    /// Committed transcript watermark: the highest journal sequence, or zero.
+    ///
+    /// Like [`Self::revision`] this is one indexed aggregate over the
+    /// autoincremented primary key, so a follower's poll costs one bounded
+    /// lookup. Journal rows never advance the event revision, so observers
+    /// that must wake on transcript progress watch this watermark separately.
+    pub fn message_revision(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(seq),0) FROM messages", [], |r| {
+                r.get(0)
+            })?)
     }
     /// Page executions with optional active/session filters and an exact total.
     pub fn list(
@@ -1138,14 +1196,33 @@ impl Store {
             return Err(invalid("invalid transcript cursor or limit"));
         }
         let (selection, selected) = if lineage {
-            (
-                "agent_id IN (SELECT id FROM agents WHERE root_agent_id=?1 OR id=?1)",
-                &row.root_agent_id,
-            )
+            ("root_agent_id=?1", &row.root_agent_id)
         } else {
             ("agent_id=?1", id)
         };
-        let mut stmt = self.conn.prepare(&format!("SELECT seq,at,role,name,content,raw_ref FROM messages WHERE {selection} AND seq>?2 ORDER BY seq LIMIT ?3"))?;
+        // Internal ownership-and-identity key; execution ids never leave this
+        // method and only decide where a safe block boundary starts.
+        type RowKey = (
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+        );
+        let mut previous: Option<RowKey> = self.conn.query_row(
+            &format!("SELECT agent_id,attempt_id,role,name,raw_ref FROM messages WHERE {selection} AND seq<=?2 ORDER BY seq DESC LIMIT 1"),
+            params![selected.as_str(), cursor],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        ).optional()?;
+        let mut stmt = self.conn.prepare(&format!("SELECT seq,at,role,name,content,raw_ref,error,error_source,content_complete,agent_id,attempt_id FROM messages WHERE {selection} AND seq>?2 ORDER BY seq LIMIT ?3"))?;
         let mut rows = stmt.query(params![selected.as_str(), cursor, limit as i64 + 1])?;
         let mut messages = Vec::new();
         let mut bytes = 0;
@@ -1159,7 +1236,19 @@ impl Store {
                 break;
             }
             bytes += content.len();
-            messages.push(json!({"seq":row.get::<_,i64>(0)?,"at":row.get::<_,f64>(1)?,"role":row.get::<_,String>(2)?,"name":row.get::<_,Option<String>>(3)?,"content":content,"raw_ref":row.get::<_,Option<String>>(5)?}));
+            let role: String = row.get(2)?;
+            let name: Option<String> = row.get(3)?;
+            let raw_ref: Option<String> = row.get(5)?;
+            let key = (
+                row.get::<_, String>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                role.clone(),
+                name.clone(),
+                raw_ref.clone(),
+            );
+            let starts_block = key.4.is_none() || previous.as_ref() != Some(&key);
+            previous = Some(key);
+            messages.push(json!({"starts_block":starts_block,"seq":row.get::<_,i64>(0)?,"at":row.get::<_,f64>(1)?,"role":row.get::<_,String>(2)?,"name":row.get::<_,Option<String>>(3)?,"content":content,"raw_ref":row.get::<_,Option<String>>(5)?,"error":row.get::<_,Option<bool>>(6)?,"error_source":row.get::<_,Option<String>>(7)?,"content_complete":row.get::<_,Option<bool>>(8)?}));
         }
         let next = if more {
             messages.last().and_then(|m| m.get("seq")).cloned()
@@ -1172,7 +1261,7 @@ impl Store {
     }
     pub fn delivery_status(&self, id: &AgentId) -> Result<Value> {
         let row = self.get(id)?;
-        let d=self.conn.query_row("SELECT id,state,attempts,ambiguous_result,last_error FROM deliveries WHERE agent_id=? AND id NOT IN (SELECT delivery_id FROM worker_notifications) ORDER BY terminal_event_seq DESC LIMIT 1",[id.as_str()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u32>(2)?,r.get::<_,bool>(3)?,r.get::<_,Option<String>>(4)?))).optional()?;
+        let d=self.conn.query_row("SELECT id,state,attempts,ambiguous_result,last_error FROM deliveries WHERE agent_id=? AND id NOT IN (SELECT delivery_id FROM worker_notifications) AND id NOT IN (SELECT completion_delivery_id FROM pools WHERE completion_delivery_id IS NOT NULL) ORDER BY terminal_event_seq DESC LIMIT 1",[id.as_str()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u32>(2)?,r.get::<_,bool>(3)?,r.get::<_,Option<String>>(4)?))).optional()?;
         let (notification_id, state, attempts, ambiguous, last_error, last_attempt) = if let Some(
             (did, state, attempts, ambiguous, last_error),
         ) = d

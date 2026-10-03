@@ -126,6 +126,18 @@ Discover the authoritative surface at runtime:
   hardcoded list.
 - `ping` (no params) — `{"ok": true}`; liveness probe.
 
+Cooperative pools use four strict methods from the same table: `start_pool`
+(two to five ordinary start requests sharing one goal and acceptance criteria,
+admitted atomically; returns the stable `pool_id` and each member's `agent_id`,
+name, role and status), `pool_post` (an operator message stamped as the
+orchestrator), `pool_replace` (replace a terminal, fully cleaned member; same
+`request_id` returns the same new member) and `pool` (status plus a cursor-paged
+log). The first three ride the control lane. Refusals use the shared error codes
+with the pool code leading the message (`member_busy`, `pool_completed`,
+`pool_not_found`, ...). A pool completes only by formal verification (every
+member voted ready on one proposal, ended successfully, cleanup verified) and
+delivers exactly one common notice; that is not proof the result is correct.
+
 Over MCP, every tool result renders as one compact plain-text page (see
 `assets/mcp/*.txt.j2`) instead of the structured JSON below; `start`/`resume`
 additionally keep `structuredContent` `{"agent_id": ..., "sequence": ...}` so
@@ -158,7 +170,86 @@ that omit `orchestrator` share the unbound namespace across fresh connections.
 current event revision is not newer, the call waits up to 60 seconds and wakes
 as soon as a committed event advances it. The returned `revision` becomes the
 next cursor, so terminal completion is observable without a notification
-worker or polling at a fixed interval.
+worker or polling at a fixed interval. Pages also return a
+`message_revision` transcript watermark: journal rows (transcript text and
+native tool counts) never advance the event revision, so an observer that
+needs to wake on progress passes it back as optional `after_message_revision`
+together with `after_revision`. Journal-only wakes are paced to at most one
+per second per waiting follower; event wakes stay immediate.
+
+The CLI equivalent is `agent-run agents [--active] [--offset N] [--limit N]`,
+and `agent-run agents --follow` runs one persistent process instead of
+respawning polls: it prints the first page immediately and then one NDJSON
+snapshot per meaningful change (status, phase, name, usage, tool counts,
+failure, delivery and answer facts), never reprinting a page whose only
+movement is observation time. Ctrl-C ends the viewer only; supervised agents
+keep running, and a closed output pipe terminates the process.
+
+Durable steering outcomes are truthful about evidence. `steer` still queues
+one command and returns the same acknowledgement; the command's recorded
+outcome distinguishes a correlated native reply (`accepted:true` — the
+engine accepted the input, which is not a claim the model consumed it), a
+correlated native rejection (`accepted:false`, `native_rejected`), a refusal
+to send under bounded backlog pressure (`accepted:false`,
+`backlog_pressure_unsent` — provably nothing was written), and every bounded
+end after a possible write (`accepted:null` with the finite reason, e.g.
+`uncertain_timeout` or `uncertain_backlog_pressure` — the input may have been
+taken). Interleaved engine notifications are never dropped to make room for
+a control exchange: retention is fixed and bounded, a full backlog stops the
+exchange before reading, and a late correlated reply is recorded as
+metadata only.
+
+`start` and `resume` accept optional `display_name` (CLI `--name`, alias
+`--display-name`): a trimmed, nonblank UTF-8 human label of 1–64 Unicode
+scalar values, with no control or unsafe directional formatting. Punctuation
+and non-ASCII text are accepted. Omitted or null start labels mean unnamed;
+omitted or null resume labels inherit the parent, and an explicit label replaces
+it. The normalized label participates in request-id replay: changing it with the
+same key returns `Conflict`. Public agent views expose it as nullable `name`;
+labels confer no authority and are never inferred from task text.
+
+Views expose nullable `usage` from the latest execution's existing `run_stats`
+row and `usage_cumulative` across lineage executions. Missing or pruned history, missing rows or
+unreported metrics remain null; an explicitly observed zero stays zero. Each
+cumulative metric is available only when every lineage execution reported it.
+Usage objects contain measurements, source and recording time, never internal
+execution IDs. Codex resumes record a comparable parent-thread baseline before
+launch and subtract it from native cumulative counters; absent, foreign-session,
+foreign-model or decreasing counters remain unknown. Codex turn counts are null
+unless the native protocol reports a counter, never inferred from messages,
+turn IDs, tools or execution count. Compact MCP output uses `?` for unknown
+measurements and names incomplete lineage evidence.
+
+`transcript` accepts optional representation options while keeping raw rows
+and forward `cursor`/`limit` semantics unchanged. `view` is `raw` (default) or
+`blocks`: blocks group only consecutive journal rows that share one known
+native reference (`raw_ref`), role, name and one execution/attempt scope, so
+streamed fragments of one native message read as one entry with exact
+whitespace and content, `first_seq`/`last_seq`, and a `fragment`-safe
+`next_cursor`/`resume_cursor`. Rows without a native reference never merge,
+and equal references of different executions stay separate; a `starts_block`
+flag marks safe boundaries without exposing run or attempt IDs.
+`tail_blocks: 1..=200` returns the last blocks chronologically with an
+exclusive `previous_cursor` (pass it as `before_cursor` for older pages);
+blocks are the paging unit, so a limit bounds blocks, never fragments inside
+one. Reads are bounded index scans: no whole-journal load, and no raw history
+or spool file is modified. Oversized or spooled content is never silently
+dropped — `content_complete: false` and `omitted_bytes` say what is missing,
+and `raw_ref` stays opaque.
+
+Transcript rows and agent views also carry native tool evidence. A
+`tool_result` row may carry `error` (boolean) with `error_source` naming the
+allowlisted native field that supplied it: Claude `is_error`, Codex command
+`exitCode`/`status`, or Codex MCP `status`/`error`. Only explicit native
+markers set the flag; error-shaped words, agent exit codes and unrelated
+statuses never do, and unreported results stay `null` (unknown), distinct from
+an observed `false`. Agent views include nullable `tool_counts` for the latest
+execution — `calls` counts unique native invocation IDs (started, completed
+and fragment rows of one invocation count once), `failed` counts explicitly
+failed invocations and stays `null` while any result is unknown, and
+`unknown_results` counts results without consistent evidence. Executions
+recorded before the versioned native observers, or with observed coverage
+gaps, report all counts as `null` rather than a fake zero.
 
 Agent views returned by `list_agents` include
 `effort` — the reasoning effort requested at launch, or `null` when the
@@ -277,6 +368,6 @@ rendered as `RuntimeError`.
   an agent-run upgrade instead of caching schemas across versions.
 - Restart `api serve` after switching the verified sealed release at
   `~/.agent-run/standalone/current`.
-- The current database schema is version 22, reached through the paired
+- The current database schema is version 24, reached through the paired
   `agent-run config migrate`. Older resident processes refuse a newer database
   and must be restarted after an upgrade migrates it.

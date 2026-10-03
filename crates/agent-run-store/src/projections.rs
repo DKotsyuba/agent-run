@@ -6,7 +6,7 @@ use agent_run_domain::{
     error::invalid,
     views::{
         AgentPage, AgentView, AnswerView, CleanupView, DeliveryView, McpSelectionView, MessageView,
-        TranscriptPage,
+        TranscriptPage, UsageCumulativeView, UsageView,
     },
     Result,
 };
@@ -112,6 +112,8 @@ impl Store {
                 })
                 .unwrap_or_else(|| ("accepted".to_owned(), record.created_at)),
         };
+        let usage = self.usage_view(&record.id)?;
+        let usage_cumulative = self.usage_cumulative(&record.root_agent_id)?;
         let process_state = format!(
             "{:?}",
             process::observe(
@@ -135,6 +137,7 @@ impl Store {
             parent_run_id: None,
             run_id: None,
             agent_id: record.id.clone(),
+            name: record.display_name.clone(),
             runtime: record.request.runtime,
             model: record.request.model,
             profile: record.request.profile,
@@ -175,7 +178,82 @@ impl Store {
                 .then(|| record.status.as_str().to_owned()),
             acceptance: "pending".to_owned(),
             workdir: Some(record.request.workdir.display().to_string()),
+            usage,
+            usage_cumulative: Some(usage_cumulative),
+            tool_counts: Some(self.tool_counts(&record.id)?),
         })
+    }
+
+    /// Reads one execution's persisted normalized usage row as the public
+    /// allowlisted view, or `None` before any statistics row exists.
+    ///
+    /// Missing measurements stay `null` and `usage_source` is the recorded
+    /// protocol name (`none` when no native measurement exists); internal
+    /// execution identifiers are never copied into the view.
+    pub fn usage_view(&self, id: &AgentId) -> Result<Option<UsageView>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,total_tokens,num_turns,ttft_ms,api_duration_ms,cost_usd,usage_source,recorded_at FROM run_stats WHERE agent_id=?",
+                [id.as_str()],
+                |row| {
+                    Ok(UsageView {
+                        input_tokens: row.get(0)?,
+                        output_tokens: row.get(1)?,
+                        cache_read_tokens: row.get(2)?,
+                        cache_write_tokens: row.get(3)?,
+                        reasoning_tokens: row.get(4)?,
+                        total_tokens: row.get(5)?,
+                        num_turns: row.get(6)?,
+                        ttft_ms: row.get(7)?,
+                        api_duration_ms: row.get(8)?,
+                        cost_usd: row.get(9)?,
+                        usage_source: row.get(10)?,
+                        recorded_at: row.get(11)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Aggregates native usage for the logical agent identified by `root`.
+    ///
+    /// Each metric is summed only when all one-based lineage executions remain
+    /// present and each has a recorded measurement. Missing history, missing
+    /// statistics rows and null metrics stay unknown. Resumed Codex rows contain
+    /// deltas; integer counts are summed without floating-point conversion.
+    /// `executions` counts retained rows; an absent lineage has zero rows and
+    /// null totals. SQLite errors, including integer overflow, propagate.
+    pub fn usage_cumulative(&self, root: &AgentId) -> Result<UsageCumulativeView> {
+        let columns = [
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "reasoning_tokens",
+            "total_tokens",
+            "num_turns",
+            "cost_usd",
+        ];
+        let selects = columns.iter().map(|column| format!(
+            "CASE WHEN MIN(l.sequence)=1 AND MAX(l.sequence)=COUNT(*) AND COUNT(s.{column})=COUNT(*) THEN SUM(s.{column}) END"
+        )).collect::<Vec<_>>().join(",");
+        Ok(self.conn.query_row(
+            &format!("SELECT COUNT(*),{selects} FROM agents l LEFT JOIN run_stats s ON s.agent_id=l.id WHERE l.id=?1 OR l.root_agent_id=?1"),
+            [root.as_str()],
+            |row| Ok(UsageCumulativeView {
+                executions: row.get(0)?,
+                input_tokens: row.get(1)?,
+                output_tokens: row.get(2)?,
+                cache_read_tokens: row.get(3)?,
+                cache_write_tokens: row.get(4)?,
+                reasoning_tokens: row.get(5)?,
+                total_tokens: row.get(6)?,
+                num_turns: row.get(7)?,
+                cost_usd: row.get(8)?,
+            }),
+        )?)
     }
 
     /// Returns a stable offset page and the global event revision from one SQLite read transaction.
@@ -219,6 +297,7 @@ impl Store {
                 next_offset: (!complete).then_some(offset + records.len()),
                 complete,
                 revision,
+                message_revision: self.message_revision()?,
                 observed_at,
             })
         })();
@@ -237,7 +316,7 @@ impl Store {
             return Err(invalid("invalid transcript cursor or limit"));
         }
         self.get(id)?;
-        let mut statement = self.conn.prepare("SELECT seq,at,role,name,content,raw_ref FROM messages WHERE agent_id=? AND seq>? ORDER BY seq LIMIT ?")?;
+        let mut statement = self.conn.prepare("SELECT seq,at,role,name,content,raw_ref,error,error_source,content_complete FROM messages WHERE agent_id=? AND seq>? ORDER BY seq LIMIT ?")?;
         let rows = statement
             .query_map(params![id.as_str(), cursor, limit as i64 + 1], |row| {
                 Ok(MessageView {
@@ -247,6 +326,10 @@ impl Store {
                     name: row.get(3)?,
                     content: row.get(4)?,
                     raw_ref: row.get(5)?,
+                    error: row.get(6)?,
+                    error_source: row.get(7)?,
+                    content_complete: row.get(8)?,
+                    ..MessageView::default()
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -263,6 +346,11 @@ impl Store {
             limit,
             next_cursor,
             complete,
+            view: None,
+            direction: None,
+            before_cursor: None,
+            previous_cursor: None,
+            resume_cursor: None,
         })
     }
 
@@ -332,7 +420,7 @@ impl Store {
 
     /// Reads the latest delivery row and its safe evidence into the nested public shape.
     fn delivery_view(&self, record: &Record) -> Result<DeliveryView> {
-        let delivery = self.conn.query_row("SELECT id,state,attempts,ambiguous_result,last_error FROM deliveries WHERE agent_id=? AND id NOT IN (SELECT delivery_id FROM worker_notifications) ORDER BY terminal_event_seq DESC LIMIT 1", [record.id.as_str()], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u32>(2)?, row.get::<_, bool>(3)?, row.get::<_, Option<String>>(4)?))).optional()?;
+        let delivery = self.conn.query_row("SELECT id,state,attempts,ambiguous_result,last_error FROM deliveries WHERE agent_id=? AND id NOT IN (SELECT delivery_id FROM worker_notifications) AND id NOT IN (SELECT completion_delivery_id FROM pools WHERE completion_delivery_id IS NOT NULL) ORDER BY terminal_event_seq DESC LIMIT 1", [record.id.as_str()], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u32>(2)?, row.get::<_, bool>(3)?, row.get::<_, Option<String>>(4)?))).optional()?;
         let Some((notification_id, state, attempts, ambiguous, last_error)) = delivery else {
             return Ok(DeliveryView {
                 run_id: None,

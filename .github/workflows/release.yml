@@ -23,6 +23,12 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
+      - name: Restore Rust dependency cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: agent-run-macos-15-arm64
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
       - name: Fetch locked dependencies
         run: cargo fetch --locked
       - name: Verify annotated tag and workspace version
@@ -63,6 +69,12 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
+      - name: Restore Rust dependency cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: agent-run-macos-15-arm64
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
       - name: Fetch locked dependencies
         run: cargo fetch --locked
       - name: Verify native runner architecture

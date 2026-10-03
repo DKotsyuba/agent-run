@@ -1,0 +1,30 @@
+agent-run pool {{ pool_id }} — {{ status.state }}, roster r{{ status.roster_revision }}{% if status.agreed %}, all current members valid-ready (agreement is not completion){% else %}, not yet unanimous{% endif %}
+{% if show_goal %}
+Goal: {{ status.goal }}
+Acceptance criteria:
+{% for criterion in status.criteria %}
+- {{ criterion.id }}: {{ criterion.text }}
+{% endfor %}
+{% endif %}
+{% if status.current_proposal and show_proposal %}
+Current proposal #{{ status.current_proposal.seq }} (roster r{{ status.current_proposal.roster_revision }}), snapshot:
+{{ status.current_proposal.snapshot }}
+{% elif status.current_proposal %}
+Current proposal #{{ status.current_proposal.seq }} unchanged (read with after_seq 0 for its snapshot)
+{% else %}
+No proposal yet.
+{% endif %}
+Members:
+{% for member in status.members %}
+- {{ member.name }} ({{ member.role }}, {{ member.agent_id }}): {{ member.tip_status }}, vote {{ member.why }}{% if member.vote and member.vote.decision %} [{{ member.vote.decision }}]{% endif %}{{ "" }}
+{% endfor %}
+{{ status.note }}
+Entries (after #{{ after_seq }}{% if before_seq %}, before #{{ before_seq }}{% endif %}, {{ entry_count }} shown):
+{% for entry in entries %}
+{{ entry }}
+{% endfor %}
+{% if complete %}
+page complete in this direction; this does not imply a finished pool
+{% else %}
+next cursor: {{ next_cursor }} — request the next page with after_seq={{ next_cursor }}
+{% endif %}

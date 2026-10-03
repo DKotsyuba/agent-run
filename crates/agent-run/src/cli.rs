@@ -97,6 +97,26 @@ pub trait CliService: Send + Sync {
     fn transcript_public(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
         self.transcript(id, cursor, limit)
     }
+    /// Reads typed transcript options. Historical service seams retain raw
+    /// behavior; block readers must implement this method explicitly.
+    fn transcript_options(
+        &self,
+        id: &AgentId,
+        query: &agent_run_domain::transcript::TranscriptQuery,
+        lineage: bool,
+    ) -> Result<Value> {
+        query.validate()?;
+        if query.view != agent_run_domain::transcript::TranscriptView::Raw {
+            return Err(crate::Error::Unsupported(
+                "block transcript reader is unavailable".into(),
+            ));
+        }
+        if lineage {
+            self.transcript_public(id, query.cursor, query.limit)
+        } else {
+            self.transcript(id, query.cursor, query.limit)
+        }
+    }
     /// Return the configured model roster or schema-2 provider catalog.
     fn models<'a>(&'a self, query: agent_run_domain::ModelsQuery) -> CliFuture<'a>;
     /// Return the configured capacity limits.
@@ -146,6 +166,15 @@ impl CliService for Service {
     }
     fn transcript(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
         Service::transcript(self, id, cursor, limit)
+    }
+    /// Reads raw or bounded blocks through the same public service validator.
+    fn transcript_options(
+        &self,
+        id: &AgentId,
+        query: &agent_run_domain::transcript::TranscriptQuery,
+        lineage: bool,
+    ) -> Result<Value> {
+        Service::transcript_with_options(self, id, (!lineage).then_some(id), query)
     }
     /// Keep transcript cursors continuous across independent resume executions.
     fn transcript_public(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
@@ -236,6 +265,48 @@ pub enum Command {
     Doctor,
     Start(Start),
     Resume(Resume),
+    /// Start a cooperative pool from one JSON request (`-` reads stdin).
+    StartPool {
+        /// JSON file or `-`: request_id, goal, optional acceptance, members.
+        #[arg(long)]
+        spec: String,
+        #[command(flatten)]
+        session: SessionArgs,
+    },
+    /// Post a message, stamped as from the operator, to every pool member.
+    PoolPost {
+        #[arg(long)]
+        pool_id: String,
+        #[arg(long)]
+        request_id: String,
+        /// Message text; `-` reads standard input.
+        #[arg(long)]
+        text: String,
+    },
+    /// Replace one terminal, fully cleaned pool member.
+    PoolReplace {
+        #[arg(long)]
+        pool_id: String,
+        /// Stable agent id of the current member.
+        #[arg(long)]
+        agent_id: String,
+        #[arg(long)]
+        request_id: String,
+        /// Optional JSON file or `-` with an explicit replacement start.
+        #[arg(long)]
+        spec: Option<String>,
+    },
+    /// Read a pool's status and one cursor page of its log.
+    Pool {
+        #[arg(long)]
+        pool_id: String,
+        #[arg(long)]
+        after_seq: Option<u64>,
+        #[arg(long)]
+        before_seq: Option<u64>,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
     Bind(Bind),
     Cancel {
         /// Stable agent id, or a historical run alias for that agent.
@@ -269,8 +340,17 @@ pub enum Command {
         run_id: Option<AgentId>,
         #[arg(long, default_value_t = 0)]
         cursor: i64,
-        #[arg(long, default_value_t = 200)]
+        #[arg(long, default_value_t = agent_run_domain::transcript::default_limit())]
         limit: usize,
+        /// Raw rows by default, or consecutive native-identity blocks.
+        #[arg(long, default_value = "raw")]
+        view: agent_run_domain::transcript::TranscriptView,
+        /// Last 1..=200 blocks; requires --view blocks and cursor zero.
+        #[arg(long, conflicts_with_all = ["follow", "full"])]
+        tail_blocks: Option<usize>,
+        /// Exclusive upper sequence for an older block page.
+        #[arg(long, conflicts_with_all = ["follow", "full"])]
+        before_cursor: Option<i64>,
         #[arg(long)]
         follow: bool,
         #[arg(long, conflicts_with = "follow")]
@@ -470,6 +550,10 @@ pub struct Start {
     pub account: Option<String>,
     #[arg(long)]
     pub request_id: Option<String>,
+    /// Optional human display label shown in list views; at most 64 Unicode
+    /// characters, no control or bidi formatting. `--display-name` is an alias.
+    #[arg(long = "name", alias = "display-name")]
+    pub display_name: Option<String>,
     #[arg(long)]
     pub wait: bool,
     #[command(flatten)]
@@ -496,6 +580,10 @@ pub struct Resume {
     pub timeout_seconds: Option<f64>,
     #[arg(long)]
     pub request_id: Option<String>,
+    /// Optional replacement display label; omission inherits the previous
+    /// run's label. `--display-name` is an alias.
+    #[arg(long = "name", alias = "display-name")]
+    pub display_name: Option<String>,
     #[command(flatten)]
     pub session: SessionArgs,
 }
@@ -503,7 +591,11 @@ pub struct Resume {
 #[derive(Args, Debug)]
 pub struct Bind {
     /// Stable agent whose selected execution should be bound.
-    pub agent_id: AgentId,
+    #[arg(required_unless_present = "pool", conflicts_with = "pool")]
+    pub agent_id: Option<AgentId>,
+    /// Bind a whole pool and every current member together instead of one agent.
+    #[arg(long)]
+    pub pool: Option<String>,
     /// Legacy execution selector, retained for older callers.
     #[arg(long, hide = true)]
     pub run_id: Option<AgentId>,
@@ -557,9 +649,128 @@ pub struct Agents {
     pub offset: usize,
     #[arg(long, default_value_t = 100)]
     pub limit: usize,
+    /// Keep one process watching and print one NDJSON snapshot per meaningful
+    /// change; observation-time-only movement never reprints a page.
+    #[arg(long)]
+    pub follow: bool,
     #[command(flatten)]
     pub session: SessionArgs,
 }
+/// Long-poll window, in seconds, of one follow watch round.
+const FOLLOW_WAIT_SECONDS: f64 = 25.0;
+
+/// Reduces one agent view to the stable facts a follow snapshot reports.
+///
+/// Only fields whose change is meaningful re-emit a page: observation-time
+/// drift (`observed_at`, `elapsed_seconds`, `silence_seconds`) moves every
+/// rebuild and must never redraw unchanged data. Unlisted fields are absent
+/// rather than defaulted so a view gaining evidence still changes the digest.
+fn follow_signature(agent: &Value) -> Option<String> {
+    let object = agent.as_object()?;
+    let mut stable = serde_json::Map::new();
+    for key in [
+        "agent_id",
+        "name",
+        "runtime",
+        "model",
+        "profile",
+        "task_summary",
+        "status",
+        "phase",
+        "failure_kind",
+        "failure_text",
+        "answer_available",
+        "answer_bytes",
+        "answer_sha256",
+        "effort",
+        "last_progress_at",
+        "warned",
+        "usage",
+        "usage_cumulative",
+        "tool_counts",
+        "mcp",
+    ] {
+        if let Some(value) = object.get(key) {
+            stable.insert(key.into(), value.clone());
+        }
+    }
+    if let Some(delivery) = object.get("delivery").filter(|d| d.is_object()) {
+        let mut filtered = serde_json::Map::new();
+        for key in [
+            "state",
+            "notification_id",
+            "attempts",
+            "ambiguous",
+            "last_error",
+        ] {
+            if let Some(value) = delivery.get(key) {
+                filtered.insert(key.into(), value.clone());
+            }
+        }
+        stable.insert("delivery".into(), Value::Object(filtered));
+    }
+    serde_json::to_string(&Value::Object(stable)).ok()
+}
+
+/// Runs the persistent `agents --follow` watcher for one command invocation.
+///
+/// One process emits the first bounded page immediately and then one NDJSON
+/// snapshot per meaningful change: each round long-polls the broker with the
+/// last event revision and transcript watermark, so status, usage, tool-count,
+/// name, failure, delivery and answer changes all wake it, while pages whose
+/// only movement is observation time are counted and dropped. The waiter is
+/// abortable at every await: Ctrl-C ends the viewer (never the supervised
+/// agents) and a closed output pipe terminates the process through the
+/// writer's own error.
+async fn follow_agents(dependencies: CliDependencies, a: &Agents) -> Result<()> {
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut after_revision: Option<i64> = None;
+    let mut after_message_revision: Option<i64> = None;
+    let mut signatures: std::collections::BTreeMap<String, String> = Default::default();
+    let mut total: Option<i64> = None;
+    loop {
+        let request = Query {
+            active: a.active,
+            offset: a.offset,
+            limit: a.limit,
+            after_revision,
+            after_message_revision,
+            wait_seconds: if after_revision.is_none() {
+                0.0
+            } else {
+                FOLLOW_WAIT_SECONDS
+            },
+            orchestrator: a.session.resolve()?,
+        };
+        // A pending wait owns no SQLite transaction and no engine handle, so
+        // dropping it at the interrupt boundary leaves nothing behind.
+        let page = tokio::select! {
+            biased;
+            _ = interrupt.recv() => return Ok(()),
+            page = dependencies.service.list(request) => page?,
+        };
+        after_revision = Some(page["revision"].as_i64().unwrap_or_default());
+        after_message_revision = Some(page["message_revision"].as_i64().unwrap_or_default());
+        // Rebuild the page digest from stable per-agent facts; identical
+        // digests mean nothing meaningful moved since the last snapshot.
+        let mut next = std::collections::BTreeMap::new();
+        for agent in page["items"].as_array().into_iter().flatten() {
+            if let (Some(id), Some(signature)) =
+                (agent["agent_id"].as_str(), follow_signature(agent))
+            {
+                next.insert(id.to_owned(), signature);
+            }
+        }
+        let page_total = page["total"].as_i64();
+        let unchanged = next == signatures && total == page_total;
+        (signatures, total) = (next, page_total);
+        if unchanged {
+            continue;
+        }
+        (dependencies.output)(&page)?;
+    }
+}
+
 /// API daemon commands retained from the Python operator surface.
 #[derive(Subcommand, Debug)]
 pub enum Api {
@@ -715,6 +926,26 @@ fn read_stdin(max: usize) -> Result<String> {
         return Err(invalid("stdin exceeds the maximum input size"));
     }
     String::from_utf8(bytes).map_err(|_| invalid("input must be UTF-8"))
+}
+
+/// Reads one bounded JSON object from a file, or from standard input for `-`.
+fn spec_json(source: &str) -> Result<Value> {
+    const MAX: usize = 1024 * 1024;
+    let text = if source == "-" {
+        read_stdin(MAX)?
+    } else {
+        let bytes = std::fs::read(source).map_err(|_| invalid("spec file is unreadable"))?;
+        if bytes.len() > MAX {
+            return Err(invalid("spec file exceeds the maximum input size"));
+        }
+        String::from_utf8(bytes).map_err(|_| invalid("spec must be UTF-8"))?
+    };
+    let value: Value =
+        serde_json::from_str(&text).map_err(|_| invalid("spec must be a JSON object"))?;
+    if !value.is_object() {
+        return Err(invalid("spec must be a JSON object"));
+    }
+    Ok(value)
 }
 
 /// Reads a task argument, interpreting exactly `-` as bounded standard input.
@@ -1271,6 +1502,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                     "orchestrator": a.session.resolve()?,
                     "request_id": a.request_id,
                     "account": a.account,
+                    "display_name": a.display_name,
                 }))
                 .map_err(|_| invalid("invalid provider start arguments"))?;
             request.validate()?;
@@ -1306,6 +1538,9 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             if let Some(run_id) = a.run_id {
                 arguments["run_id"] = json!(run_id);
             }
+            if let Some(display_name) = a.display_name {
+                arguments["display_name"] = json!(display_name);
+            }
             let result = dependencies.broker.call("resume", arguments).await?;
             (dependencies.output)(&admission_output(&result)?)?;
         }
@@ -1334,13 +1569,76 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 external_turn_id: a.session_turn_id,
             };
             let mut store = Store::open(&home)?;
+            if let Some(pool) = &a.pool {
+                let pool: agent_run_domain::pool::PoolId = pool.parse()?;
+                store.bind_pool(&pool, &reference, crate::domain::now())?;
+                (dependencies.output)(&json!({"pool_id": pool, "bound": true}))?;
+                return Ok(0);
+            }
+            let agent_id = a
+                .agent_id
+                .ok_or_else(|| invalid("agent id or --pool is required"))?;
             let run =
-                agent_run_core::agent_identity::resolve(&store, &a.agent_id, a.run_id.as_ref())?;
+                agent_run_core::agent_identity::resolve(&store, &agent_id, a.run_id.as_ref())?;
             hooks::bind::bind(&mut store, run.id.clone(), reference, crate::domain::now())?;
             (dependencies.output)(&agent_run_core::agent_identity::result(
                 &run,
                 store.delivery_status(&run.id)?,
             )?)?;
+        }
+        Command::StartPool { spec, session } => {
+            let mut request = spec_json(&spec)?;
+            if let Some(reference) = session.resolve()? {
+                request["orchestrator"] = serde_json::to_value(reference)?;
+            }
+            let result = dependencies.broker.call("start_pool", request).await?;
+            (dependencies.output)(&result)?;
+        }
+        Command::PoolPost {
+            pool_id,
+            request_id,
+            text,
+        } => {
+            let message = task_text(&text, agent_run_domain::pool::MAX_BODY_BYTES)?;
+            let result = dependencies
+                .broker
+                .call(
+                    "pool_post",
+                    json!({"pool_id": pool_id, "request_id": request_id, "message": message}),
+                )
+                .await?;
+            (dependencies.output)(&result)?;
+        }
+        Command::PoolReplace {
+            pool_id,
+            agent_id,
+            request_id,
+            spec,
+        } => {
+            let start = spec.as_deref().map(spec_json).transpose()?;
+            let result = dependencies
+                .broker
+                .call(
+                    "pool_replace",
+                    json!({"pool_id": pool_id, "agent_id": agent_id, "request_id": request_id, "start": start}),
+                )
+                .await?;
+            (dependencies.output)(&result)?;
+        }
+        Command::Pool {
+            pool_id,
+            after_seq,
+            before_seq,
+            limit,
+        } => {
+            let result = dependencies
+                .broker
+                .call(
+                    "pool",
+                    json!({"pool_id": pool_id, "after_seq": after_seq, "before_seq": before_seq, "limit": limit}),
+                )
+                .await?;
+            (dependencies.output)(&result)?;
         }
         Command::Context(a) => {
             let reference = OrchestratorRef {
@@ -1370,27 +1668,38 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 }
                 Hook::Bind(transport) => {
                     let mut store = Store::open(&home)?;
-                    let result =
-                        hooks::bind::run_hook(&mut store, &payload, &transport.transport, None)?;
+                    let result = hooks::bind::run_hook_bound(
+                        &mut store,
+                        &payload,
+                        &transport.transport,
+                        None,
+                    )?;
                     (dependencies.output)(
                         &json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":result.message()}}),
                     )?;
                 }
             }
         }
-        Command::Agents(a) => (dependencies.output)(
-            &dependencies
-                .service
-                .list(Query {
-                    active: a.active,
-                    offset: a.offset,
-                    limit: a.limit,
-                    after_revision: None,
-                    wait_seconds: 0.0,
-                    orchestrator: a.session.resolve()?,
-                })
-                .await?,
-        )?,
+        Command::Agents(a) => {
+            if !a.follow {
+                (dependencies.output)(
+                    &dependencies
+                        .service
+                        .list(Query {
+                            active: a.active,
+                            offset: a.offset,
+                            limit: a.limit,
+                            after_revision: None,
+                            after_message_revision: None,
+                            wait_seconds: 0.0,
+                            orchestrator: a.session.resolve()?,
+                        })
+                        .await?,
+                )?;
+            } else {
+                follow_agents(dependencies, &a).await?;
+            }
+        }
         Command::Answer { agent_id, run_id } => {
             let id = dependencies
                 .service
@@ -1403,6 +1712,9 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             run_id,
             mut cursor,
             limit,
+            view,
+            tail_blocks,
+            before_cursor,
             follow,
             full,
             format,
@@ -1410,14 +1722,25 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             let agent_id = dependencies
                 .service
                 .resolve_run_id(&agent_id, run_id.as_ref())?;
+            let query = agent_run_domain::transcript::TranscriptQuery {
+                cursor,
+                limit,
+                view,
+                tail_blocks,
+                before_cursor,
+            };
+            query.validate()?;
+            if view == agent_run_domain::transcript::TranscriptView::Blocks && (follow || full) {
+                return Err(invalid(
+                    "blocks are bounded pages; --follow and --full require raw view",
+                ));
+            }
             let page_at = |cursor| {
-                if run_id.is_some() {
-                    dependencies.service.transcript(&agent_id, cursor, limit)
-                } else {
-                    dependencies
-                        .service
-                        .transcript_public(&agent_id, cursor, limit)
-                }
+                let mut page = query.clone();
+                page.cursor = cursor;
+                dependencies
+                    .service
+                    .transcript_options(&agent_id, &page, run_id.is_none())
             };
             // An explicit --format always wins; otherwise text is interactive
             // and JSON keeps piped consumers on the historical machine shape.

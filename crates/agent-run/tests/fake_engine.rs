@@ -92,6 +92,7 @@ fn admit_runtime(home: &Path, runtime_name: &str, task: &str) -> AgentId {
         write: false,
         fast: false,
         effort: None,
+        display_name: None,
         timeout_seconds: None,
         read_roots: vec![],
         output_schema: None,

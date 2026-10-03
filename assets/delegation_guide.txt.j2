@@ -31,3 +31,5 @@ provider {{ provider.id }} (harness {{ provider.harness }}){% if provider.profil
 {% else %}
 No providers are currently configured.
 {% endif %}
+
+Cooperative pools: use start_pool when two to five agents should pursue ONE common goal with their own tasks; they coordinate through private tools, complete only by unanimous ready votes, successful ends and verified cleanup (a formal check, not proof the result is right), and you receive one common notice. Guide with pool_post, inspect with pool, replace a terminal member with pool_replace.

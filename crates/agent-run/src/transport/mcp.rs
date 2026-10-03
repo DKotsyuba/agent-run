@@ -293,7 +293,7 @@ impl ServerHandler for Proxy {
                 .into());
             }
         }
-        if matches!(request.name.as_ref(), "start" | "resume")
+        if matches!(request.name.as_ref(), "start" | "start_pool" | "resume")
             && !arguments.contains_key("orchestrator")
         {
             if let Some(o) = &self.orchestrator {
@@ -307,7 +307,9 @@ impl ServerHandler for Proxy {
         )
         .await
         {
-            Ok(value) => crate::transport::mcp_text::success_result(request.name.as_ref(), &value),
+            Ok(value) => {
+                crate::transport::mcp_text::public_success_result(request.name.as_ref(), &value)
+            }
             Err(error) => {
                 let public = error.public();
                 let message = if matches!(error, Error::BrokerUnavailable) {

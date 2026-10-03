@@ -106,7 +106,10 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Renders one session card: `<pictogram> <task>` / id / RUNTIME/model / time.
+/// Draws one session card inside `rect` using `app` observer state, with
+/// selection styling when `selected`. The optional human name leads the task
+/// summary; both share bounded display width. Stable ID, runtime/model, workdir
+/// and elapsed time remain visible. Rendering only mutates the frame.
 fn render_card(
     f: &mut Frame,
     app: &App,
@@ -144,7 +147,15 @@ fn render_card(
             ),
             Span::styled(" ", bg),
             Span::styled(
-                truncate(&agent.task_summary, text_width.saturating_sub(3)),
+                truncate(
+                    &match &agent.name {
+                        // The optional display label leads the card; the task
+                        // summary keeps its place for unnamed agents.
+                        Some(name) => format!("{name} — {}", agent.task_summary),
+                        None => agent.task_summary.clone(),
+                    },
+                    text_width.saturating_sub(3),
+                ),
                 Style::new().bold().bg(background.rat()),
             ),
         ]),
