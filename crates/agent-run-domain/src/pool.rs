@@ -425,7 +425,10 @@ impl PoolNotice {
             .chain(std::iter::once(self.message.len()))
             .rev()
             .map(with)
-            .find(|candidate| fits(candidate))
+            // Every returned candidate must itself be a legal notice, so a
+            // transport budget can never yield a message the receiving frontend
+            // would reject for exceeding the 4096-byte bound.
+            .find(|candidate| candidate.validate().is_ok() && fits(candidate))
     }
 
     /// Renders trusted framing from the embedded template around the frozen text.
@@ -1077,6 +1080,64 @@ mod tests {
             !probed.get(),
             "fits was never called for an invalid original"
         );
+    }
+
+    /// A frame just over its bound, whose body is mostly escapes at the end,
+    /// must not fit by dropping escapes while adding the ASCII marker: the
+    /// returned notice stays within the 4096-byte message bound AND the frame
+    /// bound, with identifiers and marker intact; every candidate is validated.
+    #[test]
+    fn fitted_candidates_stay_legal_at_the_frame_boundary() {
+        const FRAME_LIMIT: usize = 8192;
+        let pool_id = PoolId::new();
+        let frame = |n: &PoolNotice| {
+            serde_json::to_vec(&json!({
+                "version":4,"op":"pool_completion","thread_id":"thread-fixture",
+                "notification_id":n.notification_id,"pool_id":n.pool_id,"message":n.message,
+            }))
+            .unwrap()
+        };
+        let base = PoolNotice {
+            notification_id: "ntf_boundary".into(),
+            pool_id,
+            message: "x".into(),
+        };
+        // One escape adds one byte, so tune the escape count to put the
+        // original frame exactly one byte over the bound.
+        let overhead = frame(&base).len() - 1;
+        let escapes = FRAME_LIMIT + 1 - overhead - MAX_NOTICE_BYTES;
+        let notice = PoolNotice {
+            message: format!(
+                "{}{}",
+                "x".repeat(MAX_NOTICE_BYTES - escapes),
+                "\"".repeat(escapes)
+            ),
+            ..base
+        };
+        assert_eq!(
+            (notice.message.len(), frame(&notice).len()),
+            (MAX_NOTICE_BYTES, FRAME_LIMIT + 1)
+        );
+        let fitted = notice.fitted(|n| frame(n).len() <= FRAME_LIMIT).unwrap();
+        assert!(fitted.validate().is_ok());
+        assert!(
+            fitted.message.len() <= MAX_NOTICE_BYTES,
+            "{}",
+            fitted.message.len()
+        );
+        assert!(frame(&fitted).len() <= FRAME_LIMIT);
+        assert!(fitted.message.ends_with(TRUNCATION_MARKER));
+        assert_eq!(
+            (&fitted.notification_id, &fitted.pool_id),
+            (&notice.notification_id, &notice.pool_id)
+        );
+        // Invariant: no returned notice is ever invalid, for any budget.
+        for budget in [0, 100, 400, 1000, 4096, 6000] {
+            if let Some(candidate) = notice.fitted(|n| n.render().is_ok_and(|t| t.len() <= budget))
+            {
+                assert!(candidate.validate().is_ok(), "budget {budget}");
+            }
+        }
     }
 
     /// Defaults fill in one criterion and role/slot names; replay shape is deterministic.
