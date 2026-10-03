@@ -4,6 +4,11 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-10-04
+
+- test(delivery): keep the scripted pool relay alive across empty socket-health
+  probes, with a deterministic regression and unchanged completion assertions
+
 - feat(transcript): add the optional `blocks` view and bounded `tail_blocks`/
   `before_cursor` paging over the existing transcript API; raw rows, cursors and
   ordering stay unchanged, unknown identities never merge, and omitted or
