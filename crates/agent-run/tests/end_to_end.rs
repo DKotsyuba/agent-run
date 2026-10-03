@@ -280,3 +280,165 @@ async fn zero_exit_without_terminal_result_is_not_success() {
         .unwrap();
     assert!(!transcript["messages"].as_array().unwrap().is_empty());
 }
+
+/// One `agents --follow` viewer child, killed and reaped on drop even when an
+/// assertion panics, so no viewer outlives its test.
+struct Viewer(Child);
+impl Drop for Viewer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Spawns the real `agent-run agents --follow` binary against `home` and
+/// records its NDJSON snapshots until it exits or a 30 s reader TTL ends.
+fn spawn_follow_viewer(
+    home: &std::path::Path,
+) -> (Viewer, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agent-run"))
+        .arg("--home")
+        .arg(home)
+        .args(["agents", "--follow", "--limit", "5"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("follow viewer starts");
+    let snapshots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = std::sync::Arc::clone(&snapshots);
+    let stdout = child.stdout.take().expect("viewer stdout");
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        for line in std::io::BufRead::lines(std::io::BufReader::new(stdout)) {
+            if Instant::now() > deadline {
+                break;
+            }
+            let Ok(line) = line else { break };
+            if let Ok(value) = serde_json::from_str(&line) {
+                recorded.lock().unwrap().push(value);
+            }
+        }
+    });
+    (Viewer(child), snapshots)
+}
+
+/// Waits until a recorded snapshot satisfies `predicate`, bounded to 12 s.
+async fn wait_for_snapshot(
+    snapshots: &std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    predicate: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        if let Some(found) = snapshots
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|page| predicate(page))
+            .cloned()
+        {
+            return found;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no matching follow snapshot in {:?}",
+            snapshots.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The real follow binary, driven through the real broker and the fake
+/// engine's marker-controlled lifecycle, proves change delivery: each viewer
+/// first observes the settled baseline, the marker-released tool-count and
+/// terminal changes then arrive on that same viewer, a store event that
+/// changes no displayed fact never re-emits a page, and interrupting a
+/// viewer never cancels the agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_follow_binary_tracks_the_real_lifecycle_without_duplicates() {
+    let mut harness = Harness::new();
+    harness.start_broker().await;
+    let id = harness.submit_cli("fixture:follow-tools");
+
+    // First viewer, started before any marker: its baseline page predates
+    // every change this test releases.
+    let (mut first, seen_first) = spawn_follow_viewer(&harness.home);
+    let baseline = wait_for_snapshot(&seen_first, |page| {
+        page["items"][0]["status"] == "running"
+            && page["items"][0]["tool_counts"]["calls"] == 0
+            && page["items"][0]["tool_counts"]["failed"] == 0
+    })
+    .await;
+    assert_eq!(baseline["items"][0]["agent_id"], id.as_str());
+
+    // Release the tool phase and observe the native-count change arrive.
+    std::fs::write(harness.home.join("follow-tools"), b"").unwrap();
+    let tool_page = wait_for_snapshot(&seen_first, |page| {
+        page["items"][0]["status"] == "running"
+            && page["items"][0]["tool_counts"]["calls"] == 1
+            && page["items"][0]["tool_counts"]["failed"] == 0
+    })
+    .await;
+    assert_eq!(tool_page["items"][0]["tool_counts"]["unknown_results"], 0);
+
+    // A store event that changes no displayed fact must not re-emit a page:
+    // the wake rebuilds the page with fresh observation timestamps only.
+    let settled = {
+        let store = Store::open(&harness.home).unwrap();
+        store
+            .event(&id, "fixture_follow_probe", &serde_json::json!({}))
+            .unwrap();
+        seen_first.lock().unwrap().len()
+    };
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        seen_first.lock().unwrap().len(),
+        settled,
+        "an unchanged page was re-emitted after the probe event"
+    );
+
+    // Interrupting the viewer leaves the supervised agent running.
+    // SAFETY: the signal targets only the owned viewer child process.
+    unsafe {
+        libc::kill(first.0.id() as libc::pid_t, libc::SIGINT);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !matches!(first.0.try_wait(), Ok(Some(_))) {
+        assert!(Instant::now() < deadline, "viewer ignored SIGINT");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        Store::open(&harness.home).unwrap().get(&id).unwrap().status,
+        Status::Running,
+        "the viewer never cancels the agent"
+    );
+
+    // Second viewer, also started before its marker: its baseline is the
+    // settled tool state, and only then is the terminal change released.
+    let (mut second, seen_second) = spawn_follow_viewer(&harness.home);
+    let running = wait_for_snapshot(&seen_second, |page| {
+        page["items"][0]["status"] == "running"
+            && page["items"][0]["tool_counts"]["calls"] == 1
+            && page["items"][0]["tool_counts"]["failed"] == 0
+    })
+    .await;
+    assert_eq!(running["items"][0]["agent_id"], id.as_str());
+    std::fs::write(harness.home.join("follow-release"), b"").unwrap();
+    let terminal_page = wait_for_snapshot(&seen_second, |page| {
+        page["items"][0]["status"] == "succeeded" && page["items"][0]["answer_available"] == true
+    })
+    .await;
+    assert_eq!(terminal_page["items"][0]["agent_id"], id.as_str());
+    // SAFETY: the signal targets only the owned viewer child process.
+    unsafe {
+        libc::kill(second.0.id() as libc::pid_t, libc::SIGINT);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !matches!(second.0.try_wait(), Ok(Some(_))) {
+        assert!(Instant::now() < deadline, "second viewer ignored SIGINT");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let answer = harness.terminal(&id).await;
+    assert_eq!(answer["content"], "fixture final answer\n");
+}

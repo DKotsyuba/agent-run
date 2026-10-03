@@ -2,7 +2,7 @@
 //! Only explicit fixture-mode keywords change deterministic test behavior.
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 fn emit(value: Value) {
     println!("{value}");
     io::stdout().flush().expect("fixture stdout");
@@ -54,6 +54,15 @@ fn worker_report(args: &[String]) {
         }).await.expect("bounded worker MCP fixture");
     });
 }
+/// Blocks until the marker file exists in the current workdir, bounded to
+/// twenty seconds so a lost test driver still ends this child finitely.
+fn wait_marker(name: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !std::path::Path::new(name).exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Runs one offline native-protocol scenario selected only by fixture task text.
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -202,6 +211,23 @@ fn main() {
         {
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+    if task == "fixture:follow-tools" {
+        // Phase one waits for the driver's marker, then one native tool
+        // invocation is streamed so a follow viewer observes a tool-count
+        // change; phase two waits for the release marker before the turn's
+        // normal completion path runs.
+        wait_marker("follow-tools");
+        emit(
+            json!({"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_1","name":"shell"}}}),
+        );
+        emit(
+            json!({"type":"assistant","session_id":session,"message":{"id":"msg_one","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"shell","input":{"cmd":"ls"}}]}}),
+        );
+        emit(
+            json!({"type":"user","session_id":session,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":false,"content":"file.txt"}]}}),
+        );
+        wait_marker("follow-release");
     }
     native_history(&session, &task);
     // A Claude Code 2.1.280 protocol frame rejecting a usage window, and the
