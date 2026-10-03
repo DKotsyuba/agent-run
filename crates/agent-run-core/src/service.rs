@@ -621,11 +621,10 @@ impl Service {
                 true,
             ),
         };
-        let bound = request.orchestrator.is_some();
         if let Some(found) =
             Store::open(&self.home)?.replay_pool(&namespace, &request.request_id, &sha)?
         {
-            return self.pool_view(&Store::open(&self.home)?, &found, bound);
+            return self.pool_view(&Store::open(&self.home)?, &found);
         }
         let (config, revision) = self.current_provider_config()?;
         let accounts = Store::open(&self.home)?.list_accounts()?;
@@ -714,7 +713,7 @@ impl Service {
                 result => break result?,
             }
         };
-        self.pool_view(&Store::open(&self.home)?, &admission, bound)
+        self.pool_view(&Store::open(&self.home)?, &admission)
     }
 
     /// Admits a pool through [`Self::admit_pool`] and hands every newly
@@ -759,7 +758,22 @@ impl Service {
 
     /// Renders the public pool admission: stable identities, names, roles and
     /// current statuses only.
-    fn pool_view(&self, store: &Store, pool: &PoolAdmission, bound: bool) -> Result<Value> {
+    ///
+    /// `bound` reflects the durable shared binding stored on the pool row,
+    /// not the shape of the request that happened to be replayed, and a
+    /// replaced or pruned original member reports `status: null` instead of
+    /// failing the whole view.
+    fn pool_view(&self, store: &Store, pool: &PoolAdmission) -> Result<Value> {
+        let bound: bool = store.conn.query_row(
+            "SELECT orchestrator_session_id IS NOT NULL FROM pools WHERE id=?",
+            [pool.pool_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let roster_revision: u32 = store.conn.query_row(
+            "SELECT roster_revision FROM pools WHERE id=?",
+            [pool.pool_id.as_str()],
+            |row| row.get(0),
+        )?;
         let members = pool
             .members
             .iter()
@@ -768,13 +782,14 @@ impl Service {
                     "agent_id": member.agent_id,
                     "name": member.name,
                     "role": member.role,
-                    "status": store.get(&member.agent_id)?.status.as_str(),
+                    "status": store.get(&member.agent_id).ok().map(|row| row.status.as_str()),
                 }))
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(
-            json!({"pool_id": pool.pool_id, "created": pool.created, "bound": bound, "members": members}),
-        )
+        Ok(json!({
+            "pool_id": pool.pool_id, "created": pool.created, "bound": bound,
+            "roster_revision": roster_revision, "members": members,
+        }))
     }
 
     pub async fn start(&self, mut request: StartRequest) -> Result<Value> {

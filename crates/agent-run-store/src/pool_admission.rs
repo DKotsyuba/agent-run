@@ -70,15 +70,19 @@ pub struct PoolAdmission {
     pub pool_id: PoolId,
     /// False for a replay of the same original request.
     pub created: bool,
-    /// Current members in slot order.
+    /// The original admission roster in slot order (revision one), stable
+    /// across later replacements.
     pub members: Vec<PoolMemberRecord>,
 }
 
-/// Reads the current members of `pool_id` in slot order.
+/// Reads the original admission roster of `pool_id` in slot order: the
+/// members that joined at roster revision one, retained even after later
+/// replacements. A replay therefore always answers with the identities the
+/// original request minted; the current roster is read from pool status.
 fn members_of(conn: &rusqlite::Connection, pool_id: &str) -> Result<Vec<PoolMemberRecord>> {
     let mut statement = conn.prepare(
         "SELECT agent_id,slot,name,role FROM pool_members \
-         WHERE pool_id=? AND replaced_by IS NULL ORDER BY slot",
+         WHERE pool_id=? AND joined_roster_revision=1 ORDER BY slot",
     )?;
     let rows = statement.query_map([pool_id], |row| {
         Ok((

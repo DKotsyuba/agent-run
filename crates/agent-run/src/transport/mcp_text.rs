@@ -22,6 +22,22 @@ const TEMPLATES: &[(&str, &str)] = &[
         "notify_orchestrator",
         include_str!("../../../../assets/mcp/notify_orchestrator.txt.j2"),
     ),
+    (
+        "pool_post",
+        include_str!("../../../../assets/mcp/pool_post.txt.j2"),
+    ),
+    (
+        "pool_read",
+        include_str!("../../../../assets/mcp/pool_read.txt.j2"),
+    ),
+    (
+        "pool_propose",
+        include_str!("../../../../assets/mcp/pool_propose.txt.j2"),
+    ),
+    (
+        "pool_vote",
+        include_str!("../../../../assets/mcp/pool_vote.txt.j2"),
+    ),
     ("start", include_str!("../../../../assets/mcp/start.txt.j2")),
     (
         "resume",

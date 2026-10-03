@@ -2,6 +2,7 @@
 
 use crate::{domain::AgentId, Error, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fmt;
 
 /// Private worker MCP server identity exposed only to launched subagents.
@@ -115,6 +116,68 @@ pub struct WorkerCall {
     pub token: String,
     /// Validated worker report.
     pub input: NotifyRequest,
+}
+
+/// Private broker method routing one named worker tool with hidden credentials.
+pub const TOOL_METHOD: &str = "worker/call";
+
+/// One fixed private worker tool name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerTool {
+    /// Report a material finding to this run's orchestrator.
+    Notify,
+    /// Ordinary informational chat to the pool.
+    PoolPost,
+    /// Bounded read of the pool log and derived status.
+    PoolRead,
+    /// Propose one result snapshot for unanimous agreement.
+    PoolPropose,
+    /// Vote ready, block, or revoke on the current proposal.
+    PoolVote,
+}
+
+impl WorkerTool {
+    /// The stable tool name shared by the fixed catalog and the dispatcher.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Notify => "notify_orchestrator",
+            Self::PoolPost => "pool_post",
+            Self::PoolRead => "pool_read",
+            Self::PoolPropose => "pool_propose",
+            Self::PoolVote => "pool_vote",
+        }
+    }
+
+    /// Decodes exactly one catalog name; anything else is not a worker tool.
+    pub fn parse(name: &str) -> Option<Self> {
+        [
+            (Self::Notify.as_str(), Self::Notify),
+            (Self::PoolPost.as_str(), Self::PoolPost),
+            (Self::PoolRead.as_str(), Self::PoolRead),
+            (Self::PoolPropose.as_str(), Self::PoolPropose),
+            (Self::PoolVote.as_str(), Self::PoolVote),
+        ]
+        .into_iter()
+        .find(|(candidate, _)| *candidate == name)
+        .map(|(_, tool)| tool)
+    }
+}
+
+/// Private broker envelope for one named worker tool; the credentials are the
+/// same hidden capability fields as [`WorkerCall`] and are never echoed back.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerToolCall {
+    /// Exact execution that owns the capability.
+    pub run_id: AgentId,
+    /// Exact active attempt that owns the capability.
+    pub attempt_id: String,
+    /// Ephemeral bearer secret, sent only on the private broker route.
+    pub token: String,
+    /// One fixed catalog tool name.
+    pub tool: String,
+    /// The tool's strict object input, decoded and validated by the broker.
+    pub input: Value,
 }
 
 /// Durable enqueue acknowledgement; duplicate replay retains the same identifier.
