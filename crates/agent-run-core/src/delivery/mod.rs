@@ -438,8 +438,9 @@ fn expire_unbound(tx: &rusqlite::Transaction<'_>, time: f64) -> Result<()> {
 /// Atomically selects and leases one due bound delivery for this dispatcher identity.
 ///
 /// A queued Claude notice whose previous attempt was possibly sent
-/// (`uds_unconfirmed` or `uds_ambiguous`, e.g. a `retry_wait` row written
-/// before the at-most-once policy) is ended failed-ambiguous without a new
+/// (`uds_unconfirmed` or `uds_ambiguous`, a `retry_wait` row written before the
+/// at-most-once policy, or no evidence for the current attempt after a
+/// dispatcher crash, such as an expired `sending` lease) is ended failed-ambiguous without a new
 /// send and this claim returns `None`; the finished row leaves the schedule,
 /// so the next dispatch tick makes progress.
 fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
@@ -476,16 +477,25 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     if transport == "claude_uds" && attempts > 0 {
+        // Evidence for exactly the current attempt count decides. Missing
+        // evidence (a dispatcher that crashed around the write, e.g. an
+        // expired `sending` lease) is an unknown outcome and is treated as
+        // possibly sent; only explicit known-unsent evidence stays retryable.
         let last: Option<String> = tx
             .query_row(
                 "SELECT json_extract(evidence_json,'$.classifier') FROM delivery_attempt_evidence \
-                 WHERE delivery_id=? ORDER BY attempt DESC LIMIT 1",
-                [&delivery_id],
+                 WHERE delivery_id=? AND attempt=?",
+                params![delivery_id, attempts],
                 |row| row.get(0),
             )
             .optional()?
             .flatten();
-        if let Some(classifier @ ("uds_unconfirmed" | "uds_ambiguous")) = last.as_deref() {
+        let classifier = match last.as_deref() {
+            Some(known @ ("uds_unconfirmed" | "uds_ambiguous")) => Some(known),
+            None => Some("uds_unconfirmed"),
+            Some(_) => None,
+        };
+        if let Some(classifier) = classifier {
             tx.execute(
                 "UPDATE deliveries SET state='failed',lease_owner=NULL,lease_until=NULL,\
                  next_attempt_at=NULL,last_error=?,ambiguous_result=1 WHERE id=?",

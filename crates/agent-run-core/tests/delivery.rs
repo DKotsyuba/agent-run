@@ -1128,9 +1128,10 @@ async fn claude_uds_known_unsent_attempt_still_retries() {
 
 /// Cutover from the old bounded-retry policy: a queued Claude notice whose
 /// previous attempt was possibly sent (`uds_unconfirmed` or `uds_ambiguous`)
-/// is ended failed-ambiguous at claim time WITHOUT a new send, so an upgraded
-/// broker never re-sends what an owner already received; each such row costs
-/// one dispatch tick, after which a fresh notice behind it is attempted
+/// is ended failed-ambiguous at claim time WITHOUT a new send, as is a crashed
+/// `sending` row with no evidence for its current attempt, so an upgraded or
+/// restarted broker never re-sends what may already have arrived; each such row
+/// costs one dispatch tick, after which a fresh notice behind it is attempted
 /// exactly once.
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
@@ -1162,16 +1163,20 @@ async fn legacy_possibly_sent_claude_retry_is_not_resent_after_cutover() {
         "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary','/tmp','{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',1.0,1.0,'fixture','ag-20260825-120000-0123456789')",
         "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,attempts,next_attempt_at) VALUES('ntf_a_legacy_unconfirmed','ag-20260825-120000-0123456789','sess','retry_wait',1,0)",
         "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,attempts,next_attempt_at) VALUES('ntf_b_legacy_ambiguous','ag-20260825-120000-0123456789','sess','retry_wait',2,0)",
-        "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,next_attempt_at) VALUES('ntf_c_fresh','ag-20260825-120000-0123456789','sess','pending',0)",
+        "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,attempts,lease_owner,lease_until) VALUES('ntf_a2_crash_no_evidence','ag-20260825-120000-0123456789','sess','sending',1,'dead-dispatcher',1.0)",
+        "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,attempts,lease_owner,lease_until) VALUES('ntf_a3_crash_after_unsent','ag-20260825-120000-0123456789','sess','sending',2,'dead-dispatcher',1.0)",
+        "INSERT INTO delivery_attempt_evidence(delivery_id,attempt,recorded_at,evidence_json) VALUES('ntf_a3_crash_after_unsent',1,1.0,'{\"classifier\":\"uds_session_gone\"}')",        "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,next_attempt_at) VALUES('ntf_c_fresh','ag-20260825-120000-0123456789','sess','pending',0)",
         "INSERT INTO delivery_attempt_evidence(delivery_id,attempt,recorded_at,evidence_json) VALUES('ntf_a_legacy_unconfirmed',1,1.0,'{\"classifier\":\"uds_unconfirmed\"}')",
         "INSERT INTO delivery_attempt_evidence(delivery_id,attempt,recorded_at,evidence_json) VALUES('ntf_b_legacy_ambiguous',1,1.0,'{\"classifier\":\"uds_session_gone\"}')",
         "INSERT INTO delivery_attempt_evidence(delivery_id,attempt,recorded_at,evidence_json) VALUES('ntf_b_legacy_ambiguous',2,2.0,'{\"classifier\":\"uds_ambiguous\"}')",
     ] {
         connection.execute(sql, []).unwrap();
     }
-    // One legacy row is ended per tick without any send (count 0), then the
-    // fresh notice is attempted once (count 1).
-    for expected in [0, 0, 1] {
+    // Due order is the two legacy rows and the fresh notice (all due at 0),
+    // then the two crashed `sending` rows (lease past). Each unsafe row is
+    // ended per tick without any send (count 0); the fresh notice is attempted
+    // exactly once (count 1); the peer fails if any other row connects.
+    for expected in [0, 0, 1, 0, 0] {
         assert_eq!(dispatch_once(&home.path).await.unwrap(), expected);
     }
     let frame = peer.await.unwrap();
@@ -1181,6 +1186,10 @@ async fn legacy_possibly_sent_claude_retry_is_not_resent_after_cutover() {
     );
     for (id, attempts, error) in [
         ("ntf_a_legacy_unconfirmed", 1, "uds_unconfirmed"),
+        ("ntf_a2_crash_no_evidence", 1, "uds_unconfirmed"),
+        // Attempt 2 crashed with no evidence of its own: the older known-unsent
+        // attempt 1 does not make a resend safe.
+        ("ntf_a3_crash_after_unsent", 2, "uds_unconfirmed"),
         ("ntf_b_legacy_ambiguous", 2, "uds_ambiguous"),
     ] {
         let row: (String, u32, Option<String>, Option<f64>, bool) = connection
