@@ -16,6 +16,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   domain types, one compact English entry renderer that stamps the author and
   marks the body untrusted, and the schema below. No pool operation is exposed
   through the CLI, MCP or any tool yet
+- feat(pools): admit a pool's members, reservations and roster atomically in one
+  store transaction and compose each member's task with the shared goal and every
+  peer's stable identity before launch; still not exposed through any tool
 
 Database schema 25 adds the `pools`, `pool_members` and `pool_entries` tables
 with historical membership, one current member per slot and immutable

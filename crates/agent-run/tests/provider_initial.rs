@@ -4789,3 +4789,288 @@ async fn provider_resume_timeout_is_scaled_once_without_compounding() {
         "a newly requested 600 is scaled once, however deep the lineage"
     );
 }
+
+/// One strict pool request on `glm-user`; each member is `(role, task, pin)`.
+fn pool_request(
+    home: &Path,
+    request_id: &str,
+    bound: bool,
+    members: &[(&str, &str, Option<&str>)],
+) -> agent_run_domain::pool::PoolStartRequest {
+    serde_json::from_value(serde_json::json!({
+        "request_id": request_id,
+        "goal": "ship the fix",
+        "orchestrator": bound.then(|| serde_json::json!(
+            {"transport":"fixture","external_session_id":"test-session"})),
+        "members": members.iter().map(|(role, task, pin)| serde_json::json!({
+            "role": role,
+            "start": {"provider":"glm-user","model":"fixture","profile":"review",
+                      "task": task, "workdir": home, "account": pin}
+        })).collect::<Vec<_>>()
+    }))
+    .unwrap()
+}
+
+/// Counts rows of one table.
+fn table_rows(home: &Path, table: &str) -> i64 {
+    Store::open(home)
+        .unwrap()
+        .conn
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+/// A pool commits every identity, composed task and binding in one step: each
+/// stored task equals its frozen identity's request task and names the goal,
+/// its own seat and every peer; the revision advances once; replay returns the
+/// same identities and rows; a changed request under the key is a conflict;
+/// concurrent identical requests create one pool.
+#[tokio::test]
+async fn pool_admission_commits_identities_tasks_and_replays() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let members = [
+        ("reviewer", "fixture:answer one", Some("work")),
+        ("tester", "fixture:answer two", Some("work")),
+    ];
+    let request = pool_request(&home, "pool-1", true, &members);
+    let before = committed(&home);
+    let admitted = service
+        .admit_pool_trusted(request.clone(), candidates(before))
+        .unwrap();
+    assert_eq!(admitted["created"], true);
+    assert_eq!(admitted["bound"], true);
+    assert_eq!(committed(&home), before + 1, "revision advances once");
+    let listed = admitted["members"].as_array().unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0]["name"], "reviewer 1");
+    assert_eq!(listed[1]["status"], "starting");
+    let serialized = admitted.to_string();
+    for private in ["attempt", "namespace", "token", "identity"] {
+        assert!(!serialized.contains(private), "{private}");
+    }
+    let ids: Vec<AgentId> = listed
+        .iter()
+        .map(|m| serde_json::from_value(m["agent_id"].clone()).unwrap())
+        .collect();
+    let store = Store::open(&home).unwrap();
+    let mut sessions = std::collections::BTreeSet::new();
+    for (index, id) in ids.iter().enumerate() {
+        let row = store.get(id).unwrap();
+        let identity = row.identity.clone().unwrap();
+        let stored = identity["provider_request"]["task"].as_str().unwrap();
+        let column: String = store
+            .conn
+            .query_row("SELECT task FROM agents WHERE id=?", [id.as_str()], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(column, stored);
+        assert_eq!(row.request.task, stored);
+        assert!(stored.contains("ship the fix") && stored.contains(members[index].1));
+        assert!(ids.iter().all(|peer| stored.contains(peer.as_str())));
+        assert_eq!(
+            identity["replay_request_sha256"],
+            agent_run_domain::canonical::sha256_hex(&identity["provider_request"], true)
+        );
+        sessions.insert(row.orchestrator_session_id.clone());
+    }
+    assert_eq!(sessions.len(), 1, "one shared binding");
+    assert!(sessions.into_iter().next().unwrap().is_some());
+    assert_eq!(rows(&home), (2, 2));
+    assert_eq!(table_rows(&home, "pool_members"), 2);
+    assert_eq!(table_rows(&home, "attempt_quota_keys"), 2);
+
+    let replay = service
+        .admit_pool_trusted(request.clone(), candidates(committed(&home)))
+        .unwrap();
+    assert_eq!(replay["created"], false);
+    assert_eq!(replay["pool_id"], admitted["pool_id"]);
+    assert_eq!(
+        replay["members"][0]["agent_id"],
+        admitted["members"][0]["agent_id"]
+    );
+    assert_eq!(rows(&home), (2, 2));
+    let mut changed = request;
+    changed.goal = "something else".into();
+    assert!(matches!(
+        service.admit_pool_trusted(changed, candidates(committed(&home))),
+        Err(agent_run_domain::Error::Conflict)
+    ));
+}
+
+/// Six concurrent identical pool requests create exactly one pool with one
+/// set of identities.
+#[tokio::test]
+async fn pool_concurrent_identical_requests_create_one_pool() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let request = pool_request(
+        &home,
+        "same",
+        false,
+        &[("a", "t1", None), ("b", "t2", None)],
+    );
+    let outcomes: Vec<_> = (0..6)
+        .map(|_| {
+            let (service, request) = (service.clone(), request.clone());
+            std::thread::spawn(move || service.admit_pool(request))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|handle| handle.join().unwrap().unwrap())
+        .collect();
+    assert_eq!(outcomes.iter().filter(|o| o["created"] == true).count(), 1);
+    assert!(outcomes
+        .iter()
+        .all(|o| o["members"] == outcomes[0]["members"]
+            || o["members"][0]["agent_id"] == outcomes[0]["members"][0]["agent_id"]));
+    assert_eq!(table_rows(&home, "pools"), 1);
+    assert_eq!(rows(&home), (2, 2));
+}
+
+/// A cap that admits the first member but not the second rolls back every
+/// row, reservation and the revision.
+#[tokio::test]
+async fn pool_admission_rolls_back_every_row_on_cap_or_invalid_member() {
+    let (_temp, home) = home_with("[core]\nmax_active_agents = 1\n", &[]);
+    let service = Service::new(home.clone());
+    let before = committed(&home);
+    let pool = pool_request(
+        &home,
+        "capped",
+        false,
+        &[("a", "t1", Some("work")), ("b", "t2", Some("work"))],
+    );
+    assert!(matches!(
+        service.admit_pool_trusted(pool, candidates(before)),
+        Err(agent_run_domain::Error::Capacity)
+    ));
+    for table in [
+        "agents",
+        "attempts",
+        "attempt_quota_keys",
+        "pools",
+        "pool_members",
+    ] {
+        assert_eq!(table_rows(&home, table), 0, "{table}");
+    }
+    assert_eq!(committed(&home), before);
+    // An unknown model on the second member fails before any row is written.
+    let mut bad = pool_request(
+        &home,
+        "bad",
+        false,
+        &[("a", "t1", Some("work")), ("b", "t2", Some("work"))],
+    );
+    bad.members[1].start.model = "nope".into();
+    assert!(service.admit_pool_trusted(bad, candidates(before)).is_err());
+    assert_eq!(table_rows(&home, "agents"), 0);
+}
+
+/// Automatic selection inside one batch sees the reservations of earlier
+/// members, so two members spread across two accounts with distinct keys.
+#[tokio::test]
+async fn pool_batch_selection_sees_earlier_reservations() {
+    let (_temp, home) = home_with(TWO_ACCOUNTS, &["acct-alt"]);
+    let service = Service::new(home.clone());
+    let pool = pool_request(
+        &home,
+        "spread",
+        false,
+        &[("a", "t1", None), ("b", "t2", None)],
+    );
+    let admitted = service.admit_pool(pool).unwrap();
+    let accounts: Vec<String> = admitted["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|member| {
+            let id: AgentId = serde_json::from_value(member["agent_id"].clone()).unwrap();
+            Store::open(&home)
+                .unwrap()
+                .provider_attempt(&id)
+                .unwrap()
+                .1
+                .as_str()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(accounts, ["acct-alt", "acct-work"]);
+}
+
+/// The first child observes the full composed task, naming every committed
+/// peer, while the other member has been admitted but never launched.
+#[tokio::test]
+async fn pool_first_child_receives_full_context_with_all_ids_committed() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let pool = pool_request(
+        &home,
+        "observe",
+        false,
+        &[
+            ("lead", "fixture:pool-observe", Some("work")),
+            ("peer", "fixture:answer", Some("work")),
+        ],
+    );
+    let admitted = service
+        .admit_pool_trusted(pool, candidates(committed(&home)))
+        .unwrap();
+    let ids: Vec<AgentId> = admitted["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| serde_json::from_value(m["agent_id"].clone()).unwrap())
+        .collect();
+    run_to_end(&home, &ids[0]).await;
+    let store = Store::open(&home).unwrap();
+    let first = store.get(&ids[0]).unwrap();
+    assert_eq!(
+        first.status,
+        Status::Succeeded,
+        "{:?} {:?}",
+        first.failure_kind,
+        first.failure_text
+    );
+    assert_eq!(
+        store.get(&ids[1]).unwrap().status,
+        Status::Starting,
+        "peer never launched"
+    );
+    let received = fs::read_to_string(home.join("pool-observed.txt")).unwrap();
+    assert_eq!(received, store.get(&ids[0]).unwrap().request.task);
+    assert!(received.contains(ids[0].as_str()) && received.contains(ids[1].as_str()));
+    assert!(received.contains("ship the fix") && received.contains("fixture:pool-observe"));
+}
+
+/// A refused launch ends each affected member terminally with its exact
+/// identity while the pool and later members stay recorded and handled.
+#[tokio::test]
+async fn pool_spawn_failure_keeps_the_pool_and_reaches_every_member() {
+    let (_temp, home) = home();
+    fs::write(home.join("fixture-supervisor-spawn-error"), "").unwrap();
+    let service = Service::new(home.clone());
+    let pool = pool_request(
+        &home,
+        "refused",
+        false,
+        &[("a", "t1", Some("work")), ("b", "t2", Some("work"))],
+    );
+    let result = service
+        .start_pool_trusted(pool, candidates(committed(&home)))
+        .await
+        .unwrap();
+    assert_eq!(result["created"], true);
+    let statuses: Vec<&str> = result["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["status"].as_str().unwrap())
+        .collect();
+    assert_eq!(statuses, ["failed", "failed"], "{result}");
+    assert_eq!(table_rows(&home, "pools"), 1);
+    assert_eq!(table_rows(&home, "pool_members"), 2);
+}

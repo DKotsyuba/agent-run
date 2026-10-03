@@ -103,6 +103,11 @@ fn main() {
             .unwrap_or("")
             .to_owned()
     };
+    // Pool fixtures record the exact first-turn text this child received, as
+    // proof that every peer identity was already committed when it started.
+    if task.contains("fixture:pool-observe") {
+        std::fs::write("pool-observed.txt", &task).expect("fixture pool record");
+    }
     if task == "fixture:slow-start" {
         std::thread::sleep(Duration::from_secs(2));
     }

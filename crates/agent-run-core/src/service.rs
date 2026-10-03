@@ -18,7 +18,12 @@ use agent_run_config::provider_config::ProviderConfig;
 use agent_run_config::role_plan;
 use agent_run_domain::{
     catalog::{AccountStatus, QuotaAdmissionError, QuotaCandidateSet, ResolvedLaunchAuthority},
+    pool::{compose_member_task, PoolId, PoolSeat, PoolStartRequest},
     ProviderStartRequest, Sha256Digest,
+};
+use agent_run_store::{
+    pool_admission::{PoolAdmission, PoolAdmissionInput, PoolMemberAdmission},
+    provider_admission::AdmissionInputs,
 };
 
 /// Most `selection_stale` recalculations after the initial selection in
@@ -448,116 +453,15 @@ impl Service {
         let (config, revision) = self.current_provider_config()?;
         let accounts = Store::open(&self.home)?.list_accounts()?;
         let catalog = config.resolve_catalog(accounts)?;
-        let provider = catalog
-            .provider(&request.provider)
-            .ok_or_else(|| invalid("provider is not configured"))?;
-        let offering = provider
-            .models
-            .iter()
-            .find(|model| model.id == request.model)
-            .ok_or_else(|| invalid("model is not offered by provider"))?;
-        let effective_effort = request
-            .effort
-            .clone()
-            .or_else(|| offering.params.get("effort").cloned());
-        offering.permits_effort(effective_effort.as_deref())?;
-        // Harness options run through the existing launch mechanisms: fast
-        // is the codex service tier, output_schema the claude answer schema.
-        if request.fast && provider.harness != agent_run_domain::catalog::HarnessId::Codex {
-            return Err(invalid("fast mode is supported only by the codex harness"));
-        }
-        if request.output_schema.is_some()
-            && provider.harness != agent_run_domain::catalog::HarnessId::ClaudeCode
-        {
-            return Err(invalid(
-                "output_schema is supported only by the claude-code harness",
-            ));
-        }
-        let pinned = request
-            .account
-            .as_ref()
-            .map(|label| {
-                provider
-                    .binding(label.as_str())
-                    .ok_or_else(|| invalid("account label is not bound to provider"))
-                    .map(|binding| binding.account.clone())
-            })
-            .transpose()?;
-        let mut profile = profiles::load_provider(&config, &request)?;
-        profile
-            .required_constraints
-            .extend(offering.restrictions.iter().copied());
-        let role = role_plan::resolve_role_plan(
-            &profile,
-            config.skills_dir(),
-            &config.mcp,
-            if request.account.is_some() {
-                "account"
-            } else {
-                "global"
-            },
-            request.account.as_ref().map(|label| label.as_str()),
-        )?;
-        let mut effective = request.storage_projection();
-        effective.effort = effective_effort.clone();
-        effective.write = profile.write;
-        effective.read_roots = profile.read_roots.clone();
-        effective.required_constraints = profile.required_constraints.clone();
-        effective.timeout_seconds = Some(
-            config
-                .core
-                .effective_timeout_seconds(effective.timeout_seconds)?,
-        );
-        let eligible_accounts = provider
-            .bindings
-            .iter()
-            .filter(|binding| {
-                binding
-                    .models
-                    .as_ref()
-                    .is_none_or(|models| models.contains(&request.model))
-            })
-            .filter(|binding| {
-                catalog
-                    .account(&binding.account)
-                    .is_some_and(|record| record.status == AccountStatus::Enabled)
-            })
-            .map(|binding| binding.account.clone())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let authority = ResolvedLaunchAuthority {
-            provider: request.provider.clone(),
-            harness: provider.harness,
-            connection: provider.connection.clone(),
-            model: request.model.clone(),
-            effort: effective_effort,
-            profile: profile.name,
-            workdir: request.workdir.clone(),
-            role_payload: role.to_payload(),
-            assets_sha256: Sha256Digest::from_str(&"0".repeat(64))?,
-            eligible_accounts,
-        };
-        let identity = ProviderLaunchIdentity {
-            provider_identity_version: 2,
-            replay_request_sha256: agent_run_domain::canonical::sha256_hex(
-                &serde_json::to_value(&request)?,
-                true,
-            ),
-            provider_request: request.clone(),
-            provider_config_sha256: revision,
-            provider_config: config.clone(),
-            provider_config_snapshot: config.snapshot()?,
-            authority: authority.clone(),
-            runtime_home: None,
-            snapshot_sha256: None,
-        };
-        let cap = config
-            .harnesses
-            .get(&provider.harness)
-            .ok_or_else(|| invalid("provider harness is not configured"))?
-            .max_active_agents;
-        let identity = serde_json::to_value(identity)?;
+        let Prepared {
+            request,
+            effective,
+            authority,
+            identity,
+            cap,
+            pinned,
+        } = prepare_provider(&config, &revision, &catalog, request)?;
+        let global_cap = config.core.max_active_agents;
         let mut submission = 0;
         let admission = loop {
             let candidates = produce(&Store::open(&self.home)?, &catalog, &request, submission)?;
@@ -568,7 +472,7 @@ impl Service {
                 &authority,
                 &candidates,
                 &identity,
-                config.core.max_active_agents,
+                global_cap,
                 cap,
                 pinned.as_ref(),
             ) {
@@ -647,6 +551,232 @@ impl Service {
         self.hand_off_provider(&mut result).await?;
         Ok(result)
     }
+    /// Admits a whole cooperative pool atomically, choosing every account from
+    /// persisted quota evidence; nothing is spawned. See
+    /// [`Self::admit_pool_with`].
+    pub fn admit_pool(&self, request: PoolStartRequest) -> Result<Value> {
+        self.admit_pool_with(
+            request,
+            PROVIDER_STALE_RETRIES,
+            &mut |store, catalog, member, _| {
+                let pin = member.account.as_ref().map(|label| label.as_str());
+                crate::capacity::provider_ranking::provider_candidates(
+                    store,
+                    catalog,
+                    &member.provider,
+                    &member.model,
+                    pin,
+                    &std::collections::BTreeSet::new(),
+                )
+            },
+        )
+    }
+
+    /// [`Self::admit_pool`] with one fixed trusted candidate set for every
+    /// member, so offline tests can drive the real supervisor. A fixed set
+    /// cannot become fresh: `selection_stale` returns without retry.
+    pub fn admit_pool_trusted(
+        &self,
+        request: PoolStartRequest,
+        candidates: QuotaCandidateSet,
+    ) -> Result<Value> {
+        self.admit_pool_with(request, 0, &mut |_, _, _, _| Ok(candidates.clone()))
+    }
+
+    /// Shared pool admission.
+    ///
+    /// 1. The outer client request is validated and normalized; its digest
+    ///    (never the composed member tasks, which carry fresh identities)
+    ///    scopes replay, so a repeat returns the original pool and stable
+    ///    identities before any configuration or quota read, and a different
+    ///    request under the same key is `Conflict`.
+    /// 2. One configuration and catalog snapshot serves every member. The pool
+    ///    and every agent identity are minted, each member's actual task is
+    ///    composed from the common goal, its own seat and all peers, and each
+    ///    composed request is prepared through the same mechanism as a single
+    ///    start, so the stored task, effective request and frozen identity
+    ///    agree exactly.
+    /// 3. Candidates are produced outside any write transaction for every
+    ///    member, then [`Store::admit_pool`] commits all rows or none.
+    ///    `selection_stale` retries like a single start, over the whole batch.
+    ///
+    /// The result lists only stable identities, names, roles and statuses.
+    fn admit_pool_with(
+        &self,
+        mut request: PoolStartRequest,
+        stale_retries: u32,
+        produce: &mut dyn FnMut(
+            &Store,
+            &agent_run_domain::catalog::ProviderCatalog,
+            &ProviderStartRequest,
+            u32,
+        ) -> Result<QuotaCandidateSet>,
+    ) -> Result<Value> {
+        request.validate()?;
+        let sha = agent_run_domain::canonical::sha256_hex(&serde_json::to_value(&request)?, true);
+        let namespace = match &request.orchestrator {
+            None => "global".to_owned(),
+            Some(reference) => agent_run_domain::canonical::sha256_hex(
+                &json!([reference.transport, reference.external_session_id]),
+                true,
+            ),
+        };
+        let bound = request.orchestrator.is_some();
+        if let Some(found) =
+            Store::open(&self.home)?.replay_pool(&namespace, &request.request_id, &sha)?
+        {
+            return self.pool_view(&Store::open(&self.home)?, &found, bound);
+        }
+        let (config, revision) = self.current_provider_config()?;
+        let accounts = Store::open(&self.home)?.list_accounts()?;
+        let catalog = config.resolve_catalog(accounts)?;
+        let pool_id = PoolId::new();
+        let seats: Vec<PoolSeat> = request
+            .members
+            .iter()
+            .enumerate()
+            .map(|(index, member)| PoolSeat {
+                slot: index as u8 + 1,
+                name: member.start.display_name.clone().unwrap_or_default(),
+                role: member.role.clone(),
+                agent_id: AgentId::new(),
+            })
+            .collect();
+        let mut prepared = Vec::new();
+        for (member, seat) in request.members.iter().zip(&seats) {
+            let mut start = member.start.clone();
+            start.task = compose_member_task(
+                &pool_id,
+                &request.goal,
+                &request.acceptance,
+                &seats,
+                seat,
+                &member.start.task,
+            )?;
+            start.orchestrator = request.orchestrator.clone();
+            start.validate()?;
+            prepared.push(prepare_provider(&config, &revision, &catalog, start)?);
+        }
+        let mut submission = 0;
+        let admission = loop {
+            let mut sets = Vec::new();
+            let store = Store::open(&self.home)?;
+            for member in &prepared {
+                sets.push(produce(&store, &catalog, &member.request, submission)?);
+            }
+            let members = request
+                .members
+                .iter()
+                .zip(&seats)
+                .zip(&prepared)
+                .zip(&sets)
+                .map(
+                    |(((member, seat), prepared), candidates)| PoolMemberAdmission {
+                        id: seat.agent_id.clone(),
+                        slot: seat.slot,
+                        name: seat.name.clone(),
+                        role: seat.role.clone(),
+                        personal_task: member.start.task.clone(),
+                        inputs: AdmissionInputs {
+                            request: &prepared.request,
+                            effective: &prepared.effective,
+                            authority: &prepared.authority,
+                            candidates,
+                            identity: &prepared.identity,
+                            global_cap: config.core.max_active_agents,
+                            harness_cap: prepared.cap,
+                            pinned: prepared.pinned.as_ref(),
+                        },
+                    },
+                )
+                .collect();
+            let outcome = Store::open(&self.home)?.admit_pool(PoolAdmissionInput {
+                pool_id: &pool_id,
+                request_namespace: &namespace,
+                request_id: &request.request_id,
+                request_sha256: &sha,
+                goal: &request.goal,
+                acceptance: &request.acceptance,
+                catalog: &catalog,
+                members,
+            });
+            match outcome {
+                Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
+                    if stale_retries > 0 && submission == stale_retries =>
+                {
+                    return Err(QuotaAdmissionError::SelectionBusy { stale_retries }.into());
+                }
+                Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
+                    if submission < stale_retries =>
+                {
+                    submission += 1;
+                }
+                result => break result?,
+            }
+        };
+        self.pool_view(&Store::open(&self.home)?, &admission, bound)
+    }
+
+    /// Admits a pool through [`Self::admit_pool`] and hands every newly
+    /// admitted member to the normal detached supervisor in slot order.
+    ///
+    /// All stable identities are durable before the first launch. A member
+    /// whose launch fails ends terminally with its exact identity visible and
+    /// the remaining members are still launched; a replay launches nothing.
+    pub async fn start_pool(&self, request: PoolStartRequest) -> Result<Value> {
+        let result = self.admit_pool(request)?;
+        self.hand_off_pool(result).await
+    }
+
+    /// [`Self::start_pool`] over a fixed trusted candidate set.
+    pub async fn start_pool_trusted(
+        &self,
+        request: PoolStartRequest,
+        candidates: QuotaCandidateSet,
+    ) -> Result<Value> {
+        let result = self.admit_pool_trusted(request, candidates)?;
+        self.hand_off_pool(result).await
+    }
+
+    /// Launches each member of a freshly created pool, then re-reads statuses.
+    async fn hand_off_pool(&self, mut result: Value) -> Result<Value> {
+        if result["created"] == true {
+            let members = result["members"].as_array().cloned().unwrap_or_default();
+            for member in &members {
+                let mut single = json!({"created": true, "agent_id": member["agent_id"]});
+                // A failure of one member is recorded on that member; it must
+                // not abandon the members after it.
+                let _ = self.hand_off_provider(&mut single).await;
+            }
+            let store = Store::open(&self.home)?;
+            for member in result["members"].as_array_mut().into_iter().flatten() {
+                let id: AgentId = serde_json::from_value(member["agent_id"].clone())?;
+                member["status"] = json!(store.get(&id)?.status.as_str());
+            }
+        }
+        Ok(result)
+    }
+
+    /// Renders the public pool admission: stable identities, names, roles and
+    /// current statuses only.
+    fn pool_view(&self, store: &Store, pool: &PoolAdmission, bound: bool) -> Result<Value> {
+        let members = pool
+            .members
+            .iter()
+            .map(|member| {
+                Ok(json!({
+                    "agent_id": member.agent_id,
+                    "name": member.name,
+                    "role": member.role,
+                    "status": store.get(&member.agent_id)?.status.as_str(),
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(
+            json!({"pool_id": pool.pool_id, "created": pool.created, "bound": bound, "members": members}),
+        )
+    }
+
     pub async fn start(&self, mut request: StartRequest) -> Result<Value> {
         request.validate()?;
         if request.runtime == "opencode" {
@@ -1661,4 +1791,150 @@ pub(crate) fn verify_recorded_history(
         ));
     }
     crate::continuity::verify(&seal, frozen.authority.harness, session)
+}
+
+/// Everything the store needs to admit one provider request, derived without
+/// touching the database.
+pub(crate) struct Prepared {
+    /// The validated request exactly as frozen into the identity.
+    pub(crate) request: ProviderStartRequest,
+    /// Effective storage request.
+    pub(crate) effective: StartRequest,
+    /// Resolved launch authority.
+    pub(crate) authority: ResolvedLaunchAuthority,
+    /// Serialized frozen launch identity.
+    pub(crate) identity: Value,
+    /// Per-harness active-run cap.
+    pub(crate) cap: Option<usize>,
+    /// Account pinned by the request label.
+    pub(crate) pinned: Option<agent_run_domain::AccountId>,
+}
+
+/// Resolves role, authority, effective request and frozen identity for one
+/// provider request from an already loaded configuration and catalog, with no
+/// database access. Shared by single starts and pool admission so both freeze
+/// exactly the same facts.
+pub(crate) fn prepare_provider(
+    config: &ProviderConfig,
+    revision: &str,
+    catalog: &agent_run_domain::catalog::ProviderCatalog,
+    request: ProviderStartRequest,
+) -> Result<Prepared> {
+    let provider = catalog
+        .provider(&request.provider)
+        .ok_or_else(|| invalid("provider is not configured"))?;
+    let offering = provider
+        .models
+        .iter()
+        .find(|model| model.id == request.model)
+        .ok_or_else(|| invalid("model is not offered by provider"))?;
+    let effective_effort = request
+        .effort
+        .clone()
+        .or_else(|| offering.params.get("effort").cloned());
+    offering.permits_effort(effective_effort.as_deref())?;
+    // Harness options run through the existing launch mechanisms: fast
+    // is the codex service tier, output_schema the claude answer schema.
+    if request.fast && provider.harness != agent_run_domain::catalog::HarnessId::Codex {
+        return Err(invalid("fast mode is supported only by the codex harness"));
+    }
+    if request.output_schema.is_some()
+        && provider.harness != agent_run_domain::catalog::HarnessId::ClaudeCode
+    {
+        return Err(invalid(
+            "output_schema is supported only by the claude-code harness",
+        ));
+    }
+    let pinned = request
+        .account
+        .as_ref()
+        .map(|label| {
+            provider
+                .binding(label.as_str())
+                .ok_or_else(|| invalid("account label is not bound to provider"))
+                .map(|binding| binding.account.clone())
+        })
+        .transpose()?;
+    let mut profile = profiles::load_provider(config, &request)?;
+    profile
+        .required_constraints
+        .extend(offering.restrictions.iter().copied());
+    let role = role_plan::resolve_role_plan(
+        &profile,
+        config.skills_dir(),
+        &config.mcp,
+        if request.account.is_some() {
+            "account"
+        } else {
+            "global"
+        },
+        request.account.as_ref().map(|label| label.as_str()),
+    )?;
+    let mut effective = request.storage_projection();
+    effective.effort = effective_effort.clone();
+    effective.write = profile.write;
+    effective.read_roots = profile.read_roots.clone();
+    effective.required_constraints = profile.required_constraints.clone();
+    effective.timeout_seconds = Some(
+        config
+            .core
+            .effective_timeout_seconds(effective.timeout_seconds)?,
+    );
+    let eligible_accounts = provider
+        .bindings
+        .iter()
+        .filter(|binding| {
+            binding
+                .models
+                .as_ref()
+                .is_none_or(|models| models.contains(&request.model))
+        })
+        .filter(|binding| {
+            catalog
+                .account(&binding.account)
+                .is_some_and(|record| record.status == AccountStatus::Enabled)
+        })
+        .map(|binding| binding.account.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let authority = ResolvedLaunchAuthority {
+        provider: request.provider.clone(),
+        harness: provider.harness,
+        connection: provider.connection.clone(),
+        model: request.model.clone(),
+        effort: effective_effort,
+        profile: profile.name,
+        workdir: request.workdir.clone(),
+        role_payload: role.to_payload(),
+        assets_sha256: Sha256Digest::from_str(&"0".repeat(64))?,
+        eligible_accounts,
+    };
+    let identity = ProviderLaunchIdentity {
+        provider_identity_version: 2,
+        replay_request_sha256: agent_run_domain::canonical::sha256_hex(
+            &serde_json::to_value(&request)?,
+            true,
+        ),
+        provider_request: request.clone(),
+        provider_config_sha256: revision.to_owned(),
+        provider_config: config.clone(),
+        provider_config_snapshot: config.snapshot()?,
+        authority: authority.clone(),
+        runtime_home: None,
+        snapshot_sha256: None,
+    };
+    let cap = config
+        .harnesses
+        .get(&provider.harness)
+        .ok_or_else(|| invalid("provider harness is not configured"))?
+        .max_active_agents;
+    Ok(Prepared {
+        request,
+        effective,
+        authority,
+        identity: serde_json::to_value(identity)?,
+        cap,
+        pinned,
+    })
 }

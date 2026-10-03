@@ -102,9 +102,13 @@ binary refuses a database newer than its supported schema.
 
 Schema 25 lays the foundation for cooperative pools (a small roster of
 ordinary executions sharing one goal) with `pools`, `pool_members` and
-`pool_entries`. Only the schema, the validated domain types and the compact entry
-renderer exist so far: no tool, CLI or MCP method starts, reads or writes a pool
-yet. The tables retain replaced members, keep one current member per slot, store
+`pool_entries`. The schema, the validated domain types, the compact entry renderer and
+atomic batch admission exist so far: the store admits every member agent, its
+reservations and the pool roster in one transaction (or none), and the core
+composes each member's task with the common goal, its own seat and every peer's
+stable identity before any member is launched. Replay is keyed by the original
+client request, never by the composed text. No tool, CLI or MCP method starts,
+reads or writes a pool yet, and pool messaging is not connected. The tables retain replaced members, keep one current member per slot, store
 an immutable author stamped at send time, and reference agents and deliveries
 without cascades so a later purge can delete pool rows first.
 
