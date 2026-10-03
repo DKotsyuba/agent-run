@@ -83,14 +83,21 @@ the inbox's native hold-receipt by notification id, accepting it only from
 the same proven receiver identity: `uds_receipt_held` means the inbox
 confirmed it queued the notice (the `delivered` variant means it confirmed
 handing it to the session immediately); enqueue confirmation is still not
-proof the recipient's model read the message. `uds_unconfirmed` (a clean
-write with no correlated receipt, for example on an inbox that never answers
-or when no reply socket could be bound) and `uds_ambiguous` (an interrupted
-write) are both uncertain, not success: they retry with backoff and then end
-`failed` with `ambiguous: true`, meaning the notice was written toward the
-inbox socket at most three times without confirmation. If a notice looks
-lost, check the recipient Claude session's queue state before resending,
-because a retried notice may already be sitting in that queue.
+proof the recipient's model read the message. The inbox sends a receipt only for a message it holds for approval, later
+releases or denies, refuses by policy, expires, or drops at admission; a message
+the session accepts immediately produces none, so silence can never be reported
+delivered and exactly-once delivery cannot be proved. `uds_unconfirmed` (a
+clean write with no correlated receipt, for example on an inbox that never
+answers or when no reply socket could be bound) and `uds_ambiguous` (a write
+that failed, timed out or was reset after it began) mean the notice may already
+be in the session's queue. They are not success and are not retried: the
+notice ends `failed` with `ambiguous: true` after that single attempt
+(at-most-once), because a retry would put a duplicate in the chat. Attempts
+that provably wrote nothing (`uds_session_gone`, `uds_unavailable`,
+`uds_rejected`) still retry with backoff. A queued notice left in `retry_wait`
+by an older broker after such an outcome is ended `failed` with `ambiguous:
+true` the next time it is claimed, without a new send. If a notice looks lost,
+check the recipient Claude session's queue before resending it by hand.
 
 Desktop relay discovery requires the MCP process to have started with absolute
 `CODEX_MCP_NODE_PATH` and `CODEX_APP_TOOLS_PIPE_PATH` values. In that mode the

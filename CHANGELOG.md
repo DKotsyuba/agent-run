@@ -46,6 +46,14 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   on the control lane; whole-pool binding through the post-tool hook receipt or
   `bind --pool`, inherited by replacements and resumed members; the private
   worker catalog stays the fixed five tools
+- fix(delivery): stop duplicating Claude notices. The inbox sends no receipt for
+  an immediately accepted message, so a silent or interrupted send may already
+  have arrived and exactly-once cannot be proved. A possibly-sent Claude attempt
+  (`uds_unconfirmed`, or `uds_ambiguous` including any write error or timeout
+  after sending began) now ends `failed` with `ambiguous: true` after one
+  attempt instead of retrying up to three times; known-unsent attempts still
+  retry, and older queued `retry_wait` rows of that kind are ended without a
+  resend
 - fix(pools): retain every member lineage of a pool (replaced members, pending
   and retrying linked notices, unproven cleanup) until the whole pool has
   expired, then purge pool rows before agents; protected-only pools no longer

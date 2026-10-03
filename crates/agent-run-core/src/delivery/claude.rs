@@ -49,8 +49,12 @@ fn uds_evidence(classifier: &str, accepted: bool, ambiguous: bool) -> Evidence {
 /// `held` or `delivered` receipt is the only accepted outcome, and it confirms
 /// enqueue, never consumption by the recipient's model. A refused receipt, an
 /// uncorrelated or silent reply, or an interrupted write stays not delivered
-/// (`uds_receipt_refused`, `uds_unconfirmed`, or `uds_ambiguous`) so the
-/// dispatcher retries with backoff instead of reporting a false completion.
+/// (`uds_receipt_refused`, `uds_unconfirmed`, or `uds_ambiguous`). The inbox
+/// sends a receipt only for a message it holds, releases, denies, refuses,
+/// expires or drops; a message its session accepts immediately produces none,
+/// so silence can never be reported delivered and exactly-once cannot be
+/// proved. The dispatcher therefore ends a possibly-sent attempt failed and
+/// ambiguous without retrying, rather than risking duplicates.
 pub async fn send(registry: &Path, session: &str, notice: &Notice) -> Evidence {
     send_after(registry, session, notice, async {}).await
 }
@@ -380,19 +384,11 @@ async fn send_text_after(
         json!({"type":"auth","token":token}),
         json!({"type":"user","session_id":session,"msg_id":msg_id,"from":from,"message":{"role":"user","content":text}}),
     );
+    // Once the first byte may have left, any failure or timeout is a possibly
+    // sent message, not a known-unsent one: it must not retry into a duplicate.
     match tokio::time::timeout(Duration::from_secs(5), stream.write_all(frames.as_bytes())).await {
         Ok(Ok(())) => {}
-        Ok(Err(error))
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::TimedOut
-            ) =>
-        {
-            return uds_evidence("uds_ambiguous", false, true);
-        }
-        Ok(Err(_)) | Err(_) => return uds_evidence("uds_unavailable", false, false),
+        Ok(Err(_)) | Err(_) => return uds_evidence("uds_ambiguous", false, true),
     }
     // The frames are already kernel-buffered; the half-close hands the
     // allowHalfOpen inbox its end-of-frames marker without waiting on it.

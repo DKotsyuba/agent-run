@@ -936,12 +936,12 @@ async fn claude_uds_endless_receipt_stream_stays_bounded_and_unaccepted() {
     assert!(leftovers.is_empty(), "reply sockets leaked: {leftovers:?}");
 }
 
-/// A receiver that resets right after the buffered write cannot retry
-/// forever: every uncertain attempt (ambiguous or unconfirmed) counts toward
-/// the same cap and the notice leaves the schedule terminally failed.
+/// A receiver that resets right after the buffered write may already have the
+/// message, so the notice is never re-sent: one attempt, terminally failed
+/// and ambiguous, off the schedule.
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn claude_uds_reset_after_write_stops_retrying_at_the_uncertain_cap() {
+async fn claude_uds_reset_after_write_is_not_retried() {
     use std::os::fd::AsRawFd;
 
     let home = common::Home::new();
@@ -953,7 +953,7 @@ async fn claude_uds_reset_after_write_stops_retrying_at_the_uncertain_cap() {
     std::env::set_var("AGENT_RUN_CLAUDE_SESSION_REGISTRY", &registry);
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let peer = tokio::spawn(async move {
-        for _ in 0..3 {
+        for _ in 0..1 {
             let (stream, _) = listener.accept().await.unwrap();
             let linger = libc::linger {
                 l_onoff: 1,
@@ -993,45 +993,29 @@ async fn claude_uds_reset_after_write_stops_retrying_at_the_uncertain_cap() {
         )
         .unwrap();
     drop(connection);
-    for _ in 0..2 {
-        assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
-        let (state, error): (String, String) = Connection::open(home.path.join("state.db"))
-            .unwrap()
-            .query_row(
-                "SELECT state,last_error FROM deliveries WHERE id='ntf_reset'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(state, "retry_wait");
-        assert!(matches!(
-            error.as_str(),
-            "uds_ambiguous" | "uds_unconfirmed"
-        ));
-        make_due(&home.path, "ntf_reset");
-    }
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
     peer.await.unwrap();
-    let row: (String, u32, Option<f64>) = Connection::open(home.path.join("state.db"))
+    let row: (String, u32, Option<f64>, bool) = Connection::open(home.path.join("state.db"))
         .unwrap()
         .query_row(
-            "SELECT state,attempts,next_attempt_at FROM deliveries WHERE id='ntf_reset'",
+            "SELECT state,attempts,next_attempt_at,ambiguous_result FROM deliveries WHERE id='ntf_reset'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap();
-    assert_eq!((row.0.as_str(), row.1), ("failed", 3));
-    assert_eq!(row.2, None, "capped notice leaves the schedule");
+    assert_eq!((row.0.as_str(), row.1, row.3), ("failed", 1, true));
+    assert_eq!(row.2, None, "an ambiguous send leaves the schedule");
 }
 
 /// A dispatcher-level regression for the delivery-confirmation bug: a Claude
-/// inbox that accepts the write but stays silent must never reach `delivered`,
-/// must persist one immutable evidence row per attempt (so `last_attempt` is
-/// observable), and must stop retrying after the unconfirmed cap instead of
-/// duplicating the notice forever. The endpoint is a private temporary fake.
+/// inbox that accepts the write but stays silent must never reach `delivered`
+/// (the native inbox sends no receipt for an immediately accepted message, so
+/// the send may already have arrived), must persist one immutable evidence row
+/// (so `last_attempt` is observable), and must not be re-sent: it ends failed
+/// and ambiguous after the single attempt. The endpoint is a private fake.
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
+async fn claude_uds_unconfirmed_write_is_not_retried_and_fails_ambiguous() {
     use tokio::io::AsyncReadExt;
 
     let home = common::Home::new();
@@ -1043,8 +1027,8 @@ async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
     std::env::set_var("AGENT_RUN_CLAUDE_SESSION_REGISTRY", &registry);
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let peer = tokio::spawn(async move {
-        // Three accepted-and-read connections: every retry is written in full.
-        for _ in 0..3 {
+        // One accepted-and-read connection: the notice is written exactly once.
+        for _ in 0..1 {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut received = String::new();
             stream.read_to_string(&mut received).await.unwrap();
@@ -1070,23 +1054,6 @@ async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
             [],
         )
         .unwrap();
-    for attempt in 1..=2 {
-        assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
-        let row: (String, u32, Option<String>, bool) = Connection::open(home.path.join("state.db"))
-            .unwrap()
-            .query_row(
-                "SELECT state,attempts,last_error,ambiguous_result FROM deliveries WHERE id='ntf_unconfirmed'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(row.1, attempt, "one attempt per dispatch");
-        assert_eq!(row.0, "retry_wait", "unconfirmed never looks delivered");
-        assert_eq!(row.2.as_deref(), Some("uds_unconfirmed"));
-        assert!(row.3, "unconfirmed stays flagged ambiguous");
-        make_due(&home.path, "ntf_unconfirmed");
-    }
-    // The capped third attempt ends terminally failed, still ambiguous.
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
     peer.await.unwrap();
     let connection = Connection::open(home.path.join("state.db")).unwrap();
@@ -1097,9 +1064,9 @@ async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .unwrap();
-    assert_eq!((row.0.as_str(), row.1), ("failed", 3));
+    assert_eq!((row.0.as_str(), row.1), ("failed", 1));
     assert_eq!(row.2.as_deref(), Some("uds_unconfirmed"));
-    assert_eq!(row.3, None, "capped notice leaves the schedule");
+    assert_eq!(row.3, None, "an ambiguous send leaves the schedule");
     assert!(row.4);
     let evidence: (i64, String) = connection
         .query_row(
@@ -1108,7 +1075,7 @@ async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(evidence.0, 3, "one immutable evidence row per attempt");
+    assert_eq!(evidence.0, 1, "one immutable evidence row per attempt");
     assert!(evidence.1.contains("\"classifier\":\"uds_unconfirmed\""));
     assert!(!evidence.1.contains("session-1"), "no session id persisted");
     assert!(
@@ -1123,6 +1090,111 @@ async fn claude_uds_unconfirmed_write_retries_then_fails_with_evidence() {
         .unwrap();
     assert_eq!(status["state"], "failed");
     assert_eq!(status["last_attempt"]["classifier"], "uds_unconfirmed");
+}
+
+/// A Claude send that provably wrote nothing (the session is gone from the
+/// registry) stays an ordinary retried attempt: only possibly-sent outcomes
+/// stop retrying, so a notice is not lost to a transient gap.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn claude_uds_known_unsent_attempt_still_retries() {
+    let home = common::Home::new();
+    let registry = home.path.join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    let _guard = REGISTRY_OVERRIDE.lock().unwrap();
+    std::env::set_var("AGENT_RUN_CLAUDE_SESSION_REGISTRY", &registry);
+    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    for sql in [
+        "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) VALUES('sess','claude_uds','session-gone',1.0,1.0)",
+        "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary','/tmp','{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',1.0,1.0,'fixture','ag-20260825-120000-0123456789')",
+        "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,next_attempt_at) VALUES('ntf_gone','ag-20260825-120000-0123456789','sess','pending',0)",
+    ] {
+        connection.execute(sql, []).unwrap();
+    }
+    for attempt in 1..=2 {
+        assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+        let row: (String, u32, Option<String>) = connection
+            .query_row(
+                "SELECT state,attempts,last_error FROM deliveries WHERE id='ntf_gone'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((row.0.as_str(), row.1), ("retry_wait", attempt));
+        assert_eq!(row.2.as_deref(), Some("uds_session_gone"));
+        make_due(&home.path, "ntf_gone");
+    }
+}
+
+/// Cutover from the old bounded-retry policy: a queued Claude notice whose
+/// previous attempt was possibly sent (`uds_unconfirmed` or `uds_ambiguous`)
+/// is ended failed-ambiguous at claim time WITHOUT a new send, so an upgraded
+/// broker never re-sends what an owner already received; each such row costs
+/// one dispatch tick, after which a fresh notice behind it is attempted
+/// exactly once.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn legacy_possibly_sent_claude_retry_is_not_resent_after_cutover() {
+    let home = common::Home::new();
+    let registry = home.path.join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    let socket = home.path.join("inbox.sock");
+    claude_descriptor(&registry, "session-1", &socket);
+    let _guard = REGISTRY_OVERRIDE.lock().unwrap();
+    std::env::set_var("AGENT_RUN_CLAUDE_SESSION_REGISTRY", &registry);
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let inbox = socket.clone();
+    let peer = tokio::spawn(async move {
+        // Only the fresh notice may ever connect.
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let frame = native_inbox_connection(&mut stream, &inbox, None).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), listener.accept())
+                .await
+                .is_err(),
+            "no legacy notice was re-sent"
+        );
+        frame
+    });
+    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    for sql in [
+        "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) VALUES('sess','claude_uds','session-1',1.0,1.0)",
+        "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary','/tmp','{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',1.0,1.0,'fixture','ag-20260825-120000-0123456789')",
+        "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,attempts,next_attempt_at) VALUES('ntf_a_legacy_unconfirmed','ag-20260825-120000-0123456789','sess','retry_wait',1,0)",
+        "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,attempts,next_attempt_at) VALUES('ntf_b_legacy_ambiguous','ag-20260825-120000-0123456789','sess','retry_wait',2,0)",
+        "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,next_attempt_at) VALUES('ntf_c_fresh','ag-20260825-120000-0123456789','sess','pending',0)",
+        "INSERT INTO delivery_attempt_evidence(delivery_id,attempt,recorded_at,evidence_json) VALUES('ntf_a_legacy_unconfirmed',1,1.0,'{\"classifier\":\"uds_unconfirmed\"}')",
+        "INSERT INTO delivery_attempt_evidence(delivery_id,attempt,recorded_at,evidence_json) VALUES('ntf_b_legacy_ambiguous',1,1.0,'{\"classifier\":\"uds_session_gone\"}')",
+        "INSERT INTO delivery_attempt_evidence(delivery_id,attempt,recorded_at,evidence_json) VALUES('ntf_b_legacy_ambiguous',2,2.0,'{\"classifier\":\"uds_ambiguous\"}')",
+    ] {
+        connection.execute(sql, []).unwrap();
+    }
+    // One legacy row is ended per tick without any send (count 0), then the
+    // fresh notice is attempted once (count 1).
+    for expected in [0, 0, 1] {
+        assert_eq!(dispatch_once(&home.path).await.unwrap(), expected);
+    }
+    let frame = peer.await.unwrap();
+    assert_eq!(
+        frame["msg_id"], "ntf_c_fresh",
+        "only the fresh notice was sent"
+    );
+    for (id, attempts, error) in [
+        ("ntf_a_legacy_unconfirmed", 1, "uds_unconfirmed"),
+        ("ntf_b_legacy_ambiguous", 2, "uds_ambiguous"),
+    ] {
+        let row: (String, u32, Option<String>, Option<f64>, bool) = connection
+            .query_row(
+                "SELECT state,attempts,last_error,next_attempt_at,ambiguous_result FROM deliveries WHERE id=?",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!((row.0.as_str(), row.1), ("failed", attempts), "{id}");
+        assert_eq!(row.2.as_deref(), Some(error));
+        assert_eq!(row.3, None);
+        assert!(row.4, "{id} stays flagged ambiguous");
+    }
 }
 
 /// A dispatcher-level happy path: a correlated native hold-receipt moves the

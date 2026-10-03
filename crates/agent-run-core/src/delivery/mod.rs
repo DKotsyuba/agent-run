@@ -21,11 +21,6 @@ const LEASE_SECONDS: f64 = 30.0;
 const MAX_TAIL_BYTES: usize = 4096;
 const MAX_EVIDENCE_BYTES: usize = 16 * 1024;
 const DEFAULT_MAX_BATCH: usize = 1000;
-/// Claude inbox attempts whose outcome stays uncertain (unconfirmed or
-/// ambiguous) before the notice stops retrying; a configured `max_attempts`
-/// of zero means unlimited retries, so without this cap one fire-and-forget
-/// notice would duplicate forever.
-const CLAUDE_UNCERTAIN_MAX_ATTEMPTS: u32 = 3;
 /// Version of the frozen completion-notice payload.
 pub const NOTICE_VERSION: u32 = 1;
 
@@ -441,6 +436,12 @@ fn expire_unbound(tx: &rusqlite::Transaction<'_>, time: f64) -> Result<()> {
 }
 
 /// Atomically selects and leases one due bound delivery for this dispatcher identity.
+///
+/// A queued Claude notice whose previous attempt was possibly sent
+/// (`uds_unconfirmed` or `uds_ambiguous`, e.g. a `retry_wait` row written
+/// before the at-most-once policy) is ended failed-ambiguous without a new
+/// send and this claim returns `None`; the finished row leaves the schedule,
+/// so the next dispatch tick makes progress.
 fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
     let mut store = Store::open(home)?;
     let tx = store
@@ -474,6 +475,26 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
         [session_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
+    if transport == "claude_uds" && attempts > 0 {
+        let last: Option<String> = tx
+            .query_row(
+                "SELECT json_extract(evidence_json,'$.classifier') FROM delivery_attempt_evidence \
+                 WHERE delivery_id=? ORDER BY attempt DESC LIMIT 1",
+                [&delivery_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if let Some(classifier @ ("uds_unconfirmed" | "uds_ambiguous")) = last.as_deref() {
+            tx.execute(
+                "UPDATE deliveries SET state='failed',lease_owner=NULL,lease_until=NULL,\
+                 next_attempt_at=NULL,last_error=?,ambiguous_result=1 WHERE id=?",
+                params![classifier, delivery_id],
+            )?;
+            tx.commit()?;
+            return Ok(None);
+        }
+    }
     let worker: Option<(String, String)> = tx
         .query_row(
             "SELECT kind,message FROM worker_notifications WHERE delivery_id=?",
@@ -607,9 +628,11 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
 ///
 /// A Claude inbox attempt is never accepted on write alone (see
 /// [`claude::send`]); its uncertain observations (`uds_unconfirmed` or
-/// `uds_ambiguous`) retry with backoff until [`CLAUDE_UNCERTAIN_MAX_ATTEMPTS`]
-/// and then fail terminally with the ambiguous flag set, so one notice can
-/// neither look delivered without a confirmation nor duplicate forever.
+/// `uds_ambiguous`) follow a send that may already have reached the session,
+/// and the native inbox sends no receipt for an immediately accepted message,
+/// so exactly-once cannot be proved. They end terminally `failed` with the
+/// ambiguous flag at once (at-most-once) instead of retrying into duplicates;
+/// known-unsent outcomes (session gone, unavailable, rejected) still retry.
 fn complete(home: &Path, claim: &Claim, evidence: &Evidence) -> Result<()> {
     let delivery = match ProviderConfig::load(home) {
         Ok((config, _)) => config.delivery,
@@ -631,14 +654,13 @@ fn complete(home: &Path, claim: &Claim, evidence: &Evidence) -> Result<()> {
     let accepted = evidence.accepted();
     let ambiguous = evidence.ambiguous();
     let exhausted = delivery.max_attempts > 0 && claim.attempt >= delivery.max_attempts;
-    let uncertain_exhausted = claim.transport == "claude_uds"
+    let possibly_sent = claim.transport == "claude_uds"
         && matches!(
             evidence.classifier.as_str(),
             "uds_unconfirmed" | "uds_ambiguous"
-        )
-        && claim.attempt >= CLAUDE_UNCERTAIN_MAX_ATTEMPTS;
-    let failed = !accepted
-        && (exhausted || uncertain_exhausted || evidence.classifier == "unsupported_transport");
+        );
+    let failed =
+        !accepted && (exhausted || possibly_sent || evidence.classifier == "unsupported_transport");
     let state = if accepted {
         "delivered"
     } else if failed {
