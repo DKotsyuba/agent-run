@@ -28,6 +28,14 @@ Run the release gates on macOS arm64. The non-blocking Linux validation lane
 runs the workspace and sealed-build checks independently, but its result does
 not gate or add an artifact to the qualified native release.
 
+CI and release jobs share Rust dependency caches on the same runner OS and
+architecture. Rust-cache also keys them by the toolchain, manifests, lockfile
+and build environment. Pull requests only restore caches; main and tagged
+release runs may save them. Project binaries and sealed release directories
+are rebuilt and verified on every run, and all existing checks remain enabled.
+The first cache miss still performs a full dependency build; hosted savings
+must be measured from subsequent cache-hit runs.
+
 For adapter or supervisor changes, also run a candidate through a supported
 real engine in an isolated home. Verify the answer proof, transcript, process
 cleanup, and continuation. Never modify an installed sealed release for this
