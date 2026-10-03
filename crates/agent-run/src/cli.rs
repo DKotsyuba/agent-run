@@ -1599,7 +1599,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             request_id,
             text,
         } => {
-            let message = task_text(&text, 16 * 1024)?;
+            let message = task_text(&text, agent_run_domain::pool::MAX_BODY_BYTES)?;
             let result = dependencies
                 .broker
                 .call(

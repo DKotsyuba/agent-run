@@ -291,11 +291,10 @@ impl Store {
             Ok(member) => member,
             Err(denial) => return Ok(Err(denial)),
         };
-        if member.state == "completed" {
-            return Ok(Err(PoolDenial::PoolCompleted));
-        }
         // Idempotency: the sender execution scope plus the request key. The
         // same content replays; different content under the key conflicts.
+        // This precedes the closed-pool guard so a retry of a write that
+        // committed before completion still returns its original receipt.
         let prior: Option<i64> = tx
             .query_row(
                 "SELECT seq FROM pool_entries WHERE pool_id=? AND idem_scope=? AND request_id=?",
@@ -314,6 +313,9 @@ impl Store {
                 return Ok(Ok(receipt));
             }
             return Ok(Err(PoolDenial::Conflict));
+        }
+        if member.state == "completed" {
+            return Ok(Err(PoolDenial::PoolCompleted));
         }
         write.validate()?;
         let seq = match &write {

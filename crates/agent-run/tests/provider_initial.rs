@@ -5626,3 +5626,147 @@ async fn pool_replacement_inherits_the_actual_shared_binding() {
         Some("late-chat".to_owned())
     );
 }
+
+/// A pool member's composed first prompt (common goal, criteria, its own task
+/// and every peer's stable id) is what the native Codex history actually holds,
+/// is proven by the sealed `task_proven` evidence, and is neither rewritten nor
+/// dropped by an automatic account switch or by an explicit resume of the same
+/// stable agent, whose own new task is the only added input.
+#[tokio::test]
+async fn pool_composed_task_survives_native_history_failover_and_resume() {
+    let (_temp, home) = codex_home_with(&["exhausted", "ok"]);
+    let service = Service::new(home.clone());
+    let request: agent_run_domain::pool::PoolStartRequest =
+        serde_json::from_value(serde_json::json!({
+            "request_id": "native-pool",
+            "goal": "POOL-GOAL-MARKER ship the codex fixture",
+            "acceptance": [{"id": "crit", "text": "POOL-CRITERION-MARKER holds"}],
+            "members": [
+                {"role": "lead", "start": {"provider":"codex-user","model":"fixture",
+                    "profile":"review","task":"POOL-OWN-TASK-MARKER lead work","workdir":home}},
+                {"role": "peer", "start": {"provider":"codex-user","model":"fixture",
+                    "profile":"review","task":"peer work","workdir":home}},
+            ]
+        }))
+        .unwrap();
+    let admitted = service.admit_pool(request).unwrap();
+    let ids: Vec<AgentId> = admitted["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| serde_json::from_value(m["agent_id"].clone()).unwrap())
+        .collect();
+    let lead = &ids[0];
+    let composed = Store::open(&home).unwrap().get(lead).unwrap().request.task;
+    for marker in [
+        "POOL-GOAL-MARKER",
+        "POOL-CRITERION-MARKER",
+        "POOL-OWN-TASK-MARKER",
+        ids[1].as_str(),
+    ] {
+        assert!(composed.contains(marker), "admitted task lacks {marker}");
+    }
+    // The stored request, frozen identity and replay hash agree on the composed text.
+    let identity = Store::open(&home)
+        .unwrap()
+        .get(lead)
+        .unwrap()
+        .identity
+        .unwrap();
+    assert_eq!(identity["provider_request"]["task"], composed.as_str());
+    assert_eq!(
+        identity["replay_request_sha256"],
+        agent_run_domain::canonical::sha256_hex(&identity["provider_request"], true)
+    );
+    run_to_end(&home, lead).await;
+    let store = Store::open(&home).unwrap();
+    let row = store.get(lead).unwrap();
+    assert_eq!(row.status, Status::Succeeded, "{:?}", row.failure_text);
+    let switched = attempts(&home, lead);
+    assert_eq!(
+        switched.iter().map(|a| a.1.as_str()).collect::<Vec<_>>(),
+        ["acct-cx-a", "acct-cx-b"],
+        "the first account exhausted and the same logical run switched"
+    );
+    let proven = |home: &Path, id: &AgentId, number: u32| -> serde_json::Value {
+        let state: String = Store::open(home)
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT adapter_state_json FROM attempts WHERE agent_id=? AND number=?",
+                rusqlite::params![id.as_str(), number],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str::<serde_json::Value>(&state).unwrap()["native_history"]["task_proven"]
+            .clone()
+    };
+    assert_eq!(proven(&home, lead, 1), true);
+    assert_eq!(proven(&home, lead, 2), true);
+    // Native history holds the full composed task exactly once; the switch
+    // adds only the internal control turn.
+    let inputs = rollout_inputs(&row);
+    assert!(
+        inputs[0].contains(&composed),
+        "native first input is not the composed task"
+    );
+    assert_eq!(
+        inputs
+            .iter()
+            .filter(|i| i.contains("POOL-GOAL-MARKER"))
+            .count(),
+        1,
+        "{inputs:?}"
+    );
+    assert!(inputs
+        .last()
+        .unwrap()
+        .contains(agent_run::supervisor::CONTINUATION_CONTROL));
+    let first_input = inputs[0].clone();
+
+    // Explicit resume of the same stable agent: the composition is inherited
+    // from native history, never resent, rewritten or dropped.
+    let child = service
+        .admit_provider_resume(
+            &row,
+            "POOL-RESUME-TASK-MARKER follow up".into(),
+            None,
+            Some("pool-resume".into()),
+            None,
+            None,
+        )
+        .unwrap();
+    let child: AgentId = serde_json::from_value(child["agent_id"].clone()).unwrap();
+    run_to_end(&home, &child).await;
+    let child_row = Store::open(&home).unwrap().get(&child).unwrap();
+    assert_eq!(
+        child_row.status,
+        Status::Succeeded,
+        "{:?}",
+        child_row.failure_text
+    );
+    assert_eq!(&child_row.root_agent_id, lead, "same stable agent");
+    assert_eq!(proven(&home, &child, 1), true);
+    let after = rollout_inputs(&child_row);
+    assert_eq!(
+        after[0], first_input,
+        "the composed first input is unchanged"
+    );
+    assert_eq!(
+        after
+            .iter()
+            .filter(|i| i.contains("POOL-GOAL-MARKER"))
+            .count(),
+        1,
+        "{after:?}"
+    );
+    let last = after.last().unwrap();
+    assert!(last.contains("POOL-RESUME-TASK-MARKER") && !last.contains("POOL-GOAL-MARKER"));
+    // The parent's frozen composed request is untouched by the resume.
+    let parent = Store::open(&home).unwrap().get(lead).unwrap();
+    assert_eq!(parent.request.task, composed);
+    assert_eq!(
+        parent.identity.unwrap()["provider_request"]["task"],
+        composed.as_str()
+    );
+}

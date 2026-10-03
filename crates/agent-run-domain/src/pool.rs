@@ -583,8 +583,8 @@ pub struct PoolReadRequest {
 }
 
 impl PoolReadRequest {
-    /// Rejects an exclusive-cursor conflict, an out-of-range page, or an
-    /// unsafe wait bound.
+    /// Rejects an exclusive-cursor conflict, an out-of-range page, an unsafe
+    /// wait bound, or a positive wait on a reverse page.
     pub fn validate(&self) -> Result<()> {
         validate_page(self.after_seq, self.before_seq, self.limit)?;
         if self
@@ -592,6 +592,9 @@ impl PoolReadRequest {
             .is_some_and(|seconds| !seconds.is_finite() || !(0.0..=25.0).contains(&seconds))
         {
             return Err(invalid("wait_seconds must be finite and between 0 and 25"));
+        }
+        if self.before_seq.is_some() && self.wait_seconds.is_some_and(|seconds| seconds > 0.0) {
+            return Err(invalid("a reverse page (before_seq) never waits"));
         }
         Ok(())
     }
@@ -1046,6 +1049,23 @@ mod tests {
             json!({"request_id": "k", "proposal_seq": 1, "decision": "ready", "author_kind": "operator"})
         )
         .is_err());
+    }
+
+    /// Cursor and page bounds are positive and exclusive.
+    /// A reverse page never waits; forward pages may, within the bound.
+    #[test]
+    fn reverse_reads_reject_a_positive_wait() {
+        let read = |after, before, wait| PoolReadRequest {
+            after_seq: after,
+            before_seq: before,
+            limit: None,
+            wait_seconds: wait,
+        };
+        assert!(read(None, Some(5), Some(1.0)).validate().is_err());
+        assert!(read(None, Some(5), Some(0.0)).validate().is_ok());
+        assert!(read(None, Some(5), None).validate().is_ok());
+        assert!(read(Some(0), None, Some(25.0)).validate().is_ok());
+        assert!(read(Some(0), None, Some(25.5)).validate().is_err());
     }
 
     /// Cursor and page bounds are positive and exclusive.

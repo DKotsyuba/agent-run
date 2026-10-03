@@ -1780,3 +1780,55 @@ fn terminal_member_settles_its_pool() {
         "no open pool remains"
     );
 }
+
+/// A closed pool still answers an identical retry of a write that committed
+/// earlier with its original receipt, reports a changed body under the same
+/// key as a conflict, and refuses any new key.
+#[test]
+fn closed_pool_replays_identical_retries_and_refuses_new_keys() {
+    let home = common::Home::new();
+    let (criteria, members, _) = voted_pool(&home);
+    let mut store = home.store();
+    // Close the pool while the writers are still authenticated, so only the
+    // closed-pool guard and the key lookup order are under test.
+    store
+        .conn
+        .execute("UPDATE pools SET state='completed',completed_at=9.0", [])
+        .unwrap();
+    let (run, attempt, token) = &members[0];
+    let proposal = |snapshot: &str| {
+        PoolWrite::Proposal(PoolPropose {
+            request_id: "p1".into(),
+            message: "result ready".into(),
+            snapshot: snapshot.into(),
+        })
+    };
+    let replay = store
+        .pool_write(run, attempt, token, proposal("commit abc123"))
+        .unwrap()
+        .unwrap();
+    assert!(replay.duplicate && replay.seq == 1);
+    assert_eq!(
+        store
+            .pool_write(run, attempt, token, proposal("a different snapshot"))
+            .unwrap()
+            .unwrap_err(),
+        PoolDenial::Conflict
+    );
+    assert!(
+        store
+            .pool_write(run, attempt, token, ready("v0", 1, &criteria))
+            .unwrap()
+            .unwrap()
+            .duplicate,
+        "an identical vote retry replays too"
+    );
+    assert_eq!(
+        store
+            .pool_write(run, attempt, token, message("fresh-key", "new"))
+            .unwrap()
+            .unwrap_err(),
+        PoolDenial::PoolCompleted
+    );
+    assert_eq!(rows_of(&store, "pool_entries"), 3, "no row was added");
+}
