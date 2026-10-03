@@ -70,18 +70,25 @@ pub async fn send_worker(registry: &Path, session: &str, notice: &WorkerNotice) 
 }
 
 /// Delivers a pool's common completion through the same Claude inbox route.
+///
+/// The rendered text (trusted header plus body) must fit the inbox's message
+/// bound, so only the body is shortened, with an explicit marker, to the
+/// actual rendered size; the stored frozen message is untouched. A notice
+/// whose header alone cannot fit is rejected before any connection.
 pub async fn send_pool(
     registry: &Path,
     session: &str,
     notice: &agent_run_domain::pool::PoolNotice,
 ) -> Evidence {
+    let fitted = notice
+        .fitted(|n| n.render().is_ok_and(|text| text.len() <= MESSAGE_LIMIT))
+        .and_then(|n| n.render().ok().map(|text| (n.notification_id, text)));
     send_text_after(
         registry,
         session,
-        notice
-            .render()
-            .ok()
-            .map(|text| (notice.notification_id.as_str(), text)),
+        fitted
+            .as_ref()
+            .map(|(id, text)| (id.as_str(), text.clone())),
         async {},
     )
     .await

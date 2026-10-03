@@ -371,6 +371,9 @@ pub struct PoolNotice {
     pub message: String,
 }
 
+/// Marker ending a body shortened to fit one transport's budget.
+pub const TRUNCATION_MARKER: &str = "\n[truncated; see pool log/proposal]";
+
 /// Most UTF-8 bytes of a pool notice message.
 pub const MAX_NOTICE_BYTES: usize = 4096;
 
@@ -390,6 +393,39 @@ impl PoolNotice {
             return Err(invalid("invalid stored pool notice id"));
         }
         bounded_text("pool notice", &self.message, MAX_NOTICE_BYTES)
+    }
+
+    /// Returns this notice with only its body shortened, at a character
+    /// boundary and ending in an explicit truncation marker, to the longest
+    /// prefix for which `fits` accepts the result; the identifiers and the
+    /// trusted framing are never touched. `None` when even a marker-only body
+    /// does not fit, which is a deterministic, truthful "cannot be delivered
+    /// through this transport" rather than a guess. A message that already
+    /// fits is returned unchanged. The stored frozen text is never altered.
+    pub fn fitted(&self, fits: impl Fn(&Self) -> bool) -> Option<Self> {
+        // An invalid or oversized original is never converted into a legal
+        // shortened one, and this also enforces the 4096-byte scan bound.
+        self.validate().ok()?;
+        if fits(self) {
+            return Some(self.clone());
+        }
+        let with = |end: usize| Self {
+            message: format!("{}{TRUNCATION_MARKER}", &self.message[..end]),
+            ..self.clone()
+        };
+        // Longest prefix first, correct for any `fits`. ponytail: up to one
+        // candidate per character, each costing a copy plus a render or JSON
+        // serialization of up to ~8 KiB, so roughly O(n^2) bytes (tens of MB
+        // worst case) at the validated 4096-byte ceiling; only an oversized
+        // notice pays it. Binary search is the upgrade if the cap ever grows
+        // (`fits` is monotone in the prefix length).
+        self.message
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(self.message.len()))
+            .rev()
+            .map(with)
+            .find(|candidate| fits(candidate))
     }
 
     /// Renders trusted framing from the embedded template around the frozen text.
@@ -978,6 +1014,69 @@ mod tests {
         ] {
             assert!(bad.render().is_err());
         }
+    }
+
+    /// Fitting shortens only the body, at a character boundary, ending in the
+    /// explicit marker; identifiers are untouched, a fitting notice is returned
+    /// unchanged, and an impossible budget is `None`, never a guess.
+    #[test]
+    fn fitted_notices_shorten_only_the_body() {
+        let notice = PoolNotice {
+            notification_id: "ntf_abc".into(),
+            pool_id: PoolId::new(),
+            message: "é".repeat(2048),
+        };
+        let budget = 600;
+        let fits = |n: &PoolNotice| n.render().is_ok_and(|text| text.len() <= budget);
+        let fitted = notice.fitted(fits).unwrap();
+        let text = fitted.render().unwrap();
+        assert!(
+            text.len() <= budget && text.len() > budget - 3,
+            "{}",
+            text.len()
+        );
+        assert!(fitted.message.ends_with(TRUNCATION_MARKER));
+        assert!(
+            fitted.message.starts_with("éé")
+                && fitted.message.is_char_boundary(fitted.message.len())
+        );
+        assert_eq!(
+            (&fitted.notification_id, &fitted.pool_id),
+            (&notice.notification_id, &notice.pool_id)
+        );
+        assert_eq!(
+            notice.message.len(),
+            4096,
+            "the frozen text is never altered"
+        );
+        assert_eq!(notice.fitted(|_| true).unwrap(), notice);
+        assert!(notice.fitted(|_| false).is_none());
+        // Invalid or oversized originals are refused before `fits` ever runs.
+        let probed = std::cell::Cell::new(false);
+        let probe = |_: &PoolNotice| {
+            probed.set(true);
+            true
+        };
+        for bad in [
+            PoolNotice {
+                message: "x".repeat(MAX_NOTICE_BYTES + 1),
+                ..notice.clone()
+            },
+            PoolNotice {
+                message: "bad\0".into(),
+                ..notice.clone()
+            },
+            PoolNotice {
+                notification_id: "abc".into(),
+                ..notice.clone()
+            },
+        ] {
+            assert!(bad.fitted(probe).is_none());
+        }
+        assert!(
+            !probed.get(),
+            "fits was never called for an invalid original"
+        );
     }
 
     /// Defaults fill in one criterion and role/slot names; replay shape is deterministic.

@@ -2005,6 +2005,92 @@ async fn pool_completion_reaches_a_claude_inbox_with_pool_framing() {
     assert_eq!(evidence.classifier, "uds_receipt_held");
 }
 
+/// The largest legal pool notice made of multi-byte text still reaches a
+/// Claude inbox: only the body is shortened, with the explicit marker, to the
+/// actual rendered bound; the header and notification id are intact and the
+/// receipt correlates to that id. The frozen stored message is unchanged.
+#[tokio::test]
+async fn max_pool_notice_is_truncated_to_the_claude_rendered_bound() {
+    let temporary = tempfile::tempdir().unwrap();
+    let registry = temporary.path().join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    let socket = temporary.path().join("inbox.sock");
+    claude_descriptor(&registry, "session-1", &socket);
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let inbox = socket.clone();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        native_inbox_connection(&mut stream, &inbox, Some(("ntf_maxpool", "held"))).await
+    });
+    let notice = agent_run_domain::pool::PoolNotice {
+        notification_id: "ntf_maxpool".into(),
+        pool_id: "pool-20261003-120000-0123456789".parse().unwrap(),
+        message: "é\"\n".repeat(1024),
+    };
+    assert!(notice.validate().is_ok() && notice.message.len() == 4096);
+    let evidence = claude::send_pool(&registry, "session-1", &notice).await;
+    let frame = peer.await.unwrap();
+    assert_eq!(frame["msg_id"], "ntf_maxpool");
+    let content = frame["message"]["content"].as_str().unwrap();
+    assert!(content.len() <= 4096, "{}", content.len());
+    assert!(content.starts_with(
+        "agent-run/pool-completion\nnotification_id: ntf_maxpool\npool_id: pool-20261003-120000-0123456789\n"
+    ));
+    assert!(content.ends_with(agent_run_domain::pool::TRUNCATION_MARKER));
+    assert!(content.contains("é\"\né\"\n"));
+    assert_eq!(evidence.classifier, "uds_receipt_held");
+    assert_eq!(notice.message.len(), 4096, "frozen message unchanged");
+}
+
+/// An escaping-heavy maximal pool notice whose JSON frame would exceed the
+/// relay bound is shortened (body only, explicit marker) before connecting, so
+/// the frame is written whole, correlated and accepted instead of failing
+/// pre-send as a false ambiguity.
+#[tokio::test]
+async fn escaping_heavy_pool_notice_fits_the_relay_frame_bound() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let home = tempfile::tempdir().unwrap();
+    let listener = tokio::net::UnixListener::bind(home.path().join("ar-cdx-v4-big.sock")).unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let length = stream.read_u32_le().await.unwrap() as usize;
+        let mut data = vec![0; length];
+        stream.read_exact(&mut data).await.unwrap();
+        let reply = br#"{"outcome":"accepted"}"#;
+        stream.write_u32_le(reply.len() as u32).await.unwrap();
+        stream.write_all(reply).await.unwrap();
+        (length, serde_json::from_slice::<Value>(&data).unwrap())
+    });
+    // Each "\n\"\\" is three bytes and six escaped bytes: 4098 bytes expand past 8192.
+    let message = format!("x{}", "\n\"\\".repeat(1365));
+    let notice = agent_run_domain::pool::PoolNotice {
+        notification_id: "ntf_bigrelay".into(),
+        pool_id: "pool-20261003-120000-0123456789".parse().unwrap(),
+        message: message.clone(),
+    };
+    assert!(notice.validate().is_ok());
+    assert!(
+        serde_json::to_vec(&json!({"message": &message}))
+            .unwrap()
+            .len()
+            > 8192 - 200
+    );
+    let evidence = agent_run_core::delivery::relay::send_pool(home.path(), "thread", &notice).await;
+    let (length, request) = peer.await.unwrap();
+    assert_eq!(evidence.classifier, "relay_accepted");
+    assert!(length <= 8192, "{length}");
+    assert_eq!(request["notification_id"], "ntf_bigrelay");
+    assert_eq!(request["pool_id"], "pool-20261003-120000-0123456789");
+    assert_eq!(request["op"], "pool_completion");
+    let sent = request["message"].as_str().unwrap();
+    assert!(
+        sent.starts_with("x\n\"\\") && sent.ends_with(agent_run_domain::pool::TRUNCATION_MARKER)
+    );
+    assert!(sent.len() < message.len());
+    assert_eq!(notice.message, message, "frozen message unchanged");
+}
+
 /// Mirrors `tests/test_codex_queue.py::test_send_uses_the_relay_without_a_queue_message_id`.
 #[tokio::test]
 async fn relay_acceptance_has_no_queue_message_identifier() {
