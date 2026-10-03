@@ -465,20 +465,53 @@ async fn scripted_pool_completes_with_one_correlated_common_notice() {
     }
     let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
     let sink = received.clone();
-    let _relay = Relay(tokio::spawn(async move {
+    let probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let probe_count = probes.clone();
+    let relay = Relay(tokio::spawn(async move {
         loop {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let length = stream.read_u32_le().await.unwrap() as usize;
-            let mut data = vec![0; length];
-            stream.read_exact(&mut data).await.unwrap();
-            sink.lock()
-                .unwrap()
-                .push(serde_json::from_slice(&data).unwrap());
+            // The broker's own filesystem housekeeping probes every relay
+            // socket at the home root with a bare connect-and-close
+            // (`housekeeping::probe_socket`, reclaiming only refused sockets).
+            // That is legitimate: count it and keep serving, never die on it.
+            let Ok(length) = stream.read_u32_le().await else {
+                probe_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                continue;
+            };
+            // Same frame bound as the real relay; anything else is dropped.
+            if length == 0 || length > 8192 {
+                continue;
+            }
+            let mut data = vec![0; length as usize];
+            if stream.read_exact(&mut data).await.is_err() {
+                continue;
+            }
+            let Ok(frame) = serde_json::from_slice::<Value>(&data) else {
+                continue;
+            };
+            sink.lock().unwrap().push(frame);
             let reply = br#"{"outcome":"accepted"}"#;
-            stream.write_u32_le(reply.len() as u32).await.unwrap();
-            stream.write_all(reply).await.unwrap();
+            if stream.write_u32_le(reply.len() as u32).await.is_ok() {
+                let _ = stream.write_all(reply).await;
+            }
         }
     }));
+    // Deterministic regression: one owned empty connection before any real
+    // notice. A relay that unwraps the missing frame dies here, the counter
+    // never moves, and this wait fails instead of the run losing every notice.
+    drop(
+        tokio::net::UnixStream::connect(h.home.join("ar-cdx-v4-pool.sock"))
+            .await
+            .unwrap(),
+    );
+    let probe_deadline = Instant::now() + Duration::from_secs(5);
+    while probes.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+        assert!(
+            Instant::now() < probe_deadline && !relay.0.is_finished(),
+            "the fake relay did not survive a connect-and-close liveness probe"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let member = |role: &str, task: &str| {
         json!({"role": role, "start": {
             "provider":"mock","model":"fixture","profile":"review","task":task,
