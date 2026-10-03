@@ -370,6 +370,8 @@ enum Payload {
     Completion(Notice),
     /// Untrusted worker report with no lifecycle effect.
     Worker(WorkerNotice),
+    /// The broker's one common conclusion of a completed pool.
+    Pool(agent_run_domain::pool::PoolNotice),
 }
 
 /// Counts one bounded outbox drain and reports whether another process owns it.
@@ -431,7 +433,7 @@ fn dispatcher_lock(home: &Path) -> Result<Option<DispatcherLock>> {
 fn expire_unbound(tx: &rusqlite::Transaction<'_>, time: f64) -> Result<()> {
     tx.execute(
         "UPDATE deliveries SET state='expired',lease_owner=NULL,lease_until=NULL,next_attempt_at=NULL \
-         WHERE state='waiting_binding' AND agent_id IN (SELECT id FROM agents WHERE status IN ('succeeded','failed','timed_out','cancelled','lost')) \
+         WHERE state='waiting_binding' AND id NOT IN (SELECT completion_delivery_id FROM pools WHERE completion_delivery_id IS NOT NULL) AND agent_id IN (SELECT id FROM agents WHERE status IN ('succeeded','failed','timed_out','cancelled','lost')) \
          AND terminal_event_seq IN (SELECT seq FROM events WHERE at<=?)",
         [time - 3600.0],
     )?;
@@ -509,7 +511,27 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
         [&agent_id],
         |row| row.get(0),
     )?;
-    let payload = if let Some((kind, message)) = worker {
+    // A pool's one common completion is anchored on a member's row but is not
+    // that member's lifecycle notice: its frozen text lives in the immutable
+    // completion event and names no run, attempt or session.
+    let pool: Option<(String, String)> = tx
+        .query_row(
+            "SELECT p.id,json_extract(e.data_json,'$.notice') FROM pools p \
+             JOIN deliveries d ON d.id=p.completion_delivery_id \
+             JOIN events e ON e.seq=d.terminal_event_seq WHERE p.completion_delivery_id=?",
+            [&delivery_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let payload = if let Some((pool_id, message)) = pool {
+        let notice = agent_run_domain::pool::PoolNotice {
+            notification_id: delivery_id.clone(),
+            pool_id: pool_id.parse()?,
+            message,
+        };
+        notice.validate()?;
+        Payload::Pool(notice)
+    } else if let Some((kind, message)) = worker {
         let kind = match kind.as_str() {
             "notice" => WorkerMessageKind::Notice,
             "risk" => WorkerMessageKind::Risk,
@@ -671,6 +693,12 @@ async fn dispatch_one(home: &Path) -> Result<Option<(String, bool)>> {
         }
         ("claude_uds", Payload::Worker(notice)) => {
             claude::send_worker(&claude_registry(), &claim.session, notice).await
+        }
+        ("codex_queue", Payload::Pool(notice)) => {
+            relay::send_pool(home, &claim.session, notice).await
+        }
+        ("claude_uds", Payload::Pool(notice)) => {
+            claude::send_pool(&claude_registry(), &claim.session, notice).await
         }
         _ => Evidence::new("unsupported_transport", false, false),
     };

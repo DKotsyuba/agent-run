@@ -186,3 +186,99 @@ fn pool_entry_text_validates_membership_and_renders() {
         "not_pool_member"
     );
 }
+
+/// The terminal hook every supervisor path calls completes a fully proven
+/// pool exactly once and leaves a still-open one alone.
+#[test]
+fn complete_terminal_settles_a_fully_proven_pool() {
+    use agent_run_core::commands;
+    let home = common::Home::new();
+    let config = agent_run_config::config::Config::load(&home.path).unwrap();
+    let mut request = home.request();
+    request.workdir = home.path.clone();
+    request.validate().unwrap();
+    let mut store = agent_run_core::state::Store::open(&home.path).unwrap();
+    let ids: Vec<_> = (0..2)
+        .map(|_| {
+            store
+                .admit(&request, &config, &serde_json::json!({}), None)
+                .unwrap()
+                .0
+        })
+        .collect();
+    let pool = "pool-20260101-000000-0123456789";
+    store
+        .conn
+        .execute(
+            "INSERT INTO pools(id,request_namespace,request_id,request_sha256,goal,acceptance_json,state,roster_revision,created_at) \
+             VALUES(?,'ns','r',lower(hex(zeroblob(32))),'goal','[{\"id\":\"done\",\"text\":\"ok\"}]','open',1,1.0)",
+            [pool],
+        )
+        .unwrap();
+    for (slot, id) in ids.iter().enumerate() {
+        store
+            .conn
+            .execute(
+                "INSERT INTO pool_members(agent_id,pool_id,slot,name,role,personal_task,joined_roster_revision) VALUES(?,?,?,?,'r','t',1)",
+                rusqlite::params![id.as_str(), pool, slot + 1, format!("m{slot}")],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active,phase,cleanup_proof_json) VALUES(?,?,1,'finished','{}',1.0,0,'cleanup_complete','{}')",
+                rusqlite::params![format!("att_{}", format!("{slot}").repeat(24)), id.as_str()],
+            )
+            .unwrap();
+    }
+    let first_attempt = format!("att_{}", "0".repeat(24));
+    store
+        .conn
+        .execute(
+            "INSERT INTO pool_entries(pool_id,author_kind,author_agent_id,author_name,author_role,direction,kind,roster_revision,snapshot,body,sender_run_id,sender_attempt_id,idem_scope,request_id,created_at) \
+             VALUES(?,'member',?,'m','r','team','proposal',1,'result','p',?,?,'s','p',1.0)",
+            rusqlite::params![pool, ids[0].as_str(), ids[0].as_str(), first_attempt],
+        )
+        .unwrap();
+    for (slot, id) in ids.iter().enumerate() {
+        store
+            .conn
+            .execute(
+                "INSERT INTO pool_entries(pool_id,author_kind,author_agent_id,author_name,author_role,direction,kind,roster_revision,proposal_seq,decision,checks_json,body,sender_run_id,sender_attempt_id,idem_scope,request_id,created_at) \
+                 VALUES(?,'member',?,'m','r','team','vote',1,1,'ready','[{\"criterion_id\":\"done\",\"status\":\"met\",\"evidence\":\"x\"}]','v',?,?,?,'v',2.0)",
+                rusqlite::params![pool, id.as_str(), id.as_str(), format!("att_{}", format!("{slot}").repeat(24)), id.as_str()],
+            )
+            .unwrap();
+    }
+    // The first member ends; the other still runs, so nothing completes.
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='succeeded' WHERE id=?",
+            [ids[0].as_str()],
+        )
+        .unwrap();
+    commands::complete_terminal(&mut store, &ids[0]).unwrap();
+    let state = |store: &agent_run_core::state::Store| -> String {
+        store
+            .conn
+            .query_row("SELECT state FROM pools", [], |row| row.get(0))
+            .unwrap()
+    };
+    assert_eq!(state(&store), "open");
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='succeeded' WHERE id=?",
+            [ids[1].as_str()],
+        )
+        .unwrap();
+    commands::complete_terminal(&mut store, &ids[1]).unwrap();
+    assert_eq!(state(&store), "completed");
+    commands::complete_terminal(&mut store, &ids[1]).unwrap();
+    let deliveries: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM deliveries", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(deliveries, 1);
+}

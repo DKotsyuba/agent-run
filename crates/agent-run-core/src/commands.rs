@@ -26,6 +26,10 @@ pub fn complete_terminal(store: &mut Store, agent_id: &AgentId) -> Result<()> {
     while let Some((command_id, kind, _)) = store.claim_command(agent_id)? {
         store.complete_command(agent_id, command_id, &terminal_result(&kind))?;
     }
+    // A member ending may complete its pool. Settlement is formal and
+    // idempotent, and the maintenance sweep retries it, so a failure here must
+    // never turn an already recorded terminal outcome into an error.
+    let _ = store.settle_pool_of(agent_id);
     Ok(())
 }
 

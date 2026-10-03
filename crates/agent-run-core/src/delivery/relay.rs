@@ -56,12 +56,26 @@ pub async fn send_worker(home: &Path, thread: &str, notice: &WorkerNotice) -> Ev
     send_payload(home, thread, RelayPayload::Worker(notice)).await
 }
 
-/// Distinguishes the two fixed relay operations without accepting arbitrary methods.
+/// Sends a pool's common completion only to a v4 relay that understands `pool_completion`.
+pub async fn send_pool(
+    home: &Path,
+    thread: &str,
+    notice: &agent_run_domain::pool::PoolNotice,
+) -> Evidence {
+    if notice.validate().is_err() {
+        return Evidence::new("relay_rejected", false, false);
+    }
+    send_payload(home, thread, RelayPayload::Pool(notice)).await
+}
+
+/// Distinguishes the fixed relay operations without accepting arbitrary methods.
 enum RelayPayload<'a> {
     /// Existing completion wire shape.
     Completion(&'a Notice),
     /// v4-only worker report shape.
     Worker(&'a WorkerNotice),
+    /// v4-only common pool completion shape.
+    Pool(&'a agent_run_domain::pool::PoolNotice),
 }
 
 /// Shares socket selection, framing, deadlines, and evidence classification.
@@ -115,6 +129,12 @@ async fn send_payload(home: &Path, thread: &str, payload: RelayPayload<'_>) -> E
                 "run_id":notice.run_id,"kind":notice.kind,"message":notice.message,
             }),
             RelayPayload::Worker(_) => continue,
+            RelayPayload::Pool(notice) if version >= 4 => json!({
+                "version":4,"op":"pool_completion","thread_id":thread,
+                "notification_id":notice.notification_id,"pool_id":notice.pool_id,
+                "message":notice.message,
+            }),
+            RelayPayload::Pool(_) => continue,
             RelayPayload::Completion(notice) => {
                 let exact = notice.run_id.as_ref().unwrap_or(&notice.agent_id);
                 // Legacy hosts only know the exact completed execution.

@@ -69,6 +69,24 @@ pub async fn send_worker(registry: &Path, session: &str, notice: &WorkerNotice) 
     .await
 }
 
+/// Delivers a pool's common completion through the same Claude inbox route.
+pub async fn send_pool(
+    registry: &Path,
+    session: &str,
+    notice: &agent_run_domain::pool::PoolNotice,
+) -> Evidence {
+    send_text_after(
+        registry,
+        session,
+        notice
+            .render()
+            .ok()
+            .map(|text| (notice.notification_id.as_str(), text)),
+        async {},
+    )
+    .await
+}
+
 /// [`send`] with `before_write` awaited after the connection is established
 /// and before any frame is written. Production passes an already-ready
 /// future; tests use it to order a peer close before the write, so an

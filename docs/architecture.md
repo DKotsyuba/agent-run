@@ -144,8 +144,39 @@ same key returns the same new identity even after later replacements. An omitted
 start restores the seat's original user spec (never the account a prior
 automatic choice picked). The new execution's task names the goal, the current
 roster and a catch-up instruction; peers' frozen prompts are corrected by the
-roster entry, never rewritten. Pool completion and settlement are not
-implemented yet. The tables retain replaced members, keep one current member per slot, store
+roster entry, never rewritten.
+
+A pool completes only by formal verification at one consistent moment inside one
+immediate transaction: the current proposal has a valid ready vote, covering
+every acceptance criterion, from every current member for the current roster
+revision; every current member's latest execution `succeeded`; and every attempt
+of every member lineage has verified cleanup. Agreement while anyone still runs,
+a failed, timed-out, cancelled or lost member, uncleared ownership, a missing,
+revoked, blocking or stale vote, or a roster that moved never completes the
+pool; no timer or heuristic infers success, and agent-run never judges whether
+the result is right. Completion freezes one immutable `pool_completed` event on
+a member row (goal, criteria, accepted proposal, stable roster, votes and proofs,
+plus the compact notice text) and one linked outbox row, then marks the pool
+completed, all in the same transaction, so concurrent or repeated settlement
+records exactly one of each. It is attempted after votes, after every supervisor
+terminal path through `complete_terminal`, and by the bounded maintenance sweep
+(at most twenty open pools per pass, rotating) that also converges cleanup proof
+which arrives after the terminal write. A completed pool's status is read from
+the frozen record: a member resumed later does not change it or mint another
+notice, and the closed pool refuses further writes and replacements.
+
+The notice is a broker conclusion for the whole pool, delivered over the
+existing outbox as a typed pool payload (the Desktop relay's `pool_completion`
+operation, rendered by the frontend's fixed template, and the Claude inbox as
+text). It names the stable pool ID, goal, accepted result and roster, never a
+run, attempt or session identity; a result longer than the 4096-byte bound is
+shortened with an explicit marker naming the full proposal entry in the pool
+log. An unbound pool still completes: its notice stays `waiting_binding`
+(exempt from the one-hour binding window and not activated by binding a single
+member) until the pool itself is bound, which the store's `bind_pool` does for
+the pool and every current member tip. No tool, CLI or MCP method calls
+`bind_pool` or exposes completion yet, and retention of completed pools is a
+later stage. The tables retain replaced members, keep one current member per slot, store
 an immutable author stamped at send time, and reference agents and deliveries
 without cascades so a later purge can delete pool rows first.
 

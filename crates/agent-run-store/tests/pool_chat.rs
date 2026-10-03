@@ -1349,3 +1349,434 @@ fn operator_post_is_stamped_fanned_out_and_idempotent() {
         agent_run_domain::pool::PoolDenial::PoolNotFound
     );
 }
+
+/// Criteria, member capabilities and pool identity of a voted pool.
+type Voted = (
+    Vec<(&'static str, &'static str)>,
+    Vec<(AgentId, String, String)>,
+    agent_run_domain::pool::PoolId,
+);
+
+/// A pool whose proposal carries a ready vote from both members, while both
+/// executions are still running; returns the criteria, members and store.
+fn voted_pool(home: &common::Home) -> Voted {
+    let criteria = vec![("done", "it ships")];
+    let (pool_id, members) = pool(home, &criteria);
+    let mut store = home.store();
+    let (run, attempt, token) = &members[0];
+    store
+        .pool_write(
+            run,
+            attempt,
+            token,
+            PoolWrite::Proposal(PoolPropose {
+                request_id: "p1".into(),
+                message: "result ready".into(),
+                snapshot: "commit abc123".into(),
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    for (n, (run, attempt, token)) in members.iter().enumerate() {
+        store
+            .pool_write(run, attempt, token, ready(&format!("v{n}"), 1, &criteria))
+            .unwrap()
+            .unwrap();
+    }
+    (criteria, members, pool_id.parse().unwrap())
+}
+
+/// Ends every member execution `succeeded` and, when `cleaned`, releases
+/// ownership with verified cleanup proof.
+fn finish_members(store: &Store, members: &[(AgentId, String, String)], cleaned: bool) {
+    for (run, _, _) in members {
+        store
+            .conn
+            .execute(
+                "UPDATE agents SET status='succeeded' WHERE id=?",
+                [run.as_str()],
+            )
+            .unwrap();
+        if cleaned {
+            store
+                .conn
+                .execute(
+                    "UPDATE attempts SET ownership_active=0,phase='cleanup_complete',cleanup_proof_json='{}' WHERE agent_id=?",
+                    [run.as_str()],
+                )
+                .unwrap();
+        }
+    }
+}
+
+/// Counts rows of `table`.
+fn rows_of(store: &Store, table: &str) -> i64 {
+    store
+        .conn
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+        .unwrap()
+}
+
+/// Agreement while members still run, or finished without proven cleanup,
+/// never completes; once everything is proven it completes exactly once with
+/// one frozen event and one waiting (unbound) outbox row, and a repeat adds nothing.
+#[test]
+fn completion_needs_agreement_succeeded_tips_and_cleanup() {
+    let home = common::Home::new();
+    let (_, members, pool_id) = voted_pool(&home);
+    let mut store = home.store();
+    assert!(
+        store.settle_pool(&pool_id).unwrap().is_none(),
+        "agreed but running"
+    );
+    finish_members(&store, &members, false);
+    assert!(
+        store.settle_pool(&pool_id).unwrap().is_none(),
+        "succeeded but cleanup unknown"
+    );
+    assert_eq!(store.settle_open_pools(20, 0).unwrap(), 0);
+    assert_eq!(rows_of(&store, "deliveries"), 0);
+    finish_members(&store, &members, true);
+    // The maintenance sweep converges once cleanup proof lands later.
+    assert_eq!(store.settle_open_pools(20, 7).unwrap(), 1);
+    let again = store.settle_pool(&pool_id).unwrap().unwrap();
+    assert!(!again.created && !again.bound);
+    let (state, delivery, completed): (String, String, f64) = store
+        .conn
+        .query_row(
+            "SELECT state,completion_delivery_id,completed_at FROM pools WHERE id=?",
+            [pool_id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "completed");
+    assert_eq!(delivery, again.delivery_id);
+    assert!(completed > 0.0);
+    assert_eq!(rows_of(&store, "deliveries"), 1);
+    let events: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE kind='pool_completed'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(events, 1);
+    let (delivery_state, session): (String, Option<String>) = store
+        .conn
+        .query_row(
+            "SELECT state,orchestrator_session_id FROM deliveries WHERE id=?",
+            [&delivery],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (delivery_state.as_str(), session),
+        ("waiting_binding", None)
+    );
+    let notice: String = store
+        .conn
+        .query_row(
+            "SELECT json_extract(e.data_json,'$.notice') FROM events e JOIN deliveries d ON d.terminal_event_seq=e.seq WHERE d.id=?",
+            [&delivery],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(notice.contains("commit abc123") && notice.contains("ship it"));
+    assert!(notice.contains("member-1 (doer,") && notice.len() <= 4096);
+    assert!(!notice.contains("att_"), "no attempt identity: {notice}");
+}
+
+/// Every non-success condition leaves the pool open with nothing written.
+#[test]
+fn failed_missing_stale_or_withdrawn_agreement_never_completes() {
+    type Break = fn(&Store, &[(AgentId, String, String)]);
+    let cases: [(&str, Break); 8] = [
+        ("failed", |s, m| {
+            s.conn
+                .execute(
+                    "UPDATE agents SET status='failed' WHERE id=?",
+                    [m[1].0.as_str()],
+                )
+                .map(|_| ())
+                .unwrap()
+        }),
+        ("timed_out", |s, m| {
+            s.conn
+                .execute(
+                    "UPDATE agents SET status='timed_out' WHERE id=?",
+                    [m[1].0.as_str()],
+                )
+                .map(|_| ())
+                .unwrap()
+        }),
+        ("cancelled", |s, m| {
+            s.conn
+                .execute(
+                    "UPDATE agents SET status='cancelled' WHERE id=?",
+                    [m[1].0.as_str()],
+                )
+                .map(|_| ())
+                .unwrap()
+        }),
+        ("lost", |s, m| {
+            s.conn
+                .execute(
+                    "UPDATE agents SET status='lost' WHERE id=?",
+                    [m[1].0.as_str()],
+                )
+                .map(|_| ())
+                .unwrap()
+        }),
+        ("uncleared ownership", |s, m| {
+            s.conn.execute("UPDATE attempts SET ownership_active=1,phase='running',cleanup_proof_json=NULL WHERE agent_id=?", [m[0].0.as_str()]).map(|_| ()).unwrap()
+        }),
+        ("stale roster", |s, _| {
+            s.conn
+                .execute("UPDATE pools SET roster_revision=2", [])
+                .map(|_| ())
+                .unwrap()
+        }),
+        ("missing vote", |s, m| {
+            s.conn
+                .execute(
+                    "DELETE FROM pool_entries WHERE kind='vote' AND author_agent_id=?",
+                    [m[1].0.as_str()],
+                )
+                .map(|_| ())
+                .unwrap()
+        }),
+        ("unmet check", |s, m| {
+            s.conn
+                .execute(
+                    "INSERT INTO pool_entries(pool_id,author_kind,author_agent_id,author_name,author_role,direction,kind,roster_revision,proposal_seq,decision,checks_json,body,sender_run_id,sender_attempt_id,idem_scope,request_id,created_at) \
+                     SELECT e.pool_id,'member',e.author_agent_id,e.author_name,e.author_role,'team','vote',1,1,'ready','[{\"criterion_id\":\"done\",\"status\":\"unmet\",\"evidence\":\"x\"}]','later',e.sender_run_id,e.sender_attempt_id,e.idem_scope,'later-vote',99.0 \
+                     FROM pool_entries e WHERE e.kind='vote' AND e.author_agent_id=?",
+                    [m[1].0.as_str()],
+                )
+                .map(|_| ())
+                .unwrap()
+        }),
+    ];
+    for (label, break_it) in cases {
+        let home = common::Home::new();
+        let (_, members, pool_id) = voted_pool(&home);
+        let mut store = home.store();
+        finish_members(&store, &members, true);
+        break_it(&store, &members);
+        // `finish_members` made the second member succeeded; the cases then undo that.
+        assert!(store.settle_pool(&pool_id).unwrap().is_none(), "{label}");
+        assert_eq!(rows_of(&store, "deliveries"), 0, "{label}");
+        let state: String = store
+            .conn
+            .query_row("SELECT state FROM pools", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "open", "{label}");
+    }
+    // Revoke and block votes never complete either.
+    for decision in [VoteDecision::Revoke, VoteDecision::Block] {
+        let home = common::Home::new();
+        let (criteria, members, pool_id) = voted_pool(&home);
+        let mut store = home.store();
+        let (run, attempt, token) = &members[1];
+        store
+            .pool_write(
+                run,
+                attempt,
+                token,
+                PoolWrite::Vote(PoolVote {
+                    request_id: "w".into(),
+                    proposal_seq: 1,
+                    decision,
+                    checks: if decision == VoteDecision::Block {
+                        criteria
+                            .iter()
+                            .map(|(id, _)| CriterionCheck {
+                                criterion_id: (*id).into(),
+                                status: CheckStatus::Met,
+                                evidence: "x".into(),
+                            })
+                            .collect()
+                    } else {
+                        vec![]
+                    },
+                    message: None,
+                }),
+            )
+            .unwrap()
+            .unwrap();
+        finish_members(&store, &members, true);
+        assert!(
+            store.settle_pool(&pool_id).unwrap().is_none(),
+            "{decision:?}"
+        );
+    }
+}
+
+/// Concurrent settlement records one event and one delivery; a later resume
+/// of a member neither changes the frozen status nor mints another notice,
+/// and the closed pool refuses new writes.
+#[test]
+fn concurrent_settlement_is_single_and_the_completed_record_stays_frozen() {
+    let home = common::Home::new();
+    let (criteria, members, pool_id) = voted_pool(&home);
+    finish_members(&home.store(), &members, true);
+    let outcomes: Vec<_> = (0..4)
+        .map(|_| {
+            let (path, pool_id) = (home.path.clone(), pool_id.clone());
+            std::thread::spawn(move || {
+                Store::open(&path)
+                    .unwrap()
+                    .settle_pool(&pool_id)
+                    .unwrap()
+                    .unwrap()
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .collect();
+    assert_eq!(outcomes.iter().filter(|c| c.created).count(), 1);
+    assert!(outcomes
+        .iter()
+        .all(|c| c.delivery_id == outcomes[0].delivery_id));
+    let mut store = home.store();
+    assert_eq!(rows_of(&store, "deliveries"), 1);
+    let frozen = store
+        .pool_operator_read(&pool_id, 0, None, 50)
+        .unwrap()
+        .unwrap();
+    assert_eq!(frozen["status"]["state"], "completed");
+    assert_eq!(frozen["status"]["agreed"], true);
+    // A member later resumes independently: a new running tip appears.
+    store
+        .conn
+        .execute(
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id,parent_agent_id,sequence) \
+             SELECT 'ag-20260101-000000-0000000088',runtime,model,profile,'t','t',workdir,'{}','running',9.0,10.0,'cfg',id,id,2 FROM agents WHERE id=?",
+            [members[0].0.as_str()],
+        )
+        .unwrap();
+    let after = store
+        .pool_operator_read(&pool_id, 0, None, 50)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after["status"], frozen["status"], "history does not drift");
+    assert!(store
+        .settle_pool(&pool_id)
+        .unwrap()
+        .is_some_and(|c| !c.created));
+    assert_eq!(rows_of(&store, "deliveries"), 1);
+    let (run, attempt, token) = &members[1];
+    let _ = (run, attempt, token, &criteria);
+    assert_eq!(
+        store
+            .pool_operator_post(&pool_id, "late", "anything")
+            .unwrap()
+            .unwrap_err(),
+        PoolDenial::PoolCompleted
+    );
+}
+
+/// A pool with an orchestrator binding queues a pending notice; an unbound
+/// pool's notice waits, is never expired by the binding window, is not
+/// activated by binding one member alone, and `bind_pool` activates it once.
+#[test]
+fn unbound_completion_waits_for_pool_binding() {
+    let reference = agent_run_domain::domain::OrchestratorRef {
+        transport: "claude_uds".into(),
+        external_session_id: "sess-pool".into(),
+        external_turn_id: None,
+    };
+    // Bound before completion: pending immediately.
+    let home = common::Home::new();
+    let (_, members, pool_id) = voted_pool(&home);
+    let mut store = home.store();
+    store
+        .conn
+        .execute(
+            "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) VALUES('os-p','claude_uds','sess-pool',1.0,1.0)",
+            [],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute("UPDATE pools SET orchestrator_session_id='os-p'", [])
+        .unwrap();
+    finish_members(&store, &members, true);
+    let done = store.settle_pool(&pool_id).unwrap().unwrap();
+    assert!(done.bound);
+    let state: String = store
+        .conn
+        .query_row(
+            "SELECT state FROM deliveries WHERE id=?",
+            [&done.delivery_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "pending");
+
+    // Unbound.
+    let home = common::Home::new();
+    let (_, members, pool_id) = voted_pool(&home);
+    let mut store = home.store();
+    finish_members(&store, &members, true);
+    let done = store.settle_pool(&pool_id).unwrap().unwrap();
+    let state = |store: &Store| -> String {
+        store
+            .conn
+            .query_row(
+                "SELECT state FROM deliveries WHERE id=?",
+                [&done.delivery_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(state(&store), "waiting_binding");
+    assert!(store.expire_unbound_deliveries(1.0e12).unwrap().is_empty());
+    store
+        .bind_orchestrator(&members[0].0, &reference, 5.0)
+        .unwrap();
+    assert_eq!(
+        state(&store),
+        "waiting_binding",
+        "one member's binding is not a pool binding"
+    );
+    let session = store.bind_pool(&pool_id, &reference, 6.0).unwrap();
+    assert_eq!(state(&store), "pending");
+    let tips_bound: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM agents WHERE orchestrator_session_id=?",
+            [&session],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tips_bound, 2);
+    assert_eq!(
+        store.bind_pool(&pool_id, &reference, 7.0).unwrap(),
+        session,
+        "repeat is a no-op"
+    );
+    let other = agent_run_domain::domain::OrchestratorRef {
+        external_session_id: "someone-else".into(),
+        ..reference
+    };
+    assert!(store.bind_pool(&pool_id, &other, 8.0).is_err());
+}
+
+/// The member-terminal hook entry settles the pool its lineage belongs to.
+#[test]
+fn terminal_member_settles_its_pool() {
+    let home = common::Home::new();
+    let (_, members, pool_id) = voted_pool(&home);
+    let mut store = home.store();
+    finish_members(&store, &members, true);
+    let done = store.settle_pool_of(&members[1].0).unwrap().unwrap();
+    assert!(done.created);
+    assert_eq!(done.pool_id, pool_id);
+    assert!(
+        store.settle_pool_of(&members[1].0).unwrap().is_none(),
+        "no open pool remains"
+    );
+}

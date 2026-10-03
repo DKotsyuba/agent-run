@@ -31,8 +31,15 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 - feat(pools): add core operator operations: post a stamped operator message,
   read a pool's status and log, and replace a terminal, fully cleaned member
   atomically with a roster change, a broker roster entry and a replayable result;
-  not yet exposed through any tool, CLI or MCP method, and completion and
-  settlement are not implemented yet
+  not yet exposed through any tool, CLI or MCP method
+- feat(pools): complete a pool only when every current member voted ready on the
+  current proposal, ended successfully and has verified cleanup, in one
+  transaction that freezes one completion record and queues exactly one common
+  notice (Desktop relay `pool_completion`, Claude inbox text) naming no run,
+  attempt or session identity; unbound pools keep the notice waiting until a pool
+  binding exists (store `bind_pool`, not yet exposed); completed pools stay frozen
+  if a member is resumed later, and retention of completed pools is not
+  implemented yet
 
 Database schema 25 adds the `pools`, `pool_members` and `pool_entries` tables
 with historical membership, one current member per slot and immutable

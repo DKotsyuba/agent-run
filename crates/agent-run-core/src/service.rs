@@ -33,6 +33,9 @@ use agent_run_store::{
 /// Most `selection_stale` recalculations after the initial selection in
 /// [`Service::admit_provider`]: four admission submissions in total.
 pub const PROVIDER_STALE_RETRIES: u32 = 3;
+
+/// Open pools the maintenance sweep inspects per pass.
+const POOL_SWEEP_LIMIT: usize = 20;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1765,7 +1768,15 @@ impl Service {
     /// never treats unavailable OS evidence as a terminal outcome.
     pub fn reconcile(&self) -> Result<usize> {
         let mut store = Store::open(&self.home)?;
-        Ok(reconcile::reconcile(&mut store, 100)?.len())
+        let reconciled = reconcile::reconcile(&mut store, 100)?.len();
+        // Bounded pool convergence for crashes, reconciled losses and cleanup
+        // proof that landed after the terminal write; a failure never hides
+        // the reconciliation result.
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs() as usize);
+        let _ = store.settle_open_pools(POOL_SWEEP_LIMIT, seed);
+        Ok(reconciled)
     }
     /// Returns the active cached config revision after the request-boundary
     /// digest check; an invalid edit keeps the last valid revision active.

@@ -1892,6 +1892,119 @@ async fn pool_linked_worker_report_is_rendered_with_the_stamped_sender() {
     assert_eq!(stored, "raw stored body");
 }
 
+/// Inserts one completed pool anchored on the fixture agent: its frozen
+/// completion event, the linked delivery and the pool row.
+fn completed_pool(home: &Path, delivery_id: &str, notice: &str) {
+    let connection = Connection::open(home.join("state.db")).unwrap();
+    let agent = "ag-20260825-120000-0123456789";
+    connection
+        .execute(
+            "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?,1.0,'pool_completed',?)",
+            params![agent, json!({"notice": notice}).to_string()],
+        )
+        .unwrap();
+    let event = connection.last_insert_rowid();
+    connection
+        .execute(
+            "UPDATE deliveries SET terminal_event_seq=? WHERE id=?",
+            params![event, delivery_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO pools(id,request_namespace,request_id,request_sha256,goal,acceptance_json,state,roster_revision,completed_at,completion_delivery_id,created_at) \
+             VALUES('pool-20261003-120000-0123456789','ns','r',lower(hex(zeroblob(32))),'goal','[]','completed',1,2.0,?,1.0)",
+            [delivery_id],
+        )
+        .unwrap();
+}
+
+/// The common pool conclusion travels the existing outbox to a v4 desktop
+/// relay as the one `pool_completion` operation: no agent, run or session
+/// identity on the wire, the frozen text intact, and accepted only after the
+/// relay's own correlated reply.
+#[tokio::test]
+async fn pool_completion_is_dispatched_as_one_common_conclusion() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let home = common::Home::new();
+    delivery(&home.path, "ntf_poolc", "codex_queue", "pending");
+    let text = "Pool pool-20261003-120000-0123456789 is complete.\nMembers: Ada (reviewer, ag-20260825-120000-0123456789)";
+    completed_pool(&home.path, "ntf_poolc", text);
+    let listener = tokio::net::UnixListener::bind(home.path.join("ar-cdx-v4-pool.sock")).unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let length = stream.read_u32_le().await.unwrap() as usize;
+        let mut data = vec![0; length];
+        stream.read_exact(&mut data).await.unwrap();
+        let reply = br#"{"outcome":"accepted"}"#;
+        stream.write_u32_le(reply.len() as u32).await.unwrap();
+        stream.write_all(reply).await.unwrap();
+        serde_json::from_slice::<Value>(&data).unwrap()
+    });
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+    let request = tokio::time::timeout(Duration::from_secs(2), peer)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        request,
+        json!({"version":4,"op":"pool_completion","thread_id":"thread",
+               "notification_id":"ntf_poolc","pool_id":"pool-20261003-120000-0123456789",
+               "message":text})
+    );
+    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let (state, evidence): (String, i64) = (
+        connection
+            .query_row(
+                "SELECT state FROM deliveries WHERE id='ntf_poolc'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM delivery_attempt_evidence WHERE delivery_id='ntf_poolc'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+    );
+    assert_eq!((state.as_str(), evidence), ("delivered", 1));
+}
+
+/// Claude receives the same frozen conclusion as plain inbox text with the
+/// trusted pool framing, and only a correlated hold receipt confirms it.
+#[tokio::test]
+async fn pool_completion_reaches_a_claude_inbox_with_pool_framing() {
+    let temporary = tempfile::tempdir().unwrap();
+    let registry = temporary.path().join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    let socket = temporary.path().join("inbox.sock");
+    claude_descriptor(&registry, "session-1", &socket);
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let inbox = socket.clone();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        native_inbox_connection(&mut stream, &inbox, Some(("ntf_poolc", "held"))).await
+    });
+    let notice = agent_run_domain::pool::PoolNotice {
+        notification_id: "ntf_poolc".into(),
+        pool_id: "pool-20261003-120000-0123456789".parse().unwrap(),
+        message: "Pool is complete.".into(),
+    };
+    let evidence = claude::send_pool(&registry, "session-1", &notice).await;
+    let frame = peer.await.unwrap();
+    let content = frame["message"]["content"].as_str().unwrap();
+    assert!(content.starts_with("agent-run/pool-completion\nnotification_id: ntf_poolc\n"));
+    assert!(
+        content.contains("Broker conclusion for the whole pool")
+            && content.ends_with("Pool is complete.")
+    );
+    assert!(!content.contains("run_id") && !content.contains("agent_id"));
+    assert_eq!(evidence.classifier, "uds_receipt_held");
+}
+
 /// Mirrors `tests/test_codex_queue.py::test_send_uses_the_relay_without_a_queue_message_id`.
 #[tokio::test]
 async fn relay_acceptance_has_no_queue_message_identifier() {

@@ -344,6 +344,55 @@ impl PoolDenial {
     }
 }
 
+/// The one common conclusion of a completed pool, frozen at completion and
+/// delivered to the orchestrator as a broker notice, not as any member's claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolNotice {
+    /// Stable delivery identity, `ntf_` followed by safe characters.
+    pub notification_id: String,
+    /// The completed pool.
+    pub pool_id: PoolId,
+    /// Frozen compact English conclusion, at most [`MAX_NOTICE_BYTES`] bytes.
+    pub message: String,
+}
+
+/// Most UTF-8 bytes of a pool notice message.
+pub const MAX_NOTICE_BYTES: usize = 4096;
+
+impl PoolNotice {
+    /// Rejects malformed stored fields before any transport can send them.
+    pub fn validate(&self) -> Result<()> {
+        let id = self
+            .notification_id
+            .strip_prefix("ntf_")
+            .unwrap_or_default();
+        if id.is_empty()
+            || self.notification_id.len() > 512
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+        {
+            return Err(invalid("invalid stored pool notice id"));
+        }
+        bounded_text("pool notice", &self.message, MAX_NOTICE_BYTES)
+    }
+
+    /// Renders trusted framing from the embedded template around the frozen text.
+    pub fn render(&self) -> Result<String> {
+        self.validate()?;
+        let contract: serde_json::Value =
+            serde_json::from_str(include_str!("../../../assets/completion_notice.json"))?;
+        let template = contract
+            .get("pool_template")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| crate::Error::Runtime("pool template missing".into()))?;
+        Ok(template
+            .replace("{notification_id}", &self.notification_id)
+            .replace("{pool_id}", self.pool_id.as_str())
+            .replace("{message}", &self.message))
+    }
+}
+
 /// Builds the admitted task of one member: the pool preamble followed by its
 /// personal task, checked against the ordinary task bound.
 ///
@@ -876,6 +925,40 @@ mod tests {
             proposal_seq: None,
             decision: None,
             body: "{agent_id} stays literal".into(),
+        }
+    }
+
+    /// The common pool notice validates its identity and bound and renders
+    /// the broker framing around the frozen text without any run identity.
+    #[test]
+    fn pool_notice_renders_broker_framing() {
+        let notice = PoolNotice {
+            notification_id: "ntf_abc".into(),
+            pool_id: PoolId::new(),
+            message: "Pool is complete.".into(),
+        };
+        let rendered = notice.render().unwrap();
+        assert!(rendered
+            .starts_with("agent-run/pool-completion\nnotification_id: ntf_abc\npool_id: pool-"));
+        assert!(
+            rendered.contains("Broker conclusion for the whole pool")
+                && rendered.ends_with("Pool is complete.")
+        );
+        for bad in [
+            PoolNotice {
+                notification_id: "abc".into(),
+                ..notice.clone()
+            },
+            PoolNotice {
+                message: "x".repeat(MAX_NOTICE_BYTES + 1),
+                ..notice.clone()
+            },
+            PoolNotice {
+                message: "bad\0".into(),
+                ..notice.clone()
+            },
+        ] {
+            assert!(bad.render().is_err());
         }
     }
 

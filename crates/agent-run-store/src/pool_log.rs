@@ -84,7 +84,7 @@ fn membership(conn: &Connection, root: &AgentId) -> Result<Option<Membership>> {
 }
 
 /// Decodes stored acceptance criteria into `(id, text)` pairs.
-fn criteria_of(acceptance: &str) -> Result<Vec<(String, String)>> {
+pub(crate) fn criteria_of(acceptance: &str) -> Result<Vec<(String, String)>> {
     let parsed: Value = serde_json::from_str(acceptance)
         .map_err(|_| Error::Integrity("pool acceptance is malformed".into()))?;
     parsed
@@ -104,7 +104,10 @@ fn criteria_of(acceptance: &str) -> Result<Vec<(String, String)>> {
 }
 
 /// The current proposal of `pool_id`, when one exists.
-fn current_proposal(conn: &Connection, pool_id: &str) -> Result<Option<(u64, String, u32)>> {
+pub(crate) fn current_proposal(
+    conn: &Connection,
+    pool_id: &str,
+) -> Result<Option<(u64, String, u32)>> {
     Ok(conn
         .query_row(
             "SELECT seq,snapshot,roster_revision FROM pool_entries \
@@ -123,7 +126,7 @@ fn current_proposal(conn: &Connection, pool_id: &str) -> Result<Option<(u64, Str
 
 /// The member's latest vote-shaped entry on `proposal`, if any.
 #[allow(clippy::type_complexity)]
-fn latest_vote(
+pub(crate) fn latest_vote(
     conn: &Connection,
     pool_id: &str,
     member: &str,
@@ -340,6 +343,11 @@ impl Store {
         // key return before this point so nothing is enqueued twice.
         fanout_entry(&tx, &member.pool_id, &member.seat_agent_id, seq)?;
         tx.commit()?;
+        if matches!(write, PoolWrite::Vote(_)) {
+            // Convergence is also swept by maintenance, so a failure here is
+            // never allowed to fail the already committed vote.
+            let _ = self.settle_pool(&member.pool_id.parse()?);
+        }
         Ok(Ok(PoolWriteReceipt {
             pool_id: member.pool_id.parse()?,
             seq,
@@ -884,6 +892,64 @@ pub(crate) fn fanout_entry(
     Ok(())
 }
 
+/// The status of a completed pool exactly as it was when it completed, read
+/// from the immutable completion event so a member that later resumes never
+/// changes or retroactively invalidates the recorded proof.
+fn frozen_status(conn: &Connection, pool_id: &str) -> Result<Option<Value>> {
+    let raw: Option<(String, f64)> = conn
+        .query_row(
+            "SELECT e.data_json,p.completed_at FROM pools p \
+             JOIN deliveries d ON d.id=p.completion_delivery_id \
+             JOIN events e ON e.seq=d.terminal_event_seq WHERE p.id=?",
+            [pool_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((data, completed_at)) = raw else {
+        return Ok(None);
+    };
+    let data: Value = serde_json::from_str(&data)
+        .map_err(|_| Error::Integrity("pool completion record is malformed".into()))?;
+    let members: Vec<Value> = data["members"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|member| {
+            json!({
+                "name": member["name"], "role": member["role"], "agent_id": member["agent_id"],
+                "slot": member["slot"], "tip_status": "succeeded", "cleanup_complete": true,
+                "vote": {"decision": "ready"}, "counts": true, "why": "valid",
+            })
+        })
+        .collect();
+    let mut retired = conn.prepare(
+        "SELECT m.agent_id,m.slot,m.name,m.role,m.replaced_by FROM pool_members m \
+         WHERE m.pool_id=? AND m.replaced_by IS NOT NULL ORDER BY m.slot,m.joined_roster_revision",
+    )?;
+    let retired: Vec<Value> = retired
+        .query_map([pool_id], |row| {
+            Ok(json!({
+                "agent_id": row.get::<_, String>(0)?, "slot": row.get::<_, i64>(1)?,
+                "name": row.get::<_, String>(2)?, "role": row.get::<_, String>(3)?,
+                "replaced_by": row.get::<_, String>(4)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(Some(json!({
+        "state": "completed",
+        "completed_at": completed_at,
+        "roster_revision": data["roster_revision"],
+        "goal": data["goal"],
+        "criteria": data["acceptance"],
+        "current_proposal": {"seq": data["proposal"]["seq"], "snapshot": data["proposal"]["snapshot"],
+                             "roster_revision": data["roster_revision"]},
+        "members": members,
+        "replaced_members": retired,
+        "agreed": true,
+        "note": "frozen at completion: the recorded proof does not change if a member is resumed later; agent-run verified formal checks only",
+    })))
+}
+
 /// Computes the derived status: roster, current proposal, per-member vote
 /// validity with reasons, and whether unanimity currently holds. Agreement is
 /// explicitly not completion; nothing here ever completes the pool.
@@ -909,6 +975,11 @@ fn pool_status(conn: &Connection, pool_id: &str) -> Result<Value> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(seats);
+    if state == "completed" {
+        if let Some(frozen) = frozen_status(conn, pool_id)? {
+            return Ok(frozen);
+        }
+    }
     let proposal = current_proposal(conn, pool_id)?;
     let criteria: Vec<Value> = criteria_of(&acceptance)?
         .iter()
@@ -972,7 +1043,7 @@ fn pool_status(conn: &Connection, pool_id: &str) -> Result<Value> {
 }
 
 /// Derives one member's vote status fields and the reason it counts or not.
-fn vote_validity(
+pub(crate) fn vote_validity(
     latest: Option<(String, Option<String>, Option<String>, String)>,
     roster_revision: u32,
     proposal_roster: u32,
