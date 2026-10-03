@@ -51,16 +51,9 @@ struct Transcript {
     /// Optional historical execution, otherwise the latest run.
     #[serde(default)]
     run_id: Option<AgentId>,
-    #[serde(default)]
-    /// Exclusive journal cursor, zero for the first page.
-    cursor: i64,
-    #[serde(default = "transcript_limit")]
-    /// Bounded maximum number of returned messages.
-    limit: usize,
-}
-/// Default bounded MCP transcript page size.
-fn transcript_limit() -> usize {
-    200
+    /// Shared representation, bounds and exclusive cursor options.
+    #[serde(flatten)]
+    page: agent_run_domain::transcript::TranscriptQuery,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -172,11 +165,7 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
         }
         "transcript" => {
             let a: Transcript = args(raw)?;
-            if a.run_id.is_none() {
-                return service.transcript_public(&a.agent_id, a.cursor, a.limit);
-            }
-            let row = service.resolve_run(&a.agent_id, a.run_id.as_ref())?;
-            agent_identity::result(&row, service.transcript(&row.id, a.cursor, a.limit)?)
+            service.transcript_with_options(&a.agent_id, a.run_id.as_ref(), &a.page)
         }
         "list_agents" => service.list_public(args::<Query>(raw)?).await,
         "doc" => {

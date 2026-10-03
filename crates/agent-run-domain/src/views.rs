@@ -152,6 +152,24 @@ pub struct AgentView {
     /// row or did not report it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_cumulative: Option<UsageCumulativeView>,
+    /// Latest-execution native invocation counts; historical coverage is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_counts: Option<ToolCountsView>,
+}
+
+/// Observed native tool invocations of the latest execution only.
+/// Historical or incomplete encoder coverage leaves all counts unknown.
+/// IDs deduplicate started/completed/fragments within their native attempt.
+/// Failures remain null while any result is absent, unreported or contradictory.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolCountsView {
+    /// Unique native invocations, or null when IDs/coverage are incomplete.
+    pub calls: Option<u64>,
+    /// Explicitly failed invocations; null while any result is unknown.
+    pub failed: Option<u64>,
+    /// Invocations without a consistent explicit result, when coverage is known.
+    pub unknown_results: Option<u64>,
 }
 
 /// Latest observed native usage of one execution, straight from `run_stats`.
@@ -260,7 +278,7 @@ pub struct CommandView {
 }
 
 /// One transcript message with raw content references left opaque.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessageView {
     /// Per-agent transcript sequence cursor.
@@ -275,6 +293,33 @@ pub struct MessageView {
     pub content: String,
     /// Opaque raw-stream reference, never auto-expanded.
     pub raw_ref: Option<String>,
+    /// Native tool-result failure flag; absent/null means unreported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<bool>,
+    /// Allowlisted native field supplying error; absent for unknown evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_source: Option<String>,
+    /// First included sequence in a block; absent for raw rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_seq: Option<i64>,
+    /// Last included sequence in a block; seq is this same forward cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seq: Option<i64>,
+    /// Whether a prior fragment of this block lies outside this page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_before: Option<bool>,
+    /// Whether a later fragment of this block lies outside this page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_after: Option<bool>,
+    /// Whether original content is fully inline; historical coverage is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_complete: Option<bool>,
+    /// UTF-8 bytes explicitly omitted from an oversized legacy inline row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted_bytes: Option<usize>,
+    /// Safe boundary flag, separating executions/attempts without exposing IDs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starts_block: Option<bool>,
 }
 
 /// Cursor page of transcript messages; `complete` does not imply a terminal agent.
@@ -294,8 +339,23 @@ pub struct TranscriptPage {
     pub limit: usize,
     /// Next cursor, or `null` when this page is complete.
     pub next_cursor: Option<i64>,
-    /// Whether no further transcript rows follow this page.
+    /// No further rows in the indicated direction; never implies terminal state.
     pub complete: bool,
+    /// Blocks when grouping was requested; absent for compatible raw pages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<crate::transcript::TranscriptView>,
+    /// Forward or backward paging; absent means historical forward semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    /// Exclusive upper sequence used by a reverse block request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_cursor: Option<i64>,
+    /// Exclusive upper sequence to request older blocks; absent at the beginning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_cursor: Option<i64>,
+    /// Last included sequence for a subsequent forward read, even on a complete page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_cursor: Option<i64>,
 }
 
 /// Verified answer metadata and optional bounded inline text.

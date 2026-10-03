@@ -49,11 +49,10 @@ fn is_text_role(role: &str) -> bool {
 
 /// Groups messages into render blocks.
 ///
-/// Consecutive text messages with the same identity (role and name) join one
-/// block — streamed deltas land as separate journal rows. A `tool_call`
-/// opens a tool group and every following `tool_result` joins it, so a call
-/// and its output render as one compact block; any other role closes the
-/// group. Separators are drawn between blocks, never inside one.
+/// Only consecutive known raw refs with matching role/name/evidence join;
+/// safe server boundary flags separate executions and attempts without IDs.
+/// Unknown identities and unrelated calls/results remain separate. Rendering
+/// separators are never inserted into the retained content itself.
 pub fn blocks(buffer: &TranscriptBuffer) -> Vec<StreamBlock> {
     let mut blocks: Vec<StreamBlock> = Vec::new();
     for (index, message) in buffer.messages.iter().enumerate() {
@@ -61,7 +60,11 @@ pub fn blocks(buffer: &TranscriptBuffer) -> Vec<StreamBlock> {
             if let Some(last) = blocks.last_mut() {
                 let same_identity = last.text && {
                     let first = &buffer.messages[last.start];
-                    first.role == message.role && first.name == message.name
+                    first.role == message.role
+                        && first.name == message.name
+                        && first.raw_ref.is_some()
+                        && first.raw_ref == message.raw_ref
+                        && message.starts_block != Some(true)
                 };
                 if same_identity {
                     last.len += 1;
@@ -74,10 +77,21 @@ pub fn blocks(buffer: &TranscriptBuffer) -> Vec<StreamBlock> {
                 text: true,
             });
         } else {
-            // tool_result joins the tool group opened by the last tool_call;
-            // a tool_call (or an orphan result) always opens a fresh group.
+            // tool_result joins the tool group opened by the last tool_call
+            // when both carry the same native call id and tool name; a
+            // tool_call (or an orphan or uncorrelated result) always opens a
+            // fresh group. Roles differ by design inside one invocation.
             let joins = match blocks.last_mut() {
-                Some(last) => !last.text && message.role == "tool_result",
+                Some(last) => {
+                    let first = &buffer.messages[last.start];
+                    !last.text
+                        && first.role == "tool_call"
+                        && message.role == "tool_result"
+                        && first.name == message.name
+                        && first.raw_ref.is_some()
+                        && first.raw_ref == message.raw_ref
+                        && message.starts_block != Some(true)
+                }
                 None => false,
             };
             if joins {
@@ -320,7 +334,12 @@ fn tool_summary(message: &MessageView, is_call: bool) -> (String, String, String
     let summary = if is_call {
         call_summary(&message.content)
     } else {
-        result_summary(&message.content)
+        let evidence = match message.error {
+            Some(true) => "error",
+            Some(false) => "ok",
+            None => "unknown",
+        };
+        format!("[{evidence}] {}", result_summary(&message.content))
     };
     (marker.to_string(), name, summary)
 }

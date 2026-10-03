@@ -205,6 +205,10 @@ fn agent_fields(view: &Value) -> Value {
         "name": text("name"),
         "usage": usage_line(&view["usage"]),
         "usage_lineage": lineage_line(&view["usage_cumulative"]),
+        "tool_counts": view["tool_counts"].as_object().map(|counts| {
+            let number = |key: &str| counts.get(key).and_then(Value::as_u64).map(|n| n.to_string()).unwrap_or_else(|| "?".into());
+            format!("{} native calls, {} failed, {} unknown results (latest execution)", number("calls"), number("failed"), number("unknown_results"))
+        }),
         "mcp": view["mcp"].as_array().into_iter().flatten().take(8).map(|server| json!({
             "name": server["name"], "source": server["source"],
             "tools": server["allowed_tools"].as_array().map(|tools| tools.len().to_string()).unwrap_or_else(|| "all".into()),
@@ -312,11 +316,20 @@ fn transcript_context(value: &Value) -> Value {
     json!({
         "agent_id": value["agent_id"],
         "next_cursor": value["next_cursor"].as_i64(),
+        "previous_cursor": value["previous_cursor"].as_i64(),
+        "direction": value["direction"].as_str().unwrap_or("forward"),
+        "view": value["view"].as_str().unwrap_or("raw"),
         "complete": value["complete"].as_bool().unwrap_or(true),
         "messages": value["messages"].as_array().into_iter().flatten().map(|message| {
             json!({
                 "seq": message["seq"], "role": message["role"],
                 "name": message["name"].as_str(), "content": message["content"],
+                "first_seq": message["first_seq"], "last_seq": message["last_seq"],
+                "raw_ref":message["raw_ref"], "partial_before":message["partial_before"],
+                "partial_after":message["partial_after"], "omitted_bytes":message["omitted_bytes"],
+                "content_complete":message["content_complete"],
+                "error":message["error"].as_bool().map(|failed| if failed {"error"} else {"ok"}).unwrap_or("unknown"),
+                "error_source":message["error_source"],
             })
         }).collect::<Vec<_>>(),
         "count": value["messages"].as_array().map(Vec::len),
@@ -804,8 +817,10 @@ mod tests {
             page.contains("[2] tool_call (shell): {\"cmd\":1}"),
             "{page}"
         );
-        assert!(page.contains("continues at cursor 4"), "{page}");
-        assert!(page.contains("next_cursor: 4"), "{page}");
+        assert!(
+            page.contains("next_cursor: 4 — request the next page with this cursor"),
+            "{page}"
+        );
     }
 
     /// answer shows availability honestly and keeps retrieval facts.

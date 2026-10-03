@@ -358,9 +358,9 @@ mod tests {
         let page: TranscriptPage = serde_json::from_value(serde_json::json!({
             "agent_id": STABLE, "run_id": RUN,
             "messages": [
-                {"seq": 1, "at": 100.0, "role": "assistant", "name": null, "content": "The me", "raw_ref": null},
-                {"seq": 2, "at": 100.0, "role": "assistant", "name": null, "content": "asurem", "raw_ref": null},
-                {"seq": 3, "at": 100.0, "role": "assistant", "name": null, "content": "ent is decisive", "raw_ref": null},
+                {"seq": 1, "at": 100.0, "role": "assistant", "name": null, "content": "The me", "raw_ref": "msg_1"},
+                {"seq": 2, "at": 100.0, "role": "assistant", "name": null, "content": "asurem", "raw_ref": "msg_1"},
+                {"seq": 3, "at": 100.0, "role": "assistant", "name": null, "content": "ent is decisive", "raw_ref": "msg_1"},
             ],
             "cursor": 0, "limit": 500, "next_cursor": null, "complete": true,
         }))
@@ -417,9 +417,9 @@ mod tests {
             "agent_id": STABLE, "run_id": RUN,
             "messages": [
                 {"seq": 1, "at": 100.0, "role": "tool_call", "name": "Bash",
-                 "content": "{\"command\":\"ls\"}", "raw_ref": null},
-                {"seq": 2, "at": 101.0, "role": "tool_result", "name": null,
-                 "content": "ok", "raw_ref": null},
+                 "content": "{\"command\":\"ls\"}", "raw_ref": "toolu_1"},
+                {"seq": 2, "at": 101.0, "role": "tool_result", "name": "Bash",
+                 "content": "ok", "raw_ref": "toolu_1"},
                 message(3, "assistant", "done"),
             ],
             "cursor": 0, "limit": 500, "next_cursor": null, "complete": true,

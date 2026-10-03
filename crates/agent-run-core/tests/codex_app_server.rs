@@ -543,3 +543,93 @@ async fn codex_failure_redacts_before_truncating() {
     drop(process.input.take());
     process.reap().await;
 }
+
+/// A native tool-evidence sequence: a started+completed command with exit
+/// code evidence, a completed-only MCP call failing with a typed error, a
+/// duplicate completion of the command, and a started-only dynamic call.
+fn tool_evidence_plan() -> LaunchPlan {
+    let mut plan = fake_plan();
+    plan.args[1] = plan.args[1].replace(
+        r#"printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread","turnId":"turn","item":{"type":"commandExecution"}}}'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"completed","items":[]}}}'"#,
+        r#"printf '%s\n' '{"method":"item/started","params":{"threadId":"thread","turnId":"turn","item":{"type":"commandExecution","id":"cmd_ok"}}}'; printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread","turnId":"turn","item":{"type":"commandExecution","id":"cmd_ok","exitCode":0,"aggregatedOutput":"fine"}}}'; printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread","turnId":"turn","item":{"type":"commandExecution","id":"cmd_ok","exitCode":0,"aggregatedOutput":"fine"}}}'; printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread","turnId":"turn","item":{"type":"mcpToolCall","id":"mcp_1","server":"srv","tool":"lookup","status":"failed","error":{"message":"refused"}}}}'; printf '%s\n' '{"method":"item/started","params":{"threadId":"thread","turnId":"turn","item":{"type":"dynamicToolCall","id":"dyn_1","tool":"custom"}}}'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"completed","items":[]}}}'"#,
+    );
+    assert_ne!(plan.args[1], fake_plan().args[1]);
+    plan
+}
+
+/// Native invocations journal once per id with explicit evidence only: the
+/// duplicate completion adds nothing, exit code 0 is success, the typed MCP
+/// error is failure, and the unresulted dynamic call keeps its result
+/// unknown without invalidating the other counts.
+#[tokio::test]
+async fn codex_tool_evidence_journals_once_with_native_flags() {
+    let fixture = common::Home::new();
+    let mut request = fixture.request();
+    request.workdir = PathBuf::from(scratch());
+    request.validate().expect("fixture request");
+    let (id, _) = fixture
+        .store()
+        .admit(&request, &fixture.config, &json!({}), None)
+        .expect("admit fixture");
+    let mut store = fixture.store();
+    let record = store.get(&id).expect("admitted row");
+    let app_home = fixture.path.join("codex-home");
+    fs::private_dir(&app_home).expect("owned Codex home");
+    let mut process = Process::spawn(&tool_evidence_plan()).expect("fake app-server starts");
+
+    let result = codex::run(
+        &mut process,
+        &mut store,
+        &record,
+        &runtime(fixture.path.join("runtime")),
+        &profile(),
+        &app_home,
+    )
+    .await
+    .expect("fake turn succeeds");
+
+    assert_eq!(result.outcome.status, Status::Succeeded);
+    let page = store.transcript(&id, 0, 1000).expect("journal page");
+    let calls: Vec<&serde_json::Value> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool_call")
+        .collect();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["raw_ref"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["cmd_ok", "mcp_1", "dyn_1"],
+        "each native id journals exactly one call, duplicates add none: {calls:?}"
+    );
+    let results: Vec<&serde_json::Value> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool_result")
+        .collect();
+    assert_eq!(results.len(), 2, "{results:?}");
+    let command = results
+        .iter()
+        .find(|result| result["raw_ref"] == "cmd_ok")
+        .expect("command result");
+    assert_eq!(command["name"], "command");
+    assert_eq!(command["error"], false);
+    assert_eq!(command["error_source"], "codex.command.exitCode");
+    assert_eq!(command["content"], "fine");
+    let mcp = results
+        .iter()
+        .find(|result| result["raw_ref"] == "mcp_1")
+        .expect("MCP result");
+    assert_eq!(mcp["name"], "srv/lookup");
+    assert_eq!(mcp["error"], true);
+    assert_eq!(mcp["error_source"], "codex.mcp.error");
+    let counts = store.tool_counts(&id).expect("native counts");
+    assert_eq!(counts.calls, Some(3));
+    assert_eq!(counts.failed, None, "one unknown result keeps failed null");
+    assert_eq!(counts.unknown_results, Some(1));
+    drop(process.input.take());
+    process.reap().await;
+}

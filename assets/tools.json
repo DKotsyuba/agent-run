@@ -245,7 +245,7 @@
     "resultShape": null
   },
   {
-    "description": "Read a bounded cursor page of retained conversation history across all resumes of the stable agent_id. Continue with the same agent_id and next_cursor; raw_ref stays an opaque reference.",
+    "description": "Read a bounded cursor page of retained conversation history across all resumes of the stable agent_id. Raw rows remain the default; view=blocks groups only consecutive known native identities. tail_blocks returns the last 1..200 blocks; use previous_cursor as before_cursor for older pages, or next_cursor as cursor for forward pages. Partial blocks and omitted inline content are explicit; raw_ref stays opaque.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -258,6 +258,29 @@
         },
         "limit": {
           "type": "integer"
+        },
+        "view": {
+          "type": "string",
+          "enum": [
+            "raw",
+            "blocks"
+          ],
+          "default": "raw"
+        },
+        "tail_blocks": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 200
+        },
+        "before_cursor": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
         }
       },
       "required": [

@@ -14,7 +14,7 @@ use agent_run_adapters::{
     EngineResult, LaunchPlan,
 };
 use serde_json::{json, Value};
-use std::{path::Path, time::Duration};
+use std::{collections::BTreeMap, path::Path, time::Duration};
 
 /// Flushes the unresolved suffix of one assistant message only after applying
 /// its launch-secret policy across all streamed fragment boundaries.
@@ -265,8 +265,14 @@ pub async fn run(
     } else {
         process.input.take();
     }
+    store.event(
+        &record.id,
+        "native_tool_observer_v1",
+        &json!({"protocol":"claude","version":1}),
+    )?;
     let mut session = None;
     let mut final_result: Option<EngineResult> = None;
+    let mut tool_names: BTreeMap<String, String> = BTreeMap::new();
     // The attempt's current authoritative native state (rate-limit events
     // and assistant error controls, in protocol order).
     let mut signals = crate::adapters::native_failure::ClaudeSignals::default();
@@ -464,6 +470,26 @@ pub async fn run(
                         emitted.clear();
                         saw_delta = false;
                     }
+                    Some("content_block_start")
+                        if event.pointer("/content_block/type").and_then(Value::as_str)
+                            == Some("tool_use") =>
+                    {
+                        let block = &event["content_block"];
+                        let native_id = block["id"].as_str().filter(|id| !id.is_empty());
+                        let name = block["name"].as_str().map(|name| process.redact(name));
+                        if let (Some(id), Some(name)) = (native_id, name.as_ref()) {
+                            tool_names.insert(id.to_owned(), name.clone());
+                        }
+                        crate::journal_with_error(
+                            store,
+                            &record.id,
+                            "tool_call",
+                            "",
+                            name.as_deref(),
+                            native_id,
+                            None,
+                        )?;
+                    }
                     Some("content_block_delta")
                         if event.pointer("/delta/type").and_then(Value::as_str)
                             == Some("text_delta") =>
@@ -507,16 +533,27 @@ pub async fn run(
                                 saw_answer |= !block_text.is_empty();
                                 text.push_str(block_text);
                             }
-                            Some("tool_use") => journal(
-                                store,
-                                &record.id,
-                                "tool_call",
-                                &process.redact(&serde_json::to_string(
-                                    block.get("input").unwrap_or(&Value::Null),
-                                )?),
-                                block.get("name").and_then(Value::as_str),
-                                block.get("id").and_then(Value::as_str),
-                            )?,
+                            Some("tool_use") => {
+                                if let (Some(id), Some(name)) =
+                                    (block["id"].as_str(), block["name"].as_str())
+                                {
+                                    tool_names.insert(id.to_owned(), process.redact(name));
+                                }
+                                crate::journal_with_error(
+                                    store,
+                                    &record.id,
+                                    "tool_call",
+                                    &process.redact(&serde_json::to_string(
+                                        block.get("input").unwrap_or(&Value::Null),
+                                    )?),
+                                    block.get("name").and_then(Value::as_str),
+                                    block
+                                        .get("id")
+                                        .and_then(Value::as_str)
+                                        .filter(|id| !id.is_empty()),
+                                    None,
+                                )?;
+                            }
                             _ => {}
                         }
                     }
@@ -590,13 +627,23 @@ pub async fn run(
                                 .unwrap_or_else(|| {
                                     block.get("content").unwrap_or(&Value::Null).to_string()
                                 });
-                            journal(
+                            crate::journal_with_error(
                                 store,
                                 &record.id,
                                 "tool_result",
                                 &process.redact(&text),
-                                None,
-                                block.get("tool_use_id").and_then(Value::as_str),
+                                block["tool_use_id"]
+                                    .as_str()
+                                    .and_then(|id| tool_names.get(id))
+                                    .map(String::as_str),
+                                block
+                                    .get("tool_use_id")
+                                    .and_then(Value::as_str)
+                                    .filter(|id| !id.is_empty()),
+                                block
+                                    .get("is_error")
+                                    .and_then(Value::as_bool)
+                                    .map(|error| (error, "claude.is_error")),
                             )?;
                         }
                     }

@@ -4,6 +4,21 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- feat(transcript): add the optional `blocks` view and bounded `tail_blocks`/
+  `before_cursor` paging over the existing transcript API; raw rows, cursors and
+  ordering stay unchanged, unknown identities never merge, and omitted or
+  spooled content is reported explicitly instead of dropped
+- feat(evidence): persist native tool-result failure flags with allowlisted
+  provenance (Claude `is_error`, Codex command/MCP markers), journal Codex tool
+  calls once per native id, and expose nullable latest-execution `tool_counts`
+  with unknown kept distinct from observed success
+
+Database schema 24 adds nullable `messages.error`/`error_source`,
+`content_complete` and the lineage index on `messages.root_agent_id`; historical
+rows keep unknown evidence and no backfill invents it. Upgrade existing homes
+through the paired `agent-run config migrate` procedure before restarting the
+broker. Configuration schema remains 2.
+
 ## [0.20.0] - 2026-10-03
 
 - feat(agents): accept optional human display labels on start and resume, inherit

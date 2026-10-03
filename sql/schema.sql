@@ -102,7 +102,10 @@ CREATE TABLE messages (
   name TEXT,
   content TEXT NOT NULL,
   raw_ref TEXT
-);
+  , error INTEGER CHECK (error IN (0,1)),
+  error_source TEXT,
+  content_complete INTEGER CHECK (content_complete IN (0,1)),
+  root_agent_id TEXT NOT NULL DEFAULT '');
 
 CREATE TABLE commands (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -456,4 +459,6 @@ CREATE INDEX idx_events_attempt ON events(attempt_id) WHERE attempt_id IS NOT NU
 CREATE INDEX idx_messages_attempt ON messages(attempt_id) WHERE attempt_id IS NOT NULL;
 CREATE INDEX idx_deliveries_terminal_event ON deliveries(terminal_event_seq) WHERE terminal_event_seq IS NOT NULL;
 
-PRAGMA user_version = 23;
+CREATE INDEX idx_messages_root_seq ON messages(root_agent_id,seq);
+
+PRAGMA user_version = 24;

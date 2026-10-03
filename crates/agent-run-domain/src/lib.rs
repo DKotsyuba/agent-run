@@ -10,6 +10,8 @@ mod provider_connection;
 pub mod provider_start;
 pub mod quota_snapshot;
 pub mod tools;
+/// Shared transcript bounds and representation options.
+pub mod transcript;
 pub mod types;
 pub mod views;
 pub mod worker;

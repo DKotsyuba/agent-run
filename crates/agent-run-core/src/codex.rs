@@ -749,6 +749,13 @@ pub async fn run(
     let mut streamed: BTreeMap<String, String> = BTreeMap::new();
     let mut emitted: BTreeMap<String, String> = BTreeMap::new();
     let mut redactors: BTreeMap<String, StreamingRedactor> = BTreeMap::new();
+    store.event(
+        &record.id,
+        "native_tool_observer_v1",
+        &json!({"protocol":"codex","version":1}),
+    )?;
+    let mut tools_started = BTreeSet::new();
+    let mut tools_completed = BTreeSet::new();
     let mut completed: BTreeMap<String, String> = BTreeMap::new();
     let mut final_answer: Option<String> = None;
     let mut usage = None;
@@ -947,6 +954,28 @@ pub async fn run(
                     text.clear();
                 }
             }
+            "item/started" => {
+                let item = &p["item"];
+                if let Some(name) = tool_name(item) {
+                    let key = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty());
+                    if key.is_none_or(|key| tools_started.insert(key.to_owned())) {
+                        crate::journal_with_error(
+                            store,
+                            &record.id,
+                            "tool_call",
+                            "",
+                            Some(&process.redact(&name)),
+                            key,
+                            None,
+                        )?;
+                    }
+                } else {
+                    record_native_event(process, store, &record.id, method, p)?;
+                }
+            }
             "item/completed" => {
                 let item = &p["item"];
                 let key = item.get("id").and_then(Value::as_str).unwrap_or("");
@@ -989,17 +1018,54 @@ pub async fn run(
                     if !text.trim().is_empty() {
                         final_answer = Some(text.to_owned());
                     }
-                } else if let Some(text) = item.get("aggregatedOutput").and_then(Value::as_str) {
-                    journal(
+                } else if let Some(name) = tool_name(item) {
+                    let native_id = (!key.is_empty()).then_some(key);
+                    if native_id.is_some_and(|key| !tools_completed.insert(key.to_owned())) {
+                        continue;
+                    }
+                    let name = process.redact(&name);
+                    if native_id.is_none_or(|key| tools_started.insert(key.to_owned())) {
+                        crate::journal_with_error(
+                            store,
+                            &record.id,
+                            "tool_call",
+                            "",
+                            Some(&name),
+                            native_id,
+                            None,
+                        )?;
+                    }
+                    let text = item
+                        .get("aggregatedOutput")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .or_else(|| item.pointer("/result/content").map(Value::to_string))
+                        .or_else(|| {
+                            item.pointer("/error/message")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .unwrap_or_default();
+                    crate::journal_with_error(
                         store,
                         &record.id,
                         "tool_result",
-                        &process.redact(text),
-                        Some("command"),
-                        Some(key),
+                        &process.redact(&text),
+                        Some(&name),
+                        native_id,
+                        tool_error(item),
                     )?;
+                    if native_id.is_none() {
+                        record_native_event(process, store, &record.id, method, p)?;
+                    }
                 } else {
                     record_native_event(process, store, &record.id, method, p)?;
+                    if !matches!(
+                        item.get("type").and_then(Value::as_str),
+                        Some("reasoning" | "plan" | "userMessage" | "contextCompaction")
+                    ) {
+                        store.event(&record.id, "native_tool_coverage_gap_v1", &json!({}))?;
+                    }
                 }
             }
             "thread/tokenUsage/updated" => {
@@ -1087,6 +1153,63 @@ pub async fn run(
             }
             _ => record_native_event(process, store, &record.id, method, p)?,
         }
+    }
+}
+
+/// Returns explicit error evidence for a completed native command or MCP item.
+/// Command exitCode applies only to commandExecution; a failed command status
+/// is authoritative, while completion without an exit remains unknown. MCP
+/// completed/failed status reflects native call success; a typed MCP error is
+/// explicit failure. Unknown types/fields stay unknown; content words, task or
+/// runtime outcomes and unrelated statuses never contribute.
+fn tool_error(item: &Value) -> Option<(bool, &'static str)> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("commandExecution") => {
+            if let Some(exit) = item.get("exitCode").and_then(Value::as_i64) {
+                Some((exit != 0, "codex.command.exitCode"))
+            } else if item.get("status").and_then(Value::as_str) == Some("failed") {
+                Some((true, "codex.command.status"))
+            } else {
+                None
+            }
+        }
+        Some("mcpToolCall") => {
+            if item
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .is_some()
+            {
+                Some((true, "codex.mcp.error"))
+            } else {
+                match item.get("status").and_then(Value::as_str) {
+                    Some("completed") => Some((false, "codex.mcp.status")),
+                    Some("failed") => Some((true, "codex.mcp.status")),
+                    _ => None,
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Names known native invocation variants without retaining commands/arguments.
+/// Other known invocation kinds count calls but keep errors unknown until their
+/// protocol-specific evidence is supported; unknown item kinds are not guessed.
+fn tool_name(item: &Value) -> Option<String> {
+    match item.get("type").and_then(Value::as_str)? {
+        "commandExecution" => Some("command".into()),
+        "mcpToolCall" => Some(format!(
+            "{}/{}",
+            item["server"].as_str().unwrap_or("?"),
+            item["tool"].as_str().unwrap_or("?")
+        )),
+        "dynamicToolCall" => Some(item["tool"].as_str().unwrap_or("dynamic_tool").into()),
+        "fileChange" => Some("file_change".into()),
+        "webSearch" => Some("web_search".into()),
+        "imageView" => Some("image_view".into()),
+        "imageGeneration" => Some("image_generation".into()),
+        "collabAgentToolCall" => Some(item["tool"].as_str().unwrap_or("agent_tool").into()),
+        _ => None,
     }
 }
 

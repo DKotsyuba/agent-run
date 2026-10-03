@@ -180,6 +180,7 @@ impl Store {
             workdir: Some(record.request.workdir.display().to_string()),
             usage,
             usage_cumulative: Some(usage_cumulative),
+            tool_counts: Some(self.tool_counts(&record.id)?),
         })
     }
 
@@ -314,7 +315,7 @@ impl Store {
             return Err(invalid("invalid transcript cursor or limit"));
         }
         self.get(id)?;
-        let mut statement = self.conn.prepare("SELECT seq,at,role,name,content,raw_ref FROM messages WHERE agent_id=? AND seq>? ORDER BY seq LIMIT ?")?;
+        let mut statement = self.conn.prepare("SELECT seq,at,role,name,content,raw_ref,error,error_source,content_complete FROM messages WHERE agent_id=? AND seq>? ORDER BY seq LIMIT ?")?;
         let rows = statement
             .query_map(params![id.as_str(), cursor, limit as i64 + 1], |row| {
                 Ok(MessageView {
@@ -324,6 +325,10 @@ impl Store {
                     name: row.get(3)?,
                     content: row.get(4)?,
                     raw_ref: row.get(5)?,
+                    error: row.get(6)?,
+                    error_source: row.get(7)?,
+                    content_complete: row.get(8)?,
+                    ..MessageView::default()
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -340,6 +345,11 @@ impl Store {
             limit,
             next_cursor,
             complete,
+            view: None,
+            direction: None,
+            before_cursor: None,
+            previous_cursor: None,
+            resume_cursor: None,
         })
     }
 

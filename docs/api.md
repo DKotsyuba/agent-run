@@ -181,6 +181,37 @@ unless the native protocol reports a counter, never inferred from messages,
 turn IDs, tools or execution count. Compact MCP output uses `?` for unknown
 measurements and names incomplete lineage evidence.
 
+`transcript` accepts optional representation options while keeping raw rows
+and forward `cursor`/`limit` semantics unchanged. `view` is `raw` (default) or
+`blocks`: blocks group only consecutive journal rows that share one known
+native reference (`raw_ref`), role, name and one execution/attempt scope, so
+streamed fragments of one native message read as one entry with exact
+whitespace and content, `first_seq`/`last_seq`, and a `fragment`-safe
+`next_cursor`/`resume_cursor`. Rows without a native reference never merge,
+and equal references of different executions stay separate; a `starts_block`
+flag marks safe boundaries without exposing run or attempt IDs.
+`tail_blocks: 1..=200` returns the last blocks chronologically with an
+exclusive `previous_cursor` (pass it as `before_cursor` for older pages);
+blocks are the paging unit, so a limit bounds blocks, never fragments inside
+one. Reads are bounded index scans: no whole-journal load, and no raw history
+or spool file is modified. Oversized or spooled content is never silently
+dropped — `content_complete: false` and `omitted_bytes` say what is missing,
+and `raw_ref` stays opaque.
+
+Transcript rows and agent views also carry native tool evidence. A
+`tool_result` row may carry `error` (boolean) with `error_source` naming the
+allowlisted native field that supplied it: Claude `is_error`, Codex command
+`exitCode`/`status`, or Codex MCP `status`/`error`. Only explicit native
+markers set the flag; error-shaped words, agent exit codes and unrelated
+statuses never do, and unreported results stay `null` (unknown), distinct from
+an observed `false`. Agent views include nullable `tool_counts` for the latest
+execution — `calls` counts unique native invocation IDs (started, completed
+and fragment rows of one invocation count once), `failed` counts explicitly
+failed invocations and stays `null` while any result is unknown, and
+`unknown_results` counts results without consistent evidence. Executions
+recorded before the versioned native observers, or with observed coverage
+gaps, report all counts as `null` rather than a fake zero.
+
 Agent views returned by `list_agents` include
 `effort` — the reasoning effort requested at launch, or `null` when the
 request did not set one.
@@ -298,6 +329,6 @@ rendered as `RuntimeError`.
   an agent-run upgrade instead of caching schemas across versions.
 - Restart `api serve` after switching the verified sealed release at
   `~/.agent-run/standalone/current`.
-- The current database schema is version 23, reached through the paired
+- The current database schema is version 24, reached through the paired
   `agent-run config migrate`. Older resident processes refuse a newer database
   and must be restarted after an upgrade migrates it.

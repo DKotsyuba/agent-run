@@ -193,6 +193,7 @@ impl Store {
         if !["user", "assistant", "system", "tool_call", "tool_result"].contains(&role) {
             return Err(invalid("unknown transcript role"));
         }
+        let content_complete = content.len() <= MAX_INLINE_MESSAGE_BYTES;
         let (content, raw_ref) = message_storage(&self.home, id, content, raw_ref)?;
         let tx = self
             .conn
@@ -215,7 +216,7 @@ impl Store {
                 return Err(invalid("attempt is unknown or owned by another agent"));
             }
         }
-        tx.execute("INSERT INTO messages(agent_id,attempt_id,at,role,name,content,raw_ref) VALUES(?,?,?,?,?,?,?)", params![id.as_str(), attempt_id, now(), role, name, content, raw_ref])?;
+        tx.execute("INSERT INTO messages(agent_id,attempt_id,at,role,name,content,raw_ref,content_complete,root_agent_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,(SELECT COALESCE(NULLIF(root_agent_id,''),id) FROM agents WHERE id=?1))", params![id.as_str(), attempt_id, now(), role, name, content, raw_ref, content_complete])?;
         let seq = tx.last_insert_rowid();
         tx.commit()?;
         Ok(seq)

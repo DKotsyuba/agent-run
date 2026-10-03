@@ -571,7 +571,9 @@ fn migration_023_adds_nullable_display_names_without_rewriting_history() {
         .unwrap();
     drop(build);
     let store = Store::open(home.path()).unwrap();
-    assert_eq!(user_version(&store.conn), 23);
+    // Opening migrates through every later migration; the display-name
+    // invariants below hold unchanged at the chain's current end.
+    assert_eq!(user_version(&store.conn), VERSION);
     assert_eq!(agent_count(&store.conn), before);
     assert_eq!(
         store

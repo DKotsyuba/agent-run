@@ -154,14 +154,20 @@ fn python_cli_spec_command_surface_is_present() {
             .filter(|option| option != "--version" && option != "-V")
             .collect::<BTreeSet<_>>();
         // Deliberate schema-2 divergences from the Python capture: start names a
-        // provider instead of a runtime, catalog reads take exact filters, and
-        // stable agent operations can pin an exact historical execution.
+        // provider instead of a runtime, catalog reads take exact filters,
+        // stable agent operations can pin an exact historical execution,
+        // admissions accept an optional display label, and transcript pages
+        // offer the bounded block view.
         let (removed, added): (&[&str], &[&str]) = match path {
-            "start" => (&["--runtime"], &["--provider"]),
+            "start" => (&["--runtime"], &["--provider", "--name"]),
             "models" => (&[], &["--provider", "--profile", "--model"]),
             "capacity order" => (&[], &["--model"]),
-            "resume" | "cancel" | "steer" | "answer" | "transcript" | "bind"
-            | "delivery status" => (&[], &["--run-id"]),
+            "resume" => (&[], &["--run-id", "--name"]),
+            "transcript" => (
+                &[],
+                &["--run-id", "--view", "--tail-blocks", "--before-cursor"],
+            ),
+            "cancel" | "steer" | "answer" | "bind" | "delivery status" => (&[], &["--run-id"]),
             _ => (&[], &[]),
         };
         for option in removed {

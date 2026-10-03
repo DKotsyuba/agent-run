@@ -170,6 +170,7 @@ fn python_view_dtos_keep_field_order_and_nulls() {
         workdir: None,
         usage: None,
         usage_cumulative: None,
+        tool_counts: None,
     };
     let page = AgentPage {
         items: vec![view],

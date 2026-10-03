@@ -97,6 +97,26 @@ pub trait CliService: Send + Sync {
     fn transcript_public(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
         self.transcript(id, cursor, limit)
     }
+    /// Reads typed transcript options. Historical service seams retain raw
+    /// behavior; block readers must implement this method explicitly.
+    fn transcript_options(
+        &self,
+        id: &AgentId,
+        query: &agent_run_domain::transcript::TranscriptQuery,
+        lineage: bool,
+    ) -> Result<Value> {
+        query.validate()?;
+        if query.view != agent_run_domain::transcript::TranscriptView::Raw {
+            return Err(crate::Error::Unsupported(
+                "block transcript reader is unavailable".into(),
+            ));
+        }
+        if lineage {
+            self.transcript_public(id, query.cursor, query.limit)
+        } else {
+            self.transcript(id, query.cursor, query.limit)
+        }
+    }
     /// Return the configured model roster or schema-2 provider catalog.
     fn models<'a>(&'a self, query: agent_run_domain::ModelsQuery) -> CliFuture<'a>;
     /// Return the configured capacity limits.
@@ -146,6 +166,15 @@ impl CliService for Service {
     }
     fn transcript(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
         Service::transcript(self, id, cursor, limit)
+    }
+    /// Reads raw or bounded blocks through the same public service validator.
+    fn transcript_options(
+        &self,
+        id: &AgentId,
+        query: &agent_run_domain::transcript::TranscriptQuery,
+        lineage: bool,
+    ) -> Result<Value> {
+        Service::transcript_with_options(self, id, (!lineage).then_some(id), query)
     }
     /// Keep transcript cursors continuous across independent resume executions.
     fn transcript_public(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
@@ -269,8 +298,17 @@ pub enum Command {
         run_id: Option<AgentId>,
         #[arg(long, default_value_t = 0)]
         cursor: i64,
-        #[arg(long, default_value_t = 200)]
+        #[arg(long, default_value_t = agent_run_domain::transcript::default_limit())]
         limit: usize,
+        /// Raw rows by default, or consecutive native-identity blocks.
+        #[arg(long, default_value = "raw")]
+        view: agent_run_domain::transcript::TranscriptView,
+        /// Last 1..=200 blocks; requires --view blocks and cursor zero.
+        #[arg(long, conflicts_with_all = ["follow", "full"])]
+        tail_blocks: Option<usize>,
+        /// Exclusive upper sequence for an older block page.
+        #[arg(long, conflicts_with_all = ["follow", "full"])]
+        before_cursor: Option<i64>,
         #[arg(long)]
         follow: bool,
         #[arg(long, conflicts_with = "follow")]
@@ -1415,6 +1453,9 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             run_id,
             mut cursor,
             limit,
+            view,
+            tail_blocks,
+            before_cursor,
             follow,
             full,
             format,
@@ -1422,14 +1463,25 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             let agent_id = dependencies
                 .service
                 .resolve_run_id(&agent_id, run_id.as_ref())?;
+            let query = agent_run_domain::transcript::TranscriptQuery {
+                cursor,
+                limit,
+                view,
+                tail_blocks,
+                before_cursor,
+            };
+            query.validate()?;
+            if view == agent_run_domain::transcript::TranscriptView::Blocks && (follow || full) {
+                return Err(invalid(
+                    "blocks are bounded pages; --follow and --full require raw view",
+                ));
+            }
             let page_at = |cursor| {
-                if run_id.is_some() {
-                    dependencies.service.transcript(&agent_id, cursor, limit)
-                } else {
-                    dependencies
-                        .service
-                        .transcript_public(&agent_id, cursor, limit)
-                }
+                let mut page = query.clone();
+                page.cursor = cursor;
+                dependencies
+                    .service
+                    .transcript_options(&agent_id, &page, run_id.is_none())
             };
             // An explicit --format always wins; otherwise text is interactive
             // and JSON keeps piped consumers on the historical machine shape.

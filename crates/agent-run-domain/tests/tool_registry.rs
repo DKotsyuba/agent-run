@@ -73,6 +73,19 @@ fn registry_matches_python_golden_field_by_field() {
             expected["inputSchema"]["properties"]["display_name"] =
                 serde_json::json!({"description":description,"type":["string","null"]});
         }
+        if definition.name == "transcript" {
+            // The block-view options are the exact additive delta over the
+            // frozen baseline: two bounded reverse selectors and one enum.
+            expected["inputSchema"]["properties"]["view"] = serde_json::json!({
+                "type":"string","enum":["raw","blocks"],"default":"raw"
+            });
+            expected["inputSchema"]["properties"]["tail_blocks"] = serde_json::json!({
+                "type":["integer","null"],"minimum":1,"maximum":200
+            });
+            expected["inputSchema"]["properties"]["before_cursor"] = serde_json::json!({
+                "type":["integer","null"],"minimum":1
+            });
+        }
         if definition.name != "start" {
             assert_eq!(actual["description"], expected["description"]);
         }
@@ -118,7 +131,7 @@ fn extend_stable_identity(value: &mut Value) {
         "resume" => value["description"] = "Continue the latest terminal execution of a stable agent in the same native context. agent_id stays constant. Concurrent continuations cannot create parallel active runs. Reuse request_id for an identical retry, including after later resumes. Identity, permissions, native-history and cleanup checks remain mandatory.".into(),
         "list_agents" => value["description"] = "List a bounded page of logical agents with an exact total. Each agent appears once with its stable agent_id and latest execution state; filters and pagination apply to these latest views.".into(),
         "answer" => value["description"] = "Read the latest execution’s verified bounded answer using the stable agent_id. Use transcript for retained earlier conversation history.".into(),
-        "transcript" => value["description"] = "Read a bounded cursor page of retained conversation history across all resumes of the stable agent_id. Continue with the same agent_id and next_cursor; raw_ref stays an opaque reference.".into(),
+        "transcript" => value["description"] = "Read a bounded cursor page of retained conversation history across all resumes of the stable agent_id. Raw rows remain the default; view=blocks groups only consecutive known native identities. tail_blocks returns the last 1..200 blocks; use previous_cursor as before_cursor for older pages, or next_cursor as cursor for forward pages. Partial blocks and omitted inline content are explicit; raw_ref stays opaque.".into(),
         _ => {}
     }
 }

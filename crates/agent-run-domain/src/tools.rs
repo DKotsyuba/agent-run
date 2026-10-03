@@ -213,9 +213,13 @@ fn argument_default(tool: &str, argument: &str) -> Option<ArgumentDefault> {
             Some(ArgumentDefault::Null)
         }
         ("list_agents", "offset") | ("transcript", "cursor") => Some(ArgumentDefault::Integer(0)),
+        ("transcript", "view") => Some(ArgumentDefault::Null),
         ("list_agents", "limit") => Some(ArgumentDefault::Integer(100)),
         ("transcript", "limit") => Some(ArgumentDefault::Integer(200)),
         ("list_agents", "wait_seconds") => Some(ArgumentDefault::Number(0)),
+        ("transcript", "tail_blocks") | ("transcript", "before_cursor") => {
+            Some(ArgumentDefault::Null)
+        }
         _ => None,
     }
 }
