@@ -180,6 +180,7 @@ fn python_view_dtos_keep_field_order_and_nulls() {
         next_offset: None,
         complete: true,
         revision: 0,
+        message_revision: 0,
         observed_at: 1.0,
     };
     let value = serde_json::to_value(page).unwrap();

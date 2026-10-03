@@ -161,12 +161,17 @@ async fn framing_does_not_consume_the_next_message() {
 #[test]
 fn list_query_bounds_reject_nonfinite_or_negative_waits() {
     let decoded: Query = serde_json::from_value(json!({
-        "after_revision": 12, "wait_seconds": 1.5, "limit": 7
+        "after_revision": 12, "after_message_revision": 34, "wait_seconds": 1.5, "limit": 7
     }))
     .expect("dispatch list query decodes Python long-poll fields");
     assert_eq!(
-        (decoded.after_revision, decoded.wait_seconds, decoded.limit),
-        (Some(12), 1.5, 7)
+        (
+            decoded.after_revision,
+            decoded.after_message_revision,
+            decoded.wait_seconds,
+            decoded.limit
+        ),
+        (Some(12), Some(34), 1.5, 7)
     );
     assert!(Query {
         wait_seconds: f64::NAN,

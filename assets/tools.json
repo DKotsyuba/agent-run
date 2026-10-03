@@ -199,6 +199,13 @@
             "null"
           ]
         },
+        "after_message_revision": {
+          "description": "Optional transcript watermark from a prior page's message_revision; journal-only progress (transcript rows, native tool counts) wakes the wait without advancing the event revision. Omission keeps the historical event-only wake.",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "limit": {
           "type": "integer"
         },

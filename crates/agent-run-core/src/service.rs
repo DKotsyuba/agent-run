@@ -189,6 +189,12 @@ pub struct Query {
     #[serde(default = "default_limit")]
     pub limit: usize,
     pub after_revision: Option<i64>,
+    /// Committed transcript watermark to wake on journal-only progress.
+    /// Journal rows never advance `after_revision`'s event revision, so an
+    /// observer that must also see transcript and tool-count changes passes
+    /// the page's `message_revision` here. Omission keeps the historical
+    /// event-only wake behavior.
+    pub after_message_revision: Option<i64>,
     pub wait_seconds: f64,
 }
 fn default_limit() -> usize {
@@ -202,6 +208,7 @@ impl Default for Query {
             offset: 0,
             limit: 100,
             after_revision: None,
+            after_message_revision: None,
             wait_seconds: 0.0,
         }
     }
@@ -214,6 +221,7 @@ impl Query {
             || !self.wait_seconds.is_finite()
             || !(0.0..=60.0).contains(&self.wait_seconds)
             || self.after_revision.is_some_and(|n| n < 0)
+            || self.after_message_revision.is_some_and(|n| n < 0)
         {
             return Err(invalid("invalid agent page or wait arguments"));
         }
@@ -1217,14 +1225,26 @@ impl Service {
     /// Share revision waiting and pagination with the stable public agent list.
     pub(crate) async fn list_selected(&self, query: Query, latest: bool) -> Result<Value> {
         query.validate()?;
-        let until = tokio::time::Instant::now() + Duration::from_secs_f64(query.wait_seconds);
+        let started = tokio::time::Instant::now();
+        let until = started + Duration::from_secs_f64(query.wait_seconds);
         loop {
             let value = {
                 let store = Store::open(&self.home)?;
                 let revision = store.revision()?;
-                if query.after_revision.is_some_and(|r| revision <= r)
-                    && tokio::time::Instant::now() < until
-                {
+                let message_revision = store.message_revision()?;
+                // Journal rows never advance the event revision, so a
+                // transcript watermark explicitly opts into waking on
+                // transcript and tool-count progress. Pure journal wakes are
+                // paced: they take effect at most one second after the wait
+                // began, which bounds snapshot rebuilds to once per second
+                // per follower during heavy streaming, while event wakes keep
+                // their immediate historical behavior.
+                let events_advanced = query.after_revision.is_none_or(|r| revision > r);
+                let journal_advanced = query
+                    .after_message_revision
+                    .is_some_and(|m| message_revision > m)
+                    && started.elapsed() >= Duration::from_secs(1);
+                if tokio::time::Instant::now() < until && !events_advanced && !journal_advanced {
                     None
                 } else {
                     let list = if latest {
@@ -1245,7 +1265,7 @@ impl Service {
                         .collect::<Result<Vec<_>>>()?;
                     let next = query.offset.saturating_add(items.len());
                     Some(
-                        json!({"items":items,"total":total,"offset":query.offset,"limit":query.limit,"next_offset":if next<total as usize{Some(next)}else{None},"complete":next>=total as usize,"revision":revision,"observed_at":now()}),
+                        json!({"items":items,"total":total,"offset":query.offset,"limit":query.limit,"next_offset":if next<total as usize{Some(next)}else{None},"complete":next>=total as usize,"revision":revision,"message_revision":message_revision,"observed_at":now()}),
                     )
                 }
             };

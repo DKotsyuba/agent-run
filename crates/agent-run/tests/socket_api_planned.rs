@@ -542,3 +542,54 @@ async fn python_wait_timeout_is_a_normal_result() {
     assert_eq!(response["result"]["timed_out"], true);
     assert_eq!(response["result"]["terminal"], false);
 }
+
+/// A journal-only change (a transcript row, no event) wakes a waiting
+/// `list_agents` round through `after_message_revision`, inside the paced
+/// floor and before the wait deadline, without advancing the event revision.
+#[tokio::test]
+async fn list_long_poll_wakes_on_journal_progress() {
+    let (home, path, task) = broker().await;
+    let id = admitted(&home);
+    let (revision, message_revision) = {
+        let store = agent_run::state::Store::open(home.path()).unwrap();
+        (store.revision().unwrap(), store.message_revision().unwrap())
+    };
+    assert_eq!(message_revision, 0, "a fresh fixture has no journal rows");
+    tokio::spawn({
+        let home = home.path().to_owned();
+        async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            agent_run::state::Store::open(&home)
+                .unwrap()
+                .message(&id, "assistant", "progress", None, None)
+                .unwrap();
+        }
+    });
+    let started = std::time::Instant::now();
+    let response = request(
+        &path,
+        json!({"jsonrpc":"2.0","id":1,"method":"list_agents","params":{
+            "after_revision":revision,"after_message_revision":message_revision,"wait_seconds":3.0
+        }}),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert_eq!(
+        response["result"]["revision"], revision,
+        "no event advanced: {response}"
+    );
+    assert!(
+        response["result"]["message_revision"].as_i64().unwrap() > message_revision,
+        "the transcript watermark advanced: {response}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(1000),
+        "journal wakes respect the one-second floor: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "the wake precedes the wait deadline: {elapsed:?}"
+    );
+    stop(task).await;
+    drop(home);
+}

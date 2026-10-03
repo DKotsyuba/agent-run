@@ -1094,6 +1094,19 @@ impl Store {
             .conn
             .query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |r| r.get(0))?)
     }
+    /// Committed transcript watermark: the highest journal sequence, or zero.
+    ///
+    /// Like [`Self::revision`] this is one indexed aggregate over the
+    /// autoincremented primary key, so a follower's poll costs one bounded
+    /// lookup. Journal rows never advance the event revision, so observers
+    /// that must wake on transcript progress watch this watermark separately.
+    pub fn message_revision(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(seq),0) FROM messages", [], |r| {
+                r.get(0)
+            })?)
+    }
     /// Page executions with optional active/session filters and an exact total.
     pub fn list(
         &self,

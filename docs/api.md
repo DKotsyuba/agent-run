@@ -158,7 +158,20 @@ that omit `orchestrator` share the unbound namespace across fresh connections.
 current event revision is not newer, the call waits up to 60 seconds and wakes
 as soon as a committed event advances it. The returned `revision` becomes the
 next cursor, so terminal completion is observable without a notification
-worker or polling at a fixed interval.
+worker or polling at a fixed interval. Pages also return a
+`message_revision` transcript watermark: journal rows (transcript text and
+native tool counts) never advance the event revision, so an observer that
+needs to wake on progress passes it back as optional `after_message_revision`
+together with `after_revision`. Journal-only wakes are paced to at most one
+per second per waiting follower; event wakes stay immediate.
+
+The CLI equivalent is `agent-run agents [--active] [--offset N] [--limit N]`,
+and `agent-run agents --follow` runs one persistent process instead of
+respawning polls: it prints the first page immediately and then one NDJSON
+snapshot per meaningful change (status, phase, name, usage, tool counts,
+failure, delivery and answer facts), never reprinting a page whose only
+movement is observation time. Ctrl-C ends the viewer only; supervised agents
+keep running, and a closed output pipe terminates the process.
 
 `start` and `resume` accept optional `display_name` (CLI `--name`, alias
 `--display-name`): a trimmed, nonblank UTF-8 human label of 1–64 Unicode

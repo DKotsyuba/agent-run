@@ -168,6 +168,7 @@ fn python_cli_spec_command_surface_is_present() {
                 &["--run-id", "--view", "--tail-blocks", "--before-cursor"],
             ),
             "cancel" | "steer" | "answer" | "bind" | "delivery status" => (&[], &["--run-id"]),
+            "agents" => (&[], &["--follow"]),
             _ => (&[], &[]),
         };
         for option in removed {

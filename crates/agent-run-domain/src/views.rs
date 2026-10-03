@@ -409,6 +409,12 @@ pub struct AgentPage {
     pub complete: bool,
     /// Committed store revision observed for the page.
     pub revision: i64,
+    /// Committed transcript watermark observed for the page; zero for
+    /// historical pages that predate the field. Journal progress does not
+    /// advance `revision`, so followers pass it back as
+    /// `after_message_revision` to also wake on transcript changes.
+    #[serde(default)]
+    pub message_revision: i64,
     /// UTC epoch seconds when the page was built.
     pub observed_at: f64,
 }

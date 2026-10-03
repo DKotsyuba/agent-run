@@ -297,6 +297,7 @@ impl Store {
                 next_offset: (!complete).then_some(offset + records.len()),
                 complete,
                 revision,
+                message_revision: self.message_revision()?,
                 observed_at,
             })
         })();

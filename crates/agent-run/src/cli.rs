@@ -603,9 +603,128 @@ pub struct Agents {
     pub offset: usize,
     #[arg(long, default_value_t = 100)]
     pub limit: usize,
+    /// Keep one process watching and print one NDJSON snapshot per meaningful
+    /// change; observation-time-only movement never reprints a page.
+    #[arg(long)]
+    pub follow: bool,
     #[command(flatten)]
     pub session: SessionArgs,
 }
+/// Long-poll window, in seconds, of one follow watch round.
+const FOLLOW_WAIT_SECONDS: f64 = 25.0;
+
+/// Reduces one agent view to the stable facts a follow snapshot reports.
+///
+/// Only fields whose change is meaningful re-emit a page: observation-time
+/// drift (`observed_at`, `elapsed_seconds`, `silence_seconds`) moves every
+/// rebuild and must never redraw unchanged data. Unlisted fields are absent
+/// rather than defaulted so a view gaining evidence still changes the digest.
+fn follow_signature(agent: &Value) -> Option<String> {
+    let object = agent.as_object()?;
+    let mut stable = serde_json::Map::new();
+    for key in [
+        "agent_id",
+        "name",
+        "runtime",
+        "model",
+        "profile",
+        "task_summary",
+        "status",
+        "phase",
+        "failure_kind",
+        "failure_text",
+        "answer_available",
+        "answer_bytes",
+        "answer_sha256",
+        "effort",
+        "last_progress_at",
+        "warned",
+        "usage",
+        "usage_cumulative",
+        "tool_counts",
+        "mcp",
+    ] {
+        if let Some(value) = object.get(key) {
+            stable.insert(key.into(), value.clone());
+        }
+    }
+    if let Some(delivery) = object.get("delivery").filter(|d| d.is_object()) {
+        let mut filtered = serde_json::Map::new();
+        for key in [
+            "state",
+            "notification_id",
+            "attempts",
+            "ambiguous",
+            "last_error",
+        ] {
+            if let Some(value) = delivery.get(key) {
+                filtered.insert(key.into(), value.clone());
+            }
+        }
+        stable.insert("delivery".into(), Value::Object(filtered));
+    }
+    serde_json::to_string(&Value::Object(stable)).ok()
+}
+
+/// Runs the persistent `agents --follow` watcher for one command invocation.
+///
+/// One process emits the first bounded page immediately and then one NDJSON
+/// snapshot per meaningful change: each round long-polls the broker with the
+/// last event revision and transcript watermark, so status, usage, tool-count,
+/// name, failure, delivery and answer changes all wake it, while pages whose
+/// only movement is observation time are counted and dropped. The waiter is
+/// abortable at every await: Ctrl-C ends the viewer (never the supervised
+/// agents) and a closed output pipe terminates the process through the
+/// writer's own error.
+async fn follow_agents(dependencies: CliDependencies, a: &Agents) -> Result<()> {
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut after_revision: Option<i64> = None;
+    let mut after_message_revision: Option<i64> = None;
+    let mut signatures: std::collections::BTreeMap<String, String> = Default::default();
+    let mut total: Option<i64> = None;
+    loop {
+        let request = Query {
+            active: a.active,
+            offset: a.offset,
+            limit: a.limit,
+            after_revision,
+            after_message_revision,
+            wait_seconds: if after_revision.is_none() {
+                0.0
+            } else {
+                FOLLOW_WAIT_SECONDS
+            },
+            orchestrator: a.session.resolve()?,
+        };
+        // A pending wait owns no SQLite transaction and no engine handle, so
+        // dropping it at the interrupt boundary leaves nothing behind.
+        let page = tokio::select! {
+            biased;
+            _ = interrupt.recv() => return Ok(()),
+            page = dependencies.service.list(request) => page?,
+        };
+        after_revision = Some(page["revision"].as_i64().unwrap_or_default());
+        after_message_revision = Some(page["message_revision"].as_i64().unwrap_or_default());
+        // Rebuild the page digest from stable per-agent facts; identical
+        // digests mean nothing meaningful moved since the last snapshot.
+        let mut next = std::collections::BTreeMap::new();
+        for agent in page["items"].as_array().into_iter().flatten() {
+            if let (Some(id), Some(signature)) =
+                (agent["agent_id"].as_str(), follow_signature(agent))
+            {
+                next.insert(id.to_owned(), signature);
+            }
+        }
+        let page_total = page["total"].as_i64();
+        let unchanged = next == signatures && total == page_total;
+        (signatures, total) = (next, page_total);
+        if unchanged {
+            continue;
+        }
+        (dependencies.output)(&page)?;
+    }
+}
+
 /// API daemon commands retained from the Python operator surface.
 #[derive(Subcommand, Debug)]
 pub enum Api {
@@ -1428,19 +1547,26 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 }
             }
         }
-        Command::Agents(a) => (dependencies.output)(
-            &dependencies
-                .service
-                .list(Query {
-                    active: a.active,
-                    offset: a.offset,
-                    limit: a.limit,
-                    after_revision: None,
-                    wait_seconds: 0.0,
-                    orchestrator: a.session.resolve()?,
-                })
-                .await?,
-        )?,
+        Command::Agents(a) => {
+            if !a.follow {
+                (dependencies.output)(
+                    &dependencies
+                        .service
+                        .list(Query {
+                            active: a.active,
+                            offset: a.offset,
+                            limit: a.limit,
+                            after_revision: None,
+                            after_message_revision: None,
+                            wait_seconds: 0.0,
+                            orchestrator: a.session.resolve()?,
+                        })
+                        .await?,
+                )?;
+            } else {
+                follow_agents(dependencies, &a).await?;
+            }
+        }
         Command::Answer { agent_id, run_id } => {
             let id = dependencies
                 .service

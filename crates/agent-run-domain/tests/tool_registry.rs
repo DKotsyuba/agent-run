@@ -73,6 +73,14 @@ fn registry_matches_python_golden_field_by_field() {
             expected["inputSchema"]["properties"]["display_name"] =
                 serde_json::json!({"description":description,"type":["string","null"]});
         }
+        if definition.name == "list_agents" {
+            // The follow watermark is the exact additive delta over the frozen
+            // baseline: one optional transcript-revision cursor.
+            expected["inputSchema"]["properties"]["after_message_revision"] = serde_json::json!({
+                "description": "Optional transcript watermark from a prior page's message_revision; journal-only progress (transcript rows, native tool counts) wakes the wait without advancing the event revision. Omission keeps the historical event-only wake.",
+                "type": ["integer", "null"]
+            });
+        }
         if definition.name == "transcript" {
             // The block-view options are the exact additive delta over the
             // frozen baseline: two bounded reverse selectors and one enum.
