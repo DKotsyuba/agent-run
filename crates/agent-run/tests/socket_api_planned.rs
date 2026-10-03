@@ -488,7 +488,8 @@ async fn python_successful_tool_round_trip() {
 }
 
 /// Mirrors `tests/test_api_socket.py::ApiSocketTests::test_surface_is_dispatch_tools_plus_control_methods`.
-/// The current shared surface additionally exposes the compact delegation guide.
+/// The current shared surface additionally exposes the compact delegation guide
+/// and the four cooperative-pool operator tools.
 #[test]
 fn python_socket_surface_is_shared_tools_plus_controls() {
     let names = agent_run::dispatch::tools()
@@ -497,7 +498,15 @@ fn python_socket_surface_is_shared_tools_plus_controls() {
         .collect::<std::collections::BTreeSet<_>>();
     assert!(names.contains("start") && names.contains("list_agents"));
     assert!(names.contains("delegation_guide"));
-    assert_eq!(names.len(), 12);
+    for pool in ["start_pool", "pool_post", "pool_replace", "pool"] {
+        assert!(names.contains(pool), "{pool}");
+    }
+    let registry: std::collections::BTreeSet<_> = agent_run_domain::registry()
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect();
+    assert_eq!(names, registry, "the socket surface is the shared table");
+    assert_eq!(names.len(), 16);
 }
 
 /// Mirrors `tests/test_api_socket.py::ApiSocketTests::test_wait_timeout_validation`.
