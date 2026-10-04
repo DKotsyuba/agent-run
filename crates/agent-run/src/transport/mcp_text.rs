@@ -1192,7 +1192,9 @@ mod tests {
         let page = |after: u64, entries: Vec<Value>| {
             json!({
             "pool_id":"p","entries":entries,"after_seq":after,"before_seq":null,"limit":50,
-            "next_cursor":null,"last_seq":null,"complete":true,"status":status.clone()})
+            "next_cursor":null,"last_seq":null,"complete":true,"status":status.clone(),
+            "delivery":{"state":"not_created","bound":false,"attempts":0,
+                        "ambiguous":false,"last_classification":null,"evidence":null}})
         };
         let (full, _) = public_text("pool", &page(0, vec![entry.clone()]));
         assert!(

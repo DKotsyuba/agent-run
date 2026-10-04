@@ -5201,7 +5201,8 @@ fn replace_request(
     .unwrap()
 }
 
-/// The service-level operator post and status share one stamped projection.
+/// Operator post and status share one public projection: delivery counters are
+/// visible while private execution and attempt identity fields remain absent.
 #[tokio::test]
 async fn pool_operator_post_and_status_through_the_service() {
     let (_temp, home) = home();
@@ -5230,7 +5231,19 @@ async fn pool_operator_post_and_status_through_the_service() {
         .contains("failing test"));
     assert_eq!(status["entries"][0]["author_kind"], "operator");
     let text = status.to_string();
-    assert!(!text.contains("attempt") && !text.contains("sender_run"));
+    assert_eq!(status["delivery"]["attempts"], 0);
+    for private_key in [
+        "attempt",
+        "attempt_id",
+        "sender_run",
+        "execution_id",
+        "run_id",
+    ] {
+        assert!(
+            !text.contains(&format!("\"{private_key}\":")),
+            "{private_key}"
+        );
+    }
 }
 
 /// A replacement needs a terminal, fully cleaned member; then it atomically

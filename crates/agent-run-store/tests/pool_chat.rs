@@ -2,6 +2,13 @@
 
 mod common;
 
+/// Snapshot of agent rows, the pool roster revision and current member rows.
+type ReplacementState = (
+    Vec<(String, String, Option<f64>)>,
+    u32,
+    Vec<(String, String, Option<String>)>,
+);
+
 use agent_run_domain::pool::{
     CheckStatus, CriterionCheck, PoolDenial, PoolMessage, PoolPropose, PoolVote, VoteDecision,
 };
@@ -164,14 +171,7 @@ fn replacement_with_name(
 }
 
 /// Captures agent state, roster revision, and member rows to prove a rejected attempt is atomic.
-fn replacement_state(
-    store: &Store,
-    pool_id: &str,
-) -> (
-    Vec<(String, String, Option<f64>)>,
-    u32,
-    Vec<(String, String, Option<String>)>,
-) {
+fn replacement_state(store: &Store, pool_id: &str) -> ReplacementState {
     let mut agents = store
         .conn
         .prepare("SELECT id,status,finished_at FROM agents ORDER BY id")
