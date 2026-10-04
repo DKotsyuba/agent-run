@@ -4,6 +4,24 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.20.3] - 2026-10-04
+
+- fix(delivery): preserve acknowledgements across configuration edits and normalize
+  orchestrator transport aliases without rewriting historical bindings
+- fix(resume): replay historical schema-1 continuations and keep immutable request
+  hash checks strict across transport aliases
+- fix(capacity): expose safe collector exit diagnostics and normalize exhausted GLM
+  counters, including decimal budget boundaries, in the external collector
+- fix(supervisor): enforce legacy execution deadlines and separate reconciliation
+  from resident delivery; report unresolved terminal process ownership in Doctor
+- fix(pools): bound encoded vote checks, correct reverse pagination and Unicode
+  replacement-name checks, and expose live common-notice delivery status
+- feat(pools): expose reversible activity for cancelled and inactive pools without
+  changing stored state, frozen results or resume/replacement permissions
+- fix(retention): retain relay sockets when a refused connection cannot prove
+  the listener is dead; synchronize finite descendant-cleanup fixtures
+
+
 ## [0.20.2] - 2026-10-04
 
 - fix(pools): emit only the common completion notice for successful current pool
