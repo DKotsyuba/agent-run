@@ -109,6 +109,10 @@ repository keeps them under scripts/collectors/:
   configured Codex executable. The temporary home is MCP-free and links only the
   selected native login. No model turn is started.
 
+GLM usage counters at or above a positive budget normalize to 100% used even
+when the provider's reported percentage differs within the existing one-point
+rounding tolerance. Contradictory percentages outside that tolerance still fail.
+
 Each script uses its neighboring .jq files to normalize provider formats. The
 HTTP scripts accept an optional quota URL as their first argument. Copy the whole
 collectors directory when customizing it; Rust neither embeds nor chooses these

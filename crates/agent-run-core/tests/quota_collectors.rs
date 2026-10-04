@@ -384,6 +384,26 @@ fn supplied_parsers_reject_unknown_and_contradictory_windows() {
             "glm",
             r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":99,"number":5,"percentage":25}]}}"#,
         ),
+        (
+            "glm",
+            r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":100,"currentValue":101,"percentage":0}]}}"#,
+        ),
+        (
+            "glm",
+            r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":0,"currentValue":0,"percentage":0}]}}"#,
+        ),
+        (
+            "glm",
+            r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":100,"currentValue":-1,"percentage":0}]}}"#,
+        ),
+        (
+            "glm",
+            r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":"100","currentValue":1,"percentage":1}]}}"#,
+        ),
+        (
+            "glm",
+            r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"currentValue":1,"percentage":1}]}}"#,
+        ),
         ("claude", r#"{"limits":[{"kind":"session","percent":101}]}"#),
         (
             "claude",
@@ -420,6 +440,55 @@ fn supplied_parsers_reject_unknown_and_contradictory_windows() {
             !child.wait().unwrap().success(),
             "{script_name}: invalid payload was accepted"
         );
+    }
+}
+
+/// GLM counters above budget normalize to exhaustion while unrelated windows remain usable.
+#[test]
+fn glm_over_budget_counters_remain_exhausted() {
+    use std::io::Write;
+    for (body, expected) in [
+        (
+            r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":100,"currentValue":101,"percentage":100},{"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":100,"currentValue":40,"percentage":40}]}}"#,
+            vec![0.0, 60.0],
+        ),
+        (
+            r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":100,"currentValue":100,"percentage":99.5}]}}"#,
+            vec![0.0],
+        ),
+    ] {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/collectors");
+        let mut child = std::process::Command::new("jq")
+            .args(["-e", "-L"])
+            .arg(&directory)
+            .args([
+                "--argjson",
+                "ctx",
+                r#"{"models":{"sonnet":{}},"now":1000}"#,
+                "-f",
+            ])
+            .arg(directory.join("glm.jq"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(body.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let remaining: Vec<f64> = parsed["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|window| window["remaining_percent"].as_f64().unwrap())
+            .collect();
+        assert_eq!(remaining, expected);
     }
 }
 

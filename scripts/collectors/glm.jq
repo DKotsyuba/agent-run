@@ -13,12 +13,13 @@ include "common";
       | (if .percentage == null then null else (.percentage | percent) end) as $reported
       | (if .usage != null or .currentValue != null then
            if (.usage | type) != "number" or (.currentValue | type) != "number"
-              or .usage <= 0 or .currentValue < 0 or .currentValue > .usage
-           then error("invalid usage counts") else (.currentValue * 100 / .usage) end
+              or .usage <= 0 or .currentValue < 0
+           then error("invalid usage counts")
+           else ([.currentValue, .usage] | min) * 100 / .usage end
          else null end) as $counted
       | if $reported != null and $counted != null and (($reported - $counted) | fabs) > 1
         then error("usage counts disagree") else . end
-      | ($reported // $counted // error("missing usage")) as $used
+      | (if $counted == 100 then 100 else ($reported // $counted // error("missing usage")) end) as $used
       | (if .nextResetTime == null then null
          elif (.nextResetTime | type) == "number" and .nextResetTime > 0 and .nextResetTime <= 253402300799000
          then .nextResetTime / 1000 else error("invalid reset") end) as $reset
