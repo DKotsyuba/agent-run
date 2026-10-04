@@ -58,3 +58,10 @@ post-tool hook on a direct `start_pool` call (or `orchestrator`, or `agent-run
 bind --pool <id>`); until bound it waits. A completed pool's record stays frozen
 even if a member is resumed later. Pool history is kept until every member has
 expired.
+
+Pool reads include a live common-notice delivery projection: bound state,
+outbox state, attempts, ambiguity, and the last safe classifier/evidence when
+available. Before a notice is created its state is `not_created`; an unbound
+completed pool remains `waiting_binding`. This delivery field may advance while
+the completed status proof remains frozen, and exposes no notification or
+orchestrator-session ids.

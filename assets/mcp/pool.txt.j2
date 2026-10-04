@@ -22,6 +22,7 @@ Members:
 - replaced: {{ retired.name }} ({{ retired.role }}, {{ retired.agent_id }}) by {{ retired.replaced_by }}
 {% endfor %}
 {{ status.note }}
+Common notice delivery: {{ delivery.state }}{% if delivery.state == "not_created" %} (not created yet){% elif delivery.state == "waiting_binding" %} (waiting for pool binding){% elif delivery.bound %} (bound){% else %} (unbound){% endif %}{% if delivery.attempts > 0 %}, attempts {{ delivery.attempts }}{% endif %}{% if delivery.ambiguous %}, ambiguous{% endif %}{% if delivery.last_classification %}, last {{ delivery.last_classification }}{% endif %}
 Entries (after #{{ after_seq }}{% if before_seq %}, before #{{ before_seq }}{% endif %}, {{ entry_count }} shown):
 {% for entry in entries %}
 {{ entry }}

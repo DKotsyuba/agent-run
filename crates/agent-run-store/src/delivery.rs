@@ -9,7 +9,7 @@ use agent_run_domain::{
     error::invalid,
     Result,
 };
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{json, Map, Value};
 
 /// Maximum age of an unbound completion notice before it is permanently expired.
@@ -434,9 +434,13 @@ pub(crate) fn retry(
 
 /// Returns the latest validated evidence document for one delivery.
 pub(crate) fn latest(store: &Store, delivery_id: &str) -> Result<Option<Value>> {
+    latest_on(&store.conn, delivery_id)
+}
+
+/// Reads and sanitizes the latest delivery evidence through an existing database snapshot.
+pub(crate) fn latest_on(conn: &Connection, delivery_id: &str) -> Result<Option<Value>> {
     required_text("delivery_id", delivery_id)?;
-    let raw: Option<String> = store
-        .conn
+    let raw: Option<String> = conn
         .query_row(
             "SELECT evidence_json FROM delivery_attempt_evidence WHERE delivery_id=? ORDER BY attempt DESC LIMIT 1",
             [delivery_id],

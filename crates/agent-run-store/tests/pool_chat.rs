@@ -2063,3 +2063,170 @@ fn closed_pool_replays_identical_retries_and_refuses_new_keys() {
     );
     assert_eq!(rows_of(&store, "pool_entries"), 3, "no row was added");
 }
+
+/// The live common-notice projection shares one frozen status across worker and operator reads.
+#[test]
+fn common_notice_projection_tracks_live_delivery_without_changing_frozen_status() {
+    let home = common::Home::new();
+    let (pool_id, members) = pool(&home, &[("done", "it ships")]);
+    let pool_id: agent_run_domain::pool::PoolId = pool_id.parse().unwrap();
+    let (run, attempt, token) = &members[0];
+    let mut store = home.store();
+
+    let not_created = store
+        .pool_operator_read(&pool_id, 0, None, 50)
+        .unwrap()
+        .unwrap();
+    assert_eq!(not_created["delivery"]["state"], "not_created");
+    assert_eq!(not_created["delivery"]["bound"], false);
+
+    let frozen = json!({
+        "goal":"ship it",
+        "acceptance":[{"id":"done","text":"it ships"}],
+        "roster_revision":1,
+        "proposal":{"seq":1,"snapshot":"verified result"},
+        "members":[
+            {"name":"member-1","role":"doer","agent_id":members[0].0,"slot":1},
+            {"name":"member-2","role":"doer","agent_id":members[1].0,"slot":2}
+        ]
+    });
+    let tx = store.conn.transaction().unwrap();
+    tx.execute(
+        "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) \
+         VALUES('pool-session-private','codex_queue','client-session-private',1,1)",
+        [],
+    ).unwrap();
+    tx.execute(
+        "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?,2,'pool_completed',?)",
+        rusqlite::params![run.as_str(), frozen.to_string()],
+    )
+    .unwrap();
+    let terminal_event: i64 = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO deliveries(id,agent_id,terminal_event_seq,state) VALUES('ntf_pool_private',?,?,'waiting_binding')",
+        rusqlite::params![run.as_str(), terminal_event],
+    ).unwrap();
+    tx.execute(
+        "UPDATE pools SET state='completed',completed_at=2,completion_delivery_id='ntf_pool_private' WHERE id=?",
+        [pool_id.as_str()],
+    ).unwrap();
+    tx.commit().unwrap();
+    let proof_before: String = store
+        .conn
+        .query_row(
+            "SELECT data_json FROM events WHERE seq=?",
+            [terminal_event],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    let cases = [
+        ("waiting_binding", None, 0, false, None, None),
+        (
+            "delivered",
+            Some("pool-session-private"),
+            1,
+            false,
+            None,
+            Some("relay_accepted"),
+        ),
+        (
+            "failed",
+            Some("pool-session-private"),
+            1,
+            true,
+            Some("relay_ambiguous"),
+            Some("relay_ambiguous"),
+        ),
+        (
+            "retry_wait",
+            Some("pool-session-private"),
+            2,
+            false,
+            Some("uds_unavailable"),
+            Some("uds_unavailable"),
+        ),
+        (
+            "cancelled",
+            Some("pool-session-private"),
+            1,
+            false,
+            Some("relay_rejected"),
+            Some("relay_rejected"),
+        ),
+    ];
+    for (state, session, attempts, ambiguous, last_error, classifier) in cases {
+        store
+            .conn
+            .execute(
+                "UPDATE pools SET orchestrator_session_id=? WHERE id=?",
+                rusqlite::params![session, pool_id.as_str()],
+            )
+            .unwrap();
+        store.conn.execute(
+            "UPDATE deliveries SET orchestrator_session_id=?,state=?,attempts=?,ambiguous_result=?,last_error=? WHERE id='ntf_pool_private'",
+            rusqlite::params![session, state, attempts, ambiguous, last_error],
+        ).unwrap();
+        store
+            .conn
+            .execute(
+                "DELETE FROM delivery_attempt_evidence WHERE delivery_id='ntf_pool_private'",
+                [],
+            )
+            .unwrap();
+        if let Some(classifier) = classifier {
+            let evidence = json!({
+                "classifier":classifier,"executable":"desktop-relay","argv_shape":["relay"],
+                "duration_ms":1,"returncode":null,"spawn_errno":null,"error_class":null,
+                "stdout_tail":"","stderr_tail":"","stdout_bytes":0,"stderr_bytes":0,
+                "stdout_truncated":false,"stderr_truncated":false,"message_id_present":state=="delivered"
+            });
+            store.conn.execute(
+                "INSERT INTO delivery_attempt_evidence(delivery_id,attempt,recorded_at,evidence_json) VALUES('ntf_pool_private',?,?,?)",
+                rusqlite::params![attempts, 3, evidence.to_string()],
+            ).unwrap();
+        }
+
+        let operator_page = store
+            .pool_operator_read(&pool_id, 0, None, 50)
+            .unwrap()
+            .unwrap();
+        let worker_page = store
+            .pool_read(run, attempt, token, 0, None, 50)
+            .unwrap()
+            .unwrap();
+        let delivery = &operator_page["delivery"];
+        assert_eq!(delivery, &worker_page["delivery"]);
+        assert_eq!(delivery["state"], state);
+        assert_eq!(delivery["bound"], session.is_some());
+        assert_eq!(delivery["attempts"], attempts);
+        assert_eq!(delivery["ambiguous"], ambiguous);
+        assert_eq!(
+            delivery["last_classification"],
+            classifier.map_or(Value::Null, Value::from)
+        );
+        assert_eq!(
+            delivery["last_attempt"]["classifier"],
+            classifier.map_or(Value::Null, Value::from)
+        );
+        assert_eq!(operator_page["status"], worker_page["status"]);
+        let printed = delivery.to_string();
+        for private in [
+            "ntf_pool_private",
+            "pool-session-private",
+            "client-session-private",
+            "orchestrator_session_id",
+        ] {
+            assert!(!printed.contains(private), "{private} leaked");
+        }
+    }
+    let proof_after: String = store
+        .conn
+        .query_row(
+            "SELECT data_json FROM events WHERE seq=?",
+            [terminal_event],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(proof_before, proof_after);
+}
