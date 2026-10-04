@@ -78,6 +78,14 @@ bind --pool <id>`); until bound it waits. A completed pool's record stays frozen
 even if a member is resumed later. Pool history is kept until every member has
 expired.
 
+Pool reads also carry a read-time `activity` beside the unchanged status:
+`running`, `stopping` (all ended, cleanup not yet proven), `cancelled` (all
+current members cancelled and cleaned; the stored state stays `open`, so the
+pool is restorable by resuming or replacing members, and nothing is completed or
+notified), `settling` (agreed success awaiting its completion record),
+`needs_action` (failure, mixed cancellation, or missing or blocked votes) and
+`completed`. It is a projection only; it never records or implies success.
+
 Pool reads include a live common-notice delivery projection: bound state,
 outbox state, attempts, ambiguity, and the last safe classifier/evidence when
 available. Before a notice is created its state is `not_created`; an unbound

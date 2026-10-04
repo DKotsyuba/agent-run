@@ -1,4 +1,4 @@
-agent-run pool {{ pool_id }} — {{ status.state }}, roster r{{ status.roster_revision }}{% if status.state == "completed" %}, frozen record{% elif status.agreed %}, all current members valid-ready (agreement is not completion){% else %}, not yet unanimous{% endif %}{{ "" }}
+agent-run pool {{ pool_id }} — {% if activity is defined and activity and activity != status.state %}{{ activity }} (state {{ status.state }}{% if activity == "cancelled" %}; restorable by resume or replacement{% elif activity == "stopping" %}; cleanup not yet proven{% elif activity == "settling" %}; completion record pending{% elif activity == "needs_action" %}; needs orchestrator action{% endif %}){% else %}{{ status.state }}{% endif %}, roster r{{ status.roster_revision }}{% if status.state == "completed" %}, frozen record{% elif status.agreed %}, all current members valid-ready (agreement is not completion){% else %}, not yet unanimous{% endif %}{{ "" }}
 {% if show_goal %}
 Goal: {{ status.goal }}
 Acceptance criteria:

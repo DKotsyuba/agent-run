@@ -2230,3 +2230,162 @@ fn common_notice_projection_tracks_live_delivery_without_changing_frozen_status(
         .unwrap();
     assert_eq!(proof_before, proof_after);
 }
+
+/// Reads the operator page's top-level `activity` word.
+fn activity(store: &Store, pool_id: &agent_run_domain::pool::PoolId) -> String {
+    store
+        .pool_operator_read(pool_id, 0, None, 50)
+        .unwrap()
+        .unwrap()["activity"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// Sets every member's latest execution status and, when `cleaned`, its cleanup proof.
+fn set_tips(store: &Store, members: &[(AgentId, String, String)], status: &str, cleaned: bool) {
+    for (run, _, _) in members {
+        store
+            .conn
+            .execute(
+                "UPDATE agents SET status=? WHERE id=?",
+                [status, run.as_str()],
+            )
+            .unwrap();
+        let (phase, proof) = if cleaned {
+            ("cleanup_complete", Some("{}"))
+        } else {
+            ("running", None)
+        };
+        store
+            .conn
+            .execute(
+                "UPDATE attempts SET ownership_active=?,phase=?,cleanup_proof_json=? WHERE agent_id=?",
+                rusqlite::params![!cleaned, phase, proof, run.as_str()],
+            )
+            .unwrap();
+    }
+}
+
+/// An open pool's read-time activity follows its current members without ever
+/// changing the stored state: cancellation is `stopping` until cleanup is
+/// proven, then `cancelled` yet restorable (state stays `open`, nothing is
+/// completed or notified), and a resumed member returns it to `running`.
+/// Failure, a mixed cancellation or a blocked vote need action; agreed
+/// success awaiting its completion record is `settling`; a completed pool
+/// stays `completed` with its frozen status byte-identical after a resume.
+#[test]
+fn pool_activity_projects_lifecycle_without_changing_stored_state() {
+    let home = common::Home::new();
+    let (_, members, pool_id) = voted_pool(&home);
+    let mut store = home.store();
+    assert_eq!(activity(&store, &pool_id), "running");
+
+    set_tips(&store, &members, "cancelled", false);
+    assert_eq!(activity(&store, &pool_id), "stopping");
+    set_tips(&store, &members, "cancelled", true);
+    assert_eq!(activity(&store, &pool_id), "cancelled");
+    let page = store
+        .pool_operator_read(&pool_id, 0, None, 50)
+        .unwrap()
+        .unwrap();
+    assert_eq!(page["status"]["state"], "open");
+    assert!(store.settle_pool(&pool_id).unwrap().is_none());
+    assert_eq!(rows_of(&store, "deliveries"), 0, "no common completion");
+
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='failed' WHERE id=?",
+            [members[0].0.as_str()],
+        )
+        .unwrap();
+    assert_eq!(activity(&store, &pool_id), "needs_action", "mixed ends");
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='cancelled' WHERE id=?",
+            [members[0].0.as_str()],
+        )
+        .unwrap();
+
+    // Resume: a new running tip makes the pool active again.
+    store
+        .conn
+        .execute(
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id,parent_agent_id,sequence) \
+             SELECT 'ag-20260101-000000-0000000077',runtime,model,profile,'t','t',workdir,'{}','running',9.0,10.0,'cfg',id,id,2 FROM agents WHERE id=?",
+            [members[0].0.as_str()],
+        )
+        .unwrap();
+    assert_eq!(activity(&store, &pool_id), "running");
+    store
+        .conn
+        .execute(
+            "DELETE FROM agents WHERE id='ag-20260101-000000-0000000077'",
+            [],
+        )
+        .unwrap();
+
+    set_tips(&store, &members, "succeeded", false);
+    assert_eq!(activity(&store, &pool_id), "stopping");
+    set_tips(&store, &members, "succeeded", true);
+    assert_eq!(activity(&store, &pool_id), "settling");
+    assert_eq!(
+        store
+            .pool_operator_read(&pool_id, 0, None, 50)
+            .unwrap()
+            .unwrap()["status"]["state"],
+        "open"
+    );
+    assert!(store.settle_pool(&pool_id).unwrap().is_some());
+    assert_eq!(activity(&store, &pool_id), "completed");
+    let frozen = store
+        .pool_operator_read(&pool_id, 0, None, 50)
+        .unwrap()
+        .unwrap()["status"]
+        .to_string();
+    store
+        .conn
+        .execute(
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id,parent_agent_id,sequence) \
+             SELECT 'ag-20260101-000000-0000000078',runtime,model,profile,'t','t',workdir,'{}','running',9.0,10.0,'cfg',id,id,2 FROM agents WHERE id=?",
+            [members[0].0.as_str()],
+        )
+        .unwrap();
+    assert_eq!(activity(&store, &pool_id), "completed");
+    let after = store
+        .pool_operator_read(&pool_id, 0, None, 50)
+        .unwrap()
+        .unwrap()["status"]
+        .to_string();
+    assert_eq!(after, frozen, "frozen status is byte-identical");
+}
+
+/// Every member succeeded and cleaned but one vote blocks: the pool cannot
+/// settle itself, so the activity asks for action.
+#[test]
+fn pool_activity_needs_action_for_succeeded_members_with_a_blocked_vote() {
+    let home = common::Home::new();
+    let (_, members, pool_id) = voted_pool(&home);
+    let mut store = home.store();
+    let (run, attempt, token) = &members[1];
+    store
+        .pool_write(
+            run,
+            attempt,
+            token,
+            PoolWrite::Vote(PoolVote {
+                request_id: "blk".into(),
+                proposal_seq: 1,
+                decision: VoteDecision::Block,
+                checks: vec![],
+                message: Some("not acceptable".into()),
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    set_tips(&store, &members, "succeeded", true);
+    assert_eq!(activity(&store, &pool_id), "needs_action");
+    assert!(store.settle_pool(&pool_id).unwrap().is_none());
+}

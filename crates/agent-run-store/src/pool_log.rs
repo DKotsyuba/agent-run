@@ -645,6 +645,7 @@ fn read_page(
             "next_cursor": next_cursor,
             "last_seq": last_seq,
             "complete": complete,
+            "activity": pool_activity(&status),
             "status": status,
             "delivery": delivery,
     });
@@ -1145,6 +1146,62 @@ fn pool_status(conn: &Connection, pool_id: &str) -> Result<Value> {
         "agreed": agreed,
         "note": "agreement is not completion: the pool completes only after every member execution ends successfully with cleanup evidence",
     }))
+}
+
+/// Projects a derived pool status into one read-time activity word.
+///
+/// Presentation only: it is never stored, completes nothing and leaves the
+/// status proof untouched. `state` stays `open` after a cancellation so a
+/// member can still resume or be replaced, which returns the activity to
+/// `running`. Precedence:
+///
+/// * `completed` — the frozen completed record;
+/// * `running` — any current member's latest run is not terminal;
+/// * `stopping` — every latest run is terminal but some member lineage still
+///   lacks verified cleanup, so nothing is called stopped or cancelled yet;
+/// * `cancelled` — every latest run is cancelled and every lineage cleaned;
+/// * `settling` — every latest run succeeded, all votes agree and all cleanup
+///   is proven, but the pool has not been recorded completed yet;
+/// * `needs_action` — every other fully terminal, cleaned case (a failure, a
+///   mixed cancellation, or missing, blocked or stale votes).
+///
+/// A pool with no current member is `needs_action`.
+fn pool_activity(status: &Value) -> &'static str {
+    if status["state"] == json!("completed") {
+        return "completed";
+    }
+    let members = status["members"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let tips: Vec<Option<agent_run_domain::domain::Status>> = members
+        .iter()
+        .map(|member| member["tip_status"].as_str().and_then(|s| s.parse().ok()))
+        .collect();
+    if members.is_empty() {
+        return "needs_action";
+    }
+    // An unparsable status is unknown, so it is treated as still active.
+    if tips
+        .iter()
+        .any(|tip| !tip.is_some_and(|tip| tip.terminal()))
+    {
+        return "running";
+    }
+    if members
+        .iter()
+        .any(|member| member["cleanup_complete"] != json!(true))
+    {
+        return "stopping";
+    }
+    let all = |wanted| tips.iter().all(|tip| *tip == Some(wanted));
+    if all(agent_run_domain::domain::Status::Cancelled) {
+        "cancelled"
+    } else if all(agent_run_domain::domain::Status::Succeeded) && status["agreed"] == json!(true) {
+        "settling"
+    } else {
+        "needs_action"
+    }
 }
 
 /// Derives one member's vote status fields and the reason it counts or not.

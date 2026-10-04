@@ -1213,4 +1213,76 @@ mod tests {
             new_proposal.contains("UNIQUE-SNAPSHOT") && !new_proposal.contains("UNIQUE-GOAL-TEXT")
         );
     }
+
+    /// Both pool pages lead with the read-time activity when present, say that a
+    /// cancelled open pool is restorable, and fall back to the stored state for
+    /// payloads without one.
+    #[test]
+    fn pool_headers_prefer_activity_and_fall_back_to_state() {
+        let page = |activity: Option<&str>, state: &str| {
+            let mut page = json!({
+                "pool_id":"p","entries":[],"after_seq":0,"before_seq":null,"limit":50,
+                "next_cursor":null,"last_seq":null,"complete":true,
+                "status":{"state":state,"roster_revision":1,"goal":"g","criteria":[],
+                    "current_proposal":null,"members":[],"replaced_members":[],
+                    "agreed":false,"note":"n"},
+                "delivery":{"state":"not_created","bound":false,"attempts":0,
+                            "ambiguous":false,"last_classification":null,"evidence":null}});
+            if let Some(activity) = activity {
+                page["activity"] = json!(activity);
+            }
+            page
+        };
+        let worker = |page: &Value| {
+            let content = serde_json::to_value(
+                &success_result("pool_read", &super::pool_page(page.clone()).unwrap()).content,
+            )
+            .unwrap();
+            content[0]["text"].as_str().unwrap().to_owned()
+        };
+        for render in [
+            &|page: &Value| public_text("pool", page).0 as String,
+            &worker as &dyn Fn(&Value) -> String,
+        ] {
+            let header = |activity, state| render(&page(activity, state));
+            let cancelled = header(Some("cancelled"), "open");
+            assert!(
+                cancelled
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .contains("cancelled (state open; restorable by resume or replacement)"),
+                "{cancelled}"
+            );
+            for (activity, hint) in [
+                ("running", "running (state open)"),
+                ("stopping", "stopping (state open; cleanup not yet proven)"),
+                (
+                    "settling",
+                    "settling (state open; completion record pending)",
+                ),
+                (
+                    "needs_action",
+                    "needs_action (state open; needs orchestrator action)",
+                ),
+            ] {
+                let text = header(Some(activity), "open");
+                assert!(text.lines().next().unwrap().contains(hint), "{text}");
+            }
+            let completed = header(Some("completed"), "completed");
+            assert!(
+                completed
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .contains("— completed, roster"),
+                "{completed}"
+            );
+            let legacy = header(None, "open");
+            assert!(
+                legacy.lines().next().unwrap().contains("— open, roster"),
+                "{legacy}"
+            );
+        }
+    }
 }

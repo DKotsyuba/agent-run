@@ -794,7 +794,7 @@
   },
   {
     "name": "pool",
-    "description": "Read a pool: its state (open or completed), roster with each member's status, vote validity and cleanup, the current proposal, and a cursor-paged log of stamped entries. Default reads omit the unchanged goal and snapshot except with after_seq 0 or when the proposal is new. Agreement is not completion: the pool completes only after every member succeeded with verified cleanup, and a completed pool's record is frozen.",
+    "description": "Read a pool: its state (open or completed), roster with each member's status, vote validity and cleanup, the current proposal, and a cursor-paged log of stamped entries. Default reads omit the unchanged goal and snapshot except with after_seq 0 or when the proposal is new. Agreement is not completion: the pool completes only after every member succeeded with verified cleanup, and a completed pool's record is frozen. The read-time activity distinguishes running, stopping, cancelled (restorable), settling, needs_action and completed without changing the stored state or frozen proof.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
