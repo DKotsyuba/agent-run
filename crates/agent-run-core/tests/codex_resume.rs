@@ -494,6 +494,68 @@ fn finish_with_session(home: &common::Home, id: &agent_run_domain::domain::Agent
         .unwrap();
 }
 
+/// A frozen raw timeout intent replays without current config or live paths;
+/// changing the timeout remains a conflict.
+#[tokio::test]
+async fn stability_resume_replays_raw_timeout_without_current_policy() {
+    let home = common::Home::new();
+    let mut initial = home.request();
+    let workspace = home.path.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    initial.workdir = workspace.clone();
+    let root = parent(&home, initial, "native");
+    let parent_row = home.store().get(&root).unwrap();
+    let mut raw = parent_row.request.clone();
+    raw.task = "continue".into();
+    raw.request_id = Some("retry-margin".into());
+    raw.timeout_seconds = Some(120.0);
+    raw.validate_intent().unwrap();
+    let hash = agent_run_domain::canonical::sha256_hex(
+        &json!({"request":raw,"explicit_timeout":Some(120.0)}),
+        true,
+    );
+    let mut effective = raw.clone();
+    effective.timeout_seconds = Some(144.0);
+    let (child, _) = home
+        .store()
+        .admit(
+            &effective,
+            &home.config,
+            &json!({"replay_request_sha256":hash}),
+            Some(&parent_row),
+        )
+        .unwrap();
+    std::fs::remove_dir(&workspace).unwrap();
+    std::fs::remove_file(home.path.join("config.toml")).unwrap();
+    let service = Service::new(home.path.clone());
+    let retry = service
+        .resume(
+            &root,
+            "continue".into(),
+            Some(120.0),
+            Some("retry-margin".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry["created"], false);
+    assert_eq!(retry["agent_id"], json!(child));
+    assert!(matches!(
+        service
+            .resume(
+                &root,
+                "continue".into(),
+                Some(121.0),
+                Some("retry-margin".into()),
+                None,
+                None
+            )
+            .await,
+        Err(Error::Conflict)
+    ));
+}
+
 /// An old parent's resume retry finds its one child under either transport
 /// spelling even after later continuations, with no configuration or sealed
 /// home read (the fixture identity is deliberately empty), while a different
@@ -510,6 +572,9 @@ async fn old_parent_resume_retry_replays_through_later_continuations() {
         )
         .unwrap();
     let mut root_request = home.request();
+    let workspace = home.path.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    root_request.workdir = workspace.clone();
     root_request.orchestrator = Some(alias.clone());
     let root = parent(&home, root_request, "one");
     let root_row = home.store().get(&root).unwrap();
@@ -532,6 +597,8 @@ async fn old_parent_resume_retry_replays_through_later_continuations() {
         .unwrap();
     assert!(created);
 
+    std::fs::remove_dir(&workspace).unwrap();
+    std::fs::remove_file(home.path.join("config.toml")).unwrap();
     let service = agent_run_core::service::Service::new(home.path.clone());
     for orchestrator in [None, Some(alias.clone()), Some(canonical.clone())] {
         let replayed = service

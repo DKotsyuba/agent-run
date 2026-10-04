@@ -94,6 +94,16 @@ impl ProviderStartRequest {
         Ok(())
     }
 
+    /// Validates immutable fields for exact replay without requiring live directories.
+    /// A new request still calls `validate` before admission and canonicalizes paths.
+    pub fn validate_intent(&mut self) -> Result<()> {
+        let mut projection = self.storage_projection();
+        projection.validate_intent()?;
+        self.display_name = projection.display_name;
+        self.orchestrator = projection.orchestrator;
+        Ok(())
+    }
+
     /// Produces the existing read-model projection for staged store readers.
     ///
     /// Its `runtime` field is only a compatibility projection; the versioned

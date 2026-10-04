@@ -4,6 +4,21 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.20.4] - 2026-10-04
+
+- fix(delivery): isolate invalid payloads, deliver cancellations without failure
+  metadata, recover missing notices on late binding and accept legacy worker
+  transport aliases without changing stored bindings
+- fix(pools): replay revoke and block votes consistently, compare vote notes,
+  reject checks on revocation and retain histories with protected members
+- fix(supervisor): recover fenced attempt snapshots across incomplete group
+  writes, persist expanded cleanup captures, and require confirmed legacy
+  descendant cleanup with durable ownership evidence
+- fix(resume): replay frozen intent before mutable configuration and filesystem
+  checks, preserving raw legacy timeout overrides independently of policy changes
+- fix(deploy): restore rollback files by synced atomic rename while preserving
+  the previous file on copy failure and keeping SQLite sidecars intact
+
 ## [0.20.3] - 2026-10-04
 
 - fix(delivery): preserve acknowledgements across configuration edits and normalize

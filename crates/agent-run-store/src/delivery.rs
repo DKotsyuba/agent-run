@@ -21,12 +21,13 @@ pub const MAX_EVIDENCE_BYTES: usize = 16 * 1024;
 
 /// Inserts a durable completion notice for a terminal event when one is needed.
 ///
-/// Successful runs in a current seat of an open pool omit individual notices;
+/// Successful runs in a current pool seat omit individual notices;
 /// the pool's common completion notice represents that success. Failures and
 /// other terminal outcomes still create individual notices. A run with an
 /// orchestrator session starts `pending`; without one, no delivery row can be
 /// activated. The caller owns the transaction, keeping any row atomic with its
-/// terminal event. Returns the new notification id when inserted, otherwise
+/// terminal event. Repeated calls for the same terminal event reuse its notice,
+/// including failed or expired rows. Returns the notification id when present, otherwise
 /// `None`.
 pub(crate) fn insert_terminal_notice(
     tx: &Transaction<'_>,
@@ -36,7 +37,7 @@ pub(crate) fn insert_terminal_notice(
     at: f64,
 ) -> Result<Option<String>> {
     let suppress_member_success: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM agents a JOIN pool_members m ON m.agent_id=COALESCE(NULLIF(a.root_agent_id,''),a.id) JOIN pools p ON p.id=m.pool_id WHERE a.id=? AND a.status='succeeded' AND m.replaced_by IS NULL AND p.state='open')",
+        "SELECT EXISTS(SELECT 1 FROM agents a JOIN pool_members m ON m.agent_id=COALESCE(NULLIF(a.root_agent_id,''),a.id) JOIN pools p ON p.id=m.pool_id WHERE a.id=? AND a.status='succeeded' AND m.replaced_by IS NULL)",
         [id.as_str()],
         |row| row.get(0),
     )?;
@@ -46,12 +47,44 @@ pub(crate) fn insert_terminal_notice(
     let Some(session) = session else {
         return Ok(None);
     };
+    let previous: Option<String> = tx
+        .query_row(
+            "SELECT id FROM deliveries WHERE agent_id=? AND terminal_event_seq=? LIMIT 1",
+            params![id.as_str(), terminal_event_seq],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if previous.is_some() {
+        return Ok(previous);
+    }
     let notification_id = format!("ntf_{}", uuid::Uuid::new_v4().simple());
     tx.execute(
         "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,terminal_event_seq,state,next_attempt_at) VALUES(?,?,?,?,?,?)",
         params![notification_id, id.as_str(), session, terminal_event_seq, "pending", at],
     )?;
     Ok(Some(notification_id))
+}
+
+/// Repairs a completion omitted before binding, atomically with the binding transaction.
+/// Only a durable terminal status event can create a notice. Existing notices are reused
+/// and successful current pool members remain suppressed; no historical row is resurrected.
+pub(crate) fn ensure_bound_terminal_notice(
+    tx: &Transaction<'_>,
+    id: &AgentId,
+    session: &str,
+    at: f64,
+) -> Result<()> {
+    let event: Option<i64> = tx.query_row(
+        "SELECT MAX(e.seq) FROM events e JOIN agents a ON a.id=e.agent_id \
+         WHERE a.id=? AND a.status IN ('succeeded','failed','timed_out','cancelled','lost') \
+         AND e.kind='status' AND e.to_status=a.status",
+        [id.as_str()],
+        |row| row.get(0),
+    )?;
+    if let Some(event) = event {
+        insert_terminal_notice(tx, id, Some(session), event, at)?;
+    }
+    Ok(())
 }
 
 /// Redacts one diagnostic suffix, retaining at most [`MAX_EVIDENCE_TAIL_BYTES`] UTF-8 bytes.

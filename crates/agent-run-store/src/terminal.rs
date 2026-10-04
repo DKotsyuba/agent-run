@@ -18,7 +18,8 @@ use serde_json::{json, Value};
 /// The answer proof is verified before opening the transaction. Once started,
 /// the state update, attempt close, event append, answer metadata, eligible
 /// outbox row, and aggregate run statistics either commit together or SQLite
-/// rolls all of them back. Successful runs in a current seat of an open pool
+/// rolls all of them back. Confirmed legacy cleanup releases ownership in this
+/// transaction; unconfirmed attempts remain owned for recovery. Successful current pool members
 /// omit the individual notice because pool settlement owns the common success
 /// notice. A pending cancel observed while a successful or timed-out run is
 /// being committed wins in this same transaction and receives its terminal
@@ -156,6 +157,14 @@ pub fn finish(
         tx.execute(
             "UPDATE attempts SET ownership_active=0 WHERE id=? AND agent_id=?",
             params![attempt, id.as_str()],
+        )?;
+    } else {
+        // Legacy attempts release only confirmed cleanup, atomically with the terminal row.
+        // Unconfirmed ownership stays active for reconciliation, even after a failed run.
+        tx.execute(
+            "UPDATE attempts SET ownership_active=0 WHERE agent_id=? AND ownership_active=1 \
+             AND phase='cleanup_complete' AND json_extract(cleanup_proof_json,'$.confirmed')=1",
+            [id.as_str()],
         )?;
     }
     tx.commit()?;

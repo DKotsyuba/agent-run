@@ -1033,6 +1033,125 @@ fn byte_budget_refuses_oversized_addition_without_a_row() {
         .unwrap();
 }
 
+/// Late pool binding recovers a fast member failure and keeps individual success suppressed.
+#[test]
+fn stability_pool_late_bind_preserves_success_suppression() {
+    let home = common::Home::new();
+    let (pool, members) = pool(&home, &[("done", "done")]);
+    let mut store = home.store();
+    store
+        .finish(
+            &members[0].0,
+            &agent_run_domain::domain::Outcome::failure("prepare_failed"),
+            None,
+            None,
+        )
+        .unwrap();
+    let answer_dir = home.path.join("agents").join(members[1].0.as_str());
+    agent_run_platform::fs::private_dir(&answer_dir).unwrap();
+    let proof = agent_run_platform::verify::seal(
+        &answer_dir,
+        std::path::Path::new("answer.md"),
+        "fixture result",
+    )
+    .unwrap();
+    store
+        .finish(
+            &members[1].0,
+            &agent_run_domain::domain::Outcome::success(None),
+            Some(&proof),
+            None,
+        )
+        .unwrap();
+    let reference = agent_run_domain::domain::OrchestratorRef {
+        transport: "codex_queue".into(),
+        external_session_id: "late".into(),
+        external_turn_id: None,
+    };
+    let pool = pool.parse().unwrap();
+    store
+        .bind_pool(&pool, &reference, agent_run_domain::domain::now())
+        .unwrap();
+    store
+        .bind_pool(&pool, &reference, agent_run_domain::domain::now())
+        .unwrap();
+    let count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM deliveries", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(
+        store.delivery_status(&members[1].0).unwrap()["state"],
+        "not_created"
+    );
+}
+
+/// Revoke and check-less block replay their exact stored form; changed notes conflict.
+#[test]
+fn stability_vote_replay_and_revoke_validation() {
+    let home = common::Home::new();
+    let (_pool, members) = pool(&home, &[("done", "done")]);
+    let (run, attempt, token) = &members[0];
+    let mut store = home.store();
+    let proposal = store
+        .pool_write(
+            run,
+            attempt,
+            token,
+            PoolWrite::Proposal(PoolPropose {
+                request_id: "proposal".into(),
+                message: "result".into(),
+                snapshot: "result".into(),
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    for (key, decision) in [
+        ("revoke", VoteDecision::Revoke),
+        ("block", VoteDecision::Block),
+    ] {
+        let vote = PoolVote {
+            request_id: key.into(),
+            proposal_seq: proposal.seq,
+            decision,
+            checks: vec![],
+            message: Some("note".into()),
+        };
+        let first = store
+            .pool_write(run, attempt, token, PoolWrite::Vote(vote.clone()))
+            .unwrap()
+            .unwrap();
+        let retry = store
+            .pool_write(run, attempt, token, PoolWrite::Vote(vote.clone()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.seq, retry.seq);
+        assert!(retry.duplicate);
+        let changed = PoolVote {
+            message: Some("changed".into()),
+            ..vote
+        };
+        assert_eq!(
+            store
+                .pool_write(run, attempt, token, PoolWrite::Vote(changed))
+                .unwrap(),
+            Err(PoolDenial::Conflict)
+        );
+    }
+    let invalid = PoolVote {
+        request_id: "invalid".into(),
+        proposal_seq: proposal.seq,
+        decision: VoteDecision::Revoke,
+        checks: vec![CriterionCheck {
+            criterion_id: "done".into(),
+            status: CheckStatus::Met,
+            evidence: "checked".into(),
+        }],
+        message: None,
+    };
+    assert!(invalid.validate().is_err());
+}
+
 /// The final vote-slot reservation accepts a revoke as well as a block: a
 /// member with seven rows can withdraw its valid ready vote, leaving a
 /// non-ready status and never a completion.

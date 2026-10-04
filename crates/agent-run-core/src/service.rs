@@ -1268,16 +1268,11 @@ impl Service {
             self.hand_off_provider(&mut result).await?;
             return Ok(result);
         }
-        if matches!(self.active_config()?.value, CachedConfigValue::Providers(_)) {
-            return Err(Error::Unsupported(
-                "legacy_continuation_unavailable: a schema-1 run cannot be continued under schema 2; its history remains readable".into(),
-            ));
-        }
         // Replay of the original resume intent precedes every mutable read, as
         // for a provider run: an old parent's retry finds its one child even
         // after later continuations, a changed configuration or a moved home.
-        // Only an explicit timeout is rescaled (by the current margin, as at
-        // admission); an inherited one is the parent's own effective value.
+        // Hash the raw override before scaling. An inherited timeout is already
+        // effective; exact retries never consult the current margin or filesystem.
         let mut replay = parent.request.clone();
         replay.task = task.clone();
         replay.request_id = request_id.clone();
@@ -1285,26 +1280,59 @@ impl Service {
             replay.display_name = display_name.clone();
         }
         if let Some(explicit) = timeout {
-            replay.timeout_seconds = Some(
-                self.current_config()?
-                    .core
-                    .effective_timeout_seconds(Some(explicit))?,
-            );
+            replay.timeout_seconds = Some(explicit);
         }
         if orchestrator.is_some() {
             replay.orchestrator = orchestrator.clone();
         }
-        replay.validate()?;
+        replay.validate_intent()?;
+        let intent_hash = agent_run_domain::canonical::sha256_hex(
+            &json!({"request": replay, "explicit_timeout": timeout}),
+            true,
+        );
         {
             let store = Store::open(&self.home)?;
-            if let Some(child) = store.replay_resume_child(&replay, &parent)? {
+            if let Some(child) = store.replay_request(&replay)? {
+                if child.parent_agent_id.as_ref() != Some(&parent.id) {
+                    return Err(Error::Conflict);
+                }
+                let frozen_hash = child
+                    .identity
+                    .as_ref()
+                    .and_then(|value| value.get("replay_request_sha256"))
+                    .and_then(Value::as_str);
+                match frozen_hash {
+                    Some(hash) if hash != intent_hash => return Err(Error::Conflict),
+                    Some(_) => {}
+                    None => {
+                        // Historical resumes did not record the raw intent. Compare every
+                        // field using the child's frozen policy, never today's multiplier.
+                        let mut historical = replay.clone();
+                        if let Some(explicit) = timeout {
+                            historical.timeout_seconds = Some(
+                                LaunchIdentity::read(&child)?
+                                    .config
+                                    .core
+                                    .effective_timeout_seconds(Some(explicit))?,
+                            );
+                        }
+                        if store.replay_resume_child(&historical, &parent)?.is_none() {
+                            return Err(Error::Conflict);
+                        }
+                    }
+                }
                 return Ok(
                     json!({"agent_id":child.id,"created":false,"agent":self.view(&store,&child)?}),
                 );
             }
         }
+        if matches!(self.active_config()?.value, CachedConfigValue::Providers(_)) {
+            return Err(Error::Unsupported(
+                "legacy_continuation_unavailable: a schema-1 run cannot be continued under schema 2; its history remains readable".into(),
+            ));
+        }
         let mut identity = LaunchIdentity::read(&parent)?;
-        identity.replay_request_sha256 = None;
+        identity.replay_request_sha256 = Some(intent_hash);
         let runtime_home = identity
             .runtime_home
             .as_deref()
@@ -1430,7 +1458,7 @@ impl Service {
             // binding, which may have been established after the first start.
             request.orchestrator = Some(shared);
         }
-        request.validate()?;
+        request.validate_intent()?;
         // Replay of the original resume intent precedes every mutable read.
         if let Some(replay) = Store::open(&self.home)?.replay_provider_request(&request)? {
             let store = Store::open(&self.home)?;
@@ -1443,6 +1471,7 @@ impl Service {
                 "created":false,"agent":self.view(&store,&row)?}),
             );
         }
+        request.validate()?;
         // A parent that already has a child is refused for that reason (the
         // child's own turns legitimately changed the parent's sealed history);
         // the unique parent index remains the final authority.

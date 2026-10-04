@@ -335,6 +335,24 @@ impl StartRequest {
     /// validators. Unsupported transports and duplicate canonical read roots are
     /// rejected before durable admission.
     pub fn validate(&mut self) -> Result<()> {
+        self.validate_intent()?;
+        self.workdir = existing_dir(&self.workdir)?;
+        self.read_roots = self
+            .read_roots
+            .iter()
+            .map(|p| existing_dir(p))
+            .collect::<Result<_>>()?;
+        let mut seen = BTreeSet::new();
+        if self.read_roots.iter().any(|p| !seen.insert(p.clone())) {
+            return Err(invalid("read_roots must not contain duplicates"));
+        }
+        Ok(())
+    }
+
+    /// Validates and normalizes immutable request fields without accessing the filesystem.
+    /// Paths must be absolute; only a new admission subsequently requires them to exist.
+    /// This permits an exact durable replay after a workspace has been removed.
+    pub fn validate_intent(&mut self) -> Result<()> {
         for (name, s) in [
             ("runtime", &self.runtime),
             ("model", &self.model),
@@ -354,12 +372,9 @@ impl StartRequest {
         if let Some(v) = self.timeout_seconds {
             timeout_seconds(v)?;
         }
-        self.workdir = existing_dir(&self.workdir)?;
-        self.read_roots = self
-            .read_roots
-            .iter()
-            .map(|p| existing_dir(p))
-            .collect::<Result<_>>()?;
+        if !self.workdir.is_absolute() || self.read_roots.iter().any(|path| !path.is_absolute()) {
+            return Err(invalid("paths must be absolute"));
+        }
         let mut seen = BTreeSet::new();
         if self.read_roots.iter().any(|p| !seen.insert(p.clone())) {
             return Err(invalid("read_roots must not contain duplicates"));
