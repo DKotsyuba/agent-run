@@ -1278,6 +1278,33 @@ fn pool(store: &Store, members: &[&AgentId]) -> String {
     id
 }
 
+/// A workflow-protected member keeps the pool log and roster until its dependency expires.
+#[test]
+fn stability_pool_history_follows_member_workflow_protection() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let old = NOW - HISTORY_SECONDS - 1.0;
+    let id = agent(&home, &mut store, "failed", Some(old));
+    pool(&store, &[&id]);
+    store.conn.execute("INSERT INTO workflow_runs(id,name,script_sha,status,created_at,finished_at) VALUES('workflow','fixture','x','running',0,?)", [old]).unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO workflow_steps VALUES('workflow','step','{}',?,'failed',NULL,NULL,NULL)",
+            [id.as_str()],
+        )
+        .unwrap();
+    assert_eq!(drain(&mut store, 8), 0);
+    assert_eq!(count(&store, "pool_entries"), 1);
+    store
+        .conn
+        .execute("UPDATE workflow_runs SET status='failed'", [])
+        .unwrap();
+    assert!(drain(&mut store, 8) > 0);
+    assert_eq!(count(&store, "pools"), 0);
+    integrity(&store);
+}
+
 /// Every member lineage of a pool, replaced members included, stays stored
 /// while any member is not expired; once all are, the pool log, roster and
 /// pool rows go before the agents and every foreign key still resolves.

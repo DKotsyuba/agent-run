@@ -219,9 +219,19 @@ impl PoolWrite {
                 ]
             }
             Self::Vote(input) => vec![
-                ("decision", json!(input.decision.as_str())),
+                (
+                    "decision",
+                    json!((input.decision != VoteDecision::Revoke).then(|| input.decision.as_str())),
+                ),
                 ("proposal_seq", json!(input.proposal_seq)),
-                ("checks", json!(input.checks)),
+                (
+                    "checks",
+                    json!((!input.checks.is_empty()).then_some(&input.checks)),
+                ),
+                (
+                    "body",
+                    json!(input.message.as_deref().unwrap_or("(no note)")),
+                ),
             ],
         }
     }
@@ -747,6 +757,7 @@ fn replay_shape_of(
                 "checks",
                 json!(checks.and_then(|raw| serde_json::from_str::<Value>(&raw).ok())),
             ),
+            ("body", json!(body)),
         ],
     })
 }

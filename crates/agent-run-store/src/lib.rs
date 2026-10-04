@@ -555,6 +555,7 @@ impl Store {
     /// same canonical transport family and external session id. A different
     /// chat is rejected without changing the prior binding. A waiting terminal
     /// delivery is activated once for a new binding and is never resurrected.
+    /// A terminal event that finished before binding gets its missing notice atomically.
     pub fn bind_orchestrator(
         &mut self,
         id: &AgentId,
@@ -581,6 +582,7 @@ impl Store {
                 return Err(invalid("agent orchestration binding is immutable"));
             }
             touch_session_reference(&tx, &current, reference, at)?;
+            delivery::ensure_bound_terminal_notice(&tx, id, &current, at)?;
             tx.commit()?;
             return Ok(current);
         }
@@ -593,6 +595,7 @@ impl Store {
             "UPDATE deliveries SET orchestrator_session_id=?,state='pending',next_attempt_at=? WHERE agent_id=? AND state='waiting_binding' AND id NOT IN (SELECT completion_delivery_id FROM pools WHERE completion_delivery_id IS NOT NULL)",
             params![session_id, at, id.as_str()],
         )?;
+        delivery::ensure_bound_terminal_notice(&tx, id, &session_id, at)?;
         tx.commit()?;
         Ok(session_id)
     }

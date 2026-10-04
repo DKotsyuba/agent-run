@@ -318,6 +318,20 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
         Duration::try_from_secs_f64((deadline - domain::now()).max(0.0)).unwrap_or(Duration::MAX);
     let execution = async {
         store.running(id, process.owner.pid)?;
+        let attempt = format!("{id}:1");
+        let leader = process
+            .owner
+            .leader
+            .as_ref()
+            .ok_or_else(|| Error::Runtime("legacy leader identity unavailable".into()))?;
+        store.conn.execute(
+            "UPDATE attempts SET ownership_active=1,phase='spawning',process_identity=?,process_birth_time=? WHERE id=?",
+            rusqlite::params![leader.token, leader.birth, attempt],
+        )?;
+        let ownership_home = home.to_owned();
+        process.observe_ownership(move |snapshot| {
+            Store::open(&ownership_home)?.remember_processes("attempt", &attempt, snapshot)
+        })?;
         crate::journal(store, id, "user", &row.request.task, None, None)?;
         match runtime.kind()? {
             Adapter::Codex => {
@@ -343,8 +357,21 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
     };
     let cleanup = process.owner.cleanup(Duration::from_secs(2)).await;
     let exit = process.reap().await;
+    process.checkpoint_ownership()?;
     let cleanup = cleanup?;
     store.event(id, "process_cleanup", &serde_json::to_value(&cleanup)?)?;
+    if cleanup.confirmed {
+        let attempt = format!("{id}:1");
+        // Runs that failed before recording ownership have nothing to release.
+        let owned: bool = store.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attempts WHERE id=? AND ownership_active=1)",
+            [&attempt],
+            |row| row.get(0),
+        )?;
+        if owned {
+            store.provider_cleanup(id, &attempt, &cleanup)?;
+        }
+    }
     let cancelled = store.cancel_pending(id)?;
     // Same predicate as a provider run: the timer firing, or the stored
     // deadline having passed by the time cleanup finished. Cancellation wins.
@@ -390,7 +417,7 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
             expired.then_some(verify::StopReason::Timeout)
         },
         Some(&evidence),
-        cleanup.group_gone,
+        cleanup.confirmed,
         last_progress_at,
         domain::now(),
         verify::DEFAULT_SILENCE_THRESHOLD_SECONDS,
@@ -400,12 +427,6 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
     Ok(())
 }
 
-/// Runs one admitted v2 attempt through the existing detached supervisor,
-/// process-identity fence, transcript, cleanup verifier, and terminal outbox.
-/// Checkpoints observed root/descendant identities on change, including final
-/// cleanup, so recovery retains captured members after this supervisor exits.
-/// Worker-enabled roles receive a fresh capability for each attempt, hashed in
-/// the store and injected only into the launch environment before spawning.
 /// The one compatibility scope every explicitly managed immutable shared tree
 /// is imported under: a digest of the versioned managed-assets domain and the
 /// effective UID, so payloads never alias across scopes or users while
@@ -1031,6 +1052,10 @@ fn verify_sealed_home(
     Ok(())
 }
 
+/// Runs an admitted provider attempt through fenced process ownership and the terminal outbox.
+/// Checkpoints root and descendant identities through cleanup, and injects an attempt-bound
+/// worker capability. Preparation, execution, cleanup and durable-store failures propagate;
+/// an unconfirmed cleanup keeps ownership reserved for recovery.
 async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
     if store.cancel_pending(id)? {
         if !store.provider_never_spawned(id)? {

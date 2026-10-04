@@ -140,6 +140,57 @@ fn evidence_redacts_secret_shaped_tails_and_caps_utf8() {
     assert!(persisted.len() <= 16 * 1024);
 }
 
+/// Cancellation evidence remains stored while the public notice omits failure metadata;
+/// two queued notices advance without touching a real transport.
+#[tokio::test]
+async fn stability_cancelled_notice_does_not_block_outbox() {
+    let home = common::Home::new();
+    delivery(&home.path, "ntf_first", "fixture-unsupported", "pending");
+    let db = Connection::open(home.path.join("state.db")).unwrap();
+    db.execute(
+        "UPDATE agents SET status='cancelled',failure_kind='cancelled_before_spawn'",
+        [],
+    )
+    .unwrap();
+    db.execute("INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,next_attempt_at) SELECT 'ntf_next',agent_id,orchestrator_session_id,'pending',next_attempt_at+1 FROM deliveries", []).unwrap();
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+    let pending: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM deliveries WHERE state='pending'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending, 0);
+    let kind: String = db
+        .query_row("SELECT failure_kind FROM agents", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(kind, "cancelled_before_spawn");
+}
+
+/// A malformed stored payload is quarantined once; later due rows keep progressing.
+#[tokio::test]
+async fn stability_invalid_payload_isolated_from_next_notice() {
+    let home = common::Home::new();
+    delivery(&home.path, "ntf_first", "fixture-unsupported", "pending");
+    let db = Connection::open(home.path.join("state.db")).unwrap();
+    db.execute("UPDATE agents SET root_agent_id='invalid'", [])
+        .unwrap();
+    db.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) VALUES('ag-20261004-000000-0000000002','mock','fixture','review','t','t','/tmp','{}','succeeded',1,1,'fixture','ag-20261004-000000-0000000002')", []).unwrap();
+    db.execute("INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,next_attempt_at) VALUES('ntf_next','ag-20261004-000000-0000000002','sess','pending',?)", [now()-0.5]).unwrap();
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 0);
+    let bad: (String, String) = db
+        .query_row(
+            "SELECT state,last_error FROM deliveries WHERE id='ntf_first'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(bad, ("failed".into(), "invalid_payload".into()));
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+}
+
 /// Mirrors `tests/test_delivery_dispatch.py::test_missing_codex_relay_retries_then_recovers_without_queue`.
 #[tokio::test]
 async fn unavailable_queue_retries_once_with_one_evidence_row() {

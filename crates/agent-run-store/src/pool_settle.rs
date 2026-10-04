@@ -461,6 +461,12 @@ impl Store {
                     params![session, tip.as_str()],
                 )?;
             }
+            crate::delivery::ensure_bound_terminal_notice(
+                &tx,
+                &tip,
+                bound.as_deref().unwrap_or(&session),
+                at,
+            )?;
         }
         tx.execute(
             "UPDATE deliveries SET orchestrator_session_id=COALESCE(orchestrator_session_id,?),state='pending',next_attempt_at=? \

@@ -10,6 +10,12 @@ agent-run/completion
 - Notice: [notification {notification_id} v{version}]
 ```
 
+Binding a run that finished before the host hook creates its missing completion
+notice from the durable terminal event exactly once. Successful pool members
+still omit individual notices. Cancelled notices omit failure metadata while
+retaining internal evidence; malformed stored payloads end only their own
+delivery row with `invalid_payload`, allowing later notices to proceed.
+
 ## Stable agent and execution ids
 
 `agent_id` is the only public agent identifier. `start` returns it, and every

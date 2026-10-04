@@ -168,7 +168,12 @@ impl Store {
                     .transpose()
                     .ok()
                     .flatten()
-                    .filter(|transport| matches!(transport.as_str(), "codex_queue" | "claude_uds"))
+                    .filter(|transport| {
+                        agent_run_domain::domain::OrchestratorRef::canonical_transport_name(
+                            transport,
+                        )
+                        .is_ok()
+                    })
                     .map(|_| auth)
             });
         let Some(auth) = auth else {

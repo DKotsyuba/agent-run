@@ -737,7 +737,7 @@ pub struct PoolVote {
 impl PoolVote {
     /// Rejects an unsafe key, a proposal outside 1..=i64::MAX, duplicate or invalid checks,
     /// checks whose serialized JSON exceeds [`MAX_CHECKS_JSON_BYTES`], a `ready` vote without
-    /// checks, or an invalid note.
+    /// checks, a revoke carrying checks, or an invalid note.
     pub fn validate(&self) -> Result<()> {
         request_key(&self.request_id)?;
         if self.proposal_seq == 0 || self.proposal_seq > i64::MAX as u64 {
@@ -749,6 +749,9 @@ impl PoolVote {
             || (self.decision == VoteDecision::Ready && self.checks.is_empty())
         {
             return Err(invalid("a ready vote needs 1 to 10 checks"));
+        }
+        if self.decision == VoteDecision::Revoke && !self.checks.is_empty() {
+            return Err(invalid("a revoke cannot carry checks"));
         }
         let mut ids = BTreeSet::new();
         for check in &self.checks {

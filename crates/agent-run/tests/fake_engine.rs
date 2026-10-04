@@ -714,6 +714,44 @@ async fn ten_consecutive_supervisor_entrypoints_land_durably() {
     }
 }
 
+/// Legacy supervision keeps durable root/descendant ownership and its confirmed cleanup proof.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stability_legacy_supervisor_checkpoints_owned_cleanup() {
+    let (_tmp, home) = home();
+    let row = run_task(&home, "fixture:descendant").await;
+    assert_eq!(row.status, Status::Succeeded);
+    let store = Store::open(&home).unwrap();
+    let attempt = format!("{}:1", row.id);
+    let owned = store
+        .remembered_processes("attempt", &attempt)
+        .unwrap()
+        .unwrap()
+        .snapshot()
+        .unwrap();
+    assert!(owned.members.len() > 1);
+    let active: bool = store
+        .conn
+        .query_row(
+            "SELECT ownership_active FROM attempts WHERE id=?",
+            [&attempt],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!active);
+    let proof: String = store
+        .conn
+        .query_row(
+            "SELECT cleanup_proof_json FROM attempts WHERE id=?",
+            [&attempt],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&proof).unwrap()["confirmed"],
+        true
+    );
+}
+
 /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_a_grandchild_is_killed_and_reaped_after_a_clean_exit`.
 /// Mirrors Python `tests/test_lifecycle.py::TerminateProcessGroupTests::test_missing_leader_does_not_hide_a_surviving_descendant`.
 /// Mirrors Python `tests/test_lifecycle.py::TerminateProcessGroupTests::test_escaped_descendant_is_reported_and_cleaned_by_fixture_owner`.

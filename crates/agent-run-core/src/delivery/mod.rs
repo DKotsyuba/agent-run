@@ -578,27 +578,29 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let payload = if let Some((pool_id, message)) = pool {
-        let notice = agent_run_domain::pool::PoolNotice {
-            notification_id: delivery_id.clone(),
-            pool_id: pool_id.parse()?,
-            message,
-        };
-        notice.validate()?;
-        Payload::Pool(notice)
-    } else if let Some((kind, message)) = worker {
-        let kind = match kind.as_str() {
-            "notice" => WorkerMessageKind::Notice,
-            "risk" => WorkerMessageKind::Risk,
-            "question" => WorkerMessageKind::Question,
-            "blocker" => WorkerMessageKind::Blocker,
-            _ => return Err(invalid("invalid stored worker kind")),
-        };
-        // A pool member's report carries its immutable linked pool entry: the
-        // orchestrator then sees the same stamped sender, direction and
-        // stable identity as peers, from the one shared renderer. The stored
-        // worker message stays raw for idempotent replay.
-        let message = match tx
+    // A malformed stored payload must end only its own row, never poison the outbox.
+    let payload = (|| -> Result<Payload> {
+        Ok(if let Some((pool_id, message)) = pool {
+            let notice = agent_run_domain::pool::PoolNotice {
+                notification_id: delivery_id.clone(),
+                pool_id: pool_id.parse()?,
+                message,
+            };
+            notice.validate()?;
+            Payload::Pool(notice)
+        } else if let Some((kind, message)) = worker {
+            let kind = match kind.as_str() {
+                "notice" => WorkerMessageKind::Notice,
+                "risk" => WorkerMessageKind::Risk,
+                "question" => WorkerMessageKind::Question,
+                "blocker" => WorkerMessageKind::Blocker,
+                _ => return Err(invalid("invalid stored worker kind")),
+            };
+            // A pool member's report carries its immutable linked pool entry: the
+            // orchestrator then sees the same stamped sender, direction and
+            // stable identity as peers, from the one shared renderer. The stored
+            // worker message stays raw for idempotent replay.
+            let message = match tx
             .query_row(
                 "SELECT seq,author_kind,author_agent_id,author_name,author_role,direction,kind,\
                  severity,proposal_seq,roster_revision,decision,body \
@@ -611,28 +613,46 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
             Some(entry) => pool_decorated(&agent_run_domain::pool::render_entry(&entry)?),
             None => message,
         };
-        let notice = WorkerNotice {
-            notification_id: delivery_id.clone(),
-            agent_id: root.parse()?,
-            run_id: agent_id.parse()?,
-            kind,
-            message,
-        };
-        notice.validate()?;
-        Payload::Worker(notice)
-    } else {
-        let notice = Notice {
-            notification_id: delivery_id.clone(),
-            agent_id: root.parse()?,
-            run_id: Some(agent_id.parse()?),
-            status: status.parse()?,
-            runtime: bounded(runtime),
-            model: bounded(model),
-            effort,
-            failure_kind: kind.and_then(bounded),
-        };
-        notice.validate()?;
-        Payload::Completion(notice)
+            let notice = WorkerNotice {
+                notification_id: delivery_id.clone(),
+                agent_id: root.parse()?,
+                run_id: agent_id.parse()?,
+                kind,
+                message,
+            };
+            notice.validate()?;
+            Payload::Worker(notice)
+        } else {
+            let notice = Notice {
+                notification_id: delivery_id.clone(),
+                agent_id: root.parse()?,
+                run_id: Some(agent_id.parse()?),
+                status: status.parse()?,
+                runtime: bounded(runtime),
+                model: bounded(model),
+                effort,
+                failure_kind: if matches!(status.as_str(), "failed" | "timed_out" | "lost") {
+                    kind.and_then(bounded)
+                } else {
+                    None
+                },
+            };
+            notice.validate()?;
+            Payload::Completion(notice)
+        })
+    })();
+    let payload = match payload {
+        Ok(payload) => payload,
+        Err(agent_run_domain::Error::Validation(_) | agent_run_domain::Error::Integrity(_)) => {
+            tx.execute(
+                "UPDATE deliveries SET state='failed',lease_owner=NULL,lease_until=NULL,\
+                 next_attempt_at=NULL,last_error='invalid_payload' WHERE id=?",
+                [&delivery_id],
+            )?;
+            tx.commit()?;
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
     };
     let policy = delivery_policy(home)?;
     let attempt = attempts
