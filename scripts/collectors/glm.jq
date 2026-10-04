@@ -15,7 +15,8 @@ include "common";
            if (.usage | type) != "number" or (.currentValue | type) != "number"
               or .usage <= 0 or .currentValue < 0
            then error("invalid usage counts")
-           else ([.currentValue, .usage] | min) * 100 / .usage end
+           elif .currentValue >= .usage then 100
+           else .currentValue * 100 / .usage end
          else null end) as $counted
       | if $reported != null and $counted != null and (($reported - $counted) | fabs) > 1
         then error("usage counts disagree") else . end

@@ -661,7 +661,9 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
 /// known-unsent outcomes (session gone, unavailable, rejected) still retry.
 ///
 /// The retry policy is the one captured in `claim`; no configuration is read
-/// here, so an acknowledgement is always committed once its send has happened.
+/// here, so a config change after sending cannot discard an acknowledgement.
+/// Evidence is committed only while this attempt still owns its live lease;
+/// cancellation or ownership loss still takes precedence.
 fn complete(home: &Path, claim: &Claim, evidence: &Evidence) -> Result<()> {
     let delivery = &claim.policy;
     let mut store = Store::open(home)?;

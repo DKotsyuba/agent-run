@@ -456,6 +456,14 @@ fn glm_over_budget_counters_remain_exhausted() {
             r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":100,"currentValue":100,"percentage":99.5}]}}"#,
             vec![0.0],
         ),
+        (
+            r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":0.68,"currentValue":0.68,"percentage":99.5}]}}"#,
+            vec![0.0],
+        ),
+        (
+            r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":0.68,"currentValue":0.69,"percentage":99.5}]}}"#,
+            vec![0.0],
+        ),
     ] {
         let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/collectors");
         let mut child = std::process::Command::new("jq")
