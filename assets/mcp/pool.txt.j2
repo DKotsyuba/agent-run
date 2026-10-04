@@ -29,5 +29,5 @@ Entries (after #{{ after_seq }}{% if before_seq %}, before #{{ before_seq }}{% e
 {% if complete %}
 page complete in this direction; this does not imply a finished pool
 {% else %}
-next cursor: {{ next_cursor }} — request the next page with after_seq={{ next_cursor }}
+next cursor: {{ next_cursor }} — request the next page with {% if before_seq %}before_seq{% else %}after_seq{% endif %}={{ next_cursor }}
 {% endif %}

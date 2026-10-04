@@ -500,7 +500,9 @@ fn pool_exists(conn: &Connection, pool_id: &str) -> Result<bool> {
     )?)
 }
 
-/// One cursor page of a pool's log plus its derived status.
+/// One cursor page of a pool's log plus its derived status. Backward pages
+/// return ascending entries and continue before their oldest returned sequence;
+/// forward pages continue after their newest returned sequence.
 fn read_page(
     conn: &Connection,
     pool_id: &str,
@@ -532,9 +534,13 @@ fn read_page(
             .validate()
             .map_err(|e| Error::Integrity(format!("pool entry is invalid: {e}")))?;
     }
-    let next_cursor = (!complete)
-        .then(|| entries.last().map(|entry| entry.seq))
-        .flatten();
+    let next_cursor = if complete {
+        None
+    } else if before_seq.is_some() {
+        entries.first().map(|entry| entry.seq)
+    } else {
+        entries.last().map(|entry| entry.seq)
+    };
     let last_seq = entries.last().map(|entry| entry.seq);
     Ok(json!({
             "pool_id": pool_id,
