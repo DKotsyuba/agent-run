@@ -31,17 +31,17 @@ pub trait Broker: Send + Sync {
 /// Shared dynamic broker seam handed to the event workers.
 pub type SharedBroker = Arc<dyn Broker>;
 
-/// Production broker with independent sessions, transcript and answer sockets.
+/// Production broker with independent sessions, transcript, answer and pool sockets.
 /// Dropping an incomplete call retires its socket before it can serve a new call.
 pub struct SocketBroker {
     /// Socket endpoint for lazy replacements after cancellation.
     socket: PathBuf,
-    /// Persistent connection per worker lane (list, transcript, one-shot).
-    clients: [std::sync::Mutex<Arc<BrokerClient>>; 3],
+    /// Persistent connection per worker lane (list, transcript, one-shot, pools).
+    clients: [std::sync::Mutex<Arc<BrokerClient>>; 4],
 }
 
 impl SocketBroker {
-    /// Creates three lazy clients; no socket opens before its first call.
+    /// Creates four lazy clients; no socket opens before its first call.
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         let socket = socket_path.into();
         Self {
@@ -79,6 +79,7 @@ impl Broker for SocketBroker {
         let index = match method {
             "list_agents" => 0,
             "transcript" => 1,
+            "pool" | "list_pools" => 3,
             _ => 2,
         };
         Box::pin(async move {
@@ -384,8 +385,9 @@ mod tests {
         assert!(view.available);
         assert_eq!(view.content.as_deref(), Some("the answer\n"));
     }
-    /// A blocked list poll cannot delay transcript/answer calls on real sockets;
-    /// cancelling a transcript also retires its unread connection.
+    /// A blocked list poll cannot delay transcript, answer or pool reads on live JSON-RPC sockets.
+    /// Blocked pools leave transcript/answer lanes free; cancelled pool and transcript reads
+    /// retire their unread connections before the next call.
     #[tokio::test]
     async fn socket_lanes_stay_independent_and_cancelled_frames_are_retired() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -431,7 +433,7 @@ mod tests {
             tokio::spawn(async move { broker.call("list_agents", json!({})).await })
         };
         assert_eq!(seen_rx.recv().await.unwrap(), "list_agents");
-        for method in ["transcript", "answer"] {
+        for method in ["transcript", "answer", "pool", "list_pools"] {
             let result = tokio::time::timeout(
                 std::time::Duration::from_millis(500),
                 broker.call(method, json!({})),
@@ -442,6 +444,31 @@ mod tests {
             assert_eq!(result, json!({"ok":true}));
             assert_eq!(seen_rx.recv().await.unwrap(), method);
         }
+        let pool = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.call("pool", json!({"blocked":true})).await })
+        };
+        assert_eq!(seen_rx.recv().await.unwrap(), "pool");
+        for method in ["transcript", "answer"] {
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                broker.call(method, json!({}))
+            )
+            .await
+            .unwrap()
+            .is_ok());
+            assert_eq!(seen_rx.recv().await.unwrap(), method);
+        }
+        pool.abort();
+        let _ = pool.await;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            broker.call("list_pools", json!({}))
+        )
+        .await
+        .unwrap()
+        .is_ok());
+        assert_eq!(seen_rx.recv().await.unwrap(), "list_pools");
         let stale = {
             let broker = broker.clone();
             tokio::spawn(async move { broker.call("transcript", json!({"blocked":true})).await })

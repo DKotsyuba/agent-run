@@ -1,14 +1,14 @@
 # Terminal UI (`agent-run-tui`)
 
 `agent-run-tui` is an interactive terminal observer for the resident broker.
-It renders live sessions as a two-row list and the transcript of the selected
-session. The observer is a **pure broker client**: it starts nothing, owns no
+It has separate Sessions and Pools tabs for session transcripts and cooperative
+pool conversations. The observer is a **pure broker client**: it starts nothing, owns no
 store, and never mutates broker state — every fact on screen comes from the
 same public JSON-RPC surface the CLI and MCP transports use.
 
 ## Layout
 
-The frame is chrome-free (no borders): row 0 is the app bar, row 1 is blank,
+The frame is chrome-free: row 0 is the app bar, row 1 is the tab bar,
 the last row is the key bar, and everything between belongs to the panes.
 
 - **Wide terminals (≥ 110 columns) render a split view**: the session list
@@ -122,6 +122,53 @@ one style: a panel background, a rounded accent border (`╭╮╰╯`), the tit
 on the top border, and a dim `esc close` on the bottom border. Esc, `?`, or
 `q` closes the help; a click anywhere closes it too.
 
+## Pools tab
+
+`2` selects **Pools**, `1` selects **Sessions**, and Shift-Tab switches tabs.
+The tabs are clickable; ordinary Tab keeps its Sessions finished toggle.
+`Pools <n> open` uses the exact broker-wide open total. Project filtering
+applies to sessions; a pool always shows the entire team.
+
+At ≥110 columns, the left shelf lists **OPEN** then **COMPLETED** pools,
+showing the state glyph, goal excerpt, valid-ready/member count, proposal
+sequence and short pool ID. The selected pool is previewed on the right;
+Enter focuses it. Narrow terminals show the list first and open the selected
+pool full-screen with Enter; Esc returns to the list. `[ ]` changes discovery
+pages (50 rows per state), while section counts remain exact across pages.
+`agent-run-tui --pool <id>` opens a pool directly, including a pool outside
+the current discovery page.
+
+The detail header shows the goal excerpt, state badge, valid readiness,
+proposal and roster revision. `c` opens the full sanitized goal and criteria
+in a scrollable overlay (↑/↓, PgUp/PgDn, Home/End; Esc closes). The MEMBERS
+shelf shows broker execution status, verified cleanup, raw vote and its
+validity reason. Readiness counts only `counts: true`; a raw ready vote with
+a stale roster/tip, revoked vote or unmet checks does not count. Unanimity
+while open means **agreement; waiting for success/cleanup**. Only the broker's
+completed state receives the completed badge; its proof stays frozen even
+if a member resumes. Joined runtime/model labels are marked `latest` on a
+completed pool and never replace frozen execution or cleanup facts.
+
+The CHAT pane shows member messages, operator posts, broker roster events,
+reports with severity and `orchestrator (team copy)` addressing, framed
+proposals, votes and revokes. Headers use historical stamped author names
+and `#seq rN`, with no invented timestamps. Every body and snapshot is
+sanitized and explicitly marked **untrusted**. Long bodies preview four
+wrapped lines with an omitted-line count; Enter/click expands them. Votes
+and revokes use compact headers and expand to their bodies. Proposal
+snapshots are attached only to their exact sequence; historical snapshots
+not observed in a status read say `snapshot unavailable`.
+
+`m` switches chat/roster focus. In the roster, ↑/↓ selects a member and
+`t`/Enter opens that stable member's existing transcript view; Esc returns
+to the pool with chat scroll, follow, expansion and roster state preserved.
+`h` expands replacement history; retired members also open transcripts.
+Chat ↑/↓ moves the entry cursor; PgUp/PgDn and wheel scroll, leaving follow
+mode. `f` toggles follow, `g`/Home requests older history, and `G`/End follows
+the tail. Incoming entries preserve the scrolled entry/row anchor.
+
+The tab is read-only: it never posts, replaces members or binds a pool.
+
 ## Running
 
 The binary lives in `crates/agent-run-tui` and connects to the resident
@@ -134,6 +181,8 @@ cargo run --locked --release --package agent-run-tui --bin agent-run-tui
 agent-run-tui ~/projects/agent-ide
 # overrides
 agent-run-tui --home ~/.agent-run --socket ~/.agent-run/api.sock
+# open a cooperative pool directly
+agent-run-tui --pool pool-20261004-100000-7ac03b9e12
 ```
 
 A project argument filters the session list to sessions whose working directory
@@ -154,6 +203,8 @@ Global:
 |---|---|
 | `q`, Ctrl-C | quit |
 | `?` | key-help overlay (Esc/`?`/`q` closes) |
+| `1`, `2`, Shift-Tab | Sessions / Pools / switch tabs |
+| click tab | switch tabs |
 | `a` | fetch and show the selected session's sealed answer |
 | mouse wheel | scroll the pane under the pointer |
 | click | select a row; clicking the selected row opens its transcript |
@@ -200,11 +251,25 @@ background so highlights stay visible.
 
 ## How it updates
 
-- Sessions, transcript pages, and one-shot answer requests use three separate
+- Sessions, transcript pages, one-shot answer/member-status requests and pools use four separate
   persistent broker connections. The sessions long-poll cannot hold up opening
   a transcript or fetching an answer. Switching selection cancels the previous
   transcript fetch and retires its socket; watcher commands keep only the latest
   target, including a clear while idle or during delivery.
+- Pools use their own persistent socket. Visible discovery polls `list_pools`
+  with separate open/completed filters, limit and offset, at most once per
+  second. Selected pools open with a reverse tail page and poll forward with
+  `after_seq` approximately every second; public `pool` has no wait parameter.
+  Hidden tabs cancel pool reads. Completed pools stop forward polling once
+  the known tail is loaded; older history remains available on demand.
+  Empty unchanged status/log pages draw nothing. Reverse requests use
+  `before_seq` equal to the **minimum returned sequence**, independently of
+  the broker's overlapping reverse `next_cursor`. Overlapping pages merge
+  once by immutable sequence. A four-pool MRU retains at most 500 entries
+  per pool; wrapped entry rows are memoized by sequence, width, expansion
+  and exact snapshot. At the memory ceiling, a scrolled history window keeps
+  its older edge and defers incoming bodies until follow resumes; status
+  still refreshes, and the forward cursor never advances past unseen bodies.
 - The sessions table long-polls `list_agents` with `after_revision` and a
   25 s `wait_seconds` window. Once data is flowing, listing fetches throttle
   to one per 500 ms so a busy broker (many revision commits per second)
@@ -316,10 +381,11 @@ process" invariant.
 
 ```
 crates/agent-run-tui/
-  src/main.rs     CLI (--home/--socket), palette choice, terminal setup
+  src/main.rs     CLI (--home/--socket/--pool), palette choice, terminal setup
   src/net.rs      typed broker seam (`Broker` trait, JSON-RPC helpers)
   src/app.rs      state + pure reducers (sorting, transcript merge, follow)
   src/events.rs   input thread, sessions/transcript watchers, event loop
+  src/pools.rs    discovery, pool watcher, bounded log cache, pool navigation
   src/ui/         frame chrome, list, transcript, overlays, text, theme
 ```
 

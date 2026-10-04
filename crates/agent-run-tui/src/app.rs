@@ -406,6 +406,8 @@ struct CardCache {
 pub struct App {
     /// Which screen is on display.
     pub screen: Screen,
+    /// Separate pool tab, cached logs and pool navigation state.
+    pub pools: crate::pools::Pools,
     /// Latest session snapshots, sorted by [`sort_sessions`].
     pub sessions: Vec<AgentView>,
     /// Derived listing products, invalidated by listing/scope/filter changes.
@@ -468,6 +470,7 @@ impl App {
     pub fn new() -> Self {
         Self {
             screen: Screen::Sessions,
+            pools: crate::pools::Pools::default(),
             sessions: Vec::new(),
             cards: std::cell::RefCell::new(None),
             revision: None,
@@ -853,6 +856,12 @@ impl App {
     /// refetching history from zero.
     pub fn watch_selected(&mut self) -> Option<(AgentId, Option<AgentId>, i64)> {
         let agent = self.selected_session()?.clone();
+        self.watch_agent(agent)
+    }
+
+    /// Restores one session transcript by stable identity, including pool members absent from the list.
+    /// The outgoing buffer is cached and a restored buffer resumes at its forward cursor.
+    pub fn watch_agent(&mut self, agent: AgentView) -> Option<(AgentId, Option<AgentId>, i64)> {
         if self
             .transcript
             .as_ref()

@@ -75,6 +75,30 @@ pub enum BrokerEvent {
     /// Exact finished-session total the broker counted over every session;
     /// delivered alongside the listings that observed a new revision.
     FinishedTotal(usize),
+    /// Whole discovery round; stale offsets are ignored.
+    Pools {
+        /// Discovery offset used for both state-filtered pages.
+        offset: usize,
+        /// Open and completed pages, or a bounded read error.
+        page: Result<
+            (
+                agent_run_domain::views::ListPoolsView,
+                agent_run_domain::views::ListPoolsView,
+            ),
+            String,
+        >,
+    },
+    /// Public pool read and requested reverse cursor.
+    Pool {
+        /// Stable identity of the requested buffer.
+        id: agent_run_domain::pool::PoolId,
+        /// Explicit reverse cursor, absent for initial tail/forward polling.
+        before: Option<u64>,
+        /// Status and entries, or a bounded read error.
+        page: Result<Box<crate::pools::Page>, String>,
+    },
+    /// Public status read for a selected roster member.
+    PoolMember(Result<Box<agent_run_domain::AgentView>, String>),
 }
 
 /// Commands addressed to the transcript watcher.
@@ -397,6 +421,10 @@ pub enum Action {
     Bottom,
     /// Toggle the key-help overlay.
     Help,
+    /// Switch Sessions (false) / Pools (true), preserving cached buffers.
+    Tab(bool),
+    /// Pure read-only pool navigation.
+    Pool(crate::pools::Action),
 }
 
 /// Maps one key press to an action given the current screen and popup state.
@@ -427,6 +455,15 @@ pub fn key_action(app: &App, key: KeyEvent) -> Action {
             KeyCode::Enter => Action::PickerApply,
             _ => Action::None,
         };
+    }
+    match key.code {
+        KeyCode::Char('1') => return Action::Tab(false),
+        KeyCode::Char('2') => return Action::Tab(true),
+        KeyCode::BackTab => return Action::Tab(!app.pools.visible),
+        _ => {}
+    }
+    if app.pools.visible && !app.pools.member_transcript {
+        return crate::pools::key(app, key.code);
     }
     match app.screen {
         crate::app::Screen::Sessions => match key.code {
@@ -476,17 +513,36 @@ pub enum Dispatched {
     Older(AgentId, Option<AgentId>, i64, i64),
     /// Fetch the answer of one session.
     Answer(AgentId, Option<AgentId>),
+    /// Fetch a pool member status before watching the transcript.
+    PoolMember(AgentId),
 }
 
 /// Applies one action to the state and returns its side effects.
 pub fn apply_action(app: &mut App, action: Action) -> Dispatched {
     match action {
+        Action::Tab(pools) => {
+            if app.pools.visible != pools {
+                app.close_transcript();
+                app.pools.visible = pools;
+                app.pools.member_transcript = false;
+                app.pools.member_watch = false;
+                app.pools.pending_member = None;
+                app.dirty = true;
+                return Dispatched::Clear;
+            }
+            Dispatched::None
+        }
+        Action::Pool(action) => crate::pools::apply(app, action),
         Action::None => Dispatched::None,
         Action::Quit => {
             app.quit = true;
             Dispatched::None
         }
         Action::Move(delta) => {
+            if app.pools.visible && !app.pools.member_transcript {
+                app.pools.focused = false;
+                return crate::pools::apply(app, crate::pools::Action::Move(delta));
+            }
             app.move_selection(delta);
             app.sync_list_scroll(ASSUMED_CARD_ROWS);
             Dispatched::None
@@ -499,6 +555,11 @@ pub fn apply_action(app: &mut App, action: Action) -> Dispatched {
             if app.answer.is_some() {
                 app.close_answer();
                 Dispatched::None
+            } else if app.pools.member_transcript {
+                app.close_transcript();
+                app.pools.member_transcript = false;
+                app.pools.focused = true;
+                Dispatched::Clear
             } else if app.screen == crate::app::Screen::Transcript {
                 app.screen = crate::app::Screen::Sessions;
                 if app.split_view() {
@@ -557,6 +618,10 @@ pub fn apply_action(app: &mut App, action: Action) -> Dispatched {
             Dispatched::None
         }
         Action::ScrollTranscript(delta) => {
+            if app.pools.visible && !app.pools.member_transcript {
+                app.pools.focused = true;
+                return crate::pools::apply(app, crate::pools::Action::Scroll(delta));
+            }
             scroll_transcript(app, delta);
             Dispatched::None
         }
@@ -573,7 +638,13 @@ pub fn apply_action(app: &mut App, action: Action) -> Dispatched {
             }
             Dispatched::None
         }
-        Action::Answer => match (app.selected_agent_id(), app.selected_run_id()) {
+        Action::Answer => match if app.pools.member_transcript {
+            app.transcript.as_ref().map_or((None, None), |b| {
+                (Some(b.agent.agent_id.clone()), b.agent.run_id.clone())
+            })
+        } else {
+            (app.selected_agent_id(), app.selected_run_id())
+        } {
             (Some(agent), run) => Dispatched::Answer(agent, run),
             (None, _) => Dispatched::None,
         },
@@ -977,6 +1048,45 @@ impl Pipeline {
             BrokerEvent::Answer(Ok(view)) => app.apply_answer(view),
             BrokerEvent::Answer(Err(message)) => app.apply_broker_error(message),
             BrokerEvent::FinishedTotal(finished) => app.apply_finished_total(finished),
+            BrokerEvent::Pools {
+                offset,
+                page: Ok((open, completed)),
+            } => {
+                app.dirty |= app.pools.listing(offset, open, completed);
+            }
+            BrokerEvent::Pools {
+                offset,
+                page: Err(error),
+            } => {
+                if offset == app.pools.offset && app.pools.error.as_ref() != Some(&error) {
+                    app.pools.error = Some(error);
+                    app.dirty = true;
+                }
+            }
+            BrokerEvent::Pool { id, before, page } => {
+                let width = crate::pools::width(app);
+                if let Some(buffer) = app.pools.buffers.iter_mut().find(|b| b.id == id) {
+                    match page {
+                        Ok(page) => app.dirty |= buffer.merge(*page, width),
+                        Err(error) => {
+                            if before == buffer.older {
+                                buffer.older = None;
+                            }
+                            if buffer.error.as_ref() != Some(&error) {
+                                buffer.error = Some(error);
+                                app.dirty = true;
+                            }
+                        }
+                    }
+                }
+            }
+            BrokerEvent::PoolMember(Ok(agent)) => {
+                let _ = crate::pools::open_member(app, *agent);
+            }
+            BrokerEvent::PoolMember(Err(error)) => {
+                app.pools.error = Some(error);
+                app.dirty = true;
+            }
         }
     }
 
@@ -994,6 +1104,25 @@ impl Pipeline {
     /// when scrolling approaches the loaded beginning.
     pub fn prepare_frame(&mut self, app: &mut App) -> Dispatched {
         self.input.flush(app);
+        if app.pools.visible {
+            if app.pools.member_transcript && app.pools.member_watch {
+                app.pools.member_watch = false;
+                if let Some(b) = &app.transcript {
+                    return Dispatched::Watch(
+                        b.agent.agent_id.clone(),
+                        b.agent.run_id.clone(),
+                        b.next_cursor,
+                    );
+                }
+            }
+            if !app.pools.member_transcript {
+                if let Some(position) = self.input.hover.take() {
+                    self.pointer = Some(position);
+                }
+                crate::pools::older(app);
+                return Dispatched::None;
+            }
+        }
         if let Some((column, row)) = self.input.hover.take() {
             self.pointer = Some((column, row));
             if apply_hover(app, column, row) {
@@ -1116,6 +1245,22 @@ impl Loop {
                     token,
                 });
             }
+            Dispatched::PoolMember(agent) => {
+                let broker = self.broker.clone();
+                let tx = self.broker_tx.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        Ok::<_, agent_run::Error>(serde_json::from_value(
+                            broker
+                                .call("status", serde_json::json!({"agent_id": agent}))
+                                .await?,
+                        )?)
+                    }
+                    .await
+                    .map_err(|e| e.to_string());
+                    let _ = tx.send(BrokerEvent::PoolMember(result.map(Box::new))).await;
+                });
+            }
             Dispatched::Answer(agent, run) => {
                 let broker = Arc::clone(&self.broker);
                 let tx = self.broker_tx.clone();
@@ -1151,6 +1296,12 @@ pub async fn run(
         token: 0,
     });
 
+    let (pool_tx, pool_rx) = watch::channel(app.pools.request());
+    tokio::spawn(crate::pools::worker(
+        broker.clone(),
+        pool_rx,
+        broker_tx.clone(),
+    ));
     spawn_input(ui_tx);
     tokio::spawn(sessions_worker(broker.clone(), scope_rx, broker_tx.clone()));
     tokio::spawn(transcript_worker(
@@ -1172,6 +1323,15 @@ pub async fn run(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
+        pool_tx.send_if_modified(|current| {
+            let next = app.pools.request();
+            if *current == next {
+                false
+            } else {
+                *current = next;
+                true
+            }
+        });
         let deadline = pipeline.next_frame(&app, Instant::now());
         tokio::select! {
             _ = tokio::time::sleep_until(
@@ -1311,6 +1471,19 @@ fn wheel_step(app: &App, mouse: &MouseEvent) -> Option<(Nav, i64)> {
         -1
     };
     let panes = drawn_panes(app);
+    if app.pools.visible && !app.pools.member_transcript {
+        let over_detail = panes
+            .transcript
+            .is_some_and(|rect| inside(rect, mouse.column, mouse.row));
+        return Some((
+            if over_detail {
+                Nav::Scroll
+            } else {
+                Nav::Selection
+            },
+            delta,
+        ));
+    }
     if panes
         .transcript
         .is_some_and(|rect| inside(rect, mouse.column, mouse.row))
@@ -1330,6 +1503,9 @@ fn wheel_step(app: &App, mouse: &MouseEvent) -> Option<(Nav, i64)> {
 /// position over neither pane clears both targets. An unchanged target
 /// changes nothing, so the frame stays clean.
 fn apply_hover(app: &mut App, column: u16, row: u16) -> bool {
+    if app.pools.visible && !app.pools.member_transcript {
+        return false;
+    }
     let panes = drawn_panes(app);
     let hover = panes
         .transcript
@@ -1358,6 +1534,23 @@ fn apply_hover(app: &mut App, column: u16, row: u16) -> bool {
 /// The event loop routes only clicks here; wheel steps and moves go through
 /// the [`InputBatch`], which applies the same reducers once per burst.
 fn apply_mouse(app: &mut App, mouse: MouseEvent) -> Dispatched {
+    if mouse.row == 1
+        && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+        && !app.help
+        && !app.project_picker
+        && app.answer.is_none()
+        && !app.pools.criteria
+    {
+        if (1..11).contains(&mouse.column) {
+            return apply_action(app, Action::Tab(false));
+        }
+        if (12..32).contains(&mouse.column) {
+            return apply_action(app, Action::Tab(true));
+        }
+    }
+    if app.pools.visible && !app.pools.member_transcript && !app.help {
+        return crate::pools::mouse(app, mouse);
+    }
     let panes = drawn_panes(app);
     let over = |pane: Option<ratatui::layout::Rect>| {
         pane.is_some_and(|rect| inside(rect, mouse.column, mouse.row))

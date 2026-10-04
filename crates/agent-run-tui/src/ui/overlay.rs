@@ -47,7 +47,7 @@ pub fn render_help(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let p = theme::palette();
-    let inner = begin(f, area, "keys", 52, 16);
+    let inner = begin(f, area, "keys", 64, 24);
     let key = |k: &str, d: &str| {
         Line::from(vec![
             Span::styled(format!("{k:<10}"), theme::accent()),
@@ -62,6 +62,8 @@ pub fn render_help(f: &mut Frame, app: &App, area: Rect) {
     };
     let lines = vec![
         Line::from(""),
+        heading("tabs"),
+        key("1 2 ⇧tab", "Sessions · Pools · switch tabs"),
         heading("agents"),
         key("↑↓ j k", "select agent · move between blocks"),
         key("⏎", "open transcript · expand tool"),
@@ -75,6 +77,12 @@ pub fn render_help(f: &mut Frame, app: &App, area: Rect) {
         key("p", "project picker"),
         key("r", "refresh from broker"),
         key("? q", "help · quit"),
+        heading("pools · read-only"),
+        key("↑↓ ⏎ esc", "pool / chat / member · open · back"),
+        key("m t", "roster focus · member transcript"),
+        key("c h", "full goal + criteria · replaced history"),
+        key("f g G", "follow · older history · tail"),
+        key("[ ]", "previous / next discovery page"),
     ];
     f.render_widget(Paragraph::new(lines).style(Style::new().bg(p.panel)), inner);
 }

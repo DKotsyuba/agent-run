@@ -4,6 +4,7 @@
 pub mod answer;
 pub mod list;
 pub mod overlay;
+pub mod pools;
 pub mod projects;
 pub mod text;
 pub mod theme;
@@ -47,7 +48,13 @@ pub fn panes(app: &App, width: u16, height: u16) -> Panes {
     if main.height == 0 || width < 4 {
         return panes;
     }
-    if width >= app::SPLIT_WIDTH {
+    if app.pools.visible && app.pools.member_transcript {
+        panes.transcript = Some(Rect {
+            x: 1,
+            width: width - 2,
+            ..main
+        });
+    } else if width >= app::SPLIT_WIDTH {
         panes.list = Some(Rect {
             x: 1,
             width: LIST_COLS.min(width.saturating_sub(2)),
@@ -66,6 +73,9 @@ pub fn panes(app: &App, width: u16, height: u16) -> Panes {
             ..main
         };
         match app.screen {
+            Screen::Sessions if app.pools.visible && app.pools.focused => {
+                panes.transcript = Some(pane)
+            }
             Screen::Sessions => panes.list = Some(pane),
             Screen::Transcript => panes.transcript = Some(pane),
         }
@@ -80,6 +90,7 @@ pub fn render(f: &mut Frame, app: &App) {
     // Base coat: the whole frame carries the design background.
     f.render_widget(Block::new().style(Style::new().bg(p.bg)), area);
     let panes = panes(app, area.width, area.height);
+    app.pools.hits.borrow_mut().clear();
     if let Some(list) = panes.list {
         // The list pane sits on a panel shelf one padding column wide on
         // each side of the content.
@@ -90,15 +101,32 @@ pub fn render(f: &mut Frame, app: &App) {
             x: 0,
         };
         f.render_widget(Paragraph::new("").style(Style::new().bg(p.panel)), shelf);
-        list::render(f, app, list);
+        if app.pools.visible {
+            pools::render_list(f, app, list);
+        } else {
+            list::render(f, app, list);
+        }
     }
     if let Some(transcript) = panes.transcript {
-        transcript::render(f, app, transcript, area.width >= app::SPLIT_WIDTH);
+        if app.pools.visible && !app.pools.member_transcript {
+            pools::render_detail(f, app, transcript);
+        } else {
+            transcript::render(f, app, transcript, area.width >= app::SPLIT_WIDTH);
+        }
     }
     if area.height > 0 {
         render_app_bar(f, app, Rect { height: 1, ..area });
     }
     if area.height > 1 {
+        render_tabs(
+            f,
+            app,
+            Rect {
+                y: 1,
+                height: 1,
+                ..area
+            },
+        );
         render_key_bar(
             f,
             app,
@@ -113,6 +141,31 @@ pub fn render(f: &mut Frame, app: &App) {
     overlay::render_help(f, app, area);
     projects::render(f, app, area);
     answer::render(f, app, area);
+    pools::render_criteria(f, app, area);
+}
+
+/// Renders clickable tabs in row one; fixed cells are shared with pointer routing.
+fn render_tabs(f: &mut Frame, app: &App, area: Rect) {
+    let p = theme::palette();
+    let session = if app.pools.visible {
+        theme::dim()
+    } else {
+        theme::accent().bg(p.accent_bg)
+    };
+    let pool = if app.pools.visible {
+        theme::accent().bg(p.accent_bg)
+    } else {
+        theme::dim()
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(" Sessions ", session),
+            Span::styled("│", theme::dim()),
+            Span::styled(format!(" Pools {} open ", app.pools.open_total), pool),
+        ])),
+        area,
+    );
 }
 
 /// Renders the app bar: brand, live/finished counts (or the open agent's
@@ -208,8 +261,51 @@ fn render_key_bar(f: &mut Frame, app: &App, area: Rect, panes: Panes) {
 
 /// Key hints of the key bar for the current screen and popup state.
 fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
-    if app.answer.is_some() || app.help || app.project_picker {
+    if app.answer.is_some() || app.help || app.project_picker || app.pools.criteria {
         return vec![("esc", "close")];
+    }
+    if app.pools.visible && !app.pools.member_transcript {
+        return if app.pools.focused {
+            let roster = app.pools.buffer().is_some_and(|b| b.roster);
+            if !app.split_view() {
+                return if roster {
+                    vec![
+                        ("↑↓", "member"),
+                        ("t", "transcript"),
+                        ("m", "chat"),
+                        ("esc", "back"),
+                    ]
+                } else {
+                    vec![
+                        ("↑↓", "block"),
+                        ("⏎", "expand"),
+                        ("m", "roster"),
+                        ("f", "follow"),
+                        ("esc", "back"),
+                    ]
+                };
+            }
+            vec![
+                ("↑↓", if roster { "member" } else { "block" }),
+                ("⏎", "expand/open"),
+                ("m", "roster"),
+                ("c", "criteria"),
+                ("h", "history"),
+                ("f", "follow"),
+                ("t", "transcript"),
+                ("esc", "list"),
+                ("?", "help"),
+            ]
+        } else {
+            vec![
+                ("↑↓", "pool"),
+                ("⏎", "open"),
+                ("[ ]", "pages"),
+                ("1 2", "tabs"),
+                ("?", "help"),
+                ("q", "quit"),
+            ]
+        };
     }
     match (app.screen, app.split_view()) {
         (Screen::Sessions, true) => vec![
@@ -256,6 +352,11 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
 fn key_bar_right(app: &App, panes: Panes) -> Vec<Span<'static>> {
     if app.answer.is_some() || app.help || app.project_picker {
         return Vec::new();
+    }
+    if app.pools.visible && !app.pools.member_transcript {
+        return app.pools.buffer().map_or_else(Vec::new, |b| {
+            vec![Span::styled(format!("seq #{} ", b.after), theme::dim())]
+        });
     }
     let (Some(pane), Some(buffer)) = (panes.transcript, app.transcript.as_ref()) else {
         return Vec::new();

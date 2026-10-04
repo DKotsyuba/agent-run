@@ -7,6 +7,7 @@
 mod app;
 mod events;
 mod net;
+mod pools;
 mod ui;
 
 #[cfg(test)]
@@ -34,6 +35,9 @@ struct Cli {
     /// Broker socket path override; defaults to `<home>/api.sock`.
     #[arg(long)]
     socket: Option<PathBuf>,
+    /// Open a cooperative pool directly in the read-only Pools tab.
+    #[arg(long)]
+    pool: Option<agent_run_domain::pool::PoolId>,
 }
 
 fn main() -> std::process::ExitCode {
@@ -89,6 +93,11 @@ async fn observe(cli: Cli) -> agent_run::Result<()> {
     let mut app = app::App::new();
     app.home_prefix = fs::home(None).ok().map(|path| path.display().to_string());
     app.project_filter = project_root(&cli)?;
+    if let Some(id) = cli.pool {
+        app.pools.visible = true;
+        app.pools.focused = true;
+        app.pools.select(id);
+    }
 
     let mut guard = events::TerminalGuard::enter()
         .map_err(|error| agent_run::Error::Runtime(format!("terminal setup failed: {error}")))?;
