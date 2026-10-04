@@ -112,7 +112,8 @@ pub fn run(home: &Path) -> Result<Report> {
     run_with(home, &Dependencies::default())
 }
 
-/// Runs doctor with injectable canary and process-inventory probes.
+/// Runs doctor with injectable canary and process-inventory probes, including read-only
+/// findings for terminal lineages whose attempt ownership remains unresolved.
 pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
     let home = home.to_path_buf();
     let mut report = Report {
@@ -190,6 +191,7 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
         &mut report.findings,
     );
     supervisors(&snapshot.agents, &mut report.findings);
+    terminal_attempt_ownership(&report.home, &mut report.findings);
     canary(
         &report.home,
         dependencies.canary_executable.as_deref(),
@@ -1150,6 +1152,79 @@ fn supervisors(rows: &[Value], findings: &mut Vec<Finding>) {
     }
 }
 
+/// Reports terminal agent lineages that still have process-owned attempts.
+///
+/// Reads the current WAL-aware database at `home` and appends findings to `findings`.
+/// Components expose validated public root agent ids; details contain bounded counts
+/// and allowlisted reasons only. The read-only query never releases ownership or
+/// observes, signals, or otherwise changes child processes.
+fn terminal_attempt_ownership(home: &Path, findings: &mut Vec<Finding>) {
+    let rows = (|| -> rusqlite::Result<Vec<(String, i64, Option<String>)>> {
+        let connection = rusqlite::Connection::open_with_flags(
+            home.join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        connection.pragma_update(None, "query_only", true)?;
+        let mut statement = connection.prepare(
+                "SELECT COALESCE(NULLIF(a.root_agent_id,''),a.id),COUNT(*),
+                    (SELECT json_extract(e.data_json,'$.reason')
+                     FROM attempts unresolved
+                     JOIN agents ua ON ua.id=unresolved.agent_id
+                     JOIN events e ON e.attempt_id=unresolved.id AND e.agent_id=ua.id
+                        AND e.kind='attempt_cleanup_unresolved'
+                     WHERE unresolved.ownership_active=1
+                       AND ua.status IN ('succeeded','failed','cancelled','lost','timed_out')
+                       AND COALESCE(NULLIF(ua.root_agent_id,''),ua.id)=COALESCE(NULLIF(a.root_agent_id,''),a.id)
+                     ORDER BY e.at DESC,e.seq DESC LIMIT 1)
+                 FROM attempts t JOIN agents a ON a.id=t.agent_id
+                 WHERE t.ownership_active=1
+                   AND a.status IN ('succeeded','failed','cancelled','lost','timed_out')
+                 GROUP BY COALESCE(NULLIF(a.root_agent_id,''),a.id)
+                 ORDER BY MAX(t.created_at) DESC LIMIT ?",
+            )?;
+        let rows: Vec<(String, i64, Option<String>)> = statement
+            .query_map([LIMIT as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    })();
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(_) => {
+            add(
+                findings,
+                "terminal_attempt_diagnostics_unavailable",
+                "warning",
+                "state",
+                "cleanup ownership diagnosis unavailable",
+            );
+            return;
+        }
+    };
+    for (root, count, reason) in rows {
+        let root = if root.parse::<agent_run_domain::domain::AgentId>().is_ok() {
+            root.as_str()
+        } else {
+            "unknown"
+        };
+        let reason = match reason.as_deref() {
+            Some("cleanup_unconfirmed") => "cleanup_unconfirmed",
+            Some("leader_gone_descendants_unverifiable") => "leader_gone_descendants_unverifiable",
+            Some("no_process_evidence") => "no_process_evidence",
+            Some("stored_process_identity_mismatch") => "stored_process_identity_mismatch",
+            _ => "cleanup_reason_unavailable",
+        };
+        add(
+            findings,
+            "terminal_attempt_ownership_unresolved",
+            "warning",
+            &format!("agent:{root}"),
+            format!("owned_attempts={count};last_reason={reason}"),
+        );
+    }
+}
+
 /// Returns whether a native process snapshot proves a member remains in `group`.
 ///
 /// A failed snapshot intentionally returns false: it supplies no orphan proof,
@@ -1371,6 +1446,99 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::cell::Cell;
+
+    /// Doctor reports only unresolved terminal ownership, grouped by stable lineage root.
+    #[test]
+    fn terminal_owned_attempt_diagnostics_are_read_only_and_lineage_scoped() {
+        let home = tempfile::tempdir().unwrap();
+        let store = state::Store::initialize(home.path()).unwrap();
+        for (id, status, parent, root) in [
+            (
+                "ag-20260101-000000-0000000001",
+                "succeeded",
+                None,
+                "ag-20260101-000000-0000000001",
+            ),
+            (
+                "ag-20260101-000000-0000000002",
+                "succeeded",
+                Some("ag-20260101-000000-0000000001"),
+                "ag-20260101-000000-0000000001",
+            ),
+            (
+                "ag-20260101-000000-0000000003",
+                "running",
+                None,
+                "ag-20260101-000000-0000000003",
+            ),
+            (
+                "ag-20260101-000000-0000000004",
+                "failed",
+                None,
+                "ag-20260101-000000-0000000004",
+            ),
+        ] {
+            store.conn.execute(
+                "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,parent_agent_id,root_agent_id) VALUES(?, 'fixture','model','','private-task-sentinel','', '/tmp','{}',?,1,60,'',?,?)",
+                rusqlite::params![id, status, parent, root],
+            ).unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE agents SET sequence=2 WHERE id='ag-20260101-000000-0000000002'",
+                [],
+            )
+            .unwrap();
+        for (id, agent, active) in [
+            ("terminal-owned", "ag-20260101-000000-0000000002", 1),
+            ("active-owned", "ag-20260101-000000-0000000003", 1),
+            ("terminal-released", "ag-20260101-000000-0000000004", 0),
+        ] {
+            store.conn.execute(
+                "INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES(?,?,1,'failed','{}',1,?)",
+                rusqlite::params![id, agent, active],
+            ).unwrap();
+        }
+        store.conn.execute(
+            "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES('ag-20260101-000000-0000000002','terminal-owned',2,'attempt_cleanup_unresolved',?)",
+            [json!({"reason":"leader_gone_descendants_unverifiable","debug":"private-event-sentinel"}).to_string()],
+        ).unwrap();
+        let before: (i64, i64) = store.conn.query_row(
+            "SELECT SUM(ownership_active),(SELECT COUNT(*) FROM attempt_quota_keys) FROM attempts",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "data_version", |row| row.get(0))
+            .unwrap();
+
+        let mut findings = Vec::new();
+        terminal_attempt_ownership(home.path(), &mut findings);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].code, "terminal_attempt_ownership_unresolved");
+        assert_eq!(findings[0].severity, "warning");
+        assert_eq!(findings[0].component, "agent:ag-20260101-000000-0000000001");
+        assert_eq!(
+            findings[0].detail,
+            "owned_attempts=1;last_reason=leader_gone_descendants_unverifiable"
+        );
+        let printed = serde_json::to_string(&findings).unwrap();
+        assert!(!printed.contains("terminal-owned"));
+        assert!(!printed.contains("private-task-sentinel"));
+        assert!(!printed.contains("private-event-sentinel"));
+        let after: (i64, i64) = store.conn.query_row(
+            "SELECT SUM(ownership_active),(SELECT COUNT(*) FROM attempt_quota_keys) FROM attempts",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        let after_version: i64 = store
+            .conn
+            .pragma_query_value(None, "data_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, after);
+        assert_eq!(version, after_version);
+    }
 
     /// Cold services are normal, missing ownership is an error, and diagnostics never expose commands or write state.
     #[test]

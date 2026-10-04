@@ -2,12 +2,27 @@
 
 mod common;
 
-use agent_run_domain::domain::AgentId;
+/// Snapshot of agent rows, the pool roster revision and current member rows.
+type ReplacementState = (
+    Vec<(String, String, Option<f64>)>,
+    u32,
+    Vec<(String, String, Option<String>)>,
+);
+
 use agent_run_domain::pool::{
     CheckStatus, CriterionCheck, PoolDenial, PoolMessage, PoolPropose, PoolVote, VoteDecision,
 };
-use agent_run_store::pool_log::PoolWrite;
+use agent_run_domain::{
+    catalog::{ProviderCatalog, QuotaCandidateSet, ResolvedLaunchAuthority, SelectionIntent},
+    domain::AgentId,
+    Error, HarnessId, ProviderConnection, ProviderStartRequest,
+};
 use agent_run_store::Store;
+use agent_run_store::{
+    pool_log::PoolWrite,
+    pool_replace::{PoolReplaceInput, PoolReplacement},
+    provider_admission::AdmissionInputs,
+};
 use serde_json::{json, Value};
 
 /// Issues one worker capability and returns (run, attempt, token).
@@ -54,6 +69,15 @@ fn pool(
     home: &common::Home,
     criteria: &[(&str, &str)],
 ) -> (String, Vec<(AgentId, String, String)>) {
+    pool_with_names(home, criteria, ["member-1", "member-2"])
+}
+
+/// Creates a two-member pool with fixture-selected names and live capabilities.
+fn pool_with_names(
+    home: &common::Home,
+    criteria: &[(&str, &str)],
+    names: [&str; 2],
+) -> (String, Vec<(AgentId, String, String)>) {
     let mut store = home.store();
     let a = plain_agent(&mut store, home);
     let b = plain_agent(&mut store, home);
@@ -75,7 +99,7 @@ fn pool(
             .execute(
                 "INSERT INTO pool_members(agent_id,pool_id,slot,name,role,personal_task,joined_roster_revision) \
                  VALUES(?, 'pool-20260101-000000-0123456789', ?, ?, 'doer', 'task', 1)",
-                rusqlite::params![id.as_str(), slot, format!("member-{slot}")],
+                rusqlite::params![id.as_str(), slot, names[(slot - 1) as usize]],
             )
             .unwrap();
     }
@@ -85,6 +109,95 @@ fn pool(
         "pool-20260101-000000-0123456789".to_owned(),
         vec![first, second],
     )
+}
+
+/// Tries one replacement with inert admission inputs; name collisions return first.
+fn replacement_with_name(
+    home: &common::Home,
+    store: &mut Store,
+    pool_id: &str,
+    old: &AgentId,
+    name: &str,
+) -> agent_run_domain::Result<std::result::Result<PoolReplacement, PoolDenial>> {
+    let catalog = ProviderCatalog::new(vec![], vec![]).unwrap();
+    let request: ProviderStartRequest = serde_json::from_value(json!({
+        "provider": "fixture", "model": "fixture", "profile": "review",
+        "task": "fixture", "workdir": home.path,
+    }))
+    .unwrap();
+    let effective = home.request();
+    let authority = ResolvedLaunchAuthority {
+        provider: "fixture".parse().unwrap(),
+        harness: HarnessId::ClaudeCode,
+        connection: ProviderConnection::Native,
+        model: "fixture".into(),
+        effort: None,
+        profile: "review".into(),
+        workdir: home.path.clone(),
+        role_payload: json!({}),
+        assets_sha256: "0".repeat(64).parse().unwrap(),
+        eligible_accounts: vec![],
+    };
+    let candidates = QuotaCandidateSet {
+        provider: "fixture".parse().unwrap(),
+        model: "fixture".into(),
+        intent: SelectionIntent::Auto,
+        candidates: vec![],
+        capacity_revision: 0,
+    };
+    let digest = "a".repeat(64);
+    let identity = json!({});
+    store.replace_pool_member(PoolReplaceInput {
+        pool_id: &pool_id.parse().unwrap(),
+        old,
+        request_id: "name-check",
+        request_sha256: &digest,
+        expected_roster_revision: 1,
+        new_id: "ag-20260101-000000-0000000009".parse().unwrap(),
+        name,
+        personal_task: "fixture",
+        catalog: &catalog,
+        inputs: AdmissionInputs {
+            request: &request,
+            effective: &effective,
+            authority: &authority,
+            candidates: &candidates,
+            identity: &identity,
+            global_cap: 5,
+            harness_cap: None,
+            pinned: None,
+        },
+    })
+}
+
+/// Captures agent state, roster revision, and member rows to prove a rejected attempt is atomic.
+fn replacement_state(store: &Store, pool_id: &str) -> ReplacementState {
+    let mut agents = store
+        .conn
+        .prepare("SELECT id,status,finished_at FROM agents ORDER BY id")
+        .unwrap();
+    let agents = agents
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let revision = store
+        .conn
+        .query_row(
+            "SELECT roster_revision FROM pools WHERE id=?",
+            [pool_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let members = store
+        .conn
+        .prepare("SELECT agent_id,name,replaced_by FROM pool_members WHERE pool_id=? ORDER BY slot")
+        .unwrap()
+        .query_map([pool_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    (agents, revision, members)
 }
 
 /// One member chat message.
@@ -601,6 +714,42 @@ fn vote_budget_reserves_a_block_slot() {
     );
 }
 
+/// Aggregate escaped check evidence is rejected before a vote or event is stored.
+#[test]
+fn oversized_vote_checks_are_typed_validation_without_rows() {
+    let home = common::Home::new();
+    let (_, members) = pool(&home, &[("done", "it ships")]);
+    let (run, attempt, token) = &members[0];
+    let vote = PoolWrite::Vote(PoolVote {
+        request_id: "large-vote".into(),
+        proposal_seq: 1,
+        decision: VoteDecision::Block,
+        checks: (0..10)
+            .map(|index| CriterionCheck {
+                criterion_id: format!("c{index}"),
+                status: CheckStatus::Met,
+                evidence: "\"".repeat(1024),
+            })
+            .collect(),
+        message: None,
+    });
+    let mut store = home.store();
+    assert!(matches!(
+        store.pool_write(run, attempt, token, vote),
+        Err(Error::Validation(_))
+    ));
+    let (votes, events): (i64, i64) = store
+        .conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM pool_entries WHERE kind='vote'), \
+                (SELECT COUNT(*) FROM events WHERE kind='pool_entry_appended')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((votes, events), (0, 0));
+}
+
 /// Reads page by the immutable cursor in both directions and report no
 /// internal execution identity.
 #[test]
@@ -609,7 +758,7 @@ fn read_pages_by_cursor_without_internal_ids() {
     let (_, members) = pool(&home, &[("done", "it ships")]);
     let (run, attempt, token) = &members[0];
     let mut store = home.store();
-    for index in 1..=3 {
+    for index in 1..=7 {
         store
             .pool_write(
                 run,
@@ -632,20 +781,102 @@ fn read_pages_by_cursor_without_internal_ids() {
         .unwrap()
         .unwrap();
     assert_eq!(rest["complete"], true);
-    assert_eq!(rest["entries"].as_array().unwrap().len(), 1);
-    let back = store
-        .pool_read(run, attempt, token, 0, Some(3), 50)
-        .unwrap()
-        .unwrap();
-    let bodies: Vec<&str> = back["entries"]
+    assert_eq!(rest["entries"].as_array().unwrap().len(), 5);
+    let forward_seqs: Vec<u64> = first["entries"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|entry| entry["body"].as_str().unwrap())
+        .chain(rest["entries"].as_array().unwrap())
+        .map(|entry| entry["seq"].as_u64().unwrap())
         .collect();
-    assert_eq!(bodies, ["m1", "m2"]);
+    assert_eq!(forward_seqs, (1..=7).collect::<Vec<_>>());
+
+    let mut before = Some(8);
+    let mut reverse_pages = Vec::new();
+    loop {
+        let page = store
+            .pool_read(run, attempt, token, 0, before, 2)
+            .unwrap()
+            .unwrap();
+        reverse_pages.extend(
+            page["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["seq"].as_u64().unwrap()),
+        );
+        if page["complete"] == true {
+            break;
+        }
+        before = Some(page["next_cursor"].as_u64().unwrap());
+    }
+    assert_eq!(reverse_pages, [6, 7, 4, 5, 2, 3, 1]);
+    let mut reverse_sorted = reverse_pages.clone();
+    reverse_sorted.sort_unstable();
+    assert_eq!(reverse_sorted, (1..=7).collect::<Vec<_>>());
     let text = rest.to_string();
     assert!(!text.contains(&attempt.clone()), "no attempt ids leak");
+}
+
+/// Replacement names follow Rust's Unicode lowercase rule inside the transaction.
+#[test]
+fn replacement_name_collisions_are_unicode_safe_and_atomic() {
+    let home = common::Home::new();
+    let (pool_id, members) = pool_with_names(&home, &[("done", "it ships")], ["Old", "Äda"]);
+    let old = &members[0].0;
+    let mut store = home.store();
+    for (run, attempt, _) in &members {
+        store
+            .conn
+            .execute(
+                "UPDATE agents SET status='failed',finished_at=2 WHERE id=?",
+                [run.as_str()],
+            )
+            .unwrap();
+        store.conn.execute(
+            "UPDATE attempts SET state='failed',finished_at=2,phase='cleanup_complete',cleanup_proof_json=? WHERE id=?",
+            rusqlite::params![r#"{"confirmed":true}"#, attempt],
+        ).unwrap();
+    }
+
+    let before_unicode = replacement_state(&store, &pool_id);
+    assert!(matches!(
+        replacement_with_name(&home, &mut store, &pool_id, old, "äDA"),
+        Err(Error::Validation(message)) if message == "member names must be unique"
+    ));
+    assert_eq!(replacement_state(&store, &pool_id), before_unicode);
+
+    let before_reuse = replacement_state(&store, &pool_id);
+    assert!(!matches!(
+        replacement_with_name(&home, &mut store, &pool_id, old, "oLD"),
+        Err(Error::Validation(message)) if message == "member names must be unique"
+    ));
+    assert_eq!(replacement_state(&store, &pool_id), before_reuse);
+
+    let ascii_home = common::Home::new();
+    let (ascii_pool, ascii_members) =
+        pool_with_names(&ascii_home, &[("done", "it ships")], ["Old", "Peer"]);
+    let ascii_old = &ascii_members[0].0;
+    let mut ascii_store = ascii_home.store();
+    for (run, attempt, _) in &ascii_members {
+        ascii_store
+            .conn
+            .execute(
+                "UPDATE agents SET status='failed',finished_at=2 WHERE id=?",
+                [run.as_str()],
+            )
+            .unwrap();
+        ascii_store.conn.execute(
+            "UPDATE attempts SET state='failed',finished_at=2,phase='cleanup_complete',cleanup_proof_json=? WHERE id=?",
+            rusqlite::params![r#"{"confirmed":true}"#, attempt],
+        ).unwrap();
+    }
+    let before_ascii = replacement_state(&ascii_store, &ascii_pool);
+    assert!(matches!(
+        replacement_with_name(&ascii_home, &mut ascii_store, &ascii_pool, ascii_old, "pEER"),
+        Err(Error::Validation(message)) if message == "member names must be unique"
+    ));
+    assert_eq!(replacement_state(&ascii_store, &ascii_pool), before_ascii);
 }
 
 /// A finished (terminal) attempt cannot read or write the log.
@@ -1831,4 +2062,330 @@ fn closed_pool_replays_identical_retries_and_refuses_new_keys() {
         PoolDenial::PoolCompleted
     );
     assert_eq!(rows_of(&store, "pool_entries"), 3, "no row was added");
+}
+
+/// The live common-notice projection shares one frozen status across worker and operator reads.
+#[test]
+fn common_notice_projection_tracks_live_delivery_without_changing_frozen_status() {
+    let home = common::Home::new();
+    let (pool_id, members) = pool(&home, &[("done", "it ships")]);
+    let pool_id: agent_run_domain::pool::PoolId = pool_id.parse().unwrap();
+    let (run, attempt, token) = &members[0];
+    let mut store = home.store();
+
+    let not_created = store
+        .pool_operator_read(&pool_id, 0, None, 50)
+        .unwrap()
+        .unwrap();
+    assert_eq!(not_created["delivery"]["state"], "not_created");
+    assert_eq!(not_created["delivery"]["bound"], false);
+
+    let frozen = json!({
+        "goal":"ship it",
+        "acceptance":[{"id":"done","text":"it ships"}],
+        "roster_revision":1,
+        "proposal":{"seq":1,"snapshot":"verified result"},
+        "members":[
+            {"name":"member-1","role":"doer","agent_id":members[0].0,"slot":1},
+            {"name":"member-2","role":"doer","agent_id":members[1].0,"slot":2}
+        ]
+    });
+    let tx = store.conn.transaction().unwrap();
+    tx.execute(
+        "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) \
+         VALUES('pool-session-private','codex_queue','client-session-private',1,1)",
+        [],
+    ).unwrap();
+    tx.execute(
+        "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?,2,'pool_completed',?)",
+        rusqlite::params![run.as_str(), frozen.to_string()],
+    )
+    .unwrap();
+    let terminal_event: i64 = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO deliveries(id,agent_id,terminal_event_seq,state) VALUES('ntf_pool_private',?,?,'waiting_binding')",
+        rusqlite::params![run.as_str(), terminal_event],
+    ).unwrap();
+    tx.execute(
+        "UPDATE pools SET state='completed',completed_at=2,completion_delivery_id='ntf_pool_private' WHERE id=?",
+        [pool_id.as_str()],
+    ).unwrap();
+    tx.commit().unwrap();
+    let proof_before: String = store
+        .conn
+        .query_row(
+            "SELECT data_json FROM events WHERE seq=?",
+            [terminal_event],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    let cases = [
+        ("waiting_binding", None, 0, false, None, None),
+        (
+            "delivered",
+            Some("pool-session-private"),
+            1,
+            false,
+            None,
+            Some("relay_accepted"),
+        ),
+        (
+            "failed",
+            Some("pool-session-private"),
+            1,
+            true,
+            Some("relay_ambiguous"),
+            Some("relay_ambiguous"),
+        ),
+        (
+            "retry_wait",
+            Some("pool-session-private"),
+            2,
+            false,
+            Some("uds_unavailable"),
+            Some("uds_unavailable"),
+        ),
+        (
+            "cancelled",
+            Some("pool-session-private"),
+            1,
+            false,
+            Some("relay_rejected"),
+            Some("relay_rejected"),
+        ),
+    ];
+    for (state, session, attempts, ambiguous, last_error, classifier) in cases {
+        store
+            .conn
+            .execute(
+                "UPDATE pools SET orchestrator_session_id=? WHERE id=?",
+                rusqlite::params![session, pool_id.as_str()],
+            )
+            .unwrap();
+        store.conn.execute(
+            "UPDATE deliveries SET orchestrator_session_id=?,state=?,attempts=?,ambiguous_result=?,last_error=? WHERE id='ntf_pool_private'",
+            rusqlite::params![session, state, attempts, ambiguous, last_error],
+        ).unwrap();
+        store
+            .conn
+            .execute(
+                "DELETE FROM delivery_attempt_evidence WHERE delivery_id='ntf_pool_private'",
+                [],
+            )
+            .unwrap();
+        if let Some(classifier) = classifier {
+            let evidence = json!({
+                "classifier":classifier,"executable":"desktop-relay","argv_shape":["relay"],
+                "duration_ms":1,"returncode":null,"spawn_errno":null,"error_class":null,
+                "stdout_tail":"","stderr_tail":"","stdout_bytes":0,"stderr_bytes":0,
+                "stdout_truncated":false,"stderr_truncated":false,"message_id_present":state=="delivered"
+            });
+            store.conn.execute(
+                "INSERT INTO delivery_attempt_evidence(delivery_id,attempt,recorded_at,evidence_json) VALUES('ntf_pool_private',?,?,?)",
+                rusqlite::params![attempts, 3, evidence.to_string()],
+            ).unwrap();
+        }
+
+        let operator_page = store
+            .pool_operator_read(&pool_id, 0, None, 50)
+            .unwrap()
+            .unwrap();
+        let worker_page = store
+            .pool_read(run, attempt, token, 0, None, 50)
+            .unwrap()
+            .unwrap();
+        let delivery = &operator_page["delivery"];
+        assert_eq!(delivery, &worker_page["delivery"]);
+        assert_eq!(delivery["state"], state);
+        assert_eq!(delivery["bound"], session.is_some());
+        assert_eq!(delivery["attempts"], attempts);
+        assert_eq!(delivery["ambiguous"], ambiguous);
+        assert_eq!(
+            delivery["last_classification"],
+            classifier.map_or(Value::Null, Value::from)
+        );
+        assert_eq!(
+            delivery["last_attempt"]["classifier"],
+            classifier.map_or(Value::Null, Value::from)
+        );
+        assert_eq!(operator_page["status"], worker_page["status"]);
+        let printed = delivery.to_string();
+        for private in [
+            "ntf_pool_private",
+            "pool-session-private",
+            "client-session-private",
+            "orchestrator_session_id",
+        ] {
+            assert!(!printed.contains(private), "{private} leaked");
+        }
+    }
+    let proof_after: String = store
+        .conn
+        .query_row(
+            "SELECT data_json FROM events WHERE seq=?",
+            [terminal_event],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(proof_before, proof_after);
+}
+
+/// Reads the operator page's top-level `activity` word.
+fn activity(store: &Store, pool_id: &agent_run_domain::pool::PoolId) -> String {
+    store
+        .pool_operator_read(pool_id, 0, None, 50)
+        .unwrap()
+        .unwrap()["activity"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// Sets every member's latest execution status and, when `cleaned`, its cleanup proof.
+fn set_tips(store: &Store, members: &[(AgentId, String, String)], status: &str, cleaned: bool) {
+    for (run, _, _) in members {
+        store
+            .conn
+            .execute(
+                "UPDATE agents SET status=? WHERE id=?",
+                [status, run.as_str()],
+            )
+            .unwrap();
+        let (phase, proof) = if cleaned {
+            ("cleanup_complete", Some("{}"))
+        } else {
+            ("running", None)
+        };
+        store
+            .conn
+            .execute(
+                "UPDATE attempts SET ownership_active=?,phase=?,cleanup_proof_json=? WHERE agent_id=?",
+                rusqlite::params![!cleaned, phase, proof, run.as_str()],
+            )
+            .unwrap();
+    }
+}
+
+/// An open pool's read-time activity follows its current members without ever
+/// changing the stored state: cancellation is `stopping` until cleanup is
+/// proven, then `cancelled` yet restorable (state stays `open`, nothing is
+/// completed or notified), and a resumed member returns it to `running`.
+/// Failure, a mixed cancellation or a blocked vote need action; agreed
+/// success awaiting its completion record is `settling`; a completed pool
+/// stays `completed` with its frozen status byte-identical after a resume.
+#[test]
+fn pool_activity_projects_lifecycle_without_changing_stored_state() {
+    let home = common::Home::new();
+    let (_, members, pool_id) = voted_pool(&home);
+    let mut store = home.store();
+    assert_eq!(activity(&store, &pool_id), "running");
+
+    set_tips(&store, &members, "cancelled", false);
+    assert_eq!(activity(&store, &pool_id), "stopping");
+    set_tips(&store, &members, "cancelled", true);
+    assert_eq!(activity(&store, &pool_id), "cancelled");
+    let page = store
+        .pool_operator_read(&pool_id, 0, None, 50)
+        .unwrap()
+        .unwrap();
+    assert_eq!(page["status"]["state"], "open");
+    assert!(store.settle_pool(&pool_id).unwrap().is_none());
+    assert_eq!(rows_of(&store, "deliveries"), 0, "no common completion");
+
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='failed' WHERE id=?",
+            [members[0].0.as_str()],
+        )
+        .unwrap();
+    assert_eq!(activity(&store, &pool_id), "needs_action", "mixed ends");
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='cancelled' WHERE id=?",
+            [members[0].0.as_str()],
+        )
+        .unwrap();
+
+    // Resume: a new running tip makes the pool active again.
+    store
+        .conn
+        .execute(
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id,parent_agent_id,sequence) \
+             SELECT 'ag-20260101-000000-0000000077',runtime,model,profile,'t','t',workdir,'{}','running',9.0,10.0,'cfg',id,id,2 FROM agents WHERE id=?",
+            [members[0].0.as_str()],
+        )
+        .unwrap();
+    assert_eq!(activity(&store, &pool_id), "running");
+    store
+        .conn
+        .execute(
+            "DELETE FROM agents WHERE id='ag-20260101-000000-0000000077'",
+            [],
+        )
+        .unwrap();
+
+    set_tips(&store, &members, "succeeded", false);
+    assert_eq!(activity(&store, &pool_id), "stopping");
+    set_tips(&store, &members, "succeeded", true);
+    assert_eq!(activity(&store, &pool_id), "settling");
+    assert_eq!(
+        store
+            .pool_operator_read(&pool_id, 0, None, 50)
+            .unwrap()
+            .unwrap()["status"]["state"],
+        "open"
+    );
+    assert!(store.settle_pool(&pool_id).unwrap().is_some());
+    assert_eq!(activity(&store, &pool_id), "completed");
+    let frozen = store
+        .pool_operator_read(&pool_id, 0, None, 50)
+        .unwrap()
+        .unwrap()["status"]
+        .to_string();
+    store
+        .conn
+        .execute(
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id,parent_agent_id,sequence) \
+             SELECT 'ag-20260101-000000-0000000078',runtime,model,profile,'t','t',workdir,'{}','running',9.0,10.0,'cfg',id,id,2 FROM agents WHERE id=?",
+            [members[0].0.as_str()],
+        )
+        .unwrap();
+    assert_eq!(activity(&store, &pool_id), "completed");
+    let after = store
+        .pool_operator_read(&pool_id, 0, None, 50)
+        .unwrap()
+        .unwrap()["status"]
+        .to_string();
+    assert_eq!(after, frozen, "frozen status is byte-identical");
+}
+
+/// Every member succeeded and cleaned but one vote blocks: the pool cannot
+/// settle itself, so the activity asks for action.
+#[test]
+fn pool_activity_needs_action_for_succeeded_members_with_a_blocked_vote() {
+    let home = common::Home::new();
+    let (_, members, pool_id) = voted_pool(&home);
+    let mut store = home.store();
+    let (run, attempt, token) = &members[1];
+    store
+        .pool_write(
+            run,
+            attempt,
+            token,
+            PoolWrite::Vote(PoolVote {
+                request_id: "blk".into(),
+                proposal_seq: 1,
+                decision: VoteDecision::Block,
+                checks: vec![],
+                message: Some("not acceptable".into()),
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    set_tips(&store, &members, "succeeded", true);
+    assert_eq!(activity(&store, &pool_id), "needs_action");
+    assert!(store.settle_pool(&pool_id).unwrap().is_none());
 }

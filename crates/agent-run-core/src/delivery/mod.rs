@@ -9,8 +9,11 @@ use crate::{
     state::Store,
     Result,
 };
-use agent_run_config::provider_config::ProviderConfig;
-use agent_run_domain::worker::{WorkerMessageKind, WorkerNotice};
+use agent_run_config::{config::Delivery, provider_config::ProviderConfig};
+use agent_run_domain::{
+    domain::OrchestratorRef,
+    worker::{WorkerMessageKind, WorkerNotice},
+};
 use fs2::FileExt;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -357,6 +360,9 @@ struct Claim {
     transport: String,
     session: String,
     payload: Payload,
+    /// Retry policy captured before the lease was taken, so a config change
+    /// during the send can never decide the outcome of an acknowledged attempt.
+    policy: Delivery,
 }
 
 /// The one trusted delivery shape selected from the durable outbox row.
@@ -435,6 +441,17 @@ fn expire_unbound(tx: &rusqlite::Transaction<'_>, time: f64) -> Result<()> {
     Ok(())
 }
 
+/// Loads the delivery policy from either supported config schema.
+///
+/// Called only before a delivery is leased: a missing or malformed config then
+/// leaves the row untouched and unsent instead of discarding evidence later.
+fn delivery_policy(home: &Path) -> Result<Delivery> {
+    Ok(match ProviderConfig::load(home) {
+        Ok((config, _)) => config.delivery,
+        Err(_) => Config::load(home)?.delivery,
+    })
+}
+
 /// Atomically selects and leases one due bound delivery for this dispatcher identity.
 ///
 /// A queued Claude notice whose previous attempt was possibly sent
@@ -443,6 +460,9 @@ fn expire_unbound(tx: &rusqlite::Transaction<'_>, time: f64) -> Result<()> {
 /// dispatcher crash, such as an expired `sending` lease) is ended failed-ambiguous without a new
 /// send and this claim returns `None`; the finished row leaves the schedule,
 /// so the next dispatch tick makes progress.
+/// Claims one due delivery and returns its canonical adapter name when a known
+/// legacy transport alias was persisted. Unknown transports remain unchanged so
+/// dispatch records the safe `unsupported_transport` classifier.
 fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
     let mut store = Store::open(home)?;
     let tx = store
@@ -476,6 +496,10 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
         [session_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
+    let transport = match OrchestratorRef::canonical_transport_name(&transport) {
+        Ok(canonical) => canonical.to_owned(),
+        Err(_) => transport,
+    };
     if transport == "claude_uds" && attempts > 0 {
         // Evidence for exactly the current attempt count decides. Missing
         // evidence (a dispatcher that crashed around the write, e.g. an
@@ -610,6 +634,7 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
         notice.validate()?;
         Payload::Completion(notice)
     };
+    let policy = delivery_policy(home)?;
     let attempt = attempts
         .checked_add(1)
         .ok_or_else(|| invalid("delivery attempt counter overflow"))?;
@@ -630,6 +655,7 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
         transport,
         session,
         payload,
+        policy,
     }))
 }
 
@@ -643,11 +669,13 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
 /// so exactly-once cannot be proved. They end terminally `failed` with the
 /// ambiguous flag at once (at-most-once) instead of retrying into duplicates;
 /// known-unsent outcomes (session gone, unavailable, rejected) still retry.
+///
+/// The retry policy is the one captured in `claim`; no configuration is read
+/// here, so a config change after sending cannot discard an acknowledgement.
+/// Evidence is committed only while this attempt still owns its live lease;
+/// cancellation or ownership loss still takes precedence.
 fn complete(home: &Path, claim: &Claim, evidence: &Evidence) -> Result<()> {
-    let delivery = match ProviderConfig::load(home) {
-        Ok((config, _)) => config.delivery,
-        Err(_) => Config::load(home)?.delivery,
-    };
+    let delivery = &claim.policy;
     let mut store = Store::open(home)?;
     let tx = store
         .conn
@@ -830,6 +858,8 @@ mod tests {
     fn resumed_notice_keeps_exact_run_and_stable_agent() {
         let home = tempfile::tempdir().unwrap();
         let store = Store::initialize(home.path()).unwrap();
+        // Claiming captures the delivery policy, so the home needs a valid config.
+        std::fs::write(home.path().join("config.toml"), "schema_version = 2\n").unwrap();
         let root = "ag-20260925-000000-0000000001";
         let child = "ag-20260925-000000-0000000002";
         for id in [root, child] {

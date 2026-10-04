@@ -443,10 +443,9 @@ async fn agents_follow_binary_tracks_the_real_lifecycle_without_duplicates() {
     assert_eq!(answer["content"], "fixture final answer\n");
 }
 
-/// A finite real-broker pool run: two members use the private worker catalog to
-/// read, propose and vote, end successfully with cleanup, and the broker
-/// completes the pool exactly once, delivering one common notice through the
-/// bound Desktop relay and keeping the completed record frozen and closed.
+/// A finite real-broker pool run accepts the `codex` alias, persists its
+/// canonical transport, and delivers exactly one common notice through the
+/// bound fake Desktop relay after both private-catalog members finish.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scripted_pool_completes_with_one_correlated_common_notice() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -516,19 +515,82 @@ async fn scripted_pool_completes_with_one_correlated_common_notice() {
             "provider":"mock","model":"fixture","profile":"review","task":task,
             "workdir":h.home,"timeout_seconds":40}})
     };
-    let started = socket::client(
-        &h.home,
-        "start_pool",
-        json!({
-            "request_id": "scripted-pool", "goal": "ship the fixture result",
-            "orchestrator": {"transport":"codex_queue","external_session_id":"fixture-pool-thread"},
-            "members": [member("lead","fixture:pool-script lead"), member("peer","fixture:pool-script peer")]
-        }),
-    )
-    .await
-    .unwrap();
+    let pool_start = json!({
+        "request_id": "scripted-pool", "goal": "ship the fixture result",
+        "orchestrator": {"transport":"codex","external_session_id":"fixture-pool-thread"},
+        "members": [member("lead","fixture:pool-script lead"), member("peer","fixture:pool-script peer")]
+    });
+    let before: (i64, i64) = Store::open(&h.home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM agents),(SELECT COUNT(*) FROM pools)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut unsupported = pool_start.clone();
+    unsupported["orchestrator"]["transport"] = json!("other");
+    let error = socket::client(&h.home, "start_pool", unsupported)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.machine_code(),
+        agent_run_domain::error::MachineCode::ValidationError
+    );
+    let after: (i64, i64) = Store::open(&h.home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM agents),(SELECT COUNT(*) FROM pools)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "unknown transport is rejected before admission"
+    );
+    let started = socket::client(&h.home, "start_pool", pool_start.clone())
+        .await
+        .unwrap();
     assert_eq!(started["bound"], true);
+    let stored_transport: String = Store::open(&h.home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT transport FROM orchestrator_sessions WHERE external_session_id=?",
+            ["fixture-pool-thread"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_transport, "codex_queue");
     let pool_id = started["pool_id"].as_str().unwrap().to_owned();
+    // Model a 0.20.2 row: replay namespace, fingerprint, and session retain
+    // the raw alias. A canonical retry must find that exact request unchanged.
+    let mut historical: agent_run_domain::pool::PoolStartRequest =
+        serde_json::from_value(pool_start.clone()).unwrap();
+    historical.validate().unwrap();
+    let mut historical_value = serde_json::to_value(&historical).unwrap();
+    historical_value["orchestrator"]["transport"] = json!("codex");
+    let old_namespace =
+        agent_run_domain::canonical::sha256_hex(&json!(["codex", "fixture-pool-thread"]), true);
+    let old_sha = agent_run_domain::canonical::sha256_hex(&historical_value, true);
+    Store::open(&h.home)
+        .unwrap()
+        .conn
+        .execute(
+            "UPDATE pools SET request_namespace=?,request_sha256=? WHERE id=?",
+            rusqlite::params![old_namespace, old_sha, pool_id],
+        )
+        .unwrap();
+    let mut canonical_retry = pool_start;
+    canonical_retry["orchestrator"]["transport"] = json!("codex_queue");
+    let replay = socket::client(&h.home, "start_pool", canonical_retry)
+        .await
+        .unwrap();
+    assert_eq!(replay["created"], false);
+    assert_eq!(replay["pool_id"], pool_id);
     let ids: Vec<AgentId> = started["members"]
         .as_array()
         .unwrap()

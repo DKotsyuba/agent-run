@@ -63,11 +63,11 @@ Only then does `start` return ownership to the caller. The supervisor opens its
 own store connection, materializes the runtime, starts the engine, journals its
 stream, seals an answer, records terminal evidence, and performs cleanup.
 
-A provider run has one execution deadline: admission time plus its stored
-`timeout_seconds`. Preparation and every account-switch attempt consume that
-same budget. Before each spawn the supervisor checks the remaining time; it
-bounds execution by that remainder, cleans up on expiry, and records
-`timed_out`. There is no independent silence watchdog. Success requires a
+A run (schema-1 and provider alike) has one execution deadline: admission
+time plus its stored, already-scaled `timeout_seconds`. Preparation and every
+account-switch attempt consume that same budget. Before each spawn the
+supervisor checks the remaining time; it bounds execution by that remainder,
+cleans up on expiry, and records `timed_out`. There is no independent silence watchdog. Success requires a
 verified answer plus completion and cleanup evidence; exit code alone is never
 enough.
 
@@ -235,8 +235,11 @@ The resident broker and its admitted detached jobs have independent ownership.
 Delivery attempts are leased, bounded, and retried with backoff. Persisted
 diagnostics contain safe classifications and redacted tails, never task or
 answer text, session IDs, argument or environment values, or credentials.
-The dispatcher reads retry policy from the active configuration schema, so
-schema-2 homes complete each claimed attempt before its lease can be retried.
+The dispatcher reads retry policy from the active configuration schema once,
+before it leases a delivery, so schema-2 homes complete each claimed attempt
+before its lease can be retried. A missing or malformed configuration at that
+point leaves the delivery unsent; a change after the lease never discards an
+acknowledgement or its evidence.
 
 ## Capacity and diagnostics
 

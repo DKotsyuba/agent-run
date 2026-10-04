@@ -79,10 +79,10 @@ fn unique_constraints<'de, D: serde::Deserializer<'de>>(
 }
 
 impl ProviderStartRequest {
-    /// Validates paths, task, effort, timeout, namespace and the optional human
-    /// label; stores canonical paths and the trimmed label in place. Invalid
-    /// labels return `ValidationError` before admission. Historical runtime
-    /// selectors remain excluded from public v2 input.
+    /// Validates paths, task, effort, timeout, namespace, orchestrator transport
+    /// and the optional human label; stores canonical paths, labels and transport
+    /// in place. Invalid values return `ValidationError` before admission.
+    /// Historical runtime selectors remain excluded from public v2 input.
     pub fn validate(&mut self) -> Result<()> {
         let mut projection = self.storage_projection();
         projection.validate()?;
@@ -90,6 +90,7 @@ impl ProviderStartRequest {
         self.read_roots = projection.read_roots;
         self.timeout_seconds = projection.timeout_seconds;
         self.display_name = projection.display_name;
+        self.orchestrator = projection.orchestrator;
         Ok(())
     }
 

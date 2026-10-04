@@ -281,7 +281,24 @@ fn main() {
             .expect("fixture workdir")
             .join("escaped.pid");
         std::fs::write(marker, child.id().to_string()).expect("fixture escaped pid");
-        std::thread::sleep(Duration::from_millis(500));
+        // Capture handshake. The supervisor records a descendant only from a
+        // refresh made while this leader lives, and refreshes at the top of each
+        // stdout read once 200 ms have passed since the last one. After this
+        // pause any earlier refresh is stale, so the read that returns frame
+        // `ready` (which begins only after frame `warmup` was processed) must
+        // refresh with the helper present. The leader then stays alive until the
+        // owning test has seen `ready` journaled and releases it, bounded to
+        // twenty seconds so a lost driver still ends this child finitely.
+        std::thread::sleep(Duration::from_millis(250));
+        for text in [
+            "fixture escaped warmup\n",
+            "fixture escaped capture ready\n",
+        ] {
+            emit(
+                json!({"type":"assistant","session_id":session,"message":{"content":[{"type":"text","text":text}]}}),
+            );
+        }
+        wait_marker("escaped-release");
     }
     if task == "fixture:missing-result" {
         return;
@@ -355,6 +372,16 @@ fn main() {
     emit(
         json!({"type":"result","subtype":if failed{"error_during_execution"}else{"success"},"is_error":failed,"session_id":session,"result":if failed{"fixture failure"}else{"fixture final answer\n"},"usage":{"input_tokens":2,"output_tokens":3},"num_turns":1}),
     );
+    if task == "fixture:result-then-hang" {
+        // A complete, valid success result followed by a root process that keeps
+        // its stdout open and never exits on its own accord: only the run
+        // deadline's cleanup should end it. The twenty second ceiling is a
+        // safety net so a failed cleanup still ends this child finitely.
+        let ceiling = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < ceiling {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
     if task == "fixture:nonzero-after-result" {
         io::stdout().flush().expect("fixture stdout");
         std::process::exit(3);

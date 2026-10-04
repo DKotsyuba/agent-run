@@ -500,7 +500,101 @@ fn pool_exists(conn: &Connection, pool_id: &str) -> Result<bool> {
     )?)
 }
 
-/// One cursor page of a pool's log plus its derived status.
+/// Projects the pool's common notice status without exposing delivery or session ids.
+/// The linked outbox row is live state; when absent, `not_created` describes the pool.
+fn pool_delivery_view(conn: &Connection, pool_id: &str) -> Result<Value> {
+    const STATES: &[&str] = &[
+        "waiting_binding",
+        "pending",
+        "sending",
+        "delivered",
+        "retry_wait",
+        "failed",
+        "cancelled",
+        "expired",
+    ];
+    const CLASSIFIERS: &[&str] = &[
+        "relay_accepted",
+        "relay_rejected",
+        "relay_ambiguous",
+        "relay_unavailable",
+        "uds_receipt_held",
+        "uds_receipt_delivered",
+        "uds_receipt_refused",
+        "uds_unconfirmed",
+        "uds_ambiguous",
+        "uds_session_gone",
+        "uds_rejected",
+        "uds_unavailable",
+        "unsupported_transport",
+    ];
+    let (pool_session, delivery_id): (Option<String>, Option<String>) = conn.query_row(
+        "SELECT orchestrator_session_id,completion_delivery_id FROM pools WHERE id=?",
+        [pool_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let Some(delivery_id) = delivery_id else {
+        return Ok(json!({
+            "bound": pool_session.is_some(),
+            "state": "not_created",
+            "attempts": 0,
+            "ambiguous": false,
+            "last_classification": null,
+            "last_attempt": null,
+        }));
+    };
+    let (session, state, attempts, ambiguous, last_error): (
+        Option<String>,
+        String,
+        u32,
+        bool,
+        Option<String>,
+    ) = conn
+        .query_row(
+            "SELECT orchestrator_session_id,state,attempts,ambiguous_result,last_error \
+             FROM deliveries WHERE id=?",
+            [&delivery_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| Error::Integrity("pool completion delivery is missing".into()))?;
+    let attempt = crate::delivery::latest_on(conn, &delivery_id)?;
+    let evidence = attempt.filter(|value| {
+        value
+            .get("classifier")
+            .and_then(Value::as_str)
+            .is_some_and(|classifier| CLASSIFIERS.contains(&classifier))
+    });
+    let last_classification = evidence
+        .as_ref()
+        .and_then(|value| value.get("classifier"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            last_error
+                .as_deref()
+                .filter(|classifier| CLASSIFIERS.contains(classifier))
+        });
+    Ok(json!({
+        "bound": session.is_some(),
+        "state": if STATES.contains(&state.as_str()) { state.as_str() } else { "unknown" },
+        "attempts": attempts,
+        "ambiguous": ambiguous,
+        "last_classification": last_classification,
+        "last_attempt": evidence,
+    }))
+}
+
+/// One cursor page of a pool's log plus its derived status. Backward pages
+/// return ascending entries and continue before their oldest returned sequence;
+/// forward pages continue after their newest returned sequence.
 fn read_page(
     conn: &Connection,
     pool_id: &str,
@@ -508,12 +602,14 @@ fn read_page(
     before_seq: Option<u64>,
     limit: u32,
 ) -> Result<Value> {
-    let status = pool_status(conn, pool_id)?;
+    let tx = conn.unchecked_transaction()?;
+    let status = pool_status(&tx, pool_id)?;
+    let delivery = pool_delivery_view(&tx, pool_id)?;
     let (selection, order, cursor) = match before_seq {
         Some(before) => ("seq<?", "DESC", before as i64),
         None => ("seq>?", "ASC", after_seq as i64),
     };
-    let mut statement = conn.prepare(&format!(
+    let mut statement = tx.prepare(&format!(
         "SELECT seq,author_kind,author_agent_id,author_name,author_role,direction,kind,\
              severity,proposal_seq,roster_revision,decision,body \
              FROM pool_entries WHERE pool_id=? AND {selection} ORDER BY seq {order} LIMIT ?"
@@ -532,11 +628,15 @@ fn read_page(
             .validate()
             .map_err(|e| Error::Integrity(format!("pool entry is invalid: {e}")))?;
     }
-    let next_cursor = (!complete)
-        .then(|| entries.last().map(|entry| entry.seq))
-        .flatten();
+    let next_cursor = if complete {
+        None
+    } else if before_seq.is_some() {
+        entries.first().map(|entry| entry.seq)
+    } else {
+        entries.last().map(|entry| entry.seq)
+    };
     let last_seq = entries.last().map(|entry| entry.seq);
-    Ok(json!({
+    let page = json!({
             "pool_id": pool_id,
             "entries": entries,
             "after_seq": after_seq,
@@ -545,8 +645,12 @@ fn read_page(
             "next_cursor": next_cursor,
             "last_seq": last_seq,
             "complete": complete,
+            "activity": pool_activity(&status),
             "status": status,
-    }))
+            "delivery": delivery,
+    });
+    tx.commit()?;
+    Ok(page)
 }
 
 /// Decodes one journal row into its validated public view shape.
@@ -1042,6 +1146,62 @@ fn pool_status(conn: &Connection, pool_id: &str) -> Result<Value> {
         "agreed": agreed,
         "note": "agreement is not completion: the pool completes only after every member execution ends successfully with cleanup evidence",
     }))
+}
+
+/// Projects a derived pool status into one read-time activity word.
+///
+/// Presentation only: it is never stored, completes nothing and leaves the
+/// status proof untouched. `state` stays `open` after a cancellation so a
+/// member can still resume or be replaced, which returns the activity to
+/// `running`. Precedence:
+///
+/// * `completed` — the frozen completed record;
+/// * `running` — any current member's latest run is not terminal;
+/// * `stopping` — every latest run is terminal but some member lineage still
+///   lacks verified cleanup, so nothing is called stopped or cancelled yet;
+/// * `cancelled` — every latest run is cancelled and every lineage cleaned;
+/// * `settling` — every latest run succeeded, all votes agree and all cleanup
+///   is proven, but the pool has not been recorded completed yet;
+/// * `needs_action` — every other fully terminal, cleaned case (a failure, a
+///   mixed cancellation, or missing, blocked or stale votes).
+///
+/// A pool with no current member is `needs_action`.
+fn pool_activity(status: &Value) -> &'static str {
+    if status["state"] == json!("completed") {
+        return "completed";
+    }
+    let members = status["members"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let tips: Vec<Option<agent_run_domain::domain::Status>> = members
+        .iter()
+        .map(|member| member["tip_status"].as_str().and_then(|s| s.parse().ok()))
+        .collect();
+    if members.is_empty() {
+        return "needs_action";
+    }
+    // An unparsable status is unknown, so it is treated as still active.
+    if tips
+        .iter()
+        .any(|tip| !tip.is_some_and(|tip| tip.terminal()))
+    {
+        return "running";
+    }
+    if members
+        .iter()
+        .any(|member| member["cleanup_complete"] != json!(true))
+    {
+        return "stopping";
+    }
+    let all = |wanted| tips.iter().all(|tip| *tip == Some(wanted));
+    if all(agent_run_domain::domain::Status::Cancelled) {
+        "cancelled"
+    } else if all(agent_run_domain::domain::Status::Succeeded) && status["agreed"] == json!(true) {
+        "settling"
+    } else {
+        "needs_action"
+    }
 }
 
 /// Derives one member's vote status fields and the reason it counts or not.

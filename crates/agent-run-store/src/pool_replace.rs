@@ -186,6 +186,26 @@ fn replayed(
 }
 
 impl Store {
+    /// For `pool_id`, checks whether any current member except `old` matches `name` under the
+    /// same Unicode lowercase comparison as initial pool admission.
+    fn current_name_taken(
+        conn: &Connection,
+        pool_id: &str,
+        old: &AgentId,
+        name: &str,
+    ) -> Result<bool> {
+        let mut statement = conn.prepare(
+            "SELECT name FROM pool_members WHERE pool_id=? AND replaced_by IS NULL AND agent_id<>?",
+        )?;
+        let names = statement
+            .query_map(params![pool_id, old.as_str()], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let folded = name.to_lowercase();
+        Ok(names.iter().any(|current| current.to_lowercase() == folded))
+    }
+
     /// The orchestrator reference a pool is actually bound to, from its stored
     /// session row, or `None` while the pool is unbound. Replacements and
     /// resumes inherit this, never the reference frozen at the original start.
@@ -300,7 +320,9 @@ impl Store {
     /// Inside the transaction it replays the same scoped request, then
     /// rechecks that the pool is open at the roster revision the task was
     /// composed against, that `old` is still a current member and that its
-    /// latest execution is terminal with its whole lineage cleaned up. It then
+    /// latest execution is terminal with its whole lineage cleaned up. A new
+    /// name may reuse the old seat's name, but must not match another current
+    /// seat under Rust's Unicode lowercase comparison. It then
     /// admits the new agent through the ordinary per-agent admission,
     /// retires the old seat, installs the new one in the same slot, bumps the
     /// roster revision, appends one broker roster entry, fans it out to the
@@ -330,12 +352,7 @@ impl Store {
         if current != input.expected_roster_revision {
             return Ok(Err(PoolDenial::StaleRoster { current }));
         }
-        let taken: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pool_members WHERE pool_id=? AND replaced_by IS NULL \
-             AND agent_id<>? AND lower(name)=lower(?))",
-            params![pool, input.old.as_str(), input.name],
-            |row| row.get(0),
-        )?;
+        let taken = Self::current_name_taken(&tx, pool, input.old, input.name)?;
         if taken {
             return Err(Error::Validation("member names must be unique".into()));
         }

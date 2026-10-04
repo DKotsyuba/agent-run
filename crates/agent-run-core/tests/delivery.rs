@@ -1845,6 +1845,48 @@ async fn dispatch_records_retry_and_success_evidence_for_one_bound_notice() {
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 0);
 }
 
+/// A legacy known-alias session is dispatched through its canonical adapter.
+#[tokio::test]
+async fn retry_dispatch_canonicalizes_legacy_transport_alias() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let home = common::Home::new();
+    delivery(&home.path, "ntf_legacy_alias", "codex", "retry_wait");
+    Connection::open(home.path.join("state.db"))
+        .unwrap()
+        .execute(
+            "UPDATE deliveries SET attempts=1,next_attempt_at=? WHERE id='ntf_legacy_alias'",
+            [now() - 1.0],
+        )
+        .unwrap();
+    let listener =
+        tokio::net::UnixListener::bind(home.path.join("ar-cdx-v4-accepted.sock")).unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let length = stream.read_u32_le().await.unwrap() as usize;
+        let mut data = vec![0; length];
+        stream.read_exact(&mut data).await.unwrap();
+        let reply = br#"{"outcome":"accepted"}"#;
+        stream.write_u32_le(reply.len() as u32).await.unwrap();
+        stream.write_all(reply).await.unwrap();
+        serde_json::from_slice::<Value>(&data).unwrap()
+    });
+
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+    assert_eq!(peer.await.unwrap()["op"], "completion");
+    assert_eq!(
+        Connection::open(home.path.join("state.db"))
+            .unwrap()
+            .query_row(
+                "SELECT state FROM deliveries WHERE id='ntf_legacy_alias'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "delivered"
+    );
+}
+
 /// A durable worker row is dispatched through v4 and retains the usual retry evidence.
 #[tokio::test]
 async fn dispatches_worker_report_without_completion_status() {
@@ -2833,4 +2875,139 @@ fn delivery_configuration_rejects_negative_attempt_and_retry_bounds() {
     std::fs::write(&path, &original).unwrap();
     agent_run_config::config::Config::load(&home.path)
         .expect("the baseline delivery policy stays loadable");
+}
+
+/// How the fixture config is damaged between admission and the peer's reply.
+#[derive(Clone, Copy)]
+enum Damage {
+    /// The file is replaced by bytes that no schema parses.
+    Malformed,
+    /// The file is removed.
+    Missing,
+}
+
+/// Runs one codex relay delivery whose peer damages `config.toml` after the
+/// request arrives (so after the claim) and then answers `reply`; returns the
+/// final `(state, attempts, evidence rows, evidence classifier, last_error)`.
+async fn relay_with_config_damaged_mid_send(
+    home: &common::Home,
+    id: &str,
+    damage: Damage,
+    reply: &'static [u8],
+) -> (String, u32, i64, Option<String>, Option<String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    delivery(&home.path, id, "codex_queue", "pending");
+    let listener = tokio::net::UnixListener::bind(home.path.join("ar-cdx-v3-damage.sock")).unwrap();
+    let config = home.path.join("config.toml");
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let length = stream.read_u32_le().await.unwrap() as usize;
+        let mut request = vec![0; length];
+        stream.read_exact(&mut request).await.unwrap();
+        match damage {
+            Damage::Malformed => std::fs::write(&config, "schema_version = [").unwrap(),
+            Damage::Missing => std::fs::remove_file(&config).unwrap(),
+        }
+        stream.write_u32_le(reply.len() as u32).await.unwrap();
+        stream.write_all(reply).await.unwrap();
+    });
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+    peer.await.unwrap();
+    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let (state, attempts, last_error) = connection
+        .query_row(
+            "SELECT state,attempts,last_error FROM deliveries WHERE id=?",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let (rows, classifier) = connection
+        .query_row(
+            "SELECT COUNT(*),MAX(json_extract(evidence_json,'$.classifier')) FROM delivery_attempt_evidence WHERE delivery_id=?",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    (state, attempts, rows, classifier, last_error)
+}
+
+/// A config that goes malformed or missing after admission must not discard an
+/// authenticated acknowledgement: it is delivered with its immutable evidence
+/// and is never sent again.
+#[tokio::test]
+async fn acknowledgement_survives_config_damage_after_claim() {
+    for (name, damage) in [
+        ("ntf_cfg_bad", Damage::Malformed),
+        ("ntf_cfg_gone", Damage::Missing),
+    ] {
+        let home = common::Home::new();
+        let row =
+            relay_with_config_damaged_mid_send(&home, name, damage, br#"{"outcome":"accepted"}"#)
+                .await;
+        assert_eq!(
+            row,
+            (
+                "delivered".into(),
+                1,
+                1,
+                Some("relay_accepted".into()),
+                None
+            ),
+            "{name}"
+        );
+        // The delivered row is terminal, so a later drain claims nothing.
+        make_due(&home.path, name);
+        assert_eq!(dispatch_once(&home.path).await.unwrap(), 0);
+        let attempts: u32 = Connection::open(home.path.join("state.db"))
+            .unwrap()
+            .query_row("SELECT attempts FROM deliveries WHERE id=?", [name], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(attempts, 1, "{name} was sent again");
+    }
+}
+
+/// A known-unsent outcome keeps its retry even when the config is damaged after
+/// the claim, using the policy captured before the send.
+#[tokio::test]
+async fn known_unsent_outcome_still_retries_after_config_damage() {
+    let home = common::Home::new();
+    delivery_config(&home.path, 1.0, 1.0, 5);
+    let row = relay_with_config_damaged_mid_send(
+        &home,
+        "ntf_cfg_retry",
+        Damage::Malformed,
+        br#"{"outcome":"rejected"}"#,
+    )
+    .await;
+    assert_eq!(
+        row,
+        (
+            "retry_wait".into(),
+            1,
+            1,
+            Some("relay_rejected".into()),
+            Some("relay_rejected".into())
+        )
+    );
+}
+
+/// A malformed config before admission leaves the row unclaimed and unsent.
+#[tokio::test]
+async fn malformed_config_before_claim_leaves_delivery_pending() {
+    let home = common::Home::new();
+    delivery(&home.path, "ntf_cfg_pre", "codex_queue", "pending");
+    std::fs::write(home.path.join("config.toml"), "schema_version = [").unwrap();
+    assert!(dispatch_once(&home.path).await.is_err());
+    let (state, attempts): (String, u32) = Connection::open(home.path.join("state.db"))
+        .unwrap()
+        .query_row(
+            "SELECT state,attempts FROM deliveries WHERE id='ntf_cfg_pre'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((state.as_str(), attempts), ("pending", 0));
 }
