@@ -4,6 +4,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.20.2] - 2026-10-04
+
+- fix(pools): emit only the common completion notice for successful current pool
+  members; failures, timeouts, lost runs and cancellations still notify the
+  orchestrator individually, while standalone completion notices stay unchanged
+
 ## [0.20.1] - 2026-10-04
 
 - test(delivery): keep the scripted pool relay alive across empty socket-health

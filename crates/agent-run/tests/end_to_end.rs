@@ -453,10 +453,9 @@ async fn scripted_pool_completes_with_one_correlated_common_notice() {
     let mut h = Harness::new();
     h.start_broker().await;
     let listener = tokio::net::UnixListener::bind(h.home.join("ar-cdx-v4-pool.sock")).unwrap();
-    // The bound members' own terminal notices are deliberately additive, so the
-    // finite relay acknowledges every notice and records them all; the pool's
-    // one common notice is then picked out by its operation. The task is
-    // aborted by the guard on every exit path.
+    // Successful members use the pool's common notice; the finite relay records
+    // that notice and any unrelated delivery frames. The task is aborted by the
+    // guard on every exit path.
     struct Relay(tokio::task::JoinHandle<()>);
     impl Drop for Relay {
         fn drop(&mut self) {
@@ -545,7 +544,7 @@ async fn scripted_pool_completes_with_one_correlated_common_notice() {
             row.failure_kind, row.failure_text
         );
     }
-    // Two member notices and exactly one common notice, all acknowledged.
+    // No successful member notices and exactly one common notice, acknowledged.
     let relay_deadline = Instant::now() + Duration::from_secs(30);
     let request = loop {
         let seen = received.lock().unwrap().clone();
@@ -554,12 +553,12 @@ async fn scripted_pool_completes_with_one_correlated_common_notice() {
             .filter(|r| r["op"] == "pool_completion")
             .collect();
         let member_notices = seen.iter().filter(|r| r["op"] == "completion").count();
-        if pool_notices.len() == 1 && member_notices == 2 {
+        if pool_notices.len() == 1 && member_notices == 0 {
             break pool_notices[0].clone();
         }
         assert!(
-            pool_notices.len() <= 1 && member_notices <= 2 && Instant::now() < relay_deadline,
-            "relay saw {} pool and {member_notices} member notices",
+            pool_notices.len() <= 1 && member_notices == 0 && Instant::now() < relay_deadline,
+            "relay saw {} pool and {member_notices} successful member notices",
             pool_notices.len()
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -594,6 +593,11 @@ async fn scripted_pool_completes_with_one_correlated_common_notice() {
     assert_eq!(
         count("SELECT COUNT(*) FROM pools WHERE state='completed'"),
         1
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM deliveries d JOIN events e ON e.seq=d.terminal_event_seq WHERE e.kind='status' AND e.to_status='succeeded'"),
+        0,
+        "successful pool members must not queue individual completion notices"
     );
     // The closed pool reads frozen and refuses further operator writes.
     let page = socket::client(&h.home, "pool", json!({"pool_id": pool_id}))

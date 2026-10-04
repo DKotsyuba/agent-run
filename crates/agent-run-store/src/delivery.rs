@@ -19,14 +19,15 @@ pub const MAX_EVIDENCE_TAIL_BYTES: usize = 4096;
 /// Maximum UTF-8 bytes retained in one complete evidence JSON document.
 pub const MAX_EVIDENCE_BYTES: usize = 16 * 1024;
 
-/// Inserts the one durable completion notice associated with a terminal event.
+/// Inserts a durable completion notice for a terminal event when one is needed.
 ///
-/// A terminal run with an already-known orchestrator session is immediately
-/// `pending`. A run without a session has no delivery row because no bind hook
-/// can ever activate it; callers report that absence as `not_created`. The
-/// caller owns the surrounding transaction, so the notice cannot become
-/// visible without the terminal event it references.
-/// Returns the new notification id when a row is inserted, otherwise `None`.
+/// Successful runs in a current seat of an open pool omit individual notices;
+/// the pool's common completion notice represents that success. Failures and
+/// other terminal outcomes still create individual notices. A run with an
+/// orchestrator session starts `pending`; without one, no delivery row can be
+/// activated. The caller owns the transaction, keeping any row atomic with its
+/// terminal event. Returns the new notification id when inserted, otherwise
+/// `None`.
 pub(crate) fn insert_terminal_notice(
     tx: &Transaction<'_>,
     id: &AgentId,
@@ -34,6 +35,14 @@ pub(crate) fn insert_terminal_notice(
     terminal_event_seq: i64,
     at: f64,
 ) -> Result<Option<String>> {
+    let suppress_member_success: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agents a JOIN pool_members m ON m.agent_id=COALESCE(NULLIF(a.root_agent_id,''),a.id) JOIN pools p ON p.id=m.pool_id WHERE a.id=? AND a.status='succeeded' AND m.replaced_by IS NULL AND p.state='open')",
+        [id.as_str()],
+        |row| row.get(0),
+    )?;
+    if suppress_member_success {
+        return Ok(None);
+    }
     let Some(session) = session else {
         return Ok(None);
     };
