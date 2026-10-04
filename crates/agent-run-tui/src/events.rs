@@ -80,15 +80,35 @@ pub enum BrokerEvent {
 /// Commands addressed to the transcript watcher.
 #[derive(Debug, Clone)]
 pub enum WatchCommand {
-    /// Follow one session, fetching after the given cursor (zero restarts
-    /// history; a restored buffer resumes where it left off).
+    /// Follow one session after its forward cursor. Zero opens at the tail;
+    /// restored buffers resume where they left off. Raw fallback starts at zero.
     Watch {
         /// Stable agent id to follow.
         agent: AgentId,
         /// Exact execution to pin, when known.
         run: Option<AgentId>,
-        /// First sequence to fetch after; zero refetches from the start.
+        /// Exclusive forward sequence; zero requests the initial tail page.
         cursor: i64,
+    },
+    /// Open at the tail with a viewport-sized block count (1..=200).
+    Tail {
+        /// Stable session selector.
+        agent: AgentId,
+        /// Exact execution when known.
+        run: Option<AgentId>,
+        /// Approximately two screens of blocks, bounded by the wire cap.
+        blocks: usize,
+    },
+    /// Fetch one older page, then resume forward follow without rewinding.
+    Older {
+        /// Stable session selector.
+        agent: AgentId,
+        /// Exact execution when known.
+        run: Option<AgentId>,
+        /// Current forward resume cursor.
+        cursor: i64,
+        /// Exclusive upper sequence of the older page.
+        before: i64,
     },
     /// Stop following; the watcher idles until the next command.
     Clear,
@@ -222,31 +242,39 @@ fn next_retry_delay(previous: Duration) -> Duration {
     }
 }
 
-/// Cursor-pages one selected transcript and keeps following its tail.
-///
-/// Backfill pages fetch back to back — the next page follows a successful
-/// one immediately while `next_cursor` is set — at the broker's maximum page
-/// size. A failed page retries with a short doubling backoff (reset by any
-/// success) so an intermittently failing broker costs milliseconds, not the
-/// fixed 2 s of the sessions path. Once the history is complete the tail is
-/// polled at the streaming cadence.
+/// Opens at the newest blocks, fetches older pages on demand, and follows
+/// forward from the reverse page's resume cursor even when complete is true.
+/// Sends through the bounded UI queue before fetching another page. Commands
+/// cancel both I/O and delivery; unsupported blocks fall back once per worker
+/// to legacy raw backfill. Other failures retain the retry/backoff policy.
 pub async fn transcript_worker(
     broker: SharedBroker,
     mut commands: watch::Receiver<WatchCommand>,
     tx: mpsc::Sender<BrokerEvent>,
 ) {
+    use agent_run_domain::transcript::{TranscriptQuery, TranscriptView};
+    let mut raw = false;
     'target: loop {
         let command = commands.borrow_and_update().clone();
-        let WatchCommand::Watch {
-            agent,
-            run,
-            mut cursor,
-        } = command
-        else {
-            if commands.changed().await.is_err() {
-                return;
+        let (agent, run, mut cursor, mut tail, mut before) = match command {
+            WatchCommand::Watch { agent, run, cursor } => {
+                (agent, run, cursor, (cursor == 0).then_some(48), None)
             }
-            continue;
+            WatchCommand::Tail { agent, run, blocks } => {
+                (agent, run, 0, Some(blocks.clamp(1, 200)), None)
+            }
+            WatchCommand::Older {
+                agent,
+                run,
+                cursor,
+                before,
+            } => (agent, run, cursor, None, Some(before)),
+            WatchCommand::Clear => {
+                if commands.changed().await.is_err() {
+                    return;
+                }
+                continue;
+            }
         };
         let mut pause = Duration::ZERO;
         let mut retry_delay = Duration::ZERO;
@@ -259,27 +287,56 @@ pub async fn transcript_worker(
                 }
                 _ = tokio::time::sleep(pause) => {}
             }
+            let reverse = !raw && (tail.is_some() || before.is_some());
+            let query = TranscriptQuery {
+                cursor: if reverse { 0 } else { cursor },
+                limit: 200,
+                view: TranscriptView::Blocks,
+                tail_blocks: tail,
+                before_cursor: before,
+            };
             let result = tokio::select! {
                 biased;
                 changed = commands.changed() => {
                     if changed.is_err() { return; }
                     continue 'target;
                 }
-                result = net::transcript_page(&*broker, &agent, run.as_ref(), cursor, net::TRANSCRIPT_PAGE_LIMIT) => result,
+                result = async {
+                    if raw {
+                        net::transcript_page(&*broker, &agent, run.as_ref(), cursor, net::TRANSCRIPT_PAGE_LIMIT).await
+                    } else {
+                        net::transcript_blocks(&*broker, &agent, run.as_ref(), query).await
+                    }
+                } => result,
             };
             let page = match result {
                 Ok(page) => {
+                    // Some old brokers ignore extra arguments and return raw.
+                    raw |= page.view != Some(TranscriptView::Blocks);
                     retry_delay = Duration::ZERO;
-                    pause = if page.next_cursor.is_some() {
+                    pause = if reverse || page.next_cursor.is_some() {
                         Duration::ZERO
                     } else {
                         TRANSCRIPT_TAIL_POLL
                     };
-                    cursor = page
-                        .next_cursor
-                        .or_else(|| page.messages.last().map(|m| m.seq))
-                        .unwrap_or(cursor);
+                    let resume = page
+                        .resume_cursor
+                        .or(page.next_cursor)
+                        .or_else(|| page.messages.last().map(|m| m.seq));
+                    if let Some(resume) = resume {
+                        cursor = cursor.max(resume);
+                    }
+                    tail = None;
+                    before = None;
                     Ok(page)
+                }
+                Err(error) if !raw && net::blocks_unsupported(&error) => {
+                    raw = true;
+                    tail = None;
+                    before = None;
+                    cursor = 0;
+                    pause = Duration::ZERO;
+                    continue;
                 }
                 Err(error) => {
                     retry_delay = next_retry_delay(retry_delay);
@@ -415,6 +472,8 @@ pub enum Dispatched {
     Clear,
     /// Reissue the sessions listing for the current scope.
     Scope,
+    /// Fetch one older history page; forward follow resumes afterward.
+    Older(AgentId, Option<AgentId>, i64, i64),
     /// Fetch the answer of one session.
     Answer(AgentId, Option<AgentId>),
 }
@@ -593,6 +652,38 @@ pub fn scroll_transcript(app: &mut App, delta: i64) {
     } else if delta > 0 {
         buffer.scroll_down(lines);
     }
+}
+
+/// Requests older blocks once the scrolled viewport is within half a screen
+/// of the loaded beginning. Marks the in-flight state before dispatch so
+/// input bursts and broker refreshes cannot enqueue duplicate reverse reads.
+fn older_if_needed(app: &mut App) -> Dispatched {
+    let Some(pane) = crate::ui::panes(app, app.last_width, app.last_height).transcript else {
+        return Dispatched::None;
+    };
+    let Some(buffer) = app.transcript.as_mut() else {
+        return Dispatched::None;
+    };
+    let viewport = usize::from(
+        pane.height
+            .saturating_sub(crate::ui::transcript::HEADER_ROWS),
+    );
+    let total =
+        crate::ui::transcript::total_height(buffer, crate::ui::transcript::body_width(pane));
+    let offset = crate::ui::transcript::scroll_offset(buffer, total, viewport);
+    if !buffer.follow && !buffer.loading_older && offset <= (viewport / 2).max(3) {
+        if let Some(before) = buffer.previous_cursor {
+            buffer.loading_older = true;
+            app.dirty = true;
+            return Dispatched::Older(
+                buffer.agent.agent_id.clone(),
+                buffer.agent.run_id.clone(),
+                buffer.resume_cursor,
+                before,
+            );
+        }
+    }
+    Dispatched::None
 }
 
 /// Terminal handle owning raw mode, the alternate screen, and mouse capture.
@@ -899,7 +990,8 @@ impl Pipeline {
     /// Readies the state for a frame: applies pending navigation, resolves
     /// the latest pointer position into hover targets (dirty only when one
     /// changed), and keeps the split view's transcript pane glued to the
-    /// selection. Returns the watcher side effect of that re-attachment.
+    /// selection. Returns a re-attachment command or one older-page request
+    /// when scrolling approaches the loaded beginning.
     pub fn prepare_frame(&mut self, app: &mut App) -> Dispatched {
         self.input.flush(app);
         if let Some((column, row)) = self.input.hover.take() {
@@ -920,7 +1012,7 @@ impl Pipeline {
             app.close_transcript();
             return Dispatched::Clear;
         }
-        Dispatched::None
+        older_if_needed(app)
     }
 
     /// Draws one frame when the state is dirty and returns whether it drew.
@@ -984,9 +1076,34 @@ impl Loop {
         match dispatched {
             Dispatched::None => {}
             Dispatched::Watch(agent, run, cursor) => {
-                let _ = self
-                    .watch_tx
-                    .send(WatchCommand::Watch { agent, run, cursor });
+                let command = if cursor == 0
+                    && app
+                        .transcript
+                        .as_ref()
+                        .is_some_and(|buffer| buffer.messages.is_empty())
+                {
+                    WatchCommand::Tail {
+                        agent,
+                        run,
+                        blocks: usize::from(
+                            app.last_height
+                                .saturating_sub(crate::ui::transcript::HEADER_ROWS + 3),
+                        )
+                        .saturating_mul(2)
+                        .clamp(1, 200),
+                    }
+                } else {
+                    WatchCommand::Watch { agent, run, cursor }
+                };
+                let _ = self.watch_tx.send(command);
+            }
+            Dispatched::Older(agent, run, cursor, before) => {
+                let _ = self.watch_tx.send(WatchCommand::Older {
+                    agent,
+                    run,
+                    cursor,
+                    before,
+                });
             }
             Dispatched::Clear => {
                 let _ = self.watch_tx.send(WatchCommand::Clear);
@@ -1576,7 +1693,7 @@ mod tests {
         // Pages request the broker maximum and advance the cursor.
         assert_eq!(
             broker.requests(),
-            vec![(0, 1000), (0, 1000), (0, 1000), (2, 1000)],
+            vec![(0, 200), (0, 200), (0, 200), (2, 1000)],
             "failures retry the same cursor; success advances it"
         );
         // The two retries cost the 150 ms + 300 ms backoff, and the second
@@ -1629,7 +1746,7 @@ mod tests {
             }
             other => panic!("expected a page, got {other:?}"),
         }
-        assert_eq!(broker.requests(), vec![(6, 1000)]);
+        assert_eq!(broker.requests(), vec![(6, 200)]);
     }
 
     #[test]
@@ -2879,5 +2996,218 @@ mod tests {
             .unwrap();
         assert_eq!(app.transcript.as_ref().unwrap().hover, Some(0));
         assert_ne!(old, 0);
+    }
+
+    /// Tail opens render newest content immediately and follow the reverse
+    /// resume cursor even when reverse complete means beginning reached.
+    #[tokio::test]
+    async fn tail_first_open_follows_resume_even_when_reverse_complete() {
+        use crate::tests_support::{block_message, block_page, FakeBroker};
+        let newest = block_page(
+            vec![block_message(
+                901,
+                950,
+                "assistant",
+                "newest content",
+                "tail",
+            )],
+            None,
+            None,
+            950,
+            true,
+        );
+        let (broker, mut requests) = FakeBroker::scripted(vec![
+            Ok(serde_json::to_value(newest).unwrap()),
+            Ok(serde_json::to_value(block_page(vec![], None, None, 950, false)).unwrap()),
+        ]);
+        let (tx, mut rx) = mpsc::channel(2);
+        let (_cmd_tx, cmd_rx) = watch::channel(WatchCommand::Tail {
+            agent: STABLE.parse().unwrap(),
+            run: Some(RUN.parse().unwrap()),
+            blocks: 34,
+        });
+        let task = tokio::spawn(transcript_worker(broker, cmd_rx, tx));
+        let request = requests.recv().await.unwrap();
+        assert_eq!(request["view"], "blocks");
+        assert_eq!(request["tail_blocks"], 34);
+        assert_eq!(request["cursor"], 0);
+        assert_eq!(request["run_id"], RUN);
+        let mut app = App::new();
+        app.sessions = vec![crate::tests_support::agent_view(STABLE, RUN, "running")];
+        app.open_selected_transcript();
+        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        Pipeline::new(FRAME_INTERVAL).broker_event(&mut app, event);
+        let buffer = app.transcript.as_ref().unwrap();
+        assert_eq!(buffer.messages[0].content, "newest content");
+        assert!(buffer.follow);
+        assert_eq!(buffer.resume_cursor, 950);
+        assert!(buffer.history_complete);
+        let request = tokio::time::timeout(Duration::from_secs(2), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request["cursor"], 950);
+        assert!(request["tail_blocks"].is_null());
+        assert!(request["before_cursor"].is_null());
+        task.abort();
+    }
+
+    /// Home requests exclusive older history once; prepend keeps the reading
+    /// anchor and cursor while unchanged block row memos survive.
+    #[test]
+    fn older_prepend_preserves_anchor_and_memos() {
+        use crate::tests_support::{block_message, block_page};
+        let mut app = App::new();
+        app.last_width = 100;
+        app.last_height = 20;
+        app.sessions = vec![crate::tests_support::agent_view(STABLE, RUN, "running")];
+        app.open_selected_transcript();
+        let agent = STABLE.parse().unwrap();
+        let messages = (100..120)
+            .map(|seq| {
+                block_message(
+                    seq,
+                    seq,
+                    "assistant",
+                    &format!("tail {seq}"),
+                    &format!("ref{seq}"),
+                )
+            })
+            .collect();
+        app.apply_transcript(&agent, block_page(messages, None, Some(100), 119, true));
+        apply_action(&mut app, Action::Top);
+        let pane = crate::ui::panes(&app, 100, 20).transcript.unwrap();
+        let width = crate::ui::transcript::body_width(pane);
+        let viewport = usize::from(pane.height - crate::ui::transcript::HEADER_ROWS);
+        let buffer = app.transcript.as_mut().unwrap();
+        buffer.cursor = 3;
+        buffer.hover = Some(4);
+        let offset = crate::ui::transcript::scroll_offset(
+            buffer,
+            crate::ui::transcript::total_height(buffer, width),
+            viewport,
+        );
+        let built = crate::ui::transcript::cache_block_builds(buffer);
+        let mut pipeline = Pipeline::new(FRAME_INTERVAL);
+        assert!(matches!(
+            pipeline.prepare_frame(&mut app),
+            Dispatched::Older(_, _, 119, 100)
+        ));
+        assert!(
+            matches!(pipeline.prepare_frame(&mut app), Dispatched::None),
+            "one reverse request per page"
+        );
+        let older = (80..100)
+            .map(|seq| {
+                block_message(
+                    seq,
+                    seq,
+                    "assistant",
+                    &format!("old {seq}"),
+                    &format!("ref{seq}"),
+                )
+            })
+            .collect();
+        app.apply_transcript(&agent, block_page(older, Some(100), Some(80), 99, true));
+        let buffer = app.transcript.as_ref().unwrap();
+        let total = crate::ui::transcript::total_height(buffer, width);
+        let next_offset = crate::ui::transcript::scroll_offset(buffer, total, viewport);
+        assert_eq!(next_offset - offset, 40, "20 new blocks plus separators");
+        assert_eq!(buffer.messages[buffer.cursor].seq, 103);
+        assert_eq!(buffer.messages[buffer.hover.unwrap()].seq, 104);
+        assert_eq!(buffer.resume_cursor, 119, "older reads never rewind follow");
+        assert_eq!(buffer.previous_cursor, Some(80));
+        assert_eq!(
+            crate::ui::transcript::cache_block_builds(buffer) - built,
+            20,
+            "existing blocks are moved, not rebuilt"
+        );
+    }
+
+    /// Older wire requests use cursor zero and the exclusive previous cursor;
+    /// the next forward call retains the newest resume cursor.
+    #[tokio::test]
+    async fn older_worker_keeps_forward_resume_cursor() {
+        use crate::tests_support::{block_message, block_page, FakeBroker};
+        let older = block_page(
+            vec![block_message(1, 10, "assistant", "old", "old")],
+            Some(100),
+            None,
+            10,
+            true,
+        );
+        let (broker, mut requests) =
+            FakeBroker::scripted(vec![Ok(serde_json::to_value(older).unwrap())]);
+        let (tx, mut rx) = mpsc::channel(2);
+        let (_cmd_tx, cmd_rx) = watch::channel(WatchCommand::Older {
+            agent: STABLE.parse().unwrap(),
+            run: None,
+            cursor: 150,
+            before: 100,
+        });
+        let task = tokio::spawn(transcript_worker(broker, cmd_rx, tx));
+        let request = requests.recv().await.unwrap();
+        assert_eq!(request["view"], "blocks");
+        assert_eq!(request["cursor"], 0);
+        assert_eq!(request["before_cursor"], 100);
+        assert!(matches!(
+            rx.recv().await,
+            Some(BrokerEvent::Transcript { page: Ok(_), .. })
+        ));
+        let request = tokio::time::timeout(Duration::from_secs(2), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request["cursor"], 150);
+        assert!(request["before_cursor"].is_null());
+        task.abort();
+    }
+
+    /// Unsupported parameters downgrade once; subsequent targets keep raw
+    /// requests. Other failures still use the ordinary retry policy.
+    #[tokio::test]
+    async fn unsupported_blocks_fall_back_once_to_raw() {
+        use crate::tests_support::FakeBroker;
+        let agent = STABLE.parse().unwrap();
+        let (broker, mut requests) = FakeBroker::scripted(vec![
+            Err("unknown field 'view'".to_owned()),
+            Ok(script_page(&agent, &[1], true)),
+        ]);
+        let (tx, mut rx) = mpsc::channel(2);
+        let (cmd_tx, cmd_rx) = watch::channel(WatchCommand::Tail {
+            agent: agent.clone(),
+            run: None,
+            blocks: 40,
+        });
+        let task = tokio::spawn(transcript_worker(broker, cmd_rx, tx));
+        assert_eq!(requests.recv().await.unwrap()["view"], "blocks");
+        let raw = requests.recv().await.unwrap();
+        assert!(raw.get("view").is_none());
+        assert_eq!(raw["limit"], 1000);
+        assert_eq!(raw["cursor"], 0);
+        assert!(matches!(
+            rx.recv().await,
+            Some(BrokerEvent::Transcript { page: Ok(_), .. })
+        ));
+        cmd_tx
+            .send(WatchCommand::Watch {
+                agent: RUN.parse().unwrap(),
+                run: None,
+                cursor: 123,
+            })
+            .unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(2), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(next.get("view").is_none());
+        assert_eq!(next["cursor"], 123);
+        assert!(!net::blocks_unsupported(&agent_run::Error::Runtime(
+            "state database operation failed".to_owned()
+        )));
+        task.abort();
     }
 }

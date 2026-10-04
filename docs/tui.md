@@ -67,7 +67,12 @@ Four header rows — glyph + task title; status badge (` ● live `, ` ✓ done 
 ` ✗ failed `, ` ◷ timed out `, ` ⊘ cancelled `, ` ◌ lost `, …) with
 `RUNTIME/model`, `up <elapsed>`, `silence <x>` (a warning past 120 s), and
 the failure text; the workdir (home shortened to `~`) with `● follow` or
-`○ scrolled` on the right; then a blank row. The body shows a two-column
+`○ scrolled` on the right; then a compact dim native-usage row: input/output
+and cache-read tokens, USD cost, turns, and `tools 41 · 2 failed · 3 unknown`.
+Unreported measurements remain `—`; absent statistics leave the row blank.
+Complete lineage totals appear only when different from the latest execution
+(for example `Σ 3 runs $1.24`). The row fits the available display width.
+The body shows a two-column
 selection gutter, the conversation, and a scrollbar (`┃` thumb, `│` track)
 once the content overflows the viewport.
 
@@ -84,8 +89,9 @@ once the content overflows the viewport.
   `▸ <tool>  <brief argument>` with a dim result summary and duration on the
   right. Results pair to their call by equal, known `raw_ref` and matching
   tool name, including out-of-order results. Uncorrelated results get their
-  own row. A `starts_block` flag clears pending call identities before
-  grouping, including across pages. The summary
+  own row. Raw-row `starts_block` flags clear pending call identities at scope
+  boundaries, including across pages; projected block starts mark ordinary
+  logical blocks too, so their results still pair by native reference. The summary
   carries the journaled native evidence — `[error]` when the result's
   `error` flag is true, `[ok]` when it is false, `[unknown]` when unreported
   — and the tool name and summary turn red only on `[error]`; `[unknown]`
@@ -212,11 +218,21 @@ background so highlights stay visible.
   while the scope still lists active sessions only. A failed call keeps the
   last known count. The count call rides the sessions lane, so the
   transcript and answer sockets never wait on it.
-- The transcript watcher cursor-pages the `transcript` method at the
-  broker's maximum page size (1000 messages): backfill pages fetch back to
-  back while a two-event queue has room, then the tail is polled while the view
-  is open. The worker waits for the UI when that queue is full, bounding queued
-  page memory. Reducers move message payloads into the buffer without cloning.
+- Opening a transcript requests `view: "blocks"` with approximately two screens
+  of `tail_blocks` (at most 200), renders the newest content at the bottom,
+  and follows forward from `resume_cursor`, even when the reverse page is
+  marked complete. Scrolling near the loaded top, or Home/`g`, requests one
+  older page with the exclusive `before_cursor`. Prepending preserves the line
+  being read and existing block row memos; prefix sums and cursor indices move
+  with the added history. A top row shows `loading older history…` during the
+  request and `beginning of transcript` once no previous cursor remains.
+  Partial edge fragments join by sequence range and known native reference;
+  unresolved edges show `… partial block`. Omitted/spooled bodies keep their
+  truncation marker; the observer cannot fetch an omitted body.
+  Block pages contain at most 200 blocks and 256 KiB of content. The worker
+  waits for the UI when its two-event queue is full, bounding queued page memory.
+  Reducers move message payloads without cloning. Brokers rejecting the blocks
+  options fall back once to the legacy raw, 1000-row forward backfill.
   A failed page
   retries with a short doubling backoff (150 ms to 2 s, reset by any
   success), so an intermittently failing broker costs milliseconds per
@@ -225,13 +241,14 @@ background so highlights stay visible.
 - Recently viewed transcripts (up to 8, and 64 MB of content in total) stay
   buffered: re-selecting a session — constant while moving through the
   split view — restores its transcript instantly and resumes fetching from
-  where it left off instead of reloading from the start.
+  where it left off instead of reloading from the start. Both the older-page
+  cursor and the independent forward resume cursor survive the restore.
 - The transcript store is append-only and `seq`-deduplicated: tail pages
   whose sequences all sit past the buffered tail extend the vector without
   touching existing data, and an unchanged tail poll costs one sequence
   comparison. Rare out-of-order or replaced messages insert in place.
-- Incomplete history is visible: the transcript header shows a dim
-  `loading <n> messages…` count while the backfill runs and a red
+- Incomplete history is visible in the top history row; legacy raw backfill
+  retains the header's dim `loading <n> messages…` count. The header shows a red
   `broker error, retrying · <reason>` while the last page failed; a
   finished session only shows its `✓ finished in X` outcome line once the
   history fully arrived.

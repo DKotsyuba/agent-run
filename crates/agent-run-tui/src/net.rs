@@ -166,6 +166,42 @@ pub async fn transcript_page(
     parse(broker.call("transcript", params).await?)
 }
 
+/// Reads a validated blocks request with the domain's shared bounds. Reverse
+/// options use cursor zero; identity and run pinning match raw requests.
+pub async fn transcript_blocks(
+    broker: &dyn Broker,
+    agent_id: &agent_run_domain::domain::AgentId,
+    run_id: Option<&agent_run_domain::domain::AgentId>,
+    query: agent_run_domain::transcript::TranscriptQuery,
+) -> agent_run::Result<TranscriptPage> {
+    query.validate()?;
+    let mut params = serde_json::to_value(query)?;
+    params["agent_id"] = json!(agent_id);
+    if let Some(run_id) = run_id {
+        params["run_id"] = json!(run_id);
+    }
+    parse(broker.call("transcript", params).await?)
+}
+
+/// Recognizes a broker rejecting new blocks parameters. Transport, storage and
+/// unrelated validation failures must retry without silently changing views.
+pub fn blocks_unsupported(error: &agent_run::Error) -> bool {
+    let reason = error.to_string().to_lowercase();
+    ["view", "blocks", "tail_blocks", "before_cursor"]
+        .iter()
+        .any(|key| reason.contains(key))
+        && [
+            "unknown",
+            "unsupported",
+            "unexpected",
+            "unrecognized",
+            "invalid",
+            "not supported",
+        ]
+        .iter()
+        .any(|word| reason.contains(word))
+}
+
 /// Reads the verified answer envelope of one session.
 pub async fn answer(
     broker: &dyn Broker,
@@ -424,6 +460,78 @@ mod tests {
         let _ = listing.await;
         server.abort();
         let _ = server.await;
+        std::fs::remove_file(socket).unwrap();
+    }
+
+    /// A live Unix JSON-RPC lane transmits validated tail, older and forward
+    /// block queries and parses the shared response without custom wire types.
+    #[tokio::test]
+    async fn block_queries_smoke_over_live_socket() {
+        use crate::tests_support::block_page;
+        use agent_run_domain::transcript::{TranscriptQuery, TranscriptView};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let socket = std::env::temp_dir().join(format!(
+            "artui-block-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (input, mut output) = stream.into_split();
+            let mut input = BufReader::new(input);
+            for round in 0..3 {
+                let mut line = String::new();
+                input.read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let params = &request["params"];
+                assert_eq!(request["method"], "transcript");
+                assert_eq!(params["view"], "blocks");
+                assert_eq!(params["run_id"], "ag-20260928-101500-bbbbbbbbbb");
+                match round {
+                    0 => {
+                        assert_eq!(params["tail_blocks"], 40);
+                        assert_eq!(params["cursor"], 0);
+                    }
+                    1 => {
+                        assert_eq!(params["before_cursor"], 100);
+                        assert_eq!(params["cursor"], 0);
+                    }
+                    _ => {
+                        assert_eq!(params["cursor"], 150);
+                        assert!(params["before_cursor"].is_null());
+                    }
+                }
+                let page = block_page(vec![], (round == 1).then_some(100), None, 150, round != 2);
+                let response =
+                    json!({"jsonrpc":"2.0","id":request["id"],"result":page}).to_string() + "\n";
+                output.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let broker = SocketBroker::new(socket.clone());
+        let agent = aid("ag-20260928-101500-aaaaaaaaaa");
+        let run = aid("ag-20260928-101500-bbbbbbbbbb");
+        for round in 0..3 {
+            let query = TranscriptQuery {
+                cursor: if round == 2 { 150 } else { 0 },
+                limit: 200,
+                view: TranscriptView::Blocks,
+                tail_blocks: (round == 0).then_some(40),
+                before_cursor: (round == 1).then_some(100),
+            };
+            let page = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                transcript_blocks(&broker, &agent, Some(&run), query),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(page.resume_cursor, Some(150));
+        }
+        server.await.unwrap();
         std::fs::remove_file(socket).unwrap();
     }
 }

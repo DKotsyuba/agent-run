@@ -23,7 +23,7 @@ use ratatui::{
     Frame,
 };
 
-/// Header rows above the transcript body (title, meta, workdir, one blank).
+/// Header rows above the transcript body (title, meta, workdir, native usage).
 pub const HEADER_ROWS: u16 = 4;
 /// Columns the body reserves on top of its content width: a two-column
 /// selection gutter plus the scrollbar track.
@@ -38,8 +38,8 @@ pub struct StreamBlock {
     /// First message index of the block: the call, the orphan result, or
     /// the opening fragment of a text run.
     pub start: usize,
-    /// Contiguous message count of the block's own span (text runs only;
-    /// tool rows always span exactly their opening message).
+    /// Contiguous message count of the block's own span: text fragments,
+    /// partial call arguments, or chunks of an unpaired tool result.
     pub len: usize,
     /// Whether the block renders as flowing text (as opposed to one tool row).
     pub text: bool,
@@ -100,12 +100,15 @@ impl Grouping {
     /// only affected cached blocks. Text joins only consecutive messages with
     /// an equal known native reference, role and name. Results pair to the
     /// latest call with an equal known reference and name, even out of order.
-    /// A server `starts_block` flag clears pending identities before grouping,
-    /// preventing any pairing across execution or attempt boundaries.
+    /// Raw-row `starts_block` clears pending identities at execution/attempt
+    /// boundaries; projected blocks mark ordinary starts too, so their tool
+    /// results continue to pair by the scoped native reference and tool name.
     fn push(&mut self, messages: &[MessageView], index: usize) {
         let message = &messages[index];
         let boundary = message.starts_block == Some(true);
-        if boundary {
+        // Projected blocks mark every logical block's start, including
+        // results. Raw starts_block still marks a scope boundary.
+        if boundary && message.first_seq.is_none() {
             self.calls_by_ref.clear();
         }
         let block = if is_text_role(&message.role) {
@@ -116,6 +119,8 @@ impl Grouping {
                         && last.start + last.len == index
                         && first.role == message.role
                         && first.name == message.name
+                        && first.error == message.error
+                        && first.error_source == message.error_source
                         && first.raw_ref.is_some()
                         && first.raw_ref == message.raw_ref
                 });
@@ -130,7 +135,23 @@ impl Grouping {
         } else {
             match message.role.as_str() {
                 "tool_call" => {
-                    let block = self.open(index, false);
+                    let existing = message
+                        .raw_ref
+                        .as_ref()
+                        .and_then(|raw_ref| self.calls_by_ref.get(raw_ref).copied())
+                        .filter(|block| {
+                            let prior = &self.blocks[*block];
+                            message.partial_before == Some(true)
+                                && prior.start + prior.len == index
+                                && messages[prior.start].name == message.name
+                        });
+                    let block = if let Some(block) = existing {
+                        self.blocks[block].len += 1;
+                        self.touch(block);
+                        block
+                    } else {
+                        self.open(index, false)
+                    };
                     if let Some(raw_ref) = &message.raw_ref {
                         self.calls_by_ref.insert(raw_ref.clone(), block);
                     }
@@ -148,7 +169,28 @@ impl Grouping {
                             self.touch(block);
                             block
                         }
-                        None => self.open(index, false),
+                        None => {
+                            let previous = self
+                                .blocks
+                                .last()
+                                .filter(|block| {
+                                    let prior = &messages[block.start];
+                                    message.partial_before == Some(true)
+                                        && block.start + block.len == index
+                                        && prior.role == "tool_result"
+                                        && prior.name == message.name
+                                        && prior.raw_ref.is_some()
+                                        && prior.raw_ref == message.raw_ref
+                                })
+                                .map(|_| self.blocks.len() - 1);
+                            if let Some(block) = previous {
+                                self.blocks[block].len += 1;
+                                self.touch(block);
+                                block
+                            } else {
+                                self.open(index, false)
+                            }
+                        }
                     }
                 }
                 _ => self.open(index, false),
@@ -271,6 +313,12 @@ struct CachedBlock {
     rows: Vec<Row>,
     /// Whether a blank separator line precedes the block.
     gap: bool,
+    /// Whether a temporary partial/truncated marker ends the cached rows.
+    text_marker: bool,
+    /// Accumulated text omission evidence, updated only from new fragments.
+    text_truncated: bool,
+    /// Argument fragments already used to build a call's cached description.
+    call_parts: usize,
 }
 
 /// Unfinished text suffix and sanitizer state of one growing block.
@@ -450,6 +498,61 @@ impl RenderCache {
         }
     }
 
+    /// Rebases row memos after inserting `count` chronological messages at
+    /// the front. Regrouping handles partial text/tool edges, but unchanged
+    /// blocks move their rows and streaming state rather than rebuilding.
+    /// Prefix sums are refreshed on the next sync; tail appends remain incremental.
+    pub(crate) fn prepend(&mut self, messages: &[MessageView], count: usize) {
+        if self.blocks.is_empty() {
+            self.grouping = Grouping::default();
+            return;
+        }
+        let mut old = std::collections::HashMap::new();
+        for (mut block, cached) in std::mem::take(&mut self.grouping.blocks)
+            .into_iter()
+            .zip(std::mem::take(&mut self.blocks))
+        {
+            block.start += count;
+            for result in &mut block.results {
+                *result += count;
+            }
+            old.insert(block.start, (block, cached));
+        }
+        let epoch = self.grouping.epoch;
+        self.grouping = Grouping {
+            epoch,
+            ..Grouping::default()
+        };
+        for index in 0..messages.len() {
+            self.grouping.push(messages, index);
+        }
+        self.grouping.touched.clear();
+        for (index, block) in self.grouping.blocks.iter().enumerate() {
+            let cached = old.remove(&block.start).filter(|(prior, _)| prior == block);
+            let mut cached = match cached {
+                Some((_, cached)) => cached,
+                None => {
+                    self.grouping.touched.push(index);
+                    CachedBlock::default()
+                }
+            };
+            for row in &mut cached.rows {
+                row.block = Some(index);
+            }
+            if let Some(stream) = &mut cached.stream {
+                for row in &mut stream.parked {
+                    row.block = Some(index);
+                }
+            }
+            self.blocks.push(cached);
+        }
+        // Reuse the prefix pass even if only separators changed.
+        self.line_starts.resize(self.blocks.len(), 0);
+        if !self.blocks.is_empty() {
+            self.grouping.touch(0);
+        }
+    }
+
     /// Drops every memoized row and line start.
     fn clear_rows(&mut self) {
         self.blocks.clear();
@@ -483,6 +586,10 @@ fn build_block(
     let block = &grouped[index];
     let head = &buffer.messages[block.start];
     let mut cached = previous.unwrap_or_default();
+    if cached.text_marker {
+        cached.rows.pop();
+        cached.text_marker = false;
+    }
     let mut first_tag = 0;
     cached.expanded = block_is_expanded(buffer, block);
     if block.text {
@@ -509,6 +616,7 @@ fn build_block(
         first_tag = rows.len().saturating_sub(memo.preview);
         rows.truncate(first_tag);
         for message in &buffer.messages[block.start + memo.consumed..block.start + block.len] {
+            cached.text_truncated |= message.content_complete == Some(false);
             let clean = memo.sanitizer.push(&message.content);
             memo.processed += message.content.len() + clean.len();
             memo.wrapper.push(&clean);
@@ -550,20 +658,65 @@ fn build_block(
         }
     } else if head.role == "tool_call" || head.role == "tool_result" {
         if head.role == "tool_call" {
-            cached.results.truncated |= head.content_complete == Some(false);
-            cached
-                .results
-                .brief
-                .get_or_insert_with(|| call_summary(&head.content));
+            if cached.call_parts != block.len {
+                cached.results.truncated |= buffer.messages
+                    [block.start + cached.call_parts..block.start + block.len]
+                    .iter()
+                    .any(|message| message.content_complete == Some(false));
+                let content: String = buffer.messages[block.start..block.start + block.len]
+                    .iter()
+                    .map(|message| message.content.as_str())
+                    .collect();
+                cached.results.brief = Some(call_summary(&content));
+                cached.call_parts = block.len;
+            }
             for message in &block.results[cached.results.consumed..] {
                 cached.results.push(&buffer.messages[*message]);
             }
-        } else if cached.results.consumed == 0 {
-            cached.results.push(head);
+        } else {
+            for message in
+                &buffer.messages[block.start + cached.results.consumed..block.start + block.len]
+            {
+                cached.results.push(message);
+            }
         }
         cached.rows = tool_rows(buffer, block, usize::from(width), &cached.results);
     } else {
         cached.rows = block_rows(buffer, grouped, index, usize::from(width));
+    }
+    let span = &buffer.messages[block.start..block.start + block.len];
+    let partial = span
+        .first()
+        .is_some_and(|message| message.partial_before == Some(true))
+        || span
+            .last()
+            .is_some_and(|message| message.partial_after == Some(true))
+        || block
+            .results
+            .first()
+            .is_some_and(|index| buffer.messages[*index].partial_before == Some(true))
+        || block
+            .results
+            .last()
+            .is_some_and(|index| buffer.messages[*index].partial_after == Some(true));
+    let truncated = block.text && cached.text_truncated;
+    if partial || truncated {
+        cached.rows.push(Row {
+            block: Some(index),
+            left: vec![Span::styled(
+                if truncated {
+                    "  … content truncated"
+                } else {
+                    "  … partial block"
+                },
+                theme::dim(),
+            )],
+            right: Vec::new(),
+            keep: None,
+            running_at: None,
+            spins: false,
+        });
+        cached.text_marker = true;
     }
     for row in cached.rows.iter_mut().skip(first_tag) {
         if row.block.is_none() {
@@ -687,25 +840,31 @@ pub fn layout(buffer: &TranscriptBuffer, width: u16) -> Vec<MessageLayout> {
         .enumerate()
         .map(|(index, cached)| MessageLayout {
             message: guard.grouping.blocks[index].start,
-            line_start: guard.line_starts[index],
+            line_start: guard.line_starts[index] + usize::from(buffer.blocks_view),
             line_count: cached.rows.len(),
         })
         .collect()
+}
+
+/// Rendered history height excluding the outcome tail, for prepend anchoring.
+pub(crate) fn history_height(buffer: &TranscriptBuffer, width: u16) -> usize {
+    cache(buffer, width).body + usize::from(buffer.blocks_view)
 }
 
 /// Total rendered body height for one width, the trailing blank and the
 /// terminal outcome line included (both render outside the cache).
 pub(crate) fn total_height(buffer: &TranscriptBuffer, width: u16) -> usize {
     let guard = cache(buffer, width);
-    tail_height(buffer) + guard.body
+    tail_height(buffer) + guard.body + usize::from(buffer.blocks_view)
 }
 
-/// Height of the body tail: one trailing blank plus the outcome line of
-/// finished sessions whose history fully arrived — an incomplete history
-/// shows the loading or error state in the header instead of a final
-/// verdict.
+/// Height of the trailing blank and the terminal outcome. An outcome needs
+/// the beginning and current forward tail to have arrived; reverse complete
+/// alone cannot establish that the forward catch-up finished.
 fn tail_height(buffer: &TranscriptBuffer) -> usize {
-    1 + usize::from(buffer.agent.status.terminal() && buffer.history_complete)
+    1 + usize::from(
+        buffer.agent.status.terminal() && buffer.history_complete && buffer.tail_complete,
+    )
 }
 
 /// The body scroll offset: pinned to the tail in follow mode, `from_bottom`
@@ -723,7 +882,10 @@ pub fn scroll_offset(buffer: &TranscriptBuffer, total: usize, viewport: usize) -
 pub(crate) fn cursor_line(buffer: &TranscriptBuffer, width: u16) -> Option<usize> {
     let guard = cache(buffer, width);
     let current = *guard.grouping.block_of.get(buffer.cursor)?;
-    guard.line_starts.get(current).copied()
+    guard
+        .line_starts
+        .get(current)
+        .map(|line| line + usize::from(buffer.blocks_view))
 }
 
 /// Moves the cursor one block up or down (positive toward the tail).
@@ -754,6 +916,7 @@ pub fn move_cursor_block(buffer: &mut TranscriptBuffer, delta: i64) {
 /// Separator lines belong to the block that follows them.
 pub(crate) fn message_at(buffer: &TranscriptBuffer, width: u16, line: usize) -> Option<usize> {
     let guard = cache(buffer, width);
+    let line = line.checked_sub(usize::from(buffer.blocks_view))?;
     let index = match body_line(&guard, line)? {
         BodyLine::Gap(index) => index,
         BodyLine::Row(row) => row.block?,
@@ -991,7 +1154,20 @@ fn tool_rows(
     }
 
     // Full arguments are wrapped once; every cached span stays pane-bounded.
-    let args = tool_args(head);
+    let joined_head;
+    let args_head = if block.len > 1 && is_call {
+        joined_head = MessageView {
+            content: buffer.messages[block.start..block.start + block.len]
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect(),
+            ..head.clone()
+        };
+        &joined_head
+    } else {
+        head
+    };
+    let args = tool_args(args_head);
     for (key, value) in &args {
         let color = if key == "command" || key == "cmd" {
             p.orange
@@ -1032,7 +1208,9 @@ fn tool_rows(
     let results: Vec<&MessageView> = if is_call {
         block.results.iter().map(|i| &buffer.messages[*i]).collect()
     } else {
-        vec![head]
+        buffer.messages[block.start..block.start + block.len]
+            .iter()
+            .collect()
     };
     let joined = concat_results(&results);
     let payloads = payload_lines(&joined);
@@ -1315,11 +1493,26 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, split: bool) {
     }
 
     let guard = cache(buffer, content_width);
-    let total = tail_height(buffer) + guard.body;
+    let top = usize::from(buffer.blocks_view);
+    let total = tail_height(buffer) + guard.body + top;
     let offset = scroll_offset(buffer, total, viewport);
 
     let mut lines = Vec::with_capacity(viewport);
     for line in offset..(offset + viewport).min(total) {
+        if top > 0 && line == 0 {
+            lines.push(Line::from(Span::styled(
+                if buffer.loading_older {
+                    "  loading older history…"
+                } else if buffer.previous_cursor.is_none() {
+                    "  beginning of transcript"
+                } else {
+                    "  scroll up for older history"
+                },
+                theme::dim(),
+            )));
+            continue;
+        }
+        let line = line - top;
         match body_line(&guard, line) {
             Some(BodyLine::Row(row)) => lines.push(assemble_row(
                 buffer,
@@ -1464,7 +1657,72 @@ fn message_base(buffer: &TranscriptBuffer, cache: &RenderCache, index: usize) ->
     }
 }
 
-/// Renders the four header rows of the transcript pane.
+/// Formats nullable native measurements without inventing zero counts or
+/// success. Complete lineage metrics print only when different from the latest
+/// execution; the header's display-width fitter bounds the resulting dim row.
+fn usage_line(agent: &agent_run_domain::AgentView) -> String {
+    let mut parts = Vec::new();
+    if let Some(usage) = &agent.usage {
+        let number =
+            |value: Option<i64>| value.map_or_else(|| "—".to_owned(), |value| value.to_string());
+        parts.push(format!(
+            "in {} · out {} · cache {}",
+            number(usage.input_tokens),
+            number(usage.output_tokens),
+            number(usage.cache_read_tokens)
+        ));
+        parts.push(
+            usage
+                .cost_usd
+                .map_or_else(|| "$—".to_owned(), |cost| format!("${cost:.2}")),
+        );
+        parts.push(format!("turns {}", number(usage.num_turns)));
+    }
+    if let Some(counts) = &agent.tool_counts {
+        let number =
+            |value: Option<u64>| value.map_or_else(|| "—".to_owned(), |value| value.to_string());
+        parts.push(format!(
+            "tools {} · {} failed · {} unknown",
+            number(counts.calls),
+            number(counts.failed),
+            number(counts.unknown_results)
+        ));
+    }
+    if let Some(total) = &agent.usage_cumulative {
+        let differs = agent.usage.as_ref().is_none_or(|latest| {
+            total
+                .cost_usd
+                .is_some_and(|value| Some(value) != latest.cost_usd)
+                || total
+                    .input_tokens
+                    .is_some_and(|value| Some(value) != latest.input_tokens)
+                || total
+                    .output_tokens
+                    .is_some_and(|value| Some(value) != latest.output_tokens)
+                || total
+                    .cache_read_tokens
+                    .is_some_and(|value| Some(value) != latest.cache_read_tokens)
+                || total
+                    .num_turns
+                    .is_some_and(|value| Some(value) != latest.num_turns)
+                || total
+                    .total_tokens
+                    .is_some_and(|value| Some(value) != latest.total_tokens)
+        });
+        if differs {
+            if let Some(cost) = total.cost_usd {
+                parts.push(format!("Σ {} runs ${cost:.2}", total.executions));
+            } else if let Some(tokens) = total.total_tokens {
+                parts.push(format!("Σ {} runs {tokens} tokens", total.executions));
+            } else if let Some(tokens) = total.input_tokens {
+                parts.push(format!("Σ {} runs {tokens} in", total.executions));
+            }
+        }
+    }
+    parts.join(" · ")
+}
+
+/// Renders title, execution metadata, workdir/follow, and nullable native usage.
 fn render_header(f: &mut Frame, app: &App, buffer: &TranscriptBuffer, split: bool, area: Rect) {
     let p = theme::palette();
     let agent = &buffer.agent;
@@ -1530,7 +1788,7 @@ fn render_header(f: &mut Frame, app: &App, buffer: &TranscriptBuffer, split: boo
             format!("broker error, retrying · {}", truncate_one(error, 64)),
             theme::failure(),
         ));
-    } else if !buffer.history_complete {
+    } else if !buffer.blocks_view && !buffer.history_complete {
         meta.push(Span::raw(" "));
         meta.push(Span::styled(
             format!("loading {} messages…", buffer.messages.len()),
@@ -1568,15 +1826,19 @@ fn render_header(f: &mut Frame, app: &App, buffer: &TranscriptBuffer, split: boo
         vec![Span::styled("○ scrolled", theme::dim())]
     };
     let follow_row = text::lr(vec![workdir], follow, width, plain);
-    // Row 4: blank.
-    let blank = text::fit(Vec::new(), width, plain);
+    // Row 4: nullable native usage; absent statistics leave the row blank.
+    let usage = text::fit(
+        vec![Span::styled(usage_line(agent), theme::dim())],
+        width,
+        plain,
+    );
 
     f.render_widget(
         Paragraph::new(vec![
             Line::from(title),
             Line::from(meta),
             Line::from(follow_row),
-            Line::from(blank),
+            Line::from(usage),
         ]),
         area,
     );
@@ -2360,5 +2622,250 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Edge fragments extend one text block and consume only new bytes;
+    /// replaying the forward page never duplicates visible content.
+    #[test]
+    fn partial_tail_extends_without_duplicate_text() {
+        use crate::tests_support::{block_message, block_page};
+        let mut buffer = TranscriptBuffer::open(agent_view(STABLE, RUN, "running"));
+        let mut tail = block_message(10, 20, "assistant", "middle ", "stream");
+        tail.partial_before = Some(true);
+        tail.starts_block = Some(false);
+        buffer.merge(block_page(vec![tail], None, Some(10), 20, true));
+        cache(&buffer, 80);
+        let first_bytes = buffer.render_cache.borrow().blocks[0]
+            .stream
+            .as_ref()
+            .unwrap()
+            .processed;
+        let mut follow = block_message(21, 30, "assistant", "newest", "stream");
+        follow.partial_before = Some(true);
+        follow.starts_block = Some(false);
+        let follow = block_page(vec![follow], None, None, 30, false);
+        buffer.merge(follow.clone());
+        cache(&buffer, 80);
+        let built = cache_block_builds(&buffer);
+        assert!(!buffer.merge(follow));
+        let guard = cache(&buffer, 80);
+        assert_eq!(guard.grouping.blocks.len(), 1);
+        assert_eq!(guard.blocks[0].stream.as_ref().unwrap().consumed, 2);
+        assert!(guard.blocks[0].stream.as_ref().unwrap().processed - first_bytes < 100);
+        let visible: String = guard.blocks[0]
+            .rows
+            .iter()
+            .flat_map(|row| &row.left)
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(visible.matches("middle newest").count(), 1, "{visible}");
+        assert!(visible.contains("partial block"));
+        assert_eq!(guard.builds, built);
+        drop(guard);
+        let older = block_message(1, 9, "assistant", "beginning ", "stream");
+        buffer.merge(block_page(vec![older], Some(10), None, 9, true));
+        let guard = cache(&buffer, 80);
+        let visible: String = guard.blocks[0]
+            .rows
+            .iter()
+            .flat_map(|row| &row.left)
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(visible.contains("beginning middle newest"), "{visible}");
+        assert!(!visible.contains("partial block"), "{visible}");
+        assert_eq!(guard.grouping.blocks.len(), 1);
+        assert!(buffer.history_complete);
+        assert_eq!(buffer.resume_cursor, 30);
+    }
+
+    /// Server block boundaries still pair call/result identities, including
+    /// split arguments and results that initially arrived without their call.
+    #[test]
+    fn projected_tool_edges_pair_and_extend_without_duplicate_rows() {
+        use crate::tests_support::{block_message, block_page};
+        let mut buffer = TranscriptBuffer::open(agent_view(STABLE, RUN, "running"));
+        let mut result = block_message(20, 30, "tool_result", "middle ", "tool");
+        result.name = Some("Bash".to_owned());
+        result.error = Some(false);
+        result.partial_before = Some(true);
+        result.starts_block = Some(false);
+        buffer.merge(block_page(vec![result], None, Some(20), 30, true));
+        cache(&buffer, 80);
+        let mut next = block_message(31, 40, "tool_result", "tail", "tool");
+        next.name = Some("Bash".to_owned());
+        next.error = Some(false);
+        next.partial_before = Some(true);
+        next.starts_block = Some(false);
+        buffer.merge(block_page(vec![next], None, None, 40, false));
+        assert_eq!(blocks(&buffer).len(), 1);
+        let mut call = block_message(1, 10, "tool_call", "{\"command\":\"echo ", "tool");
+        call.name = Some("Bash".to_owned());
+        call.partial_after = Some(true);
+        let mut suffix = block_message(11, 18, "tool_call", "hi\"}", "tool");
+        suffix.name = Some("Bash".to_owned());
+        suffix.partial_before = Some(true);
+        suffix.starts_block = Some(false);
+        let mut result_prefix = block_message(19, 19, "tool_result", "head ", "tool");
+        result_prefix.name = Some("Bash".to_owned());
+        result_prefix.error = Some(false);
+        result_prefix.partial_after = Some(true);
+        buffer.merge(block_page(
+            vec![call, suffix, result_prefix],
+            Some(20),
+            None,
+            19,
+            true,
+        ));
+        buffer.toggle_expanded(10);
+        let guard = cache(&buffer, 80);
+        assert_eq!(
+            guard.grouping.blocks.len(),
+            1,
+            "orphan results now pair to the prepended call"
+        );
+        let visible: String = guard.blocks[0]
+            .rows
+            .iter()
+            .flat_map(|row| row.left.iter().chain(&row.right))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(visible.contains("echo hi"), "{visible}");
+        assert!(visible.contains("middle tail"), "{visible}");
+        assert!(visible.contains("[ok]"), "{visible}");
+        assert!(!visible.contains("partial block"), "{visible}");
+    }
+
+    /// Overlapping replay ranges replace smaller fragments, while omitted
+    /// content stays explicitly truncated instead of triggering a body fetch.
+    #[test]
+    fn replayed_range_replaces_partial_and_keeps_truncation() {
+        use crate::tests_support::{block_message, block_page};
+        let mut buffer = TranscriptBuffer::open(agent_view(STABLE, RUN, "running"));
+        buffer.merge(block_page(
+            vec![block_message(10, 20, "assistant", "suffix", "stream")],
+            None,
+            Some(10),
+            20,
+            true,
+        ));
+        cache(&buffer, 80);
+        let mut full = block_message(1, 30, "assistant", "full body", "stream");
+        full.content_complete = Some(false);
+        full.omitted_bytes = Some(400);
+        buffer.merge(block_page(vec![full], None, None, 30, false));
+        assert_eq!(buffer.messages.len(), 1);
+        let guard = cache(&buffer, 80);
+        let visible: String = guard.blocks[0]
+            .rows
+            .iter()
+            .flat_map(|row| &row.left)
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(visible.contains("full body"), "{visible}");
+        assert!(!visible.contains("suffix"), "{visible}");
+        assert!(visible.contains("content truncated"), "{visible}");
+    }
+
+    /// Native usage is compact, width-fitted and dim; absent fields stay
+    /// unknown, and equal/absent lineage measurements never invent totals.
+    #[test]
+    fn usage_and_tools_preserve_nullable_native_measurements() {
+        let mut agent = agent_view(STABLE, RUN, "running");
+        assert_eq!(usage_line(&agent), "");
+        agent.usage = Some(
+            serde_json::from_value(serde_json::json!({
+                "input_tokens":1234,"output_tokens":56,"cache_read_tokens":1200,
+                "cache_write_tokens":null,"reasoning_tokens":null,"total_tokens":1290,
+                "num_turns":4,"ttft_ms":null,"api_duration_ms":null,"cost_usd":0.25,
+                "usage_source":"runtime_result","recorded_at":100.0
+            }))
+            .unwrap(),
+        );
+        agent.tool_counts = Some(agent_run_domain::views::ToolCountsView {
+            calls: Some(41),
+            failed: Some(2),
+            unknown_results: Some(3),
+        });
+        agent.usage_cumulative = Some(
+            serde_json::from_value(serde_json::json!({
+                "input_tokens":4000,"output_tokens":120,"cache_read_tokens":3000,
+                "cache_write_tokens":null,"reasoning_tokens":null,"total_tokens":4120,
+                "num_turns":10,"cost_usd":1.24,"executions":3
+            }))
+            .unwrap(),
+        );
+        let line = usage_line(&agent);
+        assert_eq!(line, "in 1234 · out 56 · cache 1200 · $0.25 · turns 4 · tools 41 · 2 failed · 3 unknown · Σ 3 runs $1.24");
+        let mut app = App::new();
+        app.screen = crate::app::Screen::Transcript;
+        app.transcript = Some(TranscriptBuffer::open(agent.clone()));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 16)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, frame.area(), false))
+            .unwrap();
+        let row: String = (0..120)
+            .map(|x| terminal.backend().buffer()[(x, 3)].symbol())
+            .collect();
+        assert!(row.contains("tools 41 · 2 failed · 3 unknown"), "{row}");
+        assert_eq!(
+            terminal.backend().buffer()[(0, 3)].fg,
+            theme::palette().gray
+        );
+        agent.usage.as_mut().unwrap().input_tokens = None;
+        agent.usage.as_mut().unwrap().output_tokens = None;
+        agent.usage.as_mut().unwrap().cache_read_tokens = None;
+        agent.usage.as_mut().unwrap().num_turns = None;
+        agent.usage.as_mut().unwrap().cost_usd = None;
+        agent.tool_counts = Some(agent_run_domain::views::ToolCountsView::default());
+        agent.usage_cumulative = None;
+        assert_eq!(
+            usage_line(&agent),
+            "in — · out — · cache — · $— · turns — · tools — · — failed · — unknown"
+        );
+        agent.usage_cumulative = Some(
+            serde_json::from_value(serde_json::json!({
+                "input_tokens":null,"output_tokens":null,"cache_read_tokens":null,
+                "cache_write_tokens":null,"reasoning_tokens":null,"total_tokens":null,
+                "num_turns":null,"cost_usd":null,"executions":3
+            }))
+            .unwrap(),
+        );
+        assert!(!usage_line(&agent).contains("Σ"));
+    }
+
+    /// Reverse complete cannot close a finished transcript before its forward
+    /// catch-up; top history markers remain distinct from terminal evidence.
+    #[test]
+    fn reverse_complete_waits_for_forward_tail_before_outcome() {
+        use crate::tests_support::{block_message, block_page};
+        let mut buffer = TranscriptBuffer::open(agent_view(STABLE, RUN, "succeeded"));
+        buffer.merge(block_page(
+            vec![block_message(1, 10, "assistant", "answer", "stream")],
+            None,
+            None,
+            10,
+            true,
+        ));
+        assert!(buffer.history_complete);
+        assert_eq!(tail_height(&buffer), 1);
+        buffer.merge(block_page(vec![], None, None, 10, false));
+        assert_eq!(tail_height(&buffer), 2);
+        let mut app = App::new();
+        app.transcript = Some(buffer);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 18)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, frame.area(), false))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("beginning of transcript"), "{screen}");
+        assert!(screen.contains("finished in"), "{screen}");
     }
 }

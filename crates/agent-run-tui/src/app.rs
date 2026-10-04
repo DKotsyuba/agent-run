@@ -44,8 +44,19 @@ pub struct TranscriptBuffer {
     pub messages: Vec<MessageView>,
     /// Cursor for the next transcript fetch.
     pub next_cursor: i64,
-    /// Whether the full known history is buffered (`complete` page observed).
+    /// Whether the beginning has arrived (reverse cursor absent), or legacy
+    /// forward backfill completed. A block tail's complete flag is directional.
     pub history_complete: bool,
+    /// Exclusive cursor for older blocks; retained by the transcript LRU.
+    pub previous_cursor: Option<i64>,
+    /// Forward cursor after the newest included sequence, independent of older reads.
+    pub resume_cursor: i64,
+    /// Whether the broker returned the blocks representation.
+    pub blocks_view: bool,
+    /// Whether an older-history request is in flight; prevents duplicate dispatch.
+    pub loading_older: bool,
+    /// Whether the newest forward page reached the currently known tail.
+    pub tail_complete: bool,
     /// Whether the view sticks to the tail on new content.
     pub follow: bool,
     /// Rendered lines below the viewport while the user scrolled away from the tail.
@@ -62,7 +73,8 @@ pub struct TranscriptBuffer {
     pub(crate) expansion: u64,
     /// Content epoch: bumped whenever an existing message is replaced or
     /// inserted in place (the rare path); the render cache drops every
-    /// memoized block when it moves. Appends never bump it.
+    /// memoized block when it moves. Appends and pure prepends never bump it;
+    /// prepends rebase unchanged block memos instead.
     pub(crate) epoch: u64,
     /// Render cache owned by [`crate::ui::transcript`]: per-block memoized
     /// rows and layout sums, keyed by block identity, expansion, width,
@@ -74,13 +86,18 @@ pub struct TranscriptBuffer {
 }
 
 impl TranscriptBuffer {
-    /// Opens a fresh buffer for one session; history is refetched from the start.
+    /// Opens a fresh buffer for one session, initially following its tail.
     pub fn open(agent: AgentView) -> Self {
         Self {
             agent,
             messages: Vec::new(),
             next_cursor: 0,
             history_complete: false,
+            previous_cursor: None,
+            resume_cursor: 0,
+            blocks_view: false,
+            loading_older: false,
+            tail_complete: false,
             follow: true,
             from_bottom: 0,
             cursor: 0,
@@ -93,51 +110,110 @@ impl TranscriptBuffer {
         }
     }
 
-    /// Consumes one owned page into the buffer, moving payloads and dropping duplicates by sequence
-    /// cursor, and returns whether anything changed.
-    ///
-    /// The store is append-only: a page whose sequences all sit past the
-    /// tail extends the vector without touching existing data, so backfill
-    /// stays linear and an unchanged tail poll costs nothing beyond the
-    /// sequence comparison. Only out-of-order or replaced messages take the
-    /// rare in-place path, which bumps the content epoch for any changed
-    /// content, identity or native evidence so cached rows cannot stay stale.
+    /// Moves a page into the ordered buffer, deduplicating immutable sequence
+    /// ranges. Nonoverlapping partial fragments remain separate inputs to the
+    /// incremental renderer, which joins only matching known native identities.
+    /// Reverse reads update the older cursor without rewinding forward follow.
+    /// Pure prepends preserve row memos and shift cursor/hover indices; only
+    /// replacements or interleaved inserts invalidate the content epoch.
     pub fn merge(&mut self, page: TranscriptPage) -> bool {
+        use agent_run_domain::transcript::TranscriptView;
+        let reverse = page.direction.as_deref() == Some("backward");
+        let blocks = page.view == Some(TranscriptView::Blocks);
         let resume = page
-            .next_cursor
+            .resume_cursor
+            .or(page.next_cursor)
             .or_else(|| page.messages.last().map(|m| m.seq));
-        let mut changed = false;
-        let tail = self.messages.last().map(|m| m.seq);
-        let appendable = page
-            .messages
-            .iter()
-            .all(|message| tail.is_some_and(|tail| message.seq > tail));
-        if appendable {
-            if page.messages.is_empty() {
-                // Unchanged tail poll: nothing to do.
-            } else {
-                let jumbled = page
-                    .messages
-                    .windows(2)
-                    .any(|pair| pair[0].seq > pair[1].seq);
-                self.messages.extend(page.messages);
-                if jumbled {
-                    // A jumbled page: restore the order once (rare).
-                    self.messages.sort_by_key(|m| m.seq);
-                    self.epoch += 1;
-                }
-                changed = true;
+        let mut changed = self.blocks_view != blocks;
+        self.blocks_view = blocks;
+        if reverse {
+            changed |= self.previous_cursor != page.previous_cursor || self.loading_older;
+            self.previous_cursor = page.previous_cursor;
+            self.loading_older = false;
+            let complete = page.previous_cursor.is_none();
+            changed |= self.history_complete != complete;
+            self.history_complete = complete;
+            // A reverse page is complete toward the beginning, never the tail.
+            if page.before_cursor.is_none() {
+                self.tail_complete = false;
             }
         } else {
+            if !blocks && page.complete && !self.history_complete {
+                self.history_complete = true;
+                changed = true;
+            }
+            changed |= self.tail_complete != page.complete;
+            self.tail_complete = page.complete;
+        }
+        let tail = self.messages.last().map(|m| m.seq);
+        let ordered = page
+            .messages
+            .windows(2)
+            .all(|pair| pair[0].seq < pair[1].seq);
+        let prepend = !self.messages.is_empty()
+            && !page.messages.is_empty()
+            && ordered
+            && page.messages.last().is_some_and(|m| {
+                m.seq < self.messages[0].first_seq.unwrap_or(self.messages[0].seq)
+            });
+        if prepend {
+            let count = page.messages.len();
+            self.messages.splice(0..0, page.messages);
+            self.render_cache.get_mut().prepend(&self.messages, count);
+            self.cursor += count;
+            self.hover = self.hover.map(|index| index + count);
+            changed = true;
+        } else if ordered
+            && page
+                .messages
+                .iter()
+                .all(|m| tail.is_none_or(|seq| m.first_seq.unwrap_or(m.seq) > seq))
+        {
+            changed |= !page.messages.is_empty();
+            self.messages.extend(page.messages);
+        } else {
             for message in page.messages {
-                match self.messages.binary_search_by_key(&message.seq, |m| m.seq) {
-                    Ok(pos) => {
-                        if self.messages[pos] != message {
-                            self.messages[pos] = message;
-                            self.epoch += 1;
-                            changed = true;
-                        }
+                let first = message.first_seq.unwrap_or(message.seq);
+                // Replayed block pages can cover an already buffered partial
+                // range. Replace fully covered fragments; never show them twice.
+                if blocks && message.raw_ref.is_some() {
+                    let overlaps: Vec<usize> = self
+                        .messages
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, old)| {
+                            old.raw_ref == message.raw_ref
+                                && old.role == message.role
+                                && old.name == message.name
+                                && old.first_seq.unwrap_or(old.seq) <= message.seq
+                                && old.seq >= first
+                        })
+                        .map(|(index, _)| index)
+                        .collect();
+                    if overlaps.iter().any(|index| {
+                        let old = &self.messages[*index];
+                        old.first_seq.unwrap_or(old.seq) <= first
+                            && old.seq >= message.seq
+                            && (old.first_seq.unwrap_or(old.seq) < first || old.seq > message.seq)
+                    }) {
+                        continue;
                     }
+                    for index in overlaps.into_iter().rev() {
+                        if self.messages[index] == message {
+                            continue;
+                        }
+                        self.messages.remove(index);
+                        self.epoch += 1;
+                        changed = true;
+                    }
+                }
+                match self.messages.binary_search_by_key(&message.seq, |m| m.seq) {
+                    Ok(pos) if self.messages[pos] != message => {
+                        self.messages[pos] = message;
+                        self.epoch += 1;
+                        changed = true;
+                    }
+                    Ok(_) => {}
                     Err(pos) => {
                         self.messages.insert(pos, message);
                         self.epoch += 1;
@@ -146,17 +222,10 @@ impl TranscriptBuffer {
                 }
             }
         }
-        // The resume cursor mirrors the watcher's: the page's `next_cursor`,
-        // else the last sequence it carried (a stashed buffer continues from
-        // here instead of refetching from zero).
         if let Some(resume) = resume {
-            self.next_cursor = resume;
+            self.resume_cursor = self.resume_cursor.max(resume);
+            self.next_cursor = self.resume_cursor;
         }
-        if page.complete && !self.history_complete {
-            self.history_complete = true;
-            changed = true;
-        }
-        // A successful page clears the last failure, visibly.
         changed |= self.last_page_error.take().is_some();
         self.cursor = self.cursor.min(self.messages.len().saturating_sub(1));
         changed
@@ -640,18 +709,43 @@ impl App {
         self.dirty = true;
     }
 
-    /// Consumes one owned transcript page into the open buffer when it still belongs
-    /// to the selected session; returns whether anything changed.
-    ///
-    /// An unchanged tail poll changes nothing and marks nothing dirty.
+    /// Applies an owned page for the active session. Reverse prepends preserve
+    /// the visible line's distance from the unchanged tail, including when the
+    /// initial body was smaller than the viewport. Tail polls remain cheap.
     pub fn apply_transcript(&mut self, agent_id: &AgentId, page: TranscriptPage) -> bool {
+        let pane = crate::ui::panes(self, self.last_width, self.last_height).transcript;
         let Some(buffer) = &mut self.transcript else {
             return false;
         };
         if buffer.agent.agent_id != *agent_id {
             return false;
         }
+        let anchor = if page.before_cursor.is_some() && !buffer.follow {
+            pane.map(|pane| {
+                let width = crate::ui::transcript::body_width(pane);
+                let viewport = usize::from(
+                    pane.height
+                        .saturating_sub(crate::ui::transcript::HEADER_ROWS),
+                );
+                let total = crate::ui::transcript::total_height(buffer, width);
+                let offset = crate::ui::transcript::scroll_offset(buffer, total, viewport);
+                (
+                    width,
+                    viewport,
+                    offset,
+                    crate::ui::transcript::history_height(buffer, width),
+                )
+            })
+        } else {
+            None
+        };
         let changed = buffer.merge(page);
+        if let Some((width, viewport, offset, old_height)) = anchor {
+            let height = crate::ui::transcript::history_height(buffer, width);
+            let offset = (offset + height).saturating_sub(old_height);
+            let total = crate::ui::transcript::total_height(buffer, width);
+            buffer.from_bottom = total.saturating_sub(viewport).saturating_sub(offset);
+        }
         self.dirty |= changed;
         changed
     }
@@ -776,6 +870,8 @@ impl App {
         }
         match self.transcripts.take(&key) {
             Some(mut buffer) => {
+                // Switching targets cancelled any in-flight reverse request.
+                buffer.loading_older = false;
                 // Header data went stale while stashed; refresh the view.
                 if let Some(fresh) = self
                     .sessions
@@ -1642,5 +1738,51 @@ mod tests {
         assert!(!screen.contains("hidden"));
         app.close_answer();
         assert!(app.answer.is_none());
+    }
+
+    /// Stashing and restoring a transcript retains both paging directions and
+    /// memoized content, while cancelled older-request state is cleared.
+    #[test]
+    fn transcript_lru_restores_reverse_and_forward_cursors() {
+        use crate::tests_support::{agent_view, block_message, block_page};
+        let stable = "ag-20260928-101500-aaaaaaaaaa";
+        let run = "ag-20260928-101500-bbbbbbbbbb";
+        let other = "ag-20260928-101501-cccccccccc";
+        let other_run = "ag-20260928-101501-dddddddddd";
+        let mut app = App::new();
+        app.sessions = vec![
+            agent_view(stable, run, "running"),
+            agent_view(other, other_run, "running"),
+        ];
+        app.watch_selected();
+        app.apply_transcript(
+            &stable.parse().unwrap(),
+            block_page(
+                vec![block_message(100, 150, "assistant", "tail", "stream")],
+                None,
+                Some(100),
+                150,
+                true,
+            ),
+        );
+        {
+            let buffer = app.transcript.as_mut().unwrap();
+            buffer.loading_older = true;
+            buffer.follow = false;
+            buffer.from_bottom = 7;
+            buffer.toggle_expanded(150);
+        }
+        app.selected = 1;
+        app.watch_selected();
+        app.selected = 0;
+        assert_eq!(app.watch_selected().unwrap().2, 150);
+        let buffer = app.transcript.as_ref().unwrap();
+        assert_eq!(buffer.previous_cursor, Some(100));
+        assert_eq!(buffer.resume_cursor, 150);
+        assert_eq!(buffer.next_cursor, 150);
+        assert_eq!(buffer.from_bottom, 7);
+        assert!(!buffer.loading_older);
+        assert!(buffer.is_expanded(150));
+        assert_eq!(buffer.messages[0].content, "tail");
     }
 }
