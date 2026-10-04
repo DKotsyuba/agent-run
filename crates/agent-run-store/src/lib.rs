@@ -224,26 +224,60 @@ pub(crate) fn tx_event(
     Ok(tx.last_insert_rowid())
 }
 
-/// Finds or creates the normalized session row inside a caller-owned transaction.
-///
-/// Session identity deliberately excludes the external turn: later turns of
-/// one chat update liveness and turn metadata without splitting its durable
-/// agent and receipt scope.
+/// Looks up the canonical session, falling back to an exact known legacy alias row.
+/// Canonical rows take precedence when historical data already contains both.
+fn session_id_for_reference(
+    conn: &Connection,
+    reference: &domain::OrchestratorRef,
+) -> Result<Option<String>> {
+    reference.validate()?;
+    let transport = reference.canonical_transport()?;
+    let found = conn
+        .query_row(
+            "SELECT id FROM orchestrator_sessions WHERE transport=? AND external_session_id=?",
+            params![transport, reference.external_session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if found.is_some() {
+        return Ok(found);
+    }
+    let legacy = match transport {
+        "codex_queue" => "codex",
+        "claude_uds" => "claude",
+        _ => unreachable!(),
+    };
+    Ok(conn
+        .query_row(
+            "SELECT id FROM orchestrator_sessions WHERE transport=? AND external_session_id=?",
+            params![legacy, reference.external_session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?)
+}
+
+/// Finds or creates a session inside a caller-owned transaction.
+/// New rows use canonical transports; exact existing legacy alias rows remain immutable.
 pub(crate) fn session_for_reference(
     tx: &Transaction<'_>,
     reference: &domain::OrchestratorRef,
     at: f64,
 ) -> Result<String> {
+    reference.validate()?;
+    let transport = reference.canonical_transport()?;
+    if let Some(session) = session_id_for_reference(tx, reference)? {
+        tx.execute(
+            "UPDATE orchestrator_sessions SET external_turn_id=?,last_seen_at=? WHERE id=?",
+            params![reference.external_turn_id, at, session],
+        )?;
+        return Ok(session);
+    }
     let candidate = format!("os-{}", uuid::Uuid::new_v4().simple());
     tx.execute(
-        "INSERT INTO orchestrator_sessions(id,transport,external_session_id,external_turn_id,created_at,last_seen_at) VALUES(?,?,?,?,?,?) ON CONFLICT(transport,external_session_id) DO UPDATE SET last_seen_at=excluded.last_seen_at,external_turn_id=excluded.external_turn_id",
-        params![candidate, reference.transport, reference.external_session_id, reference.external_turn_id, at, at],
+        "INSERT INTO orchestrator_sessions(id,transport,external_session_id,external_turn_id,created_at,last_seen_at) VALUES(?,?,?,?,?,?)",
+        params![candidate, transport, reference.external_session_id, reference.external_turn_id, at, at],
     )?;
-    Ok(tx.query_row(
-        "SELECT id FROM orchestrator_sessions WHERE transport=? AND external_session_id=?",
-        params![reference.transport, reference.external_session_id],
-        |row| row.get(0),
-    )?)
+    Ok(candidate)
 }
 
 /// Decodes only the bounded versioned component receipt representation.
@@ -518,15 +552,7 @@ impl Store {
         &self,
         reference: &domain::OrchestratorRef,
     ) -> Result<Option<String>> {
-        reference.validate()?;
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT id FROM orchestrator_sessions WHERE transport=? AND external_session_id=?",
-                params![reference.transport, reference.external_session_id],
-                |row| row.get(0),
-            )
-            .optional()?)
+        session_id_for_reference(&self.conn, reference)
     }
 
     /// Atomically records visible context component fingerprints for a session reference.
@@ -1135,6 +1161,8 @@ impl Store {
     }
 
     /// Share bounded pagination between execution history and logical agents.
+    /// A session filter includes canonical and known-alias rows for its exact
+    /// external id, preserving visibility of historical split session rows.
     fn list_selected(
         &self,
         active: bool,
@@ -1146,20 +1174,38 @@ impl Store {
         if limit == 0 || limit > 1000 {
             return Err(invalid("limit must be 1..1000"));
         }
-        let sid=match session{Some(s)=>self.conn.query_row("SELECT id FROM orchestrator_sessions WHERE transport=? AND external_session_id=?",params![s.transport,s.external_session_id],|r|r.get::<_,String>(0)).optional()?,None=>None};
-        if session.is_some() && sid.is_none() {
-            return Ok((vec![], 0));
-        }
+        let (external_session_id, canonical, legacy) = match session {
+            Some(reference) => {
+                reference.validate()?;
+                let canonical = reference.canonical_transport()?;
+                let legacy = match canonical {
+                    "codex_queue" => "codex",
+                    "claude_uds" => "claude",
+                    _ => unreachable!(),
+                };
+                (reference.external_session_id.as_str(), canonical, legacy)
+            }
+            None => ("", "", ""),
+        };
         // Admission permits one child per predecessor. The indexed child lookup
         // selects the lineage tip without scanning every root/sequence pair.
         let where_sql = format!(
-            "WHERE (?=0 OR status IN {ACTIVE_SQL}) AND (? IS NULL OR orchestrator_session_id=?) \
+            "WHERE (?=0 OR status IN {ACTIVE_SQL}) AND (?=0 OR EXISTS ( \
+             SELECT 1 FROM orchestrator_sessions o WHERE o.id=agents.orchestrator_session_id \
+             AND o.external_session_id=? AND o.transport IN (?,?))) \
              AND (?=0 OR NOT EXISTS (SELECT 1 FROM agents newer \
              WHERE newer.parent_agent_id=agents.id))"
         );
         let total = self.conn.query_row(
             &format!("SELECT COUNT(*) FROM agents {where_sql}"),
-            params![active, sid, sid, latest],
+            params![
+                active,
+                session.is_some(),
+                external_session_id,
+                canonical,
+                legacy,
+                latest
+            ],
             |r| r.get(0),
         )?;
         let mut stmt = self.conn.prepare(&format!(
@@ -1167,7 +1213,16 @@ impl Store {
         ))?;
         let rows = stmt
             .query_map(
-                params![active, sid, sid, latest, limit as i64, offset as i64],
+                params![
+                    active,
+                    session.is_some(),
+                    external_session_id,
+                    canonical,
+                    legacy,
+                    latest,
+                    limit as i64,
+                    offset as i64
+                ],
                 Record::read,
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;

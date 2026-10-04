@@ -1845,6 +1845,48 @@ async fn dispatch_records_retry_and_success_evidence_for_one_bound_notice() {
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 0);
 }
 
+/// A legacy known-alias session is dispatched through its canonical adapter.
+#[tokio::test]
+async fn retry_dispatch_canonicalizes_legacy_transport_alias() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let home = common::Home::new();
+    delivery(&home.path, "ntf_legacy_alias", "codex", "retry_wait");
+    Connection::open(home.path.join("state.db"))
+        .unwrap()
+        .execute(
+            "UPDATE deliveries SET attempts=1,next_attempt_at=? WHERE id='ntf_legacy_alias'",
+            [now() - 1.0],
+        )
+        .unwrap();
+    let listener =
+        tokio::net::UnixListener::bind(home.path.join("ar-cdx-v4-accepted.sock")).unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let length = stream.read_u32_le().await.unwrap() as usize;
+        let mut data = vec![0; length];
+        stream.read_exact(&mut data).await.unwrap();
+        let reply = br#"{"outcome":"accepted"}"#;
+        stream.write_u32_le(reply.len() as u32).await.unwrap();
+        stream.write_all(reply).await.unwrap();
+        serde_json::from_slice::<Value>(&data).unwrap()
+    });
+
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+    assert_eq!(peer.await.unwrap()["op"], "completion");
+    assert_eq!(
+        Connection::open(home.path.join("state.db"))
+            .unwrap()
+            .query_row(
+                "SELECT state FROM deliveries WHERE id='ntf_legacy_alias'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "delivered"
+    );
+}
+
 /// A durable worker row is dispatched through v4 and retains the usual retry evidence.
 #[tokio::test]
 async fn dispatches_worker_report_without_completion_status() {

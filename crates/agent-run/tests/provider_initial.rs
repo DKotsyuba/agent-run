@@ -2,7 +2,7 @@
 //! New provider admission through the real detached supervisor and fake engine.
 
 use agent_run::{
-    domain::{AgentId, Status},
+    domain::{AgentId, OrchestratorRef, Status},
     service::Service,
     state::Store,
 };
@@ -841,7 +841,7 @@ fn request(home: &Path) -> ProviderStartRequest {
     serde_json::from_value(serde_json::json!({
         "provider":"glm-user","model":"fixture","profile":"review",
         "task":"fixture:answer","workdir":home,"account":"work","request_id":"provider-1",
-        "orchestrator":{"transport":"fixture","external_session_id":"test-session"}
+        "orchestrator":{"transport":"codex_queue","external_session_id":"test-session"}
     }))
     .unwrap()
 }
@@ -1362,8 +1362,33 @@ async fn provider_ordinary_admission_ranks_itself_and_completes() {
 async fn provider_replay_precedes_changed_config_and_quota() {
     let (_temp, home) = home();
     let service = Service::new(home.clone());
-    let original = request_for(&home, "glm-user", "replay-1", None);
+    let mut original = request_for(&home, "glm-user", "replay-1", None);
+    original.orchestrator = Some(OrchestratorRef {
+        transport: "codex".into(),
+        external_session_id: "legacy-provider-session".into(),
+        external_turn_id: None,
+    });
     let admitted = service.admit_provider(original.clone()).unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    let legacy_fingerprint =
+        agent_run_domain::canonical::sha256_hex(&serde_json::to_value(&original).unwrap(), true);
+    let store = Store::open(&home).unwrap();
+    let mut identity = store.get(&id).unwrap().identity.unwrap();
+    identity["replay_request_sha256"] = serde_json::json!(legacy_fingerprint);
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET identity_json=? WHERE id=?",
+            rusqlite::params![serde_json::to_string(&identity).unwrap(), id.as_str()],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE orchestrator_sessions SET transport='codex' WHERE external_session_id='legacy-provider-session'",
+            [],
+        )
+        .unwrap();
     bump_revision(&home).unwrap();
     Store::open(&home)
         .unwrap()
@@ -1373,6 +1398,15 @@ async fn provider_replay_precedes_changed_config_and_quota() {
     let replay = service
         .admit_provider_observed(original.clone(), &mut |_| {
             panic!("replay must not rank or submit")
+        })
+        .unwrap();
+    assert_eq!(replay["created"], false);
+    assert_eq!(replay["agent_id"], admitted["agent_id"]);
+    let mut canonical_retry = original.clone();
+    canonical_retry.orchestrator.as_mut().unwrap().transport = "codex_queue".into();
+    let replay = service
+        .admit_provider_observed(canonical_retry, &mut |_| {
+            panic!("legacy namespace replay must not rank or submit")
         })
         .unwrap();
     assert_eq!(replay["created"], false);
@@ -1760,7 +1794,7 @@ async fn provider_resume_continues_the_proven_native_session() {
             .unwrap(),
     );
     let orchestrator: agent_run::domain::OrchestratorRef = serde_json::from_value(
-        serde_json::json!({"transport":"fixture","external_session_id":"test-session"}),
+        serde_json::json!({"transport":"codex_queue","external_session_id":"test-session"}),
     )
     .unwrap();
     let resume = |request_id: &str| {
@@ -1997,7 +2031,7 @@ async fn concurrent_provider_resumes_admit_one_child() {
                         None,
                         Some(
                             serde_json::from_value(serde_json::json!({
-                                "transport":"fixture","external_session_id":"test-session"
+                                "transport":"codex_queue","external_session_id":"test-session"
                             }))
                             .unwrap(),
                         ),
@@ -2613,7 +2647,7 @@ async fn codex_run(home: &Path, request_id: &str, account: Option<&str>) -> Agen
     let mut request: ProviderStartRequest = serde_json::from_value(serde_json::json!({
         "provider":"codex-user","model":"fixture","profile":"review",
         "task":"fixture:original-task","workdir":home,"request_id":request_id,"account":account,
-        "orchestrator":{"transport":"fixture","external_session_id":"codex-session"},
+        "orchestrator":{"transport":"codex_queue","external_session_id":"codex-session"},
     }))
     .unwrap();
     request.validate().unwrap();
@@ -3141,7 +3175,7 @@ async fn cancel_during_the_exhausted_attempt_prevents_the_switch() {
     let mut request: ProviderStartRequest = serde_json::from_value(serde_json::json!({
         "provider":"codex-user","model":"fixture","profile":"review",
         "task":"fixture:original-task","workdir":home,"request_id":"cancel-switch",
-        "orchestrator":{"transport":"fixture","external_session_id":"codex-session"},
+        "orchestrator":{"transport":"codex_queue","external_session_id":"codex-session"},
     }))
     .unwrap();
     request.validate().unwrap();
@@ -3234,7 +3268,7 @@ async fn crash_after_the_switch_reconciles_without_a_duplicate() {
     let mut request: ProviderStartRequest = serde_json::from_value(serde_json::json!({
         "provider":"codex-user","model":"fixture","profile":"review",
         "task":"fixture:original-task","workdir":home,"request_id":"crash-switch",
-        "orchestrator":{"transport":"fixture","external_session_id":"codex-session"},
+        "orchestrator":{"transport":"codex_queue","external_session_id":"codex-session"},
     }))
     .unwrap();
     request.validate().unwrap();
@@ -3339,7 +3373,7 @@ async fn held_codex_run(home: &Path, during: impl FnOnce(&Path)) -> AgentId {
     let mut request: ProviderStartRequest = serde_json::from_value(serde_json::json!({
         "provider":"codex-user","model":"fixture","profile":"review",
         "task":"fixture:original-task","workdir":home,"request_id":"held-run",
-        "orchestrator":{"transport":"fixture","external_session_id":"codex-session"},
+        "orchestrator":{"transport":"codex_queue","external_session_id":"codex-session"},
     }))
     .unwrap();
     request.validate().unwrap();
@@ -3476,7 +3510,7 @@ fn codex_admit(home: &Path, request_id: &str, timeout: Option<f64>) -> AgentId {
         "provider":"codex-user","model":"fixture","profile":"review",
         "task":"fixture:original-task","workdir":home,"request_id":request_id,
         "timeout_seconds":timeout,
-        "orchestrator":{"transport":"fixture","external_session_id":"codex-session"},
+        "orchestrator":{"transport":"codex_queue","external_session_id":"codex-session"},
     }))
     .unwrap();
     request.validate().unwrap();
@@ -4532,7 +4566,7 @@ async fn private_launch_is_guarded_before_the_first_publication() {
 
     // A resume prepares the retained home it shares with its parent.
     let orchestrator: agent_run::domain::OrchestratorRef = serde_json::from_value(
-        serde_json::json!({"transport":"fixture","external_session_id":"test-session"}),
+        serde_json::json!({"transport":"codex_queue","external_session_id":"test-session"}),
     )
     .unwrap();
     let resumed = service
@@ -4860,7 +4894,7 @@ fn pool_request(
         "request_id": request_id,
         "goal": "ship the fix",
         "orchestrator": bound.then(|| serde_json::json!(
-            {"transport":"fixture","external_session_id":"test-session"})),
+            {"transport":"codex_queue","external_session_id":"test-session"})),
         "members": members.iter().map(|(role, task, pin)| serde_json::json!({
             "role": role,
             "start": {"provider":"glm-user","model":"fixture","profile":"review",

@@ -15,41 +15,39 @@ use agent_run_platform::process;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
 
-/// Return the recorded request-id replay in its orchestrator namespace.
+/// Return the recorded request-id replay in its canonical or exact legacy namespace.
 ///
-/// This read deliberately has no mutable-config dependency, letting the
-/// service return an already admitted request after configuration was edited or
-/// made invalid. Concurrent first submissions are resolved again inside
-/// [`Store::admit`]'s immediate transaction.
+/// This read does not alter historical rows or load mutable configuration.
 pub fn replay_request(store: &Store, request: &StartRequest) -> Result<Option<Record>> {
     let Some(request_id) = request.request_id.as_deref() else {
         return Ok(None);
     };
-    let transport = request
-        .orchestrator
-        .as_ref()
-        .map(|item| item.transport.as_str());
-    let session = request
-        .orchestrator
-        .as_ref()
-        .map(|item| item.external_session_id.as_str());
-    let sql = if request.orchestrator.is_none() {
-        "SELECT a.* FROM agents a WHERE a.request_id=? AND (a.orchestrator_session_id IS NULL OR json_extract(a.request_json,'$.orchestrator') IS NULL) ORDER BY a.created_at LIMIT 1"
-    } else {
-        "SELECT a.* FROM agents a LEFT JOIN orchestrator_sessions o ON o.id=a.orchestrator_session_id WHERE a.request_id=? AND o.transport=? AND o.external_session_id=? ORDER BY a.created_at LIMIT 1"
-    };
-    let row = if request.orchestrator.is_none() {
-        store
+    let Some(reference) = &request.orchestrator else {
+        return Ok(store
             .conn
-            .query_row(sql, params![request_id], Record::read)
-            .optional()?
-    } else {
-        store
-            .conn
-            .query_row(sql, params![request_id, transport, session], Record::read)
-            .optional()?
+            .query_row(
+                "SELECT a.* FROM agents a WHERE a.request_id=? AND (a.orchestrator_session_id IS NULL OR json_extract(a.request_json,'$.orchestrator') IS NULL) ORDER BY a.created_at LIMIT 1",
+                [request_id],
+                Record::read,
+            )
+            .optional()?);
     };
-    Ok(row)
+    let transport = reference.canonical_transport()?;
+    let legacy = match transport {
+        "codex_queue" => "codex",
+        "claude_uds" => "claude",
+        _ => unreachable!(),
+    };
+    Ok(store
+        .conn
+        .query_row(
+            "SELECT a.* FROM agents a LEFT JOIN orchestrator_sessions o ON o.id=a.orchestrator_session_id \
+             WHERE a.request_id=? AND o.transport IN (?,?) AND o.external_session_id=? \
+             ORDER BY (o.transport=?) DESC,a.created_at LIMIT 1",
+            params![request_id, transport, legacy, reference.external_session_id, transport],
+            Record::read,
+        )
+        .optional()?)
 }
 
 /// Atomically create one `starting` agent or return its exact request replay.

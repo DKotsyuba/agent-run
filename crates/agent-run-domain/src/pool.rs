@@ -170,8 +170,9 @@ impl PoolStartRequest {
     /// Member starts are validated like ordinary starts, must not carry their
     /// own request key or orchestrator (the pool owns both), receive a
     /// deterministic `role slot` name when unnamed, and must keep names unique
-    /// ignoring case. The total composed task of every member is checked
-    /// against the ordinary task bound using placeholder identities.
+    /// ignoring case. A supported orchestrator alias is canonicalized before
+    /// this request can participate in replay identity. The total composed task
+    /// of every member is checked against the ordinary task bound.
     pub fn validate(&mut self) -> Result<()> {
         request_key(&self.request_id)?;
         bounded_text("goal", &self.goal, MAX_GOAL_BYTES)?;
@@ -182,8 +183,8 @@ impl PoolStartRequest {
             }];
         }
         validate_criteria(&self.acceptance)?;
-        if let Some(reference) = &self.orchestrator {
-            reference.validate()?;
+        if let Some(reference) = &mut self.orchestrator {
+            reference.normalize()?;
         }
         if !(MIN_MEMBERS..=MAX_MEMBERS).contains(&self.members.len()) {
             return Err(invalid("a pool needs 2 to 5 members"));
@@ -1159,6 +1160,32 @@ mod tests {
         assert_eq!(
             pool.members[1].start.display_name.as_deref(),
             Some("reviewer1 2")
+        );
+    }
+
+    /// Pool validation canonicalizes aliases and rejects unknown transports before admission.
+    #[test]
+    fn orchestrator_transport_is_normalized_before_pool_admission() {
+        for (alias, canonical) in [("codex", "codex_queue"), ("claude", "claude_uds")] {
+            let mut pool = request(2);
+            pool.orchestrator = Some(OrchestratorRef {
+                transport: alias.into(),
+                external_session_id: "session".into(),
+                external_turn_id: None,
+            });
+            pool.validate().unwrap();
+            assert_eq!(pool.orchestrator.unwrap().transport, canonical);
+        }
+
+        let mut invalid = request(2);
+        invalid.orchestrator = Some(OrchestratorRef {
+            transport: "other".into(),
+            external_session_id: "session".into(),
+            external_turn_id: None,
+        });
+        assert_eq!(
+            invalid.validate().unwrap_err().machine_code(),
+            crate::error::MachineCode::ValidationError
         );
     }
 

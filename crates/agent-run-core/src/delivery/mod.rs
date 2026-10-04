@@ -10,7 +10,10 @@ use crate::{
     Result,
 };
 use agent_run_config::{config::Delivery, provider_config::ProviderConfig};
-use agent_run_domain::worker::{WorkerMessageKind, WorkerNotice};
+use agent_run_domain::{
+    domain::OrchestratorRef,
+    worker::{WorkerMessageKind, WorkerNotice},
+};
 use fs2::FileExt;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -457,6 +460,9 @@ fn delivery_policy(home: &Path) -> Result<Delivery> {
 /// dispatcher crash, such as an expired `sending` lease) is ended failed-ambiguous without a new
 /// send and this claim returns `None`; the finished row leaves the schedule,
 /// so the next dispatch tick makes progress.
+/// Claims one due delivery and returns its canonical adapter name when a known
+/// legacy transport alias was persisted. Unknown transports remain unchanged so
+/// dispatch records the safe `unsupported_transport` classifier.
 fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
     let mut store = Store::open(home)?;
     let tx = store
@@ -490,6 +496,10 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
         [session_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
+    let transport = match OrchestratorRef::canonical_transport_name(&transport) {
+        Ok(canonical) => canonical.to_owned(),
+        Err(_) => transport,
+    };
     if transport == "claude_uds" && attempts > 0 {
         // Evidence for exactly the current attempt count decides. Missing
         // evidence (a dispatcher that crashed around the write, e.g. an
