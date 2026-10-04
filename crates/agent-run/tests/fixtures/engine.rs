@@ -362,10 +362,13 @@ fn main() {
 }
 
 /// Stands in for the native `codex sandbox` the shared-store qualification
-/// probes invoke: runs the command after `--` under a Seatbelt profile that
-/// denies every write except `/dev/null`, plus writes below the `-C` workdir
+/// probes invoke: runs the command after `--` with every write denied except
+/// `/dev/null` (all of `/dev` on Linux), plus writes below the `-C` workdir
 /// when the flags request `workspace-write`, mirroring the native boundary
-/// the probes exercise. Exits with the command's status; never returns.
+/// the probes exercise. macOS applies a Seatbelt profile; Linux uses a
+/// read-only bubblewrap view of `/`, which nests under the shared-asset guard
+/// the Linux probes compose it with. Exits with the command's status; never
+/// returns.
 fn sandbox(args: &[String]) -> ! {
     let split = args
         .iter()
@@ -373,17 +376,39 @@ fn sandbox(args: &[String]) -> ! {
         .expect("fixture sandbox command");
     let (flags, command) = (&args[..split], &args[split + 1..]);
     let cwd = argument(flags, "-C").expect("fixture sandbox workdir");
-    let mut profile =
-        "(version 1)(allow default)(deny file-write*)(allow file-write* (literal \"/dev/null\"))"
+    let workspace_write = flags.iter().any(|flag| flag.contains("workspace-write"));
+    let mut sandboxed = if cfg!(target_os = "linux") {
+        let mut sandboxed = std::process::Command::new("/usr/bin/bwrap");
+        sandboxed.args([
+            "--unshare-user",
+            "--die-with-parent",
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev-bind",
+            "/dev",
+            "/dev",
+        ]);
+        if workspace_write {
+            sandboxed.args(["--bind", cwd.as_str(), cwd.as_str()]);
+        }
+        sandboxed
+    } else {
+        let mut profile = "(version 1)(allow default)(deny file-write*)\
+                           (allow file-write* (literal \"/dev/null\"))"
             .to_owned();
-    if flags.iter().any(|flag| flag.contains("workspace-write")) {
-        profile.push_str("(allow file-write* (subpath (param \"CWD\")))");
-    }
-    let status = std::process::Command::new("/usr/bin/sandbox-exec")
-        .arg("-p")
-        .arg(profile)
-        .arg("-D")
-        .arg(format!("CWD={cwd}"))
+        if workspace_write {
+            profile.push_str("(allow file-write* (subpath (param \"CWD\")))");
+        }
+        let mut sandboxed = std::process::Command::new("/usr/bin/sandbox-exec");
+        sandboxed
+            .arg("-p")
+            .arg(profile)
+            .arg("-D")
+            .arg(format!("CWD={cwd}"));
+        sandboxed
+    };
+    let status = sandboxed
         .arg("--")
         .args(command)
         .current_dir(&cwd)

@@ -591,17 +591,21 @@ pub fn plan_selected_with(
         )?
     };
     // A shared layout launches only behind a proven guard, and the guard is
-    // proven here, before any child exists. The whole Codex app-server cannot
-    // be wrapped (its nested executor sandbox would fail), so Codex keeps its
-    // original managed profile and instead guards every harness-owned stdio
-    // MCP server through launch-time overrides compiled from the same frozen
-    // definitions the sealed native config carries. Claude and GLM children
-    // are wrapped whole, which constrains their descendants too.
+    // proven here, before any child exists. On macOS the whole Codex
+    // app-server cannot be wrapped (its nested Seatbelt executor sandbox would
+    // fail), so Codex keeps its original managed profile and instead guards
+    // every harness-owned stdio MCP server through launch-time overrides
+    // compiled from the same frozen definitions the sealed native config
+    // carries. On Linux the bubblewrap guard composes with Codex's own
+    // executor sandbox, so Codex is wrapped whole like Claude and GLM: its
+    // executor, the executor's sandboxed commands and every MCP child inherit
+    // the read-only store even where Codex's own sandbox cannot deny chmod.
+    // Wrapped-whole children constrain all their descendants.
     let binary = match shared_assets {
         Some(assets) => {
             let guard = SharedAssetGuard::new(&assets.store_root)
                 .map_err(|error| Error::Unsupported(error.to_string()))?;
-            if sealed.harness == HarnessId::Codex {
+            if sealed.harness == HarnessId::Codex && cfg!(target_os = "macos") {
                 let mut servers = BTreeMap::new();
                 let server_config = shared(config, role.worker_mcp)?;
                 let declared = role.mcp.iter().map(|server| server.id.clone()).chain(

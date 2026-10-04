@@ -419,13 +419,18 @@ fn probe_status(command: &mut std::process::Command) -> Result<bool> {
     }
 }
 
-/// Applies the actual Seatbelt wrapper to an owned shared sentinel and proves
-/// that a child can read it but cannot write it. The sentinel is removed even
-/// when the native probe fails or times out.
+/// Applies the actual native wrapper (Seatbelt on macOS, bubblewrap on Linux)
+/// to an owned shared sentinel and proves that a guarded child can start and
+/// read it but can neither write it nor change its mode. A child that cannot
+/// even read — for example a Linux kernel or container that refuses the
+/// helper's user and mount namespaces — is reported as an unusable guard, not
+/// as a passed denial. The sentinel is removed even when the native probe
+/// fails or times out.
 fn probe_shared_guard(
     guard: &SharedAssetGuard,
     environment: &BTreeMap<String, String>,
 ) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     let sentinel = guard.root().join(format!(
         ".agent-run-probe-{}",
         uuid::Uuid::new_v4().simple()
@@ -440,18 +445,32 @@ fn probe_shared_guard(
     }
     drop(file);
     let result = (|| -> Result<()> {
-        let args = vec![
-            "-c".to_owned(),
-            "cat \"$1\" >/dev/null && ! printf changed > \"$1\"".to_owned(),
-            "--".to_owned(),
-            sentinel.to_string_lossy().into_owned(),
-        ];
-        let argv = guard
-            .wrap(Path::new("/bin/sh"), &args)
-            .map_err(|error| Error::Unsupported(error.to_string()))?;
-        let mut command = std::process::Command::new(&argv[0]);
-        command.args(&argv[1..]).env_clear().envs(environment);
-        if !probe_status(&mut command)? || std::fs::read(&sentinel)? != b"original" {
+        let mode = std::fs::metadata(&sentinel)?.permissions().mode();
+        let run = |script: &str| -> Result<bool> {
+            let args = vec![
+                "-c".to_owned(),
+                script.to_owned(),
+                "--".to_owned(),
+                sentinel.to_string_lossy().into_owned(),
+            ];
+            let argv = guard
+                .wrap(Path::new("/bin/sh"), &args)
+                .map_err(|error| Error::Unsupported(error.to_string()))?;
+            let mut command = std::process::Command::new(&argv[0]);
+            command.args(&argv[1..]).env_clear().envs(environment);
+            probe_status(&mut command)
+        };
+        if !run("cat \"$1\" >/dev/null")? {
+            return Err(Error::Unsupported(
+                "native shared-asset guard could not start a reading child (on Linux, \
+                 bubblewrap needs unprivileged user and mount namespaces)"
+                    .into(),
+            ));
+        }
+        if !run("! printf changed > \"$1\" && ! chmod 600 \"$1\"")?
+            || std::fs::read(&sentinel)? != b"original"
+            || std::fs::metadata(&sentinel)?.permissions().mode() != mode
+        {
             return Err(Error::Unsupported(
                 "native shared-asset guard did not deny writes".into(),
             ));
@@ -462,17 +481,24 @@ fn probe_shared_guard(
     result
 }
 
-/// Proves the selected native sandbox can read a shared sentinel, cannot
-/// change it, and can still write the admitted workspace when the role may.
-/// Probe files are created exclusively and removed on every outcome.
+/// Proves the selected native sandbox can read a shared sentinel, can neither
+/// change its bytes nor its mode, and can still write the admitted workspace
+/// when the role may. The mode check refuses sandboxes that only restrict
+/// file contents (for example Landlock, which cannot deny chmod). On Linux,
+/// where the whole Codex app-server launches under `guard`, every `codex
+/// sandbox` probe runs under the same guard, so the composed boundary the
+/// executor will really have is what is proven — including the positive
+/// workspace write. On macOS the probe runs unwrapped, as Codex launches
+/// there. `binary` is the frozen native Codex executable. Probe files are
+/// created exclusively and removed on every outcome.
 fn probe_codex_shared_root(
     grant: &crate::codex::Grant,
+    guard: &SharedAssetGuard,
     binary: &Path,
     environment: &BTreeMap<String, String>,
-    root: &Path,
 ) -> Result<()> {
     let name = format!(".agent-run-probe-{}", uuid::Uuid::new_v4().simple());
-    let shared = root.join(&name);
+    let shared = guard.root().join(&name);
     let workspace = Path::new(&grant.cwd).join(&name);
     let mut shared_file = std::fs::OpenOptions::new()
         .write(true)
@@ -485,30 +511,39 @@ fn probe_codex_shared_root(
     drop(shared_file);
     let mut workspace_created = false;
     let result = (|| -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&shared)?.permissions().mode();
         let run = |script: &str, target: &Path| -> Result<bool> {
-            let mut command = std::process::Command::new(binary);
-            command.arg("sandbox");
-            if let Some(profile) = &grant.permission_profile {
-                command
-                    .arg("--include-managed-config")
-                    .arg("-P")
-                    .arg(profile);
-            } else {
-                command
-                    .arg("-c")
-                    .arg(format!("sandbox_mode={:?}", grant.sandbox));
+            let mut args = vec!["sandbox".to_owned()];
+            match &grant.permission_profile {
+                Some(profile) => args.extend([
+                    "--include-managed-config".to_owned(),
+                    "-P".to_owned(),
+                    profile.clone(),
+                ]),
+                None => args.extend(["-c".to_owned(), format!("sandbox_mode={:?}", grant.sandbox)]),
             }
-            command
-                .arg("-C")
-                .arg(&grant.cwd)
-                .arg("--")
-                .arg("/bin/sh")
-                .arg("-c")
-                .arg(script)
-                .arg("--")
-                .arg(target)
-                .env_clear()
-                .envs(environment);
+            args.extend([
+                "-C".to_owned(),
+                grant.cwd.clone(),
+                "--".to_owned(),
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                script.to_owned(),
+                "--".to_owned(),
+                target.to_string_lossy().into_owned(),
+            ]);
+            let argv = if cfg!(target_os = "linux") {
+                guard
+                    .wrap(binary, &args)
+                    .map_err(|error| Error::Unsupported(error.to_string()))?
+            } else {
+                std::iter::once(binary.as_os_str().to_os_string())
+                    .chain(args.into_iter().map(Into::into))
+                    .collect()
+            };
+            let mut command = std::process::Command::new(&argv[0]);
+            command.args(&argv[1..]).env_clear().envs(environment);
             probe_status(&mut command)
         };
         if !run("cat \"$1\" >/dev/null", &shared)? {
@@ -516,7 +551,11 @@ fn probe_codex_shared_root(
                 "native Codex sandbox cannot read shared assets".into(),
             ));
         }
-        if run("printf changed > \"$1\"", &shared)? || std::fs::read(&shared)? != b"original" {
+        if run("printf changed > \"$1\"", &shared)?
+            || run("chmod 600 \"$1\"", &shared)?
+            || std::fs::read(&shared)? != b"original"
+            || std::fs::metadata(&shared)?.permissions().mode() != mode
+        {
             return Err(Error::Unsupported(
                 "native Codex sandbox can change shared assets".into(),
             ));
@@ -579,13 +618,16 @@ fn install_shared_assets(
 /// for one frozen launch, and returns the qualified store root as the witness
 /// every publication path must hold.
 ///
-/// This is the one qualification body: a Seatbelt sentinel under the
-/// store-wide publish lock that a child can read but not write, plus the
+/// This is the one qualification body: a native guard sentinel (Seatbelt on
+/// macOS, bubblewrap on Linux) under the store-wide publish lock that a
+/// guarded child can read but neither write nor chmod, plus the
 /// harness's own boundary — for Codex, the grant must keep the store outside
-/// every admitted writable and temporary root and the native sandbox must
-/// prove read-only against a real sentinel; for every other harness the
-/// guarded metadata probe of the frozen native executable, even when the
-/// supplied launch plan already wraps it. The returned path is the only root a caller may
+/// every admitted writable and temporary root and the native sandbox of the
+/// frozen executable must prove read-only against a real sentinel (on Linux
+/// composed under the guard, exactly as the whole app-server launches); for
+/// every other harness the guarded metadata probe of the frozen native
+/// executable. Both use the frozen executable even when the supplied launch
+/// plan already wraps it. The returned path is the only root a caller may
 /// publish into: `consolidate` refuses any other, so an unqualified
 /// publication cannot masquerade as a qualified one.
 pub fn qualify_shared_root(
@@ -605,9 +647,9 @@ pub fn qualify_shared_root(
         grant.admits_shared_root(&root)?;
         probe_codex_shared_root(
             grant,
-            &preliminary.launch.binary,
+            &guard,
+            &preliminary.runtime.binary,
             &preliminary.launch.environment,
-            &root,
         )?;
     } else {
         let version = vec!["--version".to_owned()];
@@ -2013,9 +2055,9 @@ mod tests {
 
     /// Applies the production preflight against a disposable native root;
     /// sandbox application can be unavailable inside nested CI sandboxes.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    #[ignore = "requires native sandbox-exec application on the host"]
+    #[ignore = "requires native guard application on the host (sandbox-exec, or bwrap with user namespaces)"]
     fn native_shared_guard_preflight_denies_writes() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -2024,11 +2066,35 @@ mod tests {
         super::probe_shared_guard(&guard, &environment).unwrap();
     }
 
+    /// On any Linux host the preflight either proves the guard or refuses
+    /// with the exact missing capability, and never leaves its sentinel; a
+    /// container that denies user namespaces must hit the launch refusal,
+    /// not a passed or misreported denial.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_shared_guard_preflight_proves_or_names_missing_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let guard = agent_run_platform::shared_asset_guard::SharedAssetGuard::new(&root).unwrap();
+        let environment = std::env::vars().collect();
+        match super::probe_shared_guard(&guard, &environment) {
+            Ok(()) => {}
+            Err(Error::Unsupported(why)) => assert!(
+                why.contains("could not start a reading child")
+                    || why.contains("bubblewrap is not installed"),
+                "{why}"
+            ),
+            Err(other) => panic!("{other}"),
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+
     /// Exercises the production Codex preflight with an owned profile and
     /// workspace outside native temporary grants; no model turn is started.
-    #[cfg(target_os = "macos")]
+    /// On Linux the probe runs composed under the shared-asset guard.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    #[ignore = "requires CODEX_BIN and NATIVE_GUARD_HOME on a native macOS host"]
+    #[ignore = "requires CODEX_BIN and NATIVE_GUARD_HOME on a qualified native host"]
     fn native_codex_shared_preflight_uses_selected_profile() {
         let binary = std::path::PathBuf::from(std::env::var("CODEX_BIN").unwrap());
         let parent = std::path::PathBuf::from(std::env::var("NATIVE_GUARD_HOME").unwrap());
@@ -2073,7 +2139,8 @@ mod tests {
                 format!("{}:/usr/bin:/bin", binary.parent().unwrap().display()),
             ),
         ]);
-        super::probe_codex_shared_root(&grant, &binary, &environment, &root).unwrap();
+        let guard = agent_run_platform::shared_asset_guard::SharedAssetGuard::new(&root).unwrap();
+        super::probe_codex_shared_root(&grant, &guard, &binary, &environment).unwrap();
     }
 
     /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_blank_startup_error_uses_exception_type_in_ready_failure`.

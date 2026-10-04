@@ -1,32 +1,59 @@
-//! Read-only shared asset roots behind the native macOS launch sandbox.
+//! Read-only shared asset roots behind a native launch sandbox.
 //!
 //! The target storage model keeps one central immutable payload store and
 //! exposes it to each private home through symlinks. Same-UID file
 //! permissions cannot enforce that model, because the launched child owns
 //! the same UID and can rewrite, chmod, unlink or rename the shared bytes.
-//! This module proves the smallest launch guard for qualified macOS hosts:
-//! [`SharedAssetGuard::wrap`] rewrites a plain `program args…` argv into
-//! `sandbox-exec -p <profile> -D ROOT=<canonical> … -- program args…`. The
-//! profile denies every write-shaped operation (`file-write*`, which covers
-//! open-for-write, create, unlink, rename, link, chmod and chown on this OS)
-//! whose path is the canonical shared root or anything beneath it, and denies
-//! those operations on each ancestor directory of the root as one exact
-//! path, so a writable ancestor cannot be renamed to move the root out from
-//! under the deny rule. Every filesystem path travels only in `-D` parameter
-//! arguments — never embedded in the profile text — and ancestor parameters
-//! are escaped as Seatbelt regex literals, so quoted or metacharacter paths
-//! cannot widen or redirect the rules. Reads of shared assets through
-//! private-home symlinks and ordinary writes inside the child's own workdir
-//! stay allowed; the wrapper only adds denials and never loosens any other
-//! constraint. The sandbox is inherited by every descendant of the wrapped
-//! child. Before launch, a bounded no-follow inode scan refuses external
-//! hardlink aliases while permitting links wholly inside the shared tree.
+//! This module proves the smallest launch guard for qualified hosts.
 //!
-//! The argv rewrite is meant to be applied to a future `LaunchPlan` in
-//! `agent-run-adapters`; this module owns only the verified transformation.
-//! It never claims protection over unrelated pre-existing processes (for
-//! example MCP servers started elsewhere): only the wrapped child and its
-//! descendants are constrained.
+//! On macOS [`SharedAssetGuard::wrap`] rewrites a plain `program args…` argv
+//! into `sandbox-exec -p <profile> -D ROOT=<canonical> … -- program args…`.
+//! The profile denies every write-shaped operation (`file-write*`, which
+//! covers open-for-write, create, unlink, rename, link, chmod and chown on
+//! this OS) whose path is the canonical shared root or anything beneath it,
+//! and denies those operations on each ancestor directory of the root as one
+//! exact path, so a writable ancestor cannot be renamed to move the root out
+//! from under the deny rule. Every filesystem path travels only in `-D`
+//! parameter arguments — never embedded in the profile text — and ancestor
+//! parameters are escaped as Seatbelt regex literals, so quoted or
+//! metacharacter paths cannot widen or redirect the rules.
+//!
+//! On Linux the same rewrite produces `bwrap --unshare-user --die-with-parent
+//! --dev-bind / / --bind <ancestor> <ancestor>… --ro-bind <root> <root> --
+//! program args…` (bubblewrap at [`LINUX_BWRAP`]). The child sees the host
+//! filesystem unchanged except that the root and every mount beneath it are
+//! a read-only bind, so write, create, truncate, unlink, rename, link,
+//! chmod, chown and timestamp changes fail with `EROFS` and a hard link out
+//! of the tree fails with `EXDEV`. Each ancestor directory below `/` is
+//! bound onto itself (still writable), which makes it a mount point in the
+//! child's namespace: renaming or removing the root or any ancestor fails
+//! with `EBUSY`. The fresh user namespace keeps those mounts locked against
+//! nested namespaces (a descendant cannot unmount them or clear read-only)
+//! and puts every unconfined same-UID process in a parent namespace, so
+//! `/proc/<pid>/root` and `/proc/<pid>/cwd` links cannot reach the writable
+//! host view. No PID, network, IPC or session namespace is added and no
+//! environment variable is touched: PIDs, the caller's process group,
+//! signals, stdio, cwd and exit status stay as without the wrapper.
+//! Setuid executables cannot gain privilege inside the user namespace.
+//! Before launch the wrapper refuses a root that another mount of the same
+//! filesystem exposes at a second path the bind would not cover.
+//!
+//! On both platforms reads of shared assets through private-home symlinks
+//! and ordinary writes inside the child's own workdir stay allowed; the
+//! wrapper only adds denials and never loosens any other constraint. The
+//! sandbox is inherited by every descendant of the wrapped child. Before
+//! launch, a bounded no-follow inode scan refuses external hardlink aliases
+//! while permitting links wholly inside the shared tree. Every other
+//! operating system, and a host lacking the native helper, is an explicit
+//! [`SharedAssetGuardError::UnsupportedPlatform`] refusal, never a fallback.
+//! Whether the kernel actually lets the helper apply its namespace is proven
+//! by the caller's qualification probe, which runs a real guarded child.
+//!
+//! This module owns only the verified transformation; adapters apply it to
+//! their launch plans. It never claims protection over unrelated
+//! pre-existing processes (for example MCP servers started elsewhere, or a
+//! same-UID service the child asks to act on its behalf): only the wrapped
+//! child and its descendants are constrained.
 use std::{
     collections::HashMap,
     ffi::OsString,
@@ -37,6 +64,11 @@ use std::{
 
 /// Absolute path of the native Seatbelt wrapper used on qualified macOS hosts.
 pub const MACOS_SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
+/// Absolute path of the bubblewrap launcher used on qualified Linux hosts.
+/// Only this fixed distribution path is trusted; a `PATH` lookup could be
+/// redirected by the same user the guard constrains.
+pub const LINUX_BWRAP: &str = "/usr/bin/bwrap";
 
 /// Maximum number of store entries examined before launch refuses the tree:
 /// the shared-tree entry bound grew fourfold for native curated mirrors, so
@@ -74,6 +106,10 @@ pub enum SharedAssetGuardError {
     /// A regular file has an alias outside the root. `links` is its total
     /// link count; every link must be found inside the root before launch.
     AliasedAsset { path: PathBuf, links: u64 },
+    /// Another mount of the root's filesystem, at the payload mount point,
+    /// exposes the root or part of it at a second path that a read-only
+    /// bind of the canonical root would leave writable (Linux only).
+    AliasedMount(PathBuf),
     /// The store contains too many paths to verify within the fixed scan
     /// budget; reduce the tree before launching.
     TooManyAssets,
@@ -109,6 +145,10 @@ impl fmt::Display for SharedAssetGuardError {
             Self::AliasedAsset { path, links } => write!(
                 f,
                 "shared asset {path:?} has {links} hard links, including an outside alias"
+            ),
+            Self::AliasedMount(point) => write!(
+                f,
+                "shared root is also reachable through the mount at {point:?}"
             ),
             Self::TooManyAssets => write!(f, "shared asset scan exceeds {MAX_SCAN_PATHS} paths"),
             Self::Io(error) => write!(f, "shared root check failed: {error}"),
@@ -264,15 +304,22 @@ impl SharedAssetGuard {
 
     /// Rewrites one launch argv into its guarded form.
     ///
-    /// Given the intended `program` and its `args`, returns
-    /// `sandbox-exec -p <profile> -D <parameters>… -- program args…` ready
-    /// for the spawn call a `LaunchPlan` already drives. On macOS the
-    /// wrapper first verifies `/usr/bin/sandbox-exec` is an executable file
-    /// and that [`Self::verify_no_hardlink_aliases`] passes, so a launch
-    /// cannot proceed while an alias could bypass the path-based deny rules.
-    /// Non-macOS hosts return [`SharedAssetGuardError::UnsupportedPlatform`]
-    /// and must not fall back to copying assets into private homes. No
-    /// process is spawned and no environment or approval behavior changes.
+    /// Given the intended `program` and its `args`, returns the native
+    /// wrapper argv ready for the spawn call a `LaunchPlan` already drives;
+    /// `argv[0]` is the absolute wrapper executable and the original program
+    /// and arguments follow `--` unchanged. On macOS that is
+    /// `sandbox-exec -p <profile> -D <parameters>… -- program args…` after
+    /// verifying `/usr/bin/sandbox-exec` is an executable file. On Linux it is
+    /// [`Self::bubblewrap_argv`] after verifying [`LINUX_BWRAP`] is an
+    /// executable file and that [`Self::verify_no_mount_aliases`] passes. Both
+    /// require [`Self::verify_no_hardlink_aliases`], so a launch cannot
+    /// proceed while an alias could bypass the guard. A missing helper is
+    /// [`SharedAssetGuardError::UnsupportedPlatform`] naming it; other
+    /// operating systems always return that variant. Callers must refuse the
+    /// shared launch and never fall back to copying assets into private
+    /// homes. This builds argv only: whether the kernel admits the Linux
+    /// namespaces is proven when the caller runs a guarded child. No process
+    /// is spawned and no environment or approval behavior changes.
     pub fn wrap(
         &self,
         program: &Path,
@@ -309,12 +356,110 @@ impl SharedAssetGuard {
             argv.extend(args.iter().map(OsString::from));
             Ok(argv)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let executable = std::fs::metadata(LINUX_BWRAP).map_err(|_| {
+                SharedAssetGuardError::UnsupportedPlatform(
+                    "bubblewrap is not installed at /usr/bin/bwrap",
+                )
+            })?;
+            if !executable.is_file() || executable.permissions().mode() & 0o111 == 0 {
+                return Err(SharedAssetGuardError::UnsupportedPlatform(
+                    "/usr/bin/bwrap is not an executable file",
+                ));
+            }
+            self.verify_no_hardlink_aliases()?;
+            self.verify_no_mount_aliases()?;
+            Ok(self.bubblewrap_argv(program, args))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = (program, args);
             Err(SharedAssetGuardError::UnsupportedPlatform(
-                "Seatbelt launch profiles exist only on macOS; refusing to fake a guard",
+                "no native shared-asset launch sandbox exists for this operating system; \
+                 refusing to fake a guard",
             ))
+        }
+    }
+
+    /// Builds the bubblewrap argv [`Self::wrap`] returns on Linux.
+    ///
+    /// Order is significant because bubblewrap applies mounts in sequence:
+    /// `--unshare-user` always creates a fresh user namespace (also for a
+    /// setuid helper or a root caller), `--die-with-parent` ties the child to
+    /// the wrapper, `--dev-bind / /` keeps the whole host view including
+    /// devices, each ancestor of the root below `/` is then bound onto itself
+    /// from the outermost inward, and the root is bound read-only last so no
+    /// later bind can shadow it. Paths are passed as single argv elements,
+    /// never through a shell; the program and its arguments follow `--`
+    /// unchanged. Pure: no filesystem access and no validation beyond
+    /// construction.
+    #[cfg(any(target_os = "linux", test))]
+    fn bubblewrap_argv(&self, program: &Path, args: &[String]) -> Vec<OsString> {
+        let mut argv: Vec<OsString> = [
+            LINUX_BWRAP,
+            "--unshare-user",
+            "--die-with-parent",
+            "--dev-bind",
+            "/",
+            "/",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        let mut ancestors: Vec<&Path> = self
+            .root
+            .ancestors()
+            .skip(1)
+            .filter(|ancestor| ancestor.parent().is_some())
+            .collect();
+        ancestors.reverse();
+        for ancestor in ancestors {
+            argv.push(OsString::from("--bind"));
+            argv.push(ancestor.as_os_str().to_os_string());
+            argv.push(ancestor.as_os_str().to_os_string());
+        }
+        argv.push(OsString::from("--ro-bind"));
+        argv.push(self.root.as_os_str().to_os_string());
+        argv.push(self.root.as_os_str().to_os_string());
+        argv.push(OsString::from("--"));
+        argv.push(program.as_os_str().to_os_string());
+        argv.extend(args.iter().map(OsString::from));
+        argv
+    }
+
+    /// Fails when another mount of the root's filesystem exposes the root, or
+    /// part of it, at a second path the read-only bind would not cover.
+    ///
+    /// The root's own mount is identified exactly by the `mnt_id` the kernel
+    /// reports for an open descriptor of the root, then
+    /// `/proc/self/mountinfo` is classified by [`mount_alias`]. A mount table
+    /// that does not list the root's mount is
+    /// [`SharedAssetGuardError::UnsupportedPlatform`]; an alias is
+    /// [`SharedAssetGuardError::AliasedMount`] naming its mount point; read
+    /// failures are [`SharedAssetGuardError::Io`]. Like the hardlink scan
+    /// this reflects launch time only: a mount added later by an unrelated
+    /// process is outside the guarantee.
+    #[cfg(target_os = "linux")]
+    pub fn verify_no_mount_aliases(&self) -> Result<(), SharedAssetGuardError> {
+        use std::os::fd::AsRawFd;
+        let directory = std::fs::File::open(&self.root)?;
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", directory.as_raw_fd()))?;
+        let mount_id = info
+            .lines()
+            .find_map(|line| line.strip_prefix("mnt_id:"))
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .ok_or(SharedAssetGuardError::UnsupportedPlatform(
+                "the kernel does not report the shared root's mount id",
+            ))?;
+        let table = std::fs::read_to_string("/proc/self/mountinfo")?;
+        match mount_alias(&table, mount_id, &self.root) {
+            Some(Ok(())) => Ok(()),
+            Some(Err(point)) => Err(SharedAssetGuardError::AliasedMount(point)),
+            None => Err(SharedAssetGuardError::UnsupportedPlatform(
+                "the shared root's mount is missing from /proc/self/mountinfo",
+            )),
         }
     }
 
@@ -386,8 +531,89 @@ fn escape_seatbelt_regex(text: &str) -> String {
     escaped
 }
 
+/// Classifies one `/proc/self/mountinfo` table for
+/// [`SharedAssetGuard::verify_no_mount_aliases`].
+///
+/// `table` is the raw mountinfo text, `mount_id` the id of the mount that
+/// path lookup of `root` reaches, and `root` the canonical shared root.
+/// Every mount of the same device (`major:minor`, shared by bind mounts and
+/// subvolumes of one filesystem) is compared through its filesystem subtree
+/// field. A mount whose subtree contains the root's subtree is an alias
+/// unless it maps the root back onto `root` itself (the root's own mount and
+/// ancestor binds stacked beneath it). A mount whose subtree lies inside the
+/// root's subtree is an alias unless it is mounted at the matching position
+/// beneath `root`, where the recursive read-only bind covers it. Returns
+/// `None` when no line carries `mount_id` or `root` does not lie beneath
+/// that mount's point, `Some(Err(mount point))` for the first alias, and
+/// `Some(Ok(()))` otherwise. Malformed lines are skipped and fields are
+/// decoded from mountinfo's octal escapes. Pure: no filesystem access.
+#[cfg(any(target_os = "linux", test))]
+fn mount_alias(table: &str, mount_id: u64, root: &Path) -> Option<Result<(), PathBuf>> {
+    let mounts: Vec<(u64, &str, PathBuf, PathBuf)> = table
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(' ');
+            let id = fields.next()?.parse().ok()?;
+            let device = fields.nth(1)?;
+            let tree = unescape_mountinfo(fields.next()?);
+            let point = unescape_mountinfo(fields.next()?);
+            Some((id, device, tree, point))
+        })
+        .collect();
+    let (_, device, tree, point) = mounts.iter().find(|mount| mount.0 == mount_id)?;
+    let inner = tree.join(root.strip_prefix(point).ok()?);
+    for (_, other_device, other_tree, other_point) in &mounts {
+        if other_device != device {
+            continue;
+        }
+        let aliased = if let Ok(rest) = inner.strip_prefix(other_tree) {
+            other_point.join(rest) != root
+        } else if let Ok(rest) = other_tree.strip_prefix(&inner) {
+            *other_point != root.join(rest)
+        } else {
+            false
+        };
+        if aliased {
+            return Some(Err(other_point.clone()));
+        }
+    }
+    Some(Ok(()))
+}
+
+/// Decodes one mountinfo path field, whose space, tab, newline and backslash
+/// bytes the kernel writes as three-digit octal escapes (`\040`). Any other
+/// byte, including a backslash not followed by three octal digits, is kept
+/// verbatim, so the result is the exact non-UTF-8-safe path.
+#[cfg(any(target_os = "linux", test))]
+fn unescape_mountinfo(field: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    let bytes = field.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escape = bytes.get(index + 1..index + 4).filter(|digits| {
+            bytes[index] == b'\\' && digits.iter().all(|digit| (b'0'..=b'7').contains(digit))
+        });
+        match escape {
+            Some(digits) => {
+                decoded.push(
+                    digits
+                        .iter()
+                        .fold(0u8, |value, digit| value.wrapping_mul(8) + (digit - b'0')),
+                );
+                index += 4;
+            }
+            None => {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+    }
+    PathBuf::from(OsString::from_vec(decoded))
+}
+
 #[cfg(test)]
-/// Pure validation checks and a qualified-host Seatbelt behavior check.
+/// Pure validation checks and qualified-host Seatbelt and bubblewrap behavior checks.
 mod tests {
     use super::*;
 
@@ -421,6 +647,13 @@ mod tests {
             guard.wrap(Path::new("/bin/true"), &[]),
             Err(SharedAssetGuardError::AliasedAsset { .. })
         ));
+        #[cfg(target_os = "linux")]
+        assert!(
+            matches!(
+                guard.wrap(Path::new("/bin/true"), &[]),
+                Err(SharedAssetGuardError::AliasedAsset { .. })
+            ) || !Path::new(LINUX_BWRAP).exists()
+        );
     }
 
     /// Refuses trees that exceed the path budget before accepting their files.
@@ -471,6 +704,93 @@ mod tests {
         assert_eq!(argv[argv.len() - 1], "two words");
     }
 
+    /// Binds every ancestor below `/` outermost first, binds the root
+    /// read-only last, and keeps the child argv after `--` unchanged.
+    #[test]
+    fn bubblewrap_argv_binds_ancestors_then_root_readonly() {
+        let (_temp, root, _work) = fixture();
+        let guard = SharedAssetGuard::new(&root).unwrap();
+        let args = vec!["one".to_string(), "two words".to_string()];
+        let argv = guard.bubblewrap_argv(Path::new("/bin/echo"), &args);
+        let mut expected: Vec<OsString> = [
+            LINUX_BWRAP,
+            "--unshare-user",
+            "--die-with-parent",
+            "--dev-bind",
+            "/",
+            "/",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        let mut ancestors: Vec<&Path> = root.ancestors().skip(1).collect();
+        ancestors.pop();
+        for ancestor in ancestors.into_iter().rev() {
+            expected.extend(["--bind".into(), ancestor.into(), ancestor.into()]);
+        }
+        expected.extend(["--ro-bind".into(), root.clone().into(), root.into()]);
+        expected.extend(["--", "/bin/echo", "one", "two words"].map(OsString::from));
+        assert_eq!(argv, expected);
+    }
+
+    /// Accepts the root's own mount, stacked ancestor binds and covered
+    /// submounts, and refuses bind or subvolume views exposing the root
+    /// elsewhere, including escaped mount point names.
+    #[test]
+    fn mount_alias_classifies_same_filesystem_views() {
+        let root = Path::new("/home/u/.agent-run/shared-assets/v1");
+        let own = "30 1 0:40 /@home /home rw - btrfs /dev/vda rw\n\
+                   31 1 0:40 /@ / rw - btrfs /dev/vda rw\n\
+                   32 1 0:41 / /tmp rw - tmpfs tmpfs rw\n";
+        assert_eq!(mount_alias(own, 30, root), Some(Ok(())));
+        assert_eq!(mount_alias(own, 99, root), None);
+        assert_eq!(mount_alias(own, 31, root), Some(Ok(())));
+        let nested = format!(
+            "{own}40 30 0:40 /@home/u /home/u rw - btrfs /dev/vda rw\n\
+             41 40 0:40 /@home/u/.agent-run/shared-assets/v1 \
+             /home/u/.agent-run/shared-assets/v1 ro - btrfs /dev/vda rw\n\
+             42 41 0:40 /@home/u/.agent-run/shared-assets/v1/trees \
+             /home/u/.agent-run/shared-assets/v1/trees ro - btrfs /dev/vda rw\n"
+        );
+        assert_eq!(mount_alias(&nested, 41, root), Some(Ok(())));
+        let top = format!("{own}50 1 0:40 / /mnt/top\\040level rw - btrfs /dev/vda rw\n");
+        assert_eq!(
+            mount_alias(&top, 30, root),
+            Some(Err(PathBuf::from("/mnt/top level")))
+        );
+        let inner = format!(
+            "{own}51 1 0:40 /@home/u/.agent-run/shared-assets/v1/trees /srv/trees rw - btrfs /dev/vda rw\n"
+        );
+        assert_eq!(
+            mount_alias(&inner, 30, root),
+            Some(Err(PathBuf::from("/srv/trees")))
+        );
+        assert_eq!(
+            unescape_mountinfo("/a\\011b\\134c\\9"),
+            PathBuf::from("/a\tb\\c\\9")
+        );
+    }
+
+    /// A Linux host without bubblewrap is an exact refusal; with it the
+    /// guarded argv names the fixed helper and a clean fixture passes the
+    /// alias checks.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_wrap_requires_fixed_bubblewrap() {
+        let (_temp, root, _work) = fixture();
+        let guard = SharedAssetGuard::new(&root).unwrap();
+        match guard.wrap(Path::new("/bin/true"), &[]) {
+            Ok(argv) => {
+                assert_eq!(argv[0], LINUX_BWRAP);
+                guard.verify_no_mount_aliases().unwrap();
+            }
+            Err(SharedAssetGuardError::UnsupportedPlatform(why)) => {
+                assert!(!Path::new(LINUX_BWRAP).exists(), "{why}");
+            }
+            Err(other) => panic!("{other}"),
+        }
+    }
+
     /// Rejects a path that names the same root through a symlinked parent.
     #[test]
     fn root_rejects_symlinked_parent() {
@@ -484,7 +804,7 @@ mod tests {
     }
 
     /// Runs one finite shell operation through the guard and returns its status.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn run(guard: &SharedAssetGuard, work: &Path, script: &str, args: &[&Path]) -> bool {
         let mut shell_args = vec!["-c".to_string(), script.to_string(), "--".to_string()];
         shell_args.extend(args.iter().map(|path| path.to_str().unwrap().to_string()));
@@ -499,10 +819,13 @@ mod tests {
     }
 
     /// Proves denials, permitted sibling work, and inherited child restrictions.
-    /// Requires a qualified macOS host that permits applying Seatbelt profiles.
-    #[cfg(target_os = "macos")]
+    /// Requires a qualified macOS host that permits applying Seatbelt profiles,
+    /// or a Linux host with `/usr/bin/bwrap`, `unshare` and unprivileged user
+    /// and mount namespaces; Linux adds namespace-escape and `/proc` alias
+    /// checks.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    #[ignore = "requires native sandbox-exec application on a qualified macOS host"]
+    #[ignore = "requires a qualified host that can apply the native guard (sandbox-exec or bwrap namespaces)"]
     fn live_native_guard() {
         use std::os::unix::fs::PermissionsExt;
         let (_temp, root, work) = fixture();
@@ -535,6 +858,17 @@ mod tests {
         assert!(run(&guard, &work, "mv \"$1\" \"$2\"", &[&sibling, &moved]));
         assert!(run(&guard, &work, "mv \"$1\" \"$2\"", &[&moved, &sibling]));
         assert!(!run(&guard, &work, "mv \"$1\" \"$2\"", &[&file, &moved]));
+        // Linux refuses the rename out of the read-only bind with `EXDEV`;
+        // `mv` then copies (a permitted read) and its unlink is refused, so
+        // the shared inode stays in place and only an unrelated copy remains.
+        #[cfg(target_os = "linux")]
+        if moved.exists() {
+            assert_ne!(
+                std::fs::metadata(&moved).unwrap().ino(),
+                std::fs::metadata(&file).unwrap().ino()
+            );
+            std::fs::remove_file(&moved).unwrap();
+        }
         assert!(!run(&guard, &work, "rm \"$1\"", &[&file]));
         assert!(!run(&guard, &work, "ln \"$1\" \"$2\"", &[&file, &moved]));
         assert!(!moved.exists());
@@ -607,6 +941,137 @@ mod tests {
             &[&file, &child_script, &grandchild_script]
         ));
         assert_eq!(std::fs::read(&file).unwrap(), b"original");
+        #[cfg(target_os = "linux")]
+        live_linux_escapes(&guard, &root, &work, &file);
+    }
+
+    /// Linux-only part of [`live_native_guard`]: metadata denials, nested
+    /// user/mount namespace and nested bubblewrap escapes, `/proc` root, cwd
+    /// and fd links of an unconfined same-UID process, and unchanged exit
+    /// status and environment. Negative controls prove each denial is caused
+    /// by the guard: the same `/proc` links are writable unguarded, and the
+    /// same bubblewrap launch without ancestor binds can rename an ancestor.
+    #[cfg(target_os = "linux")]
+    fn live_linux_escapes(guard: &SharedAssetGuard, root: &Path, work: &Path, file: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(file).unwrap().permissions().mode();
+        assert!(!run(guard, work, "truncate -s 0 \"$1\"", &[file]));
+        assert!(!run(guard, work, "touch -d 2000-01-01 \"$1\"", &[file]));
+        let planted = root.join("planted");
+        assert!(!run(guard, work, "ln -s / \"$1\"", &[&planted]));
+        // Each nested shell receives the outer `$1 $2` explicitly. Positive
+        // controls first prove nested user/mount namespaces and nested
+        // bubblewrap work inside the guard, so the denials below come from the
+        // locked read-only mounts, not from a refused namespace.
+        let nested = work.join("nested");
+        for script in [
+            "unshare -Urm sh -c 'mount --bind \"$1\" \"$1\" && printf ok > \"$1/n1\"' sh \"$1\"",
+            "bwrap --dev-bind / / -- sh -c 'printf ok > \"$1/n2\"' sh \"$1\"",
+        ] {
+            std::fs::create_dir_all(&nested).unwrap();
+            assert!(run(guard, work, script, &[&nested]), "{script}");
+        }
+        assert_eq!(std::fs::read(nested.join("n1")).unwrap(), b"ok");
+        assert_eq!(std::fs::read(nested.join("n2")).unwrap(), b"ok");
+        for script in [
+            "unshare -Urm sh -c 'umount -l \"$1\"; printf bad > \"$2\"' sh \"$1\" \"$2\"",
+            "unshare -Urm sh -c 'mount -o remount,bind,rw \"$1\"; printf bad > \"$2\"' sh \"$1\" \"$2\"",
+            "unshare -Urm sh -c 'chmod 600 \"$2\"' sh \"$1\" \"$2\"",
+            "bwrap --dev-bind / / -- sh -c 'printf bad > \"$2\"' sh \"$1\" \"$2\"",
+            "bwrap --dev-bind / / --bind \"$1\" \"$1\" -- sh -c 'printf bad > \"$2\"' sh \"$1\" \"$2\"",
+        ] {
+            assert!(!run(guard, work, script, &[root, file]), "{script}");
+        }
+        let base = root.parent().unwrap();
+        let view = work.join("view");
+        std::fs::create_dir(&view).unwrap();
+        assert!(!run(
+            guard,
+            work,
+            "unshare -Urm sh -c 'mount --rbind \"$1\" \"$2\" && mv \"$2/shared\" \"$2/moved\"' \
+             sh \"$1\" \"$2\"",
+            &[base, &view]
+        ));
+        assert!(!run(
+            guard,
+            work,
+            "unshare -Urm sh -c 'mount --bind \"$1\" \"$2\"' sh \"$1\" \"$2\"",
+            &[base, &view]
+        ));
+        let control = root.join("control");
+        std::fs::write(&control, b"c").unwrap();
+        let mut outside = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec 3>>\"$1\"; exec sleep 30", "--"])
+            .arg(&control)
+            .current_dir(root)
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let proc = PathBuf::from(format!("/proc/{}", outside.id()));
+        let links = [
+            proc.join("root").join(control.strip_prefix("/").unwrap()),
+            proc.join("cwd/control"),
+            proc.join("fd/3"),
+        ];
+        let unguarded = links.iter().all(|link| {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(link)
+                .and_then(|mut handle| std::io::Write::write_all(&mut handle, b"u"))
+                .is_ok()
+        });
+        let guarded = links
+            .iter()
+            .map(|link| run(guard, work, "printf bad >> \"$1\"", &[link]))
+            .collect::<Vec<_>>();
+        outside.kill().unwrap();
+        outside.wait().unwrap();
+        assert!(unguarded, "control: /proc links must be writable unguarded");
+        assert_eq!(guarded, [false, false, false]);
+        assert_eq!(std::fs::read(&control).unwrap(), b"cuuu");
+        assert_eq!(std::fs::read(file).unwrap(), b"original");
+        assert_eq!(std::fs::metadata(file).unwrap().permissions().mode(), mode);
+        assert!(!planted.exists() && root.is_dir());
+
+        let argv = guard
+            .wrap(
+                Path::new("/bin/sh"),
+                &["-c".into(), "[ \"$GUARD_PROBE\" = kept ] && exit 7".into()],
+            )
+            .unwrap();
+        let status = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .env("GUARD_PROBE", "kept")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(7));
+
+        let moved = base.with_extension("control");
+        let script = ["-c", "mv \"$1\" \"$2\"", "--"].map(String::from);
+        let full = guard.bubblewrap_argv(Path::new("/bin/sh"), &script);
+        let mut unbound = Vec::new();
+        let mut index = 0;
+        while index < full.len() {
+            if full[index] == "--bind" {
+                index += 3;
+            } else {
+                unbound.push(full[index].clone());
+                index += 1;
+            }
+        }
+        let renamed = std::process::Command::new(&unbound[0])
+            .args(&unbound[1..])
+            .arg(base)
+            .arg(&moved)
+            .status()
+            .unwrap()
+            .success();
+        if renamed {
+            std::fs::rename(&moved, base).unwrap();
+        }
+        assert!(renamed, "control: an unbound ancestor must be renamable");
+        assert!(!run(guard, work, "mv \"$1\" \"$2\"", &[base, &moved]));
+        assert!(root.is_dir() && !moved.exists());
     }
 
     /// Exercises Codex's native read carveout with managed configuration and

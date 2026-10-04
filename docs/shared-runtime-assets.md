@@ -37,13 +37,31 @@ trees and blobs beneath them, and treat every view still referenced by a
 registered layout row as live (`agent-run-platform::plugin_views::{plugin_mount,
 view_root, verify_view}` derive and check the exact names).
 
+The guard is `/usr/bin/sandbox-exec` with a deny-write Seatbelt profile on
+macOS and `/usr/bin/bwrap` on Linux. The Linux wrapper starts the child in a
+fresh user and mount namespace that keeps the whole host view, binds the
+store read-only (write, create, truncate, unlink, rename, link, chmod, chown
+and timestamp changes fail) and binds every ancestor directory onto itself so
+renaming the store or any ancestor fails with `EBUSY`. Nested namespaces
+cannot unmount or remount those binds, and `/proc/<pid>/root` links of
+unconfined same-UID processes are not reachable from the child. PIDs, the
+process group, signals, environment, network, stdio and exit status are
+unchanged; setuid programs cannot gain privilege in the child, and a rename
+between the workdir and a directory on another bound ancestor reports
+`EXDEV` (tools fall back to copying). Before launch the Linux wrapper also
+refuses a store that another mount of the same filesystem exposes at a second
+path. A host without the helper, or whose kernel or container denies
+unprivileged user and mount namespaces (Docker's default seccomp profile
+does), refuses shared conversion; nothing falls back to private copies.
+
 The supervisor validates the real native guard before moving a fresh home.
-It creates a unique owned sentinel in the shared root, then runs a finite
-`sandbox-exec` child that must read it and fail to write it. For Codex it also
+It creates a unique owned sentinel in the shared root, then runs finite
+guarded children that must read it and fail to write or chmod it; a child that
+cannot start or read is reported as an unusable guard. For Codex it also
 compares the root with every effective writable grant and native temporary
 root, then runs the selected Codex binary's `sandbox` command with the same
 private config and permission profile. That command must read the sentinel,
-fail to alter it, and write an owned workspace sentinel when the admitted
+fail to alter its bytes or mode, and write an owned workspace sentinel when the admitted
 role allows writes. Claude and GLM instead run guarded `--version` metadata
 startup. Each probe has a five-second process bound and removes only its own
 sentinels. A failed or unsupported native check refuses conversion and launch.
@@ -51,12 +69,16 @@ The preflight holds the store's publish/GC lock while its sentinel files exist
 and while guard scans run; install releases and reacquires that lock at its own
 prepare and import steps. Launch wrapper scans use the same lock.
 
-Codex keeps its original app-server and nested sandbox. The launch adds
-native `-c` overrides that wrap each harness-owned stdio MCP child with
+On macOS Codex keeps its original app-server and nested sandbox. The launch
+adds native `-c` overrides that wrap each harness-owned stdio MCP child with
 `sandbox-exec`, leaving the sealed config bytes, account environment, tool
 filters and approvals unchanged. Server names that the native override key
-cannot address unambiguously are refused. Claude and GLM launch their whole
-child process under the guard. An already-running external MCP server or
+cannot address unambiguously are refused. On Linux the whole Codex
+app-server launches under the guard, because Codex's own Linux sandbox
+cannot deny chmod; its executor, sandboxed commands and MCP children inherit
+the read-only store, and the Codex qualification probe runs `codex sandbox`
+under the same guard. Claude and GLM launch their whole child process under
+the guard on both platforms. An already-running external MCP server or
 daemon is outside the child guard; it is not treated as a protected child.
 
 The guard's path and hardlink scan runs at launch time. It cannot control an

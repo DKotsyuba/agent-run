@@ -4,6 +4,16 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- feat(storage): guard shared runtime assets on Linux with `/usr/bin/bwrap`
+  (fresh user and mount namespace, read-only store bind, self-bound ancestors,
+  same-filesystem mount alias refusal); on Linux the whole Codex app-server
+  runs under the guard and its qualification probe is composed under it, Codex
+  MCP overrides name the platform helper from the wrapped argv, and guard and
+  Codex qualification probes also require chmod denial and report an
+  unlaunchable guard exactly. Hosts or
+  containers without the helper or unprivileged namespaces refuse shared
+  conversion; macOS Seatbelt rules are unchanged
+
 ## [0.20.2] - 2026-10-04
 
 - fix(pools): emit only the common completion notice for successful current pool

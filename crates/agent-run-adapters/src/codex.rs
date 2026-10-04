@@ -7,7 +7,7 @@ pub mod session;
 use agent_run_config::config::Runtime;
 use agent_run_domain::{error::invalid, Error, Result};
 use agent_run_platform::fs;
-use agent_run_platform::shared_asset_guard::{SharedAssetGuard, MACOS_SANDBOX_EXEC};
+use agent_run_platform::shared_asset_guard::SharedAssetGuard;
 use agent_run_platform::shared_assets::SharedStoreLock;
 use serde_json::{json, Value};
 use std::{
@@ -360,10 +360,12 @@ pub struct SealedMcpServer {
 /// installed under; `servers` are the frozen `(command, args)` definitions the
 /// sealed native config already carries for this role. The bytes of that
 /// config are never rewritten: for every server the compiler emits
-/// `-c mcp_servers.<name>.command=<sandbox-exec>` and
-/// `-c mcp_servers.<name>.args=[…]`, where the wrapped argv is
+/// `-c mcp_servers.<name>.command=<guard helper>` and
+/// `-c mcp_servers.<name>.args=[…]`, where the helper and its arguments are
 /// [`agent_run_platform::shared_asset_guard::SharedAssetGuard::wrap`] applied
-/// to the original program and arguments — nothing else about the server
+/// to the original program and arguments (`sandbox-exec` on macOS,
+/// `bwrap` on Linux, taken from the wrapped argv itself so the override can
+/// never name a different program than the guard) — nothing else about the server
 /// (environment, approval mode, enabled tools) changes. The dotted override
 /// form is the native CLI's own verified contract: a probe against Codex
 /// 0.156.1 (`codex mcp get --json` with the same `-c` pairs) reflected the
@@ -373,8 +375,8 @@ pub struct SealedMcpServer {
 /// therefore restricted to bare native key segments — ASCII letters, digits,
 /// underscore and hyphen — and any other name is an explicit error, never an
 /// invented quoting. Every recorded command is wrapped, including a command
-/// that itself names `sandbox-exec`: its recorded arguments are not proof of a
-/// safe profile. An unavailable guard is an
+/// that itself names the guard helper: its recorded arguments are not proof of
+/// a safe profile. An unavailable guard is an
 /// error, never a silent private fallback: the caller must refuse the shared
 /// launch instead. One store publish/GC lock covers every wrapper scan, so
 /// concurrent imports cannot alter inode counts between checks.
@@ -385,7 +387,6 @@ pub fn shared_guard_mcp_overrides(
     let _publish_lock = SharedStoreLock::acquire(store_root)?;
     let guard =
         SharedAssetGuard::new(store_root).map_err(|error| Error::Unsupported(error.to_string()))?;
-    let sandbox_exec = MACOS_SANDBOX_EXEC.to_owned();
     let mut overrides = Vec::new();
     for (name, server) in servers {
         if name.is_empty()
@@ -401,12 +402,13 @@ pub fn shared_guard_mcp_overrides(
         let argv = guard
             .wrap(Path::new(&server.command), &server.args)
             .map_err(|error| Error::Unsupported(error.to_string()))?;
+        let helper = argv[0].to_string_lossy();
         let args = argv[1..]
             .iter()
             .map(|value| value.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         overrides.push("-c".into());
-        overrides.push(format!("mcp_servers.{name}.command={sandbox_exec}"));
+        overrides.push(format!("mcp_servers.{name}.command={helper}"));
         overrides.push("-c".into());
         overrides.push(format!(
             "mcp_servers.{name}.args=[{}]",
@@ -425,13 +427,40 @@ pub fn shared_guard_mcp_overrides(
 mod tests {
     use super::*;
 
+    /// The platform's fixed guard helper, or `None` when this host lacks it
+    /// and every shared wrapper must therefore be refused.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn guard_helper() -> Option<&'static str> {
+        #[cfg(target_os = "macos")]
+        let helper = agent_run_platform::shared_asset_guard::MACOS_SANDBOX_EXEC;
+        #[cfg(target_os = "linux")]
+        let helper = agent_run_platform::shared_asset_guard::LINUX_BWRAP;
+        Path::new(helper).is_file().then_some(helper)
+    }
+
     /// Shared MCP overrides guard the original command and exact arguments
-    /// under bare native keys; ambiguous keys are refused before launch.
-    #[cfg(target_os = "macos")]
+    /// under bare native keys with the platform helper as the command;
+    /// ambiguous keys are refused before launch and a host without the
+    /// helper refuses instead of emitting an unguarded override.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn shared_mcp_overrides_preserve_server_argv() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
+        let Some(helper) = guard_helper() else {
+            let servers = std::collections::BTreeMap::from([(
+                "worker".to_owned(),
+                SealedMcpServer {
+                    command: "/bin/echo".into(),
+                    args: vec![],
+                },
+            )]);
+            assert!(matches!(
+                shared_guard_mcp_overrides(&root, &servers),
+                Err(Error::Unsupported(_))
+            ));
+            return;
+        };
         let servers = std::collections::BTreeMap::from([(
             "worker-probe".to_owned(),
             SealedMcpServer {
@@ -444,7 +473,7 @@ mod tests {
         assert_eq!(overrides[0], "-c");
         assert_eq!(
             overrides[1],
-            "mcp_servers.worker-probe.command=/usr/bin/sandbox-exec"
+            format!("mcp_servers.worker-probe.command={helper}")
         );
         let args: Vec<String> = serde_json::from_str(
             overrides[3]
@@ -463,7 +492,7 @@ mod tests {
         let self_named = std::collections::BTreeMap::from([(
             "worker".to_owned(),
             SealedMcpServer {
-                command: MACOS_SANDBOX_EXEC.into(),
+                command: helper.into(),
                 args: vec!["--version".into()],
             },
         )]);
@@ -471,14 +500,16 @@ mod tests {
         let nested_args: Vec<String> =
             serde_json::from_str(nested[3].strip_prefix("mcp_servers.worker.args=").unwrap())
                 .unwrap();
+        assert_eq!(nested[1], format!("mcp_servers.worker.command={helper}"));
         assert!(nested_args
             .windows(2)
-            .any(|window| { window == [MACOS_SANDBOX_EXEC, "--version"] }));
+            .any(|window| { window == [helper, "--version"] }));
     }
 
     /// A launch waits for an in-flight publisher to finish creating both
-    /// internal hardlinks before its whole-store alias scan begins.
-    #[cfg(target_os = "macos")]
+    /// internal hardlinks before its whole-store alias scan begins; the
+    /// finished scan succeeds exactly when the host has the guard helper.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn shared_mcp_scan_waits_for_store_publisher() {
         let temp = tempfile::tempdir().unwrap();
@@ -510,10 +541,13 @@ mod tests {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ));
         drop(publisher);
-        assert!(done_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap()
-            .is_ok());
+        assert_eq!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .is_ok(),
+            guard_helper().is_some()
+        );
         handle.join().unwrap();
     }
 
