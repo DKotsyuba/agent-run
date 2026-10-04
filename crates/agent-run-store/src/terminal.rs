@@ -13,12 +13,14 @@ use agent_run_platform::verify::{self, Proof};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
 
-/// Commits one terminal result and the completion notice that announces it.
+/// Commits one terminal result and any individual completion notice it needs.
 ///
 /// The answer proof is verified before opening the transaction. Once started,
-/// the state update, attempt close, event append, answer metadata, outbox row,
-/// and aggregate run statistics either commit together or SQLite rolls all of
-/// them back. A pending cancel observed while a successful or timed-out run is
+/// the state update, attempt close, event append, answer metadata, eligible
+/// outbox row, and aggregate run statistics either commit together or SQLite
+/// rolls all of them back. Successful runs in a current seat of an open pool
+/// omit the individual notice because pool settlement owns the common success
+/// notice. A pending cancel observed while a successful or timed-out run is
 /// being committed wins in this same transaction and receives its terminal
 /// command result. Repeating a completion after a prior terminal commit is a
 /// no-op.
