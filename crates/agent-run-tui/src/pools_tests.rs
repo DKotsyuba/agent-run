@@ -11,7 +11,200 @@ use ratatui::{
     Terminal,
 };
 use serde_json::Value;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
+
+/// Broker stub exposing exact method calls and a controllable pool reconnect generation.
+struct DiscoveryBroker {
+    /// Recorded pool-lane method names.
+    calls: Mutex<Vec<String>>,
+    /// Simulated pool socket generation.
+    generation: AtomicU64,
+    /// Whether the legacy discovery method is unavailable.
+    legacy: bool,
+    /// Whether list_pools should return a genuine operational error.
+    real_error: bool,
+}
+
+impl crate::net::Broker for DiscoveryBroker {
+    /// Records calls and serves compact discovery/status fixtures.
+    fn call<'a>(&'a self, method: &'a str, params: Value) -> crate::net::BrokerFuture<'a> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push(method.to_owned());
+            match method {
+                "list_pools" if self.real_error => {
+                    Err(agent_run::Error::Runtime("daemon overloaded".into()))
+                }
+                "list_pools" if self.legacy && self.generation.load(Ordering::Relaxed) == 0 => Err(
+                    agent_run::Error::Runtime("JSON-RPC method not found".into()),
+                ),
+                "list_pools" => Ok(serde_json::to_value(empty_list(
+                    params["offset"].as_u64().unwrap_or(0) as usize,
+                ))
+                .unwrap()),
+                "pool" => {
+                    let id = params["pool_id"].as_str().unwrap();
+                    if id == "pool-20261004-100002-2222222222" {
+                        return Err(agent_run::Error::NotFound(id.into()));
+                    }
+                    let mode = if id == "pool-20261004-100001-1111111111" {
+                        "completed"
+                    } else {
+                        "active"
+                    };
+                    let mut value = page_value(mode, vec![], Some(i64::MAX as u64), true);
+                    value["pool_id"] = json!(id);
+                    Ok(value)
+                }
+                _ => Err(agent_run::Error::Runtime(format!(
+                    "unexpected method {method}"
+                ))),
+            }
+        })
+    }
+
+    /// Returns the simulated pool socket generation.
+    fn pool_connection_generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+}
+
+/// Session summaries contribute only strictly shaped ids; explicit ids are retained.
+#[test]
+fn candidates_parse_strict_pool_ids_and_dedupe() {
+    let mut agent = agent_view(
+        "ag-20261004-100000-aaaaaaaaaa",
+        "ag-20261004-100000-aaaaaaaaaa",
+        "running",
+    );
+    agent.task_summary =
+        format!("member of cooperative pool {ID} and pool-20261004-100000-7ac03b9e1Z");
+    assert_eq!(candidates(&[agent], None), vec![ID.parse().unwrap()]);
+}
+
+/// Missing discovery falls back once, confirms candidates, partitions state, and retries after reconnect.
+#[tokio::test]
+async fn discovery_fallback_confirms_pools_and_retries_after_reconnect() {
+    let broker = Arc::new(DiscoveryBroker {
+        calls: Mutex::new(vec![]),
+        generation: AtomicU64::new(0),
+        legacy: true,
+        real_error: false,
+    });
+    let mut session = agent_view(
+        "ag-20261004-100000-aaaaaaaaaa",
+        "ag-20261004-100000-aaaaaaaaaa",
+        "running",
+    );
+    session.task_summary =
+        format!("pool {ID} pool-20261004-100001-1111111111 pool-20261004-100002-2222222222");
+    let (request_tx, request_rx) = tokio::sync::watch::channel(Request {
+        visible: true,
+        candidates: candidates(&[session], None),
+        ..Request::default()
+    });
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let worker = tokio::spawn(super::worker(broker.clone(), request_rx, tx));
+    for expected_fallback in [true, true] {
+        let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let BrokerEvent::Pools {
+            page: Ok((open, completed)),
+            fallback,
+            ..
+        } = event
+        else {
+            panic!("expected discovery event")
+        };
+        assert_eq!(fallback, expected_fallback);
+        if expected_fallback {
+            assert_eq!(
+                open.items
+                    .iter()
+                    .map(|p| p.pool_id.to_string())
+                    .collect::<Vec<_>>(),
+                vec![ID]
+            );
+            assert_eq!(completed.items.len(), 1);
+            assert_eq!(completed.items[0].state, PoolState::Completed);
+            assert!(!open
+                .items
+                .iter()
+                .any(|p| p.pool_id.as_str().contains("222222")));
+        }
+    }
+    assert_eq!(
+        broker
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.as_str() == "list_pools")
+            .count(),
+        1
+    );
+    broker.generation.store(1, Ordering::Relaxed);
+    let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let BrokerEvent::Pools { fallback, .. } = event else {
+        panic!("expected discovery event")
+    };
+    assert!(!fallback);
+    assert_eq!(
+        broker
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.as_str() == "list_pools")
+            .count(),
+        3
+    );
+    drop(request_tx);
+    worker.abort();
+}
+
+/// A genuine list failure remains a broker error and does not enable compatibility mode.
+#[tokio::test]
+async fn discovery_real_errors_remain_visible_errors() {
+    let broker = Arc::new(DiscoveryBroker {
+        calls: Mutex::new(vec![]),
+        generation: AtomicU64::new(0),
+        legacy: false,
+        real_error: true,
+    });
+    let (_request_tx, request_rx) = tokio::sync::watch::channel(Request {
+        visible: true,
+        ..Request::default()
+    });
+    let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+    let worker = tokio::spawn(super::worker(broker, request_rx, tx));
+    let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let BrokerEvent::Pools {
+        page: Err(error),
+        fallback,
+        ..
+    } = event
+    else {
+        panic!("expected real discovery error")
+    };
+    assert!(!fallback);
+    assert!(error.contains("daemon overloaded"));
+    let mut app = App::new();
+    app.pools.visible = true;
+    app.pools.error = Some(error);
+    assert!(frame(&app, 120, 30).contains("broker error, retrying · daemon overloaded"));
+    worker.abort();
+}
 
 /// Stable illustrative pool identity from the design frames.
 const ID: &str = "pool-20261004-100000-7ac03b9e12";
@@ -311,7 +504,7 @@ fn forward_backward_overlap_preserves_anchor_and_cursor() {
     b.offset = 0;
     older(&mut app);
     assert_eq!(
-        app.pools.request().before,
+        app.pools.request(&app.sessions).before,
         Some(8),
         "never use reverse next_cursor #10"
     );
@@ -404,6 +597,7 @@ async fn fake_broker_list_paging_and_unchanged_draw() {
         &mut app,
         BrokerEvent::Pools {
             offset: 0,
+            fallback: false,
             page: Ok((first.clone(), empty_list(0))),
         },
     );
@@ -413,6 +607,7 @@ async fn fake_broker_list_paging_and_unchanged_draw() {
         &mut app,
         BrokerEvent::Pools {
             offset: 0,
+            fallback: false,
             page: Ok((first, empty_list(0))),
         },
     );
@@ -426,6 +621,7 @@ async fn fake_broker_list_paging_and_unchanged_draw() {
         &mut app,
         BrokerEvent::Pools {
             offset: 50,
+            fallback: false,
             page: Ok((second, empty_list(50))),
         },
     );
@@ -436,6 +632,7 @@ async fn fake_broker_list_paging_and_unchanged_draw() {
         &mut app,
         BrokerEvent::Pools {
             offset: 0,
+            fallback: false,
             page: Ok((list("active", 0, 2), empty_list(0))),
         },
     );

@@ -8,7 +8,16 @@
 use agent_run::transport::socket::BrokerClient;
 use agent_run_domain::views::{AgentPage, AnswerView, TranscriptPage};
 use serde_json::{json, Value};
-use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    os::unix::fs::MetadataExt,
+    path::PathBuf,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 /// Upper bound of one transcript page accepted from the broker.
 ///
@@ -26,6 +35,11 @@ pub type BrokerFuture<'a> = Pin<Box<dyn Future<Output = agent_run::Result<Value>
 pub trait Broker: Send + Sync {
     /// Send one method and JSON object to the resident broker.
     fn call<'a>(&'a self, method: &'a str, params: Value) -> BrokerFuture<'a>;
+
+    /// Returns the pool socket generation, incremented whenever its connection is retired.
+    fn pool_connection_generation(&self) -> u64 {
+        0
+    }
 }
 
 /// Shared dynamic broker seam handed to the event workers.
@@ -38,17 +52,27 @@ pub struct SocketBroker {
     socket: PathBuf,
     /// Persistent connection per worker lane (list, transcript, one-shot, pools).
     clients: [std::sync::Mutex<Arc<BrokerClient>>; 4],
+    /// Pool lane generation observed by compatibility discovery.
+    pool_generation: AtomicU64,
+    /// Filesystem identity of the currently published pool socket.
+    pool_socket_identity: std::sync::Mutex<Option<(u64, u64)>>,
 }
 
 impl SocketBroker {
     /// Creates four lazy clients; no socket opens before its first call.
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         let socket = socket_path.into();
+        let pool_socket_identity = socket
+            .symlink_metadata()
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()));
         Self {
             clients: std::array::from_fn(|_| {
                 std::sync::Mutex::new(Arc::new(BrokerClient::new(socket.clone())))
             }),
             socket,
+            pool_generation: AtomicU64::new(0),
+            pool_socket_identity: std::sync::Mutex::new(pool_socket_identity),
         }
     }
 }
@@ -61,6 +85,8 @@ struct InFlight<'a> {
     socket: &'a PathBuf,
     /// Whether the response has been consumed.
     complete: bool,
+    /// Pool generation, present only for the pool lane.
+    pool_generation: Option<&'a AtomicU64>,
 }
 
 impl Drop for InFlight<'_> {
@@ -69,11 +95,31 @@ impl Drop for InFlight<'_> {
         if !self.complete {
             *self.lane.lock().expect("broker lane") =
                 Arc::new(BrokerClient::new(self.socket.clone()));
+            if let Some(generation) = self.pool_generation {
+                generation.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
 
 impl Broker for SocketBroker {
+    /// Returns the current pool socket incarnation.
+    fn pool_connection_generation(&self) -> u64 {
+        let identity = self
+            .socket
+            .symlink_metadata()
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()));
+        let mut previous = self
+            .pool_socket_identity
+            .lock()
+            .expect("pool socket identity");
+        if *previous != identity {
+            *previous = identity;
+            self.pool_generation.fetch_add(1, Ordering::Relaxed);
+        }
+        self.pool_generation.load(Ordering::Relaxed)
+    }
     /// Routes each method to its worker's connection and retires cancelled calls.
     fn call<'a>(&'a self, method: &'a str, params: Value) -> BrokerFuture<'a> {
         let index = match method {
@@ -89,8 +135,21 @@ impl Broker for SocketBroker {
                 lane,
                 socket: &self.socket,
                 complete: false,
+                pool_generation: (index == 3).then_some(&self.pool_generation),
             };
             let result = client.call(method, Some(params)).await;
+            if index == 3
+                && result.as_ref().err().is_some_and(|error| {
+                    matches!(
+                        error,
+                        agent_run::Error::BrokerUnavailable | agent_run::Error::Io(_)
+                    )
+                })
+            {
+                *lane.lock().expect("broker lane") =
+                    Arc::new(BrokerClient::new(self.socket.clone()));
+                self.pool_generation.fetch_add(1, Ordering::Relaxed);
+            }
             flight.complete = true;
             result
         })

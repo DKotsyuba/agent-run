@@ -9,7 +9,7 @@ use crate::{
 use agent_run_domain::{
     domain::{AgentId, Status},
     pool::{PoolEntryView, PoolId, PoolState, VoteDecision},
-    views::{AgentView, ListPoolsView, PoolListView},
+    views::{AgentView, ListPoolsView, PoolListMemberView, PoolListView},
 };
 use ratatui::crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
 use serde::Deserialize;
@@ -324,6 +324,8 @@ pub struct Pools {
     pub buffers: VecDeque<Buffer>,
     /// Discovery/read failure, bounded by transport and sanitized at rendering.
     pub error: Option<String>,
+    /// Broker lacks list_pools on its current pool connection.
+    pub fallback: bool,
     /// Stable pointer targets from the last frame.
     pub hits: std::cell::RefCell<Vec<(ratatui::layout::Rect, Target)>>,
 }
@@ -395,7 +397,7 @@ impl Pools {
         changed
     }
     /// Builds the worker target; invisible tabs issue no pool reads.
-    pub fn request(&self) -> Request {
+    pub fn request(&self, sessions: &[AgentView]) -> Request {
         let b = self.buffer();
         Request {
             visible: self.visible,
@@ -408,6 +410,7 @@ impl Pools {
                 .and_then(|b| b.status.as_ref())
                 .is_some_and(|s| s.state == PoolState::Completed)
                 && b.is_some_and(|b| b.after >= b.last_seq),
+            candidates: candidates(sessions, self.selected.as_ref()),
         }
     }
 }
@@ -428,6 +431,8 @@ pub struct Request {
     pub before: Option<u64>,
     /// Completed pools stop forward polling but still allow history.
     pub completed: bool,
+    /// Candidate ids from loaded task summaries and explicit CLI selection.
+    pub candidates: Vec<PoolId>,
 }
 /// One-second pool polling interval; public operator reads have no wait parameter.
 const POLL: Duration = Duration::from_secs(1);
@@ -445,6 +450,34 @@ pub async fn listing(
             )
             .await?,
     )?)
+}
+/// Extracts deduplicated pool ids from loaded summaries and an optional direct target.
+/// Summary matches must use the exact minted ASCII id shape and have no adjacent
+/// alphanumeric characters; the broker remains authoritative and must confirm each id.
+pub fn candidates(sessions: &[AgentView], direct: Option<&PoolId>) -> Vec<PoolId> {
+    let mut found = BTreeMap::new();
+    if let Some(id) = direct {
+        found.insert(id.to_string(), id.clone());
+    }
+    for session in sessions {
+        let text = session.task_summary.as_str();
+        let bytes = text.as_bytes();
+        for start in 0..bytes.len().saturating_sub(4) {
+            if bytes[start..].starts_with(b"pool-") && start + 31 <= bytes.len() {
+                let candidate = &text[start..start + 31];
+                if candidate.parse::<PoolId>().is_ok()
+                    && (start == 0 || !bytes[start - 1].is_ascii_alphanumeric())
+                    && bytes
+                        .get(start + 31)
+                        .is_none_or(|b| !b.is_ascii_alphanumeric())
+                {
+                    let id: PoolId = candidate.parse().expect("validated pool id");
+                    found.insert(id.to_string(), id);
+                }
+            }
+        }
+    }
+    found.into_values().collect()
 }
 /// Reads a tail, forward or older pool page with mutually exclusive signed cursors.
 pub async fn read(broker: &dyn Broker, request: &Request) -> agent_run::Result<Page> {
@@ -464,16 +497,25 @@ pub async fn read(broker: &dyn Broker, request: &Request) -> agent_run::Result<P
 }
 /// Polls visible discovery/status on the fourth socket, cancelling target changes.
 /// List refreshes and regular forward polls are throttled independently; older pages
-/// and target switches are immediate. Failed rounds keep last valid UI data.
+/// and target switches are immediate. Method-not-found selects the read-confirmed,
+/// session-derived compatibility path until the pool socket generation changes;
+/// failed rounds keep last valid UI data.
 pub async fn worker(
     broker: SharedBroker,
     mut requests: watch::Receiver<Request>,
     tx: mpsc::Sender<BrokerEvent>,
 ) {
+    let mut list_supported = true;
+    let mut connection_generation = broker.pool_connection_generation();
     let mut list_at = tokio::time::Instant::now();
     let mut pool_at = list_at;
     let mut last = Request::default();
     loop {
+        let current_generation = broker.pool_connection_generation();
+        if current_generation != connection_generation {
+            connection_generation = current_generation;
+            list_supported = true;
+        }
         let target = requests.borrow_and_update().clone();
         if !target.visible {
             if requests.changed().await.is_err() {
@@ -497,9 +539,75 @@ pub async fn worker(
         if now >= list_at {
             list_at = tokio::time::Instant::now() + POLL;
             let round = async {
-                let open = listing(&*broker, PoolState::Open, target.offset).await?;
-                let completed = listing(&*broker, PoolState::Completed, target.offset).await?;
-                Ok::<_, agent_run::Error>((open, completed))
+                if list_supported {
+                    match listing(&*broker, PoolState::Open, target.offset).await {
+                        Ok(open) => {
+                            match listing(&*broker, PoolState::Completed, target.offset).await {
+                                Ok(completed) => return Ok((open, completed, false)),
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Err(error)
+                            if error
+                                .to_string()
+                                .to_ascii_lowercase()
+                                .contains("method not found") =>
+                        {
+                            list_supported = false
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                let mut open_items = Vec::new();
+                let mut completed_items = Vec::new();
+                for id in &target.candidates {
+                    let Ok(value) = broker.call("pool", json!({"pool_id":id,"limit":1})).await
+                    else {
+                        continue;
+                    };
+                    let Ok(page) = serde_json::from_value::<Page>(value) else {
+                        continue;
+                    };
+                    let s = page.status;
+                    let item = PoolListView {
+                        pool_id: id.clone(),
+                        state: s.state,
+                        goal: s.goal.chars().take(128).collect(),
+                        goal_truncated: s.goal.chars().count() > 128,
+                        created_at: 0.0,
+                        last_seq: page.last_seq,
+                        completed_at: None,
+                        roster_revision: s.roster_revision,
+                        members_count: s.members.len(),
+                        ready: s.ready(),
+                        current_proposal_seq: s.current_proposal.as_ref().map(|p| p.seq),
+                        members: s
+                            .members
+                            .into_iter()
+                            .map(|m| PoolListMemberView {
+                                slot: m.slot,
+                                name: m.name,
+                                role: m.role,
+                                agent_id: m.agent_id,
+                                tip_status: m.tip_status,
+                            })
+                            .collect(),
+                    };
+                    if item.state == PoolState::Open {
+                        open_items.push(item);
+                    } else {
+                        completed_items.push(item);
+                    }
+                }
+                let page = |items: Vec<PoolListView>| ListPoolsView {
+                    total: items.len() as u64,
+                    items,
+                    offset: 0,
+                    limit: 50,
+                    next_offset: None,
+                    complete: true,
+                };
+                Ok((page(open_items), page(completed_items), true))
             };
             let result = tokio::select! {
                 result = round => result.map_err(|e| e.to_string()),
@@ -509,7 +617,9 @@ pub async fn worker(
             if tx
                 .send(BrokerEvent::Pools {
                     offset: target.offset,
-                    page: result,
+                    fallback: result.as_ref().is_ok_and(|(_, _, fallback)| *fallback)
+                        || !list_supported,
+                    page: result.map(|(open, completed, _)| (open, completed)),
                 })
                 .await
                 .is_err()

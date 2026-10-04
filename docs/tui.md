@@ -136,7 +136,11 @@ Enter focuses it. Narrow terminals show the list first and open the selected
 pool full-screen with Enter; Esc returns to the list. `[ ]` changes discovery
 pages (50 rows per state), while section counts remain exact across pages.
 `agent-run-tui --pool <id>` opens a pool directly, including a pool outside
-the current discovery page.
+the current discovery page. If the connected broker predates `list_pools`,
+the tab confirms strict pool ids found in loaded session summaries through
+the public `pool` read and labels this discovery as session-derived; older
+pools whose members are all finished may be unavailable until `list_pools`
+is supported.
 
 The detail header shows the goal excerpt, state badge, valid readiness,
 proposal and roster revision. `c` opens the full sanitized goal and criteria
@@ -260,6 +264,9 @@ background so highlights stay visible.
   with separate open/completed filters, limit and offset, at most once per
   second. Selected pools open with a reverse tail page and poll forward with
   `after_seq` approximately every second; public `pool` has no wait parameter.
+  A broker without `list_pools` falls back to confirming candidate ids from
+  loaded session summaries through `pool`; retiring the pool socket resets
+  discovery capability so the list method is retried on its replacement.
   Hidden tabs cancel pool reads. Completed pools stop forward polling once
   the known tail is loaded; older history remains available on demand.
   Empty unchanged status/log pages draw nothing. Reverse requests use

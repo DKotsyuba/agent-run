@@ -352,7 +352,19 @@ fn list_rows(app: &App) -> Vec<(Line<'static>, Option<agent_run_domain::pool::Po
         ),
         None,
     ));
-    if let Some(error) = &app.pools.error {
+    if app.pools.fallback {
+        rows.push((
+            Line::styled(
+                "  discovered from sessions (broker has no list_pools)",
+                theme::dim(),
+            ),
+            None,
+        ));
+        rows.push((
+            Line::styled("  older pools need broker list_pools", theme::dim()),
+            None,
+        ));
+    } else if let Some(error) = &app.pools.error {
         rows.push((plain(format!(" broker error, retrying · {error}")), None));
     }
     rows

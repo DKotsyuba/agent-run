@@ -87,6 +87,8 @@ pub enum BrokerEvent {
             ),
             String,
         >,
+        /// Discovery used session-based compatibility mode.
+        fallback: bool,
     },
     /// Public pool read and requested reverse cursor.
     Pool {
@@ -1051,12 +1053,15 @@ impl Pipeline {
             BrokerEvent::Pools {
                 offset,
                 page: Ok((open, completed)),
+                fallback,
             } => {
+                app.pools.fallback = fallback;
                 app.dirty |= app.pools.listing(offset, open, completed);
             }
             BrokerEvent::Pools {
                 offset,
                 page: Err(error),
+                fallback: _,
             } => {
                 if offset == app.pools.offset && app.pools.error.as_ref() != Some(&error) {
                     app.pools.error = Some(error);
@@ -1296,7 +1301,7 @@ pub async fn run(
         token: 0,
     });
 
-    let (pool_tx, pool_rx) = watch::channel(app.pools.request());
+    let (pool_tx, pool_rx) = watch::channel(app.pools.request(&app.sessions));
     tokio::spawn(crate::pools::worker(
         broker.clone(),
         pool_rx,
@@ -1324,7 +1329,7 @@ pub async fn run(
 
     loop {
         pool_tx.send_if_modified(|current| {
-            let next = app.pools.request();
+            let next = app.pools.request(&app.sessions);
             if *current == next {
                 false
             } else {
