@@ -470,6 +470,171 @@ fn python_test_resume_same_request_id_replays_child() {
     assert!(!created);
 }
 
+/// Both spellings of one caller chat, as recorded by a historical schema-1 run.
+fn chat_refs() -> (OrchestratorRef, OrchestratorRef) {
+    let alias = OrchestratorRef {
+        transport: "codex".into(),
+        external_session_id: "old-chat".into(),
+        external_turn_id: None,
+    };
+    let canonical = OrchestratorRef {
+        transport: "codex_queue".into(),
+        ..alias.clone()
+    };
+    (alias, canonical)
+}
+
+/// Finishes `id` as a terminal run owning native session `session`.
+fn finish_with_session(home: &common::Home, id: &agent_run_domain::domain::AgentId, session: &str) {
+    let mut store = home.store();
+    store.running(id, 42).unwrap();
+    store.runtime_session(id, session).unwrap();
+    store
+        .finish(id, &Outcome::failure("fixture"), None, None)
+        .unwrap();
+}
+
+/// An old parent's resume retry finds its one child under either transport
+/// spelling even after later continuations, with no configuration or sealed
+/// home read (the fixture identity is deliberately empty), while a different
+/// intent or another chat family is never a replay and creates no child.
+#[tokio::test]
+async fn old_parent_resume_retry_replays_through_later_continuations() {
+    let home = common::Home::new();
+    let (alias, canonical) = chat_refs();
+    home.store()
+        .conn
+        .execute(
+            "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) VALUES('os-old','codex','old-chat',1,1)",
+            [],
+        )
+        .unwrap();
+    let mut root_request = home.request();
+    root_request.orchestrator = Some(alias.clone());
+    let root = parent(&home, root_request, "one");
+    let root_row = home.store().get(&root).unwrap();
+    let mut retry = root_row.request.clone();
+    retry.task = "continue".into();
+    retry.request_id = Some("retry-1".into());
+    let (child_id, created) = home
+        .store()
+        .admit(&retry, &home.config, &json!({}), Some(&root_row))
+        .unwrap();
+    assert!(created);
+    finish_with_session(&home, &child_id, "two");
+    let child_row = home.store().get(&child_id).unwrap();
+    let mut later = child_row.request.clone();
+    later.task = "later".into();
+    later.request_id = Some("later-1".into());
+    let (tip, created) = home
+        .store()
+        .admit(&later, &home.config, &json!({}), Some(&child_row))
+        .unwrap();
+    assert!(created);
+
+    let service = agent_run_core::service::Service::new(home.path.clone());
+    for orchestrator in [None, Some(alias.clone()), Some(canonical.clone())] {
+        let replayed = service
+            .resume(
+                &root,
+                "continue".into(),
+                None,
+                Some("retry-1".into()),
+                None,
+                orchestrator,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replayed["created"], json!(false));
+        assert_eq!(replayed["agent_id"], json!(child_id));
+    }
+    let other_family = OrchestratorRef {
+        transport: "claude_uds".into(),
+        ..canonical.clone()
+    };
+    for (task, orchestrator) in [("different task", None), ("continue", Some(other_family))] {
+        assert!(service
+            .resume(
+                &root,
+                task.into(),
+                None,
+                Some("retry-1".into()),
+                None,
+                orchestrator,
+            )
+            .await
+            .is_err());
+    }
+    let children: i64 = home
+        .store()
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM agents WHERE parent_agent_id=?",
+            [root.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(children, 1);
+    assert_eq!(home.store().get(&tip).unwrap().sequence, 3);
+}
+
+/// Present immutable request-hash mismatches remain conflicts for identical JSON
+/// and for historical transport aliases; an exact matching hash still replays.
+#[test]
+fn replay_hash_mismatch_conflicts_for_all_transport_spellings() {
+    let home = common::Home::new();
+    let (alias, _) = chat_refs();
+    let mut request = home.request();
+    request.request_id = Some("hashed".into());
+    request.orchestrator = Some(alias);
+    let mut store = home.store();
+    let (first, created) = store
+        .admit(
+            &request,
+            &home.config,
+            &json!({"replay_request_sha256":"h1"}),
+            None,
+        )
+        .unwrap();
+    assert!(created);
+    let corrupt = json!({"replay_request_sha256":"h2"});
+    assert!(matches!(
+        store.admit(&request, &home.config, &corrupt, None),
+        Err(Error::Conflict)
+    ));
+    // Model a Python-created row, whose stored request used the alias spelling.
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET request_json=json_set(request_json,'$.orchestrator.transport','codex') WHERE id=?",
+            [first.as_str()],
+        )
+        .unwrap();
+    for transport in ["codex", "codex_queue"] {
+        let mut retry = request.clone();
+        retry.orchestrator.as_mut().unwrap().transport = transport.into();
+        assert!(matches!(
+            store.admit(&retry, &home.config, &corrupt, None),
+            Err(Error::Conflict)
+        ));
+    }
+    let (again, created) = store
+        .admit(
+            &request,
+            &home.config,
+            &json!({"replay_request_sha256":"h1"}),
+            None,
+        )
+        .unwrap();
+    assert_eq!((again, created), (first, false));
+    let mut changed = request.clone();
+    changed.task = "changed".into();
+    assert!(matches!(
+        store.admit(&changed, &home.config, &corrupt, None),
+        Err(Error::Conflict)
+    ));
+}
+
 /// Mirrors `tests/test_resume.py::ResumeTests::test_same_request_id_with_a_different_task_conflicts`.
 #[test]
 fn python_test_resume_same_request_id_different_task_conflicts() {

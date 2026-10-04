@@ -1273,6 +1273,36 @@ impl Service {
                 "legacy_continuation_unavailable: a schema-1 run cannot be continued under schema 2; its history remains readable".into(),
             ));
         }
+        // Replay of the original resume intent precedes every mutable read, as
+        // for a provider run: an old parent's retry finds its one child even
+        // after later continuations, a changed configuration or a moved home.
+        // Only an explicit timeout is rescaled (by the current margin, as at
+        // admission); an inherited one is the parent's own effective value.
+        let mut replay = parent.request.clone();
+        replay.task = task.clone();
+        replay.request_id = request_id.clone();
+        if display_name.is_some() {
+            replay.display_name = display_name.clone();
+        }
+        if let Some(explicit) = timeout {
+            replay.timeout_seconds = Some(
+                self.current_config()?
+                    .core
+                    .effective_timeout_seconds(Some(explicit))?,
+            );
+        }
+        if orchestrator.is_some() {
+            replay.orchestrator = orchestrator.clone();
+        }
+        replay.validate()?;
+        {
+            let store = Store::open(&self.home)?;
+            if let Some(child) = store.replay_resume_child(&replay, &parent)? {
+                return Ok(
+                    json!({"agent_id":child.id,"created":false,"agent":self.view(&store,&child)?}),
+                );
+            }
+        }
         let mut identity = LaunchIdentity::read(&parent)?;
         identity.replay_request_sha256 = None;
         let runtime_home = identity

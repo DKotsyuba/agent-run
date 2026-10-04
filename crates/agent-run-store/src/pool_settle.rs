@@ -407,43 +407,63 @@ impl Store {
         let Some(current) = current else {
             return Err(Error::NotFound(pool_id.to_string()));
         };
-        let session = crate::session_for_reference(&tx, reference, at)?;
-        if current
-            .as_ref()
-            .is_some_and(|existing| existing != &session)
-        {
-            return Err(Error::Validation(
-                "pool orchestration binding is immutable".into(),
-            ));
+        if let Some(existing) = &current {
+            if !crate::session_matches_reference(&tx, existing, reference)? {
+                return Err(Error::Validation(
+                    "pool orchestration binding is immutable".into(),
+                ));
+            }
         }
-        tx.execute(
-            "UPDATE pools SET orchestrator_session_id=? WHERE id=?",
-            params![session, pool_id.as_str()],
-        )?;
         let seats = seat_tips(&tx, pool_id.as_str())?;
-        for tip in seats {
+        let mut bound_sessions = Vec::new();
+        for tip in &seats {
             let bound: Option<String> = tx.query_row(
                 "SELECT orchestrator_session_id FROM agents WHERE id=?",
                 [tip.as_str()],
-                |r| r.get(0),
+                |row| row.get(0),
             )?;
-            match bound {
-                None => {
-                    tx.execute(
-                        "UPDATE agents SET orchestrator_session_id=? WHERE id=?",
-                        params![session, tip.as_str()],
-                    )?;
-                }
-                Some(other) if other != session => {
+            if let Some(existing) = bound {
+                if !crate::session_matches_reference(&tx, &existing, reference)? {
                     return Err(Error::Validation(
                         "a pool member is bound to a different orchestrator".into(),
                     ));
                 }
-                Some(_) => {}
+                bound_sessions.push(existing);
+            }
+        }
+        let session = match &current {
+            Some(existing) => existing.clone(),
+            None => crate::session_for_reference(&tx, reference, at)?,
+        };
+        if current.is_some() {
+            crate::touch_session_reference(&tx, &session, reference, at)?;
+        }
+        for existing in bound_sessions {
+            if existing != session {
+                crate::touch_session_reference(&tx, &existing, reference, at)?;
+            }
+        }
+        if current.is_none() {
+            tx.execute(
+                "UPDATE pools SET orchestrator_session_id=? WHERE id=?",
+                params![session, pool_id.as_str()],
+            )?;
+        }
+        for tip in seats {
+            let bound: Option<String> = tx.query_row(
+                "SELECT orchestrator_session_id FROM agents WHERE id=?",
+                [tip.as_str()],
+                |row| row.get(0),
+            )?;
+            if bound.is_none() {
+                tx.execute(
+                    "UPDATE agents SET orchestrator_session_id=? WHERE id=?",
+                    params![session, tip.as_str()],
+                )?;
             }
         }
         tx.execute(
-            "UPDATE deliveries SET orchestrator_session_id=?,state='pending',next_attempt_at=? \
+            "UPDATE deliveries SET orchestrator_session_id=COALESCE(orchestrator_session_id,?),state='pending',next_attempt_at=? \
              WHERE state='waiting_binding' AND id=(SELECT completion_delivery_id FROM pools WHERE id=?)",
             params![session, at, pool_id.as_str()],
         )?;

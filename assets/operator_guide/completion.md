@@ -46,8 +46,9 @@ binding hook agree on the receipt format. The database schema is unchanged.
 ## Delivery transport and receiver policy
 
 Explicit orchestrator references accept `codex_queue` and `claude_uds`, or
-their aliases `codex` and `claude`. New bindings use canonical names; existing
-legacy aliases remain readable. Unknown names fail validation before admission.
+their aliases `codex` and `claude`. New session rows use canonical names;
+historical bindings retain their row identity and accept equivalent aliases
+for the same exact external chat. Unknown names fail validation before admission.
 
 Binding identifies the destination; it does not override the receiver's inbound
 message policy. Claude Code can hold peer messages in `bypassPermissions` mode
