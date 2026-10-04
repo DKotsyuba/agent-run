@@ -355,6 +355,16 @@ fn main() {
     emit(
         json!({"type":"result","subtype":if failed{"error_during_execution"}else{"success"},"is_error":failed,"session_id":session,"result":if failed{"fixture failure"}else{"fixture final answer\n"},"usage":{"input_tokens":2,"output_tokens":3},"num_turns":1}),
     );
+    if task == "fixture:result-then-hang" {
+        // A complete, valid success result followed by a root process that keeps
+        // its stdout open and never exits on its own accord: only the run
+        // deadline's cleanup should end it. The twenty second ceiling is a
+        // safety net so a failed cleanup still ends this child finitely.
+        let ceiling = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < ceiling {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
     if task == "fixture:nonzero-after-result" {
         io::stdout().flush().expect("fixture stdout");
         std::process::exit(3);

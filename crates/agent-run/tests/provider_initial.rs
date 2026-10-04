@@ -969,6 +969,65 @@ async fn provider_start_completes_one_owned_fake_engine_attempt() {
     assert_eq!(replay["agent_id"], admitted["agent_id"]);
 }
 
+/// Characterizes a complete, valid success result followed by a root engine
+/// that keeps its stdout open (`fixture:result-then-hang`, 20 s ceiling) under a
+/// short run deadline. EOF plus the exit proof stay mandatory, so the result
+/// alone is not success: the deadline ends the run as `timed_out`, cleanup
+/// terminates the engine long before the fixture's own ceiling, and the
+/// final-result text is *not* promoted to a sealed answer. The streamed
+/// assistant transcript remains durable. Documents the policy gap that an
+/// already-received result is discarded when the deadline wins.
+#[tokio::test]
+async fn result_then_hang_is_ended_by_the_run_deadline() {
+    let (_temp, home) = home();
+    // Declared after the temp dir so it drops first and terminates any engine
+    // the failed assertions below left behind.
+    let _processes = ServiceProcesses(home.clone());
+    let service = Service::new(home.clone());
+    let mut request = request(&home);
+    request.task = "fixture:result-then-hang".into();
+    request.timeout_seconds = Some(3.0);
+    let admitted = service
+        .admit_provider_trusted(request, candidates(committed(&home)))
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    let started = std::time::Instant::now();
+    let mut child = supervisor(&home, &id);
+    let exit = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("supervisor outlived the fixture's own 20 s ceiling")
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(exit.success(), "supervisor exit: {exit}");
+    // The 3 s deadline plus bounded cleanup; far below the engine's ceiling.
+    assert!(elapsed < Duration::from_secs(12), "elapsed {elapsed:?}");
+    let store = Store::open(&home).unwrap();
+    let row = store.get(&id).unwrap();
+    assert_eq!(row.status, Status::TimedOut);
+    assert_eq!(row.failure_kind.as_deref(), Some("no_answer"));
+    assert_eq!(service.answer(&id).unwrap()["available"], false);
+    assert!(store
+        .last_event(&id, "run_deadline_expired")
+        .unwrap()
+        .is_some());
+    let cleanup = store
+        .last_event(&id, "process_cleanup")
+        .unwrap()
+        .expect("process_cleanup event recorded");
+    assert_eq!(cleanup["confirmed"], true);
+    assert_eq!(cleanup["group_gone"], true);
+    let assistant: String = store
+        .conn
+        .query_row(
+            "SELECT COALESCE(group_concat(content, ''),'') FROM messages \
+             WHERE agent_id=? AND role='assistant'",
+            [id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(assistant.contains("fixture partial"));
+}
+
 /// Automatic selection freezes the eligible scope without inventing a
 /// provider-local account pin or a fixed global login reference.
 #[tokio::test]
