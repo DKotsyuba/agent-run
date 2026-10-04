@@ -7,7 +7,7 @@ rustc --version
 cargo --version
 uname -m
 uname -r
-ldd --version | head -1
+ldd --version | sed -n '1p'
 bwrap --version
 node --version
 jq --version

@@ -173,9 +173,47 @@ operator home, Docker configuration, accounts or credentials into this image.
 Default Docker may deny the user and mount namespaces required by bubblewrap.
 That refusal is capability evidence, not positive shared-tree protection proof;
 do not silently skip guard tests or relax the container security profile.
+For an explicitly authorized namespace test, `docker/linux-guard-seccomp.json`
+retains Moby's default `SCMP_ACT_ERRNO` policy and 60 baseline entries. It adds
+`clone` with other namespace flags excluded, `unshare` only for user/mount
+namespaces, and `mount`, `umount2`, `pivot_root`. It adds no capabilities and does
+not enable `setns` or `clone3`. Its source is
+[Moby's default profile](https://github.com/moby/profiles/blob/main/seccomp/default.json),
+SHA-256 `6416b47770785a41ac59073cdc77d9fe98517df2799dc83ef207e622de3053f6`;
+the derived profile is `bccb49ff5abad5381567318c5c25a5c990e32729fb57b593e5f87211cfc8a540`.
+The profile does not override host AppArmor or kernel user-namespace restrictions.
+
+Prepare a committed source bundle to avoid mounting a worktree whose Git metadata
+points outside the container. This recipe exposes only that read-only bundle and
+isolated writable caches; it never mounts a host home:
+
+```bash
+git bundle create target/linux-docker/source.bundle HEAD
+docker run --rm --init \
+  --security-opt "seccomp=$PWD/docker/linux-guard-seccomp.json" \
+  --mount "type=bind,src=$PWD/target/linux-docker/source.bundle,dst=/tmp/source.bundle,readonly" \
+  --mount type=volume,src=agent-run-linux-check-cargo,dst=/cache/cargo \
+  --mount type=volume,src=agent-run-linux-check-target,dst=/cache/target \
+  agent-run-linux-check:local bash -c \
+  'git clone /tmp/source.bundle /work/source && cd /work/source && bash scripts/linux-check.sh'
+```
+
+Use fresh cache volume names to measure a cold dependency fetch. Retained caches
+accelerate later runs; source and release directories are rebuilt independently.
 A supported Linux host must prove the guard and lifecycle tests before release
 qualification. Native arm64 containers exercise the Linux kernel but do not
 qualify GNU x86-64. An amd64 container on an arm64 host is emulated: compilation
 or seal verification there remains preparation evidence only. The first planned
 Linux release baseline is native x86-64 Debian 12 with glibc 2.36; ARM64 Linux
 artifacts are outside the release scope.
+
+The shell installer maps Linux x86-64 to `x86_64-unknown-linux-gnu` only with
+`--allow-unqualified --version X.Y.Z`. Default Linux installation still refuses
+before downloading. No Linux archive is currently published; the opt-in prepares
+the verified archive path for isolated fixture validation, not a supported public
+installation. Local candidates use the sealed `agent-run-deploy install` helper
+with disposable home, prefix and bin paths. Its existing checksum/seal checks,
+ownership checks, schema compatibility, broker/service locks and SQLite writer
+reservation apply unchanged. GNU x86-64 candidates require Debian 12/glibc 2.36
+or a separately proven compatible host. Linux ARM64 and musl distribution are
+outside scope.

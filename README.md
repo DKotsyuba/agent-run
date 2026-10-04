@@ -125,9 +125,13 @@ agent-run api launchd --binary "$(command -v agent-run)" \
 launchctl bootstrap "gui/$(id -u)" "$plist"
 ```
 
-Future Linux builds can run the same `agent-run api serve` command under an
+Local, unqualified Linux candidates can run the same `agent-run api serve` command under an
 external service manager such as systemd. Linux is not a qualified or published
 release platform, and agent-run does not generate systemd units.
+The [Linux preparation procedure](docs/releasing.md#local-linux-validation-environment)
+uses pinned Docker validation and the existing sealed deployment helper. The
+public installer refuses Linux by default; `--allow-unqualified` requires an
+explicit version and does not imply that a Linux archive is published.
 
 ## Use the CLI
 

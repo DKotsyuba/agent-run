@@ -52,6 +52,38 @@ fn ci_checks_native_release_and_desktop_transport() {
     }
 }
 
+/// Linux validation installs its guard tools and runs ignored live checks without publication.
+#[test]
+fn linux_validation_keeps_guard_checks_and_distribution_unqualified() {
+    let ci = repository_file(".github/workflows/ci.yml");
+    assert!(ci.contains("sudo apt-get install -y bubblewrap jq"));
+    assert!(ci.contains("--lib shared_asset_guard -- --include-ignored --nocapture"));
+    let release = repository_file(".github/workflows/release.yml");
+    assert!(!release.contains("x86_64-unknown-linux-gnu"));
+    let docker = repository_file("docker/linux-check.Dockerfile");
+    for required in [
+        "rust:1.98.1-bookworm@sha256:",
+        "rustfmt clippy",
+        "bubblewrap jq nodejs",
+        "USER checker",
+        "CARGO_BUILD_JOBS=2",
+    ] {
+        assert!(
+            docker.contains(required),
+            "Docker bootstrap is missing {required}"
+        );
+    }
+    let script = repository_file("scripts/linux-check.sh");
+    assert!(
+        script.find("cargo fetch --locked").unwrap() < script.find("cargo xtask check").unwrap()
+    );
+    assert!(script.contains("--include-ignored"));
+    let profile: serde_json::Value =
+        serde_json::from_str(&repository_file("docker/linux-guard-seccomp.json")).unwrap();
+    assert_eq!(profile["defaultAction"], "SCMP_ACT_ERRNO");
+    assert_eq!(profile["syscalls"].as_array().unwrap().len(), 65);
+}
+
 /// Keeps dependency caches pinned and shared between compatible macOS jobs,
 /// while only trusted main/tag runs may save them and installed binaries stay uncached.
 #[test]

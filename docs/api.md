@@ -40,7 +40,7 @@ broker, supervisors, and runtime children inherit that limit instead of
 launchd's default 256. A foreground process can still be run under another
 supervisor when launchd is unavailable.
 
-Future, unqualified Linux builds can run the foreground command under an
+Local, unqualified Linux candidates can run the foreground command under an
 external service manager. Linux is not a qualified or published release target,
 and agent-run does not generate systemd units. A user unit can use:
 
@@ -59,6 +59,10 @@ WantedBy=default.target
 
 Install it as `~/.config/systemd/user/agent-run.service`, adjust both absolute
 paths, then run `systemctl --user enable --now agent-run.service`.
+The resident broker already schedules delivery and managed services; the unit
+needs only `api serve`. Stop the unit explicitly before a sealed-runtime update
+and restart it after verification. No separate delivery timer is required.
+This unit is an operator example, not Linux release qualification.
 
 - Socket path defaults to `<home>/api.sock` (with `--home ~/.agent-run`
   that is `~/.agent-run/api.sock`). Override with `--socket PATH`.

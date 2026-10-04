@@ -91,21 +91,22 @@ impl Fixture {
             .unwrap();
     }
 
-    /// Archives the sealed candidate and writes the release API/checksum fixtures.
-    fn archive(&self) -> PathBuf {
+    /// Archives the sealed fixture for a supported target suffix and writes API/checksum files.
+    /// The suffix controls the download name; fixture executables do not prove architecture.
+    fn archive(&self, target: &str) -> PathBuf {
         let remote = self.temporary.path().join("remote");
         fs::create_dir(&remote).unwrap();
-        let asset = "agent-run-1.0.0-aarch64-apple-darwin.tar.gz";
+        let asset = format!("agent-run-1.0.0-{target}.tar.gz");
         assert!(Command::new("tar")
             .args(["-czf"])
-            .arg(remote.join(asset))
+            .arg(remote.join(&asset))
             .arg("-C")
             .arg(&self.candidate)
             .arg(".")
             .status()
             .unwrap()
             .success());
-        checksums(&remote, asset);
+        checksums(&remote, &asset);
         fs::write(remote.join("latest"), "{\n  \"tag_name\": \"v1.0.0\"\n}\n").unwrap();
         remote
     }
@@ -257,14 +258,20 @@ fn installed_version_is_not_rewritten_and_pending_recovery_is_preserved() {
 /// Exercises both downloaders without network access, including integrity and archive rejection.
 #[test]
 fn shell_download_and_archive_checks() {
-    for downloader in ["curl", "wget"] {
+    for (downloader, os, arch, target) in [
+        ("curl", "Darwin", "arm64", "aarch64-apple-darwin"),
+        ("wget", "Darwin", "arm64", "aarch64-apple-darwin"),
+        ("curl", "Linux", "x86_64", "x86_64-unknown-linux-gnu"),
+        ("wget", "Linux", "x86_64", "x86_64-unknown-linux-gnu"),
+    ] {
         let fixture = Fixture::with_tui(true);
-        let remote = fixture.archive();
+        let remote = fixture.archive(target);
+        let asset = format!("agent-run-1.0.0-{target}.tar.gz");
         let mocks = fixture.temporary.path().join("mocks");
         fs::create_dir(&mocks).unwrap();
         executable(
             &mocks.join("uname"),
-            "#!/bin/sh\ncase $1 in -s) echo \"${TEST_OS:-Darwin}\" ;; -m) echo arm64 ;; esac\n",
+            "#!/bin/sh\ncase $1 in -s) echo \"${TEST_OS:-Darwin}\" ;; -m) echo \"${TEST_ARCH:-arm64}\" ;; esac\n",
         );
         executable(
             &mocks.join(downloader),
@@ -294,8 +301,26 @@ cp "$TEST_REMOTE/${url##*/}" "$output"
                     "PATH",
                     format!("{}:{}", mocks.display(), std::env::var("PATH").unwrap()),
                 )
+                .env("TEST_OS", os)
+                .env("TEST_ARCH", arch)
                 .env("TEST_REMOTE", &remote)
                 .env("TMPDIR", fixture.temporary.path());
+            command
+        };
+        if os == "Linux" {
+            let refused = run().output().unwrap();
+            assert!(!refused.status.success());
+            assert!(String::from_utf8_lossy(&refused.stderr).contains("--allow-unqualified"));
+            assert!(!fixture.prefix.join("current").exists());
+            let latest = run().arg("--allow-unqualified").output().unwrap();
+            assert!(!latest.status.success());
+            assert!(String::from_utf8_lossy(&latest.stderr).contains("--version"));
+        }
+        let run = || {
+            let mut command = run();
+            if os == "Linux" {
+                command.args(["--allow-unqualified", "--version", "1.0.0"]);
+            }
             command
         };
         let success = run().output().unwrap();
@@ -308,30 +333,30 @@ cp "$TEST_REMOTE/${url##*/}" "$output"
         let current = fs::read_link(fixture.prefix.join("current")).unwrap();
         fs::write(
             remote.join("SHA256SUMS"),
-            format!(
-                "{}  agent-run-1.0.0-aarch64-apple-darwin.tar.gz\n",
-                "0".repeat(64)
-            ),
+            format!("{}  {asset}\n", "0".repeat(64)),
         )
         .unwrap();
         let bad = run().output().unwrap();
         assert!(!bad.status.success());
         assert!(String::from_utf8_lossy(&bad.stderr).contains("checksum mismatch"));
-        let unsupported = run().env("TEST_OS", "Linux").output().unwrap();
+        let unsupported = run()
+            .env("TEST_OS", "Linux")
+            .env("TEST_ARCH", "aarch64")
+            .output()
+            .unwrap();
         assert!(!unsupported.status.success());
         assert!(String::from_utf8_lossy(&unsupported.stderr).contains("only macOS"));
         std::os::unix::fs::symlink("/tmp", fixture.candidate.join("unsafe-link")).unwrap();
-        let asset = "agent-run-1.0.0-aarch64-apple-darwin.tar.gz";
         assert!(Command::new("tar")
             .arg("-czf")
-            .arg(remote.join(asset))
+            .arg(remote.join(&asset))
             .arg("-C")
             .arg(&fixture.candidate)
             .arg(".")
             .status()
             .unwrap()
             .success());
-        checksums(&remote, asset);
+        checksums(&remote, &asset);
         let unsafe_archive = run().output().unwrap();
         assert!(!unsafe_archive.status.success());
         assert!(String::from_utf8_lossy(&unsafe_archive.stderr).contains("links and special files"));

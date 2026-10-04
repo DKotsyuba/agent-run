@@ -10,9 +10,10 @@ fail() { printf 'agent-run install: %s\n' "$*" >&2; exit 1; }
 usage() {
     cat <<'HELP'
 Usage: sh install.sh [--version X.Y.Z] [--prefix DIR] [--home DIR] [--bin-dir DIR]
-                     [--downloader curl|wget]
+                     [--downloader curl|wget] [--allow-unqualified]
 Defaults: latest GitHub release, ~/.agent-run/standalone, ~/.agent-run, ~/.local/bin.
 Only macOS Apple silicon is qualified. Stop the broker before updating.
+Linux GNU x86-64 preparation requires --allow-unqualified and an explicit version.
 Configuration, accounts and engine CLIs are not created or replaced.
 HELP
 }
@@ -22,9 +23,11 @@ install_home=${AGENT_RUN_HOME:-"$HOME/.agent-run"}
 prefix=
 bin_dir=$HOME/.local/bin
 downloader=
+allow_unqualified=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --help|-h) usage; exit 0 ;;
+        --allow-unqualified) allow_unqualified=1; shift ;;
         --version|--prefix|--home|--bin-dir|--downloader)
             [ "$#" -ge 2 ] || fail "missing value for $1"
             case "$1" in
@@ -43,7 +46,15 @@ for destination in "$prefix" "$install_home" "$bin_dir"; do
     case "$destination" in /*) ;; *) fail 'use absolute installation paths' ;; esac
     [ "$destination" != / ] || fail 'refusing filesystem root as installation directory'
 done
-[ "$(uname -s)/$(uname -m)" = Darwin/arm64 ] || fail 'only macOS Apple silicon (Darwin/arm64) is qualified'
+case "$(uname -s)/$(uname -m)" in
+    Darwin/arm64) target=aarch64-apple-darwin ;;
+    Linux/x86_64)
+        [ "$allow_unqualified" = 1 ] || fail 'only macOS Apple silicon is qualified; Linux requires --allow-unqualified'
+        [ "$version" != latest ] || fail 'unqualified Linux preparation requires --version X.Y.Z'
+        target=x86_64-unknown-linux-gnu
+        printf 'Linux GNU x86-64 is unqualified; no Linux release is currently published.\n' >&2 ;;
+    *) fail 'unsupported host; only macOS Apple silicon is qualified' ;;
+esac
 if [ -z "$downloader" ]; then
     if command -v curl >/dev/null 2>&1; then downloader=curl; else downloader=wget; fi
 fi
@@ -75,7 +86,7 @@ if [ "$version" = latest ]; then
     version=$(sed -n 's/^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' "$temporary/latest.json")
 fi
 printf '%s\n' "$version" | LC_ALL=C awk 'BEGIN { ok=0 } /^[0-9]+\.[0-9]+\.[0-9]+$/ { ok++ } END { exit !(NR == 1 && ok == 1) }' || fail 'version must be X.Y.Z'
-asset=agent-run-$version-aarch64-apple-darwin.tar.gz
+asset=agent-run-$version-$target.tar.gz
 base=https://github.com/DKotsyuba/agent-run/releases/download/v$version
 printf 'Downloading agent-run %s…\n' "$version"
 download "$base/SHA256SUMS" "$temporary/SHA256SUMS"

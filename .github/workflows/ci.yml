@@ -39,6 +39,9 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
+      - name: Install Linux guard and collector prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap jq
       - name: Restore Rust dependency cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -54,6 +57,9 @@ jobs:
         run: |
           cargo test --offline --locked -p agent-run-platform --all-features --lib shared_assets -- --nocapture
           cargo test --offline --locked -p agent-run-platform --all-features --lib shared_asset_guard::tests::live_native_guard -- --ignored --exact
+      - name: Verify Linux shared guard without skipping live checks
+        if: runner.os == 'Linux'
+        run: cargo test --offline --locked -p agent-run-platform --all-features --lib shared_asset_guard -- --include-ignored --nocapture
       - name: Run workspace gates
         run: cargo xtask check
       - name: Verify desktop transport and service probe fixtures
