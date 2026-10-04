@@ -63,11 +63,11 @@ Only then does `start` return ownership to the caller. The supervisor opens its
 own store connection, materializes the runtime, starts the engine, journals its
 stream, seals an answer, records terminal evidence, and performs cleanup.
 
-A provider run has one execution deadline: admission time plus its stored
-`timeout_seconds`. Preparation and every account-switch attempt consume that
-same budget. Before each spawn the supervisor checks the remaining time; it
-bounds execution by that remainder, cleans up on expiry, and records
-`timed_out`. There is no independent silence watchdog. Success requires a
+A run (schema-1 and provider alike) has one execution deadline: admission
+time plus its stored, already-scaled `timeout_seconds`. Preparation and every
+account-switch attempt consume that same budget. Before each spawn the
+supervisor checks the remaining time; it bounds execution by that remainder,
+cleans up on expiry, and records `timed_out`. There is no independent silence watchdog. Success requires a
 verified answer plus completion and cleanup evidence; exit code alone is never
 enough.
 

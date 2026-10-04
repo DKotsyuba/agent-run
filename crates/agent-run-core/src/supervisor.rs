@@ -303,10 +303,19 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
             &snapshot,
         )?,
     };
+    // The same one run deadline as a provider run: admission time plus the
+    // stored (already multiplier-scaled) timeout, which preparation consumes.
+    // An expired run never spawns an engine.
+    let deadline = run_deadline(store, id)?;
+    if domain::now() >= deadline {
+        return timed_out_before_spawn(id, store);
+    }
     store.event(id, "phase", &json!({"phase":"spawning"}))?;
     let mut process = Process::spawn(&plan)?;
     // From this point EVERY path must clean up before returning, including a
     // database failure immediately after spawning the engine.
+    let remaining =
+        Duration::try_from_secs_f64((deadline - domain::now()).max(0.0)).unwrap_or(Duration::MAX);
     let execution = async {
         store.running(id, process.owner.pid)?;
         crate::journal(store, id, "user", &row.request.task, None, None)?;
@@ -324,13 +333,25 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
             }
             _ => crate::stream::run(&mut process, store, &row, plan.initial_input.as_deref()).await,
         }
-    }
-    .await;
+    };
+    // On expiry the pending runner, and with it any result already received
+    // but not yet concluded by EOF and exit, is dropped; the group is then
+    // cleaned exactly as for any other end.
+    let (execution, expired) = match tokio::time::timeout(remaining, execution).await {
+        Ok(execution) => (execution, false),
+        Err(_) => (Err(Error::Runtime("run deadline expired".into())), true),
+    };
     let cleanup = process.owner.cleanup(Duration::from_secs(2)).await;
     let exit = process.reap().await;
     let cleanup = cleanup?;
     store.event(id, "process_cleanup", &serde_json::to_value(&cleanup)?)?;
     let cancelled = store.cancel_pending(id)?;
+    // Same predicate as a provider run: the timer firing, or the stored
+    // deadline having passed by the time cleanup finished. Cancellation wins.
+    let expired = expired || domain::now() >= run_deadline(store, id)?;
+    if expired && !cancelled {
+        store.event(id, "run_deadline_expired", &json!({"deadline":deadline}))?;
+    }
     let mut result = match execution {
         Ok(result) => result,
         Err(error) => adapters::EngineResult {
@@ -363,7 +384,11 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
     let last_progress_at = store.last_progress(id)?;
     let outcome = verify::verify_completion(
         Some(result.outcome),
-        cancelled.then_some(verify::StopReason::Cancel),
+        if cancelled {
+            Some(verify::StopReason::Cancel)
+        } else {
+            expired.then_some(verify::StopReason::Timeout)
+        },
         Some(&evidence),
         cleanup.group_gone,
         last_progress_at,

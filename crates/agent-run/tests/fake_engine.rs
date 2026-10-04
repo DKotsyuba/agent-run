@@ -83,6 +83,18 @@ fn admit(home: &Path, task: &str) -> AgentId {
 
 /// Admit one fixture task against a named configured runtime.
 fn admit_runtime(home: &Path, runtime_name: &str, task: &str) -> AgentId {
+    admit_with_timeout(home, runtime_name, task, None)
+}
+
+/// Admit one fixture task with an explicit effective run deadline in seconds
+/// (stored as given, so no multiplier applies), or the configured default
+/// when `timeout` is `None`.
+fn admit_with_timeout(
+    home: &Path,
+    runtime_name: &str,
+    task: &str,
+    timeout: Option<f64>,
+) -> AgentId {
     let mut request = StartRequest {
         runtime: runtime_name.into(),
         model: "fixture".into(),
@@ -93,7 +105,7 @@ fn admit_runtime(home: &Path, runtime_name: &str, task: &str) -> AgentId {
         fast: false,
         effort: None,
         display_name: None,
-        timeout_seconds: None,
+        timeout_seconds: timeout,
         read_roots: vec![],
         output_schema: None,
         orchestrator: None,
@@ -352,6 +364,92 @@ async fn exit_zero_without_terminal_result_is_not_success() {
     assert_eq!(row.failure_kind.as_deref(), Some("cut_off"));
     let answer = Service::new(home.clone()).answer(&row.id).unwrap();
     assert_eq!(answer["available"], json!(false));
+}
+
+/// A schema-1 run has the same one run deadline as a provider run: a complete
+/// result followed by a root engine that keeps its pipe open
+/// (`fixture:result-then-hang`, 20 s ceiling) is ended as `timed_out` at the
+/// stored 3 s timeout, long before the engine would exit. The result alone is
+/// not success and its text is not promoted to a sealed answer; the streamed
+/// transcript and the confirmed cleanup are retained.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_result_then_hang_is_ended_by_the_run_deadline() {
+    let (_tmp, home) = home();
+    let id = admit_with_timeout(&home, "mock", "fixture:result-then-hang", Some(3.0));
+    let started = Instant::now();
+    let mut child = spawn_supervisor(&home, &id);
+    let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("supervisor outlived the fixture's own 20 s ceiling")
+        .expect("wait on supervisor subprocess");
+    let elapsed = started.elapsed();
+    assert!(status.success(), "supervisor subprocess failed: {status:?}");
+    assert!(elapsed < Duration::from_secs(12), "elapsed {elapsed:?}");
+    let store = Store::open(&home).unwrap();
+    let row = store.get(&id).unwrap();
+    assert_eq!(row.status, Status::TimedOut);
+    assert_eq!(row.failure_kind.as_deref(), Some("no_answer"));
+    assert_eq!(
+        Service::new(home.clone()).answer(&id).unwrap()["available"],
+        json!(false)
+    );
+    assert!(store
+        .last_event(&id, "run_deadline_expired")
+        .unwrap()
+        .is_some());
+    let cleanup = store
+        .last_event(&id, "process_cleanup")
+        .unwrap()
+        .expect("process_cleanup event recorded");
+    assert_eq!(cleanup["confirmed"], json!(true));
+    assert_eq!(cleanup["group_gone"], json!(true));
+    let assistant: String = store
+        .conn
+        .query_row(
+            "SELECT COALESCE(group_concat(content, ''),'') FROM messages WHERE agent_id=? AND role='assistant'",
+            [id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(assistant.contains("fixture partial"));
+}
+
+/// A schema-1 run that completes normally after its stored deadline has
+/// passed is `timed_out`, as for a provider run: the deadline is re-read after
+/// cleanup, not only observed through the timer. The fixture holds its normal
+/// completion (`fixture:follow-tools`, 20 s marker bounds) while the test
+/// shortens the stored timeout of the still-running row, so the timer (600 s)
+/// cannot fire and no wall-clock race is involved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_completion_after_the_stored_deadline_is_timed_out() {
+    let (_tmp, home) = home();
+    let id = admit_with_timeout(&home, "mock", "fixture:follow-tools", Some(600.0));
+    let mut child = spawn_supervisor(&home, &id);
+    wait_engine_ready(&home, &id, Duration::from_secs(10)).await;
+    Store::open(&home)
+        .unwrap()
+        .conn
+        .execute(
+            "UPDATE agents SET timeout_seconds=0.001 WHERE id=?",
+            [id.as_str()],
+        )
+        .unwrap();
+    std::fs::write(home.join("follow-tools"), "").unwrap();
+    std::fs::write(home.join("follow-release"), "").unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("supervisor timed out")
+        .expect("wait on supervisor subprocess");
+    assert!(status.success(), "supervisor subprocess failed: {status:?}");
+    let store = Store::open(&home).unwrap();
+    let row = store.get(&id).unwrap();
+    assert_eq!(row.status, Status::TimedOut);
+    assert!(store
+        .last_event(&id, "run_deadline_expired")
+        .unwrap()
+        .is_some());
+    let cleanup = store.last_event(&id, "process_cleanup").unwrap().unwrap();
+    assert_eq!(cleanup["confirmed"], json!(true));
 }
 
 /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_early_exited_engine_keeps_nonzero_failure`.
