@@ -112,3 +112,9 @@ Run `agent-run doctor` and cross-reference its supervisor findings with
 `agent-run agents --active` for the same home. Reconcile only records whose
 stored PID plus birth identity is observed as dead or reused; unknown or denied
 identity is never proof of an orphan.
+
+`terminal_attempt_ownership_unresolved` warns that a terminal run still owns
+one or more attempts because cleanup could not be proven. Its component uses
+the public root agent id; detail contains only the count and a safe cleanup
+reason. Ownership and its reservations remain active until normal cleanup
+reconciliation proves they can be released. Doctor never releases them.
