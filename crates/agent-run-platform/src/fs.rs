@@ -229,7 +229,10 @@ fn entry_of(status: &libc::stat) -> Entry {
         inode: status.st_ino,
         socket: kind == libc::S_IFSOCK,
         modified: status.st_mtime as f64 + status.st_mtime_nsec as f64 / 1e9,
-        mode: (status.st_mode & 0o7777) as u32,
+        #[cfg(target_os = "macos")]
+        mode: u32::from(status.st_mode & 0o7777),
+        #[cfg(not(target_os = "macos"))]
+        mode: status.st_mode & 0o7777,
     }
 }
 
@@ -1142,6 +1145,17 @@ pub fn canonical_json(value: &serde_json::Value) -> Result<Vec<u8>> {
 /// Checks that bounded scans own independent offsets and converge beyond one batch.
 mod scan_tests {
     use super::*;
+
+    /// Entry conversion preserves permission bits and excludes the raw file type.
+    #[test]
+    fn entry_preserves_permission_bits() {
+        // SAFETY: stat contains integer fields; zero is a valid value for each.
+        let mut status: libc::stat = unsafe { std::mem::zeroed() };
+        status.st_mode = libc::S_IFREG | 0o6751;
+        let entry = entry_of(&status);
+        assert_eq!(entry.mode, 0o6751);
+        assert_eq!(entry.kind, EntryType::File);
+    }
 
     /// Two fresh scans repeat the first page; one live scan reaches every later entry.
     #[test]

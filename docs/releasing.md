@@ -148,3 +148,34 @@ GitHub Releases is the only public distribution channel. Each release carries:
 
 The project does not publish package-manager artifacts, containers, or runtime
 dependency bundles.
+
+## Local Linux validation environment
+
+`docker/linux-check.Dockerfile` is a validation environment, not a distribution
+artifact. Its Rust 1.98.1 Debian 12 base is pinned by digest; it installs rustfmt,
+clippy, Node, jq and bubblewrap before any offline gate. Build without sending a
+checkout (or host credentials) as Docker build context:
+
+```bash
+mkdir -p target/linux-docker/config
+export DOCKER_CONFIG="$PWD/target/linux-docker/config"
+docker build -t agent-run-linux-check:local - < docker/linux-check.Dockerfile
+```
+
+Run `scripts/linux-check.sh` in a clean, writable checkout inside the image,
+as its non-root `checker` user, with `--init`. Keep `/cache/cargo` and
+`/cache/target` writable and task-scoped. The script prints the exact source
+commit and environment, runs `cargo fetch --locked` online, then executes the
+existing offline gates with two build jobs. Record the image ID, source commit,
+commands and complete exit results outside the source tree. Never mount an
+operator home, Docker configuration, accounts or credentials into this image.
+
+Default Docker may deny the user and mount namespaces required by bubblewrap.
+That refusal is capability evidence, not positive shared-tree protection proof;
+do not silently skip guard tests or relax the container security profile.
+A supported Linux host must prove the guard and lifecycle tests before release
+qualification. Native arm64 containers exercise the Linux kernel but do not
+qualify GNU x86-64. An amd64 container on an arm64 host is emulated: compilation
+or seal verification there remains preparation evidence only. The first planned
+Linux release baseline is native x86-64 Debian 12 with glibc 2.36; ARM64 Linux
+artifacts are outside the release scope.
