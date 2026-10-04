@@ -181,7 +181,9 @@ impl Buffer {
         }
     }
     /// Merges overlap once by immutable sequence, freezes completed status, and caps memory.
-    /// Reverse pages evict the newest edge; forward pages evict the oldest edge.
+    /// Reverse pages evict the newest edge; following forward pages evict the oldest.
+    /// Scrolled forward pages admit only remaining capacity and defer their cursor
+    /// at the last retained entry, preserving the reader's older edge.
     /// The next reverse cursor is the minimum entry, never the API's overlapping next_cursor.
     pub fn merge(&mut self, page: Page, width: usize) -> bool {
         if page.pool_id != self.id {
@@ -219,9 +221,8 @@ impl Buffer {
         if backward {
             self.history_complete = page.complete;
         }
-        let hold_window = !backward && !self.follow && self.entries.len() >= ENTRY_CAP;
         for entry in page.entries {
-            if hold_window {
+            if !backward && !self.follow && self.entries.len() >= ENTRY_CAP {
                 continue;
             }
             match self.entries.binary_search_by_key(&entry.seq, |e| e.seq) {
@@ -735,17 +736,24 @@ pub fn older(app: &mut App) {
     }
 }
 /// Applies a pool action without broker writes; member reads dispatch through the one-shot lane.
+/// Criteria navigation clamps and persists wrapped offsets at the current viewport size,
+/// so End and oversized steps remain immediately reversible.
 pub fn apply(app: &mut App, action: Action) -> Dispatched {
     app.dirty = true;
     if app.pools.criteria {
+        let max = crate::ui::pools::criteria_max_offset(app);
+        app.pools.criteria_offset = app.pools.criteria_offset.min(max);
         match action {
             Action::Back => app.pools.criteria = false,
             Action::Move(d) | Action::Scroll(d) => {
-                app.pools.criteria_offset =
-                    app.pools.criteria_offset.saturating_add_signed(d as isize)
+                app.pools.criteria_offset = app
+                    .pools
+                    .criteria_offset
+                    .saturating_add_signed(d as isize)
+                    .min(max)
             }
             Action::Top => app.pools.criteria_offset = 0,
-            Action::Bottom => app.pools.criteria_offset = usize::MAX,
+            Action::Bottom => app.pools.criteria_offset = max,
             _ => {}
         }
         return Dispatched::None;

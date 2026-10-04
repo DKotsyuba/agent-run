@@ -209,7 +209,6 @@ Global:
 | `?` | key-help overlay (Esc/`?`/`q` closes) |
 | `1`, `2`, Shift-Tab | Sessions / Pools / switch tabs |
 | click tab | switch tabs |
-| `a` | fetch and show the selected session's sealed answer |
 | mouse wheel | scroll the pane under the pointer |
 | click | select a row; clicking the selected row opens its transcript |
 
@@ -222,6 +221,7 @@ Sessions list:
 | Tab, `o` | expand/collapse the `FINISHED` section |
 | `p` | project picker (filter by project; worktrees group together) |
 | `r` | force a refetch |
+| `a` | fetch and show the selected session's sealed answer |
 | click on `▸ FINISHED` | toggle the finished section |
 
 Transcript pane:
@@ -234,6 +234,7 @@ Transcript pane:
 | hover | highlight the block under the pointer |
 | PgUp/PgDn, wheel | scroll; scrolling away from the tail leaves follow mode |
 | `f` | toggle tail-follow |
+| `a` | fetch and show this session's sealed answer (including pool member transcripts) |
 | `g`/Home, `G`/End | jump to top / tail |
 | Esc, ←, Backspace | back to the list (narrow) / return focus to the list (split) |
 
@@ -282,7 +283,10 @@ background so highlights stay visible.
   to one per 500 ms so a busy broker (many revision commits per second)
   cannot flood the UI; the first load, every scope change, and a forced
   refresh (`r`) stay immediate. Failures fall back to a full listing after a
-  2 s delay. Each listing round that observes a new store revision also
+  2 s delay. Every successful page restores link health and refreshes session
+  observations, including elapsed and silence clocks at an unchanged revision;
+  card and project projections remain cached while their keys stay unchanged.
+  Each listing round that observes a new store revision also
   refreshes the finished-session total with one cheap unfiltered call
   (`list_agents` without `active` and `limit: 1`), reading the exact total
   instead of loading finished rows; the finished count is that total minus

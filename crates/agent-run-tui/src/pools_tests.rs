@@ -521,6 +521,85 @@ fn forward_backward_overlap_preserves_anchor_and_cursor() {
     assert_eq!(b.entries.iter().filter(|e| e.seq == 24).count(), 1);
     assert_eq!(b.after, 32);
 }
+
+/// A nearly full scrolled window admits only retained bodies, preserving its older anchor.
+#[test]
+fn scrolled_forward_page_stops_at_remaining_capacity() {
+    let mut buffer = Buffer::new(ID.parse().unwrap());
+    buffer.merge(
+        page(
+            "active",
+            (1..500).map(|seq| entry(seq, "body")).collect(),
+            None,
+            true,
+        ),
+        63,
+    );
+    buffer.follow = false;
+    buffer.offset = 1;
+    buffer.cursor = Some(1);
+    let rows = crate::ui::pools::rows(&buffer, 63);
+    let anchor = rows[buffer.offset].seq;
+    let incoming = page(
+        "active",
+        (500..550).map(|seq| entry(seq, "incoming")).collect(),
+        None,
+        true,
+    );
+    assert!(buffer.merge(incoming.clone(), 63));
+    assert_eq!(buffer.entries.len(), ENTRY_CAP);
+    assert_eq!(buffer.entries.first().unwrap().seq, 1);
+    assert_eq!(buffer.entries.last().unwrap().seq, 500);
+    assert_eq!(buffer.after, 500);
+    assert_eq!(buffer.cursor, Some(1));
+    assert_eq!(
+        crate::ui::pools::rows(&buffer, 63)[buffer.offset].seq,
+        anchor
+    );
+    assert!(!buffer.merge(incoming.clone(), 63));
+    assert_eq!(buffer.after, 500);
+    buffer.follow = true;
+    buffer.merge(incoming, 63);
+    assert_eq!(buffer.after, 549);
+    assert_eq!(buffer.entries.first().unwrap().seq, 50);
+    assert_eq!(buffer.entries.last().unwrap().seq, 549);
+}
+
+/// End persists the real last page; reverse navigation immediately moves and overscroll clamps.
+#[test]
+fn criteria_end_then_up_moves_one_wrapped_line() {
+    let mut app = fixture("active", 66, 20);
+    app.pools
+        .buffer_mut()
+        .unwrap()
+        .status
+        .as_mut()
+        .unwrap()
+        .goal = (0..100)
+        .map(|n| format!("goal line {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    apply(&mut app, Action::Criteria);
+    let max = crate::ui::pools::criteria_max_offset(&app);
+    assert!(max > 10);
+    apply(&mut app, Action::Bottom);
+    assert_eq!(app.pools.criteria_offset, max);
+    let bottom = frame(&app, 66, 20);
+    apply(&mut app, Action::Move(-1));
+    assert_eq!(app.pools.criteria_offset, max - 1);
+    assert_ne!(frame(&app, 66, 20), bottom);
+    apply(&mut app, Action::Scroll(i64::MAX));
+    assert_eq!(app.pools.criteria_offset, max);
+    apply(&mut app, Action::Scroll(-10));
+    assert_eq!(app.pools.criteria_offset, max - 10);
+    app.last_height = 40;
+    let resized_max = crate::ui::pools::criteria_max_offset(&app);
+    assert!(resized_max < max);
+    app.pools.criteria_offset = usize::MAX;
+    apply(&mut app, Action::Move(-1));
+    assert_eq!(app.pools.criteria_offset, resized_max.saturating_sub(1));
+}
+
 /// Retained windows and MRU stay bounded; older pages can evict tail without losing the reader.
 #[test]
 fn memory_caps_and_pool_restore() {

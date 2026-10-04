@@ -815,6 +815,40 @@ pub fn render_detail(f: &mut Frame, app: &App, pane: Rect) {
         }
     }
 }
+
+/// Wraps sanitized full goal and criteria at the overlay's content width in columns.
+fn criteria_rows(status: &PoolStatus, width: usize) -> Vec<String> {
+    let mut content = vec![
+        "Goal (untrusted):".into(),
+        status.goal.clone(),
+        String::new(),
+        "Criteria (untrusted):".into(),
+    ];
+    content.extend(
+        status
+            .criteria
+            .iter()
+            .map(|c| format!("{}: {}", c.id, c.text)),
+    );
+    content
+        .into_iter()
+        .flat_map(|v| text::wrap(&sanitize(&v), width))
+        .collect()
+}
+
+/// Last-page row offset for the full criteria at the app's current terminal size.
+/// Returns zero before status arrives or when all wrapped rows fit the viewport.
+pub fn criteria_max_offset(app: &App) -> usize {
+    let Some(status) = app.pools.buffer().and_then(|b| b.status.as_ref()) else {
+        return 0;
+    };
+    let area = Rect::new(0, 0, app.last_width, app.last_height);
+    let popup = overlay::rect(area, 90, area.height.saturating_sub(4));
+    criteria_rows(status, usize::from(popup.width.saturating_sub(2)))
+        .len()
+        .saturating_sub(usize::from(popup.height.saturating_sub(2)))
+}
+
 /// Renders a scrollable, sanitized full goal/criteria overlay using shared chrome.
 pub fn render_criteria(f: &mut Frame, app: &App, area: Rect) {
     if !app.pools.criteria {
@@ -830,22 +864,7 @@ pub fn render_criteria(f: &mut Frame, app: &App, area: Rect) {
         90,
         area.height.saturating_sub(4),
     );
-    let mut content = vec![
-        "Goal (untrusted):".into(),
-        status.goal.clone(),
-        String::new(),
-        "Criteria (untrusted):".into(),
-    ];
-    content.extend(
-        status
-            .criteria
-            .iter()
-            .map(|c| format!("{}: {}", c.id, c.text)),
-    );
-    let rows = content
-        .into_iter()
-        .flat_map(|v| text::wrap(&sanitize(&v), usize::from(inner.width)))
-        .collect::<Vec<_>>();
+    let rows = criteria_rows(status, usize::from(inner.width));
     let offset = app
         .pools
         .criteria_offset

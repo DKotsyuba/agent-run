@@ -668,21 +668,34 @@ impl App {
     /// Applies one sessions page: sorts rows, tracks the revision, and keeps
     /// the selection anchored on the same agent across refreshes.
     ///
-    /// A refreshed [`AgentView`] updates the pane header only — body rows
-    /// never depend on it — so the transcript cache is untouched here.
+    /// Every successful page restores broker health and refreshes observations,
+    /// even at the same revision. Card/project projections survive when identity,
+    /// order, sort keys and project roots match; transcript body caches are untouched.
     pub fn apply_sessions(&mut self, page: &agent_run_domain::AgentPage) {
-        if self.loaded && self.revision == Some(page.revision) {
-            // An unchanged page (same committed revision) changes nothing.
-            return;
-        }
         let anchored = self.selected_agent_id();
-        self.sessions = sort_sessions(page.items.clone());
-        self.cards.get_mut().take();
+        let sessions = sort_sessions(page.items.clone());
+        let projection_changed = self.sessions.len() != sessions.len()
+            || self.sessions.iter().zip(&sessions).any(|(old, fresh)| {
+                old.agent_id != fresh.agent_id
+                    || old.status.terminal() != fresh.status.terminal()
+                    || old.created_at != fresh.created_at
+                    || ((old.workdir != fresh.workdir || old.task_summary != fresh.task_summary)
+                        && agent_workdir(old).map(|w| project_root(&w))
+                            != agent_workdir(fresh).map(|w| project_root(&w)))
+            });
+        self.dirty |= !self.loaded
+            || self.link != Link::Up
+            || self.last_error.is_some()
+            || self.revision != Some(page.revision)
+            || self.sessions != sessions;
+        self.sessions = sessions;
+        if projection_changed {
+            self.cards.get_mut().take();
+        }
         self.revision = Some(page.revision);
         self.loaded = true;
         self.link = Link::Up;
         self.last_error = None;
-        self.dirty = true;
         let cards = self.card_list();
         self.selected = anchored
             .and_then(|id| {
@@ -981,9 +994,10 @@ pub fn display_title(agent: &AgentView) -> String {
     }
 }
 
-/// Extracts the first absolute path after a `Workdir:` sentence fragment.
+/// Extracts the first absolute or home-relative path after an ASCII-case-insensitive
+/// `Workdir:` marker in arbitrary UTF-8 text; returns `None` when no path follows.
 fn task_workdir(task: &str) -> Option<String> {
-    let lowered = task.to_lowercase();
+    let lowered = task.to_ascii_lowercase();
     let start = lowered.find("workdir:")? + "workdir:".len();
     let rest = &task[start..];
     // Skip filler words such as `worktree` before the path itself.
@@ -1747,6 +1761,103 @@ mod tests {
         assert!(!screen.contains("hidden"));
         app.close_answer();
         assert!(app.answer.is_none());
+    }
+
+    /// ASCII marker matching preserves UTF-8 offsets even when Unicode case expands.
+    #[test]
+    fn task_workdir_preserves_unicode_offsets() {
+        assert_eq!(task_workdir("İWorkdir:漢 /tmp").as_deref(), Some("/tmp"));
+        assert_eq!(task_workdir("İwOrKdIr:漢 /tmp").as_deref(), Some("/tmp"));
+    }
+
+    /// A successful same-revision listing clears a preceding broker failure.
+    #[test]
+    fn same_revision_restores_broker_health() {
+        let mut app = App::new();
+        let page = serde_json::from_value(json!({
+            "items": [agent(&id(1), "running", 1.0)], "total": 1,
+            "offset": 0, "limit": 200, "complete": true,
+            "revision": 1, "observed_at": 1.0
+        }))
+        .unwrap();
+        app.apply_sessions(&page);
+        app.apply_broker_error("connection lost".into());
+        app.dirty = false;
+        app.apply_sessions(&page);
+        assert_eq!(app.link, Link::Up);
+        assert!(app.last_error.is_none());
+        assert!(app.dirty);
+        app.dirty = false;
+        app.apply_sessions(&page);
+        assert!(!app.dirty, "identical healthy observations stay idle");
+    }
+
+    /// Same-revision observations refresh headers and clocks while projections stay cached.
+    /// Terminal transitions, membership, ordering and project changes invalidate projections.
+    #[test]
+    fn same_revision_refreshes_views_and_preserves_projection_cache() {
+        let mut app = App::new();
+        let mut first = agent(&id(1), "running", 1.0);
+        first.workdir = Some("/tmp/one".into());
+        let mut page: agent_run_domain::AgentPage = serde_json::from_value(json!({
+            "items": [first.clone()], "total": 1, "offset": 0, "limit": 200,
+            "complete": true, "revision": 1, "observed_at": 1.0
+        }))
+        .unwrap();
+        app.apply_sessions(&page);
+        app.watch_selected();
+        let cards = app.card_list();
+        let projects = app.projects();
+        let buffer = app.transcript.as_ref().unwrap();
+        let epoch = buffer.epoch();
+        first.elapsed_seconds = 145.0;
+        first.silence_seconds = Some(121.0);
+        first.observed_at = 146.0;
+        first.status = Status::Cancelling;
+        first.usage = Some(
+            serde_json::from_value(json!({
+                "output_tokens": 7, "usage_source": "runtime_result", "recorded_at": 146.0
+            }))
+            .unwrap(),
+        );
+        first.tool_counts = Some(
+            serde_json::from_value(json!({
+                "calls": 2, "failed": 1, "unknown_results": 0
+            }))
+            .unwrap(),
+        );
+        page.items = vec![first.clone()];
+        app.dirty = false;
+        app.apply_sessions(&page);
+        assert!(app.dirty);
+        assert_eq!(app.sessions[0], first);
+        let buffer = app.transcript.as_ref().unwrap();
+        assert_eq!(buffer.agent, first);
+        assert!(buffer.agent.silence_seconds.unwrap() > SILENCE_WARN_SECONDS);
+        assert_eq!(buffer.epoch(), epoch);
+        assert!(std::sync::Arc::ptr_eq(&cards, &app.card_list()));
+        assert!(std::sync::Arc::ptr_eq(&projects, &app.projects()));
+
+        page.items[0].status = Status::Succeeded;
+        app.apply_sessions(&page);
+        assert!(app.card_list().is_empty());
+        assert!(!std::sync::Arc::ptr_eq(&projects, &app.projects()));
+        page.items[0].status = Status::Running;
+        page.items.push(agent(&id(2), "running", 2.0));
+        app.apply_sessions(&page);
+        assert_eq!(app.card_list().len(), 2);
+        assert_eq!(app.selected_agent_id().unwrap().as_str(), id(2));
+        let cards = app.card_list();
+        page.items[0].created_at = 3.0;
+        app.apply_sessions(&page);
+        assert_eq!(app.sessions[0].agent_id, first.agent_id);
+        assert_eq!(app.selected_agent_id().unwrap().as_str(), id(2));
+        assert!(!std::sync::Arc::ptr_eq(&cards, &app.card_list()));
+        let projects = app.projects();
+        page.items[0].workdir = Some("/tmp/two".into());
+        app.apply_sessions(&page);
+        assert!(!std::sync::Arc::ptr_eq(&projects, &app.projects()));
+        assert_eq!(app.projects()[0].0, "/tmp/two");
     }
 
     /// Stashing and restoring a transcript retains both paging directions and
