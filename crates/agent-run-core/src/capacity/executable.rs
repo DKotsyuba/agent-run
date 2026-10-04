@@ -3,7 +3,10 @@
 use agent_run_domain::catalog::CollectorBinding;
 use agent_run_platform::process::OwnedProcess;
 use serde_json::Value;
-use std::{collections::BTreeMap, path::Path, process::Stdio, time::Duration};
+use std::{
+    collections::BTreeMap, os::unix::process::ExitStatusExt, path::Path, process::Stdio,
+    time::Duration,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 /// Maximum context or quota JSON bytes; stderr has a smaller independent ceiling.
@@ -45,17 +48,18 @@ impl Drop for ProcessGuard {
 /// The context may contain credentials and is never persisted or put in argv. The
 /// environment is cleared, retaining basic host paths and explicitly granted names.
 /// A zero exit, one JSON document and confirmed process cleanup are all required.
-/// Provider output and OS error text never escape this boundary. The caller validates
-/// quota semantics and rejects any credential echoed into the result before storage.
-pub async fn run(
-    binding: &CollectorBinding,
-    context: &Value,
-    cwd: &Path,
-) -> Result<Value, &'static str> {
-    binding.validate().map_err(|_| "collector_config_invalid")?;
-    let input = serde_json::to_vec(context).map_err(|_| "collector_input_invalid")?;
+/// Provider output and OS error text never escape this boundary. Nonzero termination
+/// returns only a numeric `collector_exit_status:N` or `collector_exit_signal:N` code,
+/// or `collector_exit_unknown` when the operating system provides neither;
+/// the caller validates quota semantics and rejects any credential echoed into the
+/// result before storage.
+pub async fn run(binding: &CollectorBinding, context: &Value, cwd: &Path) -> Result<Value, String> {
+    binding
+        .validate()
+        .map_err(|_| "collector_config_invalid".to_owned())?;
+    let input = serde_json::to_vec(context).map_err(|_| "collector_input_invalid".to_owned())?;
     if input.len() > MAX_BYTES {
-        return Err("collector_input_too_large");
+        return Err("collector_input_too_large".into());
     }
     let mut environment: BTreeMap<String, String> = [
         "HOME", "PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR",
@@ -132,10 +136,18 @@ pub async fn run(
     guard.armed = false;
     let reaped = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
     if !cleanup.is_ok_and(|proof| proof.confirmed) || !matches!(reaped, Ok(Ok(_))) {
-        return Err("collector_cleanup_unverified");
+        return Err("collector_cleanup_unverified".into());
     }
-    if !status?.success() {
-        return Err("collector_exit_failed");
+    let status = status?;
+    if !status.success() {
+        let code = match status.code() {
+            Some(code) => format!("collector_exit_status:{code}"),
+            None => status.signal().map_or_else(
+                || "collector_exit_unknown".to_owned(),
+                |signal| format!("collector_exit_signal:{signal}"),
+            ),
+        };
+        return Err(code);
     }
     let output = match output {
         Some(output) => output,
@@ -146,5 +158,5 @@ pub async fn run(
                 .1
         }
     };
-    serde_json::from_slice(&output).map_err(|_| "collector_output_invalid")
+    serde_json::from_slice(&output).map_err(|_| "collector_output_invalid".to_owned())
 }

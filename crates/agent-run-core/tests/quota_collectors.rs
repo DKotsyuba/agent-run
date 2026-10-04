@@ -109,20 +109,61 @@ async fn changed_script_failure_preserves_facts_and_backs_off() {
     );
     fs::write(
         root.path().join("collector.sh"),
-        "cat >/dev/null; echo private-fixture-token >&2; exit 7",
+        "cat >/dev/null; echo private-fixture-token >&2; exit 22",
     )
     .unwrap();
     let failed = collect_providers(root.path(), &config).await.unwrap();
     assert_eq!(failed["ok"], false, "{failed}");
+    assert_eq!(
+        failed["results"][0]["issues"],
+        json!(["collector_exit_status:22"])
+    );
     assert!(!failed.to_string().contains("private-fixture-token"));
     let later = collect_providers(root.path(), &config).await.unwrap();
-    assert_eq!(later["results"][0]["issues"], json!(["backoff"]));
+    assert_eq!(
+        later["results"][0]["issues"],
+        json!(["backoff", "last_failure:collector_exit_status:22"])
+    );
+    fs::write(
+        root.path().join("capacity/backoff.json"),
+        r#"[[["acct-test","fixture"],[1,9999999999,"token-sentinel-unrecognized"]]]"#,
+    )
+    .unwrap();
+    let poisoned = collect_providers(root.path(), &config).await.unwrap();
+    assert_eq!(poisoned["results"][0]["issues"], json!(["backoff"]));
+    assert!(!poisoned.to_string().contains("token-sentinel"));
+    assert!(
+        !fs::read_to_string(root.path().join("capacity/backoff.json"))
+            .unwrap()
+            .contains("token-sentinel")
+    );
+    fs::write(
+        root.path().join("capacity/backoff.json"),
+        r#"[[["acct-test","fixture"],[1,9999999999]]]"#,
+    )
+    .unwrap();
+    let legacy = collect_providers(root.path(), &config).await.unwrap();
+    assert_eq!(legacy["results"][0]["issues"], json!(["backoff"]));
+    fs::write(
+        root.path().join("capacity/backoff.json"),
+        r#"[[["acct-test","fixture"],[1,0,"collector_exit_status:22"]]]"#,
+    )
+    .unwrap();
+    fs::write(root.path().join("collector.sh"), r#"jq '{version:1,windows:[{pool:"shared",window:"five_hour",models:(.models|keys),remaining_percent:50,observed_at:.now}]}'"#).unwrap();
+    let recovered = collect_providers(root.path(), &config).await.unwrap();
+    assert_eq!(recovered["results"][0]["status"], "collected");
+    assert_eq!(recovered["results"][0]["issues"], json!([]));
+    assert!(
+        !fs::read_to_string(root.path().join("capacity/backoff.json"))
+            .unwrap()
+            .contains("collector_exit_status:22")
+    );
     let store = agent_run_store::Store::open(root.path()).unwrap();
     let count: i64 = store
         .conn
         .query_row("SELECT count(*) FROM capacity_samples", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(count, 1);
+    assert_eq!(count, 2);
 }
 
 /// An emitted credential, a foreign model and malformed output cannot become durable quota facts.
@@ -219,7 +260,7 @@ async fn timeout_and_cancel_clean_children() {
             task.abort();
             assert!(task.await.unwrap_err().is_cancelled());
         } else {
-            assert_eq!(task.await.unwrap(), Err("collector_timeout"));
+            assert_eq!(task.await.unwrap(), Err("collector_timeout".into()));
         }
         assert_gone(&owned);
     }
@@ -254,7 +295,7 @@ async fn oversized_stdout_is_bounded() {
     );
     assert_eq!(
         executable::run(&command, &json!({}), root.path()).await,
-        Err("collector_output_too_large")
+        Err("collector_output_too_large".into())
     );
 }
 

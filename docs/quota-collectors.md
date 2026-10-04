@@ -81,13 +81,22 @@ captured descendants, and drains output with a short bound. Timeout, cancellatio
 nonzero exit, missing executable, oversized/malformed output, and unconfirmed
 cleanup are failures. Reports contain fixed classifications, never raw output
 or script error text. The last good samples keep their original timestamps.
+Numeric process failures are reported as `collector_exit_status:N` or
+`collector_exit_signal:N`; termination without either is `collector_exit_unknown`.
+Suppressed rounds include `backoff` and the retained `last_failure:<code>` issue.
+Unsafe ledger text is discarded. These process codes identify termination only;
+they do not classify authentication, network or quota causes. Stderr remains
+discarded.
 
 ## Polling and supplied scripts
 
 Collection runs once per global account/source per round. Aliases with conflicting
 command settings are rejected before any execution. Failures apply the shared
-durable 60-second exponential backoff, capped at 900 seconds. Scripts control
-HTTP retries within their execution deadline; Rust does not interpret HTTP status
+durable 60-second exponential backoff, capped at 900 seconds. The ledger keeps
+the latest safe failure code through skipped rounds and clears
+it after a successful collection. Existing two-field ledger entries load without
+a failure code. Scripts control HTTP retries within their execution deadline;
+Rust does not interpret HTTP status
 codes or provider-specific retry headers. Reads such as models, limits and
 capacity_order use persisted observations and never execute collectors.
 
