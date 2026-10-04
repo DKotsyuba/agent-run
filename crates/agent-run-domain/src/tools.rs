@@ -142,6 +142,11 @@ impl ToolDefinition {
                 MachineCode::IOError,
                 MachineCode::StorageError,
             ],
+            "list_pools" => &[
+                MachineCode::ValidationError,
+                MachineCode::IOError,
+                MachineCode::StorageError,
+            ],
             "list_agents" | "transcript" => &[
                 MachineCode::ValidationError,
                 MachineCode::AgentNotFound,
@@ -242,7 +247,11 @@ fn argument_default(tool: &str, argument: &str) -> Option<ArgumentDefault> {
         ("resume" | "cancel" | "steer" | "answer" | "transcript", "run_id") => {
             Some(ArgumentDefault::Null)
         }
-        ("list_agents", "offset") | ("transcript", "cursor") => Some(ArgumentDefault::Integer(0)),
+        ("list_pools", "state") => Some(ArgumentDefault::Null),
+        ("list_pools", "limit") => Some(ArgumentDefault::Integer(50)),
+        ("list_pools" | "list_agents", "offset") | ("transcript", "cursor") => {
+            Some(ArgumentDefault::Integer(0))
+        }
         ("list_agents", "after_message_revision") => Some(ArgumentDefault::Null),
         ("transcript", "view") => Some(ArgumentDefault::Null),
         ("list_agents", "limit") => Some(ArgumentDefault::Integer(100)),

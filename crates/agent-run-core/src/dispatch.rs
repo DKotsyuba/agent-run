@@ -199,6 +199,13 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
                 .map_err(|_| crate::Error::Runtime("pool read failed".into()))??
                 .map_err(agent_run_domain::pool::PoolDenial::into_error)
         }
+        "list_pools" => {
+            let query = args::<agent_run_domain::pool::ListPoolsQuery>(raw)?;
+            let service = service.clone();
+            tokio::task::spawn_blocking(move || service.list_pools(query))
+                .await
+                .map_err(|_| crate::Error::Runtime("pool list failed".into()))?
+        }
         "list_agents" => service.list_public(args::<Query>(raw)?).await,
         "doc" => {
             let a: Doc = args(raw)?;

@@ -5,6 +5,73 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 
+/// One current member of a discovered pool; completed rows stay frozen.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolListMemberView {
+    /// Stable one-based roster slot.
+    pub slot: u8,
+    /// Broker-assigned member display name.
+    pub name: String,
+    /// Descriptive role, conferring no authority.
+    pub role: String,
+    /// Stable lineage identity, joinable with AgentView.
+    pub agent_id: AgentId,
+    /// Latest execution status, or the frozen successful status at completion.
+    pub tip_status: Status,
+}
+
+/// Compact pool summary with no criteria, proposal snapshot or log bodies.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolListView {
+    /// Stable pool identity.
+    pub pool_id: crate::pool::PoolId,
+    /// Open or formally completed.
+    pub state: crate::pool::PoolState,
+    /// Goal excerpt of at most 512 UTF-8 bytes, cut on a character boundary.
+    pub goal: String,
+    /// Whether the goal excerpt omits bytes.
+    pub goal_truncated: bool,
+    /// UTC epoch seconds of admission; ordering uses this then pool_id descending.
+    pub created_at: f64,
+    /// Greatest retained entry sequence, zero before the first entry.
+    pub last_seq: u64,
+    /// UTC epoch seconds of completion, null while open.
+    #[serde(default)]
+    pub completed_at: Option<f64>,
+    /// Current roster revision, frozen at completion.
+    pub roster_revision: u32,
+    /// Number of current members.
+    pub members_count: usize,
+    /// Members whose derived status has counts=true, never raw ready decisions.
+    pub ready: usize,
+    /// Current proposal sequence; null before the first proposal.
+    #[serde(default)]
+    pub current_proposal_seq: Option<u64>,
+    /// Minimal current roster in ascending slot order.
+    pub members: Vec<PoolListMemberView>,
+}
+
+/// Exact filtered total and newest-created-first discovery page from one snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListPoolsView {
+    /// Compact returned pool summaries.
+    pub items: Vec<PoolListView>,
+    /// Exact number matching the state filter before pagination.
+    pub total: u64,
+    /// Requested number of matching rows skipped.
+    pub offset: usize,
+    /// Requested maximum page size.
+    pub limit: usize,
+    /// Next offset, null when no matching rows remain.
+    #[serde(default)]
+    pub next_offset: Option<usize>,
+    /// Whether this page reaches the end of matching pools.
+    pub complete: bool,
+}
+
 /// Current bounded delivery state and its optional latest secret-safe evidence payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

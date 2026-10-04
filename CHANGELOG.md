@@ -4,6 +4,11 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- feat(pools): add read-only `list_pools` discovery across MCP and the broker
+  socket, plus `agent-run pools` (`list-pools`) with optional compact `--text`
+  output; pages expose exact filtered totals, bounded goal excerpts, current
+  member identities and valid readiness counts, preserving frozen completion
+
 ## [0.20.1] - 2026-10-04
 
 - test(delivery): keep the scripted pool relay alive across empty socket-health

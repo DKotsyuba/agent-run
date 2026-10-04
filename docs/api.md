@@ -126,13 +126,14 @@ Discover the authoritative surface at runtime:
   hardcoded list.
 - `ping` (no params) — `{"ok": true}`; liveness probe.
 
-Cooperative pools use four strict methods from the same table: `start_pool`
+Cooperative pools use five strict methods from the same table: `start_pool`
 (two to five ordinary start requests sharing one goal and acceptance criteria,
 admitted atomically; returns the stable `pool_id` and each member's `agent_id`,
 name, role and status), `pool_post` (an operator message stamped as the
 orchestrator), `pool_replace` (replace a terminal, fully cleaned member; same
 `request_id` returns the same new member) and `pool` (status plus a cursor-paged
-log). The first three ride the control lane. Refusals use the shared error codes
+log), and `list_pools` (read-only discovery). The first three ride the control
+lane; `pool` and `list_pools` use the read lane. Refusals use the shared error codes
 with the pool code leading the message (`member_busy`, `pool_completed`,
 `pool_not_found`, ...). A pool completes only by formal verification (every
 member voted ready on one proposal, ended successfully, cleanup verified) and
@@ -148,7 +149,40 @@ keep the structured contracts documented here.
 
 The tool set (same names as the MCP server) is exactly `start`, `resume`,
 `cancel`, `steer`, `list_agents`, `answer`, `transcript`, `capacity_order`,
-`doc`, `models`, `delegation_guide`, and `limits`.
+`doc`, `models`, `delegation_guide`, `limits`, `start_pool`, `pool_post`,
+`pool_replace`, `pool`, and `list_pools`.
+
+`list_pools` accepts a strict object with optional `state` (`"open"` or
+`"completed"`; omitted/null means all), `limit` (integer 1..200, default 50)
+and `offset` (nonnegative integer, default 0). It returns one consistent read
+snapshot, an exact filtered `total`, and `items` ordered by `created_at`
+descending with `pool_id` descending as the tie-breaker. `next_offset` is null
+at the end; `complete` also holds for an offset beyond the total. Offset pages
+may shift if pools are admitted or purged between calls.
+
+Each item has `pool_id`, `state`, a `goal` excerpt capped at 512 UTF-8 bytes
+on a character boundary, `goal_truncated`, `created_at` (UTC epoch seconds),
+`last_seq` (greatest retained log sequence, zero for an empty log), nullable
+`completed_at`, `roster_revision`, `members_count`, `ready`, nullable
+`current_proposal_seq`, and `members` in ascending slot order. Member rows
+contain only `slot`, `name`, `role`, stable `agent_id` and `tip_status`.
+`ready` counts only members whose derived `pool` status has `counts: true`;
+raw ready decisions invalidated by a changed roster, tip or failed execution
+do not count. Completed summaries reuse the frozen completion evidence even
+if a member resumes later. Full criteria, proposal snapshots and log bodies
+are available through `pool`, and are absent from discovery.
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"list_pools","params":{"state":"open","limit":1,"offset":0}}
+{"jsonrpc":"2.0","id":2,"result":{"items":[{"pool_id":"pool-20261004-120000-0123456789","state":"open","goal":"Ship the observer","goal_truncated":false,"created_at":1791115200.0,"last_seq":7,"completed_at":null,"roster_revision":1,"members_count":2,"ready":1,"current_proposal_seq":4,"members":[{"slot":1,"name":"Reviewer","role":"review","agent_id":"ag-20261004-120000-0123456789","tip_status":"running"},{"slot":2,"name":"Builder","role":"implement","agent_id":"ag-20261004-120000-abcdef0123","tip_status":"running"}]}],"total":2,"offset":0,"limit":1,"next_offset":1,"complete":false}}
+```
+
+The CLI equivalent is `agent-run pools [--state open|completed] [--offset N]
+[--limit N]`, alias `list-pools`; default output is JSON and `--text` prints
+the compact MCP page. No worker capability is accepted. Discovery has no
+long-poll: operator pool posts do not advance the existing event revision,
+so it would miss changes to `last_seq`. Members provide the join with
+`list_agents`; `AgentView` remains unchanged.
 
 See [continuations](continuations.md) for native-context `resume`, inherited
 authority, idempotency and history availability.

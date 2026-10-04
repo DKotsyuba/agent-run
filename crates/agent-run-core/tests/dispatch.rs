@@ -73,6 +73,67 @@ async fn retained_agent_tools_dispatch() {
     );
 }
 
+/// Service and shared dispatch expose the same exact, filtered discovery page;
+/// bad pagination, lifecycle values and unknown wait arguments stay typed.
+#[tokio::test]
+async fn list_pools_service_and_dispatch_share_strict_read_projection() {
+    use agent_run_domain::pool::{ListPoolsQuery, PoolState};
+    let home = common::Home::new();
+    let store = home.store();
+    for (id, state, at) in [
+        ("pool-20260101-000000-012345678a", "open", 1.0),
+        ("pool-20260102-000000-012345678b", "completed", 2.0),
+    ] {
+        store.conn.execute(
+            "INSERT INTO pools(id,request_namespace,request_id,request_sha256,goal,acceptance_json,state,roster_revision,created_at,completed_at) \
+             VALUES(?,'ns',?,?, 'goal','[]',?,1,?,?)",
+            rusqlite::params![id, id, "0".repeat(64), state, at,
+                (state == "completed").then_some(3.0)],
+        ).unwrap();
+    }
+    let service = Service::new(home.path.clone());
+    let revision = store.revision().unwrap();
+    let first = dispatch::call(&service, "list_pools", json!({"limit": 1}))
+        .await
+        .unwrap();
+    assert_eq!(first["total"], 2);
+    assert_eq!(
+        first["items"][0]["pool_id"],
+        "pool-20260102-000000-012345678b"
+    );
+    assert_eq!(first["next_offset"], 1);
+    let filtered = service
+        .list_pools(ListPoolsQuery {
+            state: Some(PoolState::Open),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(filtered["total"], 1);
+    assert_eq!(
+        filtered["items"][0]["pool_id"],
+        "pool-20260101-000000-012345678a"
+    );
+    let page = dispatch::call(&service, "list_pools", json!({"offset":1,"limit":1}))
+        .await
+        .unwrap();
+    assert_eq!(page["items"], filtered["items"]);
+    assert_eq!(page["complete"], true);
+    assert_eq!(store.revision().unwrap(), revision);
+    for bad in [
+        json!({"limit":0}),
+        json!({"limit":201}),
+        json!({"offset":-1}),
+        json!({"state":"closed"}),
+        json!({"after_revision":0}),
+        json!({"wait_seconds":1}),
+    ] {
+        assert!(matches!(
+            dispatch::call(&service, "list_pools", bad).await,
+            Err(agent_run_domain::Error::Validation(_))
+        ));
+    }
+}
+
 /// Mirrors `tests/test_dispatch.py::test_restored_operator_tools_dispatch`
 #[tokio::test]
 async fn restored_operator_tools_dispatch() {
