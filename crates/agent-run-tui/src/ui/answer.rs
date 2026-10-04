@@ -1,28 +1,31 @@
 //! The answer popup: the sealed, verified answer of one session.
 
-use super::theme;
+use super::{overlay, theme};
 use crate::app::App;
 use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::Paragraph,
     Frame,
 };
 
 /// Renders the answer popup centered over the current screen, when open.
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
-    let Some(answer) = app.answer.as_ref() else {
+    if app.answer.is_none() {
         return;
-    };
-    let popup = centered(area, 70, 70);
-    let block = Block::new()
-        .title(Line::from(" sealed answer ").style(theme::accent()))
-        .borders(Borders::ALL);
-    let inner = block.inner(popup);
-    f.render_widget(Clear, popup);
-    f.render_widget(block, popup);
+    }
+    let width = area.width.saturating_mul(70) / 100;
+    let height = area.height.saturating_mul(70) / 100;
+    let inner = overlay::begin(f, area, "sealed answer", width, height);
 
+    let mut cache = app.answer_lines.borrow_mut();
+    cache.sync(inner.width);
+    f.render_widget(&cache.paragraph, inner);
+}
+
+/// Builds owned, sanitized answer lines once on receipt; the frame borrows them.
+fn lines(answer: &agent_run_domain::views::AnswerView) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     if !answer.available {
         lines.push(Line::from(Span::styled(
@@ -68,21 +71,60 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             ]));
         }
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("Esc closes", theme::dim())));
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    lines
 }
 
-/// Computes a centered rectangle covering `percent` of the area in both axes.
-fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
-    let x = area.width.saturating_mul(100 - percent_x) / 200 + area.x;
-    let y = area.height.saturating_mul(100 - percent_y) / 200 + area.y;
-    let width = area.width.saturating_mul(percent_x) / 100;
-    let height = area.height.saturating_mul(percent_y) / 100;
-    Rect {
-        x,
-        y,
-        width,
-        height,
+/// Sanitized answer source and width-specific wrapped rows, shared by redraws.
+#[derive(Default)]
+pub(crate) struct Cache {
+    /// Source lines, sanitized only on envelope receipt.
+    source: Vec<Line<'static>>,
+    /// Width whose wrapping the paragraph owns; zero means not built yet.
+    width: u16,
+    /// Already wrapped lines; rendering borrows without cloning answer bytes.
+    paragraph: Paragraph<'static>,
+    /// Wrapping builds, checked by the redraw regression.
+    #[cfg(test)]
+    pub(crate) builds: usize,
+}
+
+impl Cache {
+    /// Sanitizes one received answer; wrapping waits for the actual popup width.
+    pub(crate) fn new(answer: &agent_run_domain::views::AnswerView) -> Self {
+        Self {
+            source: lines(answer),
+            ..Self::default()
+        }
+    }
+
+    /// Wraps once per positive popup width. Repeated redraws touch no source bytes.
+    fn sync(&mut self, width: u16) {
+        let width = width.max(1);
+        if self.width == width {
+            return;
+        }
+        self.width = width;
+        let mut rows = Vec::new();
+        for line in &self.source {
+            if line.width() <= usize::from(width) {
+                rows.push(line.clone());
+            } else {
+                let style = line
+                    .spans
+                    .first()
+                    .map(|span| span.style)
+                    .unwrap_or_default();
+                rows.extend(
+                    super::text::wrap(&line.to_string(), usize::from(width))
+                        .into_iter()
+                        .map(|text| Line::styled(text, style)),
+                );
+            }
+        }
+        self.paragraph = Paragraph::new(rows);
+        #[cfg(test)]
+        {
+            self.builds += 1;
+        }
     }
 }

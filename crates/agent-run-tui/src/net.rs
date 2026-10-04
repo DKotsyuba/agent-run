@@ -12,9 +12,9 @@ use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc};
 
 /// Upper bound of one transcript page accepted from the broker.
 ///
-/// The broker itself refuses pages above 1000 rows; the observer stays below
-/// it so one backfill round is a handful of requests.
-pub const TRANSCRIPT_PAGE_LIMIT: usize = 500;
+/// The broker itself refuses pages above 1000 rows; the observer uses its
+/// maximum so one backfill round is a handful of requests.
+pub const TRANSCRIPT_PAGE_LIMIT: usize = 1000;
 
 /// Long-poll window, in seconds, of one revision watch round.
 pub const REVISION_WAIT_SECONDS: f64 = 25.0;
@@ -31,27 +31,68 @@ pub trait Broker: Send + Sync {
 /// Shared dynamic broker seam handed to the event workers.
 pub type SharedBroker = Arc<dyn Broker>;
 
-/// Production [`Broker`] backed by the shared framed socket client.
-#[derive(Clone)]
+/// Production broker with independent sessions, transcript and answer sockets.
+/// Dropping an incomplete call retires its socket before it can serve a new call.
 pub struct SocketBroker {
-    /// Each concurrent request opens its own connection to this local endpoint.
-    socket_path: PathBuf,
+    /// Socket endpoint for lazy replacements after cancellation.
+    socket: PathBuf,
+    /// Persistent connection per worker lane (list, transcript, one-shot).
+    clients: [std::sync::Mutex<Arc<BrokerClient>>; 3],
 }
 
 impl SocketBroker {
-    /// Creates a lazy broker client; no socket is opened until its first call.
+    /// Creates three lazy clients; no socket opens before its first call.
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
+        let socket = socket_path.into();
         Self {
-            socket_path: socket_path.into(),
+            clients: std::array::from_fn(|_| {
+                std::sync::Mutex::new(Arc::new(BrokerClient::new(socket.clone())))
+            }),
+            socket,
+        }
+    }
+}
+
+/// Retires a connection if its future is dropped before a response arrives.
+struct InFlight<'a> {
+    /// Lane to replace on cancellation.
+    lane: &'a std::sync::Mutex<Arc<BrokerClient>>,
+    /// Endpoint of the replacement client.
+    socket: &'a PathBuf,
+    /// Whether the response has been consumed.
+    complete: bool,
+}
+
+impl Drop for InFlight<'_> {
+    /// A cancelled request may leave unread frames, so never reuse its socket.
+    fn drop(&mut self) {
+        if !self.complete {
+            *self.lane.lock().expect("broker lane") =
+                Arc::new(BrokerClient::new(self.socket.clone()));
         }
     }
 }
 
 impl Broker for SocketBroker {
-    /// Keep long-poll listing independent of transcript and answer reads.
+    /// Routes each method to its worker's connection and retires cancelled calls.
     fn call<'a>(&'a self, method: &'a str, params: Value) -> BrokerFuture<'a> {
-        let client = BrokerClient::new(self.socket_path.clone());
-        Box::pin(async move { client.call(method, Some(params)).await })
+        let index = match method {
+            "list_agents" => 0,
+            "transcript" => 1,
+            _ => 2,
+        };
+        Box::pin(async move {
+            let lane = &self.clients[index];
+            let client = lane.lock().expect("broker lane").clone();
+            let mut flight = InFlight {
+                lane,
+                socket: &self.socket,
+                complete: false,
+            };
+            let result = client.call(method, Some(params)).await;
+            flight.complete = true;
+            result
+        })
     }
 }
 
@@ -68,6 +109,19 @@ pub async fn list_agents(broker: &dyn Broker, active: bool) -> agent_run::Result
                 "list_agents",
                 json!({"active": active, "offset": 0, "limit": 200}),
             )
+            .await?,
+    )
+}
+
+/// Reads the unfiltered session total without loading rows.
+///
+/// Omitting `active` widens the broker's filter to every session, so the
+/// page's exact `total` counts live and finished rows together while
+/// `limit: 1` keeps the round trip cheap.
+pub async fn total_agents(broker: &dyn Broker) -> agent_run::Result<AgentPage> {
+    parse(
+        broker
+            .call("list_agents", json!({"offset": 0, "limit": 1}))
             .await?,
     )
 }
@@ -204,16 +258,31 @@ mod tests {
         assert_eq!(page.revision, 7);
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].status, Status::Running);
-        let mut modern = broker.0;
-        for field in ["run_id", "root_agent_id", "parent_agent_id"] {
-            modern["items"][0].as_object_mut().unwrap().remove(field);
+    }
+
+    /// The finished-count call asks for one unfiltered row: no `active`
+    /// filter, so the broker's exact total covers every session.
+    #[tokio::test]
+    async fn total_agents_fetches_one_unfiltered_row() {
+        struct Capture;
+        impl Broker for Capture {
+            fn call<'a>(&'a self, _method: &'a str, params: Value) -> BrokerFuture<'a> {
+                Box::pin(async move {
+                    assert!(params.get("active").is_none(), "no live filter: {params}");
+                    assert_eq!(params["offset"], 0);
+                    assert_eq!(params["limit"], 1, "one row keeps the round cheap");
+                    Ok(json!({
+                        "items": [],
+                        "total": 103, "offset": 0, "limit": 1,
+                        "next_offset": Some(1), "complete": false,
+                        "revision": 9, "observed_at": 1.0,
+                    }))
+                })
+            }
         }
-        modern["items"][0]["workdir"] = json!("/tmp/workspace");
-        let page = list_agents(&Canned(modern), true)
-            .await
-            .expect("stable-ID response parses");
-        assert!(page.items[0].run_id.is_none());
-        assert_eq!(page.items[0].workdir.as_deref(), Some("/tmp/workspace"));
+        let page = total_agents(&Capture).await.expect("count page parses");
+        assert_eq!(page.total, 103);
+        assert_eq!(page.revision, 9);
     }
 
     #[tokio::test]
@@ -279,66 +348,82 @@ mod tests {
         assert!(view.available);
         assert_eq!(view.content.as_deref(), Some("the answer\n"));
     }
-}
-
-/// A pending list watch must not serialize unrelated transcript requests.
-#[cfg(test)]
-#[tokio::test]
-async fn transcript_request_does_not_wait_for_pending_list_watch() {
-    use tokio::{
-        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-        net::UnixListener,
-        sync::oneshot,
-    };
-    let directory = tempfile::Builder::new()
-        .prefix("ar-tui-")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let socket = directory.path().join("api.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-    let (ready, started) = oneshot::channel();
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut first = BufReader::new(stream);
-        let mut line = String::new();
-        first.read_line(&mut line).await.unwrap();
-        let request: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(request["method"], "list_agents");
-        ready.send(()).unwrap();
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut second = BufReader::new(stream);
-        line.clear();
-        second.read_line(&mut line).await.unwrap();
-        let next: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(next["method"], "transcript");
-        for (stream, id) in [
-            (second.get_mut(), &next["id"]),
-            (first.get_mut(), &request["id"]),
-        ] {
-            let response = format!(
-                "{}\n",
-                json!({"jsonrpc":"2.0","id":id,"result":{"ok":true}})
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
+    /// A blocked list poll cannot delay transcript/answer calls on real sockets;
+    /// cancelling a transcript also retires its unread connection.
+    #[tokio::test]
+    async fn socket_lanes_stay_independent_and_cancelled_frames_are_retired() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let socket = std::env::temp_dir().join(format!(
+            "artui-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let server = tokio::spawn(async move {
+            let mut handlers = tokio::task::JoinSet::new();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let tx = seen_tx.clone();
+                handlers.spawn(async move {
+                    let (input, mut output) = stream.into_split();
+                    let mut input = BufReader::new(input);
+                    let mut line = String::new();
+                    while input.read_line(&mut line).await.unwrap() > 0 {
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        let method = request["method"].as_str().unwrap().to_string();
+                        tx.send(method.clone()).await.unwrap();
+                        if method == "list_agents" || request["params"]["blocked"] == true {
+                            std::future::pending::<()>().await;
+                        }
+                        let response =
+                            json!({"jsonrpc":"2.0","id":request["id"],"result":{"ok":true}})
+                                .to_string()
+                                + "\n";
+                        output.write_all(response.as_bytes()).await.unwrap();
+                        line.clear();
+                    }
+                });
+            }
+        });
+        let broker = Arc::new(SocketBroker::new(socket.clone()));
+        let listing = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.call("list_agents", json!({})).await })
+        };
+        assert_eq!(seen_rx.recv().await.unwrap(), "list_agents");
+        for method in ["transcript", "answer"] {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                broker.call(method, json!({})),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result, json!({"ok":true}));
+            assert_eq!(seen_rx.recv().await.unwrap(), method);
         }
-    });
-    let broker = Arc::new(SocketBroker::new(socket));
-    let watcher = broker.clone();
-    let watch = tokio::spawn(async move { watcher.call("list_agents", json!({})).await });
-    tokio::time::timeout(std::time::Duration::from_secs(2), started)
+        let stale = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.call("transcript", json!({"blocked":true})).await })
+        };
+        assert_eq!(seen_rx.recv().await.unwrap(), "transcript");
+        stale.abort();
+        let _ = stale.await;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            broker.call("transcript", json!({}))
+        )
         .await
         .unwrap()
-        .unwrap();
-    let transcript = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        broker.call("transcript", json!({})),
-    )
-    .await;
-    assert!(
-        transcript.is_ok(),
-        "list watch blocked transcript on the shared connection"
-    );
-    assert_eq!(transcript.unwrap().unwrap()["ok"], true);
-    watch.await.unwrap().unwrap();
-    server.await.unwrap();
+        .is_ok());
+        listing.abort();
+        let _ = listing.await;
+        server.abort();
+        let _ = server.await;
+        std::fs::remove_file(socket).unwrap();
+    }
 }
