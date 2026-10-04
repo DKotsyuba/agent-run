@@ -9,7 +9,7 @@ use crate::{
     state::Store,
     Result,
 };
-use agent_run_config::provider_config::ProviderConfig;
+use agent_run_config::{config::Delivery, provider_config::ProviderConfig};
 use agent_run_domain::worker::{WorkerMessageKind, WorkerNotice};
 use fs2::FileExt;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
@@ -357,6 +357,9 @@ struct Claim {
     transport: String,
     session: String,
     payload: Payload,
+    /// Retry policy captured before the lease was taken, so a config change
+    /// during the send can never decide the outcome of an acknowledged attempt.
+    policy: Delivery,
 }
 
 /// The one trusted delivery shape selected from the durable outbox row.
@@ -433,6 +436,17 @@ fn expire_unbound(tx: &rusqlite::Transaction<'_>, time: f64) -> Result<()> {
         [time - 3600.0],
     )?;
     Ok(())
+}
+
+/// Loads the delivery policy from either supported config schema.
+///
+/// Called only before a delivery is leased: a missing or malformed config then
+/// leaves the row untouched and unsent instead of discarding evidence later.
+fn delivery_policy(home: &Path) -> Result<Delivery> {
+    Ok(match ProviderConfig::load(home) {
+        Ok((config, _)) => config.delivery,
+        Err(_) => Config::load(home)?.delivery,
+    })
 }
 
 /// Atomically selects and leases one due bound delivery for this dispatcher identity.
@@ -610,6 +624,7 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
         notice.validate()?;
         Payload::Completion(notice)
     };
+    let policy = delivery_policy(home)?;
     let attempt = attempts
         .checked_add(1)
         .ok_or_else(|| invalid("delivery attempt counter overflow"))?;
@@ -630,6 +645,7 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
         transport,
         session,
         payload,
+        policy,
     }))
 }
 
@@ -643,11 +659,11 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
 /// so exactly-once cannot be proved. They end terminally `failed` with the
 /// ambiguous flag at once (at-most-once) instead of retrying into duplicates;
 /// known-unsent outcomes (session gone, unavailable, rejected) still retry.
+///
+/// The retry policy is the one captured in `claim`; no configuration is read
+/// here, so an acknowledgement is always committed once its send has happened.
 fn complete(home: &Path, claim: &Claim, evidence: &Evidence) -> Result<()> {
-    let delivery = match ProviderConfig::load(home) {
-        Ok((config, _)) => config.delivery,
-        Err(_) => Config::load(home)?.delivery,
-    };
+    let delivery = &claim.policy;
     let mut store = Store::open(home)?;
     let tx = store
         .conn
@@ -830,6 +846,8 @@ mod tests {
     fn resumed_notice_keeps_exact_run_and_stable_agent() {
         let home = tempfile::tempdir().unwrap();
         let store = Store::initialize(home.path()).unwrap();
+        // Claiming captures the delivery policy, so the home needs a valid config.
+        std::fs::write(home.path().join("config.toml"), "schema_version = 2\n").unwrap();
         let root = "ag-20260925-000000-0000000001";
         let child = "ag-20260925-000000-0000000002";
         for id in [root, child] {

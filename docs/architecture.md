@@ -235,8 +235,11 @@ The resident broker and its admitted detached jobs have independent ownership.
 Delivery attempts are leased, bounded, and retried with backoff. Persisted
 diagnostics contain safe classifications and redacted tails, never task or
 answer text, session IDs, argument or environment values, or credentials.
-The dispatcher reads retry policy from the active configuration schema, so
-schema-2 homes complete each claimed attempt before its lease can be retried.
+The dispatcher reads retry policy from the active configuration schema once,
+before it leases a delivery, so schema-2 homes complete each claimed attempt
+before its lease can be retried. A missing or malformed configuration at that
+point leaves the delivery unsent; a change after the lease never discards an
+acknowledgement or its evidence.
 
 ## Capacity and diagnostics
 
