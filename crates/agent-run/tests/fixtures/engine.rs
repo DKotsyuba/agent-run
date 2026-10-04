@@ -281,7 +281,24 @@ fn main() {
             .expect("fixture workdir")
             .join("escaped.pid");
         std::fs::write(marker, child.id().to_string()).expect("fixture escaped pid");
-        std::thread::sleep(Duration::from_millis(500));
+        // Capture handshake. The supervisor records a descendant only from a
+        // refresh made while this leader lives, and refreshes at the top of each
+        // stdout read once 200 ms have passed since the last one. After this
+        // pause any earlier refresh is stale, so the read that returns frame
+        // `ready` (which begins only after frame `warmup` was processed) must
+        // refresh with the helper present. The leader then stays alive until the
+        // owning test has seen `ready` journaled and releases it, bounded to
+        // twenty seconds so a lost driver still ends this child finitely.
+        std::thread::sleep(Duration::from_millis(250));
+        for text in [
+            "fixture escaped warmup\n",
+            "fixture escaped capture ready\n",
+        ] {
+            emit(
+                json!({"type":"assistant","session_id":session,"message":{"content":[{"type":"text","text":text}]}}),
+            );
+        }
+        wait_marker("escaped-release");
     }
     if task == "fixture:missing-result" {
         return;

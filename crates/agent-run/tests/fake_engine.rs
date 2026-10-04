@@ -274,14 +274,21 @@ async fn wait_engine_ready(home: &Path, id: &AgentId, timeout: Duration) {
 
 /// Wait until the fixture records that the supervisor returned to engine polling.
 async fn wait_engine_poll_marker(home: &Path, id: &AgentId) {
+    wait_journaled_text(home, id, "fixture poll marker").await;
+}
+
+/// Waits, bounded to ten seconds, until an engine-streamed text containing
+/// `needle` is durable in the agent's journal, which proves the supervisor
+/// processed that frame.
+async fn wait_journaled_text(home: &Path, id: &AgentId, needle: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let markers: i64 = Store::open(home)
             .unwrap()
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM messages WHERE agent_id=? AND content LIKE '%fixture poll marker%'",
-                [id.as_str()],
+                "SELECT COUNT(*) FROM messages WHERE agent_id=? AND content LIKE ?",
+                rusqlite::params![id.as_str(), format!("%{needle}%")],
                 |row| row.get(0),
             )
             .unwrap();
@@ -290,7 +297,7 @@ async fn wait_engine_poll_marker(home: &Path, id: &AgentId) {
         }
         assert!(
             Instant::now() < deadline,
-            "fixture never observed an engine poll"
+            "fixture text {needle:?} was never journaled"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -731,7 +738,19 @@ async fn descendant_process_is_reaped_before_finish() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn escaped_descendant_is_terminated_before_confirmed_cleanup() {
     let (_tmp, home) = home();
-    let row = run_task(&home, "fixture:escaped-descendant").await;
+    // Capture needs a supervisor refresh while the leader lives; the fixture
+    // holds its leader until the journal proves that refresh happened, so
+    // scheduling delay can no longer let the helper escape uncaptured.
+    let id = admit(&home, "fixture:escaped-descendant");
+    let mut child = spawn_supervisor(&home, &id);
+    wait_journaled_text(&home, &id, "fixture escaped capture ready").await;
+    std::fs::write(home.join("escaped-release"), "").unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("supervisor subprocess timed out")
+        .expect("wait on supervisor subprocess");
+    assert!(status.success(), "supervisor subprocess failed: {status:?}");
+    let row = Store::open(&home).unwrap().get(&id).unwrap();
     assert_eq!(row.status, Status::Succeeded);
     let cleanup = Store::open(&home)
         .unwrap()
