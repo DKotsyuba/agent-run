@@ -378,6 +378,95 @@ impl Store {
         read_page(&self.conn, &member.pool_id, after_seq, before_seq, limit).map(Ok)
     }
 
+    /// Lists validated compact pool summaries from one deferred read snapshot.
+    /// Ordering is created_at descending, then id descending; total is exact for
+    /// the optional state filter. Vote counts and completed members reuse the
+    /// operator status projection. No log bodies escape and no rows are written.
+    pub fn list_pools(
+        &self,
+        query: &agent_run_domain::pool::ListPoolsQuery,
+    ) -> Result<agent_run_domain::views::ListPoolsView> {
+        use agent_run_domain::views::{ListPoolsView, PoolListMemberView, PoolListView};
+        query.validate()?;
+        let tx = self.conn.unchecked_transaction()?;
+        let state = query.state.map(|state| state.as_str());
+        let total: u64 = tx.query_row(
+            "SELECT COUNT(*) FROM pools WHERE (?1 IS NULL OR state=?1)",
+            [state],
+            |row| row.get(0),
+        )?;
+        let mut statement = tx.prepare(
+            "SELECT id,created_at,completed_at,COALESCE(\
+             (SELECT MAX(seq) FROM pool_entries WHERE pool_id=p.id),0) \
+             FROM pools p WHERE (?1 IS NULL OR state=?1) \
+             ORDER BY created_at DESC,id DESC LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = statement
+            .query_map(
+                params![state, query.limit as i64, query.offset as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, Option<f64>>(2)?,
+                        row.get::<_, u64>(3)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let mut items = Vec::with_capacity(rows.len());
+        for (id, created_at, completed_at, last_seq) in rows {
+            let status = pool_status(&tx, &id)?;
+            let roster = status["members"]
+                .as_array()
+                .ok_or_else(|| Error::Integrity("pool roster is malformed".into()))?;
+            let members = roster
+                .iter()
+                .map(|member| {
+                    Ok(serde_json::from_value::<PoolListMemberView>(json!({
+                        "slot": member["slot"], "name": member["name"], "role": member["role"],
+                        "agent_id": member["agent_id"], "tip_status": member["tip_status"],
+                    }))?)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let goal = status["goal"]
+                .as_str()
+                .ok_or_else(|| Error::Integrity("pool goal is malformed".into()))?;
+            let mut end = goal.len().min(512);
+            while !goal.is_char_boundary(end) {
+                end -= 1;
+            }
+            items.push(PoolListView {
+                pool_id: id.parse()?,
+                state: serde_json::from_value(status["state"].clone())?,
+                goal: goal[..end].to_owned(),
+                goal_truncated: end < goal.len(),
+                created_at,
+                completed_at,
+                last_seq,
+                roster_revision: serde_json::from_value(status["roster_revision"].clone())?,
+                members_count: members.len(),
+                ready: roster
+                    .iter()
+                    .filter(|member| member["counts"] == json!(true))
+                    .count(),
+                current_proposal_seq: status["current_proposal"]["seq"].as_u64(),
+                members,
+            });
+        }
+        let next = query.offset.saturating_add(items.len());
+        tx.commit()?;
+        Ok(ListPoolsView {
+            items,
+            total,
+            offset: query.offset,
+            limit: query.limit,
+            next_offset: (next < total as usize).then_some(next),
+            complete: next >= total as usize,
+        })
+    }
+
     /// Reads one bounded page of any pool plus the derived status for the
     /// operator; `None` when no pool has the identity. The page and status
     /// come from the same projection members read, so nothing is aggregated

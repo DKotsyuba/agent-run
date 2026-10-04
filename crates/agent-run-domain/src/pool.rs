@@ -526,6 +526,60 @@ fn validate_page(
     Ok(())
 }
 
+/// Lifecycle filter shared by pool discovery and its compact summaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PoolState {
+    /// Members can still exchange entries and reach agreement.
+    Open,
+    /// Formal completion evidence is frozen.
+    Completed,
+}
+
+impl PoolState {
+    /// Returns the durable SQLite and public wire spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Completed => "completed",
+        }
+    }
+}
+
+/// Read-only discovery page; omission selects all states, offset zero and 50 rows.
+/// Unknown fields are rejected; no worker capability or long-poll is accepted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ListPoolsQuery {
+    /// Exact lifecycle filter; null or omission selects both states.
+    pub state: Option<PoolState>,
+    /// Number of matching pools to skip, within SQLite's signed range.
+    pub offset: usize,
+    /// Maximum returned pools, 1..=200; defaults to 50.
+    pub limit: usize,
+}
+
+impl Default for ListPoolsQuery {
+    /// Builds the unfiltered first page of 50 pools.
+    fn default() -> Self {
+        Self {
+            state: None,
+            offset: 0,
+            limit: 50,
+        }
+    }
+}
+
+impl ListPoolsQuery {
+    /// Rejects zero/oversized pages and offsets outside SQLite's signed range.
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=200).contains(&self.limit) || self.offset > i64::MAX as usize {
+            return Err(invalid("invalid pool list page arguments"));
+        }
+        Ok(())
+    }
+}
+
 /// Operator read of one pool's status and entries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

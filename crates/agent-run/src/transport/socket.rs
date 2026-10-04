@@ -1108,6 +1108,17 @@ mod tests {
     use super::*;
     use tokio::net::UnixListener;
 
+    /// Pool discovery consumes only the read lane and no control reservation.
+    #[test]
+    fn list_pools_uses_the_read_lane() {
+        let lanes = Lanes::new(0);
+        let read = lanes.try_acquire("list_pools").unwrap();
+        assert!(lanes.try_acquire("list_agents").is_none());
+        assert!(lanes.try_acquire("start_pool").is_some());
+        drop(read);
+        assert!(lanes.try_acquire("list_pools").is_some());
+    }
+
     // Protects the client from a broker that holds a wait response open forever.
     #[tokio::test]
     async fn wait_client_deadline_closes_when_broker_holds_response() {

@@ -174,6 +174,7 @@ fn additive_wires() -> Vec<Value> {
         "pool_post",
         "pool_replace",
         "pool",
+        "list_pools",
     ]
     .into_iter()
     .map(|name| {
@@ -305,6 +306,27 @@ fn mcp_matches_python_handshake_tools_calls_notifications_and_eof() {
         assert_eq!(mcp.send(expected[7]["request"].clone()), None);
         mcp.finish();
     }
+}
+
+/// The real MCP proxy calls list_pools over the broker socket and renders its page.
+#[test]
+fn list_pools_live_mcp_round_trip() {
+    let mut harness = Harness::new();
+    harness.start_broker();
+    let mut mcp = harness.mcp();
+    mcp.send(initialize("2025-11-25")).unwrap();
+    mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}));
+    let reply = mcp
+        .send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+        "params":{"name":"list_pools","arguments":{"state":"open","limit":1}}}))
+        .unwrap();
+    assert_eq!(reply["result"]["isError"], false);
+    assert!(reply["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("agent-run pools: 0 of 0"));
+    assert!(reply["result"].get("structuredContent").is_none());
+    mcp.finish();
 }
 
 /// Ensure the advertised list is exactly the captured schema table after null omission on the wire.
