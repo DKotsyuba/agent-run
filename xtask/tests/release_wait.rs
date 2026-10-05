@@ -852,12 +852,108 @@ fn controlled_interrupt_persists_cancelled_result() {
     assert_eq!(event["agent_awakened"], false);
 }
 
+/// The publisher workflow creates/verifies "dist" relative to its checkout.
+/// Absolute and relative CLI paths must inspect/extract the same sealed bytes;
+/// directory handling must retain regular-file/tamper/inventory refusals.
+#[test]
+fn package_create_verify_accept_relative_and_absolute_directories() {
+    for absolute in [false, true] {
+        let fixture = Fixture::new();
+        let directory = fixture.root.join("dist");
+        fs::create_dir(&directory).unwrap();
+        for artifact in &fixture.manifest.artifacts {
+            fs::copy(
+                fixture.assets.join(&artifact.name),
+                directory.join(&artifact.name),
+            )
+            .unwrap();
+        }
+        let argument = if absolute {
+            directory.to_string_lossy().into_owned()
+        } else {
+            "dist".into()
+        };
+        let ci_command = || {
+            let mut command = fixture.command();
+            command
+                .env("GITHUB_ACTIONS", "true")
+                .env("GITHUB_REPOSITORY", REPOSITORY)
+                .env("GITHUB_REPOSITORY_ID", REPOSITORY_ID.to_string())
+                .env("GITHUB_SHA", &fixture.manifest.commit)
+                .env("GITHUB_REF_NAME", &fixture.manifest.tag)
+                .env("GITHUB_RUN_ID", "17")
+                .env("GITHUB_RUN_ATTEMPT", "1")
+                .env("AGENT_RUN_WORKFLOW_ID", WORKFLOW_ID.to_string());
+            command
+        };
+        let mut create = ci_command();
+        create.args([
+            "package",
+            "create",
+            "--accepted-commit",
+            &fixture.manifest.commit,
+            "--directory",
+            &argument,
+        ]);
+        let output = fixture.output(create);
+        assert!(
+            output.status.success(),
+            "relative={}: {}",
+            !absolute,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for path in ["dist".to_owned(), directory.to_string_lossy().into_owned()] {
+            let mut verify = fixture.command();
+            verify.args([
+                "package",
+                "verify",
+                "--accepted-commit",
+                &fixture.manifest.commit,
+                "--directory",
+                &path,
+                "--workflow-id",
+                &WORKFLOW_ID.to_string(),
+                "--run-id",
+                "17",
+                "--attempt",
+                "1",
+            ]);
+            let output = fixture.output(verify);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        fs::write(directory.join("install.sh"), b"tampered installer").unwrap();
+        let mut verify = fixture.command();
+        verify.args([
+            "package",
+            "verify",
+            "--accepted-commit",
+            &fixture.manifest.commit,
+            "--directory",
+            &argument,
+            "--workflow-id",
+            &WORKFLOW_ID.to_string(),
+            "--run-id",
+            "17",
+            "--attempt",
+            "1",
+        ]);
+        let output = fixture.output(verify);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("asset size/hash mismatch"));
+    }
+}
+
 /// Publisher verifies its draft/downloads/provenance before publication, accepts
-/// exact published no-op and refuses a conflicting existing draft or failed verifier.
+/// relative-directory publication and absolute-directory exact published no-op,
+/// and refuses a conflicting existing draft or failed verifier.
 #[test]
 fn staged_publisher_exact_noop_and_existing_draft_refusal() {
     let fixture = Fixture::new();
-    let invoke = || {
+    let invoke = |directory: &Path| {
         let mut command = fixture.command();
         command
             .env("GITHUB_ACTIONS", "true")
@@ -876,12 +972,12 @@ fn staged_publisher_exact_noop_and_existing_draft_refusal() {
                 &fixture.manifest.commit,
                 "--directory",
             ])
-            .arg(&fixture.assets)
+            .arg(directory)
             .arg("--notes")
             .arg(fixture.root.join("CHANGELOG.md"));
         command
     };
-    let output = fixture.output(invoke());
+    let output = fixture.output(invoke(Path::new("../assets")));
     assert!(
         output.status.success(),
         "{}",
@@ -891,7 +987,7 @@ fn staged_publisher_exact_noop_and_existing_draft_refusal() {
         fs::read_to_string(fixture.temp.path().join("operations")).unwrap(),
         "create\npublish\n"
     );
-    let output = fixture.output(invoke());
+    let output = fixture.output(invoke(&fixture.assets));
     assert!(
         output.status.success(),
         "{}",
@@ -906,10 +1002,10 @@ fn staged_publisher_exact_noop_and_existing_draft_refusal() {
         fixture.temp.path().join("release.json"),
     )
     .unwrap();
-    let output = fixture.output(invoke());
+    let output = fixture.output(invoke(Path::new("../assets")));
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("existing draft"));
-    let mut command = invoke();
+    let mut command = invoke(Path::new("../assets"));
     command.env("TEST_ATTEST_FAIL", "1");
     let output = fixture.output(command);
     assert!(!output.status.success());

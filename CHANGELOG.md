@@ -4,6 +4,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.21.1
+
+- fix(release): verify and publish payloads from relative directories without
+  duplicating the directory in the extraction path; retain archive, checksum,
+  provenance and historical-seal checks
+
 ## 0.21.0
 
 - feat(mcp)!: use Cargo product versions and server instructions, add reviewed
