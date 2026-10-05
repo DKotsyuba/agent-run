@@ -160,6 +160,278 @@ pub fn verify(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Reads one repository TOML document for structural checks without rewriting it.
+fn toml_file(root: &Path, path: &str) -> Result<toml::Value, String> {
+    let text =
+        std::fs::read_to_string(root.join(path)).map_err(|_| format!("{path} is unreadable"))?;
+    toml::from_str(&text).map_err(|_| format!("{path} is not valid TOML"))
+}
+
+/// Checks only inspectable project structure, in addition to the existing digest
+/// and discovery comparisons. Passing proves no business semantics, host readiness
+/// or release qualification; all operations are read-only.
+pub fn check(root: &Path) -> Result<(), String> {
+    verify(root)?;
+    contract(root, false)?;
+    project_conformance(root)
+}
+
+/// Returns one nested TOML value or a fixed empty scalar, so missing malformed
+/// declarations produce typed check failures rather than indexing panics.
+fn toml_at<'a>(value: &'a toml::Value, keys: &[&str]) -> &'a toml::Value {
+    static MISSING: toml::Value = toml::Value::String(String::new());
+    keys.iter()
+        .try_fold(value, |value, key| value.get(*key))
+        .unwrap_or(&MISSING)
+}
+
+/// Verifies Cargo inheritance/pins, explicit workflow policy and registry shapes.
+/// Separate from verify so minimal adoption fixtures retain their hash-only contract.
+fn project_conformance(root: &Path) -> Result<(), String> {
+    let cargo = toml_file(root, "Cargo.toml")?;
+    let workspace = toml_at(&cargo, &["workspace"]);
+    let package = toml_at(workspace, &["package"]);
+    if toml_at(workspace, &["resolver"]).as_str() != Some("3")
+        || toml_at(package, &["edition"]).as_str() != Some("2024")
+        || toml_at(package, &["publish"]).as_bool() != Some(false)
+    {
+        return Err("Cargo workspace requires resolver 3, edition 2024 and publish=false".into());
+    }
+    let version = toml_at(package, &["version"])
+        .as_str()
+        .filter(|v| !v.is_empty())
+        .ok_or("workspace package version is missing")?;
+    let channel = toml_at(package, &["rust-version"])
+        .as_str()
+        .ok_or("workspace rust-version is missing")?;
+    if channel.split('.').count() != 3
+        || channel.split('.').any(|part| part.parse::<u32>().is_err())
+    {
+        return Err("workspace rust-version must pin a full stable toolchain".into());
+    }
+    let toolchain = toml_file(root, "rust-toolchain.toml")?;
+    if toml_at(&toolchain, &["toolchain", "channel"]).as_str() != Some(channel) {
+        return Err("rust-toolchain.toml must match workspace rust-version".into());
+    }
+    for component in ["rustfmt", "clippy"] {
+        if !toml_at(&toolchain, &["toolchain", "components"])
+            .as_array()
+            .is_some_and(|list| list.iter().any(|value| value.as_str() == Some(component)))
+        {
+            return Err(format!("pinned toolchain must include {component}"));
+        }
+    }
+    if toml_at(workspace, &["lints", "rust", "unsafe_op_in_unsafe_fn"]).as_str() != Some("deny")
+        || toml_at(
+            workspace,
+            &["lints", "clippy", "undocumented_unsafe_blocks"],
+        )
+        .as_str()
+            != Some("deny")
+    {
+        return Err("workspace must deny unsafe operations and undocumented unsafe blocks".into());
+    }
+    let declaration = toml_file(root, FAMILY_PATH)?;
+    let product = toml_at(&declaration, &["product"])
+        .as_str()
+        .ok_or("family product is missing")?;
+    let mut product_found = false;
+    for member in toml_at(workspace, &["members"])
+        .as_array()
+        .ok_or("workspace members are missing")?
+    {
+        let member = member
+            .as_str()
+            .ok_or("workspace member must be a relative path")?;
+        if !Path::new(member)
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err("workspace member must stay inside the repository".into());
+        }
+        let path = format!("{member}/Cargo.toml");
+        let manifest = toml_file(root, &path)?;
+        if toml_at(&manifest, &["package", "name"]).as_str() == Some(product) {
+            product_found = true;
+        }
+        for field in ["version", "edition", "publish", "license", "rust-version"] {
+            if toml_at(&manifest, &["package", field, "workspace"]).as_bool() != Some(true) {
+                return Err(format!(
+                    "{path} must inherit package.{field} from workspace ({version})"
+                ));
+            }
+        }
+        if toml_at(&manifest, &["lints", "workspace"]).as_bool() != Some(true) {
+            return Err(format!("{path} must inherit workspace lints"));
+        }
+    }
+    if !product_found {
+        return Err("family product must name a workspace package".into());
+    }
+    let rmcp = toml_at(workspace, &["dependencies", "rmcp", "version"])
+        .as_str()
+        .and_then(|version| version.strip_prefix('='))
+        .ok_or("rmcp must use an exact =version pin")?;
+    let lock = toml_file(root, "Cargo.lock")?;
+    if !toml_at(&lock, &["package"])
+        .as_array()
+        .is_some_and(|packages| {
+            packages.iter().any(|package| {
+                toml_at(package, &["name"]).as_str() == Some("rmcp")
+                    && toml_at(package, &["version"]).as_str() == Some(rmcp)
+            })
+        })
+    {
+        return Err("Cargo.lock rmcp version must match the exact workspace pin".into());
+    }
+    let workflows = std::fs::read_dir(root.join(".github/workflows"))
+        .map_err(|_| "workflow directory is unreadable")?;
+    let mut count = 0;
+    for entry in workflows {
+        let entry = entry.map_err(|_| "workflow directory entry is unreadable")?;
+        let path = entry.path();
+        if !matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("yml" | "yaml")
+        ) {
+            continue;
+        }
+        count += 1;
+        let text = std::fs::read_to_string(&path).map_err(|_| "workflow is unreadable")?;
+        workflow_structure(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    }
+    if count == 0 {
+        return Err("at least one GitHub workflow is required".into());
+    }
+    for path in ["schemas/tools.json", "schemas/worker-tools.json"] {
+        let bytes = std::fs::read(root.join(path)).map_err(|_| format!("{path} is unreadable"))?;
+        let registry: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| format!("{path} is invalid JSON"))?;
+        registry_structure(&registry).map_err(|error| format!("{path}: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Enforces full SHA pins for remote uses entries and an explicit top-level
+/// permissions mapping. This supports the repository's plain YAML keys and
+/// does not interpret actions, shell bodies or claim effective runtime authority.
+fn workflow_structure(text: &str) -> Result<(), String> {
+    if !text
+        .lines()
+        .any(|line| line == "permissions:" || line.trim_end() == "permissions: {}")
+    {
+        return Err("workflow must declare top-level permissions explicitly".into());
+    }
+    let lines: Vec<_> = text.lines().collect();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let action = trimmed
+            .strip_prefix("- uses:")
+            .or_else(|| trimmed.strip_prefix("uses:"));
+        if let Some(action) = action {
+            let action = action
+                .split('#')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_matches(['"', '\'']);
+            if action.starts_with("./") {
+                continue;
+            }
+            let (_, pin) = action
+                .rsplit_once('@')
+                .ok_or("remote action must pin a full commit SHA")?;
+            if pin.len() != 40 || !pin.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err("remote action must pin a full commit SHA".into());
+            }
+        }
+        if trimmed == "permissions:" {
+            let indent = line.len() - line.trim_start().len();
+            let mut entries = 0;
+            for permission in &lines[index + 1..] {
+                let value = permission.trim();
+                if value.is_empty() || value.starts_with('#') {
+                    continue;
+                }
+                if permission.len() - permission.trim_start().len() <= indent {
+                    break;
+                }
+                let (_, access) = value
+                    .split_once(':')
+                    .ok_or("permissions must use mapping entries")?;
+                let access = access.split('#').next().unwrap_or("").trim();
+                if !matches!(access, "read" | "write" | "none") {
+                    return Err("permission access must be read, write or none".into());
+                }
+                entries += 1;
+            }
+            if entries == 0 {
+                return Err("empty permissions must be an explicit {} mapping".into());
+            }
+        }
+        if trimmed.starts_with("permissions:")
+            && !matches!(trimmed, "permissions:" | "permissions: {}")
+        {
+            return Err(
+                "permissions must use an explicit mapping, never read-all/write-all".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Checks exported catalog syntax and typed hint fields only, never inferring
+/// idempotency or write safety from their presence.
+fn registry_structure(registry: &serde_json::Value) -> Result<(), String> {
+    let mut names = std::collections::BTreeSet::new();
+    for tool in registry.as_array().ok_or("registry must be a JSON array")? {
+        let name = tool["name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .ok_or("tool name is missing")?;
+        if !names.insert(name) {
+            return Err("tool names must be unique".into());
+        }
+        if !tool["description"].is_string()
+            || tool["inputSchema"]["type"] != "object"
+            || tool["inputSchema"]["additionalProperties"] != false
+        {
+            return Err(format!(
+                "{name} requires a description and closed object input schema"
+            ));
+        }
+        let properties = tool["inputSchema"]["properties"]
+            .as_object()
+            .ok_or("schema properties must be an object")?;
+        if let Some(required) = tool["inputSchema"].get("required") {
+            let mut keys = std::collections::BTreeSet::new();
+            for field in required
+                .as_array()
+                .ok_or("schema required must be an array")?
+            {
+                let field = field.as_str().ok_or("required names must be strings")?;
+                if !properties.contains_key(field) || !keys.insert(field) {
+                    return Err("required fields must be unique declared properties".into());
+                }
+            }
+        }
+        for hint in [
+            "readOnlyHint",
+            "destructiveHint",
+            "idempotentHint",
+            "openWorldHint",
+        ] {
+            if !tool["annotations"][hint].is_boolean() {
+                return Err(format!("{name} annotation {hint} must be boolean"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Rewrites the pinned digests of the currently managed files.
 ///
 /// The path list itself is deliberately not touched: adding or removing a
@@ -247,6 +519,119 @@ pub fn contract(root: &Path, export: bool) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    /// Builds just the structural Cargo/workflow/catalog fixture, keeping the
+    /// existing minimal digest-verification fixtures independent.
+    fn structural_fixture(root: &std::path::Path) {
+        adopted(
+            root,
+            "Cargo.toml",
+            r#"[workspace]
+    members = ["crates/agent-run"]
+    resolver = "3"
+    [workspace.package]
+    version = "1.2.3"
+    edition = "2024"
+    publish = false
+    license = "MIT"
+    rust-version = "1.98.1"
+    [workspace.dependencies]
+    rmcp = {version = "=3.4.0"}
+    [workspace.lints.rust]
+    unsafe_op_in_unsafe_fn = "deny"
+    [workspace.lints.clippy]
+    undocumented_unsafe_blocks = "deny"
+    "#,
+        );
+        adopted(
+            root,
+            "crates/agent-run/Cargo.toml",
+            r#"[package]
+    name = "agent-run"
+    version.workspace = true
+    edition.workspace = true
+    publish.workspace = true
+    license.workspace = true
+    rust-version.workspace = true
+    [lints]
+    workspace = true
+    "#,
+        );
+        adopted(root, "family.toml", "product = 'agent-run'\n");
+        adopted(
+            root,
+            "rust-toolchain.toml",
+            "[toolchain]\nchannel = '1.98.1'\ncomponents = ['rustfmt', 'clippy']\n",
+        );
+        adopted(
+            root,
+            "Cargo.lock",
+            "[[package]]\nname = 'rmcp'\nversion = '3.4.0'\n",
+        );
+        adopted(
+            root,
+            ".github/workflows/ci.yml",
+            "permissions:\n  contents: read\njobs:\n  check:\n    steps:\n      - uses: actions/checkout@0123456789012345678901234567890123456789\n",
+        );
+        super::contract(root, true).unwrap();
+    }
+
+    /// Structural checks reject actual missing/drifting declarations without
+    /// rewriting them or turning absent fields into a panic.
+    #[test]
+    fn structural_conformance_rejects_pins_and_inheritance_drift() {
+        let root = tempdir().unwrap();
+        structural_fixture(root.path());
+        super::project_conformance(root.path()).unwrap();
+        for (path, before, after) in [
+            ("Cargo.toml", "resolver = \"3\"", "resolver = \"2\""),
+            ("Cargo.toml", "edition = \"2024\"", "edition = \"2021\""),
+            ("Cargo.toml", "publish = false", "publish = true"),
+            ("Cargo.toml", "version = \"=3.4.0\"", "version = \"3.4.0\""),
+            (
+                "crates/agent-run/Cargo.toml",
+                "workspace = true",
+                "workspace = false",
+            ),
+            ("rust-toolchain.toml", "1.98.1", "stable"),
+            ("Cargo.lock", "3.4.0", "3.3.0"),
+            (
+                ".github/workflows/ci.yml",
+                "0123456789012345678901234567890123456789",
+                "v7",
+            ),
+            (
+                ".github/workflows/ci.yml",
+                "contents: read",
+                "contents: unknown",
+            ),
+        ] {
+            let target = root.path().join(path);
+            let original = fs::read_to_string(&target).unwrap();
+            let changed = original.replacen(before, after, 1);
+            assert_ne!(changed, original);
+            fs::write(&target, &changed).unwrap();
+            assert!(super::project_conformance(root.path()).is_err(), "{path}");
+            assert_eq!(fs::read_to_string(&target).unwrap(), changed);
+            fs::write(target, original).unwrap();
+        }
+        adopted(root.path(), "Cargo.toml", "");
+        assert!(super::project_conformance(root.path()).is_err());
+    }
+
+    /// Catalog checks validate syntactic required keys and boolean hints only;
+    /// no annotation proves that an operation is actually idempotent or safe.
+    #[test]
+    fn registry_shape_rejects_undeclared_required_and_untyped_hints() {
+        let mut tools = serde_json::json!(agent_run_domain::tools::tools_json());
+        super::registry_structure(&tools).unwrap();
+        tools[0]["inputSchema"]["required"] = json!(["undeclared"]);
+        assert!(super::registry_structure(&tools).is_err());
+        let mut tools = serde_json::json!(agent_run_domain::tools::worker_tools_json());
+        super::registry_structure(&tools).unwrap();
+        tools[0]["annotations"]["idempotentHint"] = json!("true");
+        assert!(super::registry_structure(&tools).is_err());
+    }
+
     use super::{MANIFEST_PATH, Manifest, verify};
     use serde_json::json;
     use std::fs;
