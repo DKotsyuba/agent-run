@@ -3,7 +3,12 @@ Selected exports from the Agent MCP family template
 
 `scaffold-family.toml` is a verbatim copy of `scaffold/family.toml` exported
 from the private family template repository `DKotsyuba/agent-mcp-template`
-(template commit 7f094e0463c0a6d5cf52d68d91ca32f6bc0f465f). It is the only
+(template commit 65c11cf73b2c02adc930e6db62445d3d4966a99b, release 0.2.1).
+The previous baseline, reviewed at 7f094e0463c0a6d5cf52d68d91ca32f6bc0f465f,
+is preserved in Git history. This update was compared before applying; it adds
+the template's declared protocol revisions and changes no product-owned code.
+The export still declares scaffold devkit 0.2.0, exactly as upstream does;
+the product records the reviewed devkit release 0.2.1 separately. It is the only
 template file selected for this adoption. Its bytes are retained so future
 template updates can run an honest three-way review
 (adopted baseline, current repository file, next template

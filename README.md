@@ -44,6 +44,19 @@ wget -qO- https://github.com/DKotsyuba/agent-run/releases/latest/download/instal
 **Availability:** the installer is included starting with 0.14.0.
 Releases through 0.13.3 do not contain its script/helper.
 
+The current bootstrap requires trusted `gh`, `jq`, `tar` and a SHA-256 utility.
+`curl` and `wget` can download the entrypoint or payload, but GitHub CLI still
+verifies the expected repository, workflow, annotated tag and full source commit
+against the payload's attestation before the installation helper executes.
+Private downloads require an existing GitHub CLI authentication; the installer
+does not install tools or sign in automatically.
+
+The one-line command executes GitHub's current bootstrap over HTTPS. For a
+reviewable entrypoint, download `install.sh` from an exact release tag and inspect
+it before running it. This bootstrap requires the external family release
+manifest; older releases retain their own version-bound installers and sealed
+directory rollback support. It never silently falls back to checksum-only trust.
+
 The installer verifies the download and release manifest, retains immutable
 versions under `~/.agent-run/standalone/releases`, and places a launcher in
 `~/.local/bin`. Add that directory to `PATH`. No Cargo, Python or sudo is needed.

@@ -18,10 +18,17 @@ use std::{
 pub const REPOSITORY_ID: u64 = 1348534205;
 /// Canonical official repository; caller-controlled URLs are not accepted.
 pub const REPOSITORY: &str = "DKotsyuba/agent-run";
+/// Reviewed immutable release workflow identity.
+pub const WORKFLOW_ID: u64 = 346709607;
+/// Reviewed release producer path.
+pub const WORKFLOW_PATH: &str = ".github/workflows/release.yml";
 /// External identity filename; never included in its own payload hash list.
 pub const MANIFEST: &str = "release-manifest.json";
 /// Scoped check evidence, hashed as an ordinary manifest artifact.
 pub const ACCEPTANCE: &str = "acceptance.json";
+/// Best-effort cancellation shared by the foreground observer and owned tools.
+pub(crate) static CANCELLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// One actual GitHub workflow invocation; local builds use null instead.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -97,6 +104,9 @@ pub struct Acceptance {
     pub checks: Vec<Check>,
     /// This producer never invents host qualification.
     pub qualified_hosts: Vec<String>,
+    /// Exact bundle whose disposable installation/smoke was actually observed.
+    #[serde(default)]
+    pub payload: Option<Artifact>,
 }
 
 /// One exact named payload in the external inventory.
@@ -153,12 +163,12 @@ pub struct Manifest {
 impl Manifest {
     /// Projects source fields only. Explicit local evidence remains usable for
     /// build checks but cannot become a shared published manifest with fake IDs.
-    fn from_identity(id: &Identity, artifacts: Vec<Artifact>) -> Result<Self, String> {
+    pub(crate) fn from_identity(id: &Identity, artifacts: Vec<Artifact>) -> Result<Self, String> {
         Ok(Self { schema_version: 1, product: id.product.clone(), version: id.version.clone(),
             tag: id.tag.clone(), repository: id.repository.clone(), repository_id: id.repository_id,
             commit: id.commit.clone(), workflow: id.workflow.clone().ok_or("published manifest requires actual workflow identity; local evidence is not publication")?,
             standard_version: id.standard_version.clone(), devkit_version: id.devkit_version.clone(),
-            baseline: id.baseline.clone(), trust_profile: "github-authenticated".into(), artifacts })
+            baseline: id.baseline.clone(), trust_profile: "github-attestation".into(), artifacts })
     }
 }
 
@@ -198,18 +208,59 @@ pub(crate) fn run(
     cwd: &Path,
     timeout: Duration,
 ) -> Result<(i32, Vec<u8>, Vec<u8>), String> {
+    run_io(program, arguments, cwd, timeout, None)
+}
+
+/// Executes owned bounded tooling; optional stdin is an already-created regular
+/// event file. GitHub downloads additionally have a per-file 512 MiB hard limit.
+/// Non-GitHub children never inherit release token environment variables.
+pub(crate) fn run_io(
+    program: &str,
+    arguments: &[String],
+    cwd: &Path,
+    timeout: Duration,
+    input: Option<&Path>,
+) -> Result<(i32, Vec<u8>, Vec<u8>), String> {
     let deadline = Instant::now() + timeout;
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(arguments)
         .current_dir(cwd)
         .process_group(0)
         .env_remove("AGENT_RUN_WORKER_TOKEN")
-        .stdin(Stdio::null())
+        .stdin(match input {
+            Some(path) => Stdio::from(fs::File::open(path).map_err(|_| "event stdin unavailable")?),
+            None => Stdio::null(),
+        })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| "external tool unavailable")?;
+        .stderr(Stdio::piped());
+    if program != "gh" {
+        for name in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+        ] {
+            command.env_remove(name);
+        }
+    } else {
+        command.env("GH_HOST", "github.com");
+        // SAFETY: setrlimit is async-signal-safe and only affects this owned child.
+        unsafe {
+            command.pre_exec(|| {
+                let bound = libc::rlimit {
+                    rlim_cur: 512 * 1024 * 1024,
+                    rlim_max: 512 * 1024 * 1024,
+                };
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &bound) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let child = command.spawn().map_err(|_| "external tool unavailable")?;
     let mut process = Process {
         owner: agent_run_platform::process::OwnedProcess::capture(child.id() as i32),
         child,
@@ -260,6 +311,9 @@ pub(crate) fn run(
                 streams[1].take().ok_or("stderr missing")?,
             ));
         }
+        if CANCELLED.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
         if Instant::now() >= deadline {
             return Err("external tool deadline exceeded".into());
         }
@@ -268,7 +322,7 @@ pub(crate) fn run(
 }
 
 /// Runs a small read-only Git query with a finite deadline.
-fn git(root: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     let args = args.iter().map(|s| (*s).into()).collect::<Vec<_>>();
     let (code, out, _) = run("git", &args, root, Duration::from_secs(15))?;
     if code != 0 {
@@ -301,23 +355,29 @@ pub fn identity(root: &Path, accepted: &str) -> Result<Identity, String> {
         .map_err(|_| "invalid Cargo")?,
     )
     .map_err(|_| "Cargo identity failed")?;
-    let family: toml::Value = toml::from_str(
-        &fs::read_to_string(root.join("family.toml")).map_err(|_| "family unavailable")?,
+    let family: Value = serde_json::to_value(
+        toml::from_str::<toml::Value>(
+            &fs::read_to_string(root.join("family.toml")).map_err(|_| "family unavailable")?,
+        )
+        .map_err(|_| "invalid family")?,
     )
-    .map_err(|_| "invalid family")?;
+    .map_err(|_| "invalid family value")?;
     let version = cargo["workspace"]["package"]["version"]
         .as_str()
         .ok_or("workspace version missing")?
         .to_owned();
-    let toolchain: toml::Value = toml::from_str(
-        &fs::read_to_string(root.join("rust-toolchain.toml"))
-            .map_err(|_| "toolchain unavailable")?,
+    let toolchain: Value = serde_json::to_value(
+        toml::from_str::<toml::Value>(
+            &fs::read_to_string(root.join("rust-toolchain.toml"))
+                .map_err(|_| "toolchain unavailable")?,
+        )
+        .map_err(|_| "invalid toolchain")?,
     )
-    .map_err(|_| "invalid toolchain")?;
+    .map_err(|_| "invalid toolchain value")?;
     let field = |name: &str| {
         family
             .get(name)
-            .and_then(toml::Value::as_str)
+            .and_then(Value::as_str)
             .map(str::to_owned)
             .ok_or_else(|| format!("family {name} missing"))
     };
@@ -338,6 +398,30 @@ pub fn identity(root: &Path, accepted: &str) -> Result<Identity, String> {
         devkit_version: field("devkit_version")?,
         baseline: field("baseline")?,
     };
+    let (compiler_code, compiler_version, _) = run(
+        "rustc",
+        &["--version".into()],
+        root,
+        Duration::from_secs(15),
+    )?;
+    if compiler_code != 0
+        || !String::from_utf8_lossy(&compiler_version)
+            .starts_with(&format!("rustc {} ", id.toolchain))
+    {
+        return Err("effective compiler/pinned toolchain mismatch".into());
+    }
+    if family["release"]["enabled"].as_bool() != Some(true)
+        || family["release"]["trust_profile"].as_str() != Some("github-attestation")
+        || !family["compatibility"]["qualified_targets"]
+            .as_array()
+            .is_some_and(|targets| {
+                targets
+                    .iter()
+                    .any(|target| target.as_str() == Some(&id.target))
+            })
+    {
+        return Err("release disabled/unqualified target/trust conflict".into());
+    }
     if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
         let number = |name: &str| {
             std::env::var(name)
@@ -359,7 +443,13 @@ pub fn identity(root: &Path, accepted: &str) -> Result<Identity, String> {
             return Err("annotated tag identity mismatch".into());
         }
         id.workflow = Some(Workflow {
-            id: number("AGENT_RUN_WORKFLOW_ID")?,
+            id: {
+                let actual = number("AGENT_RUN_WORKFLOW_ID")?;
+                if actual != WORKFLOW_ID {
+                    return Err("reviewed workflow identity mismatch".into());
+                }
+                actual
+            },
             path: ".github/workflows/release.yml".into(),
             run_id: number("GITHUB_RUN_ID")?,
             run_attempt: number("GITHUB_RUN_ATTEMPT")?,
@@ -368,20 +458,32 @@ pub fn identity(root: &Path, accepted: &str) -> Result<Identity, String> {
     Ok(id)
 }
 
-/// Writes only create-new evidence/metadata with private permissions.
-fn create_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|_| "evidence destination exists/unavailable")?;
+/// Atomically publishes create-new private JSON after file fsync, then fsyncs
+/// its directory. Existing files/symlinks are refused without replacing bytes.
+pub(crate) fn create_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut file = tempfile::Builder::new()
+        .prefix(".release-record-")
+        .tempfile_in(parent)
+        .map_err(|_| "evidence scratch unavailable")?;
+    use std::os::unix::fs::PermissionsExt;
+    file.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|_| "evidence permissions failed")?;
     let mut bytes =
         serde_json::to_vec_pretty(value).map_err(|_| "evidence serialization failed")?;
     bytes.push(b'\n');
     file.write_all(&bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|_| "evidence write failed".into())
+        .and_then(|()| file.as_file().sync_all())
+        .map_err(|_| "evidence write failed")?;
+    file.persist_noclobber(path)
+        .map_err(|_| "evidence destination exists/unavailable")?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| "evidence directory sync failed".into())
 }
 
 /// Records an actually executed check against one immutable source/run identity.
@@ -395,10 +497,12 @@ pub fn accept(
     let id = identity(root, accepted)?;
     let (program, args) = command.split_first().ok_or("check argv required")?;
     let (code, stdout, stderr) = run(program, args, root, Duration::from_secs(3600))?;
+    if identity(root, accepted)? != id {
+        return Err("check changed accepted source identity".into());
+    }
     let mut evidence = if output.exists() {
-        let evidence: Acceptance =
-            serde_json::from_slice(&fs::read(output).map_err(|_| "evidence unavailable")?)
-                .map_err(|_| "invalid evidence")?;
+        let evidence: Acceptance = serde_json::from_slice(&read_regular(output, 262144)?)
+            .map_err(|_| "invalid evidence")?;
         if evidence.identity != id {
             return Err("evidence identity/attempt conflict".into());
         }
@@ -415,8 +519,12 @@ pub fn accept(
             identity: id,
             checks: Vec::new(),
             qualified_hosts: Vec::new(),
+            payload: None,
         }
     };
+    if evidence.checks.len() >= 64 {
+        return Err("acceptance check count limit exceeded".into());
+    }
     evidence
         .checks
         .push(check_record(command, code, &stdout, &stderr)?);
@@ -435,8 +543,9 @@ pub fn accept(
 }
 
 /// Checks identity and exact finite manifest inventory without trusting filenames.
-fn validate(manifest: &Manifest) -> Result<(), String> {
+pub(crate) fn validate(manifest: &Manifest) -> Result<(), String> {
     let id = manifest;
+    crate::release_ops::version(&id.version)?;
     if manifest.schema_version != 1
         || id.product != "agent-run"
         || id.repository != REPOSITORY
@@ -447,13 +556,15 @@ fn validate(manifest: &Manifest) -> Result<(), String> {
             .commit
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        || manifest.trust_profile != "github-authenticated"
+        || manifest.trust_profile != "github-attestation"
+        || [&id.standard_version, &id.devkit_version, &id.baseline]
+            .iter()
+            .any(|value| value.is_empty() || value.len() > 128)
     {
         return Err("release identity/trust policy mismatch".into());
     }
     let w = &id.workflow;
-    if w.id == 0 || w.run_id == 0 || w.run_attempt == 0 || w.path != ".github/workflows/release.yml"
-    {
+    if w.id != WORKFLOW_ID || w.run_id == 0 || w.run_attempt == 0 || w.path != WORKFLOW_PATH {
         return Err("invalid workflow identity".into());
     }
     if manifest.artifacts.len() != 4 {
@@ -479,6 +590,16 @@ fn validate(manifest: &Manifest) -> Result<(), String> {
         {
             return Err("unsafe/duplicate release inventory".into());
         }
+        let fixed_name = match a.kind.as_str() {
+            "bundle" => format!("agent-run-{}-aarch64-apple-darwin.tar.gz", id.version),
+            "source" => format!("agent-run-{}-source.tar", id.version),
+            "installer" => "install.sh".into(),
+            "evidence" => ACCEPTANCE.into(),
+            _ => return Err("unknown artifact kind".into()),
+        };
+        if a.name != fixed_name || (a.kind != "bundle" && a.target.is_some()) {
+            return Err("artifact name/target layout mismatch".into());
+        }
         if a.kind == "bundle"
             && (a.target.as_deref() != Some("aarch64-apple-darwin")
                 || a.name != format!("agent-run-{}-aarch64-apple-darwin.tar.gz", id.version))
@@ -503,10 +624,9 @@ fn validate(manifest: &Manifest) -> Result<(), String> {
 /// Existing directories/manifests are never overwritten; no self-hash cycle.
 pub fn create(root: &Path, directory: &Path, accepted: &str) -> Result<(), String> {
     let id = identity(root, accepted)?;
-    let evidence: Acceptance = serde_json::from_slice(
-        &fs::read(directory.join(ACCEPTANCE)).map_err(|_| "acceptance missing")?,
-    )
-    .map_err(|_| "invalid acceptance")?;
+    let evidence: Acceptance =
+        serde_json::from_slice(&read_regular(&directory.join(ACCEPTANCE), 262144)?)
+            .map_err(|_| "invalid acceptance")?;
     if evidence.identity != id
         || !evidence_ready(&evidence)
         || evidence.checks.iter().any(|c| c.exit_code != 0)
@@ -570,7 +690,23 @@ pub fn verify(
     accepted: &str,
     workflow: Option<&Workflow>,
 ) -> Result<Manifest, String> {
-    let bytes = fs::read(directory.join(MANIFEST)).map_err(|_| "manifest missing")?;
+    verify_until(
+        directory,
+        accepted,
+        workflow,
+        Instant::now() + Duration::from_secs(600),
+    )
+}
+
+/// Verifies the same finite inventory under an enclosing observer/publisher
+/// deadline; no downloaded executable is run. Plain metadata reads are capped.
+pub(crate) fn verify_until(
+    directory: &Path,
+    accepted: &str,
+    workflow: Option<&Workflow>,
+    deadline: Instant,
+) -> Result<Manifest, String> {
+    let bytes = read_regular(&directory.join(MANIFEST), 65536)?;
     if bytes.len() > 65536 {
         return Err("manifest byte limit exceeded".into());
     }
@@ -581,10 +717,13 @@ pub fn verify(
         return Err("accepted source/run/attempt mismatch".into());
     }
     let mut expected = BTreeSet::from([MANIFEST.to_owned(), "SHA256SUMS".to_owned()]);
-    let checksums =
-        fs::read_to_string(directory.join("SHA256SUMS")).map_err(|_| "checksums missing")?;
+    let checksums = String::from_utf8(read_regular(&directory.join("SHA256SUMS"), 4096)?)
+        .map_err(|_| "checksums invalid UTF-8")?;
     let mut hashes = String::new();
     for a in &manifest.artifacts {
+        if Instant::now() >= deadline || CANCELLED.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("verification deadline/cancelled".into());
+        }
         expected.insert(a.name.clone());
         let path = directory.join(&a.name);
         let metadata = fs::symlink_metadata(&path).map_err(|_| "asset missing")?;
@@ -596,7 +735,7 @@ pub fn verify(
         }
         hashes.push_str(&format!("{}  {}\n", a.sha256, a.name));
         if a.kind == "bundle" {
-            crate::tar_guard::inspect(&path, true)?;
+            crate::tar_guard::inspect_until(&path, true, deadline)?;
             let temporary = tempfile::tempdir().map_err(|_| "private extraction unavailable")?;
             let args = vec![
                 "-xzf".into(),
@@ -606,21 +745,30 @@ pub fn verify(
                 "--no-same-owner".into(),
                 "--no-same-permissions".into(),
             ];
-            if run("tar", &args, directory, Duration::from_secs(120))?.0 != 0 {
+            if run(
+                "tar",
+                &args,
+                directory,
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(120)),
+            )?
+            .0 != 0
+            {
                 return Err("payload extraction failed".into());
             }
             crate::release::verify(temporary.path())?;
-            let metadata: Value = serde_json::from_slice(
-                &fs::read(temporary.path().join("metadata.json"))
-                    .map_err(|_| "payload metadata missing")?,
-            )
+            let metadata: Value = serde_json::from_slice(&read_regular(
+                &temporary.path().join("metadata.json"),
+                65536,
+            )?)
             .map_err(|_| "payload metadata invalid")?;
             if metadata["version"].as_str() != Some(&manifest.version) {
                 return Err("internal/external version mismatch".into());
             }
         }
         if a.kind == "source" {
-            crate::tar_guard::inspect(&path, false)?;
+            crate::tar_guard::inspect_until(&path, false, deadline)?;
         }
     }
     hashes.push_str(&format!("{}  {MANIFEST}\n", digest_bytes(&bytes)));
@@ -635,10 +783,9 @@ pub fn verify(
     if actual != expected {
         return Err("unexpected release inventory entry".into());
     }
-    let evidence: Acceptance = serde_json::from_slice(
-        &fs::read(directory.join(ACCEPTANCE)).map_err(|_| "acceptance missing")?,
-    )
-    .map_err(|_| "invalid acceptance")?;
+    let evidence: Acceptance =
+        serde_json::from_slice(&read_regular(&directory.join(ACCEPTANCE), 262144)?)
+            .map_err(|_| "invalid acceptance")?;
     if evidence.schema_version != 1
         || Manifest::from_identity(&evidence.identity, manifest.artifacts.clone())? != manifest
         || evidence.scope
@@ -648,32 +795,78 @@ pub fn verify(
                 "local"
             }
         || !evidence_ready(&evidence)
-        || evidence
-            .checks
-            .iter()
-            .any(|c| c.exit_code != 0 || c.stdout_sha256.len() != 64 || c.stderr_sha256.len() != 64)
+        || evidence.payload.as_ref() != manifest.artifacts.iter().find(|a| a.kind == "bundle")
+        || evidence.identity.target != "aarch64-apple-darwin"
+        || evidence.identity.toolchain.is_empty()
+        || evidence.checks.len() > 64
+        || evidence.checks.iter().any(|c| {
+            c.exit_code != 0
+                || [&c.argv_sha256, &c.stdout_sha256, &c.stderr_sha256]
+                    .iter()
+                    .any(|hash| {
+                        hash.len() != 64
+                            || !hash
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    })
+        })
         || !evidence.qualified_hosts.is_empty()
     {
         return Err("acceptance mismatch or failed check".into());
     }
+    if Instant::now() >= deadline || CANCELLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("verification deadline/cancelled".into());
+    }
     Ok(manifest)
+}
+
+/// Reads a capped regular metadata descriptor without following symlinks.
+/// A concurrent growth can read at most maximum+1 bytes before refusal.
+pub(crate) fn read_regular(path: &Path, maximum: u64) -> Result<Vec<u8>, String> {
+    let input = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| "metadata file unavailable")?;
+    let metadata = input
+        .metadata()
+        .map_err(|_| "metadata descriptor unavailable")?;
+    if !metadata.is_file() || metadata.len() > maximum {
+        return Err("metadata file type/size refused".into());
+    }
+    let mut bytes = Vec::new();
+    input
+        .take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "metadata read failed")?;
+    if bytes.len() as u64 > maximum {
+        return Err("metadata byte limit exceeded".into());
+    }
+    Ok(bytes)
 }
 
 /// Requires actual successful outcomes for all reviewed producer categories.
 fn evidence_ready(evidence: &Acceptance) -> bool {
-    ["workspace", "native-build", "source-archive", "integration"]
-        .iter()
-        .all(|id| {
-            evidence
-                .checks
-                .iter()
-                .any(|c| c.check_id == *id && c.exit_code == 0)
-        })
+    [
+        "workspace",
+        "native-build",
+        "source-archive",
+        "integration",
+        "dependency-policy",
+        "exact-payload",
+    ]
+    .iter()
+    .all(|id| {
+        evidence
+            .checks
+            .iter()
+            .any(|c| c.check_id == *id && c.exit_code == 0)
+    })
 }
 
 /// Produces a fixed public check category plus a digest of exact private argv.
 /// Custom argv never become command declarations or unbounded public strings.
-fn check_record(
+pub(crate) fn check_record(
     command: &[String],
     code: i32,
     stdout: &[u8],
@@ -701,6 +894,8 @@ fn check_record(
         ]
     {
         "integration"
+    } else if command == ["cargo", "deny", "--offline", "--locked", "check"] {
+        "dependency-policy"
     } else {
         "custom"
     };
@@ -722,7 +917,21 @@ pub fn command(root: &Path, args: &[String]) -> Result<(), String> {
             .map(|p| p[1].clone())
             .ok_or_else(|| format!("{name} required"))
     };
+    if args.first().map(String::as_str) == Some("verify")
+        && args.iter().any(|arg| arg == "--artifact")
+    {
+        if args.len() != 3 || args[1] != "--artifact" {
+            return Err("usage: package verify --artifact ARCHIVE".into());
+        }
+        return crate::release_ops::verify_archive(root, Path::new(&field("--artifact")?));
+    }
     let commit = field("--accepted-commit")?;
+    if args.first().map(String::as_str) == Some("merge-evidence") {
+        return crate::release_ops::merge_evidence(root, args, &commit);
+    }
+    if args.first().map(String::as_str) == Some("smoke") {
+        return crate::release_ops::smoke(root, Path::new(&field("--directory")?), &commit);
+    }
     match args.first().map(String::as_str) {
         Some("accept") => {
             let split = args
@@ -739,10 +948,8 @@ pub fn command(root: &Path, args: &[String]) -> Result<(), String> {
         Some("create") => create(root, Path::new(&field("--directory")?), &commit),
         Some("verify") => {
             let dir = PathBuf::from(field("--directory")?);
-            let w: Manifest = serde_json::from_slice(
-                &fs::read(dir.join(MANIFEST)).map_err(|_| "manifest missing")?,
-            )
-            .map_err(|_| "invalid manifest")?;
+            let w: Manifest = serde_json::from_slice(&read_regular(&dir.join(MANIFEST), 65536)?)
+                .map_err(|_| "invalid manifest")?;
             let expected = Workflow {
                 id: field("--workflow-id")?
                     .parse()
@@ -777,7 +984,7 @@ mod tests {
             repository_id: REPOSITORY_ID,
             commit: "a".repeat(40),
             workflow: Some(Workflow {
-                id: 7,
+                id: WORKFLOW_ID,
                 path: ".github/workflows/release.yml".into(),
                 run_id: 11,
                 run_attempt: 2,
@@ -874,6 +1081,7 @@ mod tests {
             scope: "local".into(),
             checks: vec![],
             qualified_hosts: vec![],
+            payload: None,
         };
         let value = serde_json::to_value(evidence).unwrap();
         assert!(value["identity"]["workflow"].is_null());
@@ -882,6 +1090,46 @@ mod tests {
         let mut bad = manifest;
         bad.workflow.run_attempt = 0;
         assert!(validate(&bad).is_err());
+    }
+
+    /// Fixed inventory layout and closed JSON refuse semantically different assets,
+    /// metadata links and limit+1 reads before any large allocation/deserialization.
+    #[test]
+    fn fixed_layout_closed_fields_and_metadata_limits() {
+        let id = fixture_identity();
+        let artifacts = [
+            ("bundle", "agent-run-0.19.4-aarch64-apple-darwin.tar.gz"),
+            ("source", "agent-run-0.19.4-source.tar"),
+            ("installer", "install.sh"),
+            ("evidence", ACCEPTANCE),
+        ]
+        .into_iter()
+        .map(|(kind, name)| Artifact {
+            name: name.into(),
+            kind: kind.into(),
+            target: (kind == "bundle").then(|| id.target.clone()),
+            size: 1,
+            sha256: "b".repeat(64),
+        })
+        .collect();
+        let manifest = Manifest::from_identity(&id, artifacts).unwrap();
+        let mut wrong = manifest.clone();
+        wrong.artifacts[1].name = "wrong-source.tar".into();
+        assert!(validate(&wrong).is_err());
+        let mut wrong = manifest.clone();
+        wrong.artifacts[2].target = Some(id.target);
+        assert!(validate(&wrong).is_err());
+        let mut wrong = serde_json::to_value(&manifest).unwrap();
+        wrong["unknown"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Manifest>(wrong).is_err());
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("metadata");
+        fs::write(&file, vec![b'x'; 65536]).unwrap();
+        assert!(read_regular(&file, 65536).is_ok());
+        fs::write(&file, vec![b'x'; 65537]).unwrap();
+        assert!(read_regular(&file, 65536).is_err());
+        std::os::unix::fs::symlink(&file, root.path().join("link")).unwrap();
+        assert!(read_regular(&root.path().join("link"), 65536).is_err());
     }
 
     /// Secret/private argv and arbitrary output are hashed, never made public;
@@ -915,6 +1163,7 @@ mod tests {
             scope: "github-actions".into(),
             checks: vec![check],
             qualified_hosts: vec![],
+            payload: None,
         };
         assert!(!evidence_ready(&evidence));
     }

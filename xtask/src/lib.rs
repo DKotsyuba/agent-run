@@ -15,3 +15,12 @@ pub mod delivery;
 
 /// Bounded tar validation before extraction or execution.
 pub mod tar_guard;
+
+/// Network preparation and local release/payload checks.
+pub mod release_ops;
+
+/// Read-only exact release observer and durable terminal events.
+pub mod release_wait;
+
+/// Explicit staged publication of the already accepted immutable inventory.
+pub mod release_publish;

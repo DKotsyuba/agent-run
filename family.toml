@@ -16,7 +16,7 @@ response_profile = "rust-minijinja-v1"
 response_profile_version = "0.1.0"
 # Devkit whose standard documents and scaffold were reviewed for this
 # adoption; the exact template revision is recorded in .family/manifest.json.
-devkit_version = "0.2.0"
+devkit_version = "0.2.1"
 baseline = "rust-macos-2026-09-candidate1"
 # No blanket qualification is claimed: published releases carry historical
 # macOS qualification, and new code and hosts stay not_verified until tested.
@@ -34,7 +34,7 @@ transports = ["stdio"]
 external_programs = "tools"
 # Host-specific integration exists: the signed Desktop MCP frontend, host
 # hook binding, and the embedded host-supplied Node Desktop bridge.
-# CI fixture checks exist; explicit doctor reflection remains open.
+# Doctor reports configured tools and the optional host Node bridge explicitly.
 host_adapter = true
 
 [native_surfaces]
@@ -42,7 +42,8 @@ host_adapter = true
 transports = ["cli", "unix-socket-json-rpc"]
 
 [compatibility]
-# Historically qualified through the published 0.19.x native releases; every
+supported_protocol_revisions = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"]
+# Historically qualified through the published native releases; every
 # release re-runs the native gate before this stays true.
 qualified_targets = ["aarch64-apple-darwin"]
 candidate_targets = []
@@ -59,4 +60,4 @@ workflow = "release.yml"
 delivery_profile = "agent-run-archive-v1"
 # GitHub TLS/repository identity plus artifact checksums and release
 # attestations, as implemented by the current release workflow.
-trust_profile = "github-authenticated+attestation"
+trust_profile = "github-attestation"

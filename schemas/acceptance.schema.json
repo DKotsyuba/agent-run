@@ -1,0 +1,236 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent Run observed acceptance v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "identity",
+    "scope",
+    "checks",
+    "qualified_hosts",
+    "payload"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "product",
+        "version",
+        "tag",
+        "repository",
+        "repository_id",
+        "commit",
+        "workflow",
+        "target",
+        "toolchain",
+        "standard_version",
+        "devkit_version",
+        "baseline"
+      ],
+      "properties": {
+        "product": {
+          "const": "agent-run"
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+        },
+        "tag": {
+          "type": "string",
+          "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
+        },
+        "repository": {
+          "const": "DKotsyuba/agent-run"
+        },
+        "repository_id": {
+          "const": 1348534205
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "workflow": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "id",
+                "path",
+                "run_id",
+                "run_attempt"
+              ],
+              "properties": {
+                "id": {
+                  "const": 346709607
+                },
+                "path": {
+                  "const": ".github/workflows/release.yml"
+                },
+                "run_id": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "run_attempt": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "target": {
+          "const": "aarch64-apple-darwin"
+        },
+        "toolchain": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "standard_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "devkit_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "baseline": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "scope": {
+      "enum": [
+        "local",
+        "github-actions"
+      ]
+    },
+    "checks": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "check_id",
+          "argv_sha256",
+          "exit_code",
+          "stdout_sha256",
+          "stderr_sha256"
+        ],
+        "properties": {
+          "check_id": {
+            "enum": [
+              "workspace",
+              "native-build",
+              "source-archive",
+              "integration",
+              "dependency-policy",
+              "exact-payload",
+              "custom"
+            ]
+          },
+          "argv_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "exit_code": {
+            "type": "integer"
+          },
+          "stdout_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "stderr_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      }
+    },
+    "qualified_hosts": {
+      "type": "array",
+      "maxItems": 0
+    },
+    "payload": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "kind",
+            "size",
+            "sha256"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.-]+$",
+              "maxLength": 128
+            },
+            "kind": {
+              "enum": [
+                "bundle",
+                "source",
+                "installer",
+                "evidence"
+              ]
+            },
+            "target": {
+              "const": "aarch64-apple-darwin"
+            },
+            "size": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 536870912
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "kind": {
+                    "const": "bundle"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "target"
+                ]
+              },
+              "else": {
+                "not": {
+                  "required": [
+                    "target"
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  }
+}

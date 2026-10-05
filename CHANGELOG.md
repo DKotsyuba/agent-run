@@ -12,8 +12,26 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   and preserve accepted/unknown execution receipts when presentation fails
 
 These MCP compatibility changes require the next pre-1.0 minor release.
-The workspace version is unchanged until release preparation; host
-qualification, release provenance and doctor reflection remain separate work.
+The workspace version is unchanged until release preparation; real host and
+publication qualification remain separate from local fixture checks.
+
+- feat(release): bind external inventory and observed acceptance to the exact
+  source, workflow/run/attempt, compiler and native payload; verify complete
+  drafts and published bytes without rebuilding or overwriting them
+- feat(delivery)!: enforce repository/workflow/source GitHub attestations before
+  downloaded installer execution, with explicit gh/jq bootstrap requirements
+  and bounded archive path/type/mode/duplicate/size guards
+- feat(tooling): add release preparation/tag checks, a bounded foreground release
+  observer with private deterministic events and optional exact notifier ACK,
+  and fresh dependency-policy preparation separate from offline gates
+- feat(diagnostics)!: add typed local doctor evidence and 0/2/3 exits, preserve
+  read-only doctor/canary behavior, and cap cooperating component logs at
+  4 MiB per UTC day with 8 KiB whole records
+- ci: run source and exact payload jobs in parallel, separate workload caches
+  with main-only producers, preserve required native checks, and retain pending
+  release runs through bounded repository serialization
+- fix(presentation): reject escaped MCP results that exceed the encoded frame
+  budget before publishing any partial page or losing a mutation receipt
 
 - feat(family): declare Agent MCP family standard adoption with a truthful
   `family.toml` profile, managed adoption metadata under `.family/` verified

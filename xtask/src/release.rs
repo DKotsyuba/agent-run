@@ -110,6 +110,9 @@ fn build_inner(
     let release = output.join("releases").join(version);
     if release.exists() {
         verify(&release)?;
+        if tui.is_some() && !release.join("bin/agent-run-tui").is_file() {
+            return Err("existing release predates the bundled TUI; choose a new version".into());
+        }
         for (source, name) in [
             (Some(binary), "agent-run"),
             (installer, "agent-run-deploy"),
@@ -171,8 +174,11 @@ fn build_inner(
     Ok(release)
 }
 
-/// Validates a sealed release before it can become a `current` target.
+/// Validates the historical packaging seal before a current-target switch.
+/// Metadata must be a regular file within 64 KiB before the legacy JSON parser
+/// runs. COMPLETE remains a packaging marker, never an installation receipt.
 pub fn verify(release: &Path) -> Result<(), String> {
+    crate::delivery::read_regular(&release.join("metadata.json"), 65536)?;
     agent_run_platform::release::verify(release)
 }
 

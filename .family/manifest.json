@@ -2,31 +2,31 @@
   "schema_version": 1,
   "adoption": "manual",
   "standard_version": "1.0.0-rc.2",
-  "template_revision": "7f094e0463c0a6d5cf52d68d91ca32f6bc0f465f",
+  "template_revision": "65c11cf73b2c02adc930e6db62445d3d4966a99b",
   "managed": [
     {
       "path": "family.toml",
       "role": "declaration",
       "origin": "product",
-      "sha256": "552881016f7ce9025656a94b94271e7fadb3ac7dcda30381b33501a2aafa8c5e"
+      "sha256": "514e0dfe1f5d2f0c6905b0e75ec5f9cbebca2f4401ffdf5eea3b37e0a4c7679a"
     },
     {
       "path": "docs/family-standard.md",
       "role": "boundary-summary",
       "origin": "product",
-      "sha256": "d85576e034f90abd09bff6867931d9597b97726c102b9ecd8f8b15dcd36e1f25"
+      "sha256": "0734763a11de536c87203fb05975b78c794237c3cd9db94015f49f616c682a42"
     },
     {
       "path": ".family/baseline/scaffold-family.toml",
       "role": "template-baseline",
       "origin": "template",
-      "sha256": "bba12c3687e4b57c3e9c63d6fba02c98cf32851ac4af4909116d78d2cb93c06b"
+      "sha256": "5edd8eb05ef08e71a8db8f14b2a684c49f46808bad9ba0b2617e3ad9ccbed38b"
     },
     {
       "path": ".family/baseline/NOTICE",
       "role": "license-notice",
       "origin": "product",
-      "sha256": "dc216e1c29f69740d44c7cab724e0160cb3ccb8db94005f9fc7f7ebc21f6a172"
+      "sha256": "0903902d39149028eda224aa8e2bb70a2e1f68fec0848818d117f625f44660d1"
     }
   ]
 }

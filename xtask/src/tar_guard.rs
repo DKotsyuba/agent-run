@@ -29,6 +29,12 @@ impl Drop for Decoder {
 /// duplicate normalized entries, malformed headers, extensions changing
 /// extraction semantics, excess count/bytes and missing end markers.
 pub fn inspect(path: &Path, native: bool) -> Result<(), String> {
+    inspect_until(path, native, Instant::now() + Duration::from_secs(120))
+}
+
+/// Shares an enclosing monotonic deadline across native decoder and plain-file
+/// reads; cancellation or expiry rejects before extraction and reaps the decoder.
+pub(crate) fn inspect_until(path: &Path, native: bool, deadline: Instant) -> Result<(), String> {
     let metadata = std::fs::symlink_metadata(path).map_err(|_| "archive unavailable")?;
     if !metadata.is_file() || metadata.len() > 512 * 1024 * 1024 {
         return Err("archive type/size refused".into());
@@ -42,11 +48,15 @@ pub fn inspect(path: &Path, native: bool) -> Result<(), String> {
         inspect_decoder(
             Command::new("/usr/bin/gzip").arg("-dc").arg(path),
             native,
-            Duration::from_secs(120),
+            deadline.saturating_duration_since(Instant::now()),
         )
     } else {
         inspect_stream(
-            BufReader::new(File::open(path).map_err(|_| "archive unavailable")?),
+            BufReader::new(TimedReader {
+                pipe: File::open(path).map_err(|_| "archive unavailable")?,
+                deadline,
+                cancel: None,
+            }),
             native,
         )
     }
@@ -71,6 +81,7 @@ impl<R: Read + std::os::fd::AsRawFd> Read for TimedReader<R> {
         loop {
             let remaining = self.deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero()
+                || crate::delivery::CANCELLED.load(std::sync::atomic::Ordering::Relaxed)
                 || self
                     .cancel
                     .as_ref()

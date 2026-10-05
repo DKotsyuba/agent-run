@@ -31,7 +31,10 @@ integration probe. Node is used for these declared product integrations, not
 general repository automation. CI invokes their fixture checks through
 `scripts/check-desktop-transport.cjs` and `scripts/check-codegraph-probe.cjs`;
 this records configured checks, not a green run of the adoption revision.
-Explicit Desktop bridge/version reflection in `doctor` remains open.
+`doctor` explicitly reports the resolved optional Node bridge, configured tools
+and bounded version observations. Unknown evidence stays `not_checked`. The
+bootstrap separately requires gh/jq for provenance and manifest verification;
+these are delivery tools, not dependencies of the installed Rust broker.
 
 ## Machine-contract authority
 
@@ -51,9 +54,9 @@ is `assets/worker_tools.json`; it never imports the operator registry.
 
 | Item | Status |
 |---|---|
-| `aarch64-apple-darwin` | Historically qualified through the published 0.19.x native releases; each release re-runs the native gate |
+| `aarch64-apple-darwin` | Historically qualified through published native releases, including 0.20.x; each release re-runs the native gate |
 | Linux x86-64 | Unqualified, non-blocking CI validation lane only |
-| MCP protocol revision | Legacy initialize flow (`2025-11-25`) via rmcp 3.4.0; the `2026-07-28` discovery revision is **not verified** |
+| MCP protocol revision | Legacy initialize and modern `2026-07-28` discovery/per-request catalog paths have separate raw/fixture checks; this does not qualify a particular host |
 | Hosts (Codex CLI, Claude Code, GLM, Desktop relay v1–v4) | Integration-tested through fixtures and transport tests; **no formal family host-matrix qualification** — `qualified_hosts` stays empty until one is run |
 | Compiler/SDK baseline | `rust-macos-2026-09-candidate1`: Rust 1.98.1 pinned, rmcp `=3.4.0`, MiniJinja `=2.24.0` |
 
@@ -87,9 +90,30 @@ a hostile process with the same UID; that limit is documented, not denied.
   isolation. Assertions are preserved and independent parent tests remain
   concurrent. Process-group cleanup signals only a verified owned,
   unreaped leader; it does not promise to signal groups after leader exit.
-- Adoption verification checks manifest structure, pinned managed-file
-  digests, and agreement on the declared standard version. It does not
-  certify normative compliance, host qualification, or release provenance.
+- `family verify` checks manifest structure and pinned managed-file digests.
+  `family check` additionally checks selected Cargo identity/lint inheritance,
+  toolchain/SDK pins, catalog shapes, SHA-pinned actions and workflow permissions.
+  It proves those structural facts, never business idempotency or host behavior.
+- Delivery tooling binds external inventory and actual check evidence to one
+  full source commit, workflow/run/attempt, compiler and native archive digest.
+  Source/build jobs are parallel; publication verifies a complete draft and the
+  published bytes. Trusted main jobs warm separate source/package caches;
+  releases restore them. Fresh advisories remain separate from offline gates.
+- The enforced delivery trust profile is `github-attestation`, with expected
+  repository/workflow/source checks before downloaded executable use. No silent
+  fallback to checksum-only trust is permitted. Historical directory seals and
+  rollback remain readable; earlier releases retain their version-bound bootstrap.
+- Archive verification rejects unsafe paths, normalized duplicates, links,
+  special entries and modes, and bounds entry count, unpacked bytes and decoding.
+- Operational logs retain the existing 30-day retention and add a 4-MiB
+  component/day cap across cooperating writers plus an 8-KiB whole-record cap.
+  Busy, full, oversized or unsafe sinks drop records; files are never rotated,
+  truncated or redirected to unbounded stderr to evade the cap.
+- `doctor --json` preserves historical findings while adding typed local checks,
+  executing/current release observations, platform and dependency evidence.
+  Both doctor and its detached provider-free canary bypass migration/log setup.
+  Source commit and resident version compatibility remain explicitly unknown
+  when not embedded/exposed; a source checkout is never used to fabricate them.
 
 ## Open requirements (truthful, not waived)
 
@@ -99,28 +123,24 @@ a hostile process with the same UID; that limit is documented, not denied.
   Unknown tools and malformed protocol parameters use MCP protocol errors.
   The presentation contract and intentional pre-1.0 minor delta are described
   in [MCP presentation](mcp-presentation.md). These local changes require the
-  next release to be 0.20; they do not qualify hosts or publish a release.
-- **Release/delivery stage (planned):** no external `release-manifest.json`
-  binding commit/run/attempt, no draft-verify-publish sequence, no post-
-  publication verification, no release waiter; the archive checks prove
-  path/link safety but not duplicate-member, entry-count, unpacked-size, or
-  mode constraints.
-- **Release provenance:** the existing release workflow emits GitHub
-  attestations. Independent attestation verification is a separate check;
-  the current bootstrap installer checks the archive checksum before executing
-  the downloaded installation helper; that helper verifies the sealed internal
-  manifest during installation. Neither automatically verifies attestations
-  before the helper executes. Emission alone does not
-  establish the declared `github-attestation` trust profile end to end.
+  next release to be 0.21; they do not qualify hosts or publish a release.
+- **Release qualification:** local fault-injection tests cover inventory,
+  publication states, observation and bootstrap refusals. A real publication,
+  provenance verification and installation of the new exact payload remain
+  separate acceptance; local fixtures never certify that cycle.
+- **Host wake:** the foreground Rust observer saves deterministic private
+  events and optionally calls a trusted notifier requiring an exact event-ID ACK.
+  It explicitly claims neither installation nor model wake/consumption. A real
+  external-event host adapter remains a separately qualified integration.
 - **Bounds evidence:** MCP has separate per-tool text, row and exact-content
   budgets and a bounded private writer. Oversized pages fail as a whole.
   Broader upstream and child-process limits remain separate requirements.
 - **Result validation:** MCP validates critical dynamic broker fields and
   projects explicit typed response views before rendering. This does not
   claim a separate JSON Schema validator for all CLI/socket result variants.
-- **Observability:** component logs are UTC-daily and expire after 30 idle
-  days (see [history retention](history-retention.md)); a per-file size cap
-  is not yet evidenced.
+- **Observability limits:** suppressed logs cannot replace durable answer,
+  process/cleanup or delivery evidence. Bounded version probes and local doctor
+  observations do not authenticate providers or qualify every model/host.
 - **Versioning:** the 0.x history already mixes feature and patch bumps, so
   no blanket SemVer pass is claimed; future releases follow the recorded
   policy.

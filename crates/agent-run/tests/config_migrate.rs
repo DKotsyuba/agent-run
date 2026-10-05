@@ -911,15 +911,20 @@ fn external_config_edit_during_publication_is_kept() {
     assert!(!home.root.join("migrations/in-progress.json").exists());
 }
 
-/// One committed-or-refused write from a fresh connection that never waits:
-/// the marker `'w'` is appended to the first agent's task.
+/// Adds a marker to the first agent in a disposable fixture home through a fresh
+/// connection with zero SQLite busy wait. Returns the affected rows or SQLite
+/// open/write/lock failure; used only by feature-enabled publication lease drills.
+#[cfg(feature = "test-fixtures")]
 fn try_write(home: &Path) -> rusqlite::Result<usize> {
     let conn = rusqlite::Connection::open(home.join("state.db"))?;
     conn.busy_timeout(std::time::Duration::ZERO)?;
     write_with(&conn)
 }
 
-/// The marker write through an existing connection.
+/// Attempts the fixture marker write through a caller-owned connection and its
+/// existing busy policy; returns the affected rows or SQLite failure. The
+/// feature-enabled lease drills retain ownership of the connection.
+#[cfg(feature = "test-fixtures")]
 fn write_with(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
     conn.execute(
         "UPDATE agents SET task=task||'w' WHERE id=(SELECT min(id) FROM agents)",
@@ -927,7 +932,9 @@ fn write_with(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
     )
 }
 
-/// Whether a write was refused by SQLite locking (not committed).
+/// Consumes a feature-fixture write result and recognizes DatabaseBusy or
+/// DatabaseLocked refusal; success and all other SQLite errors return false.
+#[cfg(feature = "test-fixtures")]
 fn refused_busy(result: rusqlite::Result<usize>) -> bool {
     matches!(
         result,
@@ -936,7 +943,10 @@ fn refused_busy(result: rusqlite::Result<usize>) -> bool {
     )
 }
 
-/// How many first-agent tasks carry the committed marker write.
+/// Reads disposable fixture history and returns zero or one for the first
+/// agent task carrying the committed marker. Unreadable fixture history panics;
+/// this helper is available only for feature-enabled publication lease drills.
+#[cfg(feature = "test-fixtures")]
 fn markers(home: &Path) -> usize {
     history(home)
         .iter()

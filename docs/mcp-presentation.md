@@ -2,7 +2,7 @@
 
 The operator `agent-run` and private `agent-run-worker` servers advertise the
 Cargo product version. It is independent of rmcp 3.4.0, the negotiated MCP
-protocol, state schema 22, and family response profile `rust-minijinja-v1/0.1.0`.
+protocol, state schema 25, and family response profile `rust-minijinja-v1/0.1.0`.
 Tool names, resident execution, stable agent IDs and worker capabilities keep
 their existing contracts. The worker registration namespace remains
 `agent_run_worker`; only the supervisor supplies its attempt context.
@@ -21,6 +21,9 @@ idempotency: use the same nonempty request_id and unchanged arguments for an
 identical retry. Steer is additive but repeated calls can enqueue additional
 commands. Cancel is destructive and is not declared unconditionally idempotent.
 Worker reports require a request key scoped to their immutable run context.
+Pool admission, messages, replacements, proposals and votes likewise require
+their documented request keys. Replacements and superseding proposals/votes
+carry conservative destructive hints; read pages remain read-only.
 Hints are descriptive, never authorization.
 
 `schemas/mcp-registration.json` is host-neutral metadata: actual commands,
@@ -36,6 +39,11 @@ unknown protocol methods return method-not-found (-32601). Expected input and
 business failures remain tool results with isError=true. SDK framing and
 negotiation remain authoritative.
 
+Modern `2026-07-28` discovery uses per-request metadata and `server/discover`
+without a legacy initialize. Catalog replies explicitly include `ttlMs=60000`
+and `cacheScope=private`; legacy replies omit those hints. The declared protocol
+revisions are recorded independently of host qualification in `family.toml`.
+
 ## Presentation policy
 
 MiniJinja 2.24.0 uses only serde and fuel features. A closed embedded environment
@@ -48,7 +56,7 @@ fuel and output failures use safe receipt-based fallback.
 Dynamic broker JSON is the adapter boundary. Critical shapes/statuses are
 validated and explicit typed acknowledgement, agent, page, transcript, answer,
 catalog, diagnostics, excerpt and error views whitelist the fields rendered.
-Private account/pool/provider envelopes, credentials and capabilities are
+Private account/provider envelopes, execution identities, credentials and capabilities are
 excluded. Display labels are quoted, controls/ANSI/bidi made visible, and long
 friendly labels marked shortened. Actionable values use exact references or
 reversible JSON quoting; excerpts retain their bytes, including literal Jinja.
@@ -56,6 +64,10 @@ reversible JSON quoting; excerpts retain their bytes, including literal Jinja.
 | Tools | Hard UTF-8 text cap | Whole-row cap | Exact content cap |
 |---|---:|---:|---:|
 | start, resume | 4096 | 8 displayed MCP selections, plus explicit omitted count | none |
+| start_pool, pool_replace | 8192 | 5 members | none |
+| pool_post, pool_propose, pool_vote | 8192 | none | none |
+| pool, pool_read | 614400 | 50 entries, every entry displayed or the page refused | 563200 |
+| list_pools | 524288 | 200 | 524288 |
 | cancel, steer, notify_orchestrator, routine errors | 2048 | 8 | none |
 | list_agents, limits | 8192 | 20 | none |
 | transcript | 16384 | 100 | 14336 |
@@ -64,8 +76,13 @@ reversible JSON quoting; excerpts retain their bytes, including literal Jinja.
 
 Admission replies reserve the original request key, whose existing contract
 allows 512 characters; reversible quoting can expand it beyond 2 KiB. These
-are byte limits, not token or MCP envelope limits. Stdio independently enforces
-one MiB per LF-delimited frame. No tokenizer savings are claimed.
+are text byte limits, not token counts. Pool pages retain a larger justified
+profile for exact shared messages and proposal snapshots. The presenter also
+serializes privately through a bounded writer to check the encoded MCP result,
+reserving 4096 bytes within the one-MiB frame for protocol framing. JSON escaping
+can exceed the wire budget even when text fits: the whole read then fails safely,
+with no rows or cursor published. Confirmed writes retain their receipt fallback.
+No tokenizer savings are claimed.
 
 Pages are budgeted before projection, then rendered into a bounded private
 writer. Every page row is displayed in source order or the entire page is
@@ -78,6 +95,10 @@ Semantic execution receipts are captured before presentation. Degradation after
 accepted admission, steering or enqueue keeps the confirmed identity, original
 request key and no-replay advice with isError=false. A valid admission counter
 keeps the tiny agent_id/sequence structured mirror for PostToolUse binding.
+Pool admission keeps the tiny pool_id binding mirror. Pool mutation degradation
+also preserves request identity, log position and a replacement agent identity
+when known. Shared entries use the domain's stamped untrusted-body formatter;
+reverse/block transcript pages preserve omission, error and continuation data.
 Invalid counters never bind, even when acceptance is known. Unknown writes stay
 unknown with isError=true and reconciliation advice; expected business failures
 stay errors. Fallback never emits raw JSON, Debug values, context or error chains.
@@ -96,7 +117,7 @@ and its existing bounded same-key reconnect behavior are unchanged.
 
 ## Compatibility and verification
 
-The next release needs the pre-1.0 minor 0.20: discovery metadata, error channels,
+These changes need the next pre-1.0 minor 0.21: discovery metadata, error channels,
 quoted labels, private metadata removal, page refusal and degradation semantics
 are intentional MCP changes. CLI/socket business results are retained. The
 workspace remains at its current version until separate release preparation.
@@ -107,4 +128,4 @@ fallback. Exact compiled binaries cover operator and worker discovery, calls,
 invalid/unknown requests, cancellation notifications and EOF. Cancellation
 after durable admission is separately tested with an injected broker. These
 checks do not establish real-engine/host qualification or release acceptance;
-the coherent native gate and later doctor/release stages remain required.
+the coherent native gate and exact release/host acceptance remain separate.

@@ -38,7 +38,7 @@ impl Fixture {
         let binary = root.join("runtime");
         executable(
             &binary,
-            "#!/bin/sh\nprintf '%s\\n' \"$AGENT_RUN_HOME\" \"$@\"\n",
+            "#!/bin/sh\n[ -z \"$GH_TOKEN\" ] || exit 41\nprintf '%s\\n' \"$AGENT_RUN_HOME\" \"$@\"\n",
         );
         let tui = root.join("observer");
         executable(
@@ -98,7 +98,7 @@ impl Fixture {
         let asset = "agent-run-1.0.0-aarch64-apple-darwin.tar.gz";
         assert!(
             Command::new("tar")
-                .args(["-czf"])
+                .args(["--format=ustar", "-czf"])
                 .arg(remote.join(asset))
                 .arg("-C")
                 .arg(&self.candidate)
@@ -108,7 +108,11 @@ impl Fixture {
                 .success()
         );
         checksums(&remote, asset);
-        fs::write(remote.join("latest"), "{\n  \"tag_name\": \"v1.0.0\"\n}\n").unwrap();
+        fs::write(
+            remote.join("latest"),
+            "{\"tagName\":\"v1.0.0\",\"isDraft\":false,\"isPrerelease\":false}\n",
+        )
+        .unwrap();
         remote
     }
 }
@@ -119,10 +123,71 @@ fn executable(path: &Path, text: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// Writes the exact release checksum using the workspace's existing hash implementation.
+/// Updates fixture-only external manifest and checksum inventory after archive changes.
+/// Synthetic provenance IDs are local fixture data, never a live qualification claim.
 fn checksums(remote: &Path, asset: &str) {
-    let digest = agent_run_platform::fs::sha256(&fs::read(remote.join(asset)).unwrap());
-    fs::write(remote.join("SHA256SUMS"), format!("{digest}  {asset}\n")).unwrap();
+    let bytes = fs::read(remote.join(asset)).unwrap();
+    let digest = agent_run_platform::fs::sha256(&bytes);
+    let artifacts = serde_json::json!([
+        {"name":asset,"kind":"bundle","target":"aarch64-apple-darwin","size":bytes.len(),"sha256":digest},
+        {"name":"agent-run-1.0.0-source.tar","kind":"source","size":1,"sha256":"b".repeat(64)},
+        {"name":"install.sh","kind":"installer","size":1,"sha256":"b".repeat(64)},
+        {"name":"acceptance.json","kind":"evidence","size":1,"sha256":"b".repeat(64)}
+    ]);
+    let manifest = serde_json::json!({"schema_version":1,"product":"agent-run","version":"1.0.0","tag":"v1.0.0","repository":xtask::delivery::REPOSITORY,"repository_id":xtask::delivery::REPOSITORY_ID,"commit":"a".repeat(40),"workflow":{"id":xtask::delivery::WORKFLOW_ID,"path":xtask::delivery::WORKFLOW_PATH,"run_id":17,"run_attempt":1},"standard_version":"1.0.0-rc.2","devkit_version":"0.2.1","baseline":"rust-macos-2026-09-candidate1","trust_profile":"github-attestation","artifacts":artifacts});
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    fs::write(remote.join("release-manifest.json"), &manifest_bytes).unwrap();
+    let mut sums = manifest["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|artifact| {
+            format!(
+                "{}  {}\n",
+                artifact["sha256"].as_str().unwrap(),
+                artifact["name"].as_str().unwrap()
+            )
+        })
+        .collect::<String>();
+    sums.push_str(&format!(
+        "{}  release-manifest.json\n",
+        agent_run_platform::fs::sha256(&manifest_bytes)
+    ));
+    fs::write(remote.join("SHA256SUMS"), sums).unwrap();
+}
+
+/// Writes two raw USTAR regular members whose paths alias after interior-dot
+/// normalization. The tiny fixture is gzipped locally; no payload is executed.
+fn malformed_alias_archive(remote: &Path, asset: &str) {
+    let mut archive = Vec::new();
+    for name in ["bin/agent-run", "bin/./agent-run"] {
+        let mut header = [0u8; 512];
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        header[100..108].copy_from_slice(b"0000644\0");
+        header[124..136].copy_from_slice(b"00000000001\0");
+        header[148..156].fill(b' ');
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        let checksum: u64 = header.iter().map(|byte| *byte as u64).sum();
+        header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+        archive.extend_from_slice(&header);
+        archive.push(b'x');
+        archive.resize(archive.len() + 511, 0);
+    }
+    archive.resize(archive.len() + 1024, 0);
+    let raw = remote.join("duplicate.tar");
+    fs::write(&raw, archive).unwrap();
+    assert!(
+        Command::new("gzip")
+            .arg("-c")
+            .stdin(fs::File::open(raw).unwrap())
+            .stdout(fs::File::create(remote.join(asset)).unwrap())
+            .status()
+            .unwrap()
+            .success()
+    );
+    checksums(remote, asset);
 }
 
 /// Fresh install, no-op and update keep permanent releases, custom home and state backups.
@@ -284,6 +349,25 @@ done
 cp "$TEST_REMOTE/${url##*/}" "$output"
 "#,
         );
+        executable(
+            &mocks.join("gh"),
+            r#"#!/bin/sh
+case "$1/$2" in
+ release/view) cat "$TEST_REMOTE/latest" ;;
+ api/--hostname)
+   case "$4" in
+    repos/DKotsyuba/agent-run) printf '{"id":1348534205,"full_name":"DKotsyuba/agent-run"}\n' ;;
+    */git/ref/tags/*) printf '{"object":{"type":"tag","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}\n' ;;
+    */git/tags/*) printf '{"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","object":{"type":"commit","sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}\n' ;;
+    *) exit 9 ;;
+   esac ;;
+ attestation/verify)
+   [ "${TEST_ATTEST_FAIL:-0}" = 0 ] || exit 1
+   case "$*" in *"--repo DKotsyuba/agent-run"*"--signer-workflow DKotsyuba/agent-run/.github/workflows/release.yml"*"--source-digest aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"*"--source-ref refs/tags/v1.0.0"*) exit 0 ;; *) exit 9 ;; esac ;;
+ *) exit 9 ;;
+esac
+"#,
+        );
         let run = || {
             let mut command = Command::new("sh");
             command
@@ -299,6 +383,7 @@ cp "$TEST_REMOTE/${url##*/}" "$output"
                     format!("{}:{}", mocks.display(), std::env::var("PATH").unwrap()),
                 )
                 .env("TEST_REMOTE", &remote)
+                .env("GH_TOKEN", "SECRET_SENTINEL")
                 .env("TMPDIR", fixture.temporary.path());
             command
         };
@@ -309,6 +394,11 @@ cp "$TEST_REMOTE/${url##*/}" "$output"
             String::from_utf8_lossy(&success.stderr)
         );
         assert!(fixture.bin.join("agent-run-tui").is_file());
+        let refused = run().env("TEST_ATTEST_FAIL", "1").output().unwrap();
+        assert!(!refused.status.success());
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("attestation verification failed")
+        );
         let current = fs::read_link(fixture.prefix.join("current")).unwrap();
         fs::write(
             remote.join("SHA256SUMS"),
@@ -342,6 +432,14 @@ cp "$TEST_REMOTE/${url##*/}" "$output"
         assert!(!unsafe_archive.status.success());
         assert!(
             String::from_utf8_lossy(&unsafe_archive.stderr).contains("links and special files")
+        );
+        malformed_alias_archive(&remote, asset);
+        let alias = run().output().unwrap();
+        assert!(!alias.status.success());
+        assert!(
+            String::from_utf8_lossy(&alias.stderr).contains("unsafe/duplicate archive member"),
+            "{}",
+            String::from_utf8_lossy(&alias.stderr)
         );
         assert_eq!(
             fs::read_link(fixture.prefix.join("current")).unwrap(),
