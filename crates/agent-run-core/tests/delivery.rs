@@ -66,6 +66,7 @@ impl DeliveryChild {
 }
 
 impl Drop for DeliveryChild {
+    /// Kills/reaps the isolated delivery child before its fixture home is dropped.
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();

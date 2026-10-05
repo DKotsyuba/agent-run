@@ -546,6 +546,7 @@ impl OAuthChild {
 }
 
 impl Drop for OAuthChild {
+    /// Kills/reaps this isolated OAuth fixture child after success, timeout or panic.
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();

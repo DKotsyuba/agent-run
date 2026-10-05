@@ -821,6 +821,7 @@ impl CensusChild {
 }
 
 impl Drop for CensusChild {
+    /// Kills/reaps the exact census fixture child on completion, timeout or panic.
     fn drop(&mut self) {
         self.terminate();
     }

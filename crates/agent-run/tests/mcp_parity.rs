@@ -76,6 +76,8 @@ impl Harness {
             .arg("--home")
             .arg(&self.home)
             .arg("mcp")
+            .env_remove("CODEX_MCP_NODE_PATH")
+            .env_remove("CODEX_APP_TOOLS_PIPE_PATH")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -483,11 +485,18 @@ fn worker_binary_discovery_protocol_errors_and_eof() {
         info["result"]["serverInfo"]["version"],
         env!("CARGO_PKG_VERSION")
     );
-    assert!(
-        info["result"]["instructions"]
-            .as_str()
-            .unwrap()
-            .contains("only notify_orchestrator")
+    let instructions = info["result"]["instructions"].as_str().unwrap();
+    for fact in [
+        "fixed five-tool catalog",
+        "supervisor-bound attempt",
+        "durable recording",
+        "never delivery, reading, approval or completion",
+    ] {
+        assert!(instructions.contains(fact), "{fact}: {instructions}");
+    }
+    assert_eq!(
+        info["result"]["capabilities"],
+        json!({"tools":{"listChanged":false}})
     );
     mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
     let discovery = mcp
@@ -496,6 +505,22 @@ fn worker_binary_discovery_protocol_errors_and_eof() {
     let expected: Value =
         serde_json::from_str(include_str!("../../../schemas/worker-tools.json")).unwrap();
     assert_eq!(discovery["result"]["tools"], expected);
+    let names: Vec<_> = expected
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "notify_orchestrator",
+            "pool_post",
+            "pool_read",
+            "pool_propose",
+            "pool_vote"
+        ]
+    );
     let unknown = mcp.send(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"start","arguments":{}}})).unwrap();
     assert_eq!(unknown["error"]["code"], -32602);
     assert!(unknown.get("result").is_none());
@@ -542,9 +567,11 @@ fn worker_binary_discovery_protocol_errors_and_eof() {
             .read_line(&mut line)
             .unwrap();
         let call: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(call["method"], agent_run_domain::worker::METHOD);
+        assert_eq!(call["method"], agent_run_domain::worker::TOOL_METHOD);
+        assert_eq!(call["params"]["tool"], "notify_orchestrator");
         assert_eq!(call["params"]["input"]["request_id"], "report-2");
         assert_eq!(call["params"]["run_id"], "ag-20260928-000000-0000000001");
+        assert_eq!(call["params"]["attempt_id"], "fixture-attempt");
         let response = json!({"jsonrpc":"2.0","id":call["id"],"result":{
             "notification_id":"ntf_fixture","state":"pending","duplicate":false}});
         writeln!(stream, "{response}").unwrap();
@@ -674,4 +701,97 @@ fn resume_missing_broker_and_lost_response_keep_reconciliation_identity() {
     );
     assert_eq!(calls[0], arguments);
     mcp.finish();
+}
+/// The real binary must reject a nearly-one-MiB string ID before routing even
+/// a read-only doc call. A normal opaque ID still echoes in one complete frame.
+#[test]
+fn long_rpc_ids_are_rejected_before_tool_dispatch() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    let harness = Harness::new();
+    let listener = std::os::unix::net::UnixListener::bind(harness.home.join("api.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let stopped = Arc::new(AtomicBool::new(false));
+    let seen = calls.clone();
+    let stop = stopped.clone();
+    let broker = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut line = String::new();
+                    BufReader::new(stream.try_clone().unwrap())
+                        .read_line(&mut line)
+                        .unwrap();
+                    let call: Value = serde_json::from_str(&line).unwrap();
+                    assert_eq!(call["method"], "doc");
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    let response = json!({"jsonrpc":"2.0","id":call["id"],"result":{"text":"guide\n".repeat(1024)}});
+                    writeln!(stream, "{response}").unwrap();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(error) => panic!("fixture broker: {error}"),
+            }
+        }
+    });
+    let mut bad = harness.mcp();
+    bad.send(initialize("2025-11-25")).unwrap();
+    bad.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    let request = json!({"jsonrpc":"2.0","id":"x".repeat(1024*1024-256),
+        "method":"tools/call","params":{"name":"doc","arguments":{"topic":"index"}}});
+    let frame = request.to_string();
+    assert!(frame.len() < 1024 * 1024);
+    writeln!(bad.stdin.as_mut().unwrap(), "{frame}").unwrap();
+    bad.stdin.as_mut().unwrap().flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while calls.load(Ordering::SeqCst) == 0
+        && bad.child.try_wait().unwrap().is_none()
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let dispatched = calls.load(Ordering::SeqCst);
+    eprintln!(
+        "oversized-id input frame {} bytes; broker calls {dispatched}",
+        frame.len()
+    );
+    assert_eq!(
+        dispatched, 0,
+        "SDK must not admit a call whose echoed ID can overflow stdout"
+    );
+    assert!(
+        bad.child.try_wait().unwrap().is_some(),
+        "invalid ID must close this transport"
+    );
+    assert!(
+        bad.stdout.recv_timeout(Duration::from_secs(1)).is_err(),
+        "no partial or oversized response"
+    );
+    drop(bad);
+    let mut good = harness.mcp();
+    good.send(initialize("2025-11-25")).unwrap();
+    good.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    let id = "opaque-".to_owned() + &"x".repeat(1000);
+    let response = good
+        .send(json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+        "params":{"name":"doc","arguments":{"topic":"index"}}}))
+        .unwrap();
+    assert_eq!(response["id"], id);
+    assert_eq!(response["result"]["isError"], false);
+    assert!(response.to_string().len() <= 1024 * 1024);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    good.finish();
+    stopped.store(true, Ordering::SeqCst);
+    broker.join().unwrap();
 }

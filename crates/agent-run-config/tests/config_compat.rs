@@ -521,6 +521,7 @@ impl ConfigCaseChild {
 }
 
 impl Drop for ConfigCaseChild {
+    /// Kills/reaps this exact fixture child on every exit, including parent panic.
     fn drop(&mut self) {
         self.terminate();
     }

@@ -37,7 +37,10 @@ Unknown tool names return MCP invalid-params (-32602). Malformed supported
 requests erased into the SDK's custom-method route also return invalid-params;
 unknown protocol methods return method-not-found (-32601). Expected input and
 business failures remain tool results with isError=true. SDK framing and
-negotiation remain authoritative.
+negotiation remain authoritative. The transport retains one bounded complete
+input frame before handing it to the SDK and limits the encoded JSON-RPC request
+ID to 1024 bytes. Oversized IDs are refused before business dispatch or admission;
+normal numeric/string IDs and the existing full-frame body limit are retained.
 
 Modern `2026-07-28` discovery uses per-request metadata and `server/discover`
 without a legacy initialize. Catalog replies explicitly include `ttlMs=60000`
