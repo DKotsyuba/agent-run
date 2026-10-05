@@ -64,7 +64,8 @@ one host's binary.
 ## Publish
 
 1. Run `cargo xtask release prepare X.Y.Z` to inspect the version plan. Explicit
-   `--apply` updates only the local Cargo version, lockfile and changelog.
+   `--apply` updates only the local Cargo version, lockfile, changelog and
+   the source registration descriptor's product-version mirror.
 2. Merge only after the `CI` workflow passes.
 3. Record acceptance against the exact clean source, then create the annotated
    tag with `cargo xtask release tag X.Y.Z --accepted-commit FULL_SHA
