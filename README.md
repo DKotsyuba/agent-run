@@ -216,6 +216,13 @@ See [docs/api.md](docs/api.md).
 The release installer installs both `agent-run` and the separate `agent-run-tui`
 binary at the same version. Start the observer with `agent-run-tui`.
 
+After updating, quit and reopen existing observer windows: a running process
+keeps its previous binary. Check `agent-run --version` and
+`agent-run-tui --version` to confirm that both commands select the new release.
+The redesigned observer includes Sessions and Pools tabs; press `1` or `2`
+to switch between them. A binary launched directly from a development worktree
+is independent of the installed release.
+
 `agent-run-tui` is a read-only terminal observer for the resident broker: it
 lists sessions live and shows any selected session's transcript, keyed with
 the mouse and the same JSON-RPC surface as the CLI. See
