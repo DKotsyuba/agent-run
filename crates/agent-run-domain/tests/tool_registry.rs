@@ -3,14 +3,15 @@
 use agent_run_domain::{registry, tool, tools_json, ArgumentDefault};
 use serde_json::Value;
 
-/// Tools added after the frozen Python table: the guide read and the four
+/// Tools added after the frozen Python table: the guide read and the five
 /// cooperative-pool operator tools, pinned by their own tests.
-const ADDITIVE: [&str; 5] = [
+const ADDITIVE: [&str; 6] = [
     "delegation_guide",
     "start_pool",
     "pool_post",
     "pool_replace",
     "pool",
+    "list_pools",
 ];
 
 /// Parses the captured Python discovery payload shared by all registry assertions.
@@ -32,7 +33,7 @@ fn registry_matches_python_golden_field_by_field() {
         .into_iter()
         .filter(|tool| !ADDITIVE.contains(&tool["name"].as_str().unwrap_or_default()))
         .collect();
-    assert_eq!(tools_json().len(), 16);
+    assert_eq!(tools_json().len(), 17);
     assert_eq!(actual.len(), expected.len());
 
     for (definition, (actual, mut expected)) in registry()
@@ -261,6 +262,7 @@ fn pool_tools_are_strict_registry_entries() {
         ("pool_post", &["pool_id", "request_id", "message"][..]),
         ("pool_replace", &["pool_id", "agent_id", "request_id"][..]),
         ("pool", &["pool_id"][..]),
+        ("list_pools", &[][..]),
     ] {
         let definition = tool(name).unwrap_or_else(|| panic!("{name} registered"));
         assert_eq!(

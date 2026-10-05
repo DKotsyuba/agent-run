@@ -226,6 +226,173 @@ fn ready(key: &str, proposal: u64, criteria: &[(&str, &str)]) -> PoolWrite {
     })
 }
 
+/// Discovery orders creation timestamps and stable ids descending, filters before
+/// counting/paging, bounds UTF-8 excerpts, and never exposes criteria or log bodies.
+#[test]
+fn list_pools_orders_filters_and_pages_without_writing() {
+    use agent_run_domain::pool::{ListPoolsQuery, PoolState};
+    let home = common::Home::new();
+    let (pool, _) = pool(&home, &[("done", "verified")]);
+    let store = home.store();
+    for id in [
+        "pool-20260102-000000-012345678a",
+        "pool-20260102-000000-012345678b",
+    ] {
+        store.conn.execute(
+            "INSERT INTO pools(id,request_namespace,request_id,request_sha256,goal,acceptance_json,state,roster_revision,created_at) \
+             VALUES(?,'ns',? ,? ,? ,'[]','open',1,2.0)",
+            rusqlite::params![id, id, "0".repeat(64), "漢".repeat(200)],
+        ).unwrap();
+    }
+    store
+        .conn
+        .execute(
+            "UPDATE pools SET state='completed',completed_at=3.0 WHERE id='pool-20260102-000000-012345678b'",
+            [],
+        )
+        .unwrap();
+    let revision = store.revision().unwrap();
+    let query = ListPoolsQuery {
+        limit: 1,
+        ..Default::default()
+    };
+    let first = store.list_pools(&query).unwrap();
+    assert_eq!(first.total, 3);
+    assert_eq!(
+        first.items[0].pool_id.as_str(),
+        "pool-20260102-000000-012345678b"
+    );
+    assert_eq!(first.items[0].goal.len(), 510);
+    assert!(first.items[0].goal_truncated);
+    assert_eq!(first.next_offset, Some(1));
+    assert!(!first.complete);
+    let second = store
+        .list_pools(&ListPoolsQuery {
+            offset: 1,
+            ..query.clone()
+        })
+        .unwrap();
+    assert_eq!(
+        second.items[0].pool_id.as_str(),
+        "pool-20260102-000000-012345678a"
+    );
+    let last = store
+        .list_pools(&ListPoolsQuery {
+            offset: 2,
+            ..query.clone()
+        })
+        .unwrap();
+    assert_eq!(last.items[0].pool_id.as_str(), pool);
+    assert!(last.complete);
+    assert_eq!(last.next_offset, None);
+    let beyond = store
+        .list_pools(&ListPoolsQuery {
+            offset: 99,
+            ..query
+        })
+        .unwrap();
+    assert_eq!(beyond.total, 3);
+    assert!(beyond.items.is_empty() && beyond.complete);
+    for (state, total) in [(PoolState::Open, 2), (PoolState::Completed, 1)] {
+        let page = store
+            .list_pools(&ListPoolsQuery {
+                state: Some(state),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page.total, total);
+        assert!(page.items.iter().all(|item| item.state == state));
+        let wire = serde_json::to_value(&page).unwrap();
+        assert!(wire["items"][0].get("criteria").is_none());
+        assert!(wire["items"][0].get("entries").is_none());
+    }
+    assert_eq!(store.revision().unwrap(), revision);
+}
+
+/// A raw ready decision never counts after failure, a new proposal, roster
+/// revision or continuation invalidates it; list and pool use identical validity.
+#[test]
+fn list_pools_counts_only_valid_votes() {
+    use agent_run_domain::pool::ListPoolsQuery;
+    let home = common::Home::new();
+    let (_, members, pool_id) = voted_pool(&home);
+    let mut store = home.store();
+    assert_eq!(
+        store.list_pools(&ListPoolsQuery::default()).unwrap().items[0].ready,
+        2
+    );
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='failed' WHERE id=?",
+            [members[0].0.as_str()],
+        )
+        .unwrap();
+    assert_eq!(
+        store.list_pools(&ListPoolsQuery::default()).unwrap().items[0].ready,
+        1
+    );
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='running' WHERE id=?",
+            [members[0].0.as_str()],
+        )
+        .unwrap();
+    let child = plain_agent_with_root(&mut store, &home, &members[0].0);
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='running' WHERE id=?",
+            [child.as_str()],
+        )
+        .unwrap();
+    assert_eq!(
+        store.list_pools(&ListPoolsQuery::default()).unwrap().items[0].ready,
+        1
+    );
+    store
+        .conn
+        .execute(
+            "UPDATE pools SET roster_revision=2 WHERE id=?",
+            [pool_id.as_str()],
+        )
+        .unwrap();
+    let page = store.list_pools(&ListPoolsQuery::default()).unwrap();
+    assert_eq!(page.items[0].ready, 0);
+    let status = store
+        .pool_operator_read(&pool_id, 0, None, 50)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        page.items[0].ready,
+        status["status"]["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|member| member["counts"] == true)
+            .count()
+    );
+    let (run, attempt, token) = &members[1];
+    let new = store
+        .pool_write(
+            run,
+            attempt,
+            token,
+            PoolWrite::Proposal(PoolPropose {
+                request_id: "new-proposal".into(),
+                message: "New result".into(),
+                snapshot: "New snapshot".into(),
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    let page = store.list_pools(&ListPoolsQuery::default()).unwrap();
+    assert_eq!(page.items[0].current_proposal_seq, Some(new.seq));
+    assert_eq!(page.items[0].last_seq, new.seq);
+    assert_eq!(page.items[0].ready, 0);
+}
+
 /// Unbound member chat works: membership, not a binding, authorizes writes.
 #[test]
 fn unbound_member_chat_is_recorded_with_stamped_author() {
@@ -1998,6 +2165,14 @@ fn concurrent_settlement_is_single_and_the_completed_record_stays_frozen() {
         .unwrap();
     assert_eq!(frozen["status"]["state"], "completed");
     assert_eq!(frozen["status"]["agreed"], true);
+    let frozen_list = store
+        .list_pools(&agent_run_domain::pool::ListPoolsQuery::default())
+        .unwrap();
+    assert_eq!(frozen_list.items[0].ready, 2);
+    assert_eq!(
+        frozen_list.items[0].completed_at,
+        frozen["status"]["completed_at"].as_f64()
+    );
     // A member later resumes independently: a new running tip appears.
     store
         .conn
@@ -2012,6 +2187,12 @@ fn concurrent_settlement_is_single_and_the_completed_record_stays_frozen() {
         .unwrap()
         .unwrap();
     assert_eq!(after["status"], frozen["status"], "history does not drift");
+    assert_eq!(
+        store
+            .list_pools(&agent_run_domain::pool::ListPoolsQuery::default())
+            .unwrap(),
+        frozen_list
+    );
     assert!(store
         .settle_pool(&pool_id)
         .unwrap()

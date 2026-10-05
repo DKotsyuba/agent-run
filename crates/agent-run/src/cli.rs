@@ -325,6 +325,22 @@ pub enum Command {
         text: String,
     },
     Agents(Agents),
+    /// Discover pools through the resident broker, newest-created first.
+    #[command(alias = "list-pools")]
+    Pools {
+        /// Optional exact state filter.
+        #[arg(long, value_parser = ["open", "completed"])]
+        state: Option<String>,
+        /// Matching pools to skip.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Page size, 1..=200.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Print a compact human page instead of structured JSON.
+        #[arg(long)]
+        text: bool,
+    },
     Answer {
         /// Stable agent id; defaults to its latest execution's answer.
         agent_id: AgentId,
@@ -1639,6 +1655,29 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 )
                 .await?;
             (dependencies.output)(&result)?;
+        }
+        Command::Pools {
+            state,
+            offset,
+            limit,
+            text,
+        } => {
+            let query: agent_run_domain::pool::ListPoolsQuery =
+                serde_json::from_value(json!({"state": state, "offset": offset, "limit": limit}))
+                    .map_err(|_| invalid("invalid pool list arguments"))?;
+            query.validate()?;
+            let result = dependencies
+                .broker
+                .call("list_pools", serde_json::to_value(query)?)
+                .await?;
+            if text {
+                (dependencies.text_output)(&format!(
+                    "{}\n",
+                    crate::transport::mcp_text::list_pools_text(&result)?
+                ))?;
+            } else {
+                (dependencies.output)(&result)?;
+            }
         }
         Command::Context(a) => {
             let reference = OrchestratorRef {

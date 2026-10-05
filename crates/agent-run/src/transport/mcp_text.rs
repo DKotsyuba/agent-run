@@ -53,6 +53,10 @@ const TEMPLATES: &[(&str, &str)] = &[
     ),
     ("pool", include_str!("../../../../assets/mcp/pool.txt.j2")),
     (
+        "list_pools",
+        include_str!("../../../../assets/mcp/list_pools.txt.j2"),
+    ),
+    (
         "resume",
         include_str!("../../../../assets/mcp/resume.txt.j2"),
     ),
@@ -169,6 +173,12 @@ pub fn success_result(tool: &str, value: &Value) -> CallToolResult {
     result
 }
 
+/// Renders the compact pool discovery page for CLI human output.
+/// Uses the same embedded template as MCP; malformed results return a typed error.
+pub fn list_pools_text(value: &Value) -> Result<String> {
+    render("list_pools", value)
+}
+
 /// Presents one operator-facing (public server) tool result.
 ///
 /// The public `pool_post` shares its name with the private worker tool, so it
@@ -259,6 +269,11 @@ fn context(name: &str, value: &Value) -> Value {
             "state": value["state"].as_str().unwrap_or("queued"),
         }),
         "list_agents" => list_context(value),
+        "list_pools" => {
+            let mut page = value.clone();
+            page["returned"] = json!(value["items"].as_array().map(Vec::len));
+            page
+        }
         "transcript" => transcript_context(value),
         "answer" => answer_context(value),
         "models" => models_context(value),
@@ -663,6 +678,32 @@ mod tests {
     use super::{error_result, public_success_result, success_result};
     use rmcp::model::CallToolResult;
     use serde_json::{json, Value};
+
+    /// Pool discovery renders compact text with member join ids and honest paging.
+    #[test]
+    fn list_pools_renders_excerpt_readiness_and_paging() {
+        let value = json!({"items":[{"pool_id":"pool-one","state":"open","ready":1,
+            "members_count":2,"roster_revision":3,"last_seq":7,"goal":"bounded",
+            "goal_truncated":true,"current_proposal_seq":4,
+            "members":[{"slot":1,"name":"Reviewer","role":"review","agent_id":"ag-one",
+                "tip_status":"running"}]}],
+            "total":3,"offset":0,"limit":1,"next_offset":1,"complete":false});
+        let result = public_success_result("list_pools", &value);
+        let wire = serde_json::to_value(result).unwrap();
+        assert_eq!(wire["isError"], false, "{wire}");
+        let page = wire["content"][0]["text"].as_str().unwrap();
+        assert!(page.contains("1 of 3 matching"));
+        assert!(page.contains("1/2 ready"));
+        assert!(page.contains("bounded [excerpt]"));
+        assert!(page.contains("Reviewer (review): ag-one — running"));
+        assert!(page.contains("next offset: 1"));
+        assert_eq!(page, super::list_pools_text(&value).unwrap());
+        assert!(wire.get("structuredContent").is_none());
+        let empty = super::list_pools_text(&json!({"items":[],"total":0,"offset":0,
+            "limit":50,"next_offset":null,"complete":true}))
+        .unwrap();
+        assert!(empty.contains("page complete"));
+    }
 
     /// Compact start/resume/list output preserves labels, observed zero and
     /// unknown metrics, names incomplete lineage evidence and hides execution IDs.

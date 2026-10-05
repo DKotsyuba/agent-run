@@ -831,5 +831,41 @@
     },
     "outputSchema": null,
     "resultShape": null
+  },
+  {
+    "name": "list_pools",
+    "description": "Discover pools with an exact filtered total, newest-created first. Returns bounded goal excerpts, current member identities and derived ready counts; completed summaries remain frozen. Read-only; no log bodies or criteria.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "open",
+            "completed",
+            null
+          ],
+          "description": "Optional lifecycle filter; omission or null selects all pools."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "default": 50
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "outputSchema": null,
+    "resultShape": null
   }
 ]

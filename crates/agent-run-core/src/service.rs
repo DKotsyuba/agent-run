@@ -803,6 +803,15 @@ impl Service {
             }))
     }
 
+    /// Discovers a bounded page of pools without admission, settlement or writes.
+    /// Strict page validation and frozen vote validity come from the store.
+    pub fn list_pools(&self, query: agent_run_domain::pool::ListPoolsQuery) -> Result<Value> {
+        query.validate()?;
+        Ok(serde_json::to_value(
+            Store::open(&self.home)?.list_pools(&query)?,
+        )?)
+    }
+
     /// Reads a pool's derived status and one cursor page of its log for the
     /// operator, through the projection members read.
     pub fn pool_status(&self, query: PoolQuery) -> Result<std::result::Result<Value, PoolDenial>> {

@@ -4,6 +4,19 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- feat(pools): add read-only `list_pools` discovery across MCP and the broker
+  socket, plus `agent-run pools` (`list-pools`) with optional compact `--text`
+  output; pages expose exact filtered totals, bounded goal excerpts, current
+  member identities and valid readiness counts, preserving frozen completion
+- feat(tui): redesign the terminal observer: truecolor theme with a 16-colour
+  fallback, split sessions/transcript view, app and key bars, overlays,
+  display labels, native tool evidence, tail-first transcripts with usage and
+  tool counts, incremental rendering with a 33 ms frame pacer and separate
+  broker lanes
+- feat(tui): add a read-only Pools tab with the pool list, roster and vote
+  validity, criteria and the full stamped chat log; brokers without
+  `list_pools` fall back to pools found in loaded sessions
+
 ## [0.20.4] - 2026-10-04
 
 - fix(delivery): isolate invalid payloads, deliver cancellations without failure

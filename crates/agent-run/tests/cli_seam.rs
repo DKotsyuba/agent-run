@@ -136,6 +136,46 @@ fn dependencies(
     }
 }
 
+/// Both CLI discovery spellings forward validated pages through the broker;
+/// default output preserves JSON and --text reuses the compact MCP presentation.
+#[tokio::test]
+async fn pools_cli_uses_broker_and_supports_human_output() {
+    let page = json!({"items":[],"total":0,"offset":2,"limit":3,
+        "next_offset":null,"complete":true});
+    for command in ["pools", "list-pools"] {
+        let broker = Arc::new(FakeBroker::new(vec![page.clone()]));
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let service = Arc::new(FakeService::new(vec![], false));
+        let text = Arc::new(Mutex::new(String::new()));
+        let mut deps = dependencies(service, broker.clone(), output.clone());
+        let captured = text.clone();
+        deps.text_output = Arc::new(move |chunk| {
+            captured.lock().unwrap().push_str(chunk);
+            Ok(())
+        });
+        let mut argv = vec![command, "--state", "open", "--offset", "2", "--limit", "3"];
+        if command == "list-pools" {
+            argv.push("--text");
+        }
+        agent_run::cli::run_with(parse(&argv), deps).await.unwrap();
+        assert_eq!(
+            broker.calls.lock().unwrap().as_slice(),
+            &[(
+                "list_pools".to_owned(),
+                json!({"state":"open","offset":2,"limit":3})
+            )]
+        );
+        if command == "pools" {
+            assert_eq!(
+                output.lock().unwrap().as_slice(),
+                std::slice::from_ref(&page)
+            );
+        } else {
+            assert!(text.lock().unwrap().contains("agent-run pools: 0 of 0"));
+        }
+    }
+}
+
 /// Mirrors `tests/test_cli.py::test_start_decodes_the_full_request_and_returns_immediately`.
 #[tokio::test]
 async fn test_start_decodes_the_full_request_and_returns_immediately() {
