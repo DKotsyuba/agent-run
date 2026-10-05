@@ -179,6 +179,7 @@ pub fn check(root: &Path) -> Result<(), String> {
 /// Returns one nested TOML value or a fixed empty scalar, so missing malformed
 /// declarations produce typed check failures rather than indexing panics.
 fn toml_at<'a>(value: &'a toml::Value, keys: &[&str]) -> &'a toml::Value {
+    /// Stable absent-value sentinel shared by failed nested lookups; never mutated.
     static MISSING: toml::Value = toml::Value::String(String::new());
     keys.iter()
         .try_fold(value, |value, key| value.get(*key))
@@ -468,7 +469,7 @@ pub fn contract(root: &Path, export: bool) -> Result<(), String> {
         "schema_version": 1,
         "product_version": env!("CARGO_PKG_VERSION"),
         "sdk": {"name": "rmcp", "version": "3.4.0"},
-        "protocol_versions": ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"],
+        "protocol_versions": ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"],
         "operator": {
             "server_name": "agent-run", "registration_name": "agent-run",
             "transport": "stdio", "command": "agent-run", "args": ["mcp"],
@@ -802,6 +803,28 @@ mod tests {
         manifest_for(root.path(), &[("docs/family-standard.md", "summary\n")]);
         super::update(root.path()).expect("update refreshes digests");
         verify(root.path()).expect("refreshed manifest verifies");
+    }
+
+    /// The registration export advertises the modern revision actually negotiated
+    /// by the product, in addition to every historical supported revision.
+    #[test]
+    fn registration_export_includes_modern_protocol_revision() {
+        let root = tempdir().unwrap();
+        super::contract(root.path(), true).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.path().join("schemas/mcp-registration.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            value["protocol_versions"],
+            json!([
+                "2024-11-05",
+                "2025-03-26",
+                "2025-06-18",
+                "2025-11-25",
+                "2026-07-28"
+            ])
+        );
     }
 
     /// Exported schemas and registration are deterministic; description,

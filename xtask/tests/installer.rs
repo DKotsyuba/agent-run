@@ -323,6 +323,144 @@ fn installed_version_is_not_rewritten_and_pending_recovery_is_preserved() {
     );
 }
 
+/// A finite native fake gh ignores TERM. A shortened copy of the real bootstrap
+/// must hard-escalate on deadline and reap its tool/watchdog on controlled TERM.
+#[test]
+fn bootstrap_watchdog_escalates_and_cancel_reaps_owned_children() {
+    let temp = tempfile::tempdir().unwrap();
+    let tools = temp.path().join("tools");
+    fs::create_dir(&tools).unwrap();
+    executable(
+        &tools.join("uname"),
+        "#!/bin/sh\ncase $1 in -s) echo Darwin ;; -m) echo arm64 ;; esac\n",
+    );
+    let source = temp.path().join("fake-gh.rs");
+    fs::write(&source,r#"//! Finite TERM-ignoring process fixture; no network or descendants.
+unsafe extern "C" { fn signal(number:i32, handler:usize)->usize; }
+/// Ignores TERM, records its exact PID, then exits naturally within eight seconds.
+fn main() {
+    // SAFETY: POSIX SIGTERM and SIG_IGN are fixed values on these Unix test hosts.
+    unsafe { signal(15,1); }
+    std::fs::write(std::env::var_os("TEST_TOOL_PID").unwrap(),std::process::id().to_string()).unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(8));
+}
+"#).unwrap();
+    assert!(
+        Command::new("rustc")
+            .args(["--edition", "2024"])
+            .arg(&source)
+            .arg("-o")
+            .arg(tools.join("gh"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let original =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../install.sh")).unwrap();
+    let script = temp.path().join("short-install.sh");
+    let shortened=original.replace("sleep 180 &","sleep 1 &")
+        .replace("timer_identity=$(process_identity \"$timer_pid\" || :)","timer_identity=$(process_identity \"$timer_pid\" || :)\nprintf '%s\\n' \"$timer_pid\" > \"$TEST_TIMER_PID\"")
+        .replace("sleep_identity=$(process_identity \"$sleep_pid\" || :)","sleep_identity=$(process_identity \"$sleep_pid\" || :)\nprintf '%s\\n' \"$sleep_pid\" >> \"$TEST_SLEEP_PIDS\"");
+    fs::write(&script, shortened).unwrap();
+    for cancel in [false, true] {
+        let tool_id = temp.path().join(if cancel {
+            "cancel-tool"
+        } else {
+            "timeout-tool"
+        });
+        let timer_id = temp.path().join(if cancel {
+            "cancel-timer"
+        } else {
+            "timeout-timer"
+        });
+        let sleep_ids = temp.path().join(if cancel {
+            "cancel-sleeps"
+        } else {
+            "timeout-sleeps"
+        });
+        let mut child = Command::new("sh")
+            .arg(&script)
+            .env(
+                "PATH",
+                format!("{}:{}", tools.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("TEST_TOOL_PID", &tool_id)
+            .env("TEST_TIMER_PID", &timer_id)
+            .env("TEST_SLEEP_PIDS", &sleep_ids)
+            .env("TMPDIR", temp.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let start = std::time::Instant::now();
+        while (!tool_id.exists() || !timer_id.exists() || !sleep_ids.exists())
+            && start.elapsed() < std::time::Duration::from_secs(3)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if !tool_id.exists() || !timer_id.exists() || !sleep_ids.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("finite fake gh did not start");
+        }
+        if cancel {
+            // SAFETY: this is the owned unreaped bootstrap child, not a persisted PID.
+            assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+        }
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if start.elapsed() > std::time::Duration::from_secs(10) {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("bootstrap watchdog exceeded fixture's finite lifetime");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let tool: i32 = fs::read_to_string(&tool_id).unwrap().parse().unwrap();
+        let timer: i32 = fs::read_to_string(&timer_id)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let tool_alive =
+            agent_run_platform::process::inspect(tool).is_ok_and(|process| !process.zombie);
+        let timer_alive =
+            agent_run_platform::process::inspect(timer).is_ok_and(|process| !process.zombie);
+        // Even a failing old implementation's finite tool finishes before fixture teardown.
+        while agent_run_platform::process::inspect(tool).is_ok_and(|process| !process.zombie)
+            && start.elapsed() < std::time::Duration::from_secs(10)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !tool_alive,
+            "owned tool must be dead at bootstrap completion"
+        );
+        assert!(
+            !timer_alive,
+            "owned watchdog must be dead at bootstrap completion"
+        );
+        for pid in fs::read_to_string(&sleep_ids).unwrap().lines() {
+            let pid = pid.parse::<i32>().unwrap();
+            assert!(
+                !agent_run_platform::process::inspect(pid).is_ok_and(|process| !process.zombie),
+                "watchdog sleep must also be reaped"
+            );
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "hard escalation must finish before natural tool exit"
+        );
+        if cancel {
+            assert_eq!(status.code(), Some(143));
+        } else {
+            assert!(!status.success());
+        }
+    }
+}
+
 /// Exercises both downloaders without network access, including integrity and archive rejection.
 #[test]
 fn shell_download_and_archive_checks() {

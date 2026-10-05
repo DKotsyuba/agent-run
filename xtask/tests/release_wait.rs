@@ -261,13 +261,14 @@ case "$1" in
    */git/ref/tags/*) cat "$TEST_FIXTURE/tag.json" ;;
    */git/tags/*) cat "$TEST_FIXTURE/tag-object.json" ;;
    */releases/tags/*) if [ -f "$TEST_FIXTURE/release.json" ]; then cat "$TEST_FIXTURE/release.json"; else echo 'HTTP 404' >&2; exit 1; fi ;;
-   */contents/*) name=${endpoint##*/};name=${name%%\?*};cat "$TEST_FIXTURE/source/$name" ;;
+   */contents/*) if [ "${TEST_STALL_STAGE:-}" = source ]; then touch "$TEST_FIXTURE/leaf-started"; sleep 6; exit 1; fi; name=${endpoint##*/};name=${name%%\?*};cat "$TEST_FIXTURE/source/$name" ;;
    *) exit 9 ;;
   esac ;;
  release)
   operation=$2; shift 2
   case "$operation" in
    download)
+    if [ "${TEST_STALL_STAGE:-}" = download ]; then touch "$TEST_FIXTURE/leaf-started"; sleep 6; exit 1; fi
     patterns=
     while [ "$#" -gt 0 ]; do case "$1" in --dir) directory=$2;shift ;; --pattern) patterns="$patterns $2";shift ;; esac;shift;done
     for name in $patterns; do [ ! -e "$directory/$name" ] || exit 9;cp "$TEST_FIXTURE/assets/$name" "$directory/$name";done ;;
@@ -613,6 +614,181 @@ exit {exit}
             1
         );
     }
+}
+
+/// Source preparation updates the descriptor from its explicit version plan,
+/// preserving registration fields despite a differently versioned running xtask.
+#[test]
+fn release_prepare_updates_source_registration_mirror() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("Cargo.toml"),"[workspace]\n[workspace.package]\nversion = \"1.2.3\"\n[package]\nname = \"version-fixture\"\nversion.workspace = true\nedition = \"2024\"\n[lib]\npath = \"lib.rs\"\n").unwrap();
+    fs::write(
+        fixture.root.join("lib.rs"),
+        "//! Disposable version fixture.\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.root.join("CHANGELOG.md"),
+        "# Changes\n## Unreleased\nFixture release notes.\n",
+    )
+    .unwrap();
+    fs::create_dir(fixture.root.join("schemas")).unwrap();
+    let descriptor = json!({"schema_version":1,"product_version":"1.2.3","protocol_versions":["2026-07-28"],"operator":{"command":"preserved-command"}});
+    record(
+        &fixture.root.join("schemas/mcp-registration.json"),
+        &descriptor,
+    );
+    let mut plan = fixture.command();
+    plan.args(["release", "prepare", "1.2.4"]);
+    let output = fixture.output(plan);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        plan["files"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("schemas/mcp-registration.json"))
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(
+            &fs::read(fixture.root.join("schemas/mcp-registration.json")).unwrap()
+        )
+        .unwrap(),
+        descriptor
+    );
+    let mut apply = fixture.command();
+    apply.args(["release", "prepare", "1.2.4", "--apply"]);
+    let output = fixture.output(apply);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut expected = descriptor;
+    expected["product_version"] = json!("1.2.4");
+    assert_eq!(
+        serde_json::from_slice::<Value>(
+            &fs::read(fixture.root.join("schemas/mcp-registration.json")).unwrap()
+        )
+        .unwrap(),
+        expected
+    );
+    assert!(
+        fs::read_to_string(fixture.root.join("Cargo.lock"))
+            .unwrap()
+            .contains("version = \"1.2.4\"")
+    );
+}
+
+/// Stalled download/source leaves retain the shared deadline exit; a TERM while
+/// the verified archive is being extracted produces cancelled, not integrity failure.
+#[test]
+fn stalled_leaves_and_cancelled_verification_keep_terminal_kind() {
+    for stage in ["download", "source"] {
+        let fixture = Fixture::new();
+        fs::copy(
+            fixture.temp.path().join("published.json"),
+            fixture.temp.path().join("release.json"),
+        )
+        .unwrap();
+        let mut command = fixture.command();
+        command
+            .env("TEST_STALL_STAGE", stage)
+            .args([
+                "release",
+                "wait",
+                "--repo",
+                REPOSITORY,
+                "--tag",
+                &fixture.manifest.tag,
+                "--commit",
+                &fixture.manifest.commit,
+                "--run-id",
+                "17",
+                "--attempt",
+                "1",
+                "--timeout",
+                "3",
+                "--result-file",
+            ])
+            .arg(fixture.temp.path().join("timeout.json"));
+        let output = fixture.output(command);
+        assert!(
+            fixture.temp.path().join("leaf-started").exists(),
+            "actual {stage} leaf must run"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    let fixture = Fixture::new();
+    fs::copy(
+        fixture.temp.path().join("published.json"),
+        fixture.temp.path().join("release.json"),
+    )
+    .unwrap();
+    executable(
+        &fixture.tools.join("tar"),
+        "#!/bin/sh\ntouch \"$TEST_FIXTURE/leaf-started\"\nsleep 4\nexit 1\n",
+    );
+    let result = fixture.temp.path().join("cancel.json");
+    let mut command = fixture.command();
+    command
+        .args([
+            "release",
+            "wait",
+            "--repo",
+            REPOSITORY,
+            "--tag",
+            &fixture.manifest.tag,
+            "--commit",
+            &fixture.manifest.commit,
+            "--run-id",
+            "17",
+            "--attempt",
+            "1",
+            "--timeout",
+            "10",
+            "--result-file",
+        ])
+        .arg(&result);
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(7);
+    while !fixture.temp.path().join("leaf-started").exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !fixture.temp.path().join("leaf-started").exists() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("verification extraction did not start");
+    }
+    // SAFETY: this is the still-owned unreaped CLI child, not a persisted PID.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("cancelled verification exceeded outer budget");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(130));
+    let event: Value = serde_json::from_slice(&fs::read(result).unwrap()).unwrap();
+    assert_eq!(event["status"], "cancelled");
 }
 
 /// An owned foreground SIGINT produces a private cancelled receipt and reaps

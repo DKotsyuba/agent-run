@@ -105,8 +105,26 @@ fn cargo_version(text: &str, next: &str) -> Result<(String, String), String> {
     Ok((previous, updated))
 }
 
-/// Builds a local version/changelog plan by default; --apply changes only Cargo,
-/// CHANGELOG and workspace lock entries. Failed lock update preserves the diff.
+/// Changes only the source descriptor's product version from the explicit plan.
+/// Existing SDK, protocol and registration fields survive; no compiled registry
+/// or CARGO_PKG_VERSION from the running old preparation tool is consulted.
+fn registration_version(bytes: &[u8], next: &str) -> Result<Vec<u8>, String> {
+    let mut descriptor: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| "source registration invalid")?;
+    let field = descriptor
+        .get_mut("product_version")
+        .filter(|field| field.is_string())
+        .ok_or("source registration product_version missing")?;
+    *field = serde_json::json!(next);
+    let mut bytes = serde_json::to_vec_pretty(&descriptor)
+        .map_err(|_| "source registration serialization failed")?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Plans source version mirrors by default; --apply changes Cargo, CHANGELOG,
+/// workspace lock entries and registration product_version without exporting an
+/// old compiled registry. Failed lock update preserves the reviewable diff.
 pub fn prepare_release(root: &Path, args: &[String]) -> Result<(), String> {
     let next = args.get(1).ok_or("release prepare VERSION [--apply]")?;
     let next_parts = version(next)?;
@@ -148,13 +166,18 @@ pub fn prepare_release(root: &Path, args: &[String]) -> Result<(), String> {
         return Err("release notes must not be empty".into());
     }
     let planned = changelog.replacen(heading, &format!("{heading}\n\n## {next}"), 1);
+    let registration = root.join("schemas/mcp-registration.json");
+    let registration_bytes =
+        registration_version(&delivery::read_regular(&registration, 65536)?, next)?;
     println!(
         "{}",
-        serde_json::json!({"previous":previous,"version":next,"apply":args.iter().any(|s|s=="--apply"),"files":["Cargo.toml","Cargo.lock","CHANGELOG.md"]})
+        serde_json::json!({"previous":previous,"version":next,"apply":args.iter().any(|s|s=="--apply"),"files":["Cargo.toml","Cargo.lock","CHANGELOG.md","schemas/mcp-registration.json"]})
     );
     if args.iter().any(|s| s == "--apply") {
         fs::write(root.join("Cargo.toml"), updated).map_err(|_| "Cargo write failed")?;
         fs::write(root.join("CHANGELOG.md"), planned).map_err(|_| "CHANGELOG write failed")?;
+        fs::write(registration, registration_bytes)
+            .map_err(|_| "source registration write failed")?;
         checked(root, "cargo", &["update", "--offline", "--workspace"], 180)?;
     }
     Ok(())

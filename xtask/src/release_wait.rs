@@ -686,8 +686,9 @@ pub(crate) fn download(
             args.extend(["--pattern".into(), name]);
         }
     }
-    let (code, _, _) = delivery::run("gh", &args, root, budget(deadline, 180)?)
-        .map_err(|_| failure(4, "bounded release download failed"))?;
+    let outcome = delivery::run("gh", &args, root, budget(deadline, 180)?);
+    budget(deadline, 180)?;
+    let (code, _, _) = outcome.map_err(|_| failure(4, "bounded release download failed"))?;
     if code != 0 {
         return Err(failure(
             4,
@@ -710,8 +711,9 @@ fn source_contract(root: &Path, manifest: &Manifest, deadline: Instant) -> Resul
             "Accept: application/vnd.github.raw+json".into(),
             format!("repos/{REPOSITORY}/contents/{name}?ref={}", manifest.commit),
         ];
-        let (code, bytes, _) = delivery::run("gh", &args, root, budget(deadline, 30)?)
-            .map_err(|_| failure(4, "source declaration unavailable"))?;
+        let outcome = delivery::run("gh", &args, root, budget(deadline, 30)?);
+        budget(deadline, 30)?;
+        let (code, bytes, _) = outcome.map_err(|_| failure(4, "source declaration unavailable"))?;
         if code != 0 || bytes.len() > 65536 {
             return Err(failure(5, "source declaration type/size invalid"));
         }
@@ -823,8 +825,10 @@ fn observe(root: &Path, o: &Options, w: &mut Option<Workflow>) -> Result<String,
                     inventory(&release, &manifest, bytes.len() as u64)?;
                     let pinned_toolchain = source_contract(root, &manifest, deadline)?;
                     download(root, &o.tag, &scratch, deadline, false)?;
-                    delivery::verify_until(&scratch, &o.commit, Some(workflow), deadline)
-                        .map_err(|_| failure(5, "artifact/evidence integrity failure"))?;
+                    let verified =
+                        delivery::verify_until(&scratch, &o.commit, Some(workflow), deadline);
+                    budget(deadline, 30)?;
+                    verified.map_err(|_| failure(5, "artifact/evidence integrity failure"))?;
                     let evidence: delivery::Acceptance = serde_json::from_slice(
                         &delivery::read_regular(&scratch.join(delivery::ACCEPTANCE), 262144)
                             .map_err(|_| failure(5, "acceptance metadata type/size invalid"))?,

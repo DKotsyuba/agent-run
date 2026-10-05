@@ -44,29 +44,101 @@ for destination in "$prefix" "$install_home" "$bin_dir"; do
 done
 [ "$(uname -s)/$(uname -m)" = Darwin/arm64 ] || fail 'only macOS Apple silicon (Darwin/arm64) is qualified'
 case "$downloader" in gh|curl|wget) ;; *) fail '--downloader must be gh, curl or wget' ;; esac
-for tool in gh jq tar "$downloader"; do command -v "$tool" >/dev/null 2>&1 || fail "required trusted tool: $tool"; done
+for tool in gh jq tar ps "$downloader"; do command -v "$tool" >/dev/null 2>&1 || fail "required trusted tool: $tool"; done
 if command -v shasum >/dev/null 2>&1; then hash_tool=shasum;
 elif command -v sha256sum >/dev/null 2>&1; then hash_tool=sha256sum;
 else fail 'shasum or sha256sum is required'; fi
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/agent-run-install.XXXXXXXX")
-# Remove only this invocation's private scratch; reap finite watchdogs separately.
-cleanup() { rm -rf -- "$temporary"; }
+# Owned child slots and best-effort local ps identities; never displayed.
+tool_pid= tool_identity= timer_pid= timer_identity= cleanup_unconfirmed=0
+# process_identity PID prints its PPID/birth/command string, or empty if absent.
+process_identity() { LC_ALL=C ps -p "$1" -o stat= -o ppid= -o lstart= -o args= 2>/dev/null | LC_ALL=C awk '$1 !~ /^Z/ { $1=""; sub(/^ /,""); print }'; }
+# signal_owned PID IDENTITY SIGNAL signals only an unchanged captured identity.
+# Empty/mismatching identity refuses signalling; this is a local best-effort guard.
+signal_owned() {
+    [ -n "$2" ] && [ "$(process_identity "$1")" = "$2" ] || return 1
+    kill -"$3" "$1" 2>/dev/null
+}
+# child_terminated PID recognizes a zombie or observed absence. A live process
+# with unavailable identity is still live, so callers refuse unconfirmed cleanup.
+child_terminated() {
+    child_state=$(LC_ALL=C ps -p "$1" -o stat= 2>/dev/null || :)
+    case "$child_state" in *Z*) return 0 ;; "") ! kill -0 "$1" 2>/dev/null ;; *) return 1 ;; esac
+}
+# stop_owned PID IDENTITY terminates, briefly waits, hard-escalates and reaps
+# this shell's child. A live unknown identity returns failure without unsafe kill.
+stop_owned() {
+    [ -n "$1" ] || return 0
+    if signal_owned "$1" "$2" TERM; then
+        for grace in 1 2 3 4 5 6 7 8 9 10; do
+            child_terminated "$1" && break
+            sleep 0.1
+        done
+        if ! child_terminated "$1"; then
+            signal_owned "$1" "$2" KILL || return 1
+        fi
+    elif ! child_terminated "$1"; then
+        return 1
+    fi
+    wait "$1" 2>/dev/null || :
+}
+# Stop/reap both child slots on EXIT/cancellation; preserve scratch if ownership
+# could not be confirmed rather than claiming cleanup or signalling a foreign PID.
+cleanup() {
+    trap - EXIT INT TERM HUP USR1
+    stop_owned "$tool_pid" "$tool_identity" || cleanup_unconfirmed=1
+    stop_owned "$timer_pid" "$timer_identity" || cleanup_unconfirmed=1
+    [ ! -f "$temporary/cleanup-unconfirmed" ] || cleanup_unconfirmed=1
+    if [ "$cleanup_unconfirmed" = 0 ]; then rm -rf -- "$temporary";
+    else printf 'agent-run install: child cleanup unconfirmed; scratch retained\n' >&2; fi
+}
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
-# Bound a trusted external tool's lifetime/output files; timer owns and reaps sleep.
+trap 'cleanup_unconfirmed=1; fail "child identity unavailable/changed; cleanup unconfirmed"' USR1
+# Bound trusted external tooling with exact-identity TERM/KILL escalation. The
+# watchdog also owns/reaps its sleep; cancellation unwinds through cleanup.
 bounded() {
     (ulimit -f 524288; if [ "$1" = gh ]; then GH_HOST=github.com; export GH_HOST; fi; exec "$@") & tool_pid=$!
+    tool_identity=$(process_identity "$tool_pid" || :)
+    parent_identity=$(process_identity "$$" || :)
     (
+        # Reap only this watchdog's captured sleep child on controlled shutdown.
+        sleep_pid= sleep_identity=
+        timer_cleanup() {
+            trap - TERM INT HUP
+            if [ -n "$sleep_pid" ]; then
+                signal_owned "$sleep_pid" "$sleep_identity" TERM || :
+                if ! child_terminated "$sleep_pid"; then
+                    signal_owned "$sleep_pid" "$sleep_identity" KILL || { : > "$temporary/cleanup-unconfirmed"; exit 1; }
+                fi
+                wait "$sleep_pid" 2>/dev/null || :
+            fi
+            exit 0
+        }
+        trap timer_cleanup TERM INT HUP
         sleep 180 & sleep_pid=$!
-        trap 'kill "$sleep_pid" 2>/dev/null || :; wait "$sleep_pid" 2>/dev/null || :; exit 0' TERM INT
+        sleep_identity=$(process_identity "$sleep_pid" || :)
         wait "$sleep_pid"
-        kill -TERM "$tool_pid" 2>/dev/null || :
+        sleep_pid=
+        if signal_owned "$tool_pid" "$tool_identity" TERM; then
+            sleep 1 & sleep_pid=$!
+            sleep_identity=$(process_identity "$sleep_pid" || :)
+            wait "$sleep_pid"
+            sleep_pid=
+            if ! child_terminated "$tool_pid"; then
+                signal_owned "$tool_pid" "$tool_identity" KILL || signal_owned "$$" "$parent_identity" USR1
+            fi
+        elif ! child_terminated "$tool_pid"; then
+            signal_owned "$$" "$parent_identity" USR1
+        fi
     ) & timer_pid=$!
+    timer_identity=$(process_identity "$timer_pid" || :)
     result=0
     wait "$tool_pid" || result=$?
-    kill -TERM "$timer_pid" 2>/dev/null || :
-    wait "$timer_pid" 2>/dev/null || :
+    tool_pid= tool_identity=
+    stop_owned "$timer_pid" "$timer_identity" || { cleanup_unconfirmed=1; fail 'watchdog cleanup unconfirmed'; }
+    timer_pid= timer_identity=
     return "$result"
 }
 # Fetch fixed official assets; no user URL, token argument, overwrite or fallback.
