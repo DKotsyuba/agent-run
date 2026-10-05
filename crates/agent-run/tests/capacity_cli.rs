@@ -3,13 +3,13 @@
 use agent_run::{
     capacity::{self, Key, Pool, Route, Sample, Slice, Topology},
     cli::{Cli, CliBroker, CliDependencies, CliFuture, CliService},
-    domain::{now, AgentId},
+    domain::{AgentId, now},
     error::invalid,
     service::Query,
     state::Store,
 };
 use clap::Parser;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -135,6 +135,7 @@ fn fake_dependencies(
                 home: home.to_owned(),
                 checked_at: 0.0,
                 findings: Vec::new(),
+                ..agent_run::doctor::Report::default()
             })
         }),
     }

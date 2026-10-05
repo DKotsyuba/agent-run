@@ -12,11 +12,11 @@ pub mod transcript;
 
 use crate::app::{self, App, Link, Screen};
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Paragraph},
-    Frame,
 };
 
 /// Content columns of the session list pane in the split view.
@@ -377,7 +377,7 @@ mod tests {
     use crate::tests_support::{agent_view, force_truecolor, message};
     use agent_run_domain::domain::AgentId;
     use agent_run_domain::views::TranscriptPage;
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{Terminal, backend::TestBackend};
     use std::str::FromStr;
 
     const STABLE: &str = "ag-20260928-101500-aaaaaaaaaa";

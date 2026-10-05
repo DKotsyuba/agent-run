@@ -24,10 +24,10 @@
 //! only child processes are the launch preflight's metadata-only probes, and
 //! only under `--apply`.
 
-use crate::{migrate, Result};
+use crate::{Result, migrate};
 use agent_run_core::{fs, runtime_storage, state::Store, storage_gc};
 use agent_run_domain::error::invalid;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -108,11 +108,11 @@ fn unique_bytes(directory: &Path, budget: usize) -> (u64, bool) {
                     if seen.contains_key(&entry.inode) {
                         continue;
                     }
-                    if let Ok(file) = dir.open_file(&relative) {
-                        if let Ok(metadata) = file.metadata() {
-                            seen.insert(entry.inode, ());
-                            *total += metadata.len();
-                        }
+                    if let Ok(file) = dir.open_file(&relative)
+                        && let Ok(metadata) = file.metadata()
+                    {
+                        seen.insert(entry.inode, ());
+                        *total += metadata.len();
                     }
                 }
                 _ => continue,
@@ -557,30 +557,30 @@ pub fn recover(home: &Path) -> Result<Value> {
     // roll back from their records, before anything is reported.
     let mut native_recovered = 0;
     let mut native_refused = 0;
-    if let Ok(root) = runtime_storage::store_root(home) {
-        if root.is_dir() {
-            let mut after: Option<String> = None;
-            loop {
-                let Ok((page, more)) =
-                    store.runtime_storage_layouts_page(after.as_deref(), RECOVER_ROWS)
-                else {
-                    native_refused += 1;
-                    break;
-                };
-                for record in &page {
-                    after = Some(record.runtime_home.clone());
-                    let path = PathBuf::from(&record.runtime_home);
-                    if fs::Dir::open(&path).is_err() {
-                        continue;
-                    }
-                    match agent_run_core::native_tree_cache::recover(&root, &path) {
-                        Ok(()) => native_recovered += 1,
-                        Err(_) => native_refused += 1,
-                    }
+    if let Ok(root) = runtime_storage::store_root(home)
+        && root.is_dir()
+    {
+        let mut after: Option<String> = None;
+        loop {
+            let Ok((page, more)) =
+                store.runtime_storage_layouts_page(after.as_deref(), RECOVER_ROWS)
+            else {
+                native_refused += 1;
+                break;
+            };
+            for record in &page {
+                after = Some(record.runtime_home.clone());
+                let path = PathBuf::from(&record.runtime_home);
+                if fs::Dir::open(&path).is_err() {
+                    continue;
                 }
-                if !more {
-                    break;
+                match agent_run_core::native_tree_cache::recover(&root, &path) {
+                    Ok(()) => native_recovered += 1,
+                    Err(_) => native_refused += 1,
                 }
+            }
+            if !more {
+                break;
             }
         }
     }

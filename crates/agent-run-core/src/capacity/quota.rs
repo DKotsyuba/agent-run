@@ -6,7 +6,7 @@
 //! Freshness, unknown data, and collection failure stay distinct: a malformed
 //! round returns an error and never becomes an account fact.
 
-use crate::{error::invalid, Result};
+use crate::{Result, error::invalid};
 use agent_run_domain::catalog::{
     AccountId, NormalizedQuotaSnapshot, PhysicalQuotaKey, QuotaModelObservation,
     QuotaPoolObservation, QuotaWindow,

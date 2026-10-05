@@ -302,8 +302,8 @@ impl Renderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_pages, sanitize, Renderer};
-    use serde_json::{json, Value};
+    use super::{Renderer, render_pages, sanitize};
+    use serde_json::{Value, json};
 
     /// Renders the given pages in order and returns the concatenated chunks.
     fn render(pages: &[&[Value]]) -> String {
@@ -486,11 +486,13 @@ mod tests {
             render(&[a.as_slice(), b.as_slice(), c.as_slice(), d.as_slice()]),
             "Hello \nworld\n"
         );
-        assert!(render(&[
-            &[json!({"seq":1,"role":"assistant","content":""})][..],
-            &[json!({"seq":2,"role":"assistant","content":""})][..]
-        ])
-        .is_empty());
+        assert!(
+            render(&[
+                &[json!({"seq":1,"role":"assistant","content":""})][..],
+                &[json!({"seq":2,"role":"assistant","content":""})][..]
+            ])
+            .is_empty()
+        );
     }
 
     /// A response larger than the old flush watermark is neither truncated

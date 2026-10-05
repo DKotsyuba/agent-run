@@ -4,7 +4,7 @@
 #![cfg(feature = "test-fixtures")]
 
 use agent_run::{domain::AgentId, state::Store, transport::socket};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     io::{BufRead, Write},
     path::PathBuf,
@@ -111,10 +111,10 @@ fn spawn_worker() -> (
             std::thread::sleep(Duration::from_millis(20));
         }
     });
-    if let Ok(stderr) = std::fs::read_to_string(path.join("broker.stderr")) {
-        if !stderr.trim().is_empty() {
-            eprintln!("broker stderr: {stderr}");
-        }
+    if let Ok(stderr) = std::fs::read_to_string(path.join("broker.stderr"))
+        && !stderr.trim().is_empty()
+    {
+        eprintln!("broker stderr: {stderr}");
     }
     // Admit one pool member with a live attempt and capability.
     let (pool, run, attempt, token) = {
@@ -267,10 +267,12 @@ fn worker_pool_wire_lists_calls_and_refuses() {
             "name":"pool_propose","arguments":{"request_id":"p1","message":"result","snapshot":"commit abc"}
         }}),
     );
-    assert!(proposed["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("proposal #2"));
+    assert!(
+        proposed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("proposal #2")
+    );
     let read = roundtrip(
         &mut worker,
         &json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{

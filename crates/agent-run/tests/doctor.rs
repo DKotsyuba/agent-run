@@ -3,7 +3,7 @@
 use agent_run::doctor;
 use std::{
     fs,
-    os::unix::fs::{symlink, MetadataExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
 };
 
 /// Mirrors `test_cli.py::test_init_bootstraps_private_minimal_home_without_credentials`,
@@ -83,11 +83,13 @@ fn python_init_preserves_config_and_optional_integrations_are_not_mandatory() {
         .expect("doctor CLI starts");
     assert_eq!(output.status.code(), Some(0), "doctor: {:?}", output);
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(report["findings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|finding| finding["severity"] != "error"));
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| finding["severity"] != "error")
+    );
 }
 
 /// Mirrors the unsafe-config refusal in Python `_initialize`.
@@ -111,13 +113,17 @@ fn python_doctor_names_plaintext_secret_without_its_value() {
     )
     .unwrap();
     let report = doctor::run(temp.path()).expect("doctor report");
-    assert!(report
-        .findings
-        .iter()
-        .any(|finding| finding.code == "plaintext_secret_config"));
-    assert!(!serde_json::to_string(&report)
-        .unwrap()
-        .contains("must-not-leak"));
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == "plaintext_secret_config")
+    );
+    assert!(
+        !serde_json::to_string(&report)
+            .unwrap()
+            .contains("must-not-leak")
+    );
 }
 
 /// Mirrors `test_doctor.py::test_reports_bounded_metadata_without_mutating_state`.
@@ -224,10 +230,12 @@ fn schema_two_doctor_reports_unregistered_provider_binding() {
         })
         .unwrap();
     let report = doctor::run(home).unwrap();
-    assert!(!report
-        .findings
-        .iter()
-        .any(|finding| finding.code == "provider_bindings_invalid"));
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|finding| finding.code == "provider_bindings_invalid")
+    );
 }
 
 /// Mirrors `test_doctor.py::test_canary_handshake_ok_reports_a_completed_real_handshake`.

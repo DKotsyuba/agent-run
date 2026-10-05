@@ -5,9 +5,9 @@ use crate::{
 };
 use agent_run_domain::ProviderStartRequest;
 use agent_run_domain::{
+    Result,
     domain::{self, StartRequest},
     error::invalid,
-    Result,
 };
 use agent_run_platform::fs;
 use serde::{Deserialize, Serialize};

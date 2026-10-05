@@ -1,0 +1,49 @@
+{
+  "operator": {
+    "args": [
+      "mcp"
+    ],
+    "command": "agent-run",
+    "optional_environment_names": [
+      "AGENT_RUN_HOME"
+    ],
+    "registration_name": "agent-run",
+    "server_name": "agent-run",
+    "startup_timeout_seconds": null,
+    "timeout_policy": "Host chooses startup/call deadlines; cancellation abandons the wait, not admitted work.",
+    "tool_timeout_seconds": null,
+    "transport": "stdio"
+  },
+  "product_version": "0.21.0",
+  "protocol_versions": [
+    "2024-11-05",
+    "2025-03-26",
+    "2025-06-18",
+    "2025-11-25",
+    "2026-07-28"
+  ],
+  "schema_version": 1,
+  "sdk": {
+    "name": "rmcp",
+    "version": "3.4.0"
+  },
+  "worker": {
+    "args": [
+      "_worker-mcp"
+    ],
+    "command": "agent-run",
+    "registration_name": "agent_run_worker",
+    "required_environment_names": [
+      "AGENT_RUN_WORKER_HOME",
+      "AGENT_RUN_WORKER_RUN_ID",
+      "AGENT_RUN_WORKER_ATTEMPT_ID",
+      "AGENT_RUN_WORKER_TOKEN"
+    ],
+    "server_name": "agent-run-worker",
+    "startup_timeout_seconds": null,
+    "supervisor_only": true,
+    "timeout_policy": "Supervisor supplies attempt capability; cancelled waits do not undo durable enqueue.",
+    "tool_timeout_seconds": null,
+    "transport": "stdio"
+  }
+}

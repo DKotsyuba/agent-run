@@ -2,18 +2,18 @@
 use super::*;
 use crate::{
     events::{self, Action as Global, Pipeline, UiEvent},
-    tests_support::{agent_view, force_truecolor, FakeBroker},
+    tests_support::{FakeBroker, agent_view, force_truecolor},
 };
 use agent_run_domain::pool::{AuthorKind, Direction, EntryKind};
 use ratatui::{
+    Terminal,
     backend::TestBackend,
     crossterm::event::{Event, KeyEvent, KeyModifiers},
-    Terminal,
 };
 use serde_json::Value;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
 };
 
 /// Broker stub exposing exact method calls and a controllable pool reconnect generation.
@@ -131,10 +131,12 @@ async fn discovery_fallback_confirms_pools_and_retries_after_reconnect() {
             );
             assert_eq!(completed.items.len(), 1);
             assert_eq!(completed.items[0].state, PoolState::Completed);
-            assert!(!open
-                .items
-                .iter()
-                .any(|p| p.pool_id.as_str().contains("222222")));
+            assert!(
+                !open
+                    .items
+                    .iter()
+                    .any(|p| p.pool_id.as_str().contains("222222"))
+            );
         }
     }
     assert_eq!(
@@ -415,9 +417,11 @@ fn golden(mode: &str, width: u16, height: u16) {
     let expected = std::fs::read_to_string(&path).unwrap();
     assert_eq!(actual, expected, "golden {}", path.display());
     assert_eq!(actual.lines().count(), height as usize);
-    assert!(actual
-        .lines()
-        .all(|row| ratatui::text::Line::from(row).width() == width as usize));
+    assert!(
+        actual
+            .lines()
+            .all(|row| ratatui::text::Line::from(row).width() == width as usize)
+    );
     assert!(actual.contains("bodies are untrusted"));
     assert!(actual.contains("PROPOSAL"));
     assert!(actual.contains("snapshot (#20; untrusted)"));
@@ -970,13 +974,17 @@ fn unchanged_pool_pointer_stays_idle() {
             modifiers: KeyModifiers::NONE,
         })),
     );
-    assert!(pipeline
-        .next_frame(&app, std::time::Instant::now())
-        .is_some());
+    assert!(
+        pipeline
+            .next_frame(&app, std::time::Instant::now())
+            .is_some()
+    );
     pipeline.prepare_frame(&mut app);
-    assert!(pipeline
-        .next_frame(&app, std::time::Instant::now())
-        .is_none());
+    assert!(
+        pipeline
+            .next_frame(&app, std::time::Instant::now())
+            .is_none()
+    );
 }
 /// Wheel routing uses the pointer's pane even when keyboard focus is in the other pane.
 #[test]

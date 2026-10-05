@@ -286,7 +286,7 @@ impl SharedAssetGuard {
                 Err(_) => {
                     return Err(SharedAssetGuardError::UnsupportedPlatform(
                         "sandbox-exec is not installed at /usr/bin/sandbox-exec",
-                    ))
+                    ));
                 }
             };
             if !executable.is_file() || executable.permissions().mode() & 0o111 == 0 {
@@ -323,7 +323,7 @@ impl SharedAssetGuard {
     /// Counts paths by `(device, inode)` without following symlinks. Internal
     /// hard links are allowed only when their count matches `nlink`; a larger
     /// count means an external writable alias could bypass path denials.
-    /// The scan is capped at [`MAX_SCAN_PATHS`] (400000) entries and fails
+    /// The scan is capped at `MAX_SCAN_PATHS` (400000) entries and fails
     /// closed beyond that.
     /// [`Self::wrap`] runs this check before launch. An unrelated same-UID
     /// process adding an alias after the scan remains outside this guarantee.
@@ -444,10 +444,12 @@ mod tests {
         let root = parent.join("shared");
         std::fs::create_dir_all(&root).unwrap();
         let guard = SharedAssetGuard::new(&root).unwrap();
-        assert!(guard
-            .parameters()
-            .iter()
-            .any(|(name, value)| { name == "ANC0" && value.ends_with("/a\\[b\\]\\.c$") }));
+        assert!(
+            guard
+                .parameters()
+                .iter()
+                .any(|(name, value)| { name == "ANC0" && value.ends_with("/a\\[b\\]\\.c$") })
+        );
     }
 
     /// Keeps paths out of the profile and preserves the intended child argv.
@@ -706,9 +708,11 @@ mod tests {
         assert!(!run("mv \"$1\" \"$2\"", &[&file, &escaped]).status.success());
         assert!(!run("mv \"$1\" \"$2\"", &[&root, &escaped]).status.success());
         let moved_fixture = fixture.with_extension("moved");
-        assert!(!run("mv \"$1\" \"$2\"", &[&fixture, &moved_fixture])
-            .status
-            .success());
+        assert!(
+            !run("mv \"$1\" \"$2\"", &[&fixture, &moved_fixture])
+                .status
+                .success()
+        );
         assert_eq!(std::fs::read(&file).unwrap(), b"original");
         assert!(!escaped.exists());
 

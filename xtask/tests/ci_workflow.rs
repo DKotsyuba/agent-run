@@ -52,154 +52,146 @@ fn ci_checks_native_release_and_desktop_transport() {
     }
 }
 
-/// Keeps dependency caches pinned and shared between compatible macOS jobs,
-/// while only trusted main/tag runs may save them and installed binaries stay uncached.
+/// One main-only producer owns each workload cache; releases/PRs only restore.
 #[test]
 fn rust_dependency_cache_policy_preserves_trust_and_runner_boundaries() {
-    let action = "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6";
-    for (path, save_rule) in [
-        (
-            ".github/workflows/ci.yml",
-            "github.ref == 'refs/heads/main'",
-        ),
-        (
-            ".github/workflows/release.yml",
-            "startsWith(github.ref, 'refs/tags/')",
-        ),
-    ] {
-        let workflow = repository_file(path);
-        assert_eq!(workflow.matches(action).count(), 2, "{path}");
-        for block in workflow.split(action).skip(1) {
-            let cache = block
-                .split("      - name: Fetch locked dependencies")
-                .next()
-                .unwrap();
-            assert!(
-                cache.contains("cache-bin: false"),
-                "{path}: no cached binaries"
-            );
-            assert!(
-                cache.contains("github.event_name == 'push'"),
-                "{path}: PRs only restore"
-            );
-            assert!(cache.contains(save_rule), "{path}: trusted save condition");
-        }
-    }
     let ci = repository_file(".github/workflows/ci.yml");
-    assert!(ci.contains("shared-key: agent-run-${{ matrix.os }}-${{ matrix.architecture }}"));
-    assert_eq!(
-        ci.matches("shared-key: agent-run-macos-15-arm64").count(),
-        1
-    );
     let release = repository_file(".github/workflows/release.yml");
+    assert!(
+        ci.contains("shared-key: agent-run-check-v2-${{ matrix.os }}-${{ matrix.architecture }}")
+    );
+    let package = ci
+        .split("\n  package-cache:")
+        .nth(1)
+        .unwrap()
+        .split("\n  dependencies:")
+        .next()
+        .unwrap();
+    assert!(package.contains("if: github.event_name == 'push' && github.ref == 'refs/heads/main'"));
+    assert!(package.contains("shared-key: agent-run-package-v1-macos-15-arm64"));
+    assert!(package.contains("--target aarch64-apple-darwin"));
+    let contract = ci
+        .split("\n  release-contract:")
+        .nth(1)
+        .unwrap()
+        .split("\n  package-cache:")
+        .next()
+        .unwrap();
+    assert!(contract.contains("save-if: false"));
+    assert!(contract.contains("shared-key: agent-run-package-v1-macos-15-arm64"));
+    assert!(contract.contains("--target aarch64-apple-darwin"));
     assert_eq!(
         release
-            .matches("shared-key: agent-run-macos-15-arm64")
+            .matches("shared-key: agent-run-check-v2-macos-15-arm64")
+            .count(),
+        1
+    );
+    assert_eq!(
+        release
+            .matches("shared-key: agent-run-package-v1-macos-15-arm64")
             .count(),
         2
     );
+    assert_eq!(release.matches("save-if: false").count(), 3);
+    assert!(!release.contains("actions/cache/save@"));
+    assert!(!release.contains("save-if: ${{"));
+    for workflow in [&ci, &release] {
+        assert!(!workflow.contains("pull_request_target"));
+        for line in workflow
+            .lines()
+            .filter(|line| line.trim().starts_with("uses:"))
+        {
+            let pin = line
+                .split('@')
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap();
+            assert_eq!(pin.len(), 40, "action must have full SHA: {line}");
+            assert!(pin.bytes().all(|b| b.is_ascii_hexdigit()), "{line}");
+        }
+        assert!(workflow.contains("cache-bin: false"));
+        assert!(workflow.contains("cargo-deny 0.20.2"));
+        assert!(workflow.contains("cargo-deny-"));
+    }
+    assert!(ci.contains("name: Dependency policy"));
+    assert!(ci.contains("if: runner.os != 'macOS'"));
 }
 
-/// Ensures tagged releases aggregate one verified macOS archive and one source archive.
+/// Publisher fans in independently checked source and one exact macOS payload;
+/// cache hits never replace gates, draft verification or post-publication checks.
 #[test]
 fn release_publishes_checksummed_native_assets() {
     let workflow = repository_file(".github/workflows/release.yml");
-    for required in [
-        "git cat-file -t",
-        "Cargo.toml",
-        "cargo xtask check",
-        "cargo xtask release build-native",
-        "cargo xtask release verify",
-        "cargo xtask archive --revision HEAD",
-        "runs-on: macos-15",
-        "--target aarch64-apple-darwin",
-        "agent-run-$version-aarch64-apple-darwin.tar.gz",
-        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
-        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
-        "merge-multiple: true",
-        "needs: [gate, native]",
-        "SHA256SUMS",
-        "subject-checksums: dist/SHA256SUMS",
-        "GH_REPO: ${{ github.repository }}",
-        "gh release create",
-    ] {
-        assert!(
-            workflow.contains(required),
-            "release workflow is missing {required:?}"
-        );
-    }
-    for forbidden in ["x86_64-unknown-linux-gnu", "matrix.target"] {
-        assert!(
-            !workflow.contains(forbidden),
-            "release contains an unqualified target {forbidden:?}"
-        );
-    }
+    let (header, jobs) = workflow.split_once("\njobs:").unwrap();
+    let (gate, rest) = jobs.split_once("\n  native:").unwrap();
+    let (native, publish) = rest.split_once("\n  publish:").unwrap();
+    assert!(header.contains("group: agent-run-release-publisher"));
+    assert!(header.contains("cancel-in-progress: false"));
+    assert!(
+        header.contains("queue: max"),
+        "default single pending run would cancel older queued tags"
+    );
+    assert!(header.contains("permissions:\n  contents: read"));
+    assert!(!gate.contains("contents: write") && !native.contains("contents: write"));
+    assert!(!native.contains("needs:"));
+    assert!(!native.contains("cargo xtask check"));
+    assert!(gate.contains("-- cargo xtask check"));
+    assert!(gate.contains("-- cargo deny --offline --locked check"));
     assert_eq!(
         workflow
-            .matches("cargo xtask archive --revision HEAD")
+            .matches("-- cargo xtask release build-native")
             .count(),
-        1,
-        "the verified source archive must be built once"
+        1
     );
     assert_eq!(
-        workflow.matches("gh release create").count(),
-        1,
-        "all archives must be published by one GitHub Release operation"
+        workflow
+            .matches("-- cargo xtask archive --revision HEAD")
+            .count(),
+        1
     );
-    assert!(
-        !workflow.contains("macos-latest"),
-        "release builds must pin the arm64 runner"
-    );
-    let (header, jobs) = workflow
-        .split_once("\njobs:")
-        .expect("release workflow must declare jobs");
-    let (gate, jobs) = jobs
-        .split_once("\n  native:")
-        .expect("release workflow must declare a native job");
-    let (native, publish) = jobs
-        .split_once("\n  publish:")
-        .expect("release workflow must declare a publish job");
-    assert!(
-        header.contains("permissions:\n  contents: read"),
-        "workflow-level permissions must be read-only"
-    );
-    assert!(
-        !header.contains("write")
-            && !gate.contains("contents: write")
-            && !native.contains("contents: write"),
-        "write permissions must not be available before publish"
-    );
+    assert!(native.contains("cargo xtask package smoke"));
+    assert!(native.contains("COPYFILE_DISABLE=1 tar --format=ustar"));
+    assert!(publish.contains("needs: [gate, native]"));
+    assert!(!publish.contains("release build-native"));
     for permission in [
         "contents: write",
         "id-token: write",
         "attestations: write",
         "artifact-metadata: write",
     ] {
-        assert!(
-            publish.contains(permission),
-            "publish job is missing {permission:?}"
-        );
+        assert!(publish.contains(permission));
+    }
+    for required in [
+        "env -u GH_TOKEN -u GITHUB_TOKEN",
+        "cargo build --offline --locked --release -p xtask",
+        "package merge-evidence",
+        "package create",
+        "package verify",
+        "subject-checksums: dist/SHA256SUMS",
+        "release publish --accepted-commit",
+        "--run-id \"$GITHUB_RUN_ID\"",
+        "--attempt \"$GITHUB_RUN_ATTEMPT\"",
+    ] {
+        assert!(publish.contains(required), "{required}");
     }
     assert!(
-        publish.contains("needs: [gate, native]"),
-        "publish must wait for both verified artifact jobs"
+        publish.find("package verify").unwrap() < publish.find("Stage verify publish").unwrap()
     );
-    for (name, job) in [("gate", gate), ("native", native)] {
-        let fetch = job
-            .find("cargo fetch --locked")
-            .unwrap_or_else(|| panic!("{name} job must fetch the locked graph"));
-        let gate = job
-            .find("cargo xtask")
-            .unwrap_or_else(|| panic!("{name} job must run an xtask gate"));
-        assert!(
-            fetch < gate,
-            "{name} job must fetch before offline xtask use"
-        );
+    assert!(!workflow.contains("x86_64-unknown-linux-gnu") && !workflow.contains("macos-latest"));
+    let publisher = repository_file("xtask/src/release_publish.rs");
+    for invariant in [
+        "existing draft requires manual reconciliation",
+        "--draft",
+        "--draft=false",
+        "remote(root, &manifest, &draft, false",
+        "remote(root, &manifest, &published, true",
+        "--signer-workflow",
+        "--source-digest",
+    ] {
+        assert!(publisher.contains(invariant), "{invariant}");
     }
-    assert!(
-        native.contains("run: cargo xtask check"),
-        "the macOS native job must run the full locked workspace gates"
-    );
 }
 
 /// Ensures dependency automation covers both workflow actions and locked Rust crates weekly.

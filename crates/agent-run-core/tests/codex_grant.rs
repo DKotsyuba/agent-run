@@ -1,5 +1,5 @@
 use agent_run_core::codex::Grant;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Ensures an engine echo cannot widen a read-only Codex grant's network access.
 #[test]

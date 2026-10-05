@@ -11,7 +11,7 @@
 
 use crate::{Error, Result};
 use minijinja::{AutoEscape, Environment, UndefinedBehavior};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::OnceLock;
 
 /// The one embedded guide template; a repo asset, not a configuration knob.

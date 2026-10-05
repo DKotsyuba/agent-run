@@ -1,7 +1,7 @@
 mod common;
 use agent_run_domain::{
-    domain::{Outcome, Status},
     Error,
+    domain::{Outcome, Status},
 };
 use agent_run_platform::{
     fs::{self, Dir},
@@ -94,12 +94,14 @@ fn non_inline_answer_is_still_verified() {
 #[test]
 fn answer_limit_is_independent_of_inline_limit() {
     let h = common::Home::new();
-    assert!(verify::seal(
-        &h.path,
-        Path::new("big.md"),
-        &"a".repeat(verify::MAX_ANSWER + 1)
-    )
-    .is_err());
+    assert!(
+        verify::seal(
+            &h.path,
+            Path::new("big.md"),
+            &"a".repeat(verify::MAX_ANSWER + 1)
+        )
+        .is_err()
+    );
 }
 #[test]
 fn payload_and_parent_symlinks_are_not_followed() {
@@ -107,15 +109,19 @@ fn payload_and_parent_symlinks_are_not_followed() {
     let external = tempfile::tempdir().unwrap();
     std::fs::write(external.path().join("payload"), b"private").unwrap();
     symlink(external.path(), h.path.join("alias")).unwrap();
-    assert!(Dir::open(&h.path)
-        .unwrap()
-        .read(Path::new("alias/payload"), 100)
-        .is_err());
+    assert!(
+        Dir::open(&h.path)
+            .unwrap()
+            .read(Path::new("alias/payload"), 100)
+            .is_err()
+    );
     symlink(external.path().join("payload"), h.path.join("payload")).unwrap();
-    assert!(Dir::open(&h.path)
-        .unwrap()
-        .read(Path::new("payload"), 100)
-        .is_err());
+    assert!(
+        Dir::open(&h.path)
+            .unwrap()
+            .read(Path::new("payload"), 100)
+            .is_err()
+    );
 }
 #[test]
 fn traversal_and_absolute_owned_paths_are_refused() {

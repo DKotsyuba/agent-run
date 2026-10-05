@@ -8,6 +8,7 @@ use crate::{
     provider_config::{HarnessConfig, ProviderConfig, ProviderSettings},
 };
 use agent_run_domain::{
+    Result,
     catalog::{
         AccountId, AccountRecord, AuthFamily, CollectorBinding, HarnessId, LegacyRuntime,
         LimitsSource, ProviderBinding, ProviderConnection, ProviderId, ProviderModel,
@@ -15,7 +16,6 @@ use agent_run_domain::{
     domain::Constraint,
     error::invalid,
     types::PositiveFinite,
-    Result,
 };
 use serde::Deserialize;
 use std::{
@@ -267,8 +267,8 @@ pub fn plan_v1(
         if runtime.auth.is_some() {
             manual_review.push(format!("{runtime_name}:auth_reference"));
         }
-        if let Some(harness) = harnesses.get(&mapped.harness) {
-            if harness.binary != runtime.binary
+        if let Some(harness) = harnesses.get(&mapped.harness)
+            && (harness.binary != runtime.binary
                 || harness.home != runtime.home
                 || harness.native_settings != runtime.native_settings
                 || harness.workspace_roots != runtime.workspace_roots
@@ -278,10 +278,9 @@ pub fn plan_v1(
                 || harness.plugin_snapshot_assets != runtime.plugin_snapshot_assets
                 || harness.environment != runtime.environment
                 || serde_json::to_value(&harness.hooks)? != serde_json::to_value(&runtime.hooks)?
-                || serde_json::to_value(&harness.rust)? != serde_json::to_value(&runtime.rust)?
-            {
-                manual_review.push(format!("{runtime_name}:harness_settings"));
-            }
+                || serde_json::to_value(&harness.rust)? != serde_json::to_value(&runtime.rust)?)
+        {
+            manual_review.push(format!("{runtime_name}:harness_settings"));
         }
     }
     let mut config = ProviderConfig {

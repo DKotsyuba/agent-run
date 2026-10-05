@@ -1,6 +1,6 @@
 //! Validated scalar domain values shared across configuration, state, and transports.
 
-use crate::{error::invalid, Error, Result};
+use crate::{Error, Result, error::invalid};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{
     fmt,
@@ -9,7 +9,7 @@ use std::{
 };
 
 pub use crate::domain::{
-    external_id, nonblank, now, AgentId, Constraint, OrchestratorRef, Outcome, StartRequest,
+    AgentId, Constraint, OrchestratorRef, Outcome, StartRequest, external_id, nonblank, now,
 };
 
 /// The immutable role of one stored transcript message.

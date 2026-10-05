@@ -1,8 +1,8 @@
 //! Bounded fake-process coverage shared by Claude-family stream sessions.
 
 use agent_run_adapters::{
-    io::{Event, Process},
     LaunchPlan,
+    io::{Event, Process},
 };
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -55,10 +55,12 @@ async fn fake_claude_stream_is_drained_and_diagnostics_stay_secret_safe() {
         .await
         .expect("bounded stdin write");
     assert_eq!(process.reap().await, Some(0));
-    assert!(!process
-        .diagnostic_tail()
-        .expect("stderr evidence")
-        .contains("fixture-secret"));
+    assert!(
+        !process
+            .diagnostic_tail()
+            .expect("stderr evidence")
+            .contains("fixture-secret")
+    );
 }
 
 /// Mirrors `tests/test_resume_adapters.py::StreamIdentityTests::test_descriptorless_injected_stdin_accepts_initial_input`

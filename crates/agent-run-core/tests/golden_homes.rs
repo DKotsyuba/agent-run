@@ -7,7 +7,7 @@ use agent_run_config::{
 };
 use agent_run_core::{state::Record, stream::plan_with_environment};
 use agent_run_domain::domain::{AgentId, StartRequest, Status};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},

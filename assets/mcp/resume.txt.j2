@@ -13,4 +13,4 @@ agent-run resume accepted (asynchronous durable run)
 {% if effort %}
 - Effort: {{ effort }}
 {% endif %}
-- Notice binding: {{ "bound" if bound else "not bound" }}; use list_agents, transcript, or answer with the ID above for progress and results
+- Notice binding: {{ "unknown" if bound is none else "bound" if bound else "not bound" }}; use list_agents, transcript, or answer with the ID above for progress and results

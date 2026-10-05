@@ -4,9 +4,9 @@ mod common;
 
 use agent_run_domain::domain::{AgentId, Outcome};
 use agent_run_platform::{fs, verify};
-use agent_run_store::{run_stats, Store};
+use agent_run_store::{Store, run_stats};
 use rusqlite::params;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 
 /// The Python Claude-family terminal payload with every supported measurement.

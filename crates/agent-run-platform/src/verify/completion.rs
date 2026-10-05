@@ -13,12 +13,12 @@
 //! back onto `Outcome` — `domain::Outcome` has no `answer_*` fields to carry
 //! them. The decision (status/failure_kind/failure_text) is otherwise exact.
 
-use super::{load_sidecar, Dir, MAX_ANSWER};
+use super::{Dir, MAX_ANSWER, load_sidecar};
 use crate::fs;
 use agent_run_domain::{
+    Error, Result,
     domain::{Outcome, Status},
     error::invalid,
-    Error, Result,
 };
 use std::{
     io::Read,

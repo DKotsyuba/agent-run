@@ -3,7 +3,7 @@
 mod common;
 
 use agent_run_adapters::redact::Redactor;
-use agent_run_adapters::{io::Process, LaunchPlan};
+use agent_run_adapters::{LaunchPlan, io::Process};
 use std::collections::BTreeMap;
 
 /// The stream-journal call persists only the adapter-redacted message text.

@@ -182,18 +182,22 @@ fn python_test_codex_adapter_admission_keeps_capabilities_and_roles_closed() {
     assert!(!capabilities(Adapter::Codex).contains(&"output_schema"));
 
     let runtime = runtime();
-    assert!(validate(
-        &request("fixture"),
-        &runtime,
-        &profile("review", false, false)
-    )
-    .is_ok());
-    assert!(validate(
-        &request("fixture"),
-        &runtime,
-        &profile("review", false, true)
-    )
-    .is_err());
+    assert!(
+        validate(
+            &request("fixture"),
+            &runtime,
+            &profile("review", false, false)
+        )
+        .is_ok()
+    );
+    assert!(
+        validate(
+            &request("fixture"),
+            &runtime,
+            &profile("review", false, true)
+        )
+        .is_err()
+    );
 
     let mut schema = request("fixture");
     schema.output_schema = Some(serde_json::Map::new());
@@ -201,16 +205,20 @@ fn python_test_codex_adapter_admission_keeps_capabilities_and_roles_closed() {
 
     let mut astra_runtime = runtime.clone();
     astra_runtime.models = vec!["gpt-6-astra".into()];
-    assert!(validate(
-        &request("gpt-6-astra"),
-        &astra_runtime,
-        &profile("review", false, false),
-    )
-    .is_ok());
-    assert!(validate(
-        &request("gpt-6-astra"),
-        &astra_runtime,
-        &profile("implement", true, false),
-    )
-    .is_err());
+    assert!(
+        validate(
+            &request("gpt-6-astra"),
+            &astra_runtime,
+            &profile("review", false, false),
+        )
+        .is_ok()
+    );
+    assert!(
+        validate(
+            &request("gpt-6-astra"),
+            &astra_runtime,
+            &profile("implement", true, false),
+        )
+        .is_err()
+    );
 }

@@ -66,17 +66,34 @@ fn stored(home: &Path, account: &str) -> Vec<(String, String, f64, String)> {
 /// references (never alias labels), one physical account is probed once
 /// across aliases, and each lane governs only its own models; a failing
 /// later round reports `ok=false` while earlier samples survive.
+///
+/// The native login is located through the process `CODEX_HOME`, so the case
+/// reruns itself in an isolated child test process that receives `CODEX_HOME`
+/// and its fixture root only through the command environment; the parent
+/// asserts the child passed.
 #[tokio::test]
 async fn codex_accounts_probe_by_reference_with_distinct_lanes() {
-    let root = tempdir().unwrap();
-    let home = root.path().join("home");
+    if let (Some(root), Some(native)) = (
+        std::env::var_os("AGENT_RUN_TEST_QUOTA_ROOT"),
+        std::env::var_os("CODEX_HOME"),
+    ) {
+        codex_accounts_probe_body(root.as_ref(), native.as_ref()).await;
+        return;
+    }
+    let fixture = tempdir().unwrap();
+    QuotaChild::spawn(fixture.path()).finish(std::time::Duration::from_secs(240));
+}
+
+/// Body of [`codex_accounts_probe_by_reference_with_distinct_lanes`], run
+/// where `CODEX_HOME` is inherited from the isolated child command.
+async fn codex_accounts_probe_body(root: &Path, native: &Path) {
+    let root = root.canonicalize().unwrap();
+    let home = root.join("home");
     fs::create_dir_all(&home).unwrap();
-    let binary = fake_app_server(root.path());
+    let binary = fake_app_server(&root);
     // Native login: the host CODEX_HOME, exactly as the provider adapter binds it.
-    let native = root.path().join("native-codex");
-    fs::create_dir_all(&native).unwrap();
+    fs::create_dir_all(native).unwrap();
     fs::write(native.join("auth.json"), "native-auth").unwrap();
-    std::env::set_var("CODEX_HOME", &native);
     // Named login `work`; the alias labels `work-a`/`work-b` have no homes.
     let work = home.join("accounts/codex/work");
     fs::create_dir_all(&work).unwrap();
@@ -125,7 +142,7 @@ account = "acct-work"
             collector = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../scripts/collectors/codex.sh")
                 .display(),
-            root = root.path().display(),
+            root = root.display(),
         ),
     )
     .unwrap();
@@ -151,7 +168,7 @@ account = "acct-work"
     assert_eq!(report["ok"], true, "{report}");
     let rows = report["results"].as_array().unwrap();
     assert_eq!(rows.len(), 2, "one row per physical account: {report}");
-    let log = fs::read_to_string(root.path().join("probes.log")).unwrap();
+    let log = fs::read_to_string(root.join("probes.log")).unwrap();
     let mut probed: Vec<&str> = log.lines().filter(|line| !line.is_empty()).collect();
     probed.sort_unstable();
     assert_eq!(probed, ["native-auth", "work-auth"]);
@@ -177,25 +194,98 @@ account = "acct-work"
     assert_eq!(work_rows[0].2, 75.0);
 
     // A later failing round is reported truthfully and keeps prior samples.
-    fs::write(root.path().join("fail"), "").unwrap();
+    fs::write(root.join("fail"), "").unwrap();
     let failed = agent_run_core::capacity::sources::collect(&home)
         .await
         .unwrap();
     assert_eq!(failed["ok"], false, "{failed}");
-    assert!(failed["results"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|row| row["status"] == "failed" && row["issues"][0] == "collector_exit_status:5"));
+    assert!(
+        failed["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["status"] == "failed" && row["issues"][0] == "collector_exit_status:5")
+    );
     assert_eq!(stored(&home, "acct-native").len(), 2);
     // The durable ledger now suppresses the next round across processes.
     assert!(home.join("capacity/backoff.json").is_file());
     let suppressed = agent_run_core::capacity::sources::collect(&home)
         .await
         .unwrap();
-    assert!(suppressed["results"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|row| row["issues"][0] == "backoff"));
+    assert!(
+        suppressed["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["issues"][0] == "backoff")
+    );
+}
+
+/// An isolated child copy of this test binary that owns its own process
+/// group. On drop, timeout, or parent panic it signals that group only while
+/// the owned leader is verified unreaped and running, then kills and reaps
+/// the child. Once the leader exits, no recycled group id is signalled.
+struct QuotaChild(std::process::Child);
+
+impl QuotaChild {
+    /// Spawns this test binary running only the quota case, with `CODEX_HOME`
+    /// and the fixture root passed through the child's environment.
+    fn spawn(fixture: &Path) -> Self {
+        use std::os::unix::process::CommandExt;
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "codex_accounts_probe_by_reference_with_distinct_lanes",
+                "--test-threads",
+                "1",
+                "--nocapture",
+            ])
+            .env("CODEX_HOME", fixture.join("native-codex"))
+            .env("AGENT_RUN_TEST_QUOTA_ROOT", fixture)
+            .process_group(0);
+        Self(command.spawn().expect("child test process"))
+    }
+
+    /// Waits for a successful child exit within `timeout`; on failure or
+    /// panic the guard cleans up only while its owned leader is unreaped.
+    /// A successful exit proves the case assertions, not descendant reaping.
+    fn finish(mut self, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.0.try_wait().expect("child must be waitable") {
+                assert!(status.success(), "isolated quota case failed: {status}");
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                self.terminate();
+                panic!("isolated quota case exceeded its bounded window");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Signals the child's process group only while the owned leader is
+    /// verified running, then kills and reaps the exact child.
+    ///
+    /// Once the leader has been reaped its process id could be recycled, so
+    /// the group signal is sent only while the leader is still known to run.
+    fn terminate(&mut self) {
+        if self.0.try_wait().expect("child must be waitable").is_none() {
+            // SAFETY: try_wait proved this owned, unreaped child was running;
+            // its PID cannot be reused before reaping, even if it exits now.
+            // process_group(0) made that PID its private group id.
+            unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for QuotaChild {
+    /// Cleans up only the owned unreaped leader and its verified private group.
+    fn drop(&mut self) {
+        self.terminate();
+    }
 }

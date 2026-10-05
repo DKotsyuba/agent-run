@@ -1,20 +1,20 @@
 //! Stable client-facing projections over the durable journal.
 
-use crate::{Record, Store, ACTIVE_SQL};
+use crate::{ACTIVE_SQL, Record, Store};
 use agent_run_domain::{
+    Result,
     domain::{AgentId, Status},
     error::invalid,
     views::{
         AgentPage, AgentView, AnswerView, CleanupView, DeliveryView, McpSelectionView, MessageView,
         TranscriptPage, UsageCumulativeView, UsageView,
     },
-    Result,
 };
 use agent_run_platform::{
     process,
     verify::{self, Proof},
 };
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
 
 /// Projects verified frozen role selections without leaking command, env or auth data.
@@ -280,7 +280,9 @@ impl Store {
                 [],
                 |row| row.get(0),
             )?;
-            let mut statement = self.conn.prepare(&format!("SELECT * FROM agents {where_sql} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?"))?;
+            let mut statement = self.conn.prepare(&format!(
+                "SELECT * FROM agents {where_sql} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?"
+            ))?;
             let records = statement
                 .query_map(params![limit as i64, offset as i64], Record::read)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;

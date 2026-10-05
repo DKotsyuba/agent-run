@@ -5,10 +5,10 @@ mod common;
 use agent_run_config::{
     config::Mcp,
     profiles,
-    role_plan::{resolve_role_plan, role_from_authority, ResolvedRolePlan},
+    role_plan::{ResolvedRolePlan, resolve_role_plan, role_from_authority},
 };
 use agent_run_domain::catalog::ResolvedLaunchAuthority;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
 fn reseal(document: &mut Value) {

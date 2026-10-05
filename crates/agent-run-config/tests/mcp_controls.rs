@@ -4,7 +4,7 @@ mod common;
 use agent_run_config::{
     config::Mcp,
     profiles,
-    role_plan::{resolve_role_plan, ResolvedRolePlan},
+    role_plan::{ResolvedRolePlan, resolve_role_plan},
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -74,10 +74,12 @@ fn defaults_do_not_change_old_serialized_assets() {
         json!({"transport":"stdio","command":"/bin/echo","args":[],"env_from":[],"approval_mode":"auto"})
     );
     let profile = profile(&home, "['old']");
-    assert!(serde_json::to_value(&profile)
-        .unwrap()
-        .get("mcp_tools")
-        .is_none());
+    assert!(
+        serde_json::to_value(&profile)
+            .unwrap()
+            .get("mcp_tools")
+            .is_none()
+    );
     let plan = resolve_role_plan(
         &profile,
         &home.path,

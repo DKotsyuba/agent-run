@@ -4,16 +4,16 @@
 //! selected account context separately over a private stdin pipe.
 
 use agent_run_domain::{
+    CredentialRef, Error, Result,
     catalog::{
         AccountId, AttemptCredentials, CredentialHeader, ProviderCatalog, ProviderConnection,
         ProviderId,
     },
     error::invalid,
-    CredentialRef, Error, Result,
 };
 use reqwest::{
-    header::{HeaderValue, AUTHORIZATION},
     Method, Request, Response,
+    header::{AUTHORIZATION, HeaderValue},
 };
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
@@ -66,7 +66,7 @@ impl CredentialReader for SystemCredentialReader {
                 agent_run_platform::keychain::generic_password(account, service)
             }
             CredentialRef::Native(_) | CredentialRef::Named { .. } => {
-                return Err(invalid("native login remains owned by the harness"))
+                return Err(invalid("native login remains owned by the harness"));
             }
         };
         value

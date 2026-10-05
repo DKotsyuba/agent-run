@@ -129,9 +129,11 @@ fn pool_entry_text_validates_membership_and_renders() {
     );
     // The current member renders; an entry of a pool it does not belong to
     // refuses as foreign.
-    assert!(commands::pool_entry_text(&store, &replacement, seq)
-        .unwrap()
-        .is_ok());
+    assert!(
+        commands::pool_entry_text(&store, &replacement, seq)
+            .unwrap()
+            .is_ok()
+    );
     store
         .conn
         .execute(

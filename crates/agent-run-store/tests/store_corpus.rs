@@ -3,11 +3,11 @@
 mod common;
 
 use agent_run_domain::{
-    domain::{OrchestratorRef, Outcome, StartRequest, Status},
     Error,
+    domain::{OrchestratorRef, Outcome, StartRequest, Status},
 };
 use agent_run_store::Store;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -283,10 +283,12 @@ fn session_lookup_and_agent_listing_are_read_only_and_composable() {
         .admit(&second_request, &home.config, &json!({}), None)
         .unwrap()
         .0;
-    assert!(store
-        .find_orchestrator_session(&reference)
-        .unwrap()
-        .is_some());
+    assert!(
+        store
+            .find_orchestrator_session(&reference)
+            .unwrap()
+            .is_some()
+    );
     let before: i64 = store
         .conn
         .query_row("SELECT COUNT(*) FROM orchestrator_sessions", [], |row| {

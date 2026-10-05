@@ -1,6 +1,6 @@
 //! Resolved paths below the private agent-run home, matching `paths.py`.
 use crate::fs;
-use agent_run_domain::{domain::AgentId, error::invalid, Result};
+use agent_run_domain::{Result, domain::AgentId, error::invalid};
 use std::{
     os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
@@ -98,7 +98,7 @@ fn resolve_existing_prefix(path: &Path) -> Result<PathBuf> {
 /// first). Rejecting anything but a well-formed `AgentId` up front, before
 /// the join, is what makes this a private per-agent directory rather than a
 /// generic freeform path; its fixed `ag-YYYYMMDD-HHMMSS-<hex10>` shape also
-/// contains no path separators, so [`require_beneath`] below can never
+/// contains no path separators, so `require_beneath` below can never
 /// actually fire for it, unlike [`runtime_skills_dir`]'s freeform component.
 pub fn agent_dir(agent_id: &str, home: Option<PathBuf>) -> Result<PathBuf> {
     let id = AgentId::from_str(agent_id)?;

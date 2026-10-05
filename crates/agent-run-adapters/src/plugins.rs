@@ -1,9 +1,9 @@
 //! Native plugin installation and Codex hook trust digests.
-use super::materialize::{shell_command, Publisher};
+use super::materialize::{Publisher, shell_command};
 use agent_run_config::config::{Adapter, Runtime};
-use agent_run_domain::{error::invalid, Result};
+use agent_run_domain::{Result, error::invalid};
 use agent_run_platform::fs;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     path::{Component, Path, PathBuf},
@@ -142,10 +142,10 @@ fn digest(event: &str, matcher: Option<&str>, raw: &Value) -> Result<String> {
         handler["statusMessage"] = status.clone();
     }
     let mut identity = json!({"event_name":event,"hooks":[handler]});
-    if !["user_prompt_submit", "stop"].contains(&event) {
-        if let Some(matcher) = matcher {
-            identity["matcher"] = json!(matcher);
-        }
+    if !["user_prompt_submit", "stop"].contains(&event)
+        && let Some(matcher) = matcher
+    {
+        identity["matcher"] = json!(matcher);
     }
     Ok(format!(
         "sha256:{}",
@@ -250,39 +250,39 @@ pub fn install(p: &mut Publisher, runtime: &Runtime, kind: Adapter) -> Result<In
             installed.codex_names.push(name.clone());
             listed.push(json!({"name":name,"source":{"source":"local","path":format!("./{relative}")},"policy":{"installation":"AVAILABLE","authentication":"ON_INSTALL"}}));
         }
-        if kind == Adapter::Codex {
-            if let Some(data) = fs::Dir::open(source)?.optional(&hooks_relative, 1024 * 1024)? {
-                let doc: Value = serde_json::from_slice(&data)?;
-                let events = doc
-                    .get("hooks")
-                    .and_then(Value::as_object)
-                    .ok_or_else(|| invalid("plugin hooks table is missing"))?;
-                for (event, groups) in events {
-                    let label = event_label(event)?;
-                    let groups = groups
-                        .as_array()
-                        .ok_or_else(|| invalid("plugin hook groups must be an array"))?;
-                    for (gi, group) in groups.iter().enumerate() {
-                        let matcher = group
-                            .get("matcher")
-                            .map(|v| {
-                                v.as_str()
-                                    .ok_or_else(|| invalid("hook matcher must be a string"))
-                            })
-                            .transpose()?;
-                        let handlers = group
-                            .get("hooks")
-                            .and_then(Value::as_array)
-                            .ok_or_else(|| invalid("plugin handlers must be an array"))?;
-                        for (hi, handler) in handlers.iter().enumerate() {
-                            installed.trust.insert(
-                                format!(
-                                    "{name}@personal:{}:{label}:{gi}:{hi}",
-                                    hooks_relative.to_string_lossy()
-                                ),
-                                digest(label, matcher, handler)?,
-                            );
-                        }
+        if kind == Adapter::Codex
+            && let Some(data) = fs::Dir::open(source)?.optional(&hooks_relative, 1024 * 1024)?
+        {
+            let doc: Value = serde_json::from_slice(&data)?;
+            let events = doc
+                .get("hooks")
+                .and_then(Value::as_object)
+                .ok_or_else(|| invalid("plugin hooks table is missing"))?;
+            for (event, groups) in events {
+                let label = event_label(event)?;
+                let groups = groups
+                    .as_array()
+                    .ok_or_else(|| invalid("plugin hook groups must be an array"))?;
+                for (gi, group) in groups.iter().enumerate() {
+                    let matcher = group
+                        .get("matcher")
+                        .map(|v| {
+                            v.as_str()
+                                .ok_or_else(|| invalid("hook matcher must be a string"))
+                        })
+                        .transpose()?;
+                    let handlers = group
+                        .get("hooks")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| invalid("plugin handlers must be an array"))?;
+                    for (hi, handler) in handlers.iter().enumerate() {
+                        installed.trust.insert(
+                            format!(
+                                "{name}@personal:{}:{label}:{gi}:{hi}",
+                                hooks_relative.to_string_lossy()
+                            ),
+                            digest(label, matcher, handler)?,
+                        );
                     }
                 }
             }

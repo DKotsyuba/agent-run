@@ -10,10 +10,10 @@ pub mod quota;
 pub mod quota_auth;
 pub mod ranking;
 pub mod sources;
-use crate::{config::Config, domain::now, error::invalid, state::Store, Result};
-use rusqlite::{params, TransactionBehavior};
+use crate::{Result, config::Config, domain::now, error::invalid, state::Store};
+use rusqlite::{TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -69,10 +69,10 @@ impl Sample {
         {
             return Err(invalid("invalid quota timestamp"));
         }
-        if let (Some(o), Some(v)) = (self.observed_at, self.valid_until) {
-            if v < o {
-                return Err(invalid("quota expiry precedes observation"));
-            }
+        if let (Some(o), Some(v)) = (self.observed_at, self.valid_until)
+            && v < o
+        {
+            return Err(invalid("quota expiry precedes observation"));
         }
         Ok(())
     }
@@ -357,18 +357,17 @@ pub fn forecast(key: &Key, samples: &[Sample], at: f64) -> Forecast {
     let mut span = None;
     let mut burn = None;
     let matching: Vec<_> = samples.iter().filter(|s| same_cycle(s, latest)).collect();
-    if matching.len() >= 2 {
-        if let Some(oldest) = matching.last() {
-            if let (Some(a), Some(b), Some(old)) = (
-                latest.observed_at,
-                oldest.observed_at,
-                oldest.remaining_percent,
-            ) {
-                span = Some(a - b);
-                if a > b {
-                    burn = Some((old - remaining).max(0.0) / ((a - b) / 3600.0));
-                }
-            }
+    if matching.len() >= 2
+        && let Some(oldest) = matching.last()
+        && let (Some(a), Some(b), Some(old)) = (
+            latest.observed_at,
+            oldest.observed_at,
+            oldest.remaining_percent,
+        )
+    {
+        span = Some(a - b);
+        if a > b {
+            burn = Some((old - remaining).max(0.0) / ((a - b) / 3600.0));
         }
     }
     let sustainable = latest

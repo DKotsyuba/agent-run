@@ -29,7 +29,7 @@
 //!
 //! Writer exclusion: besides the broker lock and the `migration_required` /
 //! `migration_incomplete` gate for newly started commands, apply and rollback
-//! hold one exclusive SQLite lease on the live database ([`lease`]) from
+//! hold one exclusive SQLite lease on the live database from
 //! before the first live read until the journal is cleared. Every live read
 //! (active agents, row digest, the snapshot backup) and every replacement run
 //! through that same connection. A process that already holds the database
@@ -40,16 +40,16 @@
 //! Historical snapshot filenames and v1/v2 digest keys mean before/after for
 //! both input schemas. Recovery restores the original pair; there is no roll-forward.
 
-use crate::{config::Config, fs, state::Store, Result};
+use crate::{Result, config::Config, fs, state::Store};
 use agent_run_config::{
     provider_config::ProviderConfig,
-    provider_migration::{plan_v1, MigrationMapping},
+    provider_migration::{MigrationMapping, plan_v1},
 };
 use agent_run_domain::error::invalid;
 use agent_run_platform::release;
 use fs2::FileExt;
-use rusqlite::{functions::FunctionFlags, Connection, OpenFlags};
-use serde_json::{json, Value};
+use rusqlite::{Connection, OpenFlags, functions::FunctionFlags};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
@@ -398,17 +398,16 @@ fn checkpoint(step: &str) -> Result<()> {
         .as_deref()
         .and_then(|value| value.split_once(':'))
         .map(|(at, dir)| (at.to_owned(), PathBuf::from(dir)))
+        && at == step
     {
-        if at == step {
-            std::fs::write(dir.join("paused"), step)?;
-            for _ in 0..600 {
-                if dir.join("release").exists() {
-                    return Ok(());
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(dir.join("paused"), step)?;
+        for _ in 0..600 {
+            if dir.join("release").exists() {
+                return Ok(());
             }
-            return Err(invalid("migration pause was never released"));
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        return Err(invalid("migration pause was never released"));
     }
     Ok(())
 }

@@ -51,10 +51,12 @@ fn missing_pid_without_birth_is_a_dead_verdict() {
 #[test]
 fn native_process_enumeration_includes_this_process() {
     let self_pid = std::process::id() as i32;
-    assert!(process::processes()
-        .expect("native process enumeration")
-        .iter()
-        .any(|identity| identity.pid == self_pid));
+    assert!(
+        process::processes()
+            .expect("native process enumeration")
+            .iter()
+            .any(|identity| identity.pid == self_pid)
+    );
 }
 
 #[test]

@@ -1,6 +1,6 @@
 //! Owner-configured command denials and deterministic native rule renderers.
 
-use agent_run_domain::{error::invalid, Result};
+use agent_run_domain::{Result, error::invalid};
 use serde_json::json;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -242,14 +242,15 @@ fn write_marker(directory: &Path, commands: &[String]) -> Result<()> {
 
 /// Atomically create or replace one verified refusal shim.
 fn write_refusal(path: &Path) -> Result<()> {
-    if let Ok(meta) = fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() || !meta.is_file() || fs::read_to_string(path)? != REFUSAL
-        {
-            return Err(invalid(format!(
-                "refusing to replace unmanaged command-policy entry: {}",
-                path.display()
-            )));
-        }
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && (meta.file_type().is_symlink()
+            || !meta.is_file()
+            || fs::read_to_string(path)? != REFUSAL)
+    {
+        return Err(invalid(format!(
+            "refusing to replace unmanaged command-policy entry: {}",
+            path.display()
+        )));
     }
     atomic_write(path, REFUSAL.as_bytes(), 0o700)
 }

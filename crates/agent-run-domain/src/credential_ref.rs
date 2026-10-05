@@ -1,10 +1,10 @@
 //! Canonical, nonsecret references to operator-owned credential stores.
 
 use crate::{
+    Result,
     catalog::{AuthFamily, HarnessId, SecretRef},
     error::invalid,
     types::AccountLabel,
-    Result,
 };
 use std::{path::PathBuf, str::FromStr};
 

@@ -1,14 +1,14 @@
 //! Bounded read-only diagnostics and model-visible active context snapshots.
 
-use crate::{accounts::account_record, Store, ACTIVE_SQL, VERSION};
+use crate::{ACTIVE_SQL, Store, VERSION, accounts::account_record};
 use agent_run_domain::{
+    Result,
     catalog::{AccountId, AccountRecord},
     error::invalid,
-    Result,
 };
-use rusqlite::{types::ValueRef, Connection, OpenFlags, OptionalExtension, Row};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, types::ValueRef};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::Path};
 
 /// A doctor-safe point-in-time view of active agents and newest capacity samples per identity.
@@ -68,7 +68,9 @@ pub fn diagnostic_snapshot(
             "state migration required: found v{version}, expected v{VERSION}"
         )));
     }
-    let mut agents_stmt = conn.prepare(&format!("SELECT * FROM agents WHERE status IN {ACTIVE_SQL} ORDER BY created_at DESC,id DESC LIMIT ?"))?;
+    let mut agents_stmt = conn.prepare(&format!(
+        "SELECT * FROM agents WHERE status IN {ACTIVE_SQL} ORDER BY created_at DESC,id DESC LIMIT ?"
+    ))?;
     let agents = agents_stmt
         .query_map([limit as i64], row_object)?
         .collect::<rusqlite::Result<Vec<_>>>()?;

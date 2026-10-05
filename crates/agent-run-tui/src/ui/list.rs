@@ -7,13 +7,13 @@
 //! section adds its header plus one blank line before the finished rows.
 
 use super::{text, theme};
-use crate::app::{self, human_duration, App};
+use crate::app::{self, App, human_duration};
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
-    Frame,
 };
 
 /// Terminal rows one session entry occupies: two content rows plus one gap.

@@ -152,12 +152,10 @@ fn python_codex_prepare_network_is_explicit_for_write() {
     let workdir = temporary.path().join("work");
     std::fs::create_dir(&workdir).unwrap();
     let role = profile("research", true, true, vec![]);
-    assert!(agent_run_adapters::validate(
-        &request(&workdir, true),
-        &runtime(temporary.path()),
-        &role
-    )
-    .is_ok());
+    assert!(
+        agent_run_adapters::validate(&request(&workdir, true), &runtime(temporary.path()), &role)
+            .is_ok()
+    );
 }
 
 /// Mirrors `test_codex_adapter.py::test_prepare_enables_the_post_execution_fallback_only_for_read_only_agents`.
@@ -271,12 +269,14 @@ fn python_codex_prepare_refuses_unknown_configured_model() {
     let temporary = tempfile::tempdir().unwrap();
     let mut req = request(temporary.path(), false);
     req.model = "unlisted".into();
-    assert!(agent_run_adapters::validate(
-        &req,
-        &runtime(temporary.path()),
-        &profile("review", false, false, vec![])
-    )
-    .is_err());
+    assert!(
+        agent_run_adapters::validate(
+            &req,
+            &runtime(temporary.path()),
+            &profile("review", false, false, vec![])
+        )
+        .is_err()
+    );
 }
 
 /// Mirrors `test_codex_adapter.py::test_prepare_refuses_unresolved_mcp_servers`.
@@ -294,13 +294,15 @@ fn python_codex_prepare_refuses_request_role_write_mismatch() {
     let temporary = tempfile::tempdir().unwrap();
     let workdir = temporary.path().join("work");
     std::fs::create_dir(&workdir).unwrap();
-    assert!(Grant::new(
-        &runtime(temporary.path()),
-        &request(&workdir, true),
-        &profile("review", false, false, vec![]),
-        temporary.path()
-    )
-    .is_err());
+    assert!(
+        Grant::new(
+            &runtime(temporary.path()),
+            &request(&workdir, true),
+            &profile("review", false, false, vec![]),
+            temporary.path()
+        )
+        .is_err()
+    );
 }
 
 /// Mirrors `test_codex_adapter.py::test_prepare_requires_an_explicitly_discovered_effort`.
@@ -352,9 +354,11 @@ fn python_codex_prepare_seals_project_trust_receipt() {
     let cfg: Config = serde_json::from_value(json!({"schema_version":1})).unwrap();
     let (req, role) = (serde_json::from_value(json!({"runtime":"codex","model":"fixture","profile":"review","task":"fixture","workdir":temporary.path()})).unwrap(), profile("review", false, false, vec![]));
     materialize::materialize(&cfg, &rt, &req, &role, &home, temporary.path()).unwrap();
-    assert!(std::fs::read_to_string(home.join("config.toml"))
-        .unwrap()
-        .contains("projects"));
+    assert!(
+        std::fs::read_to_string(home.join("config.toml"))
+            .unwrap()
+            .contains("projects")
+    );
 }
 
 /// Mirrors `tests/test_codex_adapter.py::CodexAdapterTests::test_prepare_seals_native_project_trust_before_snapshot`.

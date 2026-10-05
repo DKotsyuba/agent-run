@@ -1,20 +1,22 @@
 name: Release
-
 on:
   push:
     tags: ["v*.*.*"]
-
 permissions:
   contents: read
-
+# Repository-wide serialization preserves attempts for older tags.
 concurrency:
-  group: release-${{ github.ref }}
+  group: agent-run-release-publisher
+  # GitHub retains up to 100 pending runs; overflow refuses new arrivals.
+  queue: max
   cancel-in-progress: false
-
+env:
+  AGENT_RUN_WORKFLOW_ID: "346709607"
 jobs:
   gate:
     name: Verify tag and build source archive
     runs-on: macos-15
+    timeout-minutes: 60
     steps:
       - name: Check out tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -23,117 +25,143 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
-      - name: Restore Rust dependency cache
+      - name: Restore check dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: agent-run-macos-15-arm64
+          shared-key: agent-run-check-v2-macos-15-arm64
           cache-bin: false
-          save-if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
-      - name: Fetch locked dependencies
-        run: cargo fetch --locked
-      - name: Verify annotated tag and workspace version
+          save-if: false
+      - name: Restore native cargo-deny
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ runner.os }}-${{ runner.arch }}-macos-15-0.20.2-${{ hashFiles('rust-toolchain.toml') }}
+      - name: Prepare verified dependency tools
         shell: bash
         run: |
-          test "$(git cat-file -t "$GITHUB_REF_NAME")" = tag
-          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
-          test "$GITHUB_REF_NAME" = "v$version"
-      - name: Run Rust release gates
+          if [ "$(cargo deny --version 2>/dev/null)" != 'cargo-deny 0.20.2' ]; then
+            cargo install cargo-deny --version 0.20.2 --locked --force
+          fi
+          test "$(cargo deny --version)" = 'cargo-deny 0.20.2'
+          cargo fetch --locked
+          cargo xtask prepare
+      - name: Verify annotated exact-source tag
+        run: cargo xtask release verify --accepted-commit "$GITHUB_SHA"
+      - name: Observe full source and dependency gates
+        shell: bash
         run: |
-          cargo xtask check
-          node --test scripts/check-desktop-transport.cjs scripts/check-codegraph-probe.cjs
-      - name: Build and verify source archive
+          mkdir -p dist
+          cargo xtask package accept --accepted-commit "$GITHUB_SHA" --output "$RUNNER_TEMP/gate.json" -- cargo xtask check
+          cargo xtask package accept --accepted-commit "$GITHUB_SHA" --output "$RUNNER_TEMP/gate.json" -- cargo deny --offline --locked check
+          cargo xtask package accept --accepted-commit "$GITHUB_SHA" --output "$RUNNER_TEMP/gate.json" -- node --test scripts/check-desktop-transport.cjs scripts/check-codegraph-probe.cjs
+      - name: Build and verify source archive once
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
-          mkdir -p dist
-          cargo xtask archive --revision HEAD --output "dist/agent-run-$version-source.tar" --verify
+          cargo xtask package accept --accepted-commit "$GITHUB_SHA" --output "$RUNNER_TEMP/gate.json" -- cargo xtask archive --revision HEAD --output "dist/agent-run-$version-source.tar" --verify
           cp install.sh dist/install.sh
-      - name: Upload source archive
+          cp "$RUNNER_TEMP/gate.json" dist/gate.json
+      - name: Upload source and observed evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: source
-          path: |
-            dist/agent-run-*-source.tar
-            dist/install.sh
+          path: dist/*
           if-no-files-found: error
           retention-days: 7
-
   native:
     name: Build aarch64-apple-darwin archive
-    needs: gate
+    # Independent payload build; publisher needs both jobs.
     runs-on: macos-15
+    timeout-minutes: 45
     steps:
       - name: Check out tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
-      - name: Restore Rust dependency cache
+      - name: Restore package dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: agent-run-macos-15-arm64
+          shared-key: agent-run-package-v1-macos-15-arm64
           cache-bin: false
-          save-if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+          save-if: false
       - name: Fetch locked dependencies
         run: cargo fetch --locked
       - name: Verify native runner architecture
         run: test "$(uname -m)" = arm64
-      - name: Run locked workspace gates
-        run: cargo xtask check
-      - name: Build and verify sealed native archive
+      - name: Build installed payload once and observe exact bytes
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
           mkdir -p dist
-          cargo xtask release build-native \
-            --target aarch64-apple-darwin \
-            --output "$RUNNER_TEMP/native" \
-            --version "$version"
+          cargo xtask package accept --accepted-commit "$GITHUB_SHA" --output "dist/acceptance.json" -- cargo xtask release build-native --target aarch64-apple-darwin --output "$RUNNER_TEMP/native" --version "$version"
           cargo xtask release verify --release "$RUNNER_TEMP/native/releases/$version"
-          tar -C "$RUNNER_TEMP/native/releases/$version" \
-            -czf "dist/agent-run-$version-aarch64-apple-darwin.tar.gz" .
-      - name: Upload native archive
+          COPYFILE_DISABLE=1 tar --format=ustar -C "$RUNNER_TEMP/native/releases/$version" -czf "dist/agent-run-$version-aarch64-apple-darwin.tar.gz" .
+          cargo xtask package smoke --accepted-commit "$GITHUB_SHA" --directory dist
+          mv dist/acceptance.json dist/native.json
+      - name: Upload exact native payload and evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-aarch64-apple-darwin
-          path: dist/agent-run-*-aarch64-apple-darwin.tar.gz
+          path: dist/*
           if-no-files-found: error
           retention-days: 7
-
   publish:
     name: Publish verified release
     needs: [gate, native]
-    runs-on: ubuntu-latest
+    runs-on: macos-15
+    timeout-minutes: 30
     permissions:
       contents: write
       id-token: write
       attestations: write
       artifact-metadata: write
     steps:
-      - name: Download release archives
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - name: Check out accepted verification source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: dist
-          merge-multiple: true
-      - name: Create aggregate checksums
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Restore package dependencies read-only
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: agent-run-package-v1-macos-15-arm64
+          cache-bin: false
+          save-if: false
+      - name: Build trusted verifier without release credentials
         shell: bash
         run: |
-          cd dist
-          sha256sum agent-run-*.tar.gz agent-run-*-source.tar install.sh > SHA256SUMS
-          sha256sum --check SHA256SUMS
-      - name: Attest release artifacts
+          env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN cargo fetch --locked
+          env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN cargo build --offline --locked --release -p xtask --target aarch64-apple-darwin
+      - name: Download producer artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ${{ runner.temp }}/candidate
+          merge-multiple: true
+      - name: Validate inventory and evidence before draft
+        shell: bash
+        run: |
+          mkdir dist
+          version="${GITHUB_REF_NAME#v}"
+          cp "$RUNNER_TEMP/candidate/agent-run-$version-aarch64-apple-darwin.tar.gz" "$RUNNER_TEMP/candidate/agent-run-$version-source.tar" "$RUNNER_TEMP/candidate/install.sh" dist/
+          verifier=target/aarch64-apple-darwin/release/xtask
+          "$verifier" package merge-evidence --accepted-commit "$GITHUB_SHA" --gate "$RUNNER_TEMP/candidate/gate.json" --native "$RUNNER_TEMP/candidate/native.json" --directory dist
+          "$verifier" package create --accepted-commit "$GITHUB_SHA" --directory dist
+          "$verifier" package verify --accepted-commit "$GITHUB_SHA" --directory dist --workflow-id "$AGENT_RUN_WORKFLOW_ID" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
+          awk -v version="$version" '$0 == "## "version || $0 == "## ["version"]" { printing=1; next } printing && /^## / { exit } printing { print }' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          test -s "$RUNNER_TEMP/notes.md"
+      - name: Attest exact release inventory
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-checksums: dist/SHA256SUMS
-      - name: Publish GitHub Release
+      - name: Stage verify publish and post-verify release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
-          test -z "$(gh release view "$GITHUB_REF_NAME" 2>/dev/null || true)"
-          gh release create "$GITHUB_REF_NAME" \
-            dist/agent-run-*.tar.gz \
-            dist/agent-run-*-source.tar dist/SHA256SUMS dist/install.sh \
-            --generate-notes --title "$GITHUB_REF_NAME" --verify-tag
+          # Rust creates/uploads the draft, verifies fresh downloads and provenance,
+          # publishes, and verifies publication again. It never rebuilds the payload.
+          target/aarch64-apple-darwin/release/xtask release publish --accepted-commit "$GITHUB_SHA" --directory dist --notes "$RUNNER_TEMP/notes.md"

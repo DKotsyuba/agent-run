@@ -7,8 +7,8 @@ use agent_run_core::{
     service::{LaunchIdentity, Service},
 };
 use agent_run_domain::{
-    domain::{OrchestratorRef, Outcome},
     Error,
+    domain::{OrchestratorRef, Outcome},
 };
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -261,14 +261,16 @@ fn python_test_resume_lost_parent_requires_quiescence() {
         )
         .unwrap();
     let row = store.get(&id).unwrap();
-    assert!(store
-        .admit(
-            &request(&home, "blocked"),
-            &home.config,
-            &json!({}),
-            Some(&row)
-        )
-        .is_err());
+    assert!(
+        store
+            .admit(
+                &request(&home, "blocked"),
+                &home.config,
+                &json!({}),
+                Some(&row)
+            )
+            .is_err()
+    );
     store
         .conn
         .execute(
@@ -276,14 +278,16 @@ fn python_test_resume_lost_parent_requires_quiescence() {
             [id.as_str()],
         )
         .unwrap();
-    assert!(store
-        .admit(
-            &request(&home, "allowed"),
-            &home.config,
-            &json!({}),
-            Some(&row)
-        )
-        .is_ok());
+    assert!(
+        store
+            .admit(
+                &request(&home, "allowed"),
+                &home.config,
+                &json!({}),
+                Some(&row)
+            )
+            .is_ok()
+    );
 }
 
 /// Mirrors `tests/test_resume.py::ResumeTests::test_missing_inherited_workdir_refuses_instead_of_recreating`.
@@ -332,9 +336,11 @@ fn python_test_resume_removed_model_is_refused() {
 #[test]
 fn python_test_resume_pre_credential_snapshot_shape_is_accepted_as_json() {
     let snapshot = json!({"runtime_config":{"home":"/runtime"},"profile":{"role_name":"review"}});
-    assert!(snapshot["runtime_config"]
-        .get("credential_state_home")
-        .is_none());
+    assert!(
+        snapshot["runtime_config"]
+            .get("credential_state_home")
+            .is_none()
+    );
 }
 
 /// Mirrors `tests/test_resume.py::ResumeTests::test_replay_preserves_notification_caller_and_validates_timeout`.
@@ -351,9 +357,11 @@ fn python_test_resume_replay_preserves_orchestrator_namespace() {
     let id = parent(&home, request.clone(), "session");
     let mut store = home.store();
     let parent_row = store.get(&id).unwrap();
-    assert!(store
-        .admit(&request, &home.config, &json!({}), Some(&parent_row))
-        .is_err());
+    assert!(
+        store
+            .admit(&request, &home.config, &json!({}), Some(&parent_row))
+            .is_err()
+    );
 }
 
 /// Mirrors `tests/test_resume.py::ResumeTests::test_replay_survives_deleted_paths_and_changed_runtime`.
@@ -620,17 +628,19 @@ async fn old_parent_resume_retry_replays_through_later_continuations() {
         ..canonical.clone()
     };
     for (task, orchestrator) in [("different task", None), ("continue", Some(other_family))] {
-        assert!(service
-            .resume(
-                &root,
-                task.into(),
-                None,
-                Some("retry-1".into()),
-                None,
-                orchestrator,
-            )
-            .await
-            .is_err());
+        assert!(
+            service
+                .resume(
+                    &root,
+                    task.into(),
+                    None,
+                    Some("retry-1".into()),
+                    None,
+                    orchestrator,
+                )
+                .await
+                .is_err()
+        );
     }
     let children: i64 = home
         .store()
@@ -790,14 +800,16 @@ fn python_test_resume_stale_ancestor_has_one_latest_child() {
     let (child_id, _) = child(&home, &root, "two");
     let mut store = home.store();
     let row = store.get(&root).unwrap();
-    assert!(store
-        .admit(
-            &request(&home, "stale"),
-            &home.config,
-            &json!({}),
-            Some(&row)
-        )
-        .is_err());
+    assert!(
+        store
+            .admit(
+                &request(&home, "stale"),
+                &home.config,
+                &json!({}),
+                Some(&row)
+            )
+            .is_err()
+    );
     assert_eq!(store.get(&child_id).unwrap().sequence, 2);
 }
 

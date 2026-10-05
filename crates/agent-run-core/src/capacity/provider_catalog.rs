@@ -8,14 +8,14 @@
 //! role grants, and cached quota standing — no automatic choice or score of
 //! model ability. No account id, label, or credential reference is emitted.
 
-use crate::{capacity::provider_ranking, error::invalid, Result};
+use crate::{Result, capacity::provider_ranking, error::invalid};
 use agent_run_config::{policy, profiles, provider_config::ProviderConfig, role_plan};
 use agent_run_domain::{
-    catalog::{ProviderCatalog, ProviderConnection, ProviderDefinition, ProviderModel},
     CapacityOrderQuery, ModelsQuery, ProviderStartRequest,
+    catalog::{ProviderCatalog, ProviderConnection, ProviderDefinition, ProviderModel},
 };
 use agent_run_store::Store;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::Path};
 
 /// Loads the canonical role `name` exactly as provider admission does, using
@@ -98,14 +98,13 @@ fn resolve(config: &ProviderConfig, store: &Store) -> Result<ProviderCatalog> {
 
 /// Validates `model` against the catalog: it must be offered somewhere.
 fn check_model(catalog: &ProviderCatalog, model: Option<&str>) -> Result<()> {
-    if let Some(model) = model {
-        if !catalog
+    if let Some(model) = model
+        && !catalog
             .providers()
             .iter()
             .any(|provider| provider.models.iter().any(|offering| offering.id == model))
-        {
-            return Err(invalid("model filter names no configured offering"));
-        }
+    {
+        return Err(invalid("model filter names no configured offering"));
     }
     Ok(())
 }
@@ -161,10 +160,10 @@ fn models_between(
     // One committed read: registry, samples, latches and revision together.
     let _read = store.conn.unchecked_transaction()?;
     let catalog = resolve(config, &store)?;
-    if let Some(provider) = &query.provider {
-        if catalog.provider(&provider.parse()?).is_none() {
-            return Err(invalid("provider filter names no configured provider"));
-        }
+    if let Some(provider) = &query.provider
+        && catalog.provider(&provider.parse()?).is_none()
+    {
+        return Err(invalid("provider filter names no configured provider"));
     }
     check_model(&catalog, query.model.as_deref())?;
     let any = catalog

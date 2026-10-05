@@ -7,18 +7,19 @@
 //! link, so history and identities stay intact.
 
 use crate::{
+    Store,
     pool_admission::PoolMemberRecord,
     pool_log::{fanout_entry, lineage_cleanup_complete, tip_of},
-    provider_admission::{admit_in_tx, AdmissionInputs},
-    tx_event, Store,
+    provider_admission::{AdmissionInputs, admit_in_tx},
+    tx_event,
 };
 use agent_run_domain::{
-    catalog::ProviderCatalog,
-    domain::{now, AgentId, OrchestratorRef, Status},
-    pool::{AcceptanceCriterion, PoolDenial, PoolId},
     Error, Result,
+    catalog::ProviderCatalog,
+    domain::{AgentId, OrchestratorRef, Status, now},
+    pool::{AcceptanceCriterion, PoolDenial, PoolId},
 };
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::json;
 
 /// Everything an operator replacement must know about the pool and the seat

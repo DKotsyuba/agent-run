@@ -94,14 +94,16 @@ fn role_plan_serializes_global_and_account_auth_choices() {
         global.to_payload()["auth"],
         json!({"mode":"global","reference":null})
     );
-    assert!(resolve_role_plan(
-        &profile,
-        PathBuf::from("/tmp/agent-run-skills").as_path(),
-        &Default::default(),
-        "global",
-        Some("personal2"),
-    )
-    .is_err());
+    assert!(
+        resolve_role_plan(
+            &profile,
+            PathBuf::from("/tmp/agent-run-skills").as_path(),
+            &Default::default(),
+            "global",
+            Some("personal2"),
+        )
+        .is_err()
+    );
 }
 
 /// Mirrors `tests/test_paths.py::PathTests::test_home_uses_environment_and_returns_resolved_paths`

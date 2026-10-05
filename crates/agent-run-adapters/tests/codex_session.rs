@@ -1,8 +1,8 @@
 //! Fake app-server coverage for the Codex session parser and transport.
 use agent_run_adapters::{
-    codex::session::{failure_kind, Notification, Session, SessionState},
-    io::Process,
     LaunchPlan,
+    codex::session::{Notification, Session, SessionState, failure_kind},
+    io::Process,
 };
 use serde_json::json;
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
@@ -177,13 +177,15 @@ fn python_test_codex_app_server_resumed_session_ignores_replayed_completion_with
     session.initialized().unwrap();
     session.thread_started("thread").unwrap();
     session.turn_started("turn-new").unwrap();
-    assert!(session
-        .notification(&json!({
-            "method": "turn/completed",
-            "params": {"threadId": "thread", "turn": {"status": "completed"}}
-        }))
-        .unwrap()
-        .is_none());
+    assert!(
+        session
+            .notification(&json!({
+                "method": "turn/completed",
+                "params": {"threadId": "thread", "turn": {"status": "completed"}}
+            }))
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// Mirrors `test_codex_app_server.py::test_item_completed_preserves_the_message_when_terminal_items_are_empty`.
@@ -315,9 +317,11 @@ fn python_test_codex_app_server_other_thread_is_not_owned() {
 // Mirrors `tests/test_codex_app_server.py::CodexAppServerSessionTests::test_envelope_without_a_method_is_reported_not_dropped`
 #[test]
 fn python_test_codex_app_server_missing_method_fails_closed() {
-    assert!(active_session(false)
-        .notification(&json!({"params":{}}))
-        .is_err());
+    assert!(
+        active_session(false)
+            .notification(&json!({"params":{}}))
+            .is_err()
+    );
 }
 
 // Mirrors `tests/test_codex_app_server.py::CodexAppServerSessionTests::test_in_progress_completion_is_refused_and_the_raw_event_is_retained`
@@ -346,12 +350,14 @@ fn python_test_codex_app_server_malformed_item_is_rejected() {
 fn python_test_codex_app_server_notification_flood_keeps_identity_checks_bounded() {
     let session = active_session(false);
     for _ in 0..64 {
-        assert!(session
-            .notification(
-                &json!({"method":"turn/started","params":{"threadId":"thread","turnId":"turn"}})
-            )
-            .unwrap()
-            .is_some());
+        assert!(
+            session
+                .notification(
+                    &json!({"method":"turn/started","params":{"threadId":"thread","turnId":"turn"}})
+                )
+                .unwrap()
+                .is_some()
+        );
     }
 }
 
@@ -573,10 +579,12 @@ async fn python_test_codex_app_server_owned_transport_reaps_repeatedly() {
             r#"read line; printf '%s\n' '{"id":1,"result":{"ok":true}}'; read rest || :"#,
         ))
         .unwrap();
-        assert!(process
-            .rpc("initialize", json!({}), Duration::from_secs(1))
-            .await
-            .is_ok());
+        assert!(
+            process
+                .rpc("initialize", json!({}), Duration::from_secs(1))
+                .await
+                .is_ok()
+        );
         drop(process.input.take());
         assert_eq!(process.reap().await, Some(0));
     }
@@ -589,10 +597,12 @@ async fn python_test_codex_app_server_notifications_cannot_extend_deadline() {
         r#"read line; for i in $(seq 1 50); do printf '%s\n' '{"method":"turn/log","params":{}}'; done; sleep 1"#,
     )).unwrap();
     let started = std::time::Instant::now();
-    assert!(process
-        .rpc("initialize", json!({}), Duration::from_millis(100))
-        .await
-        .is_err());
+    assert!(
+        process
+            .rpc("initialize", json!({}), Duration::from_millis(100))
+            .await
+            .is_err()
+    );
     assert!(started.elapsed() < Duration::from_secs(2));
     process.reap().await;
 }

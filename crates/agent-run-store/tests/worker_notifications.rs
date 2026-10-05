@@ -1,11 +1,11 @@
 //! Worker report security and outbox behavior against a private SQLite home.
 
 use agent_run_domain::{
+    Error,
     domain::AgentId,
     worker::{NotifyRequest, WorkerMessageKind},
-    Error,
 };
-use agent_run_store::{retention::HISTORY_SECONDS, Store};
+use agent_run_store::{Store, retention::HISTORY_SECONDS};
 use rusqlite::params;
 
 /// Fixed test bearer secret; no live worker or process is launched.
@@ -73,12 +73,16 @@ fn active_report_replay_and_deadline() {
         .issue_worker_capability(&run, &attempt, TOKEN, 100.0)
         .unwrap();
     let other_run: AgentId = "ag-20260928-000000-0123456788".parse().unwrap();
-    assert!(store
-        .issue_worker_capability(&other_run, &attempt, TOKEN, 100.0)
-        .is_err());
-    assert!(store
-        .notify_orchestrator(&other_run, &attempt, TOKEN, &report("one"), 191.0)
-        .is_err());
+    assert!(
+        store
+            .issue_worker_capability(&other_run, &attempt, TOKEN, 100.0)
+            .is_err()
+    );
+    assert!(
+        store
+            .notify_orchestrator(&other_run, &attempt, TOKEN, &report("one"), 191.0)
+            .is_err()
+    );
     store
         .conn
         .execute(
@@ -86,9 +90,11 @@ fn active_report_replay_and_deadline() {
             [run.as_str()],
         )
         .unwrap();
-    assert!(store
-        .notify_orchestrator(&run, &attempt, TOKEN, &report("one"), 191.0)
-        .is_err());
+    assert!(
+        store
+            .notify_orchestrator(&run, &attempt, TOKEN, &report("one"), 191.0)
+            .is_err()
+    );
     store
         .conn
         .execute(
@@ -96,9 +102,11 @@ fn active_report_replay_and_deadline() {
             [run.as_str()],
         )
         .unwrap();
-    assert!(store
-        .notify_orchestrator(&run, &attempt, TOKEN, &report("one"), 191.0)
-        .is_err());
+    assert!(
+        store
+            .notify_orchestrator(&run, &attempt, TOKEN, &report("one"), 191.0)
+            .is_err()
+    );
     store
         .conn
         .execute(
@@ -120,12 +128,16 @@ fn active_report_replay_and_deadline() {
         store.notify_orchestrator(&run, &attempt, TOKEN, &report("two"), 191.0),
         Err(Error::Validation(_))
     ));
-    assert!(store
-        .notify_orchestrator(&run, &attempt, TOKEN, &report("two"), 219.0)
-        .is_err());
-    assert!(store
-        .notify_orchestrator(&run, &attempt, TOKEN, &report("two"), 220.0)
-        .is_err());
+    assert!(
+        store
+            .notify_orchestrator(&run, &attempt, TOKEN, &report("two"), 219.0)
+            .is_err()
+    );
+    assert!(
+        store
+            .notify_orchestrator(&run, &attempt, TOKEN, &report("two"), 220.0)
+            .is_err()
+    );
     let (event_kind, event_data): (String, String) = store.conn.query_row(
         "SELECT e.kind,e.data_json FROM events e JOIN deliveries d ON d.terminal_event_seq=e.seq WHERE d.id=?",
         [&first.notification_id], |r| Ok((r.get(0)?,r.get(1)?)),
@@ -142,12 +154,16 @@ fn forged_and_inactive_reports_are_rejected() {
     store
         .issue_worker_capability(&run, &attempt, TOKEN, 100.0)
         .unwrap();
-    assert!(store
-        .notify_orchestrator(&run, "wrong-attempt", TOKEN, &report("one"), 191.0)
-        .is_err());
-    assert!(store
-        .notify_orchestrator(&run, &attempt, &"b".repeat(64), &report("one"), 191.0)
-        .is_err());
+    assert!(
+        store
+            .notify_orchestrator(&run, "wrong-attempt", TOKEN, &report("one"), 191.0)
+            .is_err()
+    );
+    assert!(
+        store
+            .notify_orchestrator(&run, &attempt, &"b".repeat(64), &report("one"), 191.0)
+            .is_err()
+    );
     let first = store
         .notify_orchestrator(&run, &attempt, TOKEN, &report("one"), 191.0)
         .unwrap();
@@ -159,9 +175,11 @@ fn forged_and_inactive_reports_are_rejected() {
     ));
     let mut leak = report("leak");
     leak.message = TOKEN.into();
-    assert!(store
-        .notify_orchestrator(&run, &attempt, TOKEN, &leak, 192.0)
-        .is_err());
+    assert!(
+        store
+            .notify_orchestrator(&run, &attempt, TOKEN, &leak, 192.0)
+            .is_err()
+    );
     let digest: String = store
         .conn
         .query_row("SELECT token_sha256 FROM worker_capabilities", [], |r| {
@@ -176,9 +194,11 @@ fn forged_and_inactive_reports_are_rejected() {
             [run.as_str()],
         )
         .unwrap();
-    assert!(store
-        .notify_orchestrator(&run, &attempt, TOKEN, &report("one"), 192.0)
-        .is_err());
+    assert!(
+        store
+            .notify_orchestrator(&run, &attempt, TOKEN, &report("one"), 192.0)
+            .is_err()
+    );
     store
         .conn
         .execute(
@@ -193,9 +213,11 @@ fn forged_and_inactive_reports_are_rejected() {
             [&attempt],
         )
         .unwrap();
-    assert!(store
-        .notify_orchestrator(&run, &attempt, TOKEN, &report("one"), 192.0)
-        .is_err());
+    assert!(
+        store
+            .notify_orchestrator(&run, &attempt, TOKEN, &report("one"), 192.0)
+            .is_err()
+    );
     assert_eq!(
         store
             .conn

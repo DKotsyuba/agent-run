@@ -1,7 +1,7 @@
 //! Claude-family runtime validation shared by Claude and GLM.
 
 use agent_run_config::config::{Adapter, Auth, Runtime};
-use agent_run_domain::{error::invalid, Result};
+use agent_run_domain::{Result, error::invalid};
 use std::path::Path;
 
 const KNOWN_HOOK_EVENTS: &[&str] = &[
@@ -46,20 +46,18 @@ pub fn validate_runtime(runtime: &Runtime, kind: Adapter) -> Result<()> {
             )));
         }
     }
-    if kind == Adapter::Glm {
-        if let Some(auth) = &runtime.auth {
-            let Auth::Environment { names } = auth else {
-                return Err(invalid("glm runtime auth.kind must be 'environment'"));
-            };
-            let unknown: Vec<_> = names
-                .iter()
-                .filter(|name| {
-                    !["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"].contains(&name.as_str())
-                })
-                .collect();
-            if !unknown.is_empty() {
-                return Err(invalid("glm runtime auth.names has unsupported entries"));
-            }
+    if kind == Adapter::Glm
+        && let Some(auth) = &runtime.auth
+    {
+        let Auth::Environment { names } = auth else {
+            return Err(invalid("glm runtime auth.kind must be 'environment'"));
+        };
+        let unknown: Vec<_> = names
+            .iter()
+            .filter(|name| !["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"].contains(&name.as_str()))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(invalid("glm runtime auth.names has unsupported entries"));
         }
     }
     if kind == Adapter::Glm {

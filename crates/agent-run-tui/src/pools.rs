@@ -390,10 +390,10 @@ impl Pools {
         self.items = items;
         self.open_total = open.total;
         self.completed_total = completed.total;
-        if self.selected.is_none() {
-            if let Some(item) = self.items.first() {
-                self.select(item.pool_id.clone());
-            }
+        if self.selected.is_none()
+            && let Some(item) = self.items.first()
+        {
+            self.select(item.pool_id.clone());
         }
         changed
     }
@@ -723,16 +723,15 @@ pub fn width(app: &App) -> usize {
 /// Requests one older page when the scrolled viewport reaches its loaded beginning.
 pub fn older(app: &mut App) {
     let width = width(app);
-    if let Some(buffer) = app.pools.buffer_mut() {
-        if !buffer.follow
-            && buffer.offset < 10
-            && !buffer.history_complete
-            && buffer.older.is_none()
-        {
-            buffer.older = buffer.entries.first().map(|e| e.seq);
-            // Keep width-dependent rows cached before prepend for anchoring.
-            let _ = crate::ui::pools::rows(buffer, width);
-        }
+    if let Some(buffer) = app.pools.buffer_mut()
+        && !buffer.follow
+        && buffer.offset < 10
+        && !buffer.history_complete
+        && buffer.older.is_none()
+    {
+        buffer.older = buffer.entries.first().map(|e| e.seq);
+        // Keep width-dependent rows cached before prepend for anchoring.
+        let _ = crate::ui::pools::rows(buffer, width);
     }
 }
 /// Applies a pool action without broker writes; member reads dispatch through the one-shot lane.
@@ -880,10 +879,10 @@ pub fn apply(app: &mut App, action: Action) -> Dispatched {
                 buffer.follow = delta > 0 && buffer.offset == total.saturating_sub(viewport);
             }
             Action::Open => {
-                if let Some(seq) = buffer.cursor {
-                    if !buffer.expanded.remove(&seq) {
-                        buffer.expanded.insert(seq);
-                    }
+                if let Some(seq) = buffer.cursor
+                    && !buffer.expanded.remove(&seq)
+                {
+                    buffer.expanded.insert(seq);
                 }
             }
             Action::Follow => {
@@ -948,19 +947,17 @@ pub fn mouse(app: &mut App, mouse: MouseEvent) -> Dispatched {
         }
         Some(Target::Member(id, agent)) if app.pools.selected.as_ref() == Some(&id) => {
             app.pools.focused = true;
-            if let Some(b) = app.pools.buffer_mut() {
-                if let Some(s) = &b.status {
-                    if let Some(at) = s
-                        .members
-                        .iter()
-                        .map(|m| &m.agent_id)
-                        .chain(s.replaced_members.iter().map(|m| &m.agent_id))
-                        .position(|id| id == &agent)
-                    {
-                        b.member = at;
-                        b.roster = true;
-                    }
-                }
+            if let Some(b) = app.pools.buffer_mut()
+                && let Some(s) = &b.status
+                && let Some(at) = s
+                    .members
+                    .iter()
+                    .map(|m| &m.agent_id)
+                    .chain(s.replaced_members.iter().map(|m| &m.agent_id))
+                    .position(|id| id == &agent)
+            {
+                b.member = at;
+                b.roster = true;
             }
         }
         Some(Target::Entry(id, seq)) if app.pools.selected.as_ref() == Some(&id) => {

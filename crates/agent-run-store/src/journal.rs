@@ -5,11 +5,11 @@
 
 use crate::Store;
 use agent_run_domain::{
-    domain::{now, AgentId},
-    error::invalid,
     Error, Result,
+    domain::{AgentId, now},
+    error::invalid,
 };
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use std::{
     fs::{self, OpenOptions},
@@ -57,7 +57,10 @@ fn spool(home: &Path, id: &AgentId, content: &str) -> Result<(String, String)> {
         }
         let stub = format!(
             "{}\n[...spooled: {} bytes exceed the 32 KiB inline limit; full content in raw_ref={name}]",
-            content.chars().take(INLINE_STUB_HEAD_CHARS).collect::<String>(),
+            content
+                .chars()
+                .take(INLINE_STUB_HEAD_CHARS)
+                .collect::<String>(),
             bytes.len(),
         );
         return Ok((stub, name));

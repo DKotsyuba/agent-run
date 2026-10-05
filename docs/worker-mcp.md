@@ -66,3 +66,11 @@ This is a separate MCP capability surface, not an OS sandbox. Shell and filesyst
 rights granted to a worker remain governed by its harness/profile and the host.
 The internal `_worker-mcp` entry point only talks to the existing broker; it never
 opens or migrates SQLite, starts a broker, or uses Desktop native capabilities.
+
+The private server advertises Cargo's product version as `serverInfo.version`,
+independently of the pinned SDK and negotiated protocol. Its only tool is
+generated into `schemas/worker-tools.json` from the domain-owned worker asset.
+Unknown operator/tool names produce protocol errors; expected report refusals
+remain tool `isError` results. A rendering failure after enqueue preserves the
+notification identity and original request key with no-replay advice; uncertainty
+stays unknown. See [MCP presentation](mcp-presentation.md).

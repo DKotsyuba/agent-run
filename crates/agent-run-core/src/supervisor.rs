@@ -1,5 +1,6 @@
 //! Separate executable process per admitted run. READY precedes authentication/materialization.
 use crate::{
+    Error, Result,
     adapters::{self, io::Process, materialize},
     commands,
     config::Adapter,
@@ -8,12 +9,12 @@ use crate::{
     fs, launch, process,
     service::{LaunchIdentity, ProviderLaunchIdentity},
     state::Store,
-    verify, Error, Result,
+    verify,
 };
 use agent_run_config::role_plan::ResolvedRolePlan;
 use agent_run_domain::catalog::{AccountId, HarnessId};
 use agent_run_platform::{shared_asset_guard::SharedAssetGuard, shared_assets::SharedStoreLock};
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -131,10 +132,10 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
             }
             let row = store.get(id)?;
             if !row.status.terminal() {
-                if let Ok((attempt, _)) = store.provider_attempt(id) {
-                    if !crate::lifecycle::reconcile::cleanup_mcp_discovery(&store, &attempt)? {
-                        return Err(error);
-                    }
+                if let Ok((attempt, _)) = store.provider_attempt(id)
+                    && !crate::lifecycle::reconcile::cleanup_mcp_discovery(&store, &attempt)?
+                {
+                    return Err(error);
                 }
                 if row
                     .identity
@@ -1260,7 +1261,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 (Some((_, state)), _) => state.clone(),
                 (None, Some(parent)) => store.latest_attempt_state(parent)?,
                 (None, None) => {
-                    return Err(invalid("a resumed attempt has no recorded history source"))
+                    return Err(invalid("a resumed attempt has no recorded history source"));
                 }
             };
             crate::service::verify_recorded_history(
@@ -1283,17 +1284,17 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         // A switched attempt re-checks, at the handoff itself, that its
         // selected account is still enabled and the current configuration
         // still permits the frozen execution; otherwise it never spawns.
-        if continuing.is_some() {
-            if let Some(blocker) = handoff_blocker(home, store, &account, &identity)? {
-                if !store.provider_never_spawned(id)? {
-                    return Err(invalid("provider attempt was already spawning"));
-                }
-                store.event(id, "failover_blocked", &json!({"reason":blocker}))?;
-                let mut outcome = Outcome::failure("quota_exhausted");
-                outcome.failure_text = Some(format!("failover_blocked: {blocker}"));
-                store.finish(id, &outcome, None, None)?;
-                return commands::complete_terminal(store, id);
+        if continuing.is_some()
+            && let Some(blocker) = handoff_blocker(home, store, &account, &identity)?
+        {
+            if !store.provider_never_spawned(id)? {
+                return Err(invalid("provider attempt was already spawning"));
             }
+            store.event(id, "failover_blocked", &json!({"reason":blocker}))?;
+            let mut outcome = Outcome::failure("quota_exhausted");
+            outcome.failure_text = Some(format!("failover_blocked: {blocker}"));
+            store.finish(id, &outcome, None, None)?;
+            return commands::complete_terminal(store, id);
         }
         if !config.services.is_empty() {
             store.event(id, "phase", &json!({"phase":"warming_services"}))?;
@@ -1690,7 +1691,7 @@ fn failover(
         match store.allocate_next_attempt(id, &frozen, &candidates) {
             Ok(next) => {
                 return Ok(json!({"previous":next.released,"attempt":next.attempt_id,
-                    "number":next.number,"account":next.account_id}))
+                    "number":next.number,"account":next.account_id}));
             }
             Err(Error::QuotaAdmission(
                 agent_run_domain::catalog::QuotaAdmissionError::SelectionStale { .. },

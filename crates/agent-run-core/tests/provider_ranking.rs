@@ -3,18 +3,18 @@
 
 use agent_run_core::{
     capacity::provider_ranking::{
-        provider_candidates_at, provider_order_at, ProviderCapacityOrder,
+        ProviderCapacityOrder, provider_candidates_at, provider_order_at,
     },
     state::Store,
 };
 use agent_run_domain::{
+    Error, ProviderStartRequest,
     catalog::{
         AccountId, AccountRecord, AccountStatus, AuthFamily, PhysicalQuotaKey, ProviderCatalog,
         QuotaAdmissionError, SelectionIntent,
     },
-    Error, ProviderStartRequest,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 /// Fixed ranking clock every fixture sample is fresh at.

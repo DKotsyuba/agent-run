@@ -3,11 +3,11 @@
 use agent_run_config::{
     config::Config,
     provider_config::HarnessConfig,
-    provider_migration::{plan_v1, RuntimeMapping},
+    provider_migration::{RuntimeMapping, plan_v1},
 };
 use agent_run_domain::catalog::{
-    decode_legacy_request, AccountRecord, AccountStatus, HarnessId, LimitsSource,
-    ProviderConnection, ProviderProtocol,
+    AccountRecord, AccountStatus, HarnessId, LimitsSource, ProviderConnection, ProviderProtocol,
+    decode_legacy_request,
 };
 use serde_json::json;
 use std::{collections::BTreeMap, fs, path::Path};
@@ -195,38 +195,44 @@ fn migration_plan_refuses_implicit_mapping() {
     let old = old(home.path());
     let mut missing_model = mappings();
     missing_model.get_mut("main").unwrap().native_models.clear();
-    assert!(plan_v1(
-        &old,
-        harnesses(home.path()),
-        missing_model,
-        accounts(),
-        home.path()
-    )
-    .is_err());
+    assert!(
+        plan_v1(
+            &old,
+            harnesses(home.path()),
+            missing_model,
+            accounts(),
+            home.path()
+        )
+        .is_err()
+    );
     let mut missing_account = mappings();
     missing_account
         .get_mut("main")
         .unwrap()
         .labelled_accounts
         .clear();
-    assert!(plan_v1(
-        &old,
-        harnesses(home.path()),
-        missing_account,
-        accounts(),
-        home.path()
-    )
-    .is_err());
+    assert!(
+        plan_v1(
+            &old,
+            harnesses(home.path()),
+            missing_account,
+            accounts(),
+            home.path()
+        )
+        .is_err()
+    );
     let mut wrong_harness = mappings();
     wrong_harness.get_mut("glm").unwrap().harness = HarnessId::Codex;
-    assert!(plan_v1(
-        &old,
-        harnesses(home.path()),
-        wrong_harness,
-        accounts(),
-        home.path()
-    )
-    .is_err());
+    assert!(
+        plan_v1(
+            &old,
+            harnesses(home.path()),
+            wrong_harness,
+            accounts(),
+            home.path()
+        )
+        .is_err()
+    );
     let mut lane_weight = old.clone();
     lane_weight
         .runtimes
@@ -234,40 +240,48 @@ fn migration_plan_refuses_implicit_mapping() {
         .unwrap()
         .priority_lane_multipliers
         .insert("gpt".into(), 2.0);
-    assert!(plan_v1(
-        &lane_weight,
-        harnesses(home.path()),
-        mappings(),
-        accounts(),
-        home.path()
-    )
-    .is_err());
+    assert!(
+        plan_v1(
+            &lane_weight,
+            harnesses(home.path()),
+            mappings(),
+            accounts(),
+            home.path()
+        )
+        .is_err()
+    );
     let mut disabled = old.clone();
     disabled.runtimes.get_mut("main").unwrap().enabled = false;
-    assert!(plan_v1(
-        &disabled,
-        harnesses(home.path()),
-        mappings(),
-        accounts(),
-        home.path()
-    )
-    .is_err());
+    assert!(
+        plan_v1(
+            &disabled,
+            harnesses(home.path()),
+            mappings(),
+            accounts(),
+            home.path()
+        )
+        .is_err()
+    );
     let mut duplicate_provider = mappings();
     duplicate_provider.get_mut("glm").unwrap().provider = "codex".parse().unwrap();
-    assert!(plan_v1(
-        &old,
-        harnesses(home.path()),
-        duplicate_provider,
-        accounts(),
-        home.path()
-    )
-    .is_err());
-    assert!(plan_v1(
-        &old,
-        harnesses(home.path()),
-        mappings(),
-        vec![],
-        home.path()
-    )
-    .is_err());
+    assert!(
+        plan_v1(
+            &old,
+            harnesses(home.path()),
+            duplicate_provider,
+            accounts(),
+            home.path()
+        )
+        .is_err()
+    );
+    assert!(
+        plan_v1(
+            &old,
+            harnesses(home.path()),
+            mappings(),
+            vec![],
+            home.path()
+        )
+        .is_err()
+    );
 }

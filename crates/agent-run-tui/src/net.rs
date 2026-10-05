@@ -7,15 +7,15 @@
 
 use agent_run::transport::socket::BrokerClient;
 use agent_run_domain::views::{AgentPage, AnswerView, TranscriptPage};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     future::Future,
     os::unix::fs::MetadataExt,
     path::PathBuf,
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
 };
 
@@ -509,24 +509,28 @@ mod tests {
         };
         assert_eq!(seen_rx.recv().await.unwrap(), "pool");
         for method in ["transcript", "answer"] {
-            assert!(tokio::time::timeout(
-                std::time::Duration::from_millis(500),
-                broker.call(method, json!({}))
-            )
-            .await
-            .unwrap()
-            .is_ok());
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    broker.call(method, json!({}))
+                )
+                .await
+                .unwrap()
+                .is_ok()
+            );
             assert_eq!(seen_rx.recv().await.unwrap(), method);
         }
         pool.abort();
         let _ = pool.await;
-        assert!(tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            broker.call("list_pools", json!({}))
-        )
-        .await
-        .unwrap()
-        .is_ok());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                broker.call("list_pools", json!({}))
+            )
+            .await
+            .unwrap()
+            .is_ok()
+        );
         assert_eq!(seen_rx.recv().await.unwrap(), "list_pools");
         let stale = {
             let broker = broker.clone();
@@ -535,13 +539,15 @@ mod tests {
         assert_eq!(seen_rx.recv().await.unwrap(), "transcript");
         stale.abort();
         let _ = stale.await;
-        assert!(tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            broker.call("transcript", json!({}))
-        )
-        .await
-        .unwrap()
-        .is_ok());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                broker.call("transcript", json!({}))
+            )
+            .await
+            .unwrap()
+            .is_ok()
+        );
         listing.abort();
         let _ = listing.await;
         server.abort();

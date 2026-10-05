@@ -4,6 +4,48 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.21.0
+
+- feat(mcp)!: use Cargo product versions and server instructions, add reviewed
+  effect annotations and registry-generated discovery/registration snapshots;
+  route unknown tools and malformed protocol parameters through MCP errors
+- feat(presentation)!: validate typed allowlisted views, quote display labels,
+  remove private account/pool metadata, bound whole pages and exact content,
+  and preserve accepted/unknown execution receipts when presentation fails
+
+This minor release contains intentional MCP, diagnostics and delivery
+compatibility changes. Real host and publication qualification remain separate
+from local fixture checks.
+
+- feat(release): bind external inventory and observed acceptance to the exact
+  source, workflow/run/attempt, compiler and native payload; verify complete
+  drafts and published bytes without rebuilding or overwriting them
+- feat(delivery)!: enforce repository/workflow/source GitHub attestations before
+  downloaded installer execution, with explicit gh/jq bootstrap requirements
+  and bounded archive path/type/mode/duplicate/size guards
+- feat(tooling): add release preparation/tag checks, a bounded foreground release
+  observer with private deterministic events and optional exact notifier ACK,
+  and fresh dependency-policy preparation separate from offline gates
+- feat(diagnostics)!: add typed local doctor evidence and 0/2/3 exits, preserve
+  read-only doctor/canary behavior, and cap cooperating component logs at
+  4 MiB per UTC day with 8 KiB whole records
+- ci: run source and exact payload jobs in parallel, separate workload caches
+  with main-only producers, preserve required native checks, and retain pending
+  release runs through bounded repository serialization
+- fix(presentation): reject escaped MCP results that exceed the encoded frame
+  budget before publishing any partial page or losing a mutation receipt
+
+- feat(family): declare Agent MCP family standard adoption with a truthful
+  `family.toml` profile, managed adoption metadata under `.family/` verified
+  by `cargo xtask family verify`, and a public boundary summary in
+  `docs/family-standard.md` separating observed from unverified compatibility
+- build(workspace): migrate to edition 2024 with resolver 3, inherit
+  `publish = false` in every member, deny undocumented unsafe blocks, and pin
+  MiniJinja to `=2.24.0`
+- feat(xtask): extend the single quality gate with rustdoc `-D warnings`, a
+  supported default-feature compile check, and adoption-metadata verification;
+  replace test process-environment mutation with isolated, bounded, reaped
+  child test processes that receive their values via the command environment
 - feat(pools): add read-only `list_pools` discovery across MCP and the broker
   socket, plus `agent-run pools` (`list-pools`) with optional compact `--text`
   output; pages expose exact filtered totals, bounded goal excerpts, current
@@ -148,6 +190,7 @@ procedure before restarting the broker. Configuration schema remains 2.
   keep their byte-identical replies
 
 No schema change. The client-side `mcp_catalog` probe remains legacy-only.
+
 
 ## [0.19.4] - 2026-10-01
 

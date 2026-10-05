@@ -1,8 +1,8 @@
 //! Private home initialization compatible with the Python command.
 
-use crate::{config::Config, fs, state::Store, Result};
+use crate::{Result, config::Config, fs, state::Store};
 use agent_run_domain::error::invalid;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 
 /// Creates or validates the minimal private home without provisioning credentials.
@@ -16,10 +16,10 @@ use std::path::Path;
 /// `config migrate` may do. Symlinked config files and non-directory homes
 /// are refused before state is initialized.
 pub fn initialize(home: &Path) -> Result<Value> {
-    if let Ok(metadata) = std::fs::symlink_metadata(home) {
-        if !metadata.is_dir() {
-            return Err(invalid("agent-run home must be a directory"));
-        }
+    if let Ok(metadata) = std::fs::symlink_metadata(home)
+        && !metadata.is_dir()
+    {
+        return Err(invalid("agent-run home must be a directory"));
     }
     fs::private_dir(home)?;
     let config = home.join("config.toml");

@@ -1,5 +1,5 @@
 //! Strict, credential-free configuration; legacy packaged adapter names remain accepted.
-use agent_run_domain::{domain, error::invalid, Result};
+use agent_run_domain::{Result, domain, error::invalid};
 use agent_run_platform::fs;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -440,10 +440,10 @@ impl Runtime {
         // must never turn an omitted selector into a labelled credential. The
         // native global Codex account is represented exclusively by `None`.
         let a = requested;
-        if let Some(a) = a {
-            if !self.accounts.iter().any(|v| v == a) {
-                return Err(invalid("account is not declared for this runtime"));
-            }
+        if let Some(a) = a
+            && !self.accounts.iter().any(|v| v == a)
+        {
+            return Err(invalid("account is not declared for this runtime"));
         }
         Ok(a.map(str::to_owned))
     }
@@ -629,7 +629,9 @@ impl Config {
                         .iter()
                         .any(|part| k.contains(part))
                 {
-                    return Err(invalid("developer environment variables must not override private homes or embed credentials"));
+                    return Err(invalid(
+                        "developer environment variables must not override private homes or embed credentials",
+                    ));
                 }
             }
             if let Some(r) = &mut e.rust {
@@ -666,10 +668,10 @@ impl Config {
             {
                 return Err(invalid("invalid scoped accounts declaration"));
             }
-            if let Some(a) = &r.default_account {
-                if !r.accounts.contains(a) {
-                    return Err(invalid("default_account must be declared in accounts"));
-                }
+            if let Some(a) = &r.default_account
+                && !r.accounts.contains(a)
+            {
+                return Err(invalid("default_account must be declared in accounts"));
             }
             if r.max_active_agents == Some(0) {
                 return Err(invalid("runtime max_active_agents must be positive"));
@@ -705,10 +707,10 @@ impl Config {
                     return Err(invalid("invalid hook command"));
                 }
             }
-            if let Some(env) = &r.environment {
-                if !self.environments.contains_key(env) {
-                    return Err(invalid("unknown environment"));
-                }
+            if let Some(env) = &r.environment
+                && !self.environments.contains_key(env)
+            {
+                return Err(invalid("unknown environment"));
             }
             if !r.workspace_roots.is_empty() {
                 if kind != Some(Adapter::Codex) {
@@ -758,12 +760,11 @@ impl Config {
                     }
                 }
             }
-            if let Some(source) = &r.limits_source {
-                if !["native", "codex_appserver", "codexbar", "omniroute", "none"]
+            if let Some(source) = &r.limits_source
+                && !["native", "codex_appserver", "codexbar", "omniroute", "none"]
                     .contains(&source.as_str())
-                {
-                    return Err(invalid("unknown limits source"));
-                }
+            {
+                return Err(invalid("unknown limits source"));
             }
             match kind {
                 Some(k) => native_settings(k, &r.native_settings)?,
@@ -782,8 +783,8 @@ impl Config {
     }
 }
 /// Top-level Codex settings owned by the agent-run launch/security contract.
-const CODEX_RESERVED:&str="model model_provider model_providers model_reasoning_effort cli_auth_credentials_store mcp_oauth_credentials_store forced_login_method forced_chatgpt_workspace_id openai_base_url chatgpt_base_url openai_api_key approvals_reviewer approval_policy sandbox_mode sandbox_workspace_write shell_environment_policy notify features otel profile profiles projects default_permissions permissions plugins hooks mcp_servers skills tools agents apps web_search trust auth credentials env environment provider providers web";
-const CLAUDE_RESERVED:&str="model env environment permissions sandbox credentials auth hooks mcpServers apiKeyHelper agent autoMemoryDirectory forceLoginMethod forceLoginOrgUUID disableAllHooks statusLine enableAllProjectMcpServers enabledMcpjsonServers disabledMcpjsonServers awsAuthRefresh awsCredentialExport gcpAuthRefresh enabledPlugins extraKnownMarketplaces fileSuggestion providers";
+const CODEX_RESERVED: &str = "model model_provider model_providers model_reasoning_effort cli_auth_credentials_store mcp_oauth_credentials_store forced_login_method forced_chatgpt_workspace_id openai_base_url chatgpt_base_url openai_api_key approvals_reviewer approval_policy sandbox_mode sandbox_workspace_write shell_environment_policy notify features otel profile profiles projects default_permissions permissions plugins hooks mcp_servers skills tools agents apps web_search trust auth credentials env environment provider providers web";
+const CLAUDE_RESERVED: &str = "model env environment permissions sandbox credentials auth hooks mcpServers apiKeyHelper agent autoMemoryDirectory forceLoginMethod forceLoginOrgUUID disableAllHooks statusLine enableAllProjectMcpServers enabledMcpjsonServers disabledMcpjsonServers awsAuthRefresh awsCredentialExport gcpAuthRefresh enabledPlugins extraKnownMarketplaces fileSuggestion providers";
 /// Validates unowned native tuning settings for one packaged adapter.
 ///
 /// Only identifier keys and TOML values that round-trip through the generated
@@ -806,7 +807,7 @@ pub fn native_settings(kind: Adapter, settings: &BTreeMap<String, toml::Value>) 
         match v {
             toml::Value::Datetime(_) => return Err(invalid("native settings do not accept dates")),
             toml::Value::Float(v) if !v.is_finite() => {
-                return Err(invalid("native settings floats must be finite"))
+                return Err(invalid("native settings floats must be finite"));
             }
             toml::Value::Table(t) => {
                 for (k, v) in t {

@@ -1,8 +1,8 @@
 mod common;
 use agent_run_core::service::Service;
 use agent_run_domain::{
-    domain::{OrchestratorRef, Outcome, Status},
     Error,
+    domain::{OrchestratorRef, Outcome, Status},
 };
 use agent_run_platform::{fs, verify};
 use agent_run_store::Store;
@@ -599,12 +599,14 @@ fn reopen_tolerates_chmod_denied_but_creation_does_not() {
     let fresh = tempfile::tempdir().unwrap();
     let blocked = fresh.path().join("state.db");
     std::fs::write(&blocked, b"").unwrap();
-    assert!(std::process::Command::new("/usr/bin/chflags")
-        .arg("uchg")
-        .arg(&blocked)
-        .status()
-        .expect("chflags runs")
-        .success());
+    assert!(
+        std::process::Command::new("/usr/bin/chflags")
+            .arg("uchg")
+            .arg(&blocked)
+            .status()
+            .expect("chflags runs")
+            .success()
+    );
     let created = Store::initialize(fresh.path());
     let _ = std::process::Command::new("/usr/bin/chflags")
         .arg("nouchg")

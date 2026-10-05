@@ -1,21 +1,21 @@
 //! Bounded engine streams with independent observation of the primary harness PID.
 
 use crate::{
-    redact::{DiagnosticTail, Redactor, StreamingRedactor},
     LaunchPlan,
+    redact::{DiagnosticTail, Redactor, StreamingRedactor},
 };
 use agent_run_domain::{Error, Result};
 use agent_run_platform::{
     frame,
     process::{OwnedProcess, OwnershipSnapshot},
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
     process::Stdio,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -550,7 +550,7 @@ impl Process {
                 Event::Json(v) => self.backlog.push_back(Event::Json(v)),
                 Event::Eof => return Ok(RpcDisposition::Uncertain(RpcUncertain::Closed)),
                 Event::Failure(kind) => {
-                    return Ok(RpcDisposition::Uncertain(RpcUncertain::Transport(kind)))
+                    return Ok(RpcDisposition::Uncertain(RpcUncertain::Transport(kind)));
                 }
             }
         }
@@ -591,12 +591,11 @@ impl Process {
         if status.is_none() {
             let exit_deadline =
                 deadline.min(tokio::time::Instant::now() + Duration::from_millis(100));
-            if exit_deadline > tokio::time::Instant::now() {
-                if let Ok(Ok(exited)) =
+            if exit_deadline > tokio::time::Instant::now()
+                && let Ok(Ok(exited)) =
                     tokio::time::timeout_at(exit_deadline, self.child.wait()).await
-                {
-                    status = Some(exited);
-                }
+            {
+                status = Some(exited);
             }
         }
         let code = status

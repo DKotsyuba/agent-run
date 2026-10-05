@@ -1,8 +1,7 @@
 mod common;
 use agent_run_core::capacity::{
-    self, persist,
+    self, Forecast, Key, Pool, Route, Sample, Slice, Topology, persist,
     ranking::{self, RouteInput},
-    Forecast, Key, Pool, Route, Sample, Slice, Topology,
 };
 use agent_run_domain::domain;
 use serde_json::json;
@@ -219,9 +218,11 @@ fn codex_normalizer_keeps_windows_and_credit_metadata() {
     assert_eq!(slice.topology.routes.len(), 1);
     assert_eq!(slice.topology.routes[0].reset_credits, Some(3));
     assert_eq!(account.as_deref(), Some("ephemeral-do-not-persist"));
-    assert!(!serde_json::to_string(&slice.topology)
-        .unwrap()
-        .contains("ephemeral-do-not-persist"));
+    assert!(
+        !serde_json::to_string(&slice.topology)
+            .unwrap()
+            .contains("ephemeral-do-not-persist")
+    );
 }
 #[test]
 fn malformed_present_window_disables_the_whole_route() {
@@ -773,22 +774,14 @@ fn new_forecast_snapshot_can_change_order() {
 /// Mirrors `tests/test_capacity_ranking.py::test_invalid_arguments_raise_validation_error`.
 #[test]
 fn invalid_multipliers_and_now_are_rejected() {
-    assert!(ranking::rank_capacity_routes(
-        vec![],
-        vec![],
-        &BTreeMap::new(),
-        &BTreeMap::new(),
-        -1.0
-    )
-    .is_err());
-    assert!(ranking::rank_capacity_routes(
-        vec![],
-        vec![],
-        &BTreeMap::new(),
-        &BTreeMap::new(),
-        f64::NAN
-    )
-    .is_err());
+    assert!(
+        ranking::rank_capacity_routes(vec![], vec![], &BTreeMap::new(), &BTreeMap::new(), -1.0)
+            .is_err()
+    );
+    assert!(
+        ranking::rank_capacity_routes(vec![], vec![], &BTreeMap::new(), &BTreeMap::new(), f64::NAN)
+            .is_err()
+    );
     let blank = BTreeMap::from([(String::new(), 1.0)]);
     assert!(
         ranking::rank_capacity_routes(vec![], vec![], &blank, &BTreeMap::new(), RK_NOW).is_err()
@@ -807,14 +800,16 @@ fn route_multiplier_values_are_strictly_validated() {
     for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
         let route_multipliers =
             BTreeMap::from([(("runtime".to_string(), "route".to_string()), bad)]);
-        assert!(ranking::rank_capacity_routes(
-            vec![],
-            vec![],
-            &BTreeMap::new(),
-            &route_multipliers,
-            RK_NOW
-        )
-        .is_err());
+        assert!(
+            ranking::rank_capacity_routes(
+                vec![],
+                vec![],
+                &BTreeMap::new(),
+                &route_multipliers,
+                RK_NOW
+            )
+            .is_err()
+        );
     }
     let blank_route = BTreeMap::from([(("runtime".to_string(), String::new()), 1.0)]);
     assert!(

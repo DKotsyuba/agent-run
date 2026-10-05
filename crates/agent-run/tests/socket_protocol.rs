@@ -7,7 +7,7 @@ use agent_run::{
     cli,
     transport::{frame, socket},
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
 use tokio::{io::BufReader, net::UnixStream};
 

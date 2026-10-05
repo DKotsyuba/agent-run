@@ -37,9 +37,11 @@ fn python_test_state_store_terminal_transition_is_atomic() {
         .conn
         .execute_batch("CREATE TRIGGER abort_terminal_delivery BEFORE INSERT ON deliveries BEGIN SELECT RAISE(ABORT, 'injected terminal delivery failure'); END;")
         .unwrap();
-    assert!(store
-        .finish(&id, &Outcome::failure("fixture"), None, None)
-        .is_err());
+    assert!(
+        store
+            .finish(&id, &Outcome::failure("fixture"), None, None)
+            .is_err()
+    );
     assert_eq!(store.get(&id).unwrap().status.as_str(), "running");
     let after_events: i64 = store
         .conn
@@ -155,12 +157,16 @@ fn duplicate_cancel_is_completed_without_breaking_the_terminal_fsm() {
         .unwrap();
     assert_eq!(results.len(), 2);
     assert!(results.iter().all(|(state, _)| state == "completed"));
-    assert!(results
-        .iter()
-        .any(|(_, result)| result == r#"{"accepted":true,"reason":"terminal_cancel"}"#));
-    assert!(results
-        .iter()
-        .any(|(_, result)| result == r#"{"accepted":true,"reason":"already_stopping"}"#));
+    assert!(
+        results
+            .iter()
+            .any(|(_, result)| result == r#"{"accepted":true,"reason":"terminal_cancel"}"#)
+    );
+    assert!(
+        results
+            .iter()
+            .any(|(_, result)| result == r#"{"accepted":true,"reason":"already_stopping"}"#)
+    );
 }
 
 /// Mirrors `tests/test_state_outbox.py::test_terminal_before_binding_activates_once_and_expired_lease_reclaims_once`.
@@ -195,26 +201,34 @@ fn python_test_state_outbox_waiting_binding_activates_and_expires() {
         .unwrap();
     assert_eq!(first["id"], delivery);
     assert_eq!(first["attempts"], 1);
-    assert!(store
-        .claim_delivery("worker-2", event_at + 9.0, 10.0)
-        .unwrap()
-        .is_none());
-    assert!(store
-        .complete_delivery(&delivery, "worker-1", event_at + 10.0, None, false, None)
-        .is_err());
+    assert!(
+        store
+            .claim_delivery("worker-2", event_at + 9.0, 10.0)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .complete_delivery(&delivery, "worker-1", event_at + 10.0, None, false, None)
+            .is_err()
+    );
     let reclaimed = store
         .claim_delivery("worker-2", event_at + 10.0, 10.0)
         .unwrap()
         .unwrap();
     assert_eq!(reclaimed["id"], delivery);
     assert_eq!(reclaimed["attempts"], 2);
-    assert!(store
-        .claim_delivery("worker-3", event_at + 10.0, 10.0)
-        .unwrap()
-        .is_none());
-    assert!(store
-        .complete_delivery(&delivery, "worker-1", event_at + 11.0, None, false, None)
-        .is_err());
+    assert!(
+        store
+            .claim_delivery("worker-3", event_at + 10.0, 10.0)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .complete_delivery(&delivery, "worker-1", event_at + 11.0, None, false, None)
+            .is_err()
+    );
     store
         .complete_delivery(
             &delivery,

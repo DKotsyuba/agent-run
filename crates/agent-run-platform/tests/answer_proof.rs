@@ -3,7 +3,8 @@
 //! the Python test to re-check. `tests/fixtures/baseline/answers/` was
 //! written by the Python release (`cases.json` records its verdicts); it is
 //! read here but never mutated — tests that need to corrupt an artifact do
-//! so in a private tempdir seeded by `verify::seal`.
+//! so in a private tempdir seeded by `verify::seal`. The symlink mutation is
+//! reconstructed in an owned tempdir from portable committed bytes.
 use agent_run_domain::Error;
 use agent_run_platform::{
     fs::Dir,
@@ -11,6 +12,7 @@ use agent_run_platform::{
 };
 use std::path::{Path, PathBuf};
 
+/// Owns a private fixture directory removed when the test drops its guard.
 fn tempdir() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("agent-run-answer-proof-")
@@ -18,16 +20,50 @@ fn tempdir() -> tempfile::TempDir {
         .expect("tempdir")
 }
 
+/// Returns the immutable committed answer corpus directory.
 fn corpus_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/baseline/answers")
 }
 
+/// Reads the frozen Python verdicts without changing oracle bytes.
 fn corpus_cases() -> Vec<serde_json::Value> {
     let raw = std::fs::read(corpus_root().join("cases.json")).expect("golden corpus is present");
     let doc: serde_json::Value = serde_json::from_slice(&raw).expect("corpus JSON parses");
     doc["cases"].as_array().expect("cases array").clone()
 }
 
+/// Returns a corpus agent directory and its optional temporary ownership guard.
+/// Only the recorded symlink mutation is reconstructed: regular payload and
+/// sidecar bytes are copied, then an actual link targets the owned parent.
+/// The guard must outlive verification; other golden artifacts remain untouched.
+fn corpus_agent(case: &serde_json::Value) -> (PathBuf, Option<tempfile::TempDir>) {
+    let name = case["case"].as_str().expect("case name");
+    let source = corpus_root().join("agents").join(name);
+    if case["mutation"].as_str() != Some("symlinked_payload") {
+        return (source, None);
+    }
+    let owned = tempdir();
+    let root = owned.path().join("agent");
+    std::fs::create_dir(&root).expect("owned agent directory");
+    std::fs::copy(source.join("outside.md"), owned.path().join("outside.md"))
+        .expect("portable outside payload");
+    std::fs::copy(
+        source.join("answer.md.proof.json"),
+        root.join("answer.md.proof.json"),
+    )
+    .expect("frozen sidecar");
+    std::os::unix::fs::symlink("../outside.md", root.join("answer.md"))
+        .expect("owned escaping symlink");
+    assert!(
+        std::fs::symlink_metadata(root.join("answer.md"))
+            .expect("symlink exists")
+            .file_type()
+            .is_symlink()
+    );
+    (root, Some(owned))
+}
+
+/// Returns the optional frozen exception class for a verdict field.
 fn exception_of(case: &serde_json::Value, field: &str) -> Option<String> {
     case.get(field)?
         .get("exception")?
@@ -84,7 +120,7 @@ fn actual_kind(error: &Error) -> &'static str {
 fn golden_corpus_composed_read_matches_python_verdicts() {
     for case in corpus_cases() {
         let name = case["case"].as_str().expect("case name");
-        let root = corpus_root().join("agents").join(name);
+        let (root, _owned) = corpus_agent(&case);
         let proof = Proof {
             path: root.join("answer.md"),
             bytes: case["expected_bytes"].as_u64().expect("expected_bytes"),
@@ -131,7 +167,7 @@ fn golden_corpus_composed_read_matches_python_verdicts() {
 fn golden_corpus_proof_sidecar_matches_python() {
     for case in corpus_cases() {
         let name = case["case"].as_str().expect("case name");
-        let root = corpus_root().join("agents").join(name);
+        let (root, _owned) = corpus_agent(&case);
         let dir = Dir::open(&root).expect("corpus agent directory opens");
         let bytes = case["expected_bytes"].as_u64().expect("expected_bytes");
         let sha256 = case["expected_sha256"].as_str().expect("expected_sha256");
@@ -275,10 +311,12 @@ fn format_marker_without_sidecar_never_looks_like_legacy_completion() {
     let inspection = verify::inspect_answer(root, Path::new("answer.md")).unwrap();
     assert_eq!(inspection.proof_version, 2);
     assert!(!inspection.complete());
-    assert!(inspection
-        .proof_error
-        .as_deref()
-        .is_some_and(|error| error.contains("missing")));
+    assert!(
+        inspection
+            .proof_error
+            .as_deref()
+            .is_some_and(|error| error.contains("missing"))
+    );
 }
 
 /// Mirrors Python `tests/test_answer_payload_proof.py::SealAndProofTests::test_read_answer_payload_raises_distinct_typed_errors`.

@@ -5,9 +5,9 @@
 //! suite uses, then `agent_run::state::migrations::pending_files()` --
 //! embedded verbatim from `src/agent_run/state/migrations/*.sql` -- is
 //! replayed forward), so no Python process runs at test time.
-use agent_run_store::{migrations, Store, VERSION};
+use agent_run_store::{Store, VERSION, migrations};
 use regex::Regex;
-use rusqlite::{params, Connection, TransactionBehavior, MAIN_DB};
+use rusqlite::{Connection, MAIN_DB, TransactionBehavior, params};
 use std::path::Path;
 
 const V1_SCHEMA: &str = include_str!("fixtures/schema_v1.sql");
@@ -169,9 +169,11 @@ fn current_binary_fixture_matches_fresh_schema() {
         "process_ownership",
         "process_members",
     ] {
-        assert!(schema_objects(&fixture)
-            .iter()
-            .any(|(_, name, _)| name == required));
+        assert!(
+            schema_objects(&fixture)
+                .iter()
+                .any(|(_, name, _)| name == required)
+        );
     }
     drop(fixture);
     assert_eq!(
@@ -190,13 +192,15 @@ fn retention_migration_retries_after_physical_preparation() {
     let path = home.path().join("state.db");
     let conn = build_fixture(&path, 18);
     let before = agent_count(&conn);
-    assert!(migrations::apply_one(
-        &conn,
-        &path,
-        19,
-        "CREATE TABLE partial_retention(id); INVALID SQL;"
-    )
-    .is_err());
+    assert!(
+        migrations::apply_one(
+            &conn,
+            &path,
+            19,
+            "CREATE TABLE partial_retention(id); INVALID SQL;"
+        )
+        .is_err()
+    );
     assert_eq!(user_version(&conn), 18);
     assert_eq!(agent_count(&conn), before);
     assert!(migrations::backup_path(&path, 19).is_file());
@@ -253,13 +257,15 @@ fn external_service_migration_preserves_managed_generations() {
         .unwrap();
     assert_eq!(ownership, "managed");
     for invalid in [None, Some("unknown")] {
-        assert!(store
-            .conn
-            .execute(
-                "UPDATE managed_service_generations SET ownership=?1 WHERE id='existing'",
-                [invalid],
-            )
-            .is_err());
+        assert!(
+            store
+                .conn
+                .execute(
+                    "UPDATE managed_service_generations SET ownership=?1 WHERE id='existing'",
+                    [invalid],
+                )
+                .is_err()
+        );
     }
     store
         .conn
@@ -628,10 +634,12 @@ fn migration_022_registers_runtime_storage_layouts() {
     let store = Store::open(home.path()).unwrap();
     assert_eq!(user_version(&store.conn), VERSION);
     assert_eq!(agent_count(&store.conn), before);
-    assert!(store
-        .pending_runtime_storage_layouts(10)
-        .unwrap()
-        .is_empty());
+    assert!(
+        store
+            .pending_runtime_storage_layouts(10)
+            .unwrap()
+            .is_empty()
+    );
     // The row the public API would write: a canonical v1 layout and its
     // digest, so the migrated store's registry is readable, not just present.
     let layout = serde_json::to_string(&serde_json::json!({
@@ -659,15 +667,17 @@ fn migration_022_registers_runtime_storage_layouts() {
         // A short digest violates the digest-length check.
         ("/runtime/short", "a".repeat(63), "prepared"),
     ] {
-        assert!(store
-            .conn
-            .execute(
-                "INSERT INTO runtime_storage_layouts(runtime_home,index_sha256,layout_json,\
+        assert!(
+            store
+                .conn
+                .execute(
+                    "INSERT INTO runtime_storage_layouts(runtime_home,index_sha256,layout_json,\
                  layout_sha256,state,operation_token,updated_at) \
                  VALUES(?1,?2,'{\"version\":1}',?3,?4,1.0)",
-                params![invalid.0, invalid.1, "b".repeat(64), invalid.2],
-            )
-            .is_err());
+                    params![invalid.0, invalid.1, "b".repeat(64), invalid.2],
+                )
+                .is_err()
+        );
     }
     assert_eq!(store.pending_runtime_storage_layouts(10).unwrap().len(), 1);
     assert_eq!(
@@ -729,14 +739,15 @@ fn each_migration_restores_pragmas_and_foreign_key_integrity() {
             .unwrap();
         assert_eq!(foreign_keys, 1, "migration v{target}");
         assert_eq!(legacy_alter_table, 0, "migration v{target}");
-        assert!(conn
-            .prepare("PRAGMA foreign_key_check")
-            .unwrap()
-            .query_map([], |_| Ok(()))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap()
-            .is_empty());
+        assert!(
+            conn.prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query_map([], |_| Ok(()))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .is_empty()
+        );
     }
 }
 
@@ -766,15 +777,17 @@ fn opening_v5_preserves_workflow_history_after_foreign_key_repair() {
             .unwrap(),
         "running"
     );
-    assert!(store
-        .conn
-        .prepare("PRAGMA foreign_key_check")
-        .unwrap()
-        .query_map([], |_| Ok(()))
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap()
-        .is_empty());
+    assert!(
+        store
+            .conn
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query_map([], |_| Ok(()))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// Mirrors `tests/test_state_migrations.py::V1UpgradeTests::test_initialize_also_upgrades_an_existing_v1_home`.
@@ -867,15 +880,17 @@ fn v2_upgrade_adds_nullable_workflow_plan_json() {
         .collect::<rusqlite::Result<_>>()
         .unwrap();
     assert!(columns.iter().any(|column| column == "plan_json"));
-    assert!(store
-        .conn
-        .query_row(
-            "SELECT plan_json FROM workflow_runs WHERE id='wr_1'",
-            [],
-            |row| row.get::<_, Option<String>>(0)
-        )
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .conn
+            .query_row(
+                "SELECT plan_json FROM workflow_runs WHERE id='wr_1'",
+                [],
+                |row| row.get::<_, Option<String>>(0)
+            )
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// Mirrors `tests/test_state_migrations.py::MigrationRefusalTests::test_incomplete_store_claiming_a_version_is_refused_unmigrated`.
@@ -1158,18 +1173,22 @@ fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts(
         1
     );
     tx.commit().unwrap();
-    assert!(writable
-        .execute(
-            "UPDATE attempts SET selected_account_id='acct-other' WHERE id='att_orch'",
-            [],
-        )
-        .is_err());
-    assert!(writable
-        .execute(
-            "UPDATE attempts SET selected_account_id=NULL WHERE id='att_orch'",
-            [],
-        )
-        .is_err());
+    assert!(
+        writable
+            .execute(
+                "UPDATE attempts SET selected_account_id='acct-other' WHERE id='att_orch'",
+                [],
+            )
+            .is_err()
+    );
+    assert!(
+        writable
+            .execute(
+                "UPDATE attempts SET selected_account_id=NULL WHERE id='att_orch'",
+                [],
+            )
+            .is_err()
+    );
     assert_eq!(
         writable
             .execute(
@@ -1208,12 +1227,14 @@ fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts(
         .is_err());
     let other: agent_run_domain::AccountId = "acct-other".parse().unwrap();
     let foreign_key = agent_run_domain::PhysicalQuotaKey::new(&other, "gpt-5.1").unwrap();
-    assert!(writable
-        .execute(
-            "INSERT INTO attempt_quota_keys VALUES ('att_orch', ?1)",
-            [foreign_key.as_str()],
-        )
-        .is_err());
+    assert!(
+        writable
+            .execute(
+                "INSERT INTO attempt_quota_keys VALUES ('att_orch', ?1)",
+                [foreign_key.as_str()],
+            )
+            .is_err()
+    );
     assert_eq!(
         store
             .active_reservation_counts(&[key.clone(), second_key.clone()])
@@ -1299,8 +1320,7 @@ fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts(
         )
         .unwrap();
     assert_eq!(
-        store.active_reservation_counts(&[key, second_key]).unwrap()
-            ["acct-codex-native::shared-tokens"],
+        store.active_reservation_counts(&[key, second_key]).unwrap()["acct-codex-native::shared-tokens"],
         0
     );
 }

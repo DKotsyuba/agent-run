@@ -1,10 +1,12 @@
+#![cfg(feature = "test-fixtures")]
 //! Real public-boundary checks for provider admission: a disposable schema-2
 //! home, the real `api serve` broker, the real CLI and MCP child processes,
 //! and the exported socket client, all driving the fake engine only.
+//! The fixture engine and stale-revision admission seam require `test-fixtures`.
 
 use agent_run::transport::socket::BrokerClient;
-use agent_run_domain::{views::StartResult, Error, ProviderStartRequest};
-use serde_json::{json, Value};
+use agent_run_domain::{Error, ProviderStartRequest, views::StartResult};
+use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader, Write},
     os::unix::fs::FileTypeExt,
@@ -490,9 +492,11 @@ async fn admission_codes_survive_every_public_transport() {
         .unwrap();
     broker.assert_refused("quota_exhausted").await;
 
-    assert!(cli(&broker.home, &["accounts", "disable", "acct-work"])
-        .status
-        .success());
+    assert!(
+        cli(&broker.home, &["accounts", "disable", "acct-work"])
+            .status
+            .success()
+    );
     broker.assert_refused("no_eligible_account").await;
 }
 

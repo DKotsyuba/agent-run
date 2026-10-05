@@ -2,8 +2,8 @@
 
 use agent_run_config::provider_config::ProviderConfig;
 use agent_run_domain::{
-    catalog::{AccountRecord, AccountStatus, ProviderConnection},
     AccountId, AuthFamily, SecretRef,
+    catalog::{AccountRecord, AccountStatus, ProviderConnection},
 };
 use std::{fs, path::Path, str::FromStr};
 
@@ -110,9 +110,11 @@ fn mcp_controls_validate_without_changing_legacy_defaults() {
         );
     }
     let legacy = ProviderConfig::parse(&base, home.path()).unwrap();
-    assert!(!serde_json::to_string(&legacy.mcp)
-        .unwrap()
-        .contains("allowed_tools"));
+    assert!(
+        !serde_json::to_string(&legacy.mcp)
+            .unwrap()
+            .contains("allowed_tools")
+    );
 }
 
 /// Native aliases share one account, custom providers retain their protocol,
@@ -152,14 +154,16 @@ fn v2_resolves_named_providers_without_secret_snapshot_values() {
 fn old_frozen_model_parameters_remain_resolvable() {
     let home = tempfile::tempdir().unwrap();
     let valid = document(home.path());
-    assert!(ProviderConfig::parse(
-        &valid.replace(
-            "params = { effort = \"medium\" }",
-            "params = { reasoning = \"medium\" }"
-        ),
-        home.path(),
-    )
-    .is_err());
+    assert!(
+        ProviderConfig::parse(
+            &valid.replace(
+                "params = { effort = \"medium\" }",
+                "params = { reasoning = \"medium\" }"
+            ),
+            home.path(),
+        )
+        .is_err()
+    );
     let mut frozen = ProviderConfig::parse(&valid, home.path()).unwrap();
     let offering = &mut frozen
         .providers
@@ -215,14 +219,16 @@ fn v2_rejects_invalid_provider_contracts() {
     let config = ProviderConfig::parse(&valid, home.path()).unwrap();
     assert!(config.resolve_catalog(vec![]).is_err());
     for retired in ["native", "codexbar", "omniroute", "provider"] {
-        assert!(ProviderConfig::parse(
-            &valid.replace(
-                "limits_source = \"none\"",
-                &format!("limits_source = \"{retired}\"")
-            ),
-            home.path()
-        )
-        .is_err());
+        assert!(
+            ProviderConfig::parse(
+                &valid.replace(
+                    "limits_source = \"none\"",
+                    &format!("limits_source = \"{retired}\"")
+                ),
+                home.path()
+            )
+            .is_err()
+        );
     }
     // The retired CodexBar binary is schema-1 migration input only.
     let with_codexbar = format!("{valid}\n[capacity]\ncodexbar_binary = \"/bin/true\"\n");

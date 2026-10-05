@@ -17,9 +17,9 @@ use agent_run_config::{
     profiles::Profile,
 };
 use agent_run_domain::{
+    Result,
     domain::{Outcome, StartRequest},
     error::invalid,
-    Result,
 };
 use std::{collections::BTreeMap, path::PathBuf};
 /// Contains live secrets. Deliberately not Debug or Serialize and never persisted.

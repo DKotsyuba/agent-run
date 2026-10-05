@@ -4,7 +4,7 @@ agent-run capacity order — schema {{ 2 if schema == 2 else 1 }} {{ "providers"
 - capacity revision: {{ capacity_revision }}
 {% for provider in providers %}
 
-{{ loop.index }}. {{ provider.id }}{% if provider.score %} (score {{ provider.score }}{% if provider.multiplier %}, multiplier {{ provider.multiplier }}{% endif %}){% endif %}{{ "" }}
+{{ loop.index }}. {{ provider.id }}{% if provider.score is not none %} (score {{ provider.score }}{% if provider.multiplier is not none %}, multiplier {{ provider.multiplier }}{% endif %}){% endif %}{{ "" }}
 {% for model in provider.models %}
    - {{ model.id }}: {{ model.status }}, evidence {{ model.evidence }}{{ "" }}
 {% endfor %}

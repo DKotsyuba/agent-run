@@ -9,10 +9,10 @@
 //! and `pool_entries` tables.
 
 use crate::{
-    domain::{display_name, external_id, task_text, AgentId, OrchestratorRef},
+    ProviderStartRequest, Result, WorkerMessageKind,
+    domain::{AgentId, OrchestratorRef, display_name, external_id, task_text},
     error::invalid,
     worker::{bounded_text, request_key},
-    ProviderStartRequest, Result, WorkerMessageKind,
 };
 use chrono::{NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -1016,7 +1016,7 @@ pub fn render_entry(entry: &PoolEntryView) -> Result<String> {
 /// Contract checks for pool input validation, entry shapes and rendering.
 mod tests {
     use super::*;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     /// An ordinary start request body with an existing working directory.
     fn start(task: &str) -> Value {
@@ -1062,8 +1062,10 @@ mod tests {
             message: "Pool is complete.".into(),
         };
         let rendered = notice.render().unwrap();
-        assert!(rendered
-            .starts_with("agent-run/pool-completion\nnotification_id: ntf_abc\npool_id: pool-"));
+        assert!(
+            rendered
+                .starts_with("agent-run/pool-completion\nnotification_id: ntf_abc\npool_id: pool-")
+        );
         assert!(
             rendered.contains("Broker conclusion for the whole pool")
                 && rendered.ends_with("Pool is complete.")
@@ -1294,10 +1296,12 @@ mod tests {
         let mut v = serde_json::to_value(request(2)).unwrap();
         v["author"] = json!("operator");
         assert!(serde_json::from_value::<PoolStartRequest>(v).is_err());
-        assert!(serde_json::from_value::<PoolMessage>(
-            json!({"request_id": "k", "message": "m", "pool_id": "x"})
-        )
-        .is_err());
+        assert!(
+            serde_json::from_value::<PoolMessage>(
+                json!({"request_id": "k", "message": "m", "pool_id": "x"})
+            )
+            .is_err()
+        );
         assert!(serde_json::from_value::<PoolVote>(
             json!({"request_id": "k", "proposal_seq": 1, "decision": "ready", "author_kind": "operator"})
         )
@@ -1404,12 +1408,16 @@ mod tests {
             message: None,
         };
         assert!(vote(VoteDecision::Ready, vec![]).validate().is_err());
-        assert!(vote(VoteDecision::Ready, vec![check("a"), check("a")])
-            .validate()
-            .is_err());
-        assert!(vote(VoteDecision::Ready, vec![check("a")])
-            .validate()
-            .is_ok());
+        assert!(
+            vote(VoteDecision::Ready, vec![check("a"), check("a")])
+                .validate()
+                .is_err()
+        );
+        assert!(
+            vote(VoteDecision::Ready, vec![check("a")])
+                .validate()
+                .is_ok()
+        );
         assert!(vote(VoteDecision::Block, vec![]).validate().is_ok());
         let mut oversized = vote(VoteDecision::Block, vec![]);
         oversized.proposal_seq = u64::MAX;
@@ -1436,9 +1444,11 @@ mod tests {
             severity: None,
             ..member_entry()
         };
-        assert!(render_entry(&operator)
-            .unwrap()
-            .contains("from orchestrator to team"));
+        assert!(
+            render_entry(&operator)
+                .unwrap()
+                .contains("from orchestrator to team")
+        );
         let serialized = serde_json::to_string(&member_entry()).unwrap();
         for forbidden in ["run_id", "attempt_id", "token", "request_namespace"] {
             assert!(!serialized.contains(forbidden), "{forbidden}");
@@ -1525,8 +1535,10 @@ mod tests {
             decision: Some(VoteDecision::Ready),
             ..base
         };
-        assert!(render_entry(&vote)
-            .unwrap()
-            .contains("kind vote proposal #4 decision ready"));
+        assert!(
+            render_entry(&vote)
+                .unwrap()
+                .contains("kind vote proposal #4 decision ready")
+        );
     }
 }

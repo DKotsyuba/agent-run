@@ -7,7 +7,7 @@
 //! themselves are real.
 #![cfg(feature = "test-fixtures")]
 
-use agent_run_adapters::{provider::ProviderLaunchPlan, LaunchPlan};
+use agent_run_adapters::{LaunchPlan, provider::ProviderLaunchPlan};
 use agent_run_config::{config::Runtime, profiles::Profile};
 use agent_run_core::supervisor;
 use agent_run_domain::{

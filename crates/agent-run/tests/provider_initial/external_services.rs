@@ -127,12 +127,14 @@ async fn managed_services_external_reuse_and_race_never_claim_or_stop_foreign_pr
         let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into()).unwrap();
         manager.tick().await.unwrap();
         let report = agent_run_core::doctor::run(&home).unwrap();
-        assert!(report
-            .findings
-            .iter()
-            .any(|f| f.component == "service:shared"
-                && f.severity == "info"
-                && f.detail.contains("external")));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.component == "service:shared"
+                    && f.severity == "info"
+                    && f.detail.contains("external"))
+        );
         finish(&home, &id).await;
         manager.tick().await.unwrap();
         if !race {
@@ -348,11 +350,13 @@ async fn managed_services_external_health_loss_blocks_new_harness() {
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     manager.tick().await.unwrap();
     let mut child = supervisor(&home, &id);
-    assert!(!tokio::time::timeout(Duration::from_secs(8), child.wait())
-        .await
-        .unwrap()
-        .unwrap()
-        .success());
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(8), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
     let row = Store::open(&home).unwrap().get(&id).unwrap();
     assert_eq!(row.status, Status::Failed);
     assert!(row.runtime_session_id.is_none());

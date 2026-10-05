@@ -5,23 +5,82 @@
 //! they were asked; no live login or credential store is touched.
 
 use serde_json::Value;
-use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
+use std::{
+    fs,
+    io::Read,
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    process::{Child, Command, Stdio},
+    sync::mpsc,
+    time::{Duration, Instant},
+};
 
-/// Runs the real CLI against `home`, returning (success, JSON or text).
+/// Owns one real CLI fixture child, killed and reaped on panic or deadline.
+struct CliChild(Child);
+
+impl Drop for CliChild {
+    /// Reaps this exact unreaped child; never signals an unrelated process group.
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Drains an owned output pipe concurrently, retaining at most one MiB plus
+/// an overflow sentinel. The caller bounds EOF retrieval after child termination.
+fn capture(reader: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        reader
+            .take(1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .unwrap();
+        let _ = sender.send(bytes);
+    });
+    receiver
+}
+
+/// Runs the real CLI only against a temporary home, returning (success, JSON
+/// or text). A 20-second deadline kills/reaps hangs; each output pipe is bounded.
+/// Optional Desktop capabilities are removed from this child only.
 fn run(home: &Path, args: &[&str]) -> (bool, Value) {
-    let output = Command::new(env!("CARGO_BIN_EXE_agent-run"))
-        .arg("--home")
-        .arg(home)
-        .args(args)
-        .output()
-        .unwrap();
-    let text = if output.status.success() {
-        output.stdout
+    let mut child = CliChild(
+        Command::new(env!("CARGO_BIN_EXE_agent-run"))
+            .arg("--home")
+            .arg(home)
+            .args(args)
+            .env_remove("CODEX_MCP_NODE_PATH")
+            .env_remove("CODEX_APP_TOOLS_PIPE_PATH")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = capture(child.0.stdout.take().unwrap());
+    let stderr = capture(child.0.stderr.take().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "provider-login CLI fixture exceeded deadline"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout.recv_timeout(Duration::from_secs(1)).unwrap();
+    let stderr = stderr.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(stdout.len() <= 1024 * 1024 && stderr.len() <= 1024 * 1024);
+    let text = if status.success() {
+        stdout
     } else {
-        [output.stdout, output.stderr].concat()
+        [stdout, stderr].concat()
     };
     (
-        output.status.success(),
+        status.success(),
         serde_json::from_slice(&text)
             .unwrap_or(Value::String(String::from_utf8_lossy(&text).into())),
     )
@@ -40,16 +99,19 @@ fn fake(path: &Path, log: &Path) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// The library readiness report (`cli::doctor`) for `home`; no broker runs.
-fn readiness(home: &Path) -> Value {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
+/// Requires one named canonical local check to have the exact evidence status.
+fn assert_check(report: &Value, name: &str, status: &str) {
+    let check = report["checks"]
+        .as_array()
         .unwrap()
-        .block_on(agent_run::cli::doctor(home))
-        .unwrap()
+        .iter()
+        .find(|check| check["name"] == name)
+        .unwrap_or_else(|| panic!("missing {name}: {report}"));
+    assert_eq!(check["status"], status, "{name}: {report}");
 }
 
+/// A fresh empty v2 catalog passes its real local canary and read-only state
+/// checks, lists no accounts and refuses agent work or schema-1 bootstrapping.
 #[test]
 fn fresh_init_is_an_empty_v2_catalog() {
     let temp = tempfile::tempdir_in("/tmp").unwrap();
@@ -64,7 +126,9 @@ fn fresh_init_is_an_empty_v2_catalog() {
     assert!(ok, "{models}");
     // Doctor sees a coherent home: an empty catalog is information, not an
     // invalid config.
-    let (ok, doctor) = run(&home, &["doctor"]);
+    // The detached canary belongs to the real CLI entrypoint. The integration
+    // test executable does not implement its hidden descriptor protocol.
+    let (ok, doctor) = run(&home, &["doctor", "--json"]);
     assert!(ok, "{doctor}");
     let codes: Vec<&str> = doctor["findings"]
         .as_array()
@@ -74,9 +138,24 @@ fn fresh_init_is_an_empty_v2_catalog() {
         .collect();
     assert!(codes.contains(&"provider_catalog_empty"), "{doctor}");
     assert!(!codes.contains(&"config_invalid"), "{doctor}");
-    let empty = readiness(&home);
-    assert_eq!(empty["checks"].as_array().unwrap().len(), 1, "{empty}");
-    assert_eq!(empty["checks"][0]["name"], "state");
+    // Native process inventory may add observations; required checks retain
+    // exact named outcomes, and no error-severity finding is accepted.
+    for name in [
+        "state",
+        "provider_catalog_empty",
+        "supervisor_canary_ok",
+        "mcp_inventory_self",
+    ] {
+        assert_check(&doctor, name, "ok");
+    }
+    assert!(
+        doctor["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| finding["severity"] != "error"),
+        "{doctor}"
+    );
     let (ok, accounts) = run(&home, &["accounts", "list"]);
     assert!(
         ok && accounts["accounts"] == serde_json::json!([]),
@@ -112,6 +191,8 @@ fn fresh_init_is_an_empty_v2_catalog() {
     assert!(!legacy.join("state.db").exists());
 }
 
+/// Native/named logins resolve the configured harness and account storage;
+/// doctor proves its own canary while preserving the missing-role failure.
 #[test]
 fn login_resolves_provider_harness_and_bound_account() {
     let temp = tempfile::tempdir_in("/tmp").unwrap();
@@ -167,6 +248,8 @@ fn login_resolves_provider_harness_and_bound_account() {
     assert_eq!(named["provider"], "codex");
     let (ok, native) = run(&home, &["auth", "acct-codex-native", "codex"]);
     assert!(ok, "{native}");
+    assert_eq!(native["account"], "acct-codex-native");
+    assert_eq!(native["provider"], "codex");
     let (ok, claude) = run(&home, &["login", "claude"]);
     assert!(ok && claude["account"] == "acct-claude-work", "{claude}");
     let (ok, codex_login) = run(&home, &["login", "codex"]);
@@ -180,30 +263,69 @@ fn login_resolves_provider_harness_and_bound_account() {
         "{unbound}"
     );
 
-    // Readiness and launchd rendering read the same schema-2 view.
-    let readiness = readiness(&home);
-    let names: Vec<&str> = readiness["checks"]
+    // This login fixture deliberately has no canonical role assets. Doctor
+    // must retain that real readiness failure and still prove its own canary.
+    let (ready, readiness) = run(&home, &["doctor", "--json"]);
+    assert!(
+        !ready,
+        "missing canonical roles must remain a failure: {readiness}"
+    );
+    assert_check(&readiness, "state", "ok");
+    assert_check(&readiness, "supervisor_canary_ok", "ok");
+    assert_check(&readiness, "canonical_role_required", "failed");
+    let errors: Vec<&str> = readiness["findings"]
         .as_array()
         .unwrap()
         .iter()
-        .filter_map(|check| check["name"].as_str())
+        .filter(|finding| finding["severity"] == "error")
+        .map(|finding| finding["code"].as_str().unwrap())
         .collect();
+    assert_eq!(errors, ["canonical_role_required"], "{readiness}");
+    for (name, file) in [
+        ("harness:codex", "fake-codex"),
+        ("harness:claude-code", "fake-claude"),
+    ] {
+        let tool = readiness["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap();
+        assert_eq!(
+            tool["executable"].as_str().unwrap(),
+            home.join(file).to_str().unwrap()
+        );
+        assert_eq!(
+            tool["status"], "not_checked",
+            "fake tools have no version interface"
+        );
+    }
+    // Bindings are owned by the typed configuration, not diagnostic check rows.
+    let (configured, _) = agent_run_config::provider_config::ProviderConfig::load(&home).unwrap();
+    let codex = configured
+        .providers
+        .iter()
+        .find(|(id, _)| id.as_str() == "codex")
+        .unwrap()
+        .1;
+    assert_eq!(codex.harness.as_str(), "codex");
+    let accounts: Vec<&str> = codex
+        .bindings
+        .iter()
+        .map(|binding| binding.account.as_str())
+        .collect();
+    assert_eq!(accounts, ["acct-codex-p2", "acct-codex-native"]);
+    let claude_provider = configured
+        .providers
+        .iter()
+        .find(|(id, _)| id.as_str() == "claude")
+        .unwrap()
+        .1;
+    assert_eq!(claude_provider.harness.as_str(), "claude-code");
     assert_eq!(
-        names,
-        [
-            "state",
-            "harness:codex",
-            "harness:claude-code",
-            "claude",
-            "codex"
-        ],
-        "{readiness}"
+        claude_provider.bindings[0].account.as_str(),
+        "acct-claude-work"
     );
-    assert_eq!(
-        readiness["checks"][4]["accounts"],
-        serde_json::json!(["acct-codex-p2", "acct-codex-native"])
-    );
-    assert_eq!(readiness["checks"][1]["executable"], true);
     let (ok, plist) = run(&home, &["capacity", "launchd", "--binary", "/bin/true"]);
     assert!(ok, "{plist}");
 

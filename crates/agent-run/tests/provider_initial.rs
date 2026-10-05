@@ -7,8 +7,8 @@ use agent_run::{
     state::Store,
 };
 use agent_run_domain::{
-    catalog::{AccountRecord, AccountStatus, QuotaCandidate, QuotaCandidateSet, SelectionIntent},
     AccountId, PositiveFinite, ProviderStartRequest,
+    catalog::{AccountRecord, AccountStatus, QuotaCandidate, QuotaCandidateSet, SelectionIntent},
 };
 use rusqlite::OptionalExtension;
 use std::{
@@ -241,11 +241,13 @@ readiness={command="/usr/bin/true"}
         .map(|id| supervisor(&home, id))
         .collect::<Vec<_>>();
     for child in &mut supervisors {
-        assert!(tokio::time::timeout(Duration::from_secs(10), child.wait())
-            .await
-            .unwrap()
-            .unwrap()
-            .success());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
     }
     for id in &ids {
         assert_eq!(
@@ -720,18 +722,22 @@ async fn managed_services_real_codegraph_qualification() {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        assert!(tokio::time::timeout(Duration::from_secs(6), client.wait())
+        assert!(
+            tokio::time::timeout(Duration::from_secs(6), client.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+    }
+    let mut child = supervisor(&home, &id);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), child.wait())
             .await
             .unwrap()
             .unwrap()
-            .success());
-    }
-    let mut child = supervisor(&home, &id);
-    assert!(tokio::time::timeout(Duration::from_secs(10), child.wait())
-        .await
-        .unwrap()
-        .unwrap()
-        .success());
+            .success()
+    );
     assert_eq!(
         Store::open(&home).unwrap().get(&id).unwrap().status,
         Status::Succeeded
@@ -867,7 +873,7 @@ fn candidates(revision: i64) -> QuotaCandidateSet {
             account: account.clone(),
             rank: 0,
             physical_keys: vec![
-                agent_run_domain::PhysicalQuotaKey::new(&account, "tokens").unwrap()
+                agent_run_domain::PhysicalQuotaKey::new(&account, "tokens").unwrap(),
             ],
             multiplier: PositiveFinite::try_from(1.0).unwrap(),
             quota_known: true,
@@ -931,9 +937,11 @@ async fn provider_start_completes_one_owned_fake_engine_attempt() {
     let captured = captured.snapshot().unwrap();
     assert!(captured.descendants_observed);
     assert_eq!(Some(&captured.leader.token), process.as_ref());
-    assert!(!serde_json::to_string(&captured)
-        .unwrap()
-        .contains("synthetic-token"));
+    assert!(
+        !serde_json::to_string(&captured)
+            .unwrap()
+            .contains("synthetic-token")
+    );
     let attached: i64 = store
         .conn
         .query_row(
@@ -1006,10 +1014,12 @@ async fn result_then_hang_is_ended_by_the_run_deadline() {
     assert_eq!(row.status, Status::TimedOut);
     assert_eq!(row.failure_kind.as_deref(), Some("no_answer"));
     assert_eq!(service.answer(&id).unwrap()["available"], false);
-    assert!(store
-        .last_event(&id, "run_deadline_expired")
-        .unwrap()
-        .is_some());
+    assert!(
+        store
+            .last_event(&id, "run_deadline_expired")
+            .unwrap()
+            .is_some()
+    );
     let cleanup = store
         .last_event(&id, "process_cleanup")
         .unwrap()
@@ -1048,11 +1058,13 @@ async fn provider_auto_start_uses_trusted_candidate_and_completes() {
     );
     assert_eq!(store.provider_attempt(&id).unwrap().1.as_str(), "acct-work");
     let mut child = supervisor(&home, &id);
-    assert!(tokio::time::timeout(Duration::from_secs(20), child.wait())
-        .await
-        .unwrap()
-        .unwrap()
-        .success());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(20), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
     assert_eq!(
         Store::open(&home).unwrap().get(&id).unwrap().status,
         Status::Succeeded
@@ -1345,11 +1357,13 @@ async fn provider_ordinary_admission_ranks_itself_and_completes() {
     assert_eq!(selected(&home, &admitted), "acct-work");
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     let mut child = supervisor(&home, &id);
-    assert!(tokio::time::timeout(Duration::from_secs(20), child.wait())
-        .await
-        .unwrap()
-        .unwrap()
-        .success());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(20), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
     assert_eq!(
         Store::open(&home).unwrap().get(&id).unwrap().status,
         Status::Succeeded
@@ -1534,9 +1548,11 @@ async fn provider_concurrent_admissions_respect_replay_and_caps() {
         .map(|handle| handle.join().unwrap().unwrap())
         .collect();
     assert_eq!(outcomes.iter().filter(|o| o["created"] == true).count(), 1);
-    assert!(outcomes
-        .iter()
-        .all(|o| o["agent_id"] == outcomes[0]["agent_id"]));
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| o["agent_id"] == outcomes[0]["agent_id"])
+    );
     assert_eq!(rows(&home), (1, 1));
     let distinct: Vec<_> = (0..6)
         .map(|n| {
@@ -1551,10 +1567,12 @@ async fn provider_concurrent_admissions_respect_replay_and_caps() {
         .map(|handle| handle.join().unwrap())
         .collect();
     assert_eq!(distinct.iter().filter(|o| o.is_ok()).count(), 1);
-    assert!(distinct
-        .iter()
-        .filter_map(|o| o.as_ref().err())
-        .all(|error| matches!(error, agent_run_domain::Error::Capacity)));
+    assert!(
+        distinct
+            .iter()
+            .filter_map(|o| o.as_ref().err())
+            .all(|error| matches!(error, agent_run_domain::Error::Capacity))
+    );
     assert_eq!(rows(&home), (2, 2));
 }
 
@@ -1575,11 +1593,13 @@ async fn provider_harness_options_are_validated_and_carried() {
     let admitted = service.admit_provider(schema).unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     let mut child = supervisor(&home, &id);
-    assert!(tokio::time::timeout(Duration::from_secs(20), child.wait())
-        .await
-        .unwrap()
-        .unwrap()
-        .success());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(20), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
     assert_eq!(
         Store::open(&home).unwrap().get(&id).unwrap().status,
         Status::Succeeded
@@ -2200,10 +2220,12 @@ async fn provider_resume_enforces_mcp_caps_and_keeps_frozen_global_selection() {
             .unwrap()
             .insert("allowed_tools".into(), toml::Value::Array(vec![]));
     });
-    assert!(resume("catalog-revoked")
-        .unwrap_err()
-        .to_string()
-        .contains("role grants"));
+    assert!(
+        resume("catalog-revoked")
+            .unwrap_err()
+            .to_string()
+            .contains("role grants")
+    );
     fs::write(home.join("config.toml"), &original).unwrap();
     let profile = home.join("profiles/review.md");
     let body = fs::read_to_string(&profile).unwrap();
@@ -2212,10 +2234,12 @@ async fn provider_resume_enforces_mcp_caps_and_keeps_frozen_global_selection() {
         body.replace("mcp = []", "mcp = [{name='shared',allowed_tools=[]}]"),
     )
     .unwrap();
-    assert!(resume("profile-revoked")
-        .unwrap_err()
-        .to_string()
-        .contains("role grants"));
+    assert!(
+        resume("profile-revoked")
+            .unwrap_err()
+            .to_string()
+            .contains("role grants")
+    );
     fs::write(profile, body).unwrap();
     assert_eq!(rows(&home), (1, 1));
     fs::write(
@@ -2308,7 +2332,7 @@ async fn resume_selector_keeps_the_parent_account_until_it_is_unavailable() {
                 account: (*account).clone(),
                 rank: *rank,
                 physical_keys: vec![
-                    agent_run_domain::PhysicalQuotaKey::new(account, "tokens").unwrap()
+                    agent_run_domain::PhysicalQuotaKey::new(account, "tokens").unwrap(),
                 ],
                 multiplier: PositiveFinite::try_from(1.0).unwrap(),
                 quota_known: true,
@@ -2975,9 +2999,11 @@ async fn inherited_identical_text_cannot_prove_an_explicit_child_task() {
     );
     assert_eq!(attempts(&home, &child).len(), 1);
     // The inherited history does contain the identical text.
-    assert!(rollout_inputs(&row)
-        .iter()
-        .any(|input| input.contains("fixture:original-task")));
+    assert!(
+        rollout_inputs(&row)
+            .iter()
+            .any(|input| input.contains("fixture:original-task"))
+    );
 }
 
 /// Automatic in-flight switch: A's authoritative usage-limit failure closes
@@ -3247,11 +3273,12 @@ async fn claude_exhaustion_never_switches_accounts() {
     run_to_end(&home, &id).await;
     let row = Store::open(&home).unwrap().get(&id).unwrap();
     assert_eq!(row.failure_kind.as_deref(), Some("quota_exhausted"));
-    assert!(row
-        .failure_text
-        .as_deref()
-        .unwrap_or_default()
-        .contains("cross_account_continuation_unverified"));
+    assert!(
+        row.failure_text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("cross_account_continuation_unverified")
+    );
     assert_eq!(attempts(&home, &id).len(), 1);
 }
 
@@ -3835,12 +3862,14 @@ fn read_until(pipe: &mut std::process::ChildStdout, needle: &str) -> String {
     // SAFETY: `dup` returns a fresh descriptor of the viewer's live pipe that
     // this File solely owns and closes.
     let mut owned = unsafe { std::fs::File::from_raw_fd(libc::dup(pipe.as_raw_fd())) };
-    std::thread::spawn(move || loop {
-        match owned.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if sender.send(chunk[..n].to_vec()).is_err() {
-                    break;
+    std::thread::spawn(move || {
+        loop {
+            match owned.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if sender.send(chunk[..n].to_vec()).is_err() {
+                        break;
+                    }
                 }
             }
         }
@@ -5016,10 +5045,12 @@ async fn pool_concurrent_identical_requests_create_one_pool() {
         .map(|handle| handle.join().unwrap().unwrap())
         .collect();
     assert_eq!(outcomes.iter().filter(|o| o["created"] == true).count(), 1);
-    assert!(outcomes
-        .iter()
-        .all(|o| o["members"] == outcomes[0]["members"]
-            || o["members"][0]["agent_id"] == outcomes[0]["members"][0]["agent_id"]));
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| o["members"] == outcomes[0]["members"]
+                || o["members"][0]["agent_id"] == outcomes[0]["members"][0]["agent_id"])
+    );
     assert_eq!(table_rows(&home, "pools"), 1);
     assert_eq!(rows(&home), (2, 2));
 }
@@ -5259,10 +5290,12 @@ async fn pool_operator_post_and_status_through_the_service() {
         serde_json::json!(ids[0])
     );
     assert_eq!(status["status"]["members"][0]["cleanup_complete"], false);
-    assert!(status["entries"][0]["body"]
-        .as_str()
-        .unwrap()
-        .contains("failing test"));
+    assert!(
+        status["entries"][0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("failing test")
+    );
     assert_eq!(status["entries"][0]["author_kind"], "operator");
     let text = status.to_string();
     assert_eq!(status["delivery"]["attempts"], 0);
@@ -5538,12 +5571,14 @@ async fn pool_replace_reuses_the_original_spec_without_pinning_the_old_account()
         identity["provider_request"]["account"].is_null(),
         "no pinned old account"
     );
-    assert!(store
-        .get(&reused.new.agent_id)
-        .unwrap()
-        .request
-        .account
-        .is_none());
+    assert!(
+        store
+            .get(&reused.new.agent_id)
+            .unwrap()
+            .request
+            .account
+            .is_none()
+    );
     assert_eq!(
         store.get(&ids[0]).unwrap().identity.unwrap(),
         old_identity,
@@ -5824,10 +5859,12 @@ async fn pool_composed_task_survives_native_history_failover_and_resume() {
         1,
         "{inputs:?}"
     );
-    assert!(inputs
-        .last()
-        .unwrap()
-        .contains(agent_run::supervisor::CONTINUATION_CONTROL));
+    assert!(
+        inputs
+            .last()
+            .unwrap()
+            .contains(agent_run::supervisor::CONTINUATION_CONTROL)
+    );
     let first_input = inputs[0].clone();
 
     // Explicit resume of the same stable agent: the composition is inherited

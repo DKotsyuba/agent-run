@@ -1,29 +1,29 @@
 //! Run-bound subagent MCP. No operator tools, recipient selection or Desktop relay.
 use crate::{
+    Error, Result,
     cli::{CliBroker, SocketBroker},
     error::invalid,
-    Error, Result,
 };
 use agent_run_domain::{
     domain::AgentId,
-    worker::{NotifyRequest, WorkerToolCall, ENV_NAMES},
+    worker::{ENV_NAMES, NotifyRequest, WorkerToolCall},
 };
 use rmcp::{
+    ServerHandler, ServiceExt,
     model::{
         CallToolRequestParams, CallToolResponse, ErrorData, Implementation, ListToolsResult,
         PaginatedRequestParams, ServerConfig, Tool,
     },
     service::{RequestContext, RoleServer},
-    ServerHandler, ServiceExt,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc};
 
 /// One authenticated attempt's transport context. Never serializable or Debug:
 /// the token is a transient capability, not a model-supplied tool argument.
 #[derive(Clone)]
 pub struct WorkerProxy {
-    /// Existing resident broker; only METHOD can be invoked by this server.
+    /// Existing resident broker; only the private TOOL_METHOD route can be invoked.
     broker: Arc<dyn CliBroker>,
     /// Exact run, not a moving stable-agent alias.
     run_id: AgentId,
@@ -33,10 +33,16 @@ pub struct WorkerProxy {
     token: String,
 }
 
-/// Decode the embedded worker-only discovery table. An invalid asset is a build defect.
-fn tools() -> Vec<Tool> {
-    serde_json::from_str(include_str!("../../../../assets/worker_tools.json"))
-        .expect("valid embedded worker tool registry")
+/// Converts every domain-owned worker definition through the pinned SDK.
+/// Invalid embedded definitions fail explicitly; no tool is silently dropped.
+fn tools() -> std::result::Result<Vec<Tool>, ErrorData> {
+    agent_run_domain::tools::worker_tools_json()
+        .into_iter()
+        .map(|tool| {
+            serde_json::from_value(tool)
+                .map_err(|_| ErrorData::internal_error("invalid worker registry", None))
+        })
+        .collect()
 }
 
 impl WorkerProxy {
@@ -51,40 +57,26 @@ impl WorkerProxy {
                 return super::mcp_text::error_result(
                     "unknown_tool",
                     "worker MCP exposes only its fixed tool catalog",
-                )
+                );
             }
         };
-        // Local argument shape checks keep obviously malformed calls off the
-        // broker; the broker revalidates everything authoritatively.
-        let validated: std::result::Result<Value, crate::Error> = match tool {
-            agent_run_domain::worker::WorkerTool::Notify => {
-                match serde_json::from_value::<NotifyRequest>(arguments) {
-                    Ok(input) => match input.validate() {
-                        Ok(()) => serde_json::to_value(input).map_err(|_| invalid_report()),
-                        Err(error) => Err(error),
-                    },
-                    Err(_) => Err(invalid_report()),
-                }
-            }
-            agent_run_domain::worker::WorkerTool::PoolRead => {
-                match serde_json::from_value::<agent_run_domain::pool::PoolReadRequest>(arguments) {
-                    Ok(input) => match input.validate() {
-                        Ok(()) => {
-                            serde_json::to_value(input).map_err(|_| invalid_arguments("pool_read"))
-                        }
-                        Err(error) => Err(error),
-                    },
-                    Err(_) => Err(invalid_arguments("pool_read")),
-                }
-            }
-            _ => Ok(arguments),
+        // The broker repeats these strict domain checks authoritatively.
+        use agent_run_domain::pool::{PoolMessage, PoolPropose, PoolReadRequest, PoolVote};
+        use agent_run_domain::worker::WorkerTool;
+        let validated = match tool {
+            WorkerTool::Notify => validated_input(arguments, name, NotifyRequest::validate),
+            WorkerTool::PoolRead => validated_input(arguments, name, PoolReadRequest::validate),
+            WorkerTool::PoolPost => validated_input(arguments, name, PoolMessage::validate),
+            WorkerTool::PoolPropose => validated_input(arguments, name, PoolPropose::validate),
+            WorkerTool::PoolVote => validated_input(arguments, name, PoolVote::validate),
         };
         let arguments = match validated {
             Ok(arguments) => arguments,
             Err(error) => {
-                return super::mcp_text::error_result(error.public().kind, &error.public().message)
+                return super::mcp_text::error_result(error.public().kind, &error.public().message);
             }
         };
+        let request_id = arguments["request_id"].as_str().map(str::to_owned);
         let call = WorkerToolCall {
             run_id: self.run_id.clone(),
             attempt_id: self.attempt_id.clone(),
@@ -106,35 +98,84 @@ impl WorkerProxy {
         })
         .await;
         match result {
-            Ok(Ok(value)) => self.render(tool, value),
+            Ok(Ok(value)) => self.render(tool, value, request_id.as_deref()),
             Ok(Err(error)) => {
-                super::mcp_text::error_result(error.public().kind, &error.public().message)
+                super::mcp_text::failure_result(name, &error, request_id.as_deref(), None)
             }
-            Err(_) => super::mcp_text::error_result("RuntimeError", "worker call failed"),
+            Err(_) => super::mcp_text::failure_result(
+                name,
+                &Error::Runtime("worker wait ended".into()),
+                request_id.as_deref(),
+                None,
+            ),
         }
     }
 
-    /// Renders one broker answer: typed in-band denials as compact errors,
-    /// pool reads with each entry pre-rendered through the one shared
-    /// formatter, and everything else through the compact tool templates.
+    /// Renders a validated in-band pool denial or one closed typed tool view.
+    /// Receipt capture precedes presentation, preserving writes and retry identities.
     fn render(
         &self,
         tool: agent_run_domain::worker::WorkerTool,
         value: Value,
+        request_id: Option<&str>,
     ) -> rmcp::model::CallToolResult {
-        if let Some(error) = value.get("error").filter(|e| e.is_object()) {
-            let code = error["code"].as_str().unwrap_or("RuntimeError");
-            let message = error["message"].as_str().unwrap_or("pool call refused");
-            return super::mcp_text::error_result(code, message);
-        }
-        if tool == agent_run_domain::worker::WorkerTool::PoolRead {
-            return match super::mcp_text::pool_page(value) {
-                Ok(page) => super::mcp_text::success_result("pool_read", &page),
-                Err(message) => super::mcp_text::error_result("RuntimeError", &message),
+        if let Some(error) = value.get("error") {
+            return match pool_denial(error) {
+                Ok((denial, message)) => super::mcp_text::error_result(denial.code(), &message),
+                Err(error) => {
+                    super::mcp_text::failure_result(tool.as_str(), &error, request_id, None)
+                }
             };
         }
-        super::mcp_text::success_result(tool.as_str(), &value)
+        super::mcp_text::success_result_with_request(tool.as_str(), &value, request_id)
     }
+}
+
+/// Decodes one strict domain input, validates its semantic bounds, then serializes
+/// only that input. The tool name selects a fixed safe shape-error diagnostic.
+fn validated_input<T: serde::de::DeserializeOwned + serde::Serialize>(
+    arguments: Value,
+    tool: &str,
+    validate: fn(&T) -> Result<()>,
+) -> Result<Value> {
+    let invalid = || {
+        if tool == "notify_orchestrator" {
+            invalid_report()
+        } else {
+            invalid_arguments(tool)
+        }
+    };
+    let input: T = serde_json::from_value(arguments).map_err(|_| invalid())?;
+    validate(&input)?;
+    serde_json::to_value(input).map_err(|_| invalid())
+}
+
+/// Decodes only the known pool-denial codes; unknown or malformed responses
+/// remain uncertain. Bounded broker messages carry canonical typed diagnostics,
+/// never arbitrary error metadata or capability context.
+fn pool_denial(error: &Value) -> Result<(agent_run_domain::pool::PoolDenial, String)> {
+    use agent_run_domain::pool::PoolDenial;
+    let denied = || Error::Runtime("invalid worker pool denial".into());
+    let message = error["message"]
+        .as_str()
+        .filter(|s| s.len() <= 1024)
+        .ok_or_else(denied)?;
+    let denial = match error["code"].as_str() {
+        Some("not_pool_member") => PoolDenial::NotPoolMember,
+        Some("pool_completed") => PoolDenial::PoolCompleted,
+        Some("stale_proposal") => PoolDenial::StaleProposal { current: None },
+        Some("stale_roster") => PoolDenial::StaleRoster { current: 0 },
+        Some("conflict") => PoolDenial::Conflict,
+        Some("chat_budget_exhausted") => PoolDenial::ChatBudgetExhausted,
+        Some("proposal_budget_exhausted") => PoolDenial::ProposalBudgetExhausted,
+        Some("vote_budget_exhausted") => PoolDenial::VoteBudgetExhausted,
+        Some("malformed_checks") => PoolDenial::MalformedChecks,
+        Some("pool_not_found") => PoolDenial::PoolNotFound,
+        Some("member_busy") => PoolDenial::MemberBusy,
+        Some("member_not_current") => PoolDenial::MemberNotCurrent,
+        _ => return Err(denied()),
+    };
+    Ok((denial, message.to_owned()))
 }
 
 /// The historical report-argument rejection text.
@@ -150,12 +191,23 @@ fn invalid_arguments(tool: &str) -> crate::Error {
 }
 
 impl ServerHandler for WorkerProxy {
+    /// Malformed known methods remain protocol errors, using the shared SDK
+    /// fallback classification; no custom method can reach the operator broker.
+    async fn on_custom_request(
+        &self,
+        request: rmcp::model::CustomRequest,
+        _: RequestContext<RoleServer>,
+    ) -> std::result::Result<rmcp::model::CustomResult, ErrorData> {
+        Err(super::mcp::unparsed_request_error(&request.method))
+    }
+
     /// Advertise tools only; this surface has no resources, prompts or operator capabilities.
     fn get_info(&self) -> ServerConfig {
         let mut info = ServerConfig::default();
         info.capabilities = serde_json::from_value(json!({"tools":{"listChanged":false}}))
             .expect("static capabilities");
-        info.server_info = Implementation::new("agent-run-worker", "1");
+        info.server_info = Implementation::new("agent-run-worker", env!("CARGO_PKG_VERSION"));
+        info.instructions = Some("This private surface exposes the fixed five-tool catalog for the supervisor-bound attempt. Receipts confirm durable recording, never delivery, reading, approval or completion. Reconcile uncertainty with the same request_id and content; never send credentials.".into());
         info
     }
 
@@ -166,12 +218,12 @@ impl ServerHandler for WorkerProxy {
         _: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, ErrorData> {
-        Ok(super::mcp_cache::tools_list_result(&context, tools()))
+        Ok(super::mcp_cache::tools_list_result(&context, tools()?))
     }
 
     /// Resolve only an embedded worker tool, never the operator tool table.
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        tools().into_iter().find(|tool| tool.name == name)
+        tools().ok()?.into_iter().find(|tool| tool.name == name)
     }
 
     /// Execute one validated report and return compact text with no secret context.
@@ -180,6 +232,9 @@ impl ServerHandler for WorkerProxy {
         request: CallToolRequestParams,
         _: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResponse, ErrorData> {
+        if self.get_tool(&request.name).is_none() {
+            return Err(ErrorData::invalid_params("unknown worker tool", None));
+        }
         Ok(self
             .call(
                 &request.name,
@@ -215,6 +270,8 @@ pub async fn serve_from_env() -> Result<()> {
     {
         return Err(invalid("invalid worker capability"));
     }
+    super::mcp_text::initialize()?;
+    tools().map_err(|_| Error::Runtime("worker registry initialization failed".into()))?;
     let proxy = WorkerProxy {
         broker: Arc::new(SocketBroker { home }),
         run_id,
@@ -237,6 +294,63 @@ pub async fn serve_from_env() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Every private pool write keeps its own strict input and durable receipt.
+    /// Invalid destination injection is rejected before broker contact; unknown
+    /// transport replies never advise creating a replacement mutation.
+    #[tokio::test]
+    async fn private_pool_writes_keep_independent_receipts() {
+        let broker = Arc::new(Broker::default());
+        let proxy = WorkerProxy {
+            broker: broker.clone(),
+            run_id: "ag-20260928-000000-0000000001".parse().unwrap(),
+            attempt_id: "attempt".into(),
+            token: "a".repeat(64),
+        };
+        for (tool, input) in [
+            (
+                "pool_post",
+                json!({"request_id":"post","message":"bounded"}),
+            ),
+            (
+                "pool_propose",
+                json!({"request_id":"propose","message":"bounded","snapshot":"exact"}),
+            ),
+            (
+                "pool_vote",
+                json!({"request_id":"vote","proposal_seq":1,"decision":"block","checks":[],"message":"blocked"}),
+            ),
+        ] {
+            let mut forged = input.clone();
+            forged["pool_id"] = json!("foreign");
+            assert_eq!(proxy.call(tool, forged).await.is_error, Some(true));
+            let result = proxy.call(tool, input.clone()).await;
+            let wire = serde_json::to_string(&result).unwrap();
+            assert_eq!(result.is_error, Some(false), "{wire}");
+            assert!(wire.contains("#7") && wire.contains(input["request_id"].as_str().unwrap()));
+            assert!(!wire.contains(&proxy.token));
+        }
+        assert_eq!(broker.0.lock().unwrap().len(), 3);
+        let refused = proxy.render(
+            agent_run_domain::worker::WorkerTool::PoolPost,
+            json!({"error":{"code":"pool_completed","message":"the pool is completed; no further writes are accepted"}}),
+            Some("original"),
+        );
+        assert_eq!(refused.is_error, Some(true));
+        assert!(
+            !serde_json::to_string(&refused)
+                .unwrap()
+                .contains("ACCEPTED")
+        );
+        let unknown = proxy.render(
+            agent_run_domain::worker::WorkerTool::PoolVote,
+            json!({"error":{"code":"unknown_future","message":"SECRET_CANARY"}}),
+            Some("original"),
+        );
+        let wire = serde_json::to_string(&unknown).unwrap();
+        assert!(wire.contains("OUTCOME_UNKNOWN") && wire.contains("original"));
+        assert!(!wire.contains("SECRET_CANARY"));
+    }
+
     use super::*;
     use crate::cli::CliFuture;
     use std::sync::Mutex;
@@ -248,8 +362,13 @@ mod tests {
         /// Return a compact fake queue receipt while retaining the private request for assertions.
         fn call<'a>(&'a self, method: &'a str, params: Value) -> CliFuture<'a> {
             Box::pin(async move {
+                let pool = params["tool"] != "notify_orchestrator";
                 self.0.lock().unwrap().push((method.into(), params));
-                Ok(json!({"notification_id":"ntf_test","state":"pending","duplicate":false}))
+                Ok(if pool {
+                    json!({"pool_id":"p","seq":7,"duplicate":false})
+                } else {
+                    json!({"notification_id":"ntf_test","state":"pending","duplicate":false})
+                })
             })
         }
     }
@@ -265,7 +384,11 @@ mod tests {
             attempt_id: "attempt".into(),
             token: "a".repeat(64),
         };
-        let names: Vec<_> = tools().iter().map(|tool| tool.name.to_string()).collect();
+        let names: Vec<_> = tools()
+            .unwrap()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
         assert_eq!(
             names,
             [

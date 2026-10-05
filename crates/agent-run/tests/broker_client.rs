@@ -4,10 +4,10 @@
 //! temporary home and is removed with that home after the test completes.
 
 use agent_run::{
-    transport::{frame, socket},
     Error,
+    transport::{frame, socket},
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 use tokio::{io::BufReader, net::UnixListener};
 

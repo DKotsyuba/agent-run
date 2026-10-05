@@ -1,8 +1,8 @@
 //! Preserve already-written output after primary exit, independently of consumer processing time.
 
 use agent_run_adapters::{
-    io::{Event, Process},
     LaunchPlan,
+    io::{Event, Process},
 };
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 

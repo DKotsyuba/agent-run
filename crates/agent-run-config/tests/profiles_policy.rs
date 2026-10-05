@@ -132,9 +132,10 @@ Implement and verify the requested change.
     assert!(role.canonical && role.write && role.revision == "1");
     assert_eq!(role.skills, vec!["lsp-first", "document-code"]);
     assert_eq!(role.mcp, vec!["agent-lsp"]);
-    assert!(role
-        .required_constraints
-        .contains(&Constraint::PluginImmutability));
+    assert!(
+        role.required_constraints
+            .contains(&Constraint::PluginImmutability)
+    );
 }
 
 /// Mirrors `tests/test_profiles.py::ProfileTests::test_incomplete_or_unrevisioned_canonical_role_is_rejected`
@@ -142,30 +143,34 @@ Implement and verify the requested change.
 fn incomplete_or_unrevisioned_canonical_role_is_rejected() {
     let home = common::Home::new();
     let request = home.request();
-    assert!(profiles::parse(
-        "+++
+    assert!(
+        profiles::parse(
+            "+++
 write = false
 skills = [\"code-reading\"]
 +++
 Review.
 ",
-        &request
-    )
-    .unwrap_err()
-    .to_string()
-    .contains("revision"));
-    assert!(profiles::parse(
-        "+++
+            &request
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("revision")
+    );
+    assert!(
+        profiles::parse(
+            "+++
 revision = \"1\"
 write = false
 +++
 Review.
 ",
-        &request
-    )
-    .unwrap_err()
-    .to_string()
-    .contains("incomplete"));
+            &request
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("incomplete")
+    );
 }
 
 /// Mirrors `test_effective_policy.py::test_only_explicit_required_unsupported_constraints_reject`:

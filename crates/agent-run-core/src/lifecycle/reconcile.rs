@@ -5,13 +5,13 @@
 //! time is never evidence that an admitted run stopped.
 
 use agent_run_domain::{
-    domain::{now, AgentId, Status},
-    error::invalid,
     Result,
+    domain::{AgentId, Status, now},
+    error::invalid,
 };
 use agent_run_platform::process::{self, ProcessState};
 use agent_run_store::Store;
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -249,8 +249,7 @@ struct OwnedAttempt {
 ///
 /// The attempt and reason guards still enforce deduplication, while the agent
 /// key prevents a write transaction from scanning unrelated transcript events.
-const UNRESOLVED_EVENT_EXISTS_SQL: &str =
-    "SELECT EXISTS(SELECT 1 FROM events WHERE agent_id=? AND attempt_id=? AND kind='attempt_cleanup_unresolved' \
+const UNRESOLVED_EVENT_EXISTS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM events WHERE agent_id=? AND attempt_id=? AND kind='attempt_cleanup_unresolved' \
      AND json_extract(data_json,'$.reason')=?)";
 
 /// Releases provider attempts that a terminal logical run still owns (for
@@ -407,7 +406,7 @@ fn release_orphaned_attempts(store: &mut Store, limit: usize) -> Result<()> {
                         Err("leader_gone_descendants_unverifiable")
                     }
                     ProcessState::Unknown | ProcessState::Denied | ProcessState::NotStarted => {
-                        continue
+                        continue;
                     }
                 }
             }
@@ -538,17 +537,17 @@ fn fair_rows(store: &mut Store, name: &str, select: &str, limit: usize) -> Resul
             params![limit as i64],
         )?
     };
-    if rows.len() < limit {
-        if let Some((created_at, id)) = cursor {
-            let remaining = (limit - rows.len()) as i64;
-            rows.extend(read_candidates(
+    if rows.len() < limit
+        && let Some((created_at, id)) = cursor
+    {
+        let remaining = (limit - rows.len()) as i64;
+        rows.extend(read_candidates(
                 store,
                 &format!(
                     "{select} AND (created_at < ? OR (created_at = ? AND id <= ?)) ORDER BY created_at,id LIMIT ?"
                 ),
                 params![created_at, created_at, id, remaining],
             )?);
-        }
     }
     if let Some(last) = rows.last() {
         let tx = store

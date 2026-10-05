@@ -83,7 +83,10 @@ pub fn build_with_installer(
 /// `binary` is sealed as `bin/agent-run`; `installer`, when present, as
 /// `bin/agent-run-deploy`; `tui`, when present, as `bin/agent-run-tui`. Each
 /// input must already be a regular file, checked before the release directory
-/// is created so a bad argument never leaves an incomplete candidate.
+/// is created so a bad argument never leaves an incomplete candidate. Existing
+/// sealed versions are reused only for the complete expected binary/asset and
+/// metadata inventory. Conflicts require a new version; existing releases are
+/// verified and compared read-only, never updated during candidate preparation.
 fn build_inner(
     output: &Path,
     version: &str,
@@ -97,17 +100,65 @@ fn build_inner(
     if !binary.is_file() {
         return Err(format!("binary is not a file: {}", binary.display()));
     }
-    if let Some(tui) = tui {
-        if !tui.is_file() {
-            return Err(format!(
-                "bundled TUI binary is not a file: {}",
-                tui.display()
-            ));
+    if let Some(tui) = tui
+        && !tui.is_file()
+    {
+        return Err(format!(
+            "bundled TUI binary is not a file: {}",
+            tui.display()
+        ));
+    }
+    let scripts_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts");
+    let metadata = format!(
+        "{{\"version\":{version:?},\"format\":1,\"schema_version\":{SUPPORTED_SCHEMA_VERSION}}}\n"
+    );
+    let mut expected = std::collections::BTreeMap::new();
+    for (source, name) in [
+        (Some(binary), "agent-run"),
+        (installer, "agent-run-deploy"),
+        (tui, "agent-run-tui"),
+    ] {
+        if let Some(source) = source {
+            expected.insert(
+                PathBuf::from("bin").join(name),
+                digest(source).map_err(|_| "input digest unavailable")?,
+            );
         }
     }
+    for directory in ["collectors", "services"] {
+        let scripts = scripts_root.join(directory);
+        for relative in files(&scripts).map_err(|_| "source asset inventory unavailable")? {
+            expected.insert(
+                PathBuf::from(directory).join(&relative),
+                digest(&scripts.join(relative)).map_err(|_| "source asset digest unavailable")?,
+            );
+        }
+    }
+    expected.insert(
+        PathBuf::from("metadata.json"),
+        digest_bytes(metadata.as_bytes()),
+    );
     let release = output.join("releases").join(version);
     if release.exists() {
         verify(&release)?;
+        if tui.is_some() && !release.join("bin/agent-run-tui").is_file() {
+            return Err("existing release predates the bundled TUI; choose a new version".into());
+        }
+        let actual = files(&release)
+            .map_err(|_| "existing release inventory unavailable")?
+            .into_iter()
+            .filter(|path| path != Path::new("SHA256SUMS") && path != Path::new("COMPLETE"))
+            .map(|path| {
+                digest(&release.join(&path))
+                    .map(|hash| (path, hash))
+                    .map_err(|_| "existing release asset digest unavailable")
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+        if actual != expected {
+            return Err(
+                "same-version release assets/metadata conflict; choose a new version".into(),
+            );
+        }
         return Ok(release);
     }
     fs::create_dir_all(release.join("bin")).map_err(|error| error.to_string())?;
@@ -121,9 +172,7 @@ fn build_inner(
     }
     // External integration scripts remain ordinary files, never embedded executable logic.
     for directory in ["collectors", "services"] {
-        let scripts = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../scripts")
-            .join(directory);
+        let scripts = scripts_root.join(directory);
         fs::create_dir(release.join(directory)).map_err(|error| error.to_string())?;
         for relative in files(&scripts).map_err(|error| error.to_string())? {
             let destination = release.join(directory).join(&relative);
@@ -133,9 +182,7 @@ fn build_inner(
             fs::copy(scripts.join(&relative), destination).map_err(|error| error.to_string())?;
         }
     }
-    let metadata = format!(
-        "{{\"version\":{version:?},\"format\":1,\"schema_version\":{SUPPORTED_SCHEMA_VERSION}}}\n"
-    );
+
     fs::write(release.join("metadata.json"), metadata).map_err(|error| error.to_string())?;
     let manifest = files(&release)
         .map_err(|error| error.to_string())?
@@ -155,8 +202,11 @@ fn build_inner(
     Ok(release)
 }
 
-/// Validates a sealed release before it can become a `current` target.
+/// Validates the historical packaging seal before a current-target switch.
+/// Metadata must be a regular file within 64 KiB before the legacy JSON parser
+/// runs. COMPLETE remains a packaging marker, never an installation receipt.
 pub fn verify(release: &Path) -> Result<(), String> {
+    crate::delivery::read_regular(&release.join("metadata.json"), 65536)?;
     agent_run_platform::release::verify(release)
 }
 
@@ -189,5 +239,55 @@ mod tests {
         );
         fs::write(release.join("bin/agent-run"), "changed").expect("tamper fixture");
         assert!(verify(&release).is_err());
+    }
+
+    /// Separately sealed older collector/service/metadata variants remain readable
+    /// but cannot be reused as this source's same-version complete candidate.
+    #[test]
+    fn same_version_changed_assets_are_not_a_noop() {
+        for changed in [
+            "collectors/codex.sh",
+            "services/codegraph-probe.cjs",
+            "metadata.json",
+        ] {
+            let temp = tempdir().unwrap();
+            let binary = temp.path().join("binary");
+            fs::write(&binary, b"same binary").unwrap();
+            let release = build(temp.path(), "9.9.9", &binary).unwrap();
+            if changed == "metadata.json" {
+                let bytes = fs::read(release.join(changed)).unwrap();
+                fs::write(
+                    release.join(changed),
+                    [b" \n".as_slice(), bytes.as_slice()].concat(),
+                )
+                .unwrap();
+            } else {
+                fs::write(release.join(changed), b"older fixture asset").unwrap();
+            }
+            let sums = super::files(&release)
+                .unwrap()
+                .into_iter()
+                .filter(|path| {
+                    path != std::path::Path::new("SHA256SUMS")
+                        && path != std::path::Path::new("COMPLETE")
+                })
+                .map(|path| {
+                    format!(
+                        "{}  {}\n",
+                        super::digest(&release.join(&path)).unwrap(),
+                        path.display()
+                    )
+                })
+                .collect::<String>();
+            fs::write(release.join("SHA256SUMS"), sums).unwrap();
+            verify(&release).unwrap();
+            let before = fs::read(release.join(changed)).unwrap();
+            assert!(
+                build(temp.path(), "9.9.9", &binary).is_err(),
+                "different sealed {changed} must require a new version"
+            );
+            assert_eq!(fs::read(release.join(changed)).unwrap(), before);
+            verify(&release).unwrap();
+        }
     }
 }

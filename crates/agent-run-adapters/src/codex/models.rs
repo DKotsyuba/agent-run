@@ -1,8 +1,8 @@
 //! Isolated Codex app-server model roster cache.
 
-use agent_run_domain::{error::invalid, Result};
+use agent_run_domain::{Result, error::invalid};
 use agent_run_platform::fs::Dir;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{path::Path, time::SystemTime};
 
 /// Relative location of the bounded app-server roster evidence.
@@ -72,12 +72,12 @@ pub fn validate_cached_selection(home: &Path, model_id: &str, effort: Option<&st
                 "model is not discovered in the codex roster cache: {model_id}"
             ))
         })?;
-    if let Some(effort) = effort {
-        if !model.efforts.iter().any(|choice| choice == effort) {
-            return Err(invalid(format!(
-                "effort {effort:?} is not offered for model {model_id:?}"
-            )));
-        }
+    if let Some(effort) = effort
+        && !model.efforts.iter().any(|choice| choice == effort)
+    {
+        return Err(invalid(format!(
+            "effort {effort:?} is not offered for model {model_id:?}"
+        )));
     }
     Ok(())
 }
@@ -138,10 +138,10 @@ pub fn parse_roster(payload: &Value) -> Result<Vec<Model>> {
                         .or_else(|| value.get("effort"))
                         .and_then(Value::as_str)
                 });
-                if let Some(effort) = effort.filter(|value| !value.is_empty()) {
-                    if !efforts.iter().any(|known| known == effort) {
-                        efforts.push(effort.to_owned());
-                    }
+                if let Some(effort) = effort.filter(|value| !value.is_empty())
+                    && !efforts.iter().any(|known| known == effort)
+                {
+                    efforts.push(effort.to_owned());
                 }
             }
         }

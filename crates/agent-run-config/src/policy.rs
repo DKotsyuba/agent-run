@@ -7,7 +7,7 @@
 //! implemented in terms of the ported functions below rather than duplicated.
 use crate::{config::Runtime, profiles::Profile};
 pub use agent_run_domain::domain::Constraint;
-use agent_run_domain::{error::invalid, Result};
+use agent_run_domain::{Result, error::invalid};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 

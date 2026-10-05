@@ -253,16 +253,18 @@ fn timeout_without_any_answer_reports_silence() {
 fn unknown_stop_reason_is_refused() {
     let h = common::Home::new();
     let answer = proof(&h.path, Some("partial"));
-    assert!(verify::verify_completion_with_stop_reason(
-        None,
-        Some("unknown"),
-        Some(&answer),
-        true,
-        None,
-        0.0,
-        60.0,
-    )
-    .is_err());
+    assert!(
+        verify::verify_completion_with_stop_reason(
+            None,
+            Some("unknown"),
+            Some(&answer),
+            true,
+            None,
+            0.0,
+            60.0,
+        )
+        .is_err()
+    );
 }
 
 /// Mirrors `test_timeout_with_a_silent_engine_says_silent`.

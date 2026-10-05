@@ -8,16 +8,16 @@
 //! failure) never rewrite history.
 
 use crate::worker::authenticate_attempt;
-use crate::{tx_event, Store};
-use agent_run_domain::domain::{now, AgentId};
+use crate::{Store, tx_event};
+use agent_run_domain::domain::{AgentId, now};
 use agent_run_domain::pool::{
     AuthorKind, Direction, EntryKind, PoolDenial, PoolEntryView, PoolId, PoolMessage, PoolPropose,
     PoolVote, VoteDecision,
 };
 use agent_run_domain::worker::WorkerMessageKind;
 use agent_run_domain::{Error, Result};
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
-use serde_json::{json, Value};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde_json::{Value, json};
 
 /// Maximum ordinary chat rows per pool before the budget refusal.
 pub const CHAT_ROW_BUDGET: i64 = 200;
@@ -221,7 +221,9 @@ impl PoolWrite {
             Self::Vote(input) => vec![
                 (
                     "decision",
-                    json!((input.decision != VoteDecision::Revoke).then(|| input.decision.as_str())),
+                    json!(
+                        (input.decision != VoteDecision::Revoke).then(|| input.decision.as_str())
+                    ),
                 ),
                 ("proposal_seq", json!(input.proposal_seq)),
                 (
@@ -1181,10 +1183,10 @@ fn pool_status(conn: &Connection, pool_id: &str) -> Result<Value> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(seats);
-    if state == "completed" {
-        if let Some(frozen) = frozen_status(conn, pool_id)? {
-            return Ok(frozen);
-        }
+    if state == "completed"
+        && let Some(frozen) = frozen_status(conn, pool_id)?
+    {
+        return Ok(frozen);
     }
     let proposal = current_proposal(conn, pool_id)?;
     let criteria: Vec<Value> = criteria_of(&acceptance)?

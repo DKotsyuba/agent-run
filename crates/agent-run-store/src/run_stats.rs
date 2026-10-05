@@ -6,8 +6,8 @@
 //! remain SQL `NULL` and are never represented as zero.
 
 use crate::{Record, Store};
-use agent_run_domain::{domain::AgentId, Result};
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use agent_run_domain::{Result, domain::AgentId};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::Value;
 
 /// One normalized, nullable run-usage snapshot ready for SQLite insertion.

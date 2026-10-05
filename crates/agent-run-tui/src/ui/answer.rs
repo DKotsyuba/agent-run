@@ -3,11 +3,11 @@
 use super::{overlay, theme};
 use crate::app::App;
 use ratatui::{
+    Frame,
     layout::Rect,
     style::Style,
     text::{Line, Span},
     widgets::Paragraph,
-    Frame,
 };
 
 /// Renders the answer popup centered over the current screen, when open.

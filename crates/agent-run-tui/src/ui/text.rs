@@ -363,12 +363,16 @@ mod tests {
     #[test]
     fn wrapping_is_bounded_and_cell_safe() {
         assert_eq!(wrap("界界", 2), vec!["界", "界"]);
-        assert!(wrap("     x", 5)
-            .iter()
-            .all(|line| Span::raw(line).width() <= 5));
-        assert!(wrap("👩‍💻👩‍💻", 2)
-            .iter()
-            .all(|line| Span::raw(line).width() <= 2));
+        assert!(
+            wrap("     x", 5)
+                .iter()
+                .all(|line| Span::raw(line).width() <= 5)
+        );
+        assert!(
+            wrap("👩‍💻👩‍💻", 2)
+                .iter()
+                .all(|line| Span::raw(line).width() <= 2)
+        );
         assert_eq!(text(&fit(vec![Span::raw("界界")], 3, Style::new())), "界…");
         let token = "x".repeat(1024 * 1024);
         let start = std::time::Instant::now();

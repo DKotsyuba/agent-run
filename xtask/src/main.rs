@@ -5,6 +5,19 @@ use xtask::{archive, deploy, release};
 /// Dispatches standalone installation, release tooling, or the locked workspace gates.
 fn main() {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
+    if arguments.first().map(String::as_str) == Some("prepare") {
+        if arguments.len() != 1 {
+            eprintln!("usage: cargo xtask prepare");
+            std::process::exit(2);
+        }
+        if let Err(error) =
+            xtask::release_ops::prepare(&env::current_dir().expect("workspace root"))
+        {
+            eprintln!("prepare stopped: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
     if arguments.first().map(String::as_str) == Some("install") {
         if let Err(error) = xtask::installer::command(&arguments[1..]) {
             eprintln!("installation stopped: {error}");
@@ -20,12 +33,52 @@ fn main() {
         archive_command(&arguments[1..]);
         return;
     }
+    if let Some(subcommand) = arguments.first().map(String::as_str)
+        && subcommand == "family"
+    {
+        family_command(&arguments[1..]);
+        return;
+    }
+    if arguments.first().map(String::as_str) == Some("package") {
+        if arguments.get(1).is_none_or(|s| s.starts_with("--")) {
+            let mut alias = vec!["build-native".to_owned()];
+            alias.extend_from_slice(&arguments[1..]);
+            release_command(&alias);
+            return;
+        }
+        if let Err(error) = xtask::delivery::command(
+            &env::current_dir().expect("workspace root"),
+            &arguments[1..],
+        ) {
+            eprintln!("package refused: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
+    if arguments.first().map(String::as_str) == Some("contract") {
+        let export = match arguments.get(1).map(String::as_str) {
+            Some("export") if arguments.len() == 2 => true,
+            Some("check") if arguments.len() == 2 => false,
+            _ => {
+                eprintln!("usage: cargo xtask contract export|check");
+                std::process::exit(2);
+            }
+        };
+        let root = env::current_dir().expect("current directory must be readable");
+        if let Err(error) = xtask::family::contract(&root, export) {
+            eprintln!("contract: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
     if arguments.first().map(String::as_str) != Some("check") {
         eprintln!(
-            "usage: cargo xtask check | release build|build-native|verify|install|update|recover|roll-forward|rollback | archive --verify"
+            "usage: cargo xtask prepare|check | contract export|check | family verify|check|update | package | release | archive --verify | install"
         );
         std::process::exit(2);
     }
+    // Workspace test-fixtures features exist: default and all-feature Clippy/tests
+    // each protect a supported configuration; a default compile alone is insufficient.
     for arguments in [
         vec!["fmt", "--all", "--check"],
         vec![
@@ -40,12 +93,23 @@ fn main() {
             "warnings",
         ],
         vec![
+            "clippy",
+            "--offline",
+            "--locked",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        vec![
             "test",
             "--offline",
             "--locked",
             "--workspace",
             "--all-features",
         ],
+        vec!["test", "--offline", "--locked", "--workspace"],
     ] {
         let status = Command::new("cargo")
             .args(arguments)
@@ -53,6 +117,56 @@ fn main() {
             .expect("cargo must be executable");
         if !status.success() {
             std::process::exit(status.code().unwrap_or(1));
+        }
+    }
+    // The supported default-feature configuration must also compile; the
+    // all-features passes above do not prove the minimal build stays valid.
+    let status = Command::new("cargo")
+        .args([
+            "check",
+            "--offline",
+            "--locked",
+            "--workspace",
+            "--all-targets",
+        ])
+        .status()
+        .expect("cargo must be executable");
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    // Documentation is part of the public contract: rustdoc warnings fail the
+    // gate the same way compiler warnings do.
+    let status = Command::new("cargo")
+        .args(["doc", "--offline", "--locked", "--workspace", "--no-deps"])
+        .env("RUSTDOCFLAGS", "-D warnings")
+        .status()
+        .expect("cargo must be executable");
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    let root = env::current_dir().expect("current directory must be readable");
+    if let Err(error) =
+        xtask::family::contract(&root, false).and_then(|()| xtask::family::check(&root))
+    {
+        eprintln!("family adoption metadata: {error}");
+        std::process::exit(2);
+    }
+}
+
+/// Runs adoption digest/structural verification or its explicit digest updater.
+fn family_command(arguments: &[String]) {
+    let root = env::current_dir().expect("current directory must be readable");
+    let result = match arguments.first().map(String::as_str) {
+        Some("verify") => xtask::family::verify(&root).map(|()| "verified".to_owned()),
+        Some("check") => xtask::family::check(&root).map(|()| "structure checked".to_owned()),
+        Some("update") => xtask::family::update(&root).map(|()| "updated".to_owned()),
+        _ => Err("usage: cargo xtask family verify|check|update".to_owned()),
+    };
+    match result {
+        Ok(outcome) => println!("family adoption metadata {outcome}"),
+        Err(error) => {
+            eprintln!("family stopped: {error}");
+            std::process::exit(2);
         }
     }
 }
@@ -103,6 +217,14 @@ fn archive_command(arguments: &[String]) {
 /// observer, and the `xtask` deployment helper.
 fn native_binaries(target: Option<&str>) -> Result<PathBuf, String> {
     let mut command = Command::new("cargo");
+    for name in [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+    ] {
+        command.env_remove(name);
+    }
     command.args([
         "build",
         "--offline",
@@ -134,8 +256,13 @@ fn native_binaries(target: Option<&str>) -> Result<PathBuf, String> {
     Ok(directory.join("release"))
 }
 
-/// Parses the deliberately small offline release/deployment command surface.
+/// Dispatches explicit local release/deploy operations, the privileged publisher,
+/// and the read-only foreground observer; no command implicitly pushes refs.
 fn release_command(arguments: &[String]) {
+    let root = env::current_dir().expect("workspace root");
+    if arguments.first().map(String::as_str) == Some("wait") {
+        std::process::exit(xtask::release_wait::command(&root, &arguments[1..]));
+    }
     let value = |name: &str| {
         arguments
             .windows(2)
@@ -151,6 +278,10 @@ fn release_command(arguments: &[String]) {
     };
     let force = arguments.iter().any(|argument| argument == "--force");
     let result = match arguments.first().map(String::as_str) {
+        Some("prepare") => xtask::release_ops::prepare_release(&root, arguments),
+        Some("tag") => xtask::release_ops::tag(&root, arguments),
+        Some("verify") if text("--accepted-commit").is_some() => xtask::release_ops::verify_source(&root, &text("--accepted-commit").unwrap_or_default(), true).map(|_| ()),
+        Some("publish") => xtask::release_publish::command(&root, &arguments[1..]),
         Some("build") => release::build(
             &value("--output")
                 .ok_or("--output is required")
@@ -217,7 +348,7 @@ fn release_command(arguments: &[String]) {
             force,
         ),
         _ => Err(
-            "usage: cargo xtask release build|build-native|verify|install|update|recover|roll-forward|rollback".into(),
+            "usage: cargo xtask release prepare|tag|verify|wait|publish|build|build-native|install|update|recover|roll-forward|rollback".into(),
         ),
     };
     if let Err(error) = result {

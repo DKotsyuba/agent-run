@@ -1,17 +1,17 @@
 //! Atomic admission of a whole cooperative pool.
 
 use crate::{
-    provider_admission::{admit_in_tx, AdmissionInputs},
     Store,
+    provider_admission::{AdmissionInputs, admit_in_tx},
 };
 use agent_run_domain::{
+    Error, Result,
     catalog::ProviderCatalog,
-    domain::{now, AgentId},
+    domain::{AgentId, now},
     error::invalid,
     pool::{AcceptanceCriterion, PoolId},
-    Error, Result,
 };
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 /// One member of a pool admission, with its pre-minted stable identity.
 pub struct PoolMemberAdmission<'a> {

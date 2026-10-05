@@ -10,18 +10,19 @@
 //! resumes or replacements never change or repeat it.
 
 use crate::{
+    Store,
     pool_log::{
         criteria_of, current_proposal, latest_vote, lineage_cleanup_complete, tip_of, vote_validity,
     },
-    tx_event, Store,
+    tx_event,
 };
 use agent_run_domain::{
-    domain::{now, AgentId, OrchestratorRef},
-    pool::PoolId,
     Error, Result,
+    domain::{AgentId, OrchestratorRef, now},
+    pool::PoolId,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
-use serde_json::{json, Value};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde_json::{Value, json};
 
 /// Most UTF-8 bytes of the frozen common notice text.
 pub const NOTICE_BYTES: usize = 4096;
@@ -407,12 +408,12 @@ impl Store {
         let Some(current) = current else {
             return Err(Error::NotFound(pool_id.to_string()));
         };
-        if let Some(existing) = &current {
-            if !crate::session_matches_reference(&tx, existing, reference)? {
-                return Err(Error::Validation(
-                    "pool orchestration binding is immutable".into(),
-                ));
-            }
+        if let Some(existing) = &current
+            && !crate::session_matches_reference(&tx, existing, reference)?
+        {
+            return Err(Error::Validation(
+                "pool orchestration binding is immutable".into(),
+            ));
         }
         let seats = seat_tips(&tx, pool_id.as_str())?;
         let mut bound_sessions = Vec::new();

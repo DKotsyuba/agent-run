@@ -1,8 +1,8 @@
 //! Lossless bounded control exchanges: pressure stops before reading.
 
 use agent_run_adapters::{
-    io::{Event, Process, RpcDisposition, RpcUncertain, RPC_BACKLOG_LIMIT},
     LaunchPlan,
+    io::{Event, Process, RPC_BACKLOG_LIMIT, RpcDisposition, RpcUncertain},
 };
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 

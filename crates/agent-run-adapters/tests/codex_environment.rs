@@ -247,10 +247,12 @@ fn symlink_bridges_are_explicit_and_validated() {
 
     publisher.link("auth/auth.json", &source).expect("bridge");
     let bridge = home.join("auth/auth.json");
-    assert!(std::fs::symlink_metadata(&bridge)
-        .expect("bridge metadata")
-        .file_type()
-        .is_symlink());
+    assert!(
+        std::fs::symlink_metadata(&bridge)
+            .expect("bridge metadata")
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(
         std::fs::canonicalize(&bridge).expect("bridge target"),
         std::fs::canonicalize(&source).expect("source")

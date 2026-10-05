@@ -5,7 +5,7 @@
 use agent_run_core::{
     fs,
     runtime_storage::{self, StorageFault},
-    state::{runtime_storage::LayoutState, Store},
+    state::{Store, runtime_storage::LayoutState},
     storage_gc::{self, Mode},
 };
 use agent_run_platform::{
@@ -17,6 +17,7 @@ use std::{
     fs as stdfs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    process::Command,
 };
 use tempfile::TempDir;
 
@@ -90,13 +91,13 @@ fn ensure_store(app_home: &Path) {
 
 /// Restores owner write permission below one fixture tree so TempDir can drop.
 fn permit_tree(path: &Path) {
-    if let Ok(metadata) = stdfs::symlink_metadata(path) {
-        if metadata.is_dir() {
-            let _ = stdfs::set_permissions(path, stdfs::Permissions::from_mode(0o700));
-            if let Ok(children) = stdfs::read_dir(path) {
-                for child in children.flatten() {
-                    permit_tree(&child.path());
-                }
+    if let Ok(metadata) = stdfs::symlink_metadata(path)
+        && metadata.is_dir()
+    {
+        let _ = stdfs::set_permissions(path, stdfs::Permissions::from_mode(0o700));
+        if let Ok(children) = stdfs::read_dir(path) {
+            for child in children.flatten() {
+                permit_tree(&child.path());
             }
         }
     }
@@ -767,8 +768,68 @@ fn corrupt_or_missing_pinned_manifest_stops_blob_collection() {
 }
 
 /// A reference census that cannot complete permits no deletion of any kind.
+///
+/// `AGENT_RUN_GC_ROW_PAGES` is a process-wide knob read by every concurrent
+/// `sweep` in this binary, so instead of mutating the environment this case
+/// reruns itself in an isolated child test process that inherits the override
+/// from its command environment; the parent asserts the child passed within
+/// a bounded window and kills and reaps it otherwise.
 #[test]
 fn partial_reference_census_permits_no_deletion() {
+    if std::env::var_os("AGENT_RUN_TEST_GC_CENSUS_CHILD").is_some() {
+        partial_reference_census_body();
+        return;
+    }
+    let mut child = CensusChild(
+        Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "partial_reference_census_permits_no_deletion",
+                "--test-threads",
+                "1",
+                "--nocapture",
+            ])
+            .env("AGENT_RUN_TEST_GC_CENSUS_CHILD", "1")
+            .env("AGENT_RUN_GC_ROW_PAGES", "1")
+            .spawn()
+            .expect("child test process"),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+    loop {
+        if let Some(status) = child.0.try_wait().expect("child must be waitable") {
+            assert!(status.success(), "isolated census case failed: {status}");
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.terminate();
+            panic!("isolated census case exceeded its bounded window");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// The isolated census child, killed and reaped on drop so a parent panic or
+/// cancelled case can never leave it running.
+struct CensusChild(std::process::Child);
+
+impl CensusChild {
+    /// Kills and reaps the child.
+    fn terminate(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for CensusChild {
+    /// Kills/reaps the exact census fixture child on completion, timeout or panic.
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+/// Body of [`partial_reference_census_permits_no_deletion`], running where the
+/// census page override is inherited from the process environment.
+fn partial_reference_census_body() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
     let mut store = Store::initialize(&app_home).expect("store");
@@ -808,9 +869,8 @@ fn partial_reference_census_permits_no_deletion() {
         stdfs::create_dir_all(&home).expect("row home");
         insert_row(&store, &home, &digest(index));
     }
-    std::env::set_var("AGENT_RUN_GC_ROW_PAGES", "1");
+    // The one-page override is inherited from the isolated child command.
     let outcome = storage_gc::sweep(&mut store, &app_home, Mode::Apply).expect("pass");
-    std::env::remove_var("AGENT_RUN_GC_ROW_PAGES");
     assert!(outcome.incomplete, "the census is honestly incomplete");
     assert_eq!(outcome.removed(), 0, "no rows, views, trees or blobs go");
     let rows_after = {

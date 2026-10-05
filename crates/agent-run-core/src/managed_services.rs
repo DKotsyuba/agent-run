@@ -1,16 +1,16 @@
 //! Resident-broker ownership, warmup and expiry of explicitly configured foreground services.
 
 use crate::{
-    domain::{now, AgentId},
+    Error, Result,
+    domain::{AgentId, now},
     process::{self, Identity, OwnedProcess, ProcessState},
     service::ProviderLaunchIdentity,
     state::Store,
-    Error, Result,
 };
 use agent_run_config::services::ManagedService;
 use agent_run_domain::error::invalid;
 use fs2::FileExt;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -70,7 +70,8 @@ fn generations(home: &Path) -> Result<Vec<Generation>> {
     let mut query = store.conn.prepare(&format!(
         "{GENERATIONS} WHERE state != 'stopped' ORDER BY created_at,id"
     ))?;
-    let result = query
+
+    query
         .query_map([], |row| row.get::<_, String>(0))?
         .map(|row| -> Result<Generation> {
             let generation: Generation = serde_json::from_str(&row?)?;
@@ -81,8 +82,7 @@ fn generations(home: &Path) -> Result<Vec<Generation>> {
             }
             Ok(generation)
         })
-        .collect();
-    result
+        .collect()
 }
 
 /// Observes an exact recorded identity; missing permissions never mean a stopped service.
@@ -189,10 +189,10 @@ impl Manager {
             let mut query = store
                 .conn
                 .prepare("SELECT id FROM managed_service_probes")?;
-            let ids = query
+
+            query
                 .query_map([], |row| row.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            ids
+                .collect::<rusqlite::Result<_>>()?
         };
         for id in ids {
             let captured = Store::open(&self.home)?.remembered_processes("probe", &id)?;
@@ -227,10 +227,10 @@ impl Manager {
         let ids: Vec<String> = {
             let store = Store::open(&self.home)?;
             let mut query = store.conn.prepare("SELECT g.agent_id FROM agent_service_gates g JOIN agents a ON a.id=g.agent_id WHERE g.state='pending' AND a.status IN ('created','starting','running','cancelling') ORDER BY a.created_at,a.id")?;
-            let ids = query
+
+            query
                 .query_map([], |row| row.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            ids
+                .collect::<rusqlite::Result<_>>()?
         };
         for id in ids {
             let agent: AgentId = id.parse()?;
@@ -373,8 +373,8 @@ impl Manager {
         let mut store = Store::open(&self.home)?;
         let held = self.held(&generation.id)?;
         let mut owned = store.remembered_processes("service", &generation.id)?;
-        if let Some(root) = &generation.root {
-            if owned
+        if let Some(root) = &generation.root
+            && owned
                 .as_ref()
                 .and_then(|owned| owned.leader.as_ref())
                 .is_none_or(|saved| {
@@ -383,10 +383,9 @@ impl Manager {
                         || root.birth != saved.birth
                         || root.group != saved.group
                 })
-            {
-                self.unhealthy(&generation.id, "service_identity_mismatch")?;
-                return Ok(());
-            }
+        {
+            self.unhealthy(&generation.id, "service_identity_mismatch")?;
+            return Ok(());
         }
         if let Some(owned) = owned.as_mut() {
             owned.refresh();
@@ -423,27 +422,26 @@ impl Manager {
             let mut cleaned = false;
             if generation.state != "unhealthy"
                 && matches!(root_state, ProcessState::Dead | ProcessState::Reused)
+                && let Some(mut owned) = owned
             {
-                if let Some(mut owned) = owned {
-                    let cleanup = owned
-                        .cleanup(Duration::from_secs(
-                            generation.definition.stop_grace_seconds,
-                        ))
-                        .await;
-                    if let Some(snapshot) = owned.snapshot() {
-                        Store::open(&self.home)?.remember_processes(
-                            "service",
-                            &generation.id,
-                            &snapshot,
-                        )?;
-                    }
-                    if let Ok(proof) = cleanup {
-                        cleaned = proof.confirmed;
-                        Store::open(&self.home)?.conn.execute(
-                            "UPDATE managed_service_generations SET cleanup_json=? WHERE id=?",
-                            params![serde_json::to_string(&proof)?, generation.id],
-                        )?;
-                    }
+                let cleanup = owned
+                    .cleanup(Duration::from_secs(
+                        generation.definition.stop_grace_seconds,
+                    ))
+                    .await;
+                if let Some(snapshot) = owned.snapshot() {
+                    Store::open(&self.home)?.remember_processes(
+                        "service",
+                        &generation.id,
+                        &snapshot,
+                    )?;
+                }
+                if let Ok(proof) = cleanup {
+                    cleaned = proof.confirmed;
+                    Store::open(&self.home)?.conn.execute(
+                        "UPDATE managed_service_generations SET cleanup_json=? WHERE id=?",
+                        params![serde_json::to_string(&proof)?, generation.id],
+                    )?;
                 }
             }
             // Another launcher may have won between preflight and exec. Only a

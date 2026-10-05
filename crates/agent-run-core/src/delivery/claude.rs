@@ -2,7 +2,7 @@
 
 use super::{Evidence, Notice};
 use agent_run_domain::worker::WorkerNotice;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 #[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};

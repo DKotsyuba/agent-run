@@ -79,10 +79,10 @@ fn tail_lines(path: &Path) -> Option<Vec<String>> {
     file.seek(SeekFrom::Start(start)).ok()?;
     let mut bytes = Vec::new();
     file.take(ROLLOUT_TAIL_BYTES).read_to_end(&mut bytes).ok()?;
-    if start > 0 {
-        if let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') {
-            bytes.drain(..=newline);
-        }
+    if start > 0
+        && let Some(newline) = bytes.iter().position(|byte| *byte == b'\n')
+    {
+        bytes.drain(..=newline);
     }
     let text = String::from_utf8(bytes).ok()?;
     Some(
@@ -225,44 +225,42 @@ pub fn rollout_limits(home: &Path, models: &[String], now: f64) -> Vec<LimitSamp
 /// Reads precomputed evidence, falling back to bounded rollout evidence when invalid.
 pub fn limits(home: &Path, models: &[String], now: f64) -> Vec<LimitSample> {
     let path = home.join("cache/rollout_evidence.json");
-    if let Ok(text) = fs::read_to_string(path) {
-        if let Ok(payload) = serde_json::from_str::<Value>(&accept_python_nonfinite(&text)) {
-            if let Some(items) = payload.get("samples").and_then(Value::as_array) {
-                let mut samples = Vec::new();
-                for item in items.iter().filter_map(Value::as_object) {
-                    let (Some(lane), Some(window)) = (
-                        item.get("lane").and_then(Value::as_str),
-                        item.get("window").and_then(Value::as_str),
-                    ) else {
-                        continue;
-                    };
-                    let observed_at = timestamp(item.get("observed_at"));
-                    let stale = observed_at
-                        .is_none_or(|value| now - value.timestamp() as f64 > STALE_SECONDS);
-                    let remaining = if stale {
-                        None
-                    } else {
-                        epoch(item.get("remaining_percent"))
-                            .filter(|value| (0.0..=100.0).contains(value))
-                    };
-                    samples.push(LimitSample {
-                        lane: lane.into(),
-                        window: window.into(),
-                        remaining_percent: remaining,
-                        reset_at: timestamp(item.get("reset_at")),
-                        observed_at,
-                        source: if stale { "unknown" } else { "rollout_evidence" }.into(),
-                        target: item
-                            .get("target")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        valid_for_seconds: item.get("valid_for_seconds").and_then(Value::as_u64),
-                    });
-                }
-                if !samples.is_empty() {
-                    return samples;
-                }
-            }
+    if let Ok(text) = fs::read_to_string(path)
+        && let Ok(payload) = serde_json::from_str::<Value>(&accept_python_nonfinite(&text))
+        && let Some(items) = payload.get("samples").and_then(Value::as_array)
+    {
+        let mut samples = Vec::new();
+        for item in items.iter().filter_map(Value::as_object) {
+            let (Some(lane), Some(window)) = (
+                item.get("lane").and_then(Value::as_str),
+                item.get("window").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            let observed_at = timestamp(item.get("observed_at"));
+            let stale =
+                observed_at.is_none_or(|value| now - value.timestamp() as f64 > STALE_SECONDS);
+            let remaining = if stale {
+                None
+            } else {
+                epoch(item.get("remaining_percent")).filter(|value| (0.0..=100.0).contains(value))
+            };
+            samples.push(LimitSample {
+                lane: lane.into(),
+                window: window.into(),
+                remaining_percent: remaining,
+                reset_at: timestamp(item.get("reset_at")),
+                observed_at,
+                source: if stale { "unknown" } else { "rollout_evidence" }.into(),
+                target: item
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                valid_for_seconds: item.get("valid_for_seconds").and_then(Value::as_u64),
+            });
+        }
+        if !samples.is_empty() {
+            return samples;
         }
     }
     rollout_limits(home, models, now)

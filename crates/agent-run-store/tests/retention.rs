@@ -2,9 +2,9 @@
 
 mod common;
 
-use agent_run_domain::domain::{AgentId, OrchestratorRef};
 use agent_run_domain::Error;
-use agent_run_store::{retention, retention::HISTORY_SECONDS, Store};
+use agent_run_domain::domain::{AgentId, OrchestratorRef};
+use agent_run_store::{Store, retention, retention::HISTORY_SECONDS};
 use rusqlite::params;
 use serde_json::json;
 use std::path::Path;
@@ -542,10 +542,12 @@ fn storage_protection_preserves_decoded_paths_and_account_files() {
             params!["x".repeat(9 * 1024 * 1024), id.as_str()],
         )
         .unwrap();
-    assert!(store
-        .storage_protection_snapshot()
-        .unwrap()
-        .retains("unregistered", &runtime));
+    assert!(
+        store
+            .storage_protection_snapshot()
+            .unwrap()
+            .retains("unregistered", &runtime)
+    );
     integrity(&store);
 }
 

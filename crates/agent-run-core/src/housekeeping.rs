@@ -13,7 +13,7 @@
 //! skills, plugins, tools, installed releases and probes are not expiring user
 //! data and are never candidates.
 
-use crate::{error::invalid, fs, logging, state::Store, Result};
+use crate::{Result, error::invalid, fs, logging, state::Store};
 use agent_run_config::{config::Config, provider_config::ProviderConfig};
 use agent_run_domain::domain::AgentId;
 use agent_run_store::retention::StorageProtection;
@@ -232,21 +232,20 @@ impl Pass {
         }
         let completed_before = registry.done.contains(&full_key);
         if !registry.active.contains_key(&full_key) {
-            if registry.active.len() >= 64 {
-                if let Some(oldest) = registry
+            if registry.active.len() >= 64
+                && let Some(oldest) = registry
                     .active
                     .iter()
                     .min_by_key(|(_, scan)| scan.last_used)
                     .map(|(name, _)| name.clone())
-                {
-                    registry.active.remove(&oldest);
-                    // A vanished directory must not leave an orphaned needed
-                    // key holding the round open forever. Its parent will be
-                    // rechecked in the next round if the path still exists.
-                    if !registry.done.contains(&oldest) {
-                        registry.needed.remove(&oldest);
-                        self.pending = true;
-                    }
+            {
+                registry.active.remove(&oldest);
+                // A vanished directory must not leave an orphaned needed
+                // key holding the round open forever. Its parent will be
+                // rechecked in the next round if the path still exists.
+                if !registry.done.contains(&oldest) {
+                    registry.needed.remove(&oldest);
+                    self.pending = true;
                 }
             }
             let scan = match dir.scan() {
@@ -377,13 +376,13 @@ pub fn sweep(home: &Path, now: f64, store: &mut Store) -> Result<usize> {
         .map(|outcome| (outcome.removed(), outcome.backlog()))
         .unwrap_or((0, true));
     pass.removed += collected.0;
-    if pass.removed > 0 {
-        if let Some(logger) = logging::configured() {
-            logger.log(
-                logging::Level::Debug,
-                &format!("housekeeping removed={}", pass.removed),
-            );
-        }
+    if pass.removed > 0
+        && let Some(logger) = logging::configured()
+    {
+        logger.log(
+            logging::Level::Debug,
+            &format!("housekeeping removed={}", pass.removed),
+        );
     }
     let more = pass.finish()?;
     Ok(pass.removed + usize::from((more || collected.1) && pass.removed == 0))
@@ -1337,12 +1336,14 @@ mod tests {
             .extend((0..=ROUND_KEYS_LIMIT).map(|index| format!("{prefix}excess-{index}")));
         resumed.failed = true;
         assert!(resumed.finish().is_err());
-        assert!(!scans()
-            .lock()
-            .unwrap()
-            .needed
-            .iter()
-            .any(|key| key.starts_with(&prefix)));
+        assert!(
+            !scans()
+                .lock()
+                .unwrap()
+                .needed
+                .iter()
+                .any(|key| key.starts_with(&prefix))
+        );
         *scans().lock().unwrap() = ScanRegistry::default();
     }
 }

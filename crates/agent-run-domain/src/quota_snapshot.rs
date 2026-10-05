@@ -1,10 +1,10 @@
 //! Normalized, host-bound quota observations passed from collectors to scoring.
 
 use crate::{
+    Result,
     catalog::{AccountId, PhysicalQuotaKey},
     domain::nonblank,
     error::invalid,
-    Result,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

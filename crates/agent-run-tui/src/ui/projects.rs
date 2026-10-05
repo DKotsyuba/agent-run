@@ -2,13 +2,13 @@
 //! its worktrees) or clear the filter.
 
 use super::{overlay, theme};
-use crate::app::{project_name, App};
+use crate::app::{App, project_name};
 use ratatui::{
+    Frame,
     layout::Rect,
     style::Style,
     text::{Line, Span},
     widgets::Paragraph,
-    Frame,
 };
 
 /// Popup width in columns.

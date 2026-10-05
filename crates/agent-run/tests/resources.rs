@@ -46,9 +46,11 @@ fn doc_works_outside_the_checkout() {
     );
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON response");
     assert_eq!(value["topic"], "models");
-    assert!(value["text"]
-        .as_str()
-        .is_some_and(|text| text.contains("claude, codex, and glm")));
+    assert!(
+        value["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("claude, codex, and glm"))
+    );
 }
 
 /// Mirrors `test_doc.py::test_doc_with_topic_returns_that_topic`.
@@ -70,9 +72,11 @@ fn release_candidate_runs_without_python_or_cjs_runtime_lookup() {
     );
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON response");
     assert_eq!(value["topic"], "models");
-    assert!(value["text"]
-        .as_str()
-        .is_some_and(|text| text.contains("claude, codex, and glm")));
+    assert!(
+        value["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("claude, codex, and glm"))
+    );
 }
 
 /// Mirrors `test_doc.py::test_topic_text_completion_is_contract_template`.
@@ -94,18 +98,22 @@ fn doc_cli_without_topic_returns_the_index() {
     assert!(output.status.success(), "{output:?}");
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON output");
     assert_eq!(value["topic"], "index");
-    assert!(value["text"]
-        .as_str()
-        .is_some_and(|text| text.contains("agent-run")));
+    assert!(
+        value["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("agent-run"))
+    );
 }
 
 /// Mirrors `tests/test_cli.py::PackagingTests::test_console_script_and_schema_are_present_in_sdist`.
 #[test]
 fn packaged_binary_and_schema_asset_are_present() {
     assert!(std::path::Path::new(env!("CARGO_BIN_EXE_agent-run")).is_file());
-    assert!(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../sql/schema.sql")
-        .is_file());
+    assert!(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../sql/schema.sql")
+            .is_file()
+    );
 }
 
 /// Mirrors `test_doc.py::test_doc_with_completion_topic_returns_contract_text`.
@@ -118,9 +126,11 @@ fn doc_cli_returns_the_completion_contract() {
     assert!(output.status.success(), "{output:?}");
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON output");
     assert_eq!(value["topic"], "completion");
-    assert!(value["text"]
-        .as_str()
-        .is_some_and(|text| text.contains("agent-run/completion")));
+    assert!(
+        value["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("agent-run/completion"))
+    );
 }
 
 /// Mirrors `test_doc.py::test_doc_with_unknown_topic_is_refused`.

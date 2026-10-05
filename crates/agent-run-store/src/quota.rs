@@ -10,11 +10,11 @@
 
 use crate::Store;
 use agent_run_domain::{
+    Result,
     catalog::{AccountId, NormalizedQuotaSnapshot, PhysicalQuotaKey, QuotaWindow},
     error::invalid,
-    Result,
 };
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Shelf life granted to a latched exhausted fact whose provider reset time is
@@ -215,17 +215,17 @@ fn authoritative_positive(window: &QuotaWindow, fact: &QuotaWindow, at: f64) -> 
 /// including when the prior reset is known. Positive evidence requires
 /// `remaining > 0`, observation at least as late as the exhausted fact and not
 /// later than `at`, unexpired validity and no passed reset. A fresher zero can
-/// replace the old fact as described by [`settled_latches`], from any source.
+/// replace the old fact as described by `settled_latches`, from any source.
 /// Fresh exhaustion, fresh
 /// percentages, and expired resets are never overridden; carried facts keep
 /// their original observation times and collector source.
 ///
 /// A latched window is carried only into models it governs according to
 /// `membership` (the newest recorded membership of that exact source's
-/// window, see [`window_governs`]); it is never copied into another model
+/// window, see `window_governs`); it is never copied into another model
 /// that merely shares the pool, even when the window is omitted or unknown
 /// this round. Only evidence that covers every governed model settles it
-/// (see [`settled_latches`]).
+/// (see `settled_latches`).
 pub fn retain_exhausted(
     exhausted: &BTreeMap<WindowKey, QuotaWindow>,
     membership: &WindowMembership,

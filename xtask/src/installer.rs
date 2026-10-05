@@ -165,7 +165,11 @@ pub fn install(
         }
         let launcher = bin.join(name);
         let target = prefix.join("current/bin").join(name);
-        let wrapper = format!("#!/bin/sh\n# agent-run managed launcher v1\nif [ -z \"${{AGENT_RUN_HOME:-}}\" ]; then AGENT_RUN_HOME={}; fi\nexport AGENT_RUN_HOME\nexec {} \"$@\"\n", quote(&home)?, quote(&target)?);
+        let wrapper = format!(
+            "#!/bin/sh\n# agent-run managed launcher v1\nif [ -z \"${{AGENT_RUN_HOME:-}}\" ]; then AGENT_RUN_HOME={}; fi\nexport AGENT_RUN_HOME\nexec {} \"$@\"\n",
+            quote(&home)?,
+            quote(&target)?
+        );
         match fs::symlink_metadata(&launcher) {
             Ok(metadata)
                 if metadata.file_type().is_symlink()
@@ -177,7 +181,7 @@ pub fn install(
                 return Err(format!(
                     "refusing to replace an unowned launcher: {}",
                     launcher.display()
-                ))
+                ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.to_string()),

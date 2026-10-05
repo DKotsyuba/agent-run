@@ -7,7 +7,7 @@ use agent_run::{
     service::Query,
 };
 use clap::Parser;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
@@ -131,6 +131,7 @@ fn dependencies(
                 home: home.to_owned(),
                 checked_at: 0.0,
                 findings: Vec::new(),
+                ..agent_run::doctor::Report::default()
             })
         }),
     }
@@ -650,6 +651,7 @@ async fn test_doctor_delegates_to_the_structured_read_only_seam() {
                 home: home.to_owned(),
                 checked_at: 0.0,
                 findings: Vec::new(),
+                ..agent_run::doctor::Report::default()
             })
         }),
     };
@@ -682,14 +684,75 @@ async fn test_dispatch_needs_no_codex_queue_binary() {
 }
 
 /// Mirrors `tests/test_cli.py::test_dispatch_ignores_legacy_queue_binary_settings`.
+///
+/// The legacy knob is process environment, so the case reruns itself in an
+/// isolated child test process that receives the knob only through its
+/// command environment; the parent asserts the child passed.
 #[tokio::test]
 async fn test_dispatch_ignores_legacy_queue_binary_settings() {
-    let temp = tempdir().unwrap();
-    agent_run::init::initialize(temp.path()).unwrap();
-    std::env::set_var("CODEX_QUEUE_BIN", "/missing/legacy-queue");
-    let result = agent_run::delivery::dispatch_once(temp.path()).await;
-    std::env::remove_var("CODEX_QUEUE_BIN");
-    assert_eq!(result.unwrap(), 0);
+    if std::env::var_os("AGENT_RUN_TEST_LEGACY_KNOB_CHILD").is_some() {
+        let temp = tempdir().unwrap();
+        agent_run::init::initialize(temp.path()).unwrap();
+        assert_eq!(
+            agent_run::delivery::dispatch_once(temp.path())
+                .await
+                .unwrap(),
+            0
+        );
+        return;
+    }
+    ChildGuard::exact(
+        "test_dispatch_ignores_legacy_queue_binary_settings",
+        &[
+            ("AGENT_RUN_TEST_LEGACY_KNOB_CHILD", "1"),
+            ("CODEX_QUEUE_BIN", "/missing/legacy-queue"),
+        ],
+    )
+    .finish(std::time::Duration::from_secs(120));
+}
+
+/// An isolated child copy of this test binary that is killed and reaped on
+/// drop, so a parent panic, timeout, or cancelled case can never leave it
+/// running.
+struct ChildGuard(std::process::Child);
+
+impl ChildGuard {
+    /// Spawns this test binary running only `test`, with `envs` applied to
+    /// the child's isolated environment.
+    fn exact(test: &str, envs: &[(&str, &str)]) -> Self {
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command.args(["--exact", test, "--test-threads", "1", "--nocapture"]);
+        for (name, value) in envs {
+            command.env(name, value);
+        }
+        Self(command.spawn().expect("child test process"))
+    }
+
+    /// Waits for the child to exit within `timeout`, failing the test on a
+    /// non-success exit or an expired bounded window; the child is killed
+    /// and reaped first in either failure case.
+    fn finish(mut self, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.0.try_wait().expect("child must be waitable") {
+                assert!(status.success(), "isolated child case failed: {status}");
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+                panic!("isolated child case exceeded its bounded window");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// Mirrors `tests/test_cli.py::test_raw_codex_hooks_normalize_context_bind_and_refuse_bad_ids`.
@@ -992,10 +1055,12 @@ fn assert_direct_mcp_fallback(frontend: &std::path::Path, home: &std::path::Path
     assert_eq!(responses.len(), 2);
     assert_eq!(responses[0]["id"], 1);
     assert_eq!(responses[1]["id"], 2);
-    assert!(!responses[1]["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .is_empty());
+    assert!(
+        !responses[1]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         "agent-run: Desktop MCP frontend unavailable; continuing without relay delivery\n"
@@ -1043,6 +1108,7 @@ fn text_dependencies(service: Arc<FakeService>, text: Arc<Mutex<String>>) -> Cli
                 home: home.to_owned(),
                 checked_at: 0.0,
                 findings: Vec::new(),
+                ..agent_run::doctor::Report::default()
             })
         }),
     }
@@ -1109,6 +1175,7 @@ async fn test_transcript_json_format_stays_the_default_when_not_a_tty() {
                         home: home.to_owned(),
                         checked_at: 0.0,
                         findings: Vec::new(),
+                        ..agent_run::doctor::Report::default()
                     })
                 }),
             },
@@ -1417,6 +1484,7 @@ async fn test_transcript_text_bytes_are_visible_before_the_stream_completes() {
                 home: home.to_owned(),
                 checked_at: 0.0,
                 findings: Vec::new(),
+                ..agent_run::doctor::Report::default()
             })
         }),
     };
@@ -1677,6 +1745,7 @@ fn follow_dependencies(service: Arc<FollowService>, output: FollowSink) -> CliDe
                 home: home.to_owned(),
                 checked_at: 0.0,
                 findings: Vec::new(),
+                ..agent_run::doctor::Report::default()
             })
         }),
     }

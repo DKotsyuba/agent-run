@@ -1,4 +1,8 @@
-//! Dense process-wide logging to private UTC-daily files with stderr fallback.
+//! Private UTC-daily operational logs: at most 4 MiB per component/day across
+//! cooperating writers and 8 KiB per record. Lock contention, overflow and unsafe
+//! sinks drop whole records; I/O failures may retain a bounded prefix. Nothing
+//! is redirected to stderr, and failed writes never truncate existing bytes.
+//! Existing logs and the separate 30-day retention policy are preserved.
 
 use agent_run_platform::fs;
 use std::{
@@ -49,11 +53,11 @@ pub struct Logger {
     level: Level,
     /// Stable component name included on every line.
     component: String,
-    /// File sink or stderr fallback, serialized for concurrent callers.
+    /// Private file sink or silent suppression, serialized for concurrent callers.
     sink: Mutex<Sink>,
 }
 
-/// The two safe destinations selected during configuration and rollover.
+/// Private append destination or silent suppression selected during setup.
 enum Sink {
     /// Append-only daily file and its no-follow parent directory descriptor.
     File {
@@ -61,11 +65,37 @@ enum Sink {
         day: String,
         file: File,
     },
-    /// Process stderr when the home cannot host logs.
-    Stderr,
+    /// Silent suppression when the home cannot host protected logs.
+    Discard,
 }
 
+/// Process-wide configured operational logger; initialization never opens state.
 static LOGGER: OnceLock<Mutex<Option<Arc<Logger>>>> = OnceLock::new();
+
+/// Maximum bytes appended by all cooperating writers to one component's UTC day.
+pub const MAX_DAILY_BYTES: u64 = 4 * 1024 * 1024;
+/// Maximum complete operational record, including severity, component and newline.
+pub const MAX_RECORD_BYTES: usize = 8 * 1024;
+
+/// Attempts one finite nonblocking append under a descriptor-scoped advisory lock.
+/// Busy locks, unsafe metadata and full files drop the whole record silently.
+/// I/O failures may retain a bounded prefix; existing bytes are never truncated,
+/// rotated or redirected to stderr.
+fn append_bounded(file: &mut File, record: &[u8]) {
+    if fs2::FileExt::try_lock_exclusive(file).is_err() {
+        return;
+    }
+    if file.metadata().is_ok_and(|metadata| {
+        metadata.is_file() && metadata.nlink() == 1
+            // SAFETY: geteuid reads this process's effective uid without retaining state.
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.permissions().mode() & 0o777 == 0o600
+            && metadata.len().saturating_add(record.len() as u64) <= MAX_DAILY_BYTES
+    }) {
+        let _ = file.write_all(record);
+    }
+    let _ = fs2::FileExt::unlock(file);
+}
 
 /// Returns the process-wide logger slot without opening files.
 fn slot() -> &'static Mutex<Option<Arc<Logger>>> {
@@ -147,13 +177,15 @@ fn file_sink(home: &Path, component: &str, day: String) -> std::io::Result<Sink>
     })
 }
 
-/// Configures one idempotent dense component logger with direct UTC-daily files.
+/// Configures one idempotent component logger with protected UTC-daily files.
+/// Unsafe/unavailable homes suppress operational records; setup never redirects
+/// them to unbounded stderr. Records use the shared daily and per-record caps.
 pub fn configure(home: &Path, component: &str) -> Arc<Logger> {
     let mut configured = slot().lock().expect("logger lock is not poisoned");
     if let Some(logger) = configured.as_ref() {
         return logger.clone();
     }
-    let sink = file_sink(home, component, utc_day()).unwrap_or(Sink::Stderr);
+    let sink = file_sink(home, component, utc_day()).unwrap_or(Sink::Discard);
     let logger = Arc::new(Logger {
         level: Level::from_environment(),
         component: component.into(),
@@ -179,7 +211,7 @@ impl Logger {
         &self.component
     }
 
-    /// Returns whether the current sink is a daily file rather than stderr.
+    /// Returns whether the current sink is a private daily file rather than suppression.
     pub fn uses_file(&self) -> bool {
         matches!(
             *self.sink.lock().expect("logger lock is not poisoned"),
@@ -187,17 +219,25 @@ impl Logger {
         )
     }
 
-    /// Writes one bounded lifecycle line to the current UTC day without renaming shared files.
+    /// Appends one record within the shared UTC-day and individual-record bounds.
+    /// Busy, full, oversized or unsafe sinks silently drop the record; no stderr spill.
     pub fn log(&self, level: Level, message: &str) {
         self.log_on(level, message, &utc_day());
     }
 
-    /// Writes one line on the given validated UTC day; tests inject a date here.
+    /// Applies record bounds and writes on an injected UTC day for deterministic tests.
+    /// A failed rollover preserves the old file and suppresses this day's record.
     fn log_on(&self, level: Level, message: &str, day: &str) {
         if level < self.level {
             return;
         }
+        if message.len() > MAX_RECORD_BYTES {
+            return;
+        }
         let line = format!("{level:?} {} {message}\n", self.component);
+        if line.len() > MAX_RECORD_BYTES {
+            return;
+        }
         let mut sink = self.sink.lock().expect("logger lock is not poisoned");
         match &mut *sink {
             Sink::File {
@@ -211,19 +251,12 @@ impl Logger {
                             *file = next;
                             *active = day.to_owned();
                         }
-                        Err(_) => {
-                            *sink = Sink::Stderr;
-                            eprint!("{line}");
-                            return;
-                        }
+                        Err(_) => return,
                     }
                 }
-                if file.write_all(line.as_bytes()).is_err() {
-                    *sink = Sink::Stderr;
-                    eprint!("{line}");
-                }
+                append_bounded(file, line.as_bytes());
             }
-            Sink::Stderr => eprint!("{line}"),
+            Sink::Discard => {}
         }
     }
 }
@@ -273,6 +306,84 @@ pub fn reset_for_tests() {
 #[cfg(test)]
 /// Deterministic daily-file and no-follow checks without changing the system clock.
 mod tests {
+    /// Exact daily and record boundaries suppress whole records without overflow.
+    #[test]
+    fn cap_boundaries_preserve_existing_bytes() {
+        let home = tempfile::tempdir().unwrap();
+        let logger = writer(home.path(), "2026-10-05");
+        let path = home.path().join("logs/cli.2026-10-05.log");
+        let record = "Info cli boundary\n";
+        std::fs::write(&path, vec![b'x'; MAX_DAILY_BYTES as usize - record.len()]).unwrap();
+        logger.log_on(Level::Info, "boundary", "2026-10-05");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), MAX_DAILY_BYTES);
+        logger.log_on(Level::Info, "suppressed", "2026-10-05");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), MAX_DAILY_BYTES);
+        let next = writer(home.path(), "2026-10-06");
+        next.log_on(Level::Info, &"x".repeat(MAX_RECORD_BYTES), "2026-10-06");
+        assert_eq!(
+            std::fs::metadata(home.path().join("logs/cli.2026-10-06.log"))
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    /// Independent descriptors coordinate one size-check/append across writers;
+    /// contention may drop records, but retained records are whole and never overflow.
+    #[test]
+    fn concurrent_writers_share_one_daily_ceiling() {
+        let home = tempfile::tempdir().unwrap();
+        let loggers: Vec<_> = (0..8).map(|_| writer(home.path(), "2026-10-05")).collect();
+        let path = home.path().join("logs/cli.2026-10-05.log");
+        let record = b"Info cli concurrent\n";
+        let prefix = MAX_DAILY_BYTES as usize - 100 * record.len();
+        std::fs::write(&path, vec![b'x'; prefix]).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(loggers.len()));
+        let workers: Vec<_> = loggers
+            .into_iter()
+            .map(|logger| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..200 {
+                        logger.log_on(Level::Info, "concurrent", "2026-10-05");
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() > prefix && bytes.len() <= MAX_DAILY_BYTES as usize);
+        assert_eq!((bytes.len() - prefix) % record.len(), 0);
+        for line in bytes[prefix..].chunks(record.len()) {
+            assert_eq!(line, record);
+        }
+    }
+
+    /// A held lock or newly hardlinked open file is preserved without blocking,
+    /// writing its bytes, changing links, or falling back to stderr.
+    #[test]
+    fn busy_and_unsafe_open_files_are_preserved() {
+        let home = tempfile::tempdir().unwrap();
+        let first = writer(home.path(), "2026-10-05");
+        let second = writer(home.path(), "2026-10-05");
+        let path = home.path().join("logs/cli.2026-10-05.log");
+        let locked = OpenOptions::new().append(true).open(&path).unwrap();
+        fs2::FileExt::lock_exclusive(&locked).unwrap();
+        let started = std::time::Instant::now();
+        second.log_on(Level::Info, "busy", "2026-10-05");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        fs2::FileExt::unlock(&locked).unwrap();
+        std::fs::write(&path, "preserved").unwrap();
+        std::fs::hard_link(&path, home.path().join("foreign-alias")).unwrap();
+        first.log_on(Level::Info, "unsafe", "2026-10-05");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "preserved");
+        assert_eq!(std::fs::metadata(&path).unwrap().nlink(), 2);
+        assert!(first.uses_file());
+    }
+
     use super::*;
 
     /// Constructs an independent writer whose first file is already open on `day`.

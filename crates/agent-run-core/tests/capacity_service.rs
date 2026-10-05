@@ -4,7 +4,7 @@ mod common;
 use agent_run_core::{dispatch, service::Service};
 use agent_run_domain::domain::now;
 use rusqlite::params;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::cell::Cell;
 
 /// Replaces the fixture config with the three runtime states used by the service contract.
@@ -72,11 +72,13 @@ fn service_reads_clock_once_and_filters_runtime_availability() {
         result["routes"].as_array().unwrap()[0]["runtime"],
         "enabled"
     );
-    assert!(result["unavailable_runtimes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|value| value == "empty"));
+    assert!(
+        result["unavailable_runtimes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "empty")
+    );
     assert!(!result.to_string().contains("disabled"));
 }
 

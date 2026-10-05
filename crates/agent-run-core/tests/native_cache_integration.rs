@@ -184,13 +184,13 @@ fn witness(app_home: &Path) -> PathBuf {
 
 /// Restores owner write below one fixture tree so the temporary dir can drop.
 fn permit(path: &Path) {
-    if let Ok(metadata) = stdfs::symlink_metadata(path) {
-        if metadata.is_dir() {
-            let _ = stdfs::set_permissions(path, stdfs::Permissions::from_mode(0o700));
-            if let Ok(children) = stdfs::read_dir(path) {
-                for child in children.flatten() {
-                    permit(&child.path());
-                }
+    if let Ok(metadata) = stdfs::symlink_metadata(path)
+        && metadata.is_dir()
+    {
+        let _ = stdfs::set_permissions(path, stdfs::Permissions::from_mode(0o700));
+        if let Ok(children) = stdfs::read_dir(path) {
+            for child in children.flatten() {
+                permit(&child.path());
             }
         }
     }
@@ -478,10 +478,12 @@ fn prepare_native_thaws_remote_parents_and_detects_shared_links() {
     )
     .expect("consolidation");
     let root = runtime_storage::store_root(&fixture.app_home).unwrap();
-    assert!(fixture
-        .home
-        .join("plugins/cache/remote/fixture-plugin")
-        .is_symlink());
+    assert!(
+        fixture
+            .home
+            .join("plugins/cache/remote/fixture-plugin")
+            .is_symlink()
+    );
     assert!(
         runtime_cache::holds_shared_links(&fixture.app_home, &fixture.home).unwrap(),
         "a cache-only home still reads through shared links"
@@ -728,12 +730,14 @@ fn curated_clone_lifecycle_thaws_before_launch_and_collects_after_last_home() {
         runtime_cache::prepare_native(&fixture.app_home, &fixture.home, true).expect("prepare");
     assert_eq!(thawed, 3, "both curated roots and the remote parent thaw");
     for root_key in curated {
-        assert!(fixture
-            .home
-            .join(root_key)
-            .symlink_metadata()
-            .unwrap()
-            .is_dir());
+        assert!(
+            fixture
+                .home
+                .join(root_key)
+                .symlink_metadata()
+                .unwrap()
+                .is_dir()
+        );
     }
     assert_eq!(
         common::private_identity(&private),

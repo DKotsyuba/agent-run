@@ -193,7 +193,7 @@ pub fn launch_detached(
                 pid,
                 backend,
                 leader,
-            })
+            });
         }
         Err(error) => error,
     };
@@ -272,17 +272,19 @@ pub fn fork_session_leader(program: &Path, args: &[&OsStr], fds: [&OwnedFd; 3]) 
 pub fn spawn_reaper(pid: i32) -> io::Result<JoinHandle<Option<i32>>> {
     std::thread::Builder::new()
         .name(format!("reap-{pid}"))
-        .spawn(move || loop {
-            let mut status = 0;
-            // SAFETY: blocking waitpid on one exact PID with a valid status pointer.
-            let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-            if waited == pid {
-                return Some(status);
+        .spawn(move || {
+            loop {
+                let mut status = 0;
+                // SAFETY: blocking waitpid on one exact PID with a valid status pointer.
+                let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+                if waited == pid {
+                    return Some(status);
+                }
+                if waited < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return None;
             }
-            if waited < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return None;
         })
 }
 
@@ -665,7 +667,7 @@ fn prove_identity(
             return Err(LaunchError::Bootstrap(Box::new(diagnose(
                 pid,
                 error.as_raw_fd(),
-            ))))
+            ))));
         }
         Ok(Line::Timeout) => return Err(refused(NOT_READY)),
         Ok(Line::Overflow) | Err(_) => return Err(refused(INVALID_IDENTITY)),
@@ -801,7 +803,9 @@ fn diagnose(pid: i32, error_fd: RawFd) -> BootstrapFailure {
     let message = match &record {
         Some(_) => format!(
             "detached supervisor died before session proof at stage {}: {}: {} ({status})",
-            stage.as_ref().map_or("None".into(), |stage| format!("'{stage}'")),
+            stage
+                .as_ref()
+                .map_or("None".into(), |stage| format!("'{stage}'")),
             error_type.as_deref().unwrap_or("None"),
             text("message").as_deref().unwrap_or("None"),
         ),

@@ -5,11 +5,11 @@ pub mod limits;
 pub mod models;
 pub mod session;
 use agent_run_config::config::Runtime;
-use agent_run_domain::{error::invalid, Error, Result};
+use agent_run_domain::{Error, Result, error::invalid};
 use agent_run_platform::fs;
-use agent_run_platform::shared_asset_guard::{SharedAssetGuard, MACOS_SANDBOX_EXEC};
+use agent_run_platform::shared_asset_guard::{MACOS_SANDBOX_EXEC, SharedAssetGuard};
 use agent_run_platform::shared_assets::SharedStoreLock;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
@@ -452,9 +452,10 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert!(args
-            .windows(3)
-            .any(|window| { window == ["/bin/echo", "a b", "quoted\"value"] }));
+        assert!(
+            args.windows(3)
+                .any(|window| { window == ["/bin/echo", "a b", "quoted\"value"] })
+        );
         let ambiguous = std::collections::BTreeMap::from([(
             "worker.probe".to_owned(),
             servers["worker-probe"].clone(),
@@ -471,9 +472,11 @@ mod tests {
         let nested_args: Vec<String> =
             serde_json::from_str(nested[3].strip_prefix("mcp_servers.worker.args=").unwrap())
                 .unwrap();
-        assert!(nested_args
-            .windows(2)
-            .any(|window| { window == [MACOS_SANDBOX_EXEC, "--version"] }));
+        assert!(
+            nested_args
+                .windows(2)
+                .any(|window| { window == [MACOS_SANDBOX_EXEC, "--version"] })
+        );
     }
 
     /// A launch waits for an in-flight publisher to finish creating both
@@ -510,10 +513,12 @@ mod tests {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ));
         drop(publisher);
-        assert!(done_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap()
-            .is_ok());
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .is_ok()
+        );
         handle.join().unwrap();
     }
 
@@ -543,9 +548,11 @@ network = { enabled = false }
 
         let error = managed_roots(&runtime, policy.as_table().expect("Projects policy table"))
             .expect_err("unproven workspace root must be refused");
-        assert!(error
-            .to_string()
-            .contains("workspace_roots are not granted by managed Projects"));
+        assert!(
+            error
+                .to_string()
+                .contains("workspace_roots are not granted by managed Projects")
+        );
     }
 
     /// Managed Projects validation requires every configured root to be
@@ -573,9 +580,11 @@ network = { enabled = false }
 
         let error = managed_roots(&runtime, table)
             .expect_err("one ungranted root must refuse the whole policy");
-        assert!(error
-            .to_string()
-            .contains("workspace_roots are not granted by managed Projects"));
+        assert!(
+            error
+                .to_string()
+                .contains("workspace_roots are not granted by managed Projects")
+        );
 
         let runtime: Runtime = serde_json::from_value(json!({
             "enabled": true,

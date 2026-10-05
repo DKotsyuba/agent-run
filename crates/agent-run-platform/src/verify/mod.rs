@@ -1,13 +1,14 @@
 //! Exact-byte answer sealing and verification. Process exit zero is insufficient.
 mod completion;
 pub use completion::{
-    inspect_answer, inspect_answer_with_sentinel, silence_seconds, verify_completion,
-    verify_completion_with_stop_reason, AnswerProof, StopReason, ANSWER_INCOMPLETE, ANSWER_PRESENT,
-    DEFAULT_SILENCE_THRESHOLD_SECONDS, ENGINE_VANISHED, GROUP_SURVIVED, NO_ANSWER,
+    ANSWER_INCOMPLETE, ANSWER_PRESENT, AnswerProof, DEFAULT_SILENCE_THRESHOLD_SECONDS,
+    ENGINE_VANISHED, GROUP_SURVIVED, NO_ANSWER, StopReason, inspect_answer,
+    inspect_answer_with_sentinel, silence_seconds, verify_completion,
+    verify_completion_with_stop_reason,
 };
 
 use crate::fs::{self, Dir};
-use agent_run_domain::{error::invalid, Error, Result};
+use agent_run_domain::{Error, Result, error::invalid};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -98,12 +99,12 @@ fn read_metadata(dir: &Dir, path: &Path, label: &str) -> Result<Option<Vec<u8>>>
         Err(e) if is_path_escape(&e) => {
             return Err(Error::AnswerIntegrity(format!(
                 "{label} must be a regular file"
-            )))
+            )));
         }
         Err(e) => {
             return Err(Error::AnswerIntegrity(format!(
                 "{label} is unreadable: {e}"
-            )))
+            )));
         }
     };
     let size = file

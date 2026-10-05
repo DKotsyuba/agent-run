@@ -194,7 +194,7 @@ impl ClaudeSignals {
 
 #[cfg(test)]
 mod tests {
-    use super::{claude_frame, codex_turn_error, ClaudeSignals, NativeFailure};
+    use super::{ClaudeSignals, NativeFailure, claude_frame, codex_turn_error};
     use serde_json::json;
 
     /// Only `usageLimitExceeded` is exhaustion; throttling, generic 429,

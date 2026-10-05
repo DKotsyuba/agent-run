@@ -1,8 +1,8 @@
 //! Application facade: transport code has no direct access to adapters or SQL.
 use crate::{
-    adapters,
+    Error, Result, adapters,
     config::Config,
-    domain::{now, AgentId, OrchestratorRef, Outcome, StartRequest, Status},
+    domain::{AgentId, OrchestratorRef, Outcome, StartRequest, Status, now},
     error::invalid,
     lifecycle::reconcile,
     logging,
@@ -12,17 +12,16 @@ use crate::{
     state::{Record, Store},
     supervisor,
     verify::{self, Proof},
-    Error, Result,
 };
 use agent_run_config::provider_config::ProviderConfig;
 use agent_run_config::role_plan;
 use agent_run_domain::{
+    ProviderStartRequest, Sha256Digest,
     catalog::{AccountStatus, QuotaAdmissionError, QuotaCandidateSet, ResolvedLaunchAuthority},
     pool::{
-        compose_member_task, PoolDenial, PoolId, PoolPost, PoolQuery, PoolReplace, PoolSeat,
-        PoolStartRequest,
+        PoolDenial, PoolId, PoolPost, PoolQuery, PoolReplace, PoolSeat, PoolStartRequest,
+        compose_member_task,
     },
-    ProviderStartRequest, Sha256Digest,
 };
 use agent_run_store::{
     pool_admission::{PoolAdmission, PoolAdmissionInput, PoolMemberAdmission},
@@ -59,7 +58,7 @@ fn start_replay_fingerprints(request: &StartRequest) -> Result<Vec<String>> {
 
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::str::FromStr;
 use std::{
     path::PathBuf,
@@ -581,7 +580,7 @@ impl Service {
     }
     /// Admits a whole cooperative pool atomically, choosing every account from
     /// persisted quota evidence; nothing is spawned. See
-    /// [`Self::admit_pool_with`].
+    /// `Self::admit_pool_with`.
     pub fn admit_pool(&self, request: PoolStartRequest) -> Result<Value> {
         self.admit_pool_with(
             request,
@@ -1113,25 +1112,24 @@ impl Service {
         let fingerprint = fingerprints[0].clone();
         {
             let store = Store::open(&self.home)?;
-            if let Some(row) = store.replay_request(&request)? {
-                if let Some(previous) = row
+            if let Some(row) = store.replay_request(&request)?
+                && let Some(previous) = row
                     .identity
                     .as_ref()
                     .and_then(|v| v.get("replay_request_sha256"))
                     .and_then(Value::as_str)
+            {
+                if !fingerprints
+                    .iter()
+                    .any(|fingerprint| fingerprint == previous)
+                    || row.parent_agent_id.is_some()
                 {
-                    if !fingerprints
-                        .iter()
-                        .any(|fingerprint| fingerprint == previous)
-                        || row.parent_agent_id.is_some()
-                    {
-                        return Err(Error::Conflict);
-                    }
-                    logging::start(&request.runtime, &request.model, &row.id.to_string(), false);
-                    return Ok(
-                        json!({"agent_id":row.id,"created":false,"agent":self.view(&store,&row)?}),
-                    );
+                    return Err(Error::Conflict);
                 }
+                logging::start(&request.runtime, &request.model, &row.id.to_string(), false);
+                return Ok(
+                    json!({"agent_id":row.id,"created":false,"agent":self.view(&store,&row)?}),
+                );
             }
         }
         let config = self.current_config()?;
@@ -1430,7 +1428,7 @@ impl Service {
     /// parent's own account.
     ///
     /// Refuses with `continuation_unavailable` when the sealed assets or the
-    /// native history cannot be proved by `verify_recorded_history`,
+    /// native history cannot be proved by the continuity checks,
     /// and with a validation error when the current configuration no longer
     /// offers the provider, harness, connection or model. Admission itself
     /// proves the parent terminal, quiescent and cleaned up, and admits at
@@ -1595,7 +1593,7 @@ impl Service {
             _ => {
                 return Err(Error::Integrity(
                     "parent selection intent is malformed".into(),
-                ))
+                ));
             }
         };
         let mut effective = parent.request.clone();

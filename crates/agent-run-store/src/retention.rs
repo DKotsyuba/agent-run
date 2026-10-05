@@ -2,8 +2,8 @@
 //! ownership and retained lineage win over both age and count.
 
 use crate::Store;
-use agent_run_domain::{domain::AgentId, error::invalid, Error, Result};
-use rusqlite::{params, ErrorCode, TransactionBehavior};
+use agent_run_domain::{Error, Result, domain::AgentId, error::invalid};
+use rusqlite::{ErrorCode, TransactionBehavior, params};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 use std::{
@@ -342,10 +342,10 @@ impl Store {
             let id: String = row.get(0)?;
             proof.ids.insert(id);
             for column in [1, 2] {
-                if let Some(id) = row.get::<_, Option<String>>(column)? {
-                    if id.parse::<AgentId>().is_ok() {
-                        proof.ids.insert(id);
-                    }
+                if let Some(id) = row.get::<_, Option<String>>(column)?
+                    && id.parse::<AgentId>().is_ok()
+                {
+                    proof.ids.insert(id);
                 }
             }
             for column in [3, 5] {

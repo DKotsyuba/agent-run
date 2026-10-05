@@ -4,7 +4,7 @@
 //! transaction; the partial unique index remains the final authority on forks.
 
 use crate::Record;
-use agent_run_domain::{domain::AgentId, error::invalid, Result};
+use agent_run_domain::{Result, domain::AgentId, error::invalid};
 use rusqlite::Transaction;
 
 /// Verified parent facts a child must inherit when continuing one native runtime session.
@@ -45,7 +45,9 @@ pub(crate) fn resume_parent(tx: &Transaction<'_>, parent_id: &AgentId) -> Result
         None => parent.supervisor_pid.is_none(),
     };
     if !quiescent {
-        return Err(invalid(format!("agent {parent_id} finished but its runtime process is still alive or unprovable; refusing to attach to a session it may own")));
+        return Err(invalid(format!(
+            "agent {parent_id} finished but its runtime process is still alive or unprovable; refusing to attach to a session it may own"
+        )));
     }
     let Some(runtime_session_id) = parent
         .runtime_session_id

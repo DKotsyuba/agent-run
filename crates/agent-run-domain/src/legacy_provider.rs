@@ -1,11 +1,11 @@
 //! Read-only historical request decoding with explicit adapter evidence.
 
 use crate::{
+    Result,
     catalog::{HarnessId, ProviderId},
-    domain::{nonblank, StartRequest},
+    domain::{StartRequest, nonblank},
     error::invalid,
     types::AccountLabel,
-    Result,
 };
 use std::str::FromStr;
 
@@ -64,12 +64,12 @@ pub fn decode_legacy_request(
         ))
     })?;
     nonblank("runtime", &request.runtime)?;
-    if let (Some(fixed), Some(recorded)) = (legacy_runtime(&request.runtime), evidence) {
-        if fixed != recorded.harness {
-            return Err(invalid(
-                "historical runtime conflicts with recorded adapter",
-            ));
-        }
+    if let (Some(fixed), Some(recorded)) = (legacy_runtime(&request.runtime), evidence)
+        && fixed != recorded.harness
+    {
+        return Err(invalid(
+            "historical runtime conflicts with recorded adapter",
+        ));
     }
     Ok(DecodedLegacyRequest {
         account: request

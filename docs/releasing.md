@@ -18,7 +18,9 @@ hosted full-suite run and sealed-release smoke exist for it.
 From a clean checkout of the accepted commit:
 
 ```bash
+cargo xtask prepare
 cargo xtask check
+cargo deny --offline --locked check
 cargo xtask archive --verify
 cargo build --locked --release --package agent-run --bin agent-run
 node --test scripts/check-desktop-transport.cjs scripts/check-codegraph-probe.cjs
@@ -28,13 +30,13 @@ Run the release gates on macOS arm64. The non-blocking Linux validation lane
 runs the workspace and sealed-build checks independently, but its result does
 not gate or add an artifact to the qualified native release.
 
-CI and release jobs share Rust dependency caches on the same runner OS and
-architecture. Rust-cache also keys them by the toolchain, manifests, lockfile
-and build environment. Pull requests only restore caches; main and tagged
-release runs may save them. Project binaries and sealed release directories
-are rebuilt and verified on every run, and all existing checks remain enabled.
-The first cache miss still performs a full dependency build; hosted savings
-must be measured from subsequent cache-hit runs.
+CI separates the source-check cache from the explicit native package workload.
+Rust-cache additionally keys by toolchain, manifests, lockfile and build inputs.
+Each workload has one trusted main producer; PRs and release jobs only restore.
+Main also warms the verified cargo-deny executable cache. Advisory database
+refresh remains an explicit network step, followed by the offline policy gate.
+Cache hits never skip source gates or exact-payload verification. Hosted speed
+changes require comparable job timings rather than a cache-hit flag alone.
 
 For adapter or supervisor changes, also run a candidate through a supported
 real engine in an isolated home. Verify the answer proof, transcript, process
@@ -45,10 +47,11 @@ smoke.
 
 ```bash
 release_root="$(mktemp -d)"
-cargo xtask release build-native --output "$release_root" --version 0.19.1
-cargo xtask release verify --release "$release_root/releases/0.19.1"
+version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+cargo xtask package --target aarch64-apple-darwin --output "$release_root" --version "$version"
+cargo xtask release verify --release "$release_root/releases/$version"
 cargo xtask archive --revision HEAD \
-  --output "$release_root/agent-run-0.19.1-source.tar" --verify
+  --output "$release_root/agent-run-$version-source.tar" --verify
 ```
 
 `build-native` seals the current host binaries. The sealed directory contains the
@@ -60,27 +63,73 @@ one host's binary.
 
 ## Publish
 
-1. Update `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md` together.
+1. Run `cargo xtask release prepare X.Y.Z` to inspect the version plan. Explicit
+   `--apply` updates only the local Cargo version, lockfile, changelog and
+   the source registration descriptor's product-version mirror.
 2. Merge only after the `CI` workflow passes.
-3. Create and push an annotated tag from that accepted commit:
+3. Record acceptance against the exact clean source, then create the annotated
+   tag with `cargo xtask release tag X.Y.Z --accepted-commit FULL_SHA
+   --evidence FILE`. Tag creation is local; push is a separate owner action.
 
-   ```bash
-   git tag -a v0.19.1 -m "agent-run 0.19.1"
-   git push origin v0.19.1
-   ```
+   The publisher accepts only a source commit reachable from `origin/main`.
+   It never substitutes the moving branch tip for the accepted full SHA.
 
-After CI accepts the commit, the tagged `Release` workflow runs the macOS
-workspace checks and builds and verifies the sealed macOS artifact. The macOS
-gate job additionally runs Desktop transport and source-archive gates once. The workflow then generates one `SHA256SUMS`, attests
-the listed macOS and source artifacts plus `install.sh`, and publishes a GitHub Release only after
-every required job succeeds. A failed run leaves no public partial release.
-Tags are immutable; corrections ship as a new patch version.
+The release source gate and native payload build run independently, and
+publication needs both. Installed binaries are built once per attempt; the
+publisher compiles verification tooling only and receives those exact bytes.
+Observed checks and an exact-payload smoke bind the archive digest, source,
+target, compiler and actual workflow/run/attempt. Local evidence has no
+fabricated GitHub run or qualified-host identity.
+
+The publisher validates the closed inventory and evidence, verifies GitHub
+attestations for the expected repository/workflow/source, creates a complete
+draft, downloads and verifies it, publishes, and verifies the public release
+again. A failure can leave a draft for manual reconciliation; it never silently
+deletes that evidence or overwrites a published version. An existing publication
+is a no-op only when identity, attempt and bytes match exactly.
+
+Repository-wide serialization uses `queue: max` with cancellation disabled:
+up to 100 pending runs are retained; excess new arrivals are rejected. See
+[GitHub's concurrency contract](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#concurrency).
+Tags and published bytes are immutable; changed bytes require a new version.
+
+## Observe an exact publication
+
+```bash
+scripts/wait-release.sh --repo DKotsyuba/agent-run --tag vX.Y.Z \
+  --commit FULL_40_CHARACTER_SHA --workflow release.yml \
+  --run-id RUN_ID --attempt ATTEMPT \
+  --result-file /absolute/private/release-result.json --timeout 1800 --interval 15
+```
+
+The thin shell wrapper calls Rust `release wait`. Without an explicit run,
+bounded discovery refuses ambiguous candidates. It checks repository/tag/run
+identity, the published stable release, manifest and every artifact's size/hash,
+then rechecks identity. A monotonic deadline bounds API calls, downloads and
+polling. It writes one final JSON to stdout and a create-new mode-0600 result;
+progress goes to stderr. Existing result paths are never overwritten.
+
+The event explicitly reports `installed=false`, `agent_awakened=false` and
+provenance verification `not_performed`: integrity observation is not permission
+to execute or install. Optional trusted `--notify-exec /absolute/adapter` and
+repeated `--notify-arg VALUE` pass the saved event through stdin. Only an exact
+event-id acknowledgement counts as adapter receipt, not model consumption.
+Notifier failure is separate from the publication fact; no private agent relay
+or fabricated agent identity is used.
+
+Exit codes: 0 verified/acknowledged; 1 workflow failure; 2 deadline; 3 arguments;
+4 access/preflight; 5 identity/integrity/result file; 6 notifier failure; 130
+controlled cancellation. SIGKILL or disk failure cannot guarantee a saved result.
 
 ## Install or update a sealed runtime
 
 The primary public entry point is the [one-line installer](../README.md#install).
-It uses curl or wget, verifies the archive checksum, rejects unsafe tar members,
-and runs the sealed native helper. It is available in releases after 0.13.3.
+It uses gh, curl or wget for downloads and requires trusted gh and jq. It checks
+the exact annotated tag, external manifest, inventory, archive size/hash and
+GitHub attestation before extracting or executing the helper. Archive paths,
+normalized duplicates, links, special entries, modes, entry count and unpacked
+bytes are bounded and rejected before execution. There is no silent trust
+downgrade. Earlier releases retain their own version-bound bootstraps.
 `install.sh --version X.Y.Z` pins a published release; omitting the version uses
 the latest stable GitHub Release. macOS Apple silicon is the only accepted host.
 
@@ -134,7 +183,8 @@ steps:
 2. Run the xtask install/update command against the verified release.
 3. Restart the API, capacity, and delivery launchd jobs on macOS.
 4. Verify release metadata, database integrity, `agent-run doctor`, API
-   `ping`/`tools`, and MCP `initialize`/`tools/list`.
+   `ping`/`tools`, and the applicable MCP lifecycle (legacy initialize or modern
+   `server/discover` and per-request `tools/list`).
 5. Run one provider-free broker fixture before admitting real work.
 
 On failure, preserve `<home>/standalone/deploy.json`, the reported backup, and
@@ -147,8 +197,18 @@ GitHub Releases is the only public distribution channel. Each release carries:
 
 - `agent-run-X.Y.Z-aarch64-apple-darwin.tar.gz`;
 - `agent-run-X.Y.Z-source.tar`;
+- `install.sh`;
+- `release-manifest.json`;
+- `acceptance.json`;
 - `SHA256SUMS`;
 - GitHub provenance for the checksummed subjects.
 
 The project does not publish package-manager artifacts, containers, or runtime
 dependency bundles.
+
+The external manifest hashes payload, source, installer and acceptance evidence;
+it does not hash itself or SHA256SUMS. SHA256SUMS includes the manifest without
+hashing itself. Historical internal metadata/SHA256SUMS/COMPLETE seals remain
+readable: COMPLETE is a packaging-completion marker, never authorship or proof
+that the bundle was installed. Real publication, installation and host delivery
+must be qualified separately; fixture tests do not certify them.

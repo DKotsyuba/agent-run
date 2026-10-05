@@ -1,6 +1,6 @@
 //! Schema-25 contract: pool tables enforce membership history, author-at-send
 //! immutability and purge ordering, and the committed fixture agrees with its manifest.
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::Path;
 
 const DB_DIR: &str = "../../tests/fixtures/baseline/db";
@@ -75,24 +75,28 @@ fn membership_history_keeps_one_current_member_per_slot() {
     .unwrap();
     member(&tx, A2, 1, "Bob").unwrap();
     tx.commit().unwrap();
-    assert!(conn
-        .execute(
+    assert!(
+        conn.execute(
             "UPDATE pool_members SET replaced_by=?2 WHERE agent_id=?1",
             [A1, A1]
         )
-        .is_err());
-    assert!(conn
-        .execute(
+        .is_err()
+    );
+    assert!(
+        conn.execute(
             "UPDATE pool_members SET replaced_by=?2 WHERE agent_id=?1",
             [A1, A3]
         )
-        .is_err());
-    assert!(conn
-        .execute("UPDATE pool_members SET name='X' WHERE agent_id=?1", [A1])
-        .is_err());
-    assert!(conn
-        .execute("UPDATE pool_members SET slot=2 WHERE agent_id=?1", [A2])
-        .is_err());
+        .is_err()
+    );
+    assert!(
+        conn.execute("UPDATE pool_members SET name='X' WHERE agent_id=?1", [A1])
+            .is_err()
+    );
+    assert!(
+        conn.execute("UPDATE pool_members SET slot=2 WHERE agent_id=?1", [A2])
+            .is_err()
+    );
     let all: i64 = conn
         .query_row("SELECT COUNT(*) FROM pool_members", [], |r| r.get(0))
         .unwrap();
@@ -113,8 +117,7 @@ fn entries_enforce_author_shape_links_and_immutability() {
     let dir = tempfile::tempdir().unwrap();
     let conn = pool_db(dir.path());
     member(&conn, A3, 1, "Ada").unwrap();
-    let cols =
-        "author_kind,author_agent_id,author_name,author_role,sender_run_id,sender_attempt_id,\
+    let cols = "author_kind,author_agent_id,author_name,author_role,sender_run_id,sender_attempt_id,\
                 direction,kind,severity,delivery_id";
     let ok = |extra: &str| format!("'member','{A3}','Ada','reviewer','{A3}','att_03',{extra}");
     entry(
@@ -171,9 +174,10 @@ fn entries_enforce_author_shape_links_and_immutability() {
         "'broker','team','roster'",
     )
     .unwrap();
-    assert!(conn
-        .execute("UPDATE pool_entries SET body='x'", [])
-        .is_err());
+    assert!(
+        conn.execute("UPDATE pool_entries SET body='x'", [])
+            .is_err()
+    );
     conn.execute(
         "INSERT INTO pool_entries(pool_id,roster_revision,body,idem_scope,request_id,created_at,author_kind,direction,kind)\
          VALUES (?1,1,'b','op','same',1.0,'operator','team','message')",
@@ -197,9 +201,10 @@ fn purge_order_and_indexes_support_reference_aware_retention() {
     member(&conn, A3, 1, "Ada").unwrap();
     conn.execute("UPDATE agents SET status=status WHERE id=?1", [A3])
         .unwrap();
-    assert!(conn
-        .execute("DELETE FROM agents WHERE id=?1", [A3])
-        .is_err());
+    assert!(
+        conn.execute("DELETE FROM agents WHERE id=?1", [A3])
+            .is_err()
+    );
     conn.execute("DELETE FROM pool_members WHERE pool_id=?1", [POOL])
         .unwrap();
     conn.execute("DELETE FROM pools WHERE id=?1", [POOL])

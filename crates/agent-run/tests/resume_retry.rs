@@ -1,7 +1,7 @@
 //! Production CLI/MCP continuation retries must share one broker request identity.
 
 use agent_run::transport::{frame, socket};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{path::Path, process::Stdio, time::Duration};
 use tokio::{io::BufReader, net::UnixListener, process::Command};
 
@@ -85,10 +85,12 @@ async fn cli_and_mcp_resume_keep_one_intent_after_lost_acknowledgement() {
                     frame::write(&mut input, &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
                         "protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"retry-fixture","version":"1"}
                     }}), socket::MAX_FRAME).await.unwrap();
-                    assert!(frame::read(&mut output, socket::MAX_FRAME)
-                        .await
-                        .unwrap()
-                        .is_some());
+                    assert!(
+                        frame::read(&mut output, socket::MAX_FRAME)
+                            .await
+                            .unwrap()
+                            .is_some()
+                    );
                     frame::write(
                         &mut input,
                         &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
@@ -118,9 +120,11 @@ async fn cli_and_mcp_resume_keep_one_intent_after_lost_acknowledgement() {
                     .unwrap();
                     assert_ne!(response["result"]["isError"], true, "{response}");
                     assert_eq!(response["result"]["structuredContent"]["sequence"], 2);
-                    assert!(response["result"]["structuredContent"]
-                        .get("run_id")
-                        .is_none());
+                    assert!(
+                        response["result"]["structuredContent"]
+                            .get("run_id")
+                            .is_none()
+                    );
                     drop(input);
                     assert!(child.wait().await.unwrap().success());
                 } else {

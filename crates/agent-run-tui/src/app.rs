@@ -705,16 +705,14 @@ impl App {
             })
             .unwrap_or(0);
         self.selected = self.selected.min(cards.len().saturating_sub(1));
-        if let Some(buffer) = &mut self.transcript {
-            if let Some(fresh) = self
+        if let Some(buffer) = &mut self.transcript
+            && let Some(fresh) = self
                 .sessions
                 .iter()
                 .find(|agent| agent.agent_id == buffer.agent.agent_id)
-            {
-                if buffer.agent != *fresh {
-                    buffer.agent = fresh.clone();
-                }
-            }
+            && buffer.agent != *fresh
+        {
+            buffer.agent = fresh.clone();
         }
     }
 
@@ -774,10 +772,10 @@ impl App {
         self.link = Link::Down;
         self.last_error = Some(message.clone());
         self.dirty = true;
-        if let Some(buffer) = &mut self.transcript {
-            if buffer.agent.agent_id == *agent_id {
-                buffer.last_page_error = Some(message);
-            }
+        if let Some(buffer) = &mut self.transcript
+            && buffer.agent.agent_id == *agent_id
+        {
+            buffer.last_page_error = Some(message);
         }
     }
 

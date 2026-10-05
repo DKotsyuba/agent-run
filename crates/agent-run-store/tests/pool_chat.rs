@@ -13,9 +13,9 @@ use agent_run_domain::pool::{
     CheckStatus, CriterionCheck, PoolDenial, PoolMessage, PoolPropose, PoolVote, VoteDecision,
 };
 use agent_run_domain::{
+    Error, HarnessId, ProviderConnection, ProviderStartRequest,
     catalog::{ProviderCatalog, QuotaCandidateSet, ResolvedLaunchAuthority, SelectionIntent},
     domain::AgentId,
-    Error, HarnessId, ProviderConnection, ProviderStartRequest,
 };
 use agent_run_store::Store;
 use agent_run_store::{
@@ -23,7 +23,7 @@ use agent_run_store::{
     pool_replace::{PoolReplaceInput, PoolReplacement},
     provider_admission::AdmissionInputs,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Issues one worker capability and returns (run, attempt, token).
 fn capability(store: &mut Store, id: &AgentId) -> (AgentId, String, String) {
@@ -468,9 +468,11 @@ fn authentication_and_membership_gate_every_write() {
     };
     let mut store = home.store();
     // Wrong token shape/hash.
-    assert!(store
-        .pool_write(run, attempt, &"0".repeat(64), message("a", "x"))
-        .is_err());
+    assert!(
+        store
+            .pool_write(run, attempt, &"0".repeat(64), message("a", "x"))
+            .is_err()
+    );
     // A live non-member with a valid capability of its own.
     let denial = store
         .pool_write(&outsider.0, &outsider.1, &outsider.2, message("b", "x"))
@@ -509,9 +511,11 @@ fn authentication_and_membership_gate_every_write() {
             [run2.as_str()],
         )
         .unwrap();
-    assert!(store
-        .pool_write(run2, attempt2, token2, message("d", "x"))
-        .is_err());
+    assert!(
+        store
+            .pool_write(run2, attempt2, token2, message("d", "x"))
+            .is_err()
+    );
 }
 
 /// Votes need the current proposal; ready needs exact criterion coverage;
@@ -1060,9 +1064,11 @@ fn terminal_attempt_cannot_read_or_write() {
         )
         .unwrap();
     let mut store = home.store();
-    assert!(store
-        .pool_write(run, attempt, token, message("x", "y"))
-        .is_err());
+    assert!(
+        store
+            .pool_write(run, attempt, token, message("x", "y"))
+            .is_err()
+    );
     assert!(store.pool_read(run, attempt, token, 0, None, 5).is_err());
 }
 
@@ -1705,17 +1711,21 @@ fn forced_fanout_failure_rolls_back_every_row() {
              WHEN NEW.kind='pool' BEGIN SELECT RAISE(ABORT,'forced fanout failure'); END;",
         )
         .unwrap();
-    assert!(store
-        .pool_write(run, attempt, token, message("c1", "hello"))
-        .is_err());
+    assert!(
+        store
+            .pool_write(run, attempt, token, message("c1", "hello"))
+            .is_err()
+    );
     let request = agent_run_domain::worker::NotifyRequest {
         request_id: "n9".into(),
         kind: agent_run_domain::worker::WorkerMessageKind::Notice,
         message: "report".into(),
     };
-    assert!(store
-        .notify_orchestrator(run, attempt, token, &request, 2.0)
-        .is_err());
+    assert!(
+        store
+            .notify_orchestrator(run, attempt, token, &request, 2.0)
+            .is_err()
+    );
     let after = [
         count(&store, "pool_entries"),
         count(&store, "worker_notifications"),
@@ -2154,9 +2164,11 @@ fn concurrent_settlement_is_single_and_the_completed_record_stays_frozen() {
         .map(|h| h.join().unwrap())
         .collect();
     assert_eq!(outcomes.iter().filter(|c| c.created).count(), 1);
-    assert!(outcomes
-        .iter()
-        .all(|c| c.delivery_id == outcomes[0].delivery_id));
+    assert!(
+        outcomes
+            .iter()
+            .all(|c| c.delivery_id == outcomes[0].delivery_id)
+    );
     let mut store = home.store();
     assert_eq!(rows_of(&store, "deliveries"), 1);
     let frozen = store
@@ -2193,10 +2205,12 @@ fn concurrent_settlement_is_single_and_the_completed_record_stays_frozen() {
             .unwrap(),
         frozen_list
     );
-    assert!(store
-        .settle_pool(&pool_id)
-        .unwrap()
-        .is_some_and(|c| !c.created));
+    assert!(
+        store
+            .settle_pool(&pool_id)
+            .unwrap()
+            .is_some_and(|c| !c.created)
+    );
     assert_eq!(rows_of(&store, "deliveries"), 1);
     let (run, attempt, token) = &members[1];
     let _ = (run, attempt, token, &criteria);

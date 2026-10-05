@@ -24,7 +24,8 @@ impl Home {
         };
         let text = format!(
             "schema_version=1\n[runtimes.mock]\nenabled=true\nadapter='claude'\nbinary={}\nhome={}\nmodels=['fixture']\nlimits_source='none'\n",
-            toml::Value::String(binary.into()), toml::Value::String(path.join("runtimes/mock").to_string_lossy().into_owned())
+            toml::Value::String(binary.into()),
+            toml::Value::String(path.join("runtimes/mock").to_string_lossy().into_owned())
         );
         std::fs::write(path.join("config.toml"), text).unwrap();
         let config = Config::load(&path).unwrap();

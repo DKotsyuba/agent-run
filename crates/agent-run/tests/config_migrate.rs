@@ -58,7 +58,8 @@ fn history(home: &Path) -> Vec<String> {
     let mut statement = conn
         .prepare("SELECT id,status,runtime,model,task,request_json FROM agents ORDER BY id")
         .unwrap();
-    let rows = statement
+
+    statement
         .query_map([], |row| {
             Ok((0..6)
                 .map(|index| format!("{:?}", row.get::<_, rusqlite::types::Value>(index).unwrap()))
@@ -67,8 +68,7 @@ fn history(home: &Path) -> Vec<String> {
         })
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap();
-    rows
+        .unwrap()
 }
 
 /// Seals `dir` the way `xtask release` does (`bin/agent-run`,
@@ -505,9 +505,11 @@ fn apply_and_rollback_move_the_whole_pair() {
     let (ok, applied) = home.apply("mapping.toml", false);
     assert!(ok, "{applied}");
     assert_eq!(version(&home.root), agent_run::state::VERSION as u32);
-    assert!(fs::read_to_string(home.root.join("config.toml"))
-        .unwrap()
-        .contains("schema_version = 2"));
+    assert!(
+        fs::read_to_string(home.root.join("config.toml"))
+            .unwrap()
+            .contains("schema_version = 2")
+    );
     let snapshot = PathBuf::from(applied["snapshot"].as_str().unwrap());
     let manifest: Value =
         serde_json::from_slice(&fs::read(snapshot.join("manifest.json")).unwrap()).unwrap();
@@ -580,9 +582,11 @@ fn apply_and_rollback_move_the_whole_pair() {
         "{refused}"
     );
     assert_eq!(version(&home.root), agent_run::state::VERSION as u32);
-    assert!(fs::read_to_string(home.root.join("config.toml"))
-        .unwrap()
-        .contains("schema_version = 2"));
+    assert!(
+        fs::read_to_string(home.root.join("config.toml"))
+            .unwrap()
+            .contains("schema_version = 2")
+    );
     for (name, digest) in frozen {
         assert_eq!(
             sha(&snapshot.join(&name)),
@@ -907,15 +911,20 @@ fn external_config_edit_during_publication_is_kept() {
     assert!(!home.root.join("migrations/in-progress.json").exists());
 }
 
-/// One committed-or-refused write from a fresh connection that never waits:
-/// the marker `'w'` is appended to the first agent's task.
+/// Adds a marker to the first agent in a disposable fixture home through a fresh
+/// connection with zero SQLite busy wait. Returns the affected rows or SQLite
+/// open/write/lock failure; used only by feature-enabled publication lease drills.
+#[cfg(feature = "test-fixtures")]
 fn try_write(home: &Path) -> rusqlite::Result<usize> {
     let conn = rusqlite::Connection::open(home.join("state.db"))?;
     conn.busy_timeout(std::time::Duration::ZERO)?;
     write_with(&conn)
 }
 
-/// The marker write through an existing connection.
+/// Attempts the fixture marker write through a caller-owned connection and its
+/// existing busy policy; returns the affected rows or SQLite failure. The
+/// feature-enabled lease drills retain ownership of the connection.
+#[cfg(feature = "test-fixtures")]
 fn write_with(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
     conn.execute(
         "UPDATE agents SET task=task||'w' WHERE id=(SELECT min(id) FROM agents)",
@@ -923,7 +932,9 @@ fn write_with(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
     )
 }
 
-/// Whether a write was refused by SQLite locking (not committed).
+/// Consumes a feature-fixture write result and recognizes DatabaseBusy or
+/// DatabaseLocked refusal; success and all other SQLite errors return false.
+#[cfg(feature = "test-fixtures")]
 fn refused_busy(result: rusqlite::Result<usize>) -> bool {
     matches!(
         result,
@@ -932,7 +943,10 @@ fn refused_busy(result: rusqlite::Result<usize>) -> bool {
     )
 }
 
-/// How many first-agent tasks carry the committed marker write.
+/// Reads disposable fixture history and returns zero or one for the first
+/// agent task carrying the committed marker. Unreadable fixture history panics;
+/// this helper is available only for feature-enabled publication lease drills.
+#[cfg(feature = "test-fixtures")]
 fn markers(home: &Path) -> usize {
     history(home)
         .iter()

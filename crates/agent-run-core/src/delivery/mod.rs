@@ -3,11 +3,11 @@ pub mod claude;
 pub mod relay;
 
 use crate::{
+    Result,
     config::Config,
-    domain::{now, AgentId, Status},
+    domain::{AgentId, Status, now},
     error::invalid,
     state::Store,
-    Result,
 };
 use agent_run_config::{config::Delivery, provider_config::ProviderConfig};
 use agent_run_domain::{
@@ -15,7 +15,7 @@ use agent_run_domain::{
     worker::{WorkerMessageKind, WorkerNotice},
 };
 use fs2::FileExt;
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{fs::File, path::Path};
@@ -601,18 +601,18 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
             // stable identity as peers, from the one shared renderer. The stored
             // worker message stays raw for idempotent replay.
             let message = match tx
-            .query_row(
-                "SELECT seq,author_kind,author_agent_id,author_name,author_role,direction,kind,\
+                .query_row(
+                    "SELECT seq,author_kind,author_agent_id,author_name,author_role,direction,kind,\
                  severity,proposal_seq,roster_revision,decision,body \
                  FROM pool_entries WHERE delivery_id=?",
-                [&delivery_id],
-                agent_run_store::pool_log::entry_view,
-            )
-            .optional()?
-        {
-            Some(entry) => pool_decorated(&agent_run_domain::pool::render_entry(&entry)?),
-            None => message,
-        };
+                    [&delivery_id],
+                    agent_run_store::pool_log::entry_view,
+                )
+                .optional()?
+            {
+                Some(entry) => pool_decorated(&agent_run_domain::pool::render_entry(&entry)?),
+                None => message,
+            };
             let notice = WorkerNotice {
                 notification_id: delivery_id.clone(),
                 agent_id: root.parse()?,
@@ -865,7 +865,7 @@ fn pool_decorated(rendered: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{claim, dispatcher_lock, Payload};
+    use super::{Payload, claim, dispatcher_lock};
     use crate::{domain::now, state::Store};
     use rusqlite::params;
     use std::io::Write;
@@ -893,10 +893,14 @@ mod tests {
             "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) \
              VALUES('session','fixture','external',?1,?1)", [now()],
         ).unwrap();
-        store.conn.execute(
-            "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,next_attempt_at) \
-             VALUES('notice',?1,'session','pending',0)", [child],
-        ).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,next_attempt_at) \
+             VALUES('notice',?1,'session','pending',0)",
+                [child],
+            )
+            .unwrap();
         let claimed = claim(home.path(), "test-owner").unwrap().unwrap();
         let Payload::Completion(notice) = claimed.payload else {
             panic!("expected completion")

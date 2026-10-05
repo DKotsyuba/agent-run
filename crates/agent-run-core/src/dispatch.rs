@@ -1,14 +1,13 @@
 //! One tool inventory and strict argument decoder for every public transport.
 use crate::{
-    agent_identity,
+    Result, agent_identity,
     domain::{AgentId, OrchestratorRef},
     error::invalid,
     service::{Query, Service},
-    Result,
 };
 pub use agent_run_domain::tools::{is_tool, tool, tools_json};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 /// Returns the one domain-owned, Python-compatible public discovery table.
 pub fn tools() -> Vec<Value> {

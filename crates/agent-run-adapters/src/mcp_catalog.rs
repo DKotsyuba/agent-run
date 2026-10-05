@@ -4,14 +4,14 @@
 //! are not covered. Codex uses its native positive allowlist instead of this module.
 
 use crate::{
-    io::{Event, Process, ENGINE_FRAME},
-    provider::ProviderLaunchPlan,
     LaunchPlan,
+    io::{ENGINE_FRAME, Event, Process},
+    provider::ProviderLaunchPlan,
 };
 use agent_run_config::role_plan::ResolvedMcp;
 use agent_run_domain::{Error, Result};
 use agent_run_platform::process::OwnershipSnapshot;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{collections::BTreeSet, time::Duration};
 
 /// Maximum discovery time per server, excluding bounded process teardown.
@@ -621,24 +621,30 @@ done
         for id in ["server.dot", "server__ambiguous", "server_"] {
             let mut plan = fixture(temp.path(), "hang");
             plan.role.mcp[0].id = id.into();
-            assert!(apply_claude_tool_filters(&mut plan, |_| Ok(()))
-                .await
-                .is_err());
+            assert!(
+                apply_claude_tool_filters(&mut plan, |_| Ok(()))
+                    .await
+                    .is_err()
+            );
         }
         let mut plan = fixture(temp.path(), "hang");
         plan.launch.environment.remove("REQUIRED_TOKEN");
-        assert!(apply_claude_tool_filters(&mut plan, |_| Ok(()))
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("environment"));
+        assert!(
+            apply_claude_tool_filters(&mut plan, |_| Ok(()))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("environment")
+        );
         let mut plan = fixture(temp.path(), "hang");
         plan.role.mcp[0].args.push("${TOKEN}".into());
-        assert!(apply_claude_tool_filters(&mut plan, |_| Ok(()))
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("interpolation"));
+        assert!(
+            apply_claude_tool_filters(&mut plan, |_| Ok(()))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("interpolation")
+        );
         assert!(!temp.path().join("pids").exists());
     }
 
@@ -646,8 +652,8 @@ done
     #[tokio::test]
     async fn ownership_refusal_keeps_backend_behind_exec_gate() {
         use std::sync::{
-            atomic::{AtomicI32, Ordering},
             Arc,
+            atomic::{AtomicI32, Ordering},
         };
         let temp = tempfile::tempdir().unwrap();
         let mut plan = fixture(temp.path(), "hang");

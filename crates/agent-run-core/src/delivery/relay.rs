@@ -1,8 +1,8 @@
 //! v1-v4 Desktop relay interoperability, bounded to ten seconds.
 use super::{Evidence, Notice};
-use crate::{error::invalid, Result};
+use crate::{Result, error::invalid};
 use agent_run_domain::worker::WorkerNotice;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     os::unix::fs::{FileTypeExt, MetadataExt},
     path::Path,
@@ -185,7 +185,7 @@ async fn send_payload(home: &Path, thread: &str, payload: RelayPayload<'_>) -> E
         .await;
         match reply {
             Ok(Ok(value)) if value == json!({"outcome":"accepted"}) => {
-                return Evidence::new("relay_accepted", true, false)
+                return Evidence::new("relay_accepted", true, false);
             }
             Ok(Ok(value)) if value == json!({"outcome":"rejected"}) => {
                 rejected = true;

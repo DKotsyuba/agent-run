@@ -10,10 +10,10 @@
 //! refs, index, logs, config, locks), `.agents`, root files and the
 //! `.tmp/plugins.sha`/`.tmp/plugins.sync.lock` siblings always stay private.
 //! This unit removes those duplicates without changing what the native SDK
-//! sees or does: while a home is caller-proven idle, [`freeze`] captures the
+//! sees or does: while a home is caller-proven idle, `freeze` captures the
 //! verified private tree into the shared store's existing content-addressed
 //! tree namespace and replaces the private root with one exact whole-root
-//! symlink; [`thaw`] restores an independent writable real tree — APFS
+//! symlink; `thaw` restores an independent writable real tree — APFS
 //! clone-backed, never an external hardlink — before any harness execution
 //! that could mutate the cache (resume, retry, account switch, probes).
 //!
@@ -24,14 +24,14 @@
 //! later check reuses `verify_shared_tree`, `shared_tree_root`, and
 //! `shared_tree_blob_names`. An operation's `op.json` record — written into
 //! the home before import runs — is the durable pin that keeps a
-//! published-but-not-yet-linked tree visible to [`scan_refs`], so no
+//! published-but-not-yet-linked tree visible to `scan_refs`, so no
 //! untracked-reference window survives a crash, and the home-link install
-//! itself runs under one global [`SharedStoreLock`] hold. The import's own
+//! itself runs under one global `SharedStoreLock` hold. The import's own
 //! internal lock hold is never nested inside ours.
 //!
 //! `<home>/.agent-run-native-<uuid>/` is the operation backup: `op.json`
 //! plus, while an operation runs, the staged capture (freeze), the moved
-//! original (freeze), or the staged clone (thaw). [`recover`] completes or
+//! original (freeze), or the staged clone (thaw). `recover` completes or
 //! rolls back from these records without losing originals.
 //!
 //! `<scope>` is the caller-supplied trusted account/connection
@@ -45,13 +45,13 @@
 //! with the original left untouched, never guessed disposable.
 
 use crate::fs::{self, Dir, EntryType};
-use agent_run_domain::{canonical, error::invalid, Error, Result};
+use agent_run_domain::{Error, Result, canonical, error::invalid};
 use agent_run_platform::{
-    shared_assets::{self, is_scope, SharedStoreLock, SharedTreeRef, MAX_TREE_MANIFEST_BYTES},
+    shared_assets::{self, MAX_TREE_MANIFEST_BYTES, SharedStoreLock, SharedTreeRef, is_scope},
     snapshot_tree::{RUNTIME_SNAPSHOT_INDEX, SNAPSHOT_MANIFEST},
 };
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::Digest;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -123,26 +123,26 @@ pub enum NativeCacheKind {
     /// `plugins/cache/<market>/<plugin>` carrying a valid
     /// `.codex-remote-plugin-install.json` marker. The native store writes
     /// version updates into the parent itself, so this root must be
-    /// [`thaw`]ed into a real writable tree before every native invocation.
+    /// `thaw`ed into a real writable tree before every native invocation.
     RemotePluginParent,
     /// The working-tree plugins directory [`CURATED_MIRROR_ROOT`] of the
     /// native curated marketplace clone, frozen only when the clone's
     /// `.git` is a real directory. The native startup sync fetches into the
     /// private `.git`, stages a replacement repository and activates it by
     /// renaming the whole clone, and the plugin manager copies installed
-    /// payloads out of this tree, so it is [`thaw`]ed before every native
+    /// payloads out of this tree, so it is `thaw`ed before every native
     /// invocation exactly like a remote plugin parent.
     CuratedMirror,
     /// The Git pack directory [`CURATED_PACK_ROOT`] of the same clone,
     /// frozen only when it holds nothing but regular `pack-<hash>.<ext>`
     /// files. Pack files are immutable and byte-identical across homes
     /// cloned from the same upstream state; HEAD, refs, index, logs, config
-    /// and locks stay private and untouched. [`thaw`]ed before every native
+    /// and locks stay private and untouched. `thaw`ed before every native
     /// invocation so fetch and repack keep native behavior.
     CuratedPacks,
 }
 
-/// The outcome of one [`freeze`] call.
+/// The outcome of one `freeze` call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FreezeOutcome {
     /// The private root was captured, imported, and replaced by its exact
@@ -225,7 +225,7 @@ fn safe_component(value: &str) -> bool {
 /// `plugins/cache/<market>/<plugin>` with both trailing components safe and
 /// `market` not `personal` classifies as
 /// [`NativeCacheKind::RemotePluginParent`] — classification alone does not
-/// prove remote provenance; [`freeze`] additionally requires the parent's
+/// prove remote provenance; `freeze` additionally requires the parent's
 /// native remote-install marker. Everything else — shallower or deeper
 /// paths, the managed `personal` marketplace, unsafe components,
 /// `plugins/data` — is refused: this unit never treats an unclassified
@@ -434,7 +434,7 @@ fn require_owner(uid: u32, label: &str) -> Result<()> {
 /// access and the execution bit are preserved; group/other bits are not
 /// native-private state). The walk is bounded by [`MAX_TREE_ENTRIES`],
 /// [`MAX_FILE_BYTES`], [`MAX_TREE_BYTES`], [`MAX_DEPTH`], and
-/// [`TIME_BUDGET`], and its canonical manifest by [`MAX_TREE_MANIFEST_BYTES`];
+/// `TIME_BUDGET`, and its canonical manifest by [`MAX_TREE_MANIFEST_BYTES`];
 /// each payload is streamed through a running hash without buffering the
 /// whole tree.
 fn capture(directory: &Dir, deadline: Instant) -> Result<Capture> {
@@ -522,7 +522,7 @@ fn walk_capture(
             kind => {
                 return Err(invalid(format!(
                     "native cache tree holds an unsupported entry ({kind:?}): {path}"
-                )))
+                )));
             }
         }
     }
@@ -713,7 +713,7 @@ fn remove_tree(directory: &Dir) -> Result<()> {
             kind => {
                 return Err(invalid(format!(
                     "native cache backup holds an unexpected entry: {kind:?}"
-                )))
+                )));
             }
         }
     }
@@ -734,7 +734,7 @@ fn remove_backup_child(home: &Dir, backup: &str, name: &str) -> Result<()> {
         Ok(kind) => {
             return Err(invalid(format!(
                 "backup holds an unexpected {name} shape: {kind:?}"
-            )))
+            )));
         }
         Err(error) => return Err(error),
     }
@@ -792,7 +792,7 @@ fn discard_freeze_backup(home: &Dir, backup: &str, record: &OpRecord) -> Result<
             return Err(invalid(format!(
                 "backup for {} has an unexpected shape: {entry:?}",
                 record.root
-            )))
+            )));
         }
     }
     finish_backup_removal(home, backup)
@@ -832,7 +832,7 @@ fn finish_backup_removal(home: &Dir, backup: &str) -> Result<()> {
 /// either the store already holds that manifest's tree and it fully
 /// verifies, or a managed-snapshot staging copy is imported through the
 /// existing shared-tree publisher and verified; then — under one global
-/// [`SharedStoreLock`] hold —
+/// `SharedStoreLock` hold —
 /// the original moves into its `.agent-run-native-<uuid>` backup and the
 /// root becomes one exact whole-tree symlink, after which the backup is
 /// removed only once it still hashes to the same manifest. An
@@ -884,7 +884,7 @@ pub fn freeze(
 }
 
 /// Captures and switches one real private cache root, described by
-/// [`freeze`]; the caller has already classified, overlap-checked, and
+/// `freeze`; the caller has already classified, overlap-checked, and
 /// marker-checked the root.
 fn freeze_directory(
     root: &Path,
@@ -940,11 +940,11 @@ fn freeze_directory(
 ///
 /// The link target is parsed and its store tree fully verified
 /// ([`shared_assets::verify_shared_tree`]) before anything is changed. The
-/// tree is restored as APFS clones ([`clone_tree`]: one directory clone, or
+/// tree is restored as APFS clones (`clone_tree`: one directory clone, or
 /// per-file clones where directories cannot be cloned) — independent inodes
 /// with the manifest's logical modes, never an external hardlink — into a
 /// staged backup clone, the link is removed, and the real tree is renamed
-/// into place under one global [`SharedStoreLock`] hold. The
+/// into place under one global `SharedStoreLock` hold. The
 /// restored tree contains exactly the captured native entries; the import
 /// manifest stays in the store. A root that is already a real directory
 /// returns `Ok(None)` — already private — without touching anything. A
@@ -964,7 +964,7 @@ pub fn thaw(store_root: &Path, home_path: &Path, root_key: &str) -> Result<Optio
         Ok(kind) => {
             return Err(invalid(format!(
                 "native cache root has an unsupported shape: {kind:?}"
-            )))
+            )));
         }
         Err(error) => return Err(error),
     };
@@ -1220,8 +1220,8 @@ fn rollback_to_link(
 /// its pending operation holds — so mid-freeze and mid-thaw states are
 /// pinned, not lost. Referenced trees' blob sets are then collected through
 /// `shared_tree_blob_names`, reading manifests only. The pass is bounded
-/// per home by [`MAX_CENSUS_PARENTS`] and [`MAX_CENSUS_BACKUPS`], in
-/// aggregate by [`MAX_CENSUS_BLOBS`] and one [`TIME_BUDGET`] wall-clock
+/// per home by `MAX_CENSUS_PARENTS` and `MAX_CENSUS_BACKUPS`, in
+/// aggregate by `MAX_CENSUS_BLOBS` and one `TIME_BUDGET` wall-clock
 /// budget, and never by the page size: a larger retained-home set is paged
 /// by the caller, resuming at the returned `homes` offset and merging with
 /// [`NativeRefScan::merge`]. Any unreadable home, directory, link, record,

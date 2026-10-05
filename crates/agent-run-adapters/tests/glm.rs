@@ -1,7 +1,7 @@
 //! GLM adapter and Claude-family launch contract regressions.
 
 use agent_run_adapters::{
-    auth::{glm_authenticated_with, glm_environment_with, GLM_ACCOUNT, GLM_BASE_URL, GLM_SERVICE},
+    auth::{GLM_ACCOUNT, GLM_BASE_URL, GLM_SERVICE, glm_authenticated_with, glm_environment_with},
     capabilities,
     claude::validate_runtime,
     glm::cli_model,
@@ -227,23 +227,27 @@ fn validate_keeps_claude_hook_semantics() {
 #[test]
 fn validate_rejects_foreign_auth_names_and_kinds() {
     let (request, profile) = validation_inputs();
-    assert!(validate(
-        &request,
-        &runtime(Some(Auth::FileLink {
-            source: PathBuf::from("/tmp/auth"),
-            target: "auth.json".into()
-        })),
-        &profile,
-    )
-    .is_err());
-    for name in ["ROGUE_VAR", "CLAUDE_CODE_OAUTH_TOKEN"] {
-        assert!(validate(
+    assert!(
+        validate(
             &request,
-            &runtime(Some(Auth::Environment {
-                names: vec![name.into()]
+            &runtime(Some(Auth::FileLink {
+                source: PathBuf::from("/tmp/auth"),
+                target: "auth.json".into()
             })),
             &profile,
         )
-        .is_err());
+        .is_err()
+    );
+    for name in ["ROGUE_VAR", "CLAUDE_CODE_OAUTH_TOKEN"] {
+        assert!(
+            validate(
+                &request,
+                &runtime(Some(Auth::Environment {
+                    names: vec![name.into()]
+                })),
+                &profile,
+            )
+            .is_err()
+        );
     }
 }

@@ -17,11 +17,10 @@
 //!   inferred classification.
 
 use crate::{
-    canonical,
-    domain::{nonblank, Constraint},
+    Error, Result, canonical,
+    domain::{Constraint, nonblank},
     error::invalid,
     types::{AccountLabel, PositiveFinite, Sha256Digest},
-    Error, Result,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt, path::PathBuf, str::FromStr, sync::Arc};
@@ -829,7 +828,7 @@ impl<'de> Deserialize<'de> for PhysicalQuotaKey {
 }
 
 pub use crate::legacy_provider::{
-    decode_legacy_request, legacy_runtime, DecodedLegacyRequest, LegacyRuntime,
+    DecodedLegacyRequest, LegacyRuntime, decode_legacy_request, legacy_runtime,
 };
 pub use crate::quota_snapshot::{
     NormalizedQuotaSnapshot, QuotaModelObservation, QuotaPoolObservation, QuotaWindow,
@@ -1081,10 +1080,10 @@ impl QuotaCandidateSet {
                 ));
             }
         }
-        if let SelectionIntent::Pinned(account) = &self.intent {
-            if !seen.contains(account) {
-                return Err(invalid("pinned account must appear among the candidates"));
-            }
+        if let SelectionIntent::Pinned(account) = &self.intent
+            && !seen.contains(account)
+        {
+            return Err(invalid("pinned account must appear among the candidates"));
         }
         if self.capacity_revision < 0 {
             return Err(invalid("capacity revision must be nonnegative"));
@@ -1096,7 +1095,7 @@ impl QuotaCandidateSet {
 /// The typed verdicts transactional admission can return instead of admitting.
 ///
 /// These are admission outcomes, not provider exhaustion observations, except
-/// [`QuotaExhausted`] which repeats an authoritative structured exhaustion
+/// `QuotaExhausted` which repeats an authoritative structured exhaustion
 /// fact. None of them may masquerade as another.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QuotaAdmissionError {

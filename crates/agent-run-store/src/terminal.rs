@@ -3,15 +3,15 @@
 //! A terminal state, its event, answer proof metadata, and exactly one durable
 //! completion-delivery row are written under one immediate SQLite transaction.
 
-use crate::{delivery, run_stats, tx_event, Record, Store};
+use crate::{Record, Store, delivery, run_stats, tx_event};
 use agent_run_domain::{
-    domain::{now, AgentId, Outcome, Status},
-    error::invalid,
     Result,
+    domain::{AgentId, Outcome, Status, now},
+    error::invalid,
 };
 use agent_run_platform::verify::{self, Proof};
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
-use serde_json::{json, Value};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use serde_json::{Value, json};
 
 /// Commits one terminal result and any individual completion notice it needs.
 ///

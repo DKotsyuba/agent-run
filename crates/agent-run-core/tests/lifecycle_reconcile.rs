@@ -318,12 +318,12 @@ fn lost_reconciliation_is_atomic_with_command_finalization() {
             .conn
             .prepare("SELECT state FROM commands WHERE agent_id=? ORDER BY id")
             .unwrap();
-        let rows = statement
+
+        statement
             .query_map([id.as_str()], |r| r.get(0))
             .unwrap()
             .collect::<Result<Vec<String>, _>>()
-            .unwrap();
-        rows
+            .unwrap()
     };
     assert_eq!(states(&store), ["claimed", "pending"]);
     store
@@ -460,9 +460,11 @@ fn python_test_state_outbox_reaped_supervisor_reconciles_only_active_rows() {
     );
     assert_eq!(store.get(&other).unwrap().status, Status::Running);
     assert_eq!(store.get(&terminal).unwrap().status, Status::Failed);
-    assert!(reconcile_reaped_supervisor(&mut store, 100, 7.0, 100)
-        .unwrap()
-        .is_empty());
+    assert!(
+        reconcile_reaped_supervisor(&mut store, 100, 7.0, 100)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// Mirrors `tests/test_state_outbox.py::test_reaped_agent_closes_the_pre_identity_starting_window`.
@@ -498,9 +500,11 @@ fn python_test_state_outbox_supervisor_group_refines_once() {
         (101, "pid-100", 4242),
         (100, "other", 4242),
     ] {
-        assert!(store
-            .record_supervisor(&id, pid, identity, group, None, 9.0)
-            .is_err());
+        assert!(
+            store
+                .record_supervisor(&id, pid, identity, group, None, 9.0)
+                .is_err()
+        );
     }
     let row = store.get(&id).unwrap();
     assert_eq!(
@@ -716,9 +720,11 @@ fn lost_convergence_releases_active_capacity() {
         .unwrap(),
         vec![id]
     );
-    assert!(store
-        .admit(&home.request(), &config, &json!({}), None)
-        .is_ok());
+    assert!(
+        store
+            .admit(&home.request(), &config, &json!({}), None)
+            .is_ok()
+    );
 }
 
 /// Mirrors `tests/test_reconciliation.py::UnownedStartingReconciliationTests::test_live_owner_survives_elapsed_startup_deadline`
@@ -757,9 +763,11 @@ fn handoff_renews_deadline_until_late_supervisor_proof() {
     store
         .claim_startup(&id, owner, Some(12.5), 10.0, 120.0)
         .unwrap();
-    assert!(store
-        .begin_supervisor_handoff(&id, owner, 129.0, 40.0)
-        .unwrap());
+    assert!(
+        store
+            .begin_supervisor_handoff(&id, owner, 129.0, 40.0)
+            .unwrap()
+    );
     let deadline: f64 = store
         .conn
         .query_row(
@@ -796,9 +804,11 @@ fn elapsed_handoff_with_live_owner_remains_starting() {
     store
         .claim_startup(&id, owner, Some(12.5), 10.0, 120.0)
         .unwrap();
-    assert!(store
-        .begin_supervisor_handoff(&id, owner, 129.0, 10.0)
-        .unwrap());
+    assert!(
+        store
+            .begin_supervisor_handoff(&id, owner, 129.0, 10.0)
+            .unwrap()
+    );
 
     assert!(
         reconcile_with(&mut store, 10, |_, _, _| ProcessState::Alive)
@@ -825,9 +835,11 @@ fn generated_handoff_never_uses_elapsed_time_as_loss_proof() {
                 let handoff_seconds = 11 - preparation_delay + handoff_extension;
                 let handoff_at = preparation_delay as f64;
                 let deadline = handoff_at + handoff_seconds as f64;
-                assert!(store
-                    .begin_supervisor_handoff(&id, owner, handoff_at, handoff_seconds as f64)
-                    .unwrap());
+                assert!(
+                    store
+                        .begin_supervisor_handoff(&id, owner, handoff_at, handoff_seconds as f64)
+                        .unwrap()
+                );
                 assert!(
                     reconcile_with(&mut store, 10, |_, _, _| ProcessState::Alive)
                         .unwrap()
@@ -1093,10 +1105,12 @@ fn orphan_recovery_uses_durable_members_after_leader_exit() {
                 .unwrap()
                 .snapshot()
                 .unwrap();
-            assert!(retained
-                .members
-                .iter()
-                .any(|member| member.pid == descendant.pid && member.token == descendant.token));
+            assert!(
+                retained
+                    .members
+                    .iter()
+                    .any(|member| member.pid == descendant.pid && member.token == descendant.token)
+            );
         }
         assert!(
             started.elapsed() < Duration::from_secs(3),

@@ -3,7 +3,7 @@
 mod common;
 
 use agent_run_core::{agent_identity, dispatch, hooks::bind, journal, service::Service};
-use agent_run_domain::{domain::AgentId, domain::Outcome, Error};
+use agent_run_domain::{Error, domain::AgentId, domain::Outcome};
 use agent_run_platform::{fs, verify};
 use serde_json::json;
 use std::path::Path;
@@ -201,10 +201,12 @@ async fn receipt_pins_delayed_binding_and_wait_without_exposing_run_ids() {
     }});
     let bound = bind::run_hook(&mut store, &payload, "codex_queue", None).unwrap();
     assert_eq!(bound.run_id, child);
-    assert!(serde_json::to_value(&bound)
-        .unwrap()
-        .get("run_id")
-        .is_none());
+    assert!(
+        serde_json::to_value(&bound)
+            .unwrap()
+            .get("run_id")
+            .is_none()
+    );
     assert!(!bound.message().contains(child.as_str()));
     assert_eq!(store.delivery_status(&latest).unwrap()["bound"], false);
     let service = Service::new(home.path.clone());
@@ -213,13 +215,15 @@ async fn receipt_pins_delayed_binding_and_wait_without_exposing_run_ids() {
         .unwrap();
     assert_eq!(answer["agent_id"], root.as_str());
     assert!(answer.get("run_id").is_none());
-    assert!(dispatch::call(
-        &service,
-        "wait",
-        json!({"agent_id":root,"sequence":2,"run_id":latest})
-    )
-    .await
-    .is_err());
+    assert!(
+        dispatch::call(
+            &service,
+            "wait",
+            json!({"agent_id":root,"sequence":2,"run_id":latest})
+        )
+        .await
+        .is_err()
+    );
     for sequence in [
         json!(0),
         json!(-1),

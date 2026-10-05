@@ -23,7 +23,7 @@ agent-run agents: {{ returned }} of {{ total }} matching (offset {{ offset }})
 {% if agent.cleanup_unconfirmed %}
   cleanup unconfirmed{% if agent.process_state %} (process {{ agent.process_state }}){% endif %}{{ "" }}
 {% endif %}
-  binding: {{ "bound" if agent.bound else "not bound" }} ({{ agent.delivery_state }}){{ "" }}
+  binding: {{ "unknown" if agent.bound is none else "bound" if agent.bound else "not bound" }} ({{ agent.delivery_state }}){{ "" }}
 {% endfor %}
 {% if complete %}
 page complete: no further matching rows (total {{ total }})

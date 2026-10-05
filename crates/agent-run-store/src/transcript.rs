@@ -2,13 +2,13 @@
 
 use crate::Store;
 use agent_run_domain::{
+    Result,
     domain::AgentId,
     transcript::{TranscriptQuery, TranscriptView},
     views::MessageView,
-    Result,
 };
-use rusqlite::{params, Connection, OptionalExtension};
-use serde_json::{json, Value};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::{Value, json};
 
 /// Maximum fragments inspected per page, plus one boundary lookahead.
 pub const MAX_BLOCK_SCAN_ROWS: usize = 4096;

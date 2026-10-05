@@ -1,0 +1,63 @@
+# Agent MCP family declaration for agent-run.
+#
+# Product-owned adoption record for the Agent MCP family standard
+# (1.0.0-rc.2). This file declares what agent-run is and which baseline it
+# was reviewed against; it is not a compliance certificate. Read
+# docs/family-standard.md before editing: values here must stay truthful,
+# and `cargo xtask family verify` pins this file's digest in
+# .family/manifest.json.
+
+schema_version = 1
+product = "agent-run"
+repository = "DKotsyuba/agent-run"
+env_prefix = "AGENT_RUN_"
+standard_version = "1.0.0-rc.2"
+response_profile = "rust-minijinja-v1"
+response_profile_version = "0.1.0"
+# Devkit whose standard documents and scaffold were reviewed for this
+# adoption; the exact template revision is recorded in .family/manifest.json.
+devkit_version = "0.2.1"
+baseline = "rust-macos-2026-09-candidate1"
+# No blanket qualification is claimed: published releases carry historical
+# macOS qualification, and new code and hosts stay not_verified until tested.
+qualification = "not_verified"
+
+[profiles]
+# The resident broker owns execution, durable SQLite state, and bound
+# completion delivery; CLI and MCP front ends submit through it.
+process = "resident"
+state = "local"
+# stdio MCP is the family transport; the Unix-socket JSON-RPC API and the
+# shared CLI are agent-run's separately declared native surfaces.
+transports = ["stdio"]
+# Engine CLIs (Codex, Claude Code, GLM) are configured external programs.
+external_programs = "tools"
+# Host-specific integration exists: the signed Desktop MCP frontend, host
+# hook binding, and the embedded host-supplied Node Desktop bridge.
+# Doctor reports configured tools and the optional host Node bridge explicitly.
+host_adapter = true
+
+[native_surfaces]
+# Product surfaces separate from the MCP transport axis above.
+transports = ["cli", "unix-socket-json-rpc"]
+
+[compatibility]
+supported_protocol_revisions = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"]
+# Historically qualified through the published native releases; every
+# release re-runs the native gate before this stays true.
+qualified_targets = ["aarch64-apple-darwin"]
+candidate_targets = []
+# No host has passed a formal family host-matrix qualification. Observed
+# integrations and unknowns are separated in docs/family-standard.md.
+qualified_hosts = []
+
+[release]
+enabled = true
+workflow = "release.yml"
+# agent-run's richer sealed-directory bundle (bin/, collectors/, services/,
+# metadata.json, SHA256SUMS, COMPLETE) rather than the template's
+# single-binary-v1 profile.
+delivery_profile = "agent-run-archive-v1"
+# GitHub TLS/repository identity plus artifact checksums and release
+# attestations, as implemented by the current release workflow.
+trust_profile = "github-attestation"

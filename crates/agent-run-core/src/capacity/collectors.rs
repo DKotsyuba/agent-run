@@ -5,19 +5,19 @@ pub use super::quota_auth::QuotaCredentialReader;
 use super::quota_auth::{BACKOFF_PERSIST_FAILED, CREDENTIAL_UNAVAILABLE, STORE_FAILED};
 use super::{
     executable,
-    quota::{normalize_collector_output, CollectorScope, MAX_OUTPUT_MODELS, MAX_OUTPUT_WINDOWS},
+    quota::{CollectorScope, MAX_OUTPUT_MODELS, MAX_OUTPUT_WINDOWS, normalize_collector_output},
 };
 use crate::domain::now;
 use agent_run_adapters::authorized_request::CredentialReader;
 use agent_run_config::provider_config::ProviderConfig;
 use agent_run_domain::{
+    CredentialRef, Result,
     catalog::{
         AccountId, AccountStatus, CollectorBinding, HarnessId, LimitsSource, ProviderCatalog,
         ProviderId,
     },
-    CredentialRef, Result,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -27,7 +27,7 @@ use std::{
 ///
 /// The key is `(global account id, stable collector source)`, so two provider
 /// labels over one physical account suppress duplicate remote requests after
-/// failures together. The delay grows exponentially from [`BASE_DELAY_SECONDS`]
+/// failures together. The delay grows exponentially from `BASE_DELAY_SECONDS`
 /// and is capped at [`MAX_DELAY_SECONDS`] or an endpoint-declared
 /// `retry-after` horizon; a success clears it. State is durable in
 /// `capacity/backoff.json` under the agent-run home so suppression survives
@@ -415,11 +415,7 @@ pub async fn collect_providers(home: &Path, config: &ProviderConfig) -> Result<V
             }
         }
         let status = if issues.is_empty() {
-            if windows == 0 {
-                "no_data"
-            } else {
-                "collected"
-            }
+            if windows == 0 { "no_data" } else { "collected" }
         } else {
             "failed"
         };

@@ -647,17 +647,16 @@ impl OwnedProcess {
     pub fn signal(&mut self, sig: i32) -> Result<bool> {
         self.refresh();
         let mut signalled = false;
-        if let Some(p) = &self.leader {
-            if p.group == self.pid
-                && signal_allowed(observe(Some(p.pid), Some(&p.token), Some(p.birth)))
-            {
-                // SAFETY: signal only the verified child-created process group; never group 0/1.
-                let code = unsafe { libc::kill(-self.pid, sig) };
-                if code == 0 {
-                    signalled = true;
-                } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
-                    return Err(std::io::Error::last_os_error().into());
-                }
+        if let Some(p) = &self.leader
+            && p.group == self.pid
+            && signal_allowed(observe(Some(p.pid), Some(&p.token), Some(p.birth)))
+        {
+            // SAFETY: signal only the verified child-created process group; never group 0/1.
+            let code = unsafe { libc::kill(-self.pid, sig) };
+            if code == 0 {
+                signalled = true;
+            } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+                return Err(std::io::Error::last_os_error().into());
             }
         }
         Ok(signalled)

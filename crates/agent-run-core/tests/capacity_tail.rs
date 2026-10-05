@@ -8,9 +8,9 @@
 //! capacity behaviors.
 
 use agent_run_core::capacity::{
-    self,
+    self, Forecast, Key, Pool, Route, Sample, Slice, Topology,
     advice::{advice_key, build_advice, capacity_label},
-    persist, sources, Forecast, Key, Pool, Route, Sample, Slice, Topology,
+    persist, sources,
 };
 
 // --- Advice (`agent_run.capacity.advice`) -----------------------------------
@@ -460,11 +460,13 @@ fn same_runtime_keeps_distinct_scopes_and_key_runtimes() {
         pools: vec![tp_pool("pool-team1", key.clone())],
         routes: vec![],
     };
-    assert!(topology
-        .pools
-        .iter()
-        .flat_map(|pool| &pool.keys)
-        .all(|key| key.runtime == TP_RUNTIME));
+    assert!(
+        topology
+            .pools
+            .iter()
+            .flat_map(|pool| &pool.keys)
+            .all(|key| key.runtime == TP_RUNTIME)
+    );
 
     for (scope, observed) in [("account:personal2", 1.0), ("account:work", 3.0)] {
         persist(
@@ -956,9 +958,11 @@ fn missing_unknown_and_legacy_evidence_never_become_routes() {
     let reasons = deferred_reasons(&order);
     assert!(reasons.contains(&("runtime-missing".into(), "missing_forecast".into())));
     assert!(reasons.contains(&("runtime-unknown".into(), "unknown_forecast".into())));
-    assert!(!reasons
-        .iter()
-        .any(|(runtime, _)| runtime == "legacy-runtime"));
+    assert!(
+        !reasons
+            .iter()
+            .any(|(runtime, _)| runtime == "legacy-runtime")
+    );
 }
 
 /// Mirrors `tests/test_capacity_snapshot.py::CapacitySnapshotTests::test_invalid_inputs_raise_validation_error`.
@@ -975,14 +979,16 @@ fn invalid_snapshot_inputs_are_rejected() {
     std::fs::write(home.path().join("config.toml"), text).unwrap();
     assert!(agent_run_core::config::Config::load(home.path()).is_err());
 
-    assert!(capacity::ranking::rank_capacity_routes(
-        vec![],
-        vec![],
-        &std::collections::BTreeMap::new(),
-        &std::collections::BTreeMap::new(),
-        f64::NAN,
-    )
-    .is_err());
+    assert!(
+        capacity::ranking::rank_capacity_routes(
+            vec![],
+            vec![],
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            f64::NAN,
+        )
+        .is_err()
+    );
 }
 
 /// Mirrors `tests/test_capacity_topology.py::TopologyValidationTests::test_validation_is_independent_of_input_order`.
