@@ -54,6 +54,73 @@ pub fn attestation(
     )
 }
 
+/// Finds an exact release without assuming the tag endpoint exposes drafts.
+/// After its allowed 404, authenticated list/ID GETs share the caller's deadline
+/// and existing API byte/retry limits. At most five 100-entry pages are scanned;
+/// malformed, ambiguous, inaccessible or incomplete inventories fail closed.
+/// A listed candidate is reread by its positive numeric ID, with tag, ID and
+/// draft state checked again. No release is created, changed or retried here.
+fn lookup(root: &Path, tag: &str, deadline: Instant) -> Result<Option<serde_json::Value>, String> {
+    let endpoint = format!("repos/{REPOSITORY}/releases/tags/{tag}");
+    if let Some(release) =
+        release_wait::api(root, &endpoint, deadline, true).map_err(|e| e.reason)?
+    {
+        return Ok(Some(release));
+    }
+    let mut candidate = None;
+    for page in 1..=5 {
+        let response = release_wait::api(
+            root,
+            &format!("repos/{REPOSITORY}/releases?per_page=100&page={page}"),
+            deadline,
+            false,
+        )
+        .map_err(|e| e.reason)?
+        .ok_or("release list unavailable")?;
+        let releases = response.as_array().ok_or("release list invalid")?;
+        if releases.len() > 100 {
+            return Err("release list page limit exceeded".into());
+        }
+        for release in releases {
+            if release["tag_name"] == tag {
+                if candidate.is_some() {
+                    return Err("ambiguous releases for publication tag".into());
+                }
+                let id = release["id"]
+                    .as_u64()
+                    .filter(|id| *id > 0)
+                    .ok_or("listed release ID invalid")?;
+                let draft = release["draft"]
+                    .as_bool()
+                    .ok_or("listed release draft state invalid")?;
+                candidate = Some((id, draft));
+            }
+        }
+        if releases.len() < 100 {
+            break;
+        }
+        if page == 5 {
+            return Err("release pagination limit reached".into());
+        }
+    }
+    let Some((id, draft)) = candidate else {
+        return Ok(None);
+    };
+    let release = release_wait::api(
+        root,
+        &format!("repos/{REPOSITORY}/releases/{id}"),
+        deadline,
+        false,
+    )
+    .map_err(|e| e.reason)?
+    .ok_or("listed release unavailable")?;
+    if release["id"].as_u64() != Some(id) || release["tag_name"] != tag || release["draft"] != draft
+    {
+        return Err("listed release identity changed".into());
+    }
+    Ok(Some(release))
+}
+
 /// Downloads and verifies remote inventory in fresh retained scratch. Drafts and
 /// published releases use identical hash/size/evidence checks; neither is overwritten.
 fn remote(
@@ -150,9 +217,7 @@ pub fn command(root: &Path, args: &[String]) -> Result<(), String> {
     }
     attestation(root, &directory.join(MANIFEST), &manifest, deadline)?;
     let endpoint = format!("repos/{REPOSITORY}/releases/tags/{}", manifest.tag);
-    if let Some(existing) =
-        release_wait::api(root, &endpoint, deadline, true).map_err(|e| e.reason)?
-    {
+    if let Some(existing) = lookup(root, &manifest.tag, deadline)? {
         if existing["draft"] != false {
             return Err("existing draft requires manual reconciliation; no overwrite".into());
         }
@@ -197,9 +262,7 @@ pub fn command(root: &Path, args: &[String]) -> Result<(), String> {
         create.push(directory.join(name).to_string_lossy().into_owned());
     }
     gh(root, create, deadline)?;
-    let draft = release_wait::api(root, &endpoint, deadline, false)
-        .map_err(|e| e.reason)?
-        .ok_or("created draft unavailable")?;
+    let draft = lookup(root, &manifest.tag, deadline)?.ok_or("created draft unavailable")?;
     remote(root, &manifest, &draft, false, deadline)?;
     if release_wait::tag(root, &manifest.tag, &commit, deadline).map_err(|e| e.reason)?
         != Some(tag.clone())
