@@ -4,6 +4,14 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.21.2
+
+- fix(release): discover authenticated draft releases through bounded list and
+  numeric-ID reads when GitHub's tag endpoint returns 404; preserve inventory,
+  provenance, exact-source and no-overwrite verification
+- docs(tui): clarify that CLI and the redesigned Sessions/Pools observer ship
+  at one version, and existing observer windows must restart after an update
+
 ## 0.21.1
 
 - fix(release): verify and publish payloads from relative directories without

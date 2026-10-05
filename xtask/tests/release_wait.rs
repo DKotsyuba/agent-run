@@ -249,7 +249,8 @@ case "$1" in
       esac
     fi
     case "$endpoint" in
-      */releases/tags/*) if [ ! -f "$TEST_FIXTURE/release.json" ]; then printf 'HTTP/2.0 404 Not Found\r\n\r\n{}'; exit 1; fi ;;
+      */releases\?*) if [ "${TEST_RELEASE_LIST_DENIED:-0}" = 1 ]; then printf 'HTTP/2.0 403 Forbidden\r\n\r\n{}'; exit 1; fi ;;
+      */releases/tags/*) if [ ! -f "$TEST_FIXTURE/release.json" ] || grep -q '"draft":true' "$TEST_FIXTURE/release.json"; then printf 'HTTP/2.0 404 Not Found\r\n\r\n{}'; exit 1; fi ;;
     esac
     printf 'HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n\r\n'
   fi
@@ -261,6 +262,8 @@ case "$1" in
    */git/ref/tags/*) cat "$TEST_FIXTURE/tag.json" ;;
    */git/tags/*) cat "$TEST_FIXTURE/tag-object.json" ;;
    */releases/tags/*) if [ -f "$TEST_FIXTURE/release.json" ]; then cat "$TEST_FIXTURE/release.json"; else echo 'HTTP 404' >&2; exit 1; fi ;;
+   */releases\?*) if [ -f "$TEST_FIXTURE/releases.json" ]; then cat "$TEST_FIXTURE/releases.json"; elif [ -f "$TEST_FIXTURE/release.json" ]; then printf '[';cat "$TEST_FIXTURE/release.json";printf ']';else printf '[]';fi ;;
+   */releases/29) if [ -f "$TEST_FIXTURE/release-id.json" ]; then cat "$TEST_FIXTURE/release-id.json";else cat "$TEST_FIXTURE/release.json";fi ;;
    */contents/*) if [ "${TEST_STALL_STAGE:-}" = source ]; then touch "$TEST_FIXTURE/leaf-started"; sleep 6; exit 1; fi; name=${endpoint##*/};name=${name%%\?*};cat "$TEST_FIXTURE/source/$name" ;;
    *) exit 9 ;;
   esac ;;
@@ -949,7 +952,9 @@ fn package_create_verify_accept_relative_and_absolute_directories() {
 
 /// Publisher verifies its draft/downloads/provenance before publication, accepts
 /// relative-directory publication and absolute-directory exact published no-op,
-/// and refuses a conflicting existing draft or failed verifier.
+/// and refuses a conflicting existing draft or failed verifier. Draft tag reads
+/// return GitHub's real 404 shape while list/ID reads expose the owned draft;
+/// ambiguous, malformed, incomplete, changed and forbidden reads never write.
 #[test]
 fn staged_publisher_exact_noop_and_existing_draft_refusal() {
     let fixture = Fixture::new();
@@ -1005,6 +1010,42 @@ fn staged_publisher_exact_noop_and_existing_draft_refusal() {
     let output = fixture.output(invoke(Path::new("../assets")));
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("existing draft"));
+    let draft: Value =
+        serde_json::from_slice(&fs::read(fixture.temp.path().join("draft.json")).unwrap()).unwrap();
+    let mut unrelated = draft.clone();
+    unrelated["tag_name"] = json!("v0.0.0");
+    let mut zero_id = draft.clone();
+    zero_id["id"] = json!(0);
+    for (list, reason) in [
+        (json!([zero_id]), "listed release ID invalid"),
+        (json!([draft.clone(), draft.clone()]), "ambiguous releases"),
+        (json!({}), "release list invalid"),
+        (json!(vec![unrelated; 100]), "release pagination limit"),
+    ] {
+        record(&fixture.temp.path().join("releases.json"), &list);
+        let output = fixture.output(invoke(Path::new("../assets")));
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(reason));
+    }
+    record(
+        &fixture.temp.path().join("releases.json"),
+        &json!([draft.clone()]),
+    );
+    for (field, value) in [("id", json!(30)), ("tag_name", json!("v0.0.0"))] {
+        let mut changed = draft.clone();
+        changed[field] = value;
+        record(&fixture.temp.path().join("release-id.json"), &changed);
+        let output = fixture.output(invoke(Path::new("../assets")));
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("listed release identity changed")
+        );
+    }
+    let mut denied = invoke(Path::new("../assets"));
+    denied.env("TEST_RELEASE_LIST_DENIED", "1");
+    let output = fixture.output(denied);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("authentication/access denied"));
     let mut command = invoke(Path::new("../assets"));
     command.env("TEST_ATTEST_FAIL", "1");
     let output = fixture.output(command);
