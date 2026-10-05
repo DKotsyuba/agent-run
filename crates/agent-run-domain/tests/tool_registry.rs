@@ -197,6 +197,26 @@ fn start_description_extends_the_python_baseline_exactly() {
     );
 }
 
+/// The stable-agent resume description adds exactly the keyed-replay condition.
+/// Its optional key cannot advertise unconditional idempotency; every remaining
+/// discovery field stays compared against the declared frozen-baseline deltas.
+#[test]
+fn resume_description_discloses_optional_key_replay_exactly() {
+    let base = "Continue the latest terminal execution of a stable agent in the same native context. agent_id stays constant. Concurrent continuations cannot create parallel active runs. Reuse request_id for an identical retry, including after later resumes. Identity, permissions, native-history and cleanup checks remain mandatory.";
+    let replay = " Replays are idempotent only with the same nonempty request_id and identical arguments; without a key each call may admit new work.";
+    let resume = tool("resume").unwrap();
+    assert_eq!(resume.description, format!("{base}{replay}"));
+    assert_eq!(resume.description.matches(replay).count(), 1);
+    let key = resume
+        .arguments()
+        .into_iter()
+        .find(|argument| argument.name == "request_id")
+        .unwrap();
+    assert!(!key.required);
+    assert_eq!(key.default, Some(ArgumentDefault::Null));
+    assert!(!resume.annotations.idempotent_hint);
+}
+
 /// All current discovery entries carry explicit reviewed effect hints. Optional
 /// admission keys do not claim unconditional replay safety; cancellation is destructive.
 #[test]
@@ -205,19 +225,96 @@ fn annotations_preserve_effect_and_worker_boundaries() {
         let hints = &definition.annotations;
         let write = matches!(
             definition.name.as_str(),
-            "start" | "resume" | "cancel" | "steer"
+            "start" | "resume" | "cancel" | "steer" | "start_pool" | "pool_post" | "pool_replace"
         );
         assert_eq!(hints.read_only_hint, !write, "{}", definition.name);
-        assert_eq!(hints.destructive_hint, definition.name == "cancel");
-        assert_eq!(hints.idempotent_hint, !write);
+        assert_eq!(
+            hints.destructive_hint,
+            matches!(definition.name.as_str(), "cancel" | "pool_replace"),
+            "{}",
+            definition.name
+        );
+        // Pool writes require a scoped key; ordinary admissions/controls do
+        // not guarantee one identical call has no additional durable effect.
+        let unkeyed = matches!(
+            definition.name.as_str(),
+            "start" | "resume" | "cancel" | "steer"
+        );
+        assert_eq!(hints.idempotent_hint, !unkeyed, "{}", definition.name);
+        let external = matches!(
+            definition.name.as_str(),
+            "start" | "resume" | "cancel" | "steer" | "models" | "start_pool" | "pool_replace"
+        );
+        assert_eq!(hints.open_world_hint, external, "{}", definition.name);
+        if write && !unkeyed {
+            assert!(
+                definition
+                    .arguments()
+                    .iter()
+                    .any(|argument| argument.name == "request_id" && argument.required)
+            );
+        }
     }
     let worker = agent_run_domain::tools::worker_registry();
-    assert_eq!(worker.len(), 1);
-    assert_eq!(worker[0].name, "notify_orchestrator");
-    assert!(!worker[0].annotations.read_only_hint);
-    assert!(!worker[0].annotations.destructive_hint);
-    assert!(worker[0].annotations.idempotent_hint);
-    assert!(worker[0].annotations.open_world_hint);
+    assert_eq!(
+        worker
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "notify_orchestrator",
+            "pool_post",
+            "pool_read",
+            "pool_propose",
+            "pool_vote"
+        ]
+    );
+    for definition in worker {
+        let hints = &definition.annotations;
+        assert_eq!(
+            hints.read_only_hint,
+            definition.name == "pool_read",
+            "{}",
+            definition.name
+        );
+        // Proposals replace consensus and votes can revoke readiness; append-only
+        // storage does not make those effects non-destructive.
+        assert_eq!(
+            hints.destructive_hint,
+            matches!(definition.name.as_str(), "pool_propose" | "pool_vote"),
+            "{}",
+            definition.name
+        );
+        assert!(hints.idempotent_hint, "{}", definition.name);
+        assert_eq!(
+            hints.open_world_hint,
+            definition.name == "notify_orchestrator",
+            "{}",
+            definition.name
+        );
+        let arguments = definition.arguments();
+        if !hints.read_only_hint {
+            assert!(
+                arguments
+                    .iter()
+                    .any(|argument| argument.name == "request_id" && argument.required)
+            );
+        }
+        for forbidden in [
+            "agent_id",
+            "run_id",
+            "attempt_id",
+            "token",
+            "pool_id",
+            "author",
+        ] {
+            assert!(
+                arguments.iter().all(|argument| argument.name != forbidden),
+                "{} cannot accept {forbidden}",
+                definition.name
+            );
+        }
+    }
 }
 
 /// The additive `delegation_guide` read extends the frozen Python table by
