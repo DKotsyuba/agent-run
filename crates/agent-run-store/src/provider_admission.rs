@@ -54,10 +54,27 @@ fn replayed(
     record: &Record,
     request: &ProviderStartRequest,
 ) -> Result<ProviderAdmission> {
-    let fingerprint = canonical::sha256_hex(&serde_json::to_value(request)?, true);
+    let request_value = serde_json::to_value(request)?;
+    let mut fingerprints = vec![canonical::sha256_hex(&request_value, true)];
+    if let Some(reference) = &request.orchestrator {
+        let alias = match reference.canonical_transport()? {
+            "codex_queue" => "codex",
+            "claude_uds" => "claude",
+            _ => unreachable!(),
+        };
+        let mut legacy = request_value;
+        legacy["orchestrator"]["transport"] = json!(alias);
+        fingerprints.push(canonical::sha256_hex(&legacy, true));
+    }
     let identity = record.identity.as_ref().ok_or(Error::Conflict)?;
     if identity["provider_identity_version"] != 2
-        || identity["replay_request_sha256"] != fingerprint
+        || !identity["replay_request_sha256"]
+            .as_str()
+            .is_some_and(|previous| {
+                fingerprints
+                    .iter()
+                    .any(|fingerprint| fingerprint == previous)
+            })
     {
         return Err(Error::Conflict);
     }

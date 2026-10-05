@@ -46,6 +46,25 @@ fn report(key: &str) -> NotifyRequest {
     }
 }
 
+/// Immutable pre-normalization session aliases admit reports through the same family.
+#[test]
+fn stability_legacy_transport_alias_reports() {
+    for alias in ["codex", "claude"] {
+        let (_home, mut store, run, attempt) = running();
+        store
+            .issue_worker_capability(&run, &attempt, TOKEN, 100.0)
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE orchestrator_sessions SET transport=?", [alias])
+            .unwrap();
+        let receipt = store
+            .notify_orchestrator(&run, &attempt, TOKEN, &report("alias"), 191.0)
+            .unwrap();
+        assert_eq!(receipt.state, "pending");
+    }
+}
+
 /// A delayed start still expires at admission time; accepted reports are durable and idempotent.
 #[test]
 fn active_report_replay_and_deadline() {

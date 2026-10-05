@@ -119,7 +119,11 @@ cargo xtask release rollback --prefix "$prefix" --home "$home"
 the retained deployment journal and therefore accept only `--prefix` and
 `--home`. The deployer verifies the manifest before switching `current`, checks
 schema compatibility, backs up state, and records a
-private deployment journal.
+private deployment journal. Rollback restores each retained file through a
+private same-directory temporary, syncs it, atomically renames it and syncs the
+directory. A copy failure preserves the previous file. This is atomic per file,
+not across the database and configuration together; recovery still uses the
+journal and operator-established quiescence. SQLite WAL sidecars are preserved.
 The raw xtask recovery/deploy commands require operator-established quiescence;
 the extra broker and SQLite locks belong to the standalone `install` wrapper.
 

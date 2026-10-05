@@ -30,15 +30,20 @@ const ROW_BATCH: i64 = 2_000;
 /// SQL for one agent `x` that retention may treat as expired for a pool:
 /// terminal with a known finish time older than the cutoff (`?1`) or in a
 /// count-expired lineage (`retention_roots`), with no owned attempt, no attempt
-/// lacking verified cleanup, and no linked notice still queued or being sent.
+/// lacking verified cleanup, queued notice, workflow reference, active managed-service
+/// lease, or prepared runtime layout. Protected members retain their pool history.
 /// Notices that are `waiting_binding` do not protect: they have no recipient
 /// to wait for once the whole pool is otherwise expired (see
-/// [`POOL_RELEASABLE`]).
+/// [`pool_releasable`]).
 const POOL_AGENT_EXPIRED: &str = "(x.status IN ('succeeded','failed','timed_out','cancelled','lost') \
      AND x.finished_at IS NOT NULL \
      AND (x.finished_at < ?1 OR COALESCE(NULLIF(x.root_agent_id,''),x.id) IN (SELECT root FROM retention_roots)) \
      AND NOT EXISTS (SELECT 1 FROM attempts t WHERE t.agent_id=x.id \
           AND (t.ownership_active=1 OR t.cleanup_proof_json IS NULL OR t.phase!='cleanup_complete')) \
+     AND NOT EXISTS (SELECT 1 FROM workflow_steps s WHERE s.agent_id=x.id) \
+     AND NOT EXISTS (SELECT 1 FROM managed_service_leases l WHERE l.agent_id=x.id AND l.released_at IS NULL) \
+     AND NOT EXISTS (SELECT 1 FROM runtime_storage_layouts r WHERE r.state='prepared' \
+          AND r.runtime_home=json_extract(x.identity_json,'$.runtime_home')) \
      AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.agent_id=x.id \
           AND d.state IN ('pending','retry_wait','sending')))";
 

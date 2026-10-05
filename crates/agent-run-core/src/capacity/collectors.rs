@@ -31,12 +31,13 @@ use std::{
 /// and is capped at [`MAX_DELAY_SECONDS`] or an endpoint-declared
 /// `retry-after` horizon; a success clears it. State is durable in
 /// `capacity/backoff.json` under the agent-run home so suppression survives
-/// the process boundary between polling rounds. This is a cooperative bound
+/// the process boundary between polling rounds. The latest failure code is retained
+/// through suppressed rounds and cleared on success. This is a cooperative bound
 /// only — it never invents quota facts, and skipped rounds leave the previous
 /// samples and durable exhaustion latch untouched.
 #[derive(Default)]
 pub struct AccountBackoff {
-    entries: BTreeMap<(String, String), (u32, f64)>,
+    entries: BTreeMap<(String, String), (u32, f64, Option<String>)>,
 }
 
 /// First failed-round delay; later rounds double it up to the cap.
@@ -51,23 +52,33 @@ impl AccountBackoff {
     pub fn suppressed(&self, account: &AccountId, source: &str, at: f64) -> bool {
         self.entries
             .get(&(account.as_str().to_owned(), source.to_owned()))
-            .is_some_and(|&(_, until)| at < until)
+            .is_some_and(|&(_, until, _)| at < until)
     }
 
-    /// Records one failed round and returns the new suppressed-until epoch.
-    pub fn record_failure(&mut self, account: &AccountId, source: &str, at: f64) -> f64 {
+    /// Records one failed round with its safe issue code and returns the new suppressed-until epoch.
+    /// The code is retained durably but is allowlisted before it appears in a report.
+    pub fn record_failure(
+        &mut self,
+        account: &AccountId,
+        source: &str,
+        at: f64,
+        issue: String,
+    ) -> f64 {
         let key = (account.as_str().to_owned(), source.to_owned());
         let failures = self
             .entries
             .get(&key)
-            .map_or(0, |(n, _)| *n)
+            .map_or(0, |(n, _, _)| *n)
             .saturating_add(1);
         let delay = BASE_DELAY_SECONDS
             * 2_f64
                 .powi((failures.min(MAX_FAILURES) - 1) as i32)
                 .min(MAX_DELAY_SECONDS / BASE_DELAY_SECONDS);
         let until = at + delay.min(MAX_DELAY_SECONDS);
-        self.entries.insert(key, (failures, until));
+        self.entries.insert(
+            key,
+            (failures, until, safe_failure_issue(&issue).then_some(issue)),
+        );
         until
     }
 
@@ -78,7 +89,7 @@ impl AccountBackoff {
         self.entries
             .entry((account.as_str().to_owned(), source.to_owned()))
             .and_modify(|entry| entry.1 = entry.1.max(until))
-            .or_insert((1, until));
+            .or_insert((1, until, None));
     }
 
     /// Clears any suppression after one successful round.
@@ -93,9 +104,24 @@ impl AccountBackoff {
         let Ok(text) = std::fs::read_to_string(home.join("capacity/backoff.json")) else {
             return Self::default();
         };
-        serde_json::from_str::<Vec<((String, String), (u32, f64))>>(&text)
+        serde_json::from_str::<Vec<((String, String), (u32, f64, Option<String>))>>(&text)
             .map(|rows| Self {
-                entries: rows.into_iter().collect(),
+                entries: rows
+                    .into_iter()
+                    .map(|(key, (count, until, issue))| {
+                        (key, (count, until, issue.filter(|s| safe_failure_issue(s))))
+                    })
+                    .collect(),
+            })
+            .or_else(|_| {
+                serde_json::from_str::<Vec<((String, String), (u32, f64))>>(&text).map(|rows| {
+                    Self {
+                        entries: rows
+                            .into_iter()
+                            .map(|(key, (count, until))| (key, (count, until, None)))
+                            .collect(),
+                    }
+                })
             })
             .unwrap_or_default()
     }
@@ -108,11 +134,52 @@ impl AccountBackoff {
         let rows: Vec<_> = self
             .entries
             .iter()
-            .filter(|(_, (_, until))| *until > at)
+            .filter(|(_, (_, until, _))| *until > at)
+            .map(|(key, (count, until, issue))| {
+                (
+                    key,
+                    (
+                        *count,
+                        *until,
+                        issue.as_ref().filter(|s| safe_failure_issue(s)).cloned(),
+                    ),
+                )
+            })
             .collect();
         let text = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into());
         std::fs::write(dir.join("backoff.json"), text)
     }
+}
+
+/// Accepts only known classifications or numeric process termination evidence.
+fn safe_failure_issue(issue: &str) -> bool {
+    const KNOWN: &[&str] = &[
+        "collector_config_invalid",
+        "collector_input_invalid",
+        "collector_input_too_large",
+        "collector_spawn_failed",
+        "collector_io_failed",
+        "collector_output_too_large",
+        "collector_wait_failed",
+        "collector_timeout",
+        "collector_pipe_timeout",
+        "collector_exit_unknown",
+        "collector_cleanup_unverified",
+        "collector_output_invalid",
+        "collector_output_contains_credential",
+        CREDENTIAL_UNAVAILABLE,
+        STORE_FAILED,
+    ];
+    KNOWN.contains(&issue)
+        || ["collector_exit_status:", "collector_exit_signal:"]
+            .iter()
+            .any(|prefix| {
+                issue.strip_prefix(prefix).is_some_and(|n| {
+                    !n.is_empty()
+                        && n.bytes().all(|b| b.is_ascii_digit())
+                        && n.parse::<u32>().is_ok()
+                })
+            })
 }
 
 /// One account/executable observation, shared across every provider alias.
@@ -275,27 +342,34 @@ pub async fn collect_providers(home: &Path, config: &ProviderConfig) -> Result<V
     let mut all_ok = true;
     for unit in units {
         let at = now();
-        let mut issues = Vec::new();
+        let mut issues: Vec<String> = Vec::new();
         let mut windows = 0;
         if catalog
             .account(&unit.account)
             .is_none_or(|a| a.status != AccountStatus::Enabled)
         {
-            issues.push("account_disabled");
+            issues.push("account_disabled".into());
         } else if unit.models.is_empty() {
-            issues.push("no_bound_models");
+            issues.push("no_bound_models".into());
         } else if backoff.suppressed(&unit.account, &unit.source, at) {
-            issues.push("backoff");
+            issues.push("backoff".into());
+            if let Some((_, _, Some(issue))) = backoff
+                .entries
+                .get(&(unit.account.as_str().to_owned(), unit.source.clone()))
+                .filter(|(_, _, issue)| issue.as_deref().is_some_and(safe_failure_issue))
+            {
+                issues.push(format!("last_failure:{issue}"));
+            }
         } else {
             let outcome = async {
                 let context = context(home, config, &catalog, &unit, at)
-                    .map_err(|_| CREDENTIAL_UNAVAILABLE)?;
+                    .map_err(|_| CREDENTIAL_UNAVAILABLE.to_owned())?;
                 let raw = executable::run(&unit.binding, &context, home).await?;
                 if context["auth"]["token"]
                     .as_str()
                     .is_some_and(|token| !token.is_empty() && contains_secret(&raw, token))
                 {
-                    return Err("collector_output_contains_credential");
+                    return Err("collector_output_contains_credential".into());
                 }
                 let scope = CollectorScope {
                     runtime: unit.provider.as_str().into(),
@@ -310,7 +384,7 @@ pub async fn collect_providers(home: &Path, config: &ProviderConfig) -> Result<V
                     MAX_OUTPUT_WINDOWS,
                     MAX_OUTPUT_MODELS,
                 )
-                .map_err(|_| "collector_output_invalid")?;
+                .map_err(|_| "collector_output_invalid".to_owned())?;
                 let count = snapshot
                     .models
                     .iter()
@@ -325,8 +399,8 @@ pub async fn collect_providers(home: &Path, config: &ProviderConfig) -> Result<V
                     config.capacity.sample_retention,
                     now(),
                 )
-                .map_err(|_| STORE_FAILED)?;
-                Ok::<_, &'static str>(count)
+                .map_err(|_| STORE_FAILED.to_owned())?;
+                Ok::<_, String>(count)
             }
             .await;
             match outcome {
@@ -335,8 +409,8 @@ pub async fn collect_providers(home: &Path, config: &ProviderConfig) -> Result<V
                     backoff.record_success(&unit.account, &unit.source);
                 }
                 Err(code) => {
-                    issues.push(code);
-                    backoff.record_failure(&unit.account, &unit.source, at);
+                    issues.push(code.clone());
+                    backoff.record_failure(&unit.account, &unit.source, at, code.clone());
                 }
             }
         }

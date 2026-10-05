@@ -8,6 +8,53 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   socket, plus `agent-run pools` (`list-pools`) with optional compact `--text`
   output; pages expose exact filtered totals, bounded goal excerpts, current
   member identities and valid readiness counts, preserving frozen completion
+- feat(tui): redesign the terminal observer: truecolor theme with a 16-colour
+  fallback, split sessions/transcript view, app and key bars, overlays,
+  display labels, native tool evidence, tail-first transcripts with usage and
+  tool counts, incremental rendering with a 33 ms frame pacer and separate
+  broker lanes
+- feat(tui): add a read-only Pools tab with the pool list, roster and vote
+  validity, criteria and the full stamped chat log; brokers without
+  `list_pools` fall back to pools found in loaded sessions
+
+## [0.20.4] - 2026-10-04
+
+- fix(delivery): isolate invalid payloads, deliver cancellations without failure
+  metadata, recover missing notices on late binding and accept legacy worker
+  transport aliases without changing stored bindings
+- fix(pools): replay revoke and block votes consistently, compare vote notes,
+  reject checks on revocation and retain histories with protected members
+- fix(supervisor): recover fenced attempt snapshots across incomplete group
+  writes, persist expanded cleanup captures, and require confirmed legacy
+  descendant cleanup with durable ownership evidence
+- fix(resume): replay frozen intent before mutable configuration and filesystem
+  checks, preserving raw legacy timeout overrides independently of policy changes
+- fix(deploy): restore rollback files by synced atomic rename while preserving
+  the previous file on copy failure and keeping SQLite sidecars intact
+
+## [0.20.3] - 2026-10-04
+
+- fix(delivery): preserve acknowledgements across configuration edits and normalize
+  orchestrator transport aliases without rewriting historical bindings
+- fix(resume): replay historical schema-1 continuations and keep immutable request
+  hash checks strict across transport aliases
+- fix(capacity): expose safe collector exit diagnostics and normalize exhausted GLM
+  counters, including decimal budget boundaries, in the external collector
+- fix(supervisor): enforce legacy execution deadlines and separate reconciliation
+  from resident delivery; report unresolved terminal process ownership in Doctor
+- fix(pools): bound encoded vote checks, correct reverse pagination and Unicode
+  replacement-name checks, and expose live common-notice delivery status
+- feat(pools): expose reversible activity for cancelled and inactive pools without
+  changing stored state, frozen results or resume/replacement permissions
+- fix(retention): retain relay sockets when a refused connection cannot prove
+  the listener is dead; synchronize finite descendant-cleanup fixtures
+
+
+## [0.20.2] - 2026-10-04
+
+- fix(pools): emit only the common completion notice for successful current pool
+  members; failures, timeouts, lost runs and cancellations still notify the
+  orchestrator individually, while standalone completion notices stay unchanged
 
 ## [0.20.1] - 2026-10-04
 

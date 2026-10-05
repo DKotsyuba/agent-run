@@ -353,6 +353,9 @@ Notes for the loop:
   string of at most 512 UTF-8 bytes, and delivery attempt evidence accepts only
   its declared fields. The `wait`
   example above is for an unbound API caller, not a bound-chat polling loop.
+  Successful members of an open pool are represented by its single common pool
+  completion notice; failed or otherwise non-successful members still receive
+  individual completion notices.
 - The one-shot CLI `agent-run start` submits through this resident socket too;
   it never owns an in-process start worker that would die with the CLI. A down
   daemon is reported as `BrokerUnavailable` instead of falling back locally.

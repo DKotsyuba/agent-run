@@ -910,9 +910,10 @@ fn daily_log_created(name: &str) -> Option<f64> {
 
 /// Reclaims stale Desktop relay sockets at the home root.
 ///
-/// A socket is stale only when a fresh nonblocking connect is refused and the inode is
-/// unchanged across the probe; live sockets and unknown outcomes are retained.
-/// No process identity is guessed and nothing is killed.
+/// A socket is stale only when a fresh nonblocking connect reports the endpoint vanished
+/// and the inode is unchanged across the probe. Refusal and other uncertain outcomes are
+/// retained because a full live backlog can refuse connections. No process identity is
+/// guessed and nothing is killed; stale filesystem sockets may therefore remain.
 fn stale_sockets(home: &Path, root: &fs::Dir, proof: &StorageProtection, pass: &mut Pass) {
     let Some(names) = pass.list(root, "sockets") else {
         return;
@@ -936,8 +937,7 @@ fn stale_sockets(home: &Path, root: &fs::Dir, proof: &StorageProtection, pass: &
             continue;
         }
         pass.sockets -= 1;
-        // A full listen backlog returns pending/uncertain immediately; only an
-        // explicit refused or vanished endpoint proves a socket stale.
+        // A full live backlog can also refuse immediately, so refusal is not deletion proof.
         if !matches!(probe_socket(&home.join(name)), Ok(false)) {
             continue;
         }
@@ -958,7 +958,7 @@ fn stale_sockets(home: &Path, root: &fs::Dir, proof: &StorageProtection, pass: &
 }
 
 /// Probes a Unix socket without ever waiting for a full listen backlog.
-/// Returns `false` only for a definite refused or vanished endpoint.
+/// Returns `false` only when the endpoint path is absent; refusal and other errors remain uncertain.
 fn probe_socket(path: &Path) -> std::io::Result<bool> {
     let bytes = path.as_os_str().as_bytes();
     // SAFETY: sockaddr_un is a plain C buffer; address fields are filled before connect.
@@ -1002,7 +1002,7 @@ fn probe_socket(path: &Path) -> std::io::Result<bool> {
     }
     let error = std::io::Error::last_os_error();
     match error.raw_os_error() {
-        Some(libc::ECONNREFUSED) | Some(libc::ENOENT) => Ok(false),
+        Some(libc::ENOENT) => Ok(false),
         _ => Err(error),
     }
 }
@@ -1274,18 +1274,30 @@ mod tests {
         );
     }
 
-    /// A listener with zero queued slots still returns from the nonblocking probe promptly.
+    /// A full finite backlog may refuse a probe, but cleanup must retain the live socket.
     #[test]
-    fn zero_backlog_probe_is_bounded() {
+    fn full_backlog_refusal_does_not_unlink_live_socket() {
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("ar-cdx-v4-backlog.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         // SAFETY: listen changes only this test-owned listener's backlog.
-        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
-        let started = Instant::now();
-        let result = probe_socket(&path);
-        assert!(started.elapsed() < Duration::from_millis(200));
-        assert!(!matches!(result, Ok(false)), "a live listener is not stale");
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+        let queued = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        assert!(!matches!(probe_socket(&path), Ok(false)));
+        let root = fs::Dir::open(home.path()).unwrap();
+        Store::initialize(home.path()).unwrap();
+        let store = Store::open(home.path()).unwrap();
+        let proof = store.storage_protection_snapshot().unwrap();
+        let mut pass = Pass::new(home.path(), &root).unwrap();
+        stale_sockets(home.path(), &root, &proof, &mut pass);
+        assert!(
+            path.exists(),
+            "a refused probe must not unlink the listener"
+        );
+        drop(queued);
+        let accepted = listener.accept().unwrap();
+        drop(accepted);
+        std::os::unix::net::UnixStream::connect(&path).unwrap();
     }
 
     /// Evicting the least recently used stream resets only that traversal and allows progress.

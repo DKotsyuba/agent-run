@@ -229,17 +229,49 @@ fn is_unsafe_label_char(c: char) -> bool {
         )
 }
 
+/// Identifies one external conversation for binding and completion delivery.
+///
+/// `transport` accepts canonical `codex_queue` and `claude_uds`, plus the
+/// `codex` and `claude` aliases; normalization stores only canonical names.
+/// Session and optional turn ids are opaque, nonblank external ids. Session
+/// identity excludes the turn so later turns remain in the same durable scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrchestratorRef {
+    /// Supported delivery transport or its known user-facing alias.
     pub transport: String,
+    /// Opaque host conversation identity; not exposed in delivery diagnostics.
     pub external_session_id: String,
+    /// Optional opaque id for the current external turn.
     #[serde(default)]
     pub external_turn_id: Option<String>,
 }
 impl OrchestratorRef {
+    /// Returns the canonical delivery transport for this supported name or alias.
+    pub fn canonical_transport(&self) -> Result<&'static str> {
+        Self::canonical_transport_name(&self.transport)
+    }
+
+    /// Maps one persisted or caller-supplied name to its supported canonical transport.
+    /// Unknown names return a typed validation error.
+    pub fn canonical_transport_name(transport: &str) -> Result<&'static str> {
+        match transport {
+            "codex" | "codex_queue" => Ok("codex_queue"),
+            "claude" | "claude_uds" => Ok("claude_uds"),
+            _ => Err(invalid("unsupported orchestrator transport")),
+        }
+    }
+
+    /// Replaces a known alias with its canonical name after validating all ids.
+    pub fn normalize(&mut self) -> Result<()> {
+        self.validate()?;
+        self.transport = self.canonical_transport()?.to_owned();
+        Ok(())
+    }
+
+    /// Validates opaque ids and rejects unsupported delivery transports.
     pub fn validate(&self) -> Result<()> {
-        external_id("transport", &self.transport)?;
+        self.canonical_transport()?;
         external_id("external_session_id", &self.external_session_id)?;
         if let Some(v) = &self.external_turn_id {
             external_id("external_turn_id", v)?;
@@ -297,12 +329,30 @@ fn unique_constraints<'de, D: serde::Deserializer<'de>>(
     Ok(b)
 }
 impl StartRequest {
-    /// Validates admission inputs and canonicalizes existing directory paths and
-    /// the optional human label in place. Task text is nonblank and at most
-    /// 512 KiB; timeout, namespace and request-id bounds use shared validators.
-    /// Duplicate canonical read roots are rejected. Validation and path errors
-    /// propagate before any durable admission; no process or database is touched.
+    /// Validates admission inputs and canonicalizes directory paths, the optional
+    /// human label and known orchestrator aliases in place. Task text is nonblank
+    /// and at most 512 KiB; timeout, namespace and request-id bounds use shared
+    /// validators. Unsupported transports and duplicate canonical read roots are
+    /// rejected before durable admission.
     pub fn validate(&mut self) -> Result<()> {
+        self.validate_intent()?;
+        self.workdir = existing_dir(&self.workdir)?;
+        self.read_roots = self
+            .read_roots
+            .iter()
+            .map(|p| existing_dir(p))
+            .collect::<Result<_>>()?;
+        let mut seen = BTreeSet::new();
+        if self.read_roots.iter().any(|p| !seen.insert(p.clone())) {
+            return Err(invalid("read_roots must not contain duplicates"));
+        }
+        Ok(())
+    }
+
+    /// Validates and normalizes immutable request fields without accessing the filesystem.
+    /// Paths must be absolute; only a new admission subsequently requires them to exist.
+    /// This permits an exact durable replay after a workspace has been removed.
+    pub fn validate_intent(&mut self) -> Result<()> {
         for (name, s) in [
             ("runtime", &self.runtime),
             ("model", &self.model),
@@ -322,18 +372,15 @@ impl StartRequest {
         if let Some(v) = self.timeout_seconds {
             timeout_seconds(v)?;
         }
-        self.workdir = existing_dir(&self.workdir)?;
-        self.read_roots = self
-            .read_roots
-            .iter()
-            .map(|p| existing_dir(p))
-            .collect::<Result<_>>()?;
+        if !self.workdir.is_absolute() || self.read_roots.iter().any(|path| !path.is_absolute()) {
+            return Err(invalid("paths must be absolute"));
+        }
         let mut seen = BTreeSet::new();
         if self.read_roots.iter().any(|p| !seen.insert(p.clone())) {
             return Err(invalid("read_roots must not contain duplicates"));
         }
-        if let Some(r) = &self.orchestrator {
-            r.validate()?;
+        if let Some(r) = &mut self.orchestrator {
+            r.normalize()?;
         }
         if let Some(r) = &self.request_id {
             external_id("request_id", r)?;
@@ -389,6 +436,7 @@ pub struct Outcome {
     pub failure_text: Option<String>,
     pub runtime_session_id: Option<String>,
 }
+
 impl Outcome {
     pub fn success(session: Option<String>) -> Self {
         Self {
@@ -407,5 +455,39 @@ impl Outcome {
             failure_text: None,
             runtime_session_id: None,
         }
+    }
+}
+
+#[cfg(test)]
+/// Contract checks for supported orchestrator names and validation.
+mod orchestrator_ref_tests {
+    use super::*;
+
+    /// Known user-facing names normalize to the transport used by delivery adapters.
+    #[test]
+    fn known_transport_aliases_normalize() {
+        for (alias, canonical) in [("codex", "codex_queue"), ("claude", "claude_uds")] {
+            let mut reference = OrchestratorRef {
+                transport: alias.into(),
+                external_session_id: "session".into(),
+                external_turn_id: None,
+            };
+            reference.normalize().unwrap();
+            assert_eq!(reference.transport, canonical);
+        }
+    }
+
+    /// Unknown transport names fail with the shared typed validation code.
+    #[test]
+    fn unknown_transport_is_rejected() {
+        let reference = OrchestratorRef {
+            transport: "other".into(),
+            external_session_id: "session".into(),
+            external_turn_id: None,
+        };
+        assert_eq!(
+            reference.validate().unwrap_err().machine_code(),
+            crate::error::MachineCode::ValidationError
+        );
     }
 }

@@ -36,6 +36,8 @@ pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024;
 pub const MAX_ROLE_CHARS: usize = 48;
 /// Largest page of entries one read returns.
 pub const MAX_PAGE: u32 = 50;
+/// Maximum UTF-8 bytes in the serialized vote checks stored by SQLite.
+pub const MAX_CHECKS_JSON_BYTES: usize = 16 * 1024;
 
 /// Stable identity of one pool: `pool-YYYYMMDD-HHMMSS-<10 lowercase hex>`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
@@ -168,8 +170,9 @@ impl PoolStartRequest {
     /// Member starts are validated like ordinary starts, must not carry their
     /// own request key or orchestrator (the pool owns both), receive a
     /// deterministic `role slot` name when unnamed, and must keep names unique
-    /// ignoring case. The total composed task of every member is checked
-    /// against the ordinary task bound using placeholder identities.
+    /// ignoring case. A supported orchestrator alias is canonicalized before
+    /// this request can participate in replay identity. The total composed task
+    /// of every member is checked against the ordinary task bound.
     pub fn validate(&mut self) -> Result<()> {
         request_key(&self.request_id)?;
         bounded_text("goal", &self.goal, MAX_GOAL_BYTES)?;
@@ -180,8 +183,8 @@ impl PoolStartRequest {
             }];
         }
         validate_criteria(&self.acceptance)?;
-        if let Some(reference) = &self.orchestrator {
-            reference.validate()?;
+        if let Some(reference) = &mut self.orchestrator {
+            reference.normalize()?;
         }
         if !(MIN_MEMBERS..=MAX_MEMBERS).contains(&self.members.len()) {
             return Err(invalid("a pool needs 2 to 5 members"));
@@ -776,7 +779,8 @@ pub struct PoolVote {
     pub proposal_seq: u64,
     /// The decision.
     pub decision: VoteDecision,
-    /// Per-criterion verdicts; required for `ready`, with unique criterion ids.
+    /// Per-criterion verdicts; required for `ready`, with unique ids and a
+    /// serialized UTF-8 size no greater than [`MAX_CHECKS_JSON_BYTES`].
     #[serde(default)]
     pub checks: Vec<CriterionCheck>,
     /// Optional note, up to 8192 UTF-8 bytes.
@@ -785,8 +789,9 @@ pub struct PoolVote {
 }
 
 impl PoolVote {
-    /// Rejects an unsafe key, a proposal outside 1..=i64::MAX, duplicate or invalid checks, a
-    /// `ready` vote without checks, or an invalid note.
+    /// Rejects an unsafe key, a proposal outside 1..=i64::MAX, duplicate or invalid checks,
+    /// checks whose serialized JSON exceeds [`MAX_CHECKS_JSON_BYTES`], a `ready` vote without
+    /// checks, a revoke carrying checks, or an invalid note.
     pub fn validate(&self) -> Result<()> {
         request_key(&self.request_id)?;
         if self.proposal_seq == 0 || self.proposal_seq > i64::MAX as u64 {
@@ -799,6 +804,9 @@ impl PoolVote {
         {
             return Err(invalid("a ready vote needs 1 to 10 checks"));
         }
+        if self.decision == VoteDecision::Revoke && !self.checks.is_empty() {
+            return Err(invalid("a revoke cannot carry checks"));
+        }
         let mut ids = BTreeSet::new();
         for check in &self.checks {
             request_key(&check.criterion_id)?;
@@ -806,6 +814,11 @@ impl PoolVote {
             if !ids.insert(check.criterion_id.as_str()) {
                 return Err(invalid("check criterion ids must be unique"));
             }
+        }
+        let checks_bytes = serde_json::to_vec(&self.checks)
+            .map_err(|_| invalid("checks_json must serialize as JSON"))?;
+        if checks_bytes.len() > MAX_CHECKS_JSON_BYTES {
+            return Err(invalid("checks_json exceeds 16384 UTF-8 bytes"));
         }
         if let Some(note) = &self.message {
             bounded_text("message", note, MAX_BODY_BYTES)?;
@@ -1207,6 +1220,32 @@ mod tests {
         );
     }
 
+    /// Pool validation canonicalizes aliases and rejects unknown transports before admission.
+    #[test]
+    fn orchestrator_transport_is_normalized_before_pool_admission() {
+        for (alias, canonical) in [("codex", "codex_queue"), ("claude", "claude_uds")] {
+            let mut pool = request(2);
+            pool.orchestrator = Some(OrchestratorRef {
+                transport: alias.into(),
+                external_session_id: "session".into(),
+                external_turn_id: None,
+            });
+            pool.validate().unwrap();
+            assert_eq!(pool.orchestrator.unwrap().transport, canonical);
+        }
+
+        let mut invalid = request(2);
+        invalid.orchestrator = Some(OrchestratorRef {
+            transport: "other".into(),
+            external_session_id: "session".into(),
+            external_turn_id: None,
+        });
+        assert_eq!(
+            invalid.validate().unwrap_err().machine_code(),
+            crate::error::MachineCode::ValidationError
+        );
+    }
+
     /// Member count, key, goal, role, duplicate name and criterion bounds fail closed.
     #[test]
     fn bounds_and_duplicates_are_rejected() {
@@ -1304,7 +1343,52 @@ mod tests {
         assert!(pool_id.as_str().parse::<PoolId>().is_ok());
     }
 
-    /// A ready vote needs unique checks; block and revoke may omit them.
+    /// Accepts checks at the SQLite byte boundary and rejects escaped JSON above it.
+    #[test]
+    fn vote_checks_json_obeys_stored_byte_limit() {
+        let mut checks: Vec<_> = (0..8)
+            .map(|index| CriterionCheck {
+                criterion_id: format!("c{index}"),
+                status: CheckStatus::Met,
+                evidence: String::new(),
+            })
+            .collect();
+        let empty_bytes = serde_json::to_vec(&checks).unwrap().len();
+        let text_adjustment = (MAX_CHECKS_JSON_BYTES - empty_bytes) % 2;
+        let quote_count = (MAX_CHECKS_JSON_BYTES - empty_bytes - text_adjustment) / 2;
+        let prefix_quotes = 7 * MAX_CRITERION_BYTES;
+        let last_quotes = quote_count - prefix_quotes;
+        assert!(last_quotes < MAX_CRITERION_BYTES);
+        for check in &mut checks[..7] {
+            check.evidence = "\"".repeat(MAX_CRITERION_BYTES);
+        }
+        checks[7].evidence = format!(
+            "{}{}",
+            "a".repeat(text_adjustment),
+            "\"".repeat(last_quotes)
+        );
+        let mut vote = PoolVote {
+            request_id: "k".into(),
+            proposal_seq: 1,
+            decision: VoteDecision::Ready,
+            checks,
+            message: None,
+        };
+        assert_eq!(
+            serde_json::to_vec(&vote.checks).unwrap().len(),
+            MAX_CHECKS_JSON_BYTES
+        );
+        assert!(vote.validate().is_ok());
+
+        vote.checks[7].evidence.push('"');
+        assert_eq!(
+            serde_json::to_vec(&vote.checks).unwrap().len(),
+            MAX_CHECKS_JSON_BYTES + 2
+        );
+        assert!(matches!(vote.validate(), Err(crate::Error::Validation(_))));
+    }
+
+    /// A ready vote needs unique checks within the stored JSON byte limit; block and revoke may omit them.
     #[test]
     fn votes_require_checks_only_for_ready() {
         let check = |id: &str| CriterionCheck {

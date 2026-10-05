@@ -36,6 +36,27 @@ pub const PROVIDER_STALE_RETRIES: u32 = 3;
 
 /// Open pools the maintenance sweep inspects per pass.
 const POOL_SWEEP_LIMIT: usize = 20;
+
+/// Builds canonical and legacy-alias fingerprints for a validated request.
+/// The compatibility fingerprint changes only its known orchestrator transport.
+fn start_replay_fingerprints(request: &StartRequest) -> Result<Vec<String>> {
+    let mut fingerprints = vec![agent_run_domain::canonical::sha256_hex(
+        &serde_json::to_value(request)?,
+        true,
+    )];
+    if let Some(reference) = &request.orchestrator {
+        let alias = match reference.canonical_transport()? {
+            "codex_queue" => "codex",
+            "claude_uds" => "claude",
+            _ => unreachable!(),
+        };
+        let mut legacy = serde_json::to_value(request)?;
+        legacy["orchestrator"]["transport"] = json!(alias);
+        fingerprints.push(agent_run_domain::canonical::sha256_hex(&legacy, true));
+    }
+    Ok(fingerprints)
+}
+
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -620,18 +641,42 @@ impl Service {
         ) -> Result<QuotaCandidateSet>,
     ) -> Result<Value> {
         request.validate()?;
-        let sha = agent_run_domain::canonical::sha256_hex(&serde_json::to_value(&request)?, true);
-        let namespace = match &request.orchestrator {
-            None => "global".to_owned(),
-            Some(reference) => agent_run_domain::canonical::sha256_hex(
-                &json!([reference.transport, reference.external_session_id]),
-                true,
-            ),
+        let request_value = serde_json::to_value(&request)?;
+        let canonical_sha = agent_run_domain::canonical::sha256_hex(&request_value, true);
+        let (namespace, sha) = match &request.orchestrator {
+            None => ("global".to_owned(), canonical_sha),
+            Some(reference) => {
+                let canonical = reference.canonical_transport()?;
+                let namespace = agent_run_domain::canonical::sha256_hex(
+                    &json!([canonical, reference.external_session_id]),
+                    true,
+                );
+                (namespace, canonical_sha)
+            }
         };
-        if let Some(found) =
-            Store::open(&self.home)?.replay_pool(&namespace, &request.request_id, &sha)?
-        {
-            return self.pool_view(&Store::open(&self.home)?, &found);
+        let mut replay_keys = vec![(namespace.clone(), sha.clone())];
+        if let Some(reference) = &request.orchestrator {
+            let canonical = reference.canonical_transport()?;
+            let alias = match canonical {
+                "codex_queue" => "codex",
+                "claude_uds" => "claude",
+                _ => unreachable!(),
+            };
+            let mut compatible = request_value.clone();
+            compatible["orchestrator"]["transport"] = json!(alias);
+            replay_keys.push((
+                agent_run_domain::canonical::sha256_hex(
+                    &json!([alias, reference.external_session_id]),
+                    true,
+                ),
+                agent_run_domain::canonical::sha256_hex(&compatible, true),
+            ));
+        }
+        let store = Store::open(&self.home)?;
+        for (namespace, sha) in replay_keys {
+            if let Some(found) = store.replay_pool(&namespace, &request.request_id, &sha)? {
+                return self.pool_view(&Store::open(&self.home)?, &found);
+            }
         }
         let (config, revision) = self.current_provider_config()?;
         let accounts = Store::open(&self.home)?.list_accounts()?;
@@ -1064,8 +1109,8 @@ impl Service {
                 "runtime 'opencode' is no longer supported; remove [runtimes.opencode] from config.toml",
             ));
         }
-        let fingerprint =
-            agent_run_domain::canonical::sha256_hex(&serde_json::to_value(&request)?, true);
+        let fingerprints = start_replay_fingerprints(&request)?;
+        let fingerprint = fingerprints[0].clone();
         {
             let store = Store::open(&self.home)?;
             if let Some(row) = store.replay_request(&request)? {
@@ -1075,7 +1120,11 @@ impl Service {
                     .and_then(|v| v.get("replay_request_sha256"))
                     .and_then(Value::as_str)
                 {
-                    if previous != fingerprint || row.parent_agent_id.is_some() {
+                    if !fingerprints
+                        .iter()
+                        .any(|fingerprint| fingerprint == previous)
+                        || row.parent_agent_id.is_some()
+                    {
                         return Err(Error::Conflict);
                     }
                     logging::start(&request.runtime, &request.model, &row.id.to_string(), false);
@@ -1228,13 +1277,71 @@ impl Service {
             self.hand_off_provider(&mut result).await?;
             return Ok(result);
         }
+        // Replay of the original resume intent precedes every mutable read, as
+        // for a provider run: an old parent's retry finds its one child even
+        // after later continuations, a changed configuration or a moved home.
+        // Hash the raw override before scaling. An inherited timeout is already
+        // effective; exact retries never consult the current margin or filesystem.
+        let mut replay = parent.request.clone();
+        replay.task = task.clone();
+        replay.request_id = request_id.clone();
+        if display_name.is_some() {
+            replay.display_name = display_name.clone();
+        }
+        if let Some(explicit) = timeout {
+            replay.timeout_seconds = Some(explicit);
+        }
+        if orchestrator.is_some() {
+            replay.orchestrator = orchestrator.clone();
+        }
+        replay.validate_intent()?;
+        let intent_hash = agent_run_domain::canonical::sha256_hex(
+            &json!({"request": replay, "explicit_timeout": timeout}),
+            true,
+        );
+        {
+            let store = Store::open(&self.home)?;
+            if let Some(child) = store.replay_request(&replay)? {
+                if child.parent_agent_id.as_ref() != Some(&parent.id) {
+                    return Err(Error::Conflict);
+                }
+                let frozen_hash = child
+                    .identity
+                    .as_ref()
+                    .and_then(|value| value.get("replay_request_sha256"))
+                    .and_then(Value::as_str);
+                match frozen_hash {
+                    Some(hash) if hash != intent_hash => return Err(Error::Conflict),
+                    Some(_) => {}
+                    None => {
+                        // Historical resumes did not record the raw intent. Compare every
+                        // field using the child's frozen policy, never today's multiplier.
+                        let mut historical = replay.clone();
+                        if let Some(explicit) = timeout {
+                            historical.timeout_seconds = Some(
+                                LaunchIdentity::read(&child)?
+                                    .config
+                                    .core
+                                    .effective_timeout_seconds(Some(explicit))?,
+                            );
+                        }
+                        if store.replay_resume_child(&historical, &parent)?.is_none() {
+                            return Err(Error::Conflict);
+                        }
+                    }
+                }
+                return Ok(
+                    json!({"agent_id":child.id,"created":false,"agent":self.view(&store,&child)?}),
+                );
+            }
+        }
         if matches!(self.active_config()?.value, CachedConfigValue::Providers(_)) {
             return Err(Error::Unsupported(
                 "legacy_continuation_unavailable: a schema-1 run cannot be continued under schema 2; its history remains readable".into(),
             ));
         }
         let mut identity = LaunchIdentity::read(&parent)?;
-        identity.replay_request_sha256 = None;
+        identity.replay_request_sha256 = Some(intent_hash);
         let runtime_home = identity
             .runtime_home
             .as_deref()
@@ -1360,7 +1467,7 @@ impl Service {
             // binding, which may have been established after the first start.
             request.orchestrator = Some(shared);
         }
-        request.validate()?;
+        request.validate_intent()?;
         // Replay of the original resume intent precedes every mutable read.
         if let Some(replay) = Store::open(&self.home)?.replay_provider_request(&request)? {
             let store = Store::open(&self.home)?;
@@ -1373,6 +1480,7 @@ impl Service {
                 "created":false,"agent":self.view(&store,&row)?}),
             );
         }
+        request.validate()?;
         // A parent that already has a child is refused for that reason (the
         // child's own turns legitimately changed the parent's sealed history);
         // the unique parent index remains the final authority.
