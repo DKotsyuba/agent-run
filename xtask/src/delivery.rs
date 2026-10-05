@@ -700,6 +700,8 @@ pub fn verify(
 
 /// Verifies the same finite inventory under an enclosing observer/publisher
 /// deadline; no downloaded executable is run. Plain metadata reads are capped.
+/// Relative directories resolve from the caller's working directory; extraction
+/// uses the validated bundle basename from inside that same directory.
 pub(crate) fn verify_until(
     directory: &Path,
     accepted: &str,
@@ -739,7 +741,7 @@ pub(crate) fn verify_until(
             let temporary = tempfile::tempdir().map_err(|_| "private extraction unavailable")?;
             let args = vec![
                 "-xzf".into(),
-                path.to_string_lossy().into_owned(),
+                a.name.clone(),
                 "-C".into(),
                 temporary.path().to_string_lossy().into_owned(),
                 "--no-same-owner".into(),
