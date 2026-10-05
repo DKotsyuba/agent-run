@@ -135,6 +135,7 @@ fn fake_dependencies(
                 home: home.to_owned(),
                 checked_at: 0.0,
                 findings: Vec::new(),
+                ..agent_run::doctor::Report::default()
             })
         }),
     }

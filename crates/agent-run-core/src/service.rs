@@ -16,12 +16,12 @@ use crate::{
 use agent_run_config::provider_config::ProviderConfig;
 use agent_run_config::role_plan;
 use agent_run_domain::{
-    pool::{
-        compose_member_task, PoolDenial, PoolId, PoolPost, PoolQuery, PoolReplace, PoolSeat,
-        PoolStartRequest,
-    },
     ProviderStartRequest, Sha256Digest,
     catalog::{AccountStatus, QuotaAdmissionError, QuotaCandidateSet, ResolvedLaunchAuthority},
+    pool::{
+        PoolDenial, PoolId, PoolPost, PoolQuery, PoolReplace, PoolSeat, PoolStartRequest,
+        compose_member_task,
+    },
 };
 use agent_run_store::{
     pool_admission::{PoolAdmission, PoolAdmissionInput, PoolMemberAdmission},
@@ -580,7 +580,7 @@ impl Service {
     }
     /// Admits a whole cooperative pool atomically, choosing every account from
     /// persisted quota evidence; nothing is spawned. See
-    /// [`Self::admit_pool_with`].
+    /// `Self::admit_pool_with`.
     pub fn admit_pool(&self, request: PoolStartRequest) -> Result<Value> {
         self.admit_pool_with(
             request,
@@ -1119,7 +1119,9 @@ impl Service {
                     .and_then(|v| v.get("replay_request_sha256"))
                     .and_then(Value::as_str)
             {
-                if !fingerprints.iter().any(|fingerprint| fingerprint == previous)
+                if !fingerprints
+                    .iter()
+                    .any(|fingerprint| fingerprint == previous)
                     || row.parent_agent_id.is_some()
                 {
                     return Err(Error::Conflict);

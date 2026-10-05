@@ -126,7 +126,14 @@ it excludes task text. If proof fails, filesystem cleanup retries after a
 minute while database expiry and vacuum continue independently.
 
 Component logs now append directly to UTC-daily
-`<home>/logs/<component>.YYYY-MM-DD.log` files. Daily files older than 30 days
+`<home>/logs/<component>.YYYY-MM-DD.log` files. All cooperating current-version
+writers share a nonblocking advisory lock around the size check and append.
+Each component/day accepts at most 4 MiB and each whole record at most 8 KiB.
+Busy, full, oversized, unsafe or failed sinks suppress records; they do not
+truncate, rotate, remove existing files or spill into unbounded stderr. Legacy
+versions and external launchd writers do not participate in this new cap.
+Durable answers, execution/cleanup proof and delivery state remain separate
+from best-effort operational logging. Daily files older than 30 days
 expire after their last write is also older than 30 days. Undated legacy
 component logs and launchd stdout/stderr files remain: an idle open writer
 cannot be proven closed from age or an advisory lock, so automatic unlinking

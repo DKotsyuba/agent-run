@@ -262,7 +262,12 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     Init,
-    Doctor,
+    /// Read-only local diagnostics; emits one JSON report and exits 0/2/3.
+    Doctor {
+        /// Explicit JSON selection; JSON remains the default output.
+        #[arg(long)]
+        json: bool,
+    },
     Start(Start),
     Resume(Resume),
     /// Start a cooperative pool from one JSON request (`-` reads stdin).
@@ -1115,66 +1120,11 @@ fn operator_config(
 pub fn doc(topic: &str) -> Result<&'static str> {
     crate::dispatch::doc(topic)
 }
+/// Returns the canonical read-only local diagnostic report as JSON.
+/// Configuration/state failures are report findings; no store bootstrap, migration,
+/// broker mutation or model turn is performed. Serialization/report errors stay typed.
 pub async fn doctor(home: &Path) -> Result<Value> {
-    let (cfg, v2) = operator_config(home)?;
-    let store = Store::open(home)?;
-    let mut checks = vec![json!({"name":"state","result":store.health()?})];
-    drop(store);
-    // A schema-2 home reports its harness executables and each provider's
-    // bound accounts; an empty catalog simply has none.
-    if let Some(v2) = &v2 {
-        use std::os::unix::fs::PermissionsExt;
-        for (id, harness) in &v2.harnesses {
-            let executable = std::fs::metadata(&harness.binary)
-                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false);
-            checks.push(json!({"name":format!("harness:{}", id.as_str()),"executable":executable}));
-        }
-        for (id, provider) in &v2.providers {
-            let accounts: Vec<&str> = provider
-                .bindings
-                .iter()
-                .map(|b| b.account.as_str())
-                .collect();
-            checks.push(json!({"name":id.as_str(),"harness":provider.harness.as_str(),"accounts":accounts,"limits_source":provider.limits_source}));
-        }
-    }
-    for (name, runtime) in cfg.runtimes.iter().filter(|(_, r)| r.enabled) {
-        use std::os::unix::fs::PermissionsExt;
-        let executable = std::fs::metadata(&runtime.binary)
-            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false);
-        let mut missing = Vec::new();
-        if let Some(crate::config::Auth::Environment { names }) = &runtime.auth {
-            for n in names {
-                if std::env::var(n).map(|s| s.is_empty()).unwrap_or(true) {
-                    missing.push(n.clone());
-                }
-            }
-        }
-        let auth = match &runtime.auth {
-            Some(crate::config::Auth::FileLink { source, .. }) => {
-                json!({"kind":"file_link","available":source.is_file()})
-            }
-            Some(crate::config::Auth::Environment { .. }) => {
-                json!({"kind":"environment","available":missing.is_empty(),"missing_names":missing})
-            }
-            None => json!({"kind":"native","available":null}),
-        };
-        checks.push(json!({"name":name,"executable":executable,"auth":auth,"accounts":runtime.accounts,"limits_source":runtime.limits_source}));
-    }
-    let broker = transport::socket::client(home, "ping", json!({}))
-        .await
-        .is_ok();
-    let ok = broker
-        && checks.iter().all(|c| {
-            c.get("executable") != Some(&Value::Bool(false))
-                && c.pointer("/auth/available") != Some(&Value::Bool(false))
-                && c.pointer("/result/ok") != Some(&Value::Bool(false))
-        });
-    Ok(
-        json!({"ok":ok,"home":home,"broker_available":broker,"checks":checks,"validation_level":"filesystem-and-configuration; provider authentication is checked at launch"}),
-    )
+    Ok(serde_json::to_value(crate::doctor::run(home)?)?)
 }
 /// Escapes a scalar value for insertion into a launchd plist XML text node.
 fn xml(s: &str) -> String {
@@ -1475,6 +1425,27 @@ fn provider_login_target(
     })
 }
 
+/// Recognizes the doctor command in argv before Clap reports invalid flags.
+/// Only the leading command after an optional --home value is considered, so
+/// unrelated commands whose task text contains "doctor" retain their exit policy.
+pub fn doctor_invocation(arguments: &[std::ffi::OsString]) -> bool {
+    let mut arguments = arguments.iter().skip(1);
+    while let Some(argument) = arguments.next() {
+        if argument == "--home" {
+            arguments.next();
+            continue;
+        }
+        if argument
+            .to_str()
+            .is_some_and(|value| value.starts_with("--home="))
+        {
+            continue;
+        }
+        return argument == "doctor";
+    }
+    false
+}
+
 /// Executes one parsed command and returns its public process exit status.
 ///
 /// Success writes JSON except for the text guide, text transcript viewer and
@@ -1491,6 +1462,12 @@ pub async fn run(cli: Cli) -> Result<i32> {
         return Ok(0);
     }
     let home = fs::home(cli.home.clone())?;
+    if matches!(
+        &cli.command,
+        Command::Doctor { .. } | Command::DoctorCanary { .. }
+    ) {
+        return run_with(cli, CliDependencies::production(home)).await;
+    }
     // An older state database must be migrated together with its config;
     // no other command may open (and so auto-upgrade) it first.
     // The permission hook helper never opens the database.
@@ -1524,7 +1501,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
     let home = fs::home(cli.home)?;
     match cli.command {
         Command::Init => (dependencies.output)(&crate::init::initialize(&home)?)?,
-        Command::Doctor => {
+        Command::Doctor { .. } => {
             let report = (dependencies.doctor)(&home)?;
             let ok = report.ok();
             (dependencies.output)(&serde_json::to_value(report)?)?;

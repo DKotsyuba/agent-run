@@ -1,9 +1,12 @@
 use clap::{Parser, error::ErrorKind};
 
-/// Parses and executes the operator CLI with JSON errors compatible with Python.
+/// Parses the CLI, preserving global errors while doctor uses 0/2/3 for
+/// passed checks, failed checks and invocation/report failures respectively.
 #[tokio::main]
 async fn main() {
-    let cli = match agent_run::cli::Cli::try_parse() {
+    let arguments: Vec<_> = std::env::args_os().collect();
+    let doctor = agent_run::cli::doctor_invocation(&arguments);
+    let cli = match agent_run::cli::Cli::try_parse_from(arguments) {
         Ok(cli) => cli,
         Err(error)
             if matches!(
@@ -19,7 +22,7 @@ async fn main() {
                 "{}",
                 serde_json::json!({"error":{"type":"ValidationError","message":error.to_string().chars().take(512).collect::<String>()}})
             );
-            std::process::exit(2);
+            std::process::exit(if doctor { 3 } else { 2 });
         }
     };
     let code = match agent_run::cli::run(cli).await {
@@ -44,7 +47,11 @@ async fn main() {
             let value = serde_json::json!({"error":details});
             // MCP protocol errors never spill JSON onto the stdio protocol stream.
             eprintln!("{value}");
-            error.protocol_mapping().cli_exit_code
+            if doctor {
+                3
+            } else {
+                error.protocol_mapping().cli_exit_code
+            }
         }
     };
     std::process::exit(code);

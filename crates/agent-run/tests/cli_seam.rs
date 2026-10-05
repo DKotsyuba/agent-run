@@ -131,6 +131,7 @@ fn dependencies(
                 home: home.to_owned(),
                 checked_at: 0.0,
                 findings: Vec::new(),
+                ..agent_run::doctor::Report::default()
             })
         }),
     }
@@ -650,6 +651,7 @@ async fn test_doctor_delegates_to_the_structured_read_only_seam() {
                 home: home.to_owned(),
                 checked_at: 0.0,
                 findings: Vec::new(),
+                ..agent_run::doctor::Report::default()
             })
         }),
     };
@@ -1106,6 +1108,7 @@ fn text_dependencies(service: Arc<FakeService>, text: Arc<Mutex<String>>) -> Cli
                 home: home.to_owned(),
                 checked_at: 0.0,
                 findings: Vec::new(),
+                ..agent_run::doctor::Report::default()
             })
         }),
     }
@@ -1172,6 +1175,7 @@ async fn test_transcript_json_format_stays_the_default_when_not_a_tty() {
                         home: home.to_owned(),
                         checked_at: 0.0,
                         findings: Vec::new(),
+                        ..agent_run::doctor::Report::default()
                     })
                 }),
             },
@@ -1480,6 +1484,7 @@ async fn test_transcript_text_bytes_are_visible_before_the_stream_completes() {
                 home: home.to_owned(),
                 checked_at: 0.0,
                 findings: Vec::new(),
+                ..agent_run::doctor::Report::default()
             })
         }),
     };
@@ -1740,6 +1745,7 @@ fn follow_dependencies(service: Arc<FollowService>, output: FollowSink) -> CliDe
                 home: home.to_owned(),
                 checked_at: 0.0,
                 findings: Vec::new(),
+                ..agent_run::doctor::Report::default()
             })
         }),
     }

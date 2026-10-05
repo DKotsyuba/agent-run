@@ -26,6 +26,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+/// Maximum independently reported legacy findings and state snapshot rows.
 const LIMIT: usize = 256;
 
 /// One secret-safe diagnosis emitted by [`run`].
@@ -50,6 +51,396 @@ pub struct Report {
     pub checked_at: f64,
     /// At most 256 stable findings.
     pub findings: Vec<Finding>,
+    /// Typed additive observations serialized beside the historical fields.
+    #[serde(flatten)]
+    pub diagnostics: Diagnostics,
+}
+
+/// Closed local-check outcomes; absence of evidence is never success.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckStatus {
+    /// Named local observation passed.
+    Ok,
+    /// Optional or recoverable limitation was observed.
+    Warning,
+    /// Required local observation failed.
+    Failed,
+    /// Observation was unavailable or deliberately skipped.
+    NotChecked,
+}
+
+/// Bounded local observation and safe remediation, never raw error metadata.
+#[derive(Debug, Clone, Serialize)]
+pub struct Check {
+    /// Stable public check identifier.
+    pub name: String,
+    /// Closed evidence classification.
+    pub status: CheckStatus,
+    /// Bounded explanation of observed facts.
+    pub detail: String,
+    /// Safe local repair or follow-up, never a model turn or credential value.
+    pub remediation: String,
+}
+
+/// Honest compiler build facts; checkout identity is not runtime evidence.
+#[derive(Debug, Clone, Serialize)]
+pub struct BuildInfo {
+    /// Unknown unless embedded; never guessed from the current checkout.
+    pub source_commit: Option<String>,
+    /// Actual rustc-selected debug-assertion mode.
+    pub debug_assertions: bool,
+}
+
+/// Compiler-selected platform, independent of installed release declarations.
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetInfo {
+    /// Target architecture selected by rustc.
+    pub arch: &'static str,
+    /// Target OS selected by rustc.
+    pub os: &'static str,
+}
+
+/// Read-only COMPLETE/manifest/metadata observation of one release directory.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReleaseSummary {
+    /// Resolved observed release directory; absent in source builds.
+    pub path: Option<PathBuf>,
+    /// Shared seal-verifier observation.
+    pub check: Check,
+    /// Bounded version from verified metadata, absent without usable evidence.
+    pub version: Option<String>,
+    /// Store schema from verified metadata.
+    pub schema_version: Option<u64>,
+}
+
+/// Resolved dependency evidence; args, environment and credentials are absent.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolSummary {
+    /// Public component identity.
+    pub name: String,
+    /// Actual canonical executable when observable.
+    pub executable: Option<PathBuf>,
+    /// Extracted numeric version; unknown stays absent.
+    pub version: Option<String>,
+    /// Executable/version classification; required missing files fail.
+    pub status: CheckStatus,
+    /// Safe local follow-up for missing or unobserved evidence.
+    pub remediation: String,
+}
+
+/// Additive diagnostic fields serialized beside the historical report fields.
+#[derive(Debug, Clone, Serialize)]
+pub struct Diagnostics {
+    /// Product version of this executing Cargo build.
+    pub version: &'static str,
+    /// Honest compile-time build facts.
+    pub build: BuildInfo,
+    /// Compiler-selected platform.
+    pub target: TargetInfo,
+    /// Configuration read/parse observation.
+    pub config: Check,
+    /// Executing sealed release; source builds remain not_checked.
+    pub executing_release: ReleaseSummary,
+    /// Current installed release, when its pointer exists.
+    pub current_release: ReleaseSummary,
+    /// Resident version/schema compatibility, explicitly unavailable on current ping.
+    pub resident_compatibility: Check,
+    /// Local observations including original legacy finding codes.
+    pub checks: Vec<Check>,
+    /// Required configured dependencies and optional host Node bridge.
+    pub tools: Vec<ToolSummary>,
+}
+
+impl Default for Report {
+    /// Creates unknown observations for injectable seams without any I/O.
+    fn default() -> Self {
+        Self {
+            home: PathBuf::new(),
+            checked_at: 0.0,
+            findings: Vec::new(),
+            diagnostics: Diagnostics {
+                version: env!("CARGO_PKG_VERSION"),
+                build: BuildInfo {
+                    source_commit: None,
+                    debug_assertions: cfg!(debug_assertions),
+                },
+                target: TargetInfo {
+                    arch: std::env::consts::ARCH,
+                    os: std::env::consts::OS,
+                },
+                config: check(
+                    "config",
+                    CheckStatus::NotChecked,
+                    "not read",
+                    "run local doctor",
+                ),
+                executing_release: unobserved_release("executing_release"),
+                current_release: unobserved_release("current_release"),
+                resident_compatibility: check(
+                    "resident_compatibility",
+                    CheckStatus::NotChecked,
+                    "resident ping exposes no version/schema compatibility; process inventory is reported separately",
+                    "verify the installed release and reconnect older sessions after switching releases",
+                ),
+                checks: Vec::new(),
+                tools: Vec::new(),
+            },
+        }
+    }
+}
+
+/// Builds fixed bounded check framing, discarding underlying error chains.
+fn check(name: &str, status: CheckStatus, detail: &str, remediation: &str) -> Check {
+    Check {
+        name: name.into(),
+        status,
+        detail: detail.chars().take(512).collect(),
+        remediation: remediation.into(),
+    }
+}
+
+/// Represents unavailable release evidence without inventing a version or seal.
+fn unobserved_release(name: &str) -> ReleaseSummary {
+    ReleaseSummary {
+        path: None,
+        version: None,
+        schema_version: None,
+        check: check(
+            name,
+            CheckStatus::NotChecked,
+            "no sealed release observed",
+            "source builds require no installed release; inspect installed releases with release verify",
+        ),
+    }
+}
+
+/// Applies the shared read-only seal verifier to one observed directory.
+/// Raw manifest contents, filesystem errors and parser diagnostics stay private.
+fn release_summary(name: &str, path: Option<PathBuf>) -> ReleaseSummary {
+    let Some(path) = path else {
+        return unobserved_release(name);
+    };
+    let verified = agent_run_platform::release::verify(&path).is_ok();
+    let metadata = verified
+        .then(|| fs::read(path.join("metadata.json")).ok())
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    ReleaseSummary {
+        version: metadata
+            .as_ref()
+            .and_then(|v| v["version"].as_str())
+            .and_then(|v| numeric_version(v.as_bytes())),
+        schema_version: metadata.as_ref().and_then(|v| v["schema_version"].as_u64()),
+        check: check(
+            name,
+            if verified {
+                CheckStatus::Ok
+            } else {
+                CheckStatus::Failed
+            },
+            if verified {
+                "COMPLETE, SHA256SUMS and metadata verified"
+            } else {
+                "sealed release verification failed"
+            },
+            if verified {
+                "none"
+            } else {
+                "verify this release directory before switching its current pointer"
+            },
+        ),
+        path: Some(path),
+    }
+}
+
+/// Extracts only a short numeric dotted token; arbitrary tool output and
+/// credential-shaped assignments are never serialized into a report.
+fn numeric_version(bytes: &[u8]) -> Option<String> {
+    std::str::from_utf8(bytes)
+        .ok()?
+        .split_whitespace()
+        .find_map(|token| {
+            let token = token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.');
+            let token = token.strip_prefix('v').unwrap_or(token);
+            if token.len() > 64
+                || !token
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b".-+".contains(&b))
+            {
+                return None;
+            }
+            let base = token.split(['-', '+']).next()?;
+            let parts: Vec<_> = base.split('.').collect();
+            (parts.len() >= 2
+                && parts
+                    .iter()
+                    .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())))
+            .then(|| token.to_owned())
+        })
+}
+
+/// Owns the exact version-probe child and its captured group on every path.
+struct VersionChild {
+    /// Unreaped direct child, not an unrelated reused PID.
+    child: std::process::Child,
+    /// Existing PID-safe cleanup authority for captured descendants.
+    owner: process::OwnedProcess,
+}
+impl Drop for VersionChild {
+    /// Cleans captured identities through the platform helper, then kills/reaps the direct child.
+    fn drop(&mut self) {
+        let _ = self.owner.cleanup_blocking(Duration::from_millis(100));
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Runs --version with null stdin/stderr, a two-second lifetime and 8 KiB
+/// accepted stdout. No auth, network or model command is issued.
+fn tool_version(binary: &Path) -> Option<String> {
+    use std::os::unix::process::CommandExt;
+    let child = Command::new(binary)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .ok()?;
+    let owner = process::OwnedProcess::capture(child.id() as i32);
+    let mut probe = VersionChild { child, owner };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut refresh_at = Instant::now();
+    loop {
+        if Instant::now() >= refresh_at {
+            probe.owner.refresh();
+            refresh_at = Instant::now() + Duration::from_millis(100);
+        }
+        match probe.child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let output = read_until(probe.child.stdout.as_mut()?, deadline, 8192)?;
+                return (output.len() <= 8192)
+                    .then(|| numeric_version(&output))
+                    .flatten();
+            }
+            Ok(Some(_)) | Err(_) => return None,
+            Ok(None) if Instant::now() >= deadline => return None,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+/// Resolves a dependency and optionally probes its known version interface.
+/// Missing required binaries fail; absent optional bridge or unknown interface
+/// remains not_checked. Args, environment and authentication are omitted.
+fn tool_summary(name: String, binary: Option<&Path>, required: bool, probe: bool) -> ToolSummary {
+    let present = binary.is_some_and(executable);
+    let path = binary.filter(|_| present).map(resolved);
+    let version = path.as_deref().filter(|_| probe).and_then(tool_version);
+    ToolSummary {
+        name,
+        executable: path,
+        version: version.clone(),
+        status: if !present && required {
+            CheckStatus::Failed
+        } else if !present || !probe {
+            CheckStatus::NotChecked
+        } else if version.is_some() {
+            CheckStatus::Ok
+        } else {
+            CheckStatus::Warning
+        },
+        remediation: if !present && required {
+            "configure an existing absolute executable path"
+        } else if !present {
+            "optional host Node bridge absent; direct Rust MCP remains available"
+        } else if !probe {
+            "version CLI is unrecognized; inspect the tool manually"
+        } else if version.is_none() {
+            "verify the local version response; only --version was requested"
+        } else {
+            "none"
+        }
+        .into(),
+    }
+}
+
+/// Checks every configured dependency; at most 16 version CLIs including Node
+/// are probed. The CLI applies its complete-report byte bound without dropping rows.
+/// Arbitrary MCP command interfaces are never executed speculatively.
+fn diagnostic_tools(
+    config: &Config,
+    v2: Option<&agent_run_config::provider_config::ProviderConfig>,
+) -> Vec<ToolSummary> {
+    let mut binaries = BTreeMap::new();
+    if let Some(v2) = v2 {
+        for (name, harness) in &v2.harnesses {
+            binaries.insert(
+                format!("harness:{}", name.as_str()),
+                harness.binary.as_path(),
+            );
+        }
+    } else {
+        for (name, runtime) in config.runtimes.iter().filter(|(_, v)| v.enabled) {
+            binaries.insert(format!("runtime:{name}"), runtime.binary.as_path());
+        }
+    }
+    let mut tools = Vec::new();
+    for (index, (name, binary)) in binaries.into_iter().enumerate() {
+        let known = binary
+            .file_name()
+            .and_then(|v| v.to_str())
+            .is_some_and(|v| {
+                matches!(
+                    v,
+                    "codex" | "claude" | "claude-code" | "glm" | "opencode" | "node"
+                )
+            });
+        tools.push(tool_summary(name, Some(binary), true, known && index < 15));
+    }
+    for (name, server) in &config.mcp {
+        tools.push(tool_summary(
+            format!("mcp:{name}"),
+            Some(&server.command),
+            true,
+            false,
+        ));
+    }
+    let node = std::env::var_os("CODEX_MCP_NODE_PATH").map(PathBuf::from);
+    tools.push(tool_summary(
+        "host_node_bridge".into(),
+        node.as_deref(),
+        node.is_some(),
+        true,
+    ));
+    tools
+}
+
+/// Mirrors existing finding codes/severities into explicit checks while retaining
+/// the historical findings array. No skipped observation becomes an ok check.
+fn finish_report(report: &mut Report) {
+    report
+        .diagnostics
+        .checks
+        .extend(report.findings.iter().map(|finding| {
+            check(
+                &finding.code,
+                match finding.severity.as_str() {
+                    "error" => CheckStatus::Failed,
+                    "warning" => CheckStatus::Warning,
+                    _ => CheckStatus::Ok,
+                },
+                &finding.detail,
+                if finding.severity == "error" {
+                    "repair this local component and rerun doctor; do not retry admitted work"
+                } else if finding.severity == "warning" {
+                    "inspect the named local evidence before relying on this component"
+                } else {
+                    "none"
+                },
+            )
+        }));
 }
 
 /// One process record needed to diagnose stale MCP sessions.
@@ -95,12 +486,26 @@ impl Dependencies {
 }
 
 impl Report {
-    /// Returns whether the report contains no error-severity finding.
+    /// Returns whether all required observed local checks passed.
+    /// Optional warnings/not_checked observations preserve the historical success policy.
     pub fn ok(&self) -> bool {
         !self
             .findings
             .iter()
             .any(|finding| finding.severity == "error")
+            && self.diagnostics.config.status != CheckStatus::Failed
+            && self.diagnostics.executing_release.check.status != CheckStatus::Failed
+            && self.diagnostics.current_release.check.status != CheckStatus::Failed
+            && !self
+                .diagnostics
+                .tools
+                .iter()
+                .any(|tool| tool.status == CheckStatus::Failed)
+            && !self
+                .diagnostics
+                .checks
+                .iter()
+                .any(|check| check.status == CheckStatus::Failed)
     }
 }
 
@@ -121,7 +526,20 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
         home,
         checked_at: now()?,
         findings: Vec::new(),
+        ..Report::default()
     };
+    let executing = std::env::current_exe().ok().and_then(|binary| {
+        let bin = binary.parent()?;
+        (bin.file_name()? == "bin" && bin.parent()?.join("COMPLETE").exists())
+            .then(|| bin.parent().map(Path::to_path_buf))
+            .flatten()
+    });
+    report.diagnostics.executing_release = release_summary("executing_release", executing);
+    let current = report.home.join("standalone/current");
+    if fs::symlink_metadata(&current).is_ok() {
+        report.diagnostics.current_release =
+            release_summary("current_release", Some(resolved(&current)));
+    }
     let config_path = report.home.join("config.toml");
     plaintext_secrets(&config_path, &mut report.findings);
     let (config, provider_config) = match (
@@ -138,9 +556,23 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
                 "config",
                 "ValidationError",
             );
+            report.diagnostics.config = check(
+                "config",
+                CheckStatus::Failed,
+                "configuration is unreadable or invalid",
+                "repair config.toml locally; no authentication check was attempted",
+            );
+            finish_report(&mut report);
             return Ok(report);
         }
     };
+    report.diagnostics.config = check(
+        "config",
+        CheckStatus::Ok,
+        "configuration parsed without changing it",
+        "none",
+    );
+    report.diagnostics.tools = diagnostic_tools(&config, provider_config.as_ref());
     configuration(
         &config,
         &report.home,
@@ -163,6 +595,7 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
                 "state",
                 error.to_string(),
             );
+            finish_report(&mut report);
             return Ok(report);
         }
         Err(_) => {
@@ -173,9 +606,16 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
                 "state",
                 "ValidationError",
             );
+            finish_report(&mut report);
             return Ok(report);
         }
     };
+    report.diagnostics.checks.push(check(
+        "state",
+        CheckStatus::Ok,
+        "read-only state snapshot obtained",
+        "none",
+    ));
     if let Some(config) = &provider_config {
         provider_bindings(config, &report.home, &mut report.findings);
         managed_services(
@@ -203,6 +643,7 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
         &mut report.findings,
         dependencies.process_lister.as_ref(),
     );
+    finish_report(&mut report);
     Ok(report)
 }
 
@@ -1284,7 +1725,7 @@ fn ps_by_pid_with_timeout(args: &[&str], timeout: Duration) -> BTreeMap<i32, Str
                 let Some(stdout) = child.stdout.as_mut() else {
                     return BTreeMap::new();
                 };
-                let Some(output) = read_until(stdout, deadline) else {
+                let Some(output) = read_until(stdout, deadline, 1024 * 1024) else {
                     let _ = child.kill();
                     let _ = child.wait();
                     return BTreeMap::new();
@@ -1302,8 +1743,13 @@ fn ps_by_pid_with_timeout(args: &[&str], timeout: Duration) -> BTreeMap<i32, Str
     }
 }
 
-/// Drains one process-listing pipe until EOF or the listing deadline.
-fn read_until(output: &mut (impl Read + AsRawFd), deadline: Instant) -> Option<Vec<u8>> {
+/// Drains a pipe until EOF within a byte limit and absolute deadline.
+/// Overflow, timeout or I/O failure discards the whole captured output.
+fn read_until(
+    output: &mut (impl Read + AsRawFd),
+    deadline: Instant,
+    limit: usize,
+) -> Option<Vec<u8>> {
     let fd = output.as_raw_fd();
     let mut bytes = Vec::new();
     loop {
@@ -1332,7 +1778,10 @@ fn read_until(output: &mut (impl Read + AsRawFd), deadline: Instant) -> Option<V
         let mut chunk = [0u8; 4096];
         match output.read(&mut chunk) {
             Ok(0) => return Some(bytes),
-            Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+            Ok(read) if read <= limit.saturating_sub(bytes.len()) => {
+                bytes.extend_from_slice(&chunk[..read])
+            }
+            Ok(_) => return None,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => return None,
         }
@@ -1446,6 +1895,120 @@ fn executable(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Verified releases expose only bounded public metadata; corrupt releases,
+    /// missing required tools and absent optional bridges keep distinct outcomes.
+    #[test]
+    fn diagnostic_metadata_and_tool_absence_are_honest() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("bin")).unwrap();
+        std::fs::write(home.path().join("bin/agent-run"), b"binary").unwrap();
+        let metadata = serde_json::json!({"version":"1.2.3","schema_version":25,"private_token":"SECRET_CANARY"}).to_string();
+        std::fs::write(home.path().join("metadata.json"), metadata.as_bytes()).unwrap();
+        std::fs::write(home.path().join("COMPLETE"), "complete\n").unwrap();
+        std::fs::write(
+            home.path().join("SHA256SUMS"),
+            format!(
+                "{}  bin/agent-run\n{}  metadata.json\n",
+                agent_run_platform::fs::sha256(b"binary"),
+                agent_run_platform::fs::sha256(metadata.as_bytes())
+            ),
+        )
+        .unwrap();
+        let sealed = release_summary("current_release", Some(home.path().into()));
+        assert_eq!(sealed.check.status, CheckStatus::Ok);
+        assert_eq!(sealed.version.as_deref(), Some("1.2.3"));
+        assert_eq!(sealed.schema_version, Some(25));
+        assert!(
+            !serde_json::to_string(&sealed)
+                .unwrap()
+                .contains("SECRET_CANARY")
+        );
+        std::fs::write(home.path().join("bin/agent-run"), b"corrupt").unwrap();
+        assert_eq!(
+            release_summary("current_release", Some(home.path().into()))
+                .check
+                .status,
+            CheckStatus::Failed
+        );
+        let missing = home.path().join("missing");
+        assert_eq!(
+            tool_summary("required".into(), Some(&missing), true, false).status,
+            CheckStatus::Failed
+        );
+        assert_eq!(
+            tool_summary("host_node_bridge".into(), None, false, true).status,
+            CheckStatus::NotChecked
+        );
+        let report = Report::default();
+        assert_eq!(report.diagnostics.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(report.diagnostics.target.arch, std::env::consts::ARCH);
+        assert_eq!(report.diagnostics.build.source_commit, None);
+        assert_eq!(
+            report.diagnostics.resident_compatibility.status,
+            CheckStatus::NotChecked
+        );
+        assert_eq!(numeric_version(b"token=SECRET_CANARY"), None);
+        let entries: serde_json::Map<String, Value> = (0..=LIMIT)
+            .map(|n| {
+                (
+                    format!("missing-{n:04}"),
+                    json!({"command":missing,"args":[],"transport":"stdio"}),
+                )
+            })
+            .collect();
+        let config: Config =
+            serde_json::from_value(json!({"schema_version":1,"mcp":entries})).unwrap();
+        let tools = diagnostic_tools(&config, None);
+        assert_eq!(tools.len(), LIMIT + 2, "no configured row may disappear");
+        assert!(
+            tools[..=LIMIT]
+                .iter()
+                .all(|tool| tool.status == CheckStatus::Failed)
+        );
+        let mut report = Report::default();
+        report.diagnostics.tools = tools;
+        assert!(!report.ok(), "missing dependencies beyond row256 must fail");
+    }
+
+    /// Writes a private executable probe fixture; callers supply only fixed shell
+    /// bodies for local version/timeout checks, never model or authentication commands.
+    fn version_fixture(root: &Path, body: &str) -> PathBuf {
+        let binary = root.join("probe");
+        std::fs::write(&binary, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        binary
+    }
+
+    /// Version probes issue only --version, omit stderr secrets, refuse oversized
+    /// output, and kill/reap a timeout without signalling an unrelated process group.
+    #[test]
+    fn version_probes_are_bounded_secret_safe_and_reaped() {
+        let home = tempfile::tempdir().unwrap();
+        let probe = version_fixture(
+            home.path(),
+            "[ \"$1\" = '--version' ] || exit 9\nprintf 'tool 1.2.3\\n'\nprintf 'SECRET_CANARY' >&2",
+        );
+        assert_eq!(tool_version(&probe).as_deref(), Some("1.2.3"));
+        let probe = version_fixture(
+            home.path(),
+            "i=0; while [ \"$i\" -lt 1000 ]; do printf 'abcdefghij'; i=$((i+1)); done",
+        );
+        assert_eq!(tool_version(&probe), None);
+        let pid_file = home.path().join("pid");
+        let probe = version_fixture(
+            home.path(),
+            &format!(
+                "printf '%s' \"$$\" > '{}'\nexec /bin/sleep 30",
+                pid_file.display()
+            ),
+        );
+        let started = Instant::now();
+        assert_eq!(tool_version(&probe), None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid: i32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
+        assert!(process::inspect(pid).is_err(), "owned probe must be reaped");
+    }
+
     use super::*;
     use serde_json::json;
     use std::cell::Cell;
