@@ -117,10 +117,10 @@ and its existing bounded same-key reconnect behavior are unchanged.
 
 ## Compatibility and verification
 
-These changes need the next pre-1.0 minor 0.21: discovery metadata, error channels,
+The prepared pre-1.0 minor 0.21 includes discovery metadata, error channels,
 quoted labels, private metadata removal, page refusal and degradation semantics
 are intentional MCP changes. CLI/socket business results are retained. The
-workspace remains at its current version until separate release preparation.
+workspace and generated mirrors use 0.21.0; preparation does not publish it.
 
 Rust tests cover registry drift, typed projection, secret canaries, exact
 content/critical values, byte/row boundaries, strict variables, fuel and receipt

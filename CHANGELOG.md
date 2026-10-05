@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.21.0
+
 - feat(mcp)!: use Cargo product versions and server instructions, add reviewed
   effect annotations and registry-generated discovery/registration snapshots;
   route unknown tools and malformed protocol parameters through MCP errors
@@ -11,9 +13,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   remove private account/pool metadata, bound whole pages and exact content,
   and preserve accepted/unknown execution receipts when presentation fails
 
-These MCP compatibility changes require the next pre-1.0 minor release.
-The workspace version is unchanged until release preparation; real host and
-publication qualification remain separate from local fixture checks.
+This minor release contains intentional MCP, diagnostics and delivery
+compatibility changes. Real host and publication qualification remain separate
+from local fixture checks.
 
 - feat(release): bind external inventory and observed acceptance to the exact
   source, workflow/run/attempt, compiler and native payload; verify complete
