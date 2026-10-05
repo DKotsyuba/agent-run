@@ -1,16 +1,44 @@
 [
   {
     "name": "notify_orchestrator",
-    "annotations": {"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true
+    },
     "description": "Send a material finding, risk, question or blocker to this run's orchestrator without ending your work. Use only when coordination is needed, never for routine progress. The recipient and run are fixed by Agent Run. Reuse the same request_id and content after an uncertain result; use a new id for a distinct report. A receipt only confirms durable queueing, not delivery, approval or an answer. Continue independent authorized work; the orchestrator can reply through steer. Do not send credentials. Maximum 2048 UTF-8 bytes, 20 distinct reports per run, at least 30 seconds apart.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "request_id": {"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"Stable retry key for this report within the current run."},
-        "kind": {"type":"string","enum":["notice","risk","question","blocker"],"default":"notice"},
-        "message": {"type":"string","minLength":1,"maxLength":2048,"description":"Concise report; UTF-8 byte limit is enforced by the broker. Newlines and tabs are permitted; other control characters are rejected."}
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "description": "Stable retry key for this report within the current run."
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "notice",
+            "risk",
+            "question",
+            "blocker"
+          ],
+          "default": "notice"
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "description": "Concise report; UTF-8 byte limit is enforced by the broker. Newlines and tabs are permitted; other control characters are rejected."
+        }
       },
-      "required": ["request_id","message"],
+      "required": [
+        "request_id",
+        "message"
+      ],
       "additionalProperties": false
     }
   },
@@ -20,11 +48,31 @@
     "inputSchema": {
       "type": "object",
       "properties": {
-        "request_id": {"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"Stable retry key scoped to this execution."},
-        "message": {"type":"string","minLength":1,"maxLength":8192,"description":"Untrusted-to-peers body, 1-8192 UTF-8 bytes. Newlines and tabs are permitted; other control characters are rejected."}
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "description": "Stable retry key scoped to this execution."
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192,
+          "description": "Untrusted-to-peers body, 1-8192 UTF-8 bytes. Newlines and tabs are permitted; other control characters are rejected."
+        }
       },
-      "required": ["request_id","message"],
+      "required": [
+        "request_id",
+        "message"
+      ],
       "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
     }
   },
   {
@@ -33,12 +81,37 @@
     "inputSchema": {
       "type": "object",
       "properties": {
-        "after_seq": {"type":"integer","minimum":0,"description":"Return entries with a greater sequence; 0 starts from the beginning."},
-        "before_seq": {"type":"integer","minimum":1,"description":"Return older entries before this positive sequence; exclusive with after_seq."},
-        "limit": {"type":"integer","minimum":1,"maximum":50,"description":"Page size, 1-50; default 50."},
-        "wait_seconds": {"type":"number","minimum":0,"maximum":25,"default":0,"description":"Hold this read until an entry exists beyond after_seq, at most 25 seconds; 0 returns immediately."}
+        "after_seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Return entries with a greater sequence; 0 starts from the beginning."
+        },
+        "before_seq": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Return older entries before this positive sequence; exclusive with after_seq."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50,
+          "description": "Page size, 1-50; default 50."
+        },
+        "wait_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 25,
+          "default": 0,
+          "description": "Hold this read until an entry exists beyond after_seq, at most 25 seconds; 0 returns immediately."
+        }
       },
       "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
     }
   },
   {
@@ -47,12 +120,38 @@
     "inputSchema": {
       "type": "object",
       "properties": {
-        "request_id": {"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"Stable retry key scoped to this execution."},
-        "message": {"type":"string","minLength":1,"maxLength":8192,"description":"Short statement of the proposal."},
-        "snapshot": {"type":"string","minLength":1,"maxLength":65536,"description":"Immutable snapshot of the proposed result; peers must echo exactly this snapshot when voting ready."}
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "description": "Stable retry key scoped to this execution."
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192,
+          "description": "Short statement of the proposal."
+        },
+        "snapshot": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 65536,
+          "description": "Immutable snapshot of the proposed result; peers must echo exactly this snapshot when voting ready."
+        }
       },
-      "required": ["request_id","message","snapshot"],
+      "required": [
+        "request_id",
+        "message",
+        "snapshot"
+      ],
       "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
     }
   },
   {
@@ -61,14 +160,74 @@
     "inputSchema": {
       "type": "object",
       "properties": {
-        "request_id": {"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"Stable retry key scoped to this execution."},
-        "proposal_seq": {"type":"integer","minimum":1,"description":"The proposal entry being voted on; must equal the current proposal shown by pool_read."},
-        "decision": {"type":"string","enum":["ready","block","revoke"]},
-        "checks": {"type":"array","maxItems":10,"items":{"type":"object","properties":{"criterion_id":{"type":"string"},"status":{"type":"string","enum":["met","unmet"]},"evidence":{"type":"string","maxLength":1024}},"required":["criterion_id","status","evidence"],"additionalProperties":false},"description":"Per-criterion verdicts; required for ready, covering every acceptance criterion exactly once."},
-        "message": {"type":"string","maxLength":8192,"description":"Optional note."}
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "description": "Stable retry key scoped to this execution."
+        },
+        "proposal_seq": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The proposal entry being voted on; must equal the current proposal shown by pool_read."
+        },
+        "decision": {
+          "type": "string",
+          "enum": [
+            "ready",
+            "block",
+            "revoke"
+          ]
+        },
+        "checks": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "type": "object",
+            "properties": {
+              "criterion_id": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "met",
+                  "unmet"
+                ]
+              },
+              "evidence": {
+                "type": "string",
+                "maxLength": 1024
+              }
+            },
+            "required": [
+              "criterion_id",
+              "status",
+              "evidence"
+            ],
+            "additionalProperties": false
+          },
+          "description": "Per-criterion verdicts; required for ready, covering every acceptance criterion exactly once."
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 8192,
+          "description": "Optional note."
+        }
       },
-      "required": ["request_id","proposal_seq","decision"],
+      "required": [
+        "request_id",
+        "proposal_seq",
+        "decision"
+      ],
       "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
     }
   }
 ]
