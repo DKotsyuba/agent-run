@@ -373,10 +373,12 @@ fn list_pools_live_mcp_round_trip() {
         "params":{"name":"list_pools","arguments":{"state":"open","limit":1}}}))
         .unwrap();
     assert_eq!(reply["result"]["isError"], false);
-    assert!(reply["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("agent-run pools: 0 of 0"));
+    assert!(
+        reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("agent-run pools: 0 of 0")
+    );
     assert!(reply["result"].get("structuredContent").is_none());
     mcp.finish();
 }

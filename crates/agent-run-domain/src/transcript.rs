@@ -1,6 +1,6 @@
 //! Shared bounded transcript options used by CLI and every wire transport.
 
-use crate::{error::invalid, Result};
+use crate::{Result, error::invalid};
 use serde::{Deserialize, Serialize};
 
 /// Transcript representation; raw immutable journal rows remain the default.

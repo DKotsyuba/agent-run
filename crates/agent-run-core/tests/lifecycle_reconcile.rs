@@ -1105,10 +1105,12 @@ fn orphan_recovery_uses_durable_members_after_leader_exit() {
                 .unwrap()
                 .snapshot()
                 .unwrap();
-            assert!(retained
-                .members
-                .iter()
-                .any(|member| member.pid == descendant.pid && member.token == descendant.token));
+            assert!(
+                retained
+                    .members
+                    .iter()
+                    .any(|member| member.pid == descendant.pid && member.token == descendant.token)
+            );
         }
         assert!(
             started.elapsed() < Duration::from_secs(3),

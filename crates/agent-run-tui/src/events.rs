@@ -228,17 +228,17 @@ pub async fn sessions_worker(
                         // when the store moved past the counted revision: a
                         // failure keeps the last known count and retries
                         // with the next listing round.
-                        if counted != revision {
-                            if let Ok(total_page) = net::total_agents(&*broker).await {
-                                counted = Some(total_page.revision);
-                                let finished = total_page.total.saturating_sub(live);
-                                if tx
-                                    .send(BrokerEvent::FinishedTotal(finished))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                    }
+                        if counted != revision
+                            && let Ok(total_page) = net::total_agents(&*broker).await
+                        {
+                            counted = Some(total_page.revision);
+                            let finished = total_page.total.saturating_sub(live);
+                            if tx
+                                .send(BrokerEvent::FinishedTotal(finished))
+                                .await
+                                .is_err()
+                            {
+                                return;
                             }
                         }
                     }
@@ -713,10 +713,10 @@ pub fn scroll_transcript(app: &mut App, delta: i64) {
     let Some(buffer) = app.transcript.as_mut() else {
         return;
     };
-    if buffer.from_bottom == usize::MAX {
-        if let Some(max) = max {
-            buffer.from_bottom = max;
-        }
+    if buffer.from_bottom == usize::MAX
+        && let Some(max) = max
+    {
+        buffer.from_bottom = max;
     }
     // Coalesced wheel bursts can exceed the row range; clamp, never wrap.
     let lines = usize::try_from(delta.unsigned_abs()).unwrap_or(usize::MAX);
@@ -744,17 +744,19 @@ fn older_if_needed(app: &mut App) -> Dispatched {
     let total =
         crate::ui::transcript::total_height(buffer, crate::ui::transcript::body_width(pane));
     let offset = crate::ui::transcript::scroll_offset(buffer, total, viewport);
-    if !buffer.follow && !buffer.loading_older && offset <= (viewport / 2).max(3) {
-        if let Some(before) = buffer.previous_cursor {
-            buffer.loading_older = true;
-            app.dirty = true;
-            return Dispatched::Older(
-                buffer.agent.agent_id.clone(),
-                buffer.agent.run_id.clone(),
-                buffer.resume_cursor,
-                before,
-            );
-        }
+    if !buffer.follow
+        && !buffer.loading_older
+        && offset <= (viewport / 2).max(3)
+        && let Some(before) = buffer.previous_cursor
+    {
+        buffer.loading_older = true;
+        app.dirty = true;
+        return Dispatched::Older(
+            buffer.agent.agent_id.clone(),
+            buffer.agent.run_id.clone(),
+            buffer.resume_cursor,
+            before,
+        );
     }
     Dispatched::None
 }
@@ -1417,16 +1419,15 @@ pub(crate) fn capture_hits(app: &App, area: ratatui::layout::Rect) {
     let mut rows = vec![RowHit::default(); usize::from(area.height)];
     for (y, hit) in rows.iter_mut().enumerate() {
         let row = y as u16;
-        if let Some((rect, targets)) = &list_rows {
-            if let Some((card, finished)) = row
+        if let Some((rect, targets)) = &list_rows
+            && let Some((card, finished)) = row
                 .checked_sub(rect.y)
                 .and_then(|row| targets.get(usize::from(row)))
-            {
-                hit.card = card
-                    .and_then(|card| cards.get(card))
-                    .map(|index| app.sessions[*index].agent_id.clone());
-                hit.finished = *finished;
-            }
+        {
+            hit.card = card
+                .and_then(|card| cards.get(card))
+                .map(|index| app.sessions[*index].agent_id.clone());
+            hit.finished = *finished;
         }
         if let Some(rect) = panes.transcript {
             hit.message = current_transcript_message_at(app, rect, row).and_then(|index| {

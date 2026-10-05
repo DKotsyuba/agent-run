@@ -13,7 +13,7 @@
 //! can never drift apart.
 
 use super::{text, theme};
-use crate::app::{self, human_duration, App, TranscriptBuffer, SILENCE_WARN_SECONDS};
+use crate::app::{self, App, SILENCE_WARN_SECONDS, TranscriptBuffer, human_duration};
 use agent_run_domain::views::MessageView;
 use ratatui::{
     Frame,
@@ -1360,7 +1360,7 @@ fn end_row(agent: &agent_run_domain::AgentView) -> Row {
                 keep: None,
                 running_at: None,
                 spins: false,
-            }
+            };
         }
     };
     let style = Style::new().fg(color).add_modifier(Modifier::BOLD);
@@ -1766,15 +1766,15 @@ fn render_header(f: &mut Frame, app: &App, buffer: &TranscriptBuffer, split: boo
             theme::dim(),
         ),
     ];
-    if let Some(silence) = agent.silence_seconds {
-        if !agent.status.terminal() {
-            let warn = silence >= SILENCE_WARN_SECONDS;
-            meta.push(Span::raw(" "));
-            meta.push(Span::styled(
-                format!("silence {}", human_duration(silence)),
-                if warn { theme::warning() } else { theme::dim() },
-            ));
-        }
+    if let Some(silence) = agent.silence_seconds
+        && !agent.status.terminal()
+    {
+        let warn = silence >= SILENCE_WARN_SECONDS;
+        meta.push(Span::raw(" "));
+        meta.push(Span::styled(
+            format!("silence {}", human_duration(silence)),
+            if warn { theme::warning() } else { theme::dim() },
+        ));
     }
     if let Some(failure) = &agent.failure_text {
         meta.push(Span::raw(" "));
@@ -2079,22 +2079,25 @@ mod tests {
             }])));
             let guard = cache(&buffer, 80);
             let row = &guard.blocks[0].rows[0];
-            assert!(row
-                .left
-                .iter()
-                .any(|span| span.content == "Bash" && span.style.fg == Some(color)));
+            assert!(
+                row.left
+                    .iter()
+                    .any(|span| span.content == "Bash" && span.style.fg == Some(color))
+            );
             assert!(row.right.iter().any(|span| span.content == marker));
             if error == Some(true) {
-                assert!(row
-                    .left
-                    .iter()
-                    .any(|span| span.content.contains("error: exit 101")
-                        && span.style.fg == Some(p.red)));
-                assert!(row
-                    .right
-                    .iter()
-                    .filter(|span| !span.content.is_empty())
-                    .all(|span| span.style.fg == Some(p.red)));
+                assert!(
+                    row.left
+                        .iter()
+                        .any(|span| span.content.contains("error: exit 101")
+                            && span.style.fg == Some(p.red))
+                );
+                assert!(
+                    row.right
+                        .iter()
+                        .filter(|span| !span.content.is_empty())
+                        .all(|span| span.style.fg == Some(p.red))
+                );
             }
         }
     }
@@ -2115,17 +2118,19 @@ mod tests {
             now: 101.0,
         };
         let line = assemble_row(&buffer, &guard, &guard.blocks[0].rows[0], 100, true, &ctx);
-        assert!(line
-            .spans
-            .iter()
-            .any(|span| span.content.contains("… content truncated")
-                && span.style.fg == theme::dim().fg));
+        assert!(
+            line.spans
+                .iter()
+                .any(|span| span.content.contains("… content truncated")
+                    && span.style.fg == theme::dim().fg)
+        );
         drop(guard);
         buffer.toggle_expanded(1);
-        assert!(cache(&buffer, 100).blocks[0].rows.iter().any(|row| row
-            .left
-            .iter()
-            .any(|span| span.content == "… content truncated")));
+        assert!(cache(&buffer, 100).blocks[0].rows.iter().any(|row| {
+            row.left
+                .iter()
+                .any(|span| span.content == "… content truncated")
+        }));
     }
 
     #[test]
@@ -2569,11 +2574,13 @@ mod tests {
         cache(&buffer, 80);
         buffer.toggle_expanded(1);
         let guard = cache(&buffer, 80);
-        assert!(guard.blocks[0]
-            .rows
-            .iter()
-            .flat_map(|row| &row.left)
-            .all(|span| span.content.len() <= 512));
+        assert!(
+            guard.blocks[0]
+                .rows
+                .iter()
+                .flat_map(|row| &row.left)
+                .all(|span| span.content.len() <= 512)
+        );
         let full: usize = guard.blocks[0]
             .rows
             .iter()
@@ -2795,7 +2802,10 @@ mod tests {
             .unwrap(),
         );
         let line = usage_line(&agent);
-        assert_eq!(line, "in 1234 · out 56 · cache 1200 · $0.25 · turns 4 · tools 41 · 2 failed · 3 unknown · Σ 3 runs $1.24");
+        assert_eq!(
+            line,
+            "in 1234 · out 56 · cache 1200 · $0.25 · turns 4 · tools 41 · 2 failed · 3 unknown · Σ 3 runs $1.24"
+        );
         let mut app = App::new();
         app.screen = crate::app::Screen::Transcript;
         app.transcript = Some(TranscriptBuffer::open(agent.clone()));

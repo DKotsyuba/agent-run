@@ -339,26 +339,30 @@ fn message_error_evidence_is_validated() {
     let home = common::Home::new();
     let mut store = home.store();
     let id = agent(&mut store, &home);
-    assert!(store
-        .message_with_error(
-            &id,
-            "assistant",
-            "x",
-            None,
-            None,
-            Some((true, "claude.is_error"))
-        )
-        .is_err());
-    assert!(store
-        .message_with_error(
-            &id,
-            "tool_result",
-            "x",
-            None,
-            Some("t1"),
-            Some((false, "agent.exit_code"))
-        )
-        .is_err());
+    assert!(
+        store
+            .message_with_error(
+                &id,
+                "assistant",
+                "x",
+                None,
+                None,
+                Some((true, "claude.is_error"))
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .message_with_error(
+                &id,
+                "tool_result",
+                "x",
+                None,
+                Some("t1"),
+                Some((false, "agent.exit_code"))
+            )
+            .is_err()
+    );
     store
         .message_with_error(
             &id,

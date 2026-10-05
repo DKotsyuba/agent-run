@@ -1014,10 +1014,12 @@ async fn result_then_hang_is_ended_by_the_run_deadline() {
     assert_eq!(row.status, Status::TimedOut);
     assert_eq!(row.failure_kind.as_deref(), Some("no_answer"));
     assert_eq!(service.answer(&id).unwrap()["available"], false);
-    assert!(store
-        .last_event(&id, "run_deadline_expired")
-        .unwrap()
-        .is_some());
+    assert!(
+        store
+            .last_event(&id, "run_deadline_expired")
+            .unwrap()
+            .is_some()
+    );
     let cleanup = store
         .last_event(&id, "process_cleanup")
         .unwrap()
@@ -5043,10 +5045,12 @@ async fn pool_concurrent_identical_requests_create_one_pool() {
         .map(|handle| handle.join().unwrap().unwrap())
         .collect();
     assert_eq!(outcomes.iter().filter(|o| o["created"] == true).count(), 1);
-    assert!(outcomes
-        .iter()
-        .all(|o| o["members"] == outcomes[0]["members"]
-            || o["members"][0]["agent_id"] == outcomes[0]["members"][0]["agent_id"]));
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| o["members"] == outcomes[0]["members"]
+                || o["members"][0]["agent_id"] == outcomes[0]["members"][0]["agent_id"])
+    );
     assert_eq!(table_rows(&home, "pools"), 1);
     assert_eq!(rows(&home), (2, 2));
 }
@@ -5286,10 +5290,12 @@ async fn pool_operator_post_and_status_through_the_service() {
         serde_json::json!(ids[0])
     );
     assert_eq!(status["status"]["members"][0]["cleanup_complete"], false);
-    assert!(status["entries"][0]["body"]
-        .as_str()
-        .unwrap()
-        .contains("failing test"));
+    assert!(
+        status["entries"][0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("failing test")
+    );
     assert_eq!(status["entries"][0]["author_kind"], "operator");
     let text = status.to_string();
     assert_eq!(status["delivery"]["attempts"], 0);
@@ -5565,12 +5571,14 @@ async fn pool_replace_reuses_the_original_spec_without_pinning_the_old_account()
         identity["provider_request"]["account"].is_null(),
         "no pinned old account"
     );
-    assert!(store
-        .get(&reused.new.agent_id)
-        .unwrap()
-        .request
-        .account
-        .is_none());
+    assert!(
+        store
+            .get(&reused.new.agent_id)
+            .unwrap()
+            .request
+            .account
+            .is_none()
+    );
     assert_eq!(
         store.get(&ids[0]).unwrap().identity.unwrap(),
         old_identity,
@@ -5851,10 +5859,12 @@ async fn pool_composed_task_survives_native_history_failover_and_resume() {
         1,
         "{inputs:?}"
     );
-    assert!(inputs
-        .last()
-        .unwrap()
-        .contains(agent_run::supervisor::CONTINUATION_CONTROL));
+    assert!(
+        inputs
+            .last()
+            .unwrap()
+            .contains(agent_run::supervisor::CONTINUATION_CONTROL)
+    );
     let first_input = inputs[0].clone();
 
     // Explicit resume of the same stable agent: the composition is inherited

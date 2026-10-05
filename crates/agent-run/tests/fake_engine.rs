@@ -400,10 +400,12 @@ async fn legacy_result_then_hang_is_ended_by_the_run_deadline() {
         Service::new(home.clone()).answer(&id).unwrap()["available"],
         json!(false)
     );
-    assert!(store
-        .last_event(&id, "run_deadline_expired")
-        .unwrap()
-        .is_some());
+    assert!(
+        store
+            .last_event(&id, "run_deadline_expired")
+            .unwrap()
+            .is_some()
+    );
     let cleanup = store
         .last_event(&id, "process_cleanup")
         .unwrap()
@@ -451,10 +453,12 @@ async fn legacy_completion_after_the_stored_deadline_is_timed_out() {
     let store = Store::open(&home).unwrap();
     let row = store.get(&id).unwrap();
     assert_eq!(row.status, Status::TimedOut);
-    assert!(store
-        .last_event(&id, "run_deadline_expired")
-        .unwrap()
-        .is_some());
+    assert!(
+        store
+            .last_event(&id, "run_deadline_expired")
+            .unwrap()
+            .is_some()
+    );
     let cleanup = store.last_event(&id, "process_cleanup").unwrap().unwrap();
     assert_eq!(cleanup["confirmed"], json!(true));
 }

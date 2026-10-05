@@ -5,11 +5,11 @@
 use super::theme;
 use crate::app::App;
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Clear, Paragraph},
-    Frame,
 };
 
 /// The centered overlay rectangle for one content size, clipped to the area.

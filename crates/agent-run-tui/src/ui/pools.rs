@@ -10,11 +10,11 @@ use agent_run_domain::pool::{
     AuthorKind, Direction, EntryKind, PoolEntryView, PoolState, VoteDecision,
 };
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
-    Frame,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},

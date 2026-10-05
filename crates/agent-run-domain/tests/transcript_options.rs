@@ -33,13 +33,15 @@ fn default_query_is_a_forward_raw_page() {
 /// Bounds and selector conflicts reject before any read.
 #[test]
 fn query_validation_rejects_conflicting_selections() {
-    assert!(TranscriptQuery {
-        limit: 200,
-        view: TranscriptView::Blocks,
-        ..Default::default()
-    }
-    .validate()
-    .is_ok());
+    assert!(
+        TranscriptQuery {
+            limit: 200,
+            view: TranscriptView::Blocks,
+            ..Default::default()
+        }
+        .validate()
+        .is_ok()
+    );
     for invalid in [
         TranscriptQuery {
             cursor: -1,

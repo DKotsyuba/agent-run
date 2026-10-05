@@ -710,10 +710,9 @@ impl App {
                 .sessions
                 .iter()
                 .find(|agent| agent.agent_id == buffer.agent.agent_id)
+            && buffer.agent != *fresh
         {
-            if buffer.agent != *fresh {
-                buffer.agent = fresh.clone();
-            }
+            buffer.agent = fresh.clone();
         }
     }
 
@@ -773,10 +772,10 @@ impl App {
         self.link = Link::Down;
         self.last_error = Some(message.clone());
         self.dirty = true;
-        if let Some(buffer) = &mut self.transcript {
-            if buffer.agent.agent_id == *agent_id {
-                buffer.last_page_error = Some(message);
-            }
+        if let Some(buffer) = &mut self.transcript
+            && buffer.agent.agent_id == *agent_id
+        {
+            buffer.last_page_error = Some(message);
         }
     }
 

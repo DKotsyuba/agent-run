@@ -4,9 +4,9 @@
 
 mod common;
 
-use agent_run_adapters::{io::Process, LaunchPlan};
+use agent_run_adapters::{LaunchPlan, io::Process};
 use agent_run_core::{domain::Status, stream};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 const RESULT: &str = r#"{"type":"result","subtype":"success","is_error":false,"session_id":"s","result":"done","usage":{"input_tokens":1,"output_tokens":1},"num_turns":1}"#;

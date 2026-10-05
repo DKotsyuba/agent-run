@@ -657,7 +657,9 @@ async fn scripted_pool_completes_with_one_correlated_common_notice() {
         1
     );
     assert_eq!(
-        count("SELECT COUNT(*) FROM deliveries d JOIN events e ON e.seq=d.terminal_event_seq WHERE e.kind='status' AND e.to_status='succeeded'"),
+        count(
+            "SELECT COUNT(*) FROM deliveries d JOIN events e ON e.seq=d.terminal_event_seq WHERE e.kind='status' AND e.to_status='succeeded'"
+        ),
         0,
         "successful pool members must not queue individual completion notices"
     );
@@ -666,11 +668,13 @@ async fn scripted_pool_completes_with_one_correlated_common_notice() {
         .await
         .unwrap();
     assert_eq!(page["status"]["state"], "completed");
-    assert!(socket::client(
-        &h.home,
-        "pool_post",
-        json!({"pool_id": pool_id, "request_id": "late", "message": "too late"})
-    )
-    .await
-    .is_err());
+    assert!(
+        socket::client(
+            &h.home,
+            "pool_post",
+            json!({"pool_id": pool_id, "request_id": "late", "message": "too late"})
+        )
+        .await
+        .is_err()
+    );
 }

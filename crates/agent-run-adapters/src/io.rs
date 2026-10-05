@@ -550,7 +550,7 @@ impl Process {
                 Event::Json(v) => self.backlog.push_back(Event::Json(v)),
                 Event::Eof => return Ok(RpcDisposition::Uncertain(RpcUncertain::Closed)),
                 Event::Failure(kind) => {
-                    return Ok(RpcDisposition::Uncertain(RpcUncertain::Transport(kind)))
+                    return Ok(RpcDisposition::Uncertain(RpcUncertain::Transport(kind)));
                 }
             }
         }

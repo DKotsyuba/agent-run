@@ -48,14 +48,18 @@ fn unnamed_requests_preserve_historical_replay_shape() {
         "task":"review", "workdir":std::env::current_dir().unwrap(), "display_name":null
     }))
     .unwrap();
-    assert!(!serde_json::to_value(&request)
-        .unwrap()
-        .as_object()
-        .unwrap()
-        .contains_key("display_name"));
-    assert!(!serde_json::to_value(request.storage_projection())
-        .unwrap()
-        .as_object()
-        .unwrap()
-        .contains_key("display_name"));
+    assert!(
+        !serde_json::to_value(&request)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("display_name")
+    );
+    assert!(
+        !serde_json::to_value(request.storage_projection())
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("display_name")
+    );
 }

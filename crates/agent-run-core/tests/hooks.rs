@@ -846,10 +846,12 @@ fn start_pool_receipt_binds_the_whole_pool_atomically() {
         json!({"pool_id": pool, "created": true, "state": "open"}),
         json!({"content":[{"type":"text","text":"agent-run pool"}]}),
     ] {
-        assert!(bind::normalize(&receipt(response), true, "claude_uds")
-            .map(|p| p.pool_id)
-            .unwrap_or(None)
-            .is_none());
+        assert!(
+            bind::normalize(&receipt(response), true, "claude_uds")
+                .map(|p| p.pool_id)
+                .unwrap_or(None)
+                .is_none()
+        );
     }
     // A conflicting binding of one member makes the pool binding fail whole.
     let other = OrchestratorRef {
@@ -859,13 +861,15 @@ fn start_pool_receipt_binds_the_whole_pool_atomically() {
     };
     store.bind_orchestrator(&members[1], &other, 1.0).unwrap();
     let structured = json!({"structuredContent": {"pool_id": pool}});
-    assert!(bind::run_hook_bound(
-        &mut store,
-        &receipt(structured.clone()),
-        "claude_uds",
-        Some(2.0)
-    )
-    .is_err());
+    assert!(
+        bind::run_hook_bound(
+            &mut store,
+            &receipt(structured.clone()),
+            "claude_uds",
+            Some(2.0)
+        )
+        .is_err()
+    );
     let bound: i64 = store
         .conn
         .query_row(

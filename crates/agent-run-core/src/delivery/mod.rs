@@ -601,18 +601,18 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
             // stable identity as peers, from the one shared renderer. The stored
             // worker message stays raw for idempotent replay.
             let message = match tx
-            .query_row(
-                "SELECT seq,author_kind,author_agent_id,author_name,author_role,direction,kind,\
+                .query_row(
+                    "SELECT seq,author_kind,author_agent_id,author_name,author_role,direction,kind,\
                  severity,proposal_seq,roster_revision,decision,body \
                  FROM pool_entries WHERE delivery_id=?",
-                [&delivery_id],
-                agent_run_store::pool_log::entry_view,
-            )
-            .optional()?
-        {
-            Some(entry) => pool_decorated(&agent_run_domain::pool::render_entry(&entry)?),
-            None => message,
-        };
+                    [&delivery_id],
+                    agent_run_store::pool_log::entry_view,
+                )
+                .optional()?
+            {
+                Some(entry) => pool_decorated(&agent_run_domain::pool::render_entry(&entry)?),
+                None => message,
+            };
             let notice = WorkerNotice {
                 notification_id: delivery_id.clone(),
                 agent_id: root.parse()?,

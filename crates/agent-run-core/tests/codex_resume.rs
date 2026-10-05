@@ -628,17 +628,19 @@ async fn old_parent_resume_retry_replays_through_later_continuations() {
         ..canonical.clone()
     };
     for (task, orchestrator) in [("different task", None), ("continue", Some(other_family))] {
-        assert!(service
-            .resume(
-                &root,
-                task.into(),
-                None,
-                Some("retry-1".into()),
-                None,
-                orchestrator,
-            )
-            .await
-            .is_err());
+        assert!(
+            service
+                .resume(
+                    &root,
+                    task.into(),
+                    None,
+                    Some("retry-1".into()),
+                    None,
+                    orchestrator,
+                )
+                .await
+                .is_err()
+        );
     }
     let children: i64 = home
         .store()
