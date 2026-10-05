@@ -1018,71 +1018,122 @@ fn orphan_recovery_uses_durable_members_after_leader_exit() {
         }
     }
 
-    let child = Command::new("/bin/sh")
-        .args(["-c", "sleep 8 & echo $!; read finish"])
-        .process_group(0)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let owner = process::OwnedProcess::capture(child.id() as i32);
-    let mut fixture = Fixture { child, owner };
-    let mut line = String::new();
-    std::io::BufReader::new(fixture.child.stdout.take().unwrap())
-        .read_line(&mut line)
-        .unwrap();
-    let descendant = process::inspect(line.trim().parse().unwrap()).unwrap();
-    fixture.owner.refresh();
-    let root = fixture.owner.leader.clone().unwrap();
-    let home = common::Home::new();
-    let mut store = home.store();
-    lost_agent_with_attempt(
-        &store,
-        "ag-20260924-000000-0000000011",
-        "att_recover",
-        1.0,
-        Some((&root.token, root.birth)),
-        Some(root.pid),
-    );
-    store
-        .remember_processes("attempt", "att_recover", &fixture.owner.snapshot().unwrap())
-        .unwrap();
-    fixture
-        .child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"finish\n")
-        .unwrap();
-    fixture.child.wait().unwrap();
-    drop(store);
+    for group_case in 0..4 {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "sleep 8 & echo $!; read finish"])
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let owner = process::OwnedProcess::capture(child.id() as i32);
+        let mut fixture = Fixture { child, owner };
+        let mut line = String::new();
+        std::io::BufReader::new(fixture.child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let descendant = process::inspect(line.trim().parse().unwrap()).unwrap();
+        fixture.owner.refresh();
+        let root = fixture.owner.leader.clone().unwrap();
+        let home = common::Home::new();
+        let mut store = home.store();
+        lost_agent_with_attempt(
+            &store,
+            "ag-20260924-000000-0000000011",
+            "att_recover",
+            1.0,
+            Some((&root.token, root.birth)),
+            match group_case {
+                0 => Some(root.pid),
+                1 => None,
+                _ => Some(root.pid + 1),
+            },
+        );
+        let mut snapshot = fixture.owner.snapshot().unwrap();
+        if group_case == 3 {
+            // Recovery must retain members first discovered during its own cleanup.
+            snapshot.members.retain(|member| member.pid == root.pid);
+        }
+        store
+            .remember_processes("attempt", "att_recover", &snapshot)
+            .unwrap();
+        if group_case != 3 {
+            fixture
+                .child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"finish\n")
+                .unwrap();
+            fixture.child.wait().unwrap();
+        }
+        drop(store);
 
-    let started = Instant::now();
-    let mut store = home.store();
-    reconcile(&mut store, 10).unwrap();
-    assert!(
-        started.elapsed() < Duration::from_secs(3),
-        "recovery must not wait for the fixture TTL"
-    );
-    assert!(matches!(
-        process::observe(
-            Some(descendant.pid),
-            Some(&descendant.token),
-            Some(descendant.birth)
-        ),
-        ProcessState::Dead | ProcessState::Reused
-    ));
-    let (active, proof): (bool, String) = store
-        .conn
-        .query_row(
-            "SELECT ownership_active,cleanup_proof_json FROM attempts WHERE id='att_recover'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert!(!active);
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&proof).unwrap()["confirmed"],
-        true
-    );
+        let started = Instant::now();
+        let mut store = home.store();
+        if group_case == 2 {
+            store
+                .conn
+                .execute(
+                    "UPDATE attempts SET process_identity='mismatched' WHERE id='att_recover'",
+                    [],
+                )
+                .unwrap();
+            reconcile(&mut store, 10).unwrap();
+            assert_eq!(
+                process::observe(
+                    Some(descendant.pid),
+                    Some(&descendant.token),
+                    Some(descendant.birth)
+                ),
+                ProcessState::Alive
+            );
+            store
+                .conn
+                .execute(
+                    "UPDATE attempts SET process_identity=? WHERE id='att_recover'",
+                    [&root.token],
+                )
+                .unwrap();
+        }
+        reconcile(&mut store, 10).unwrap();
+        if group_case == 3 {
+            fixture.child.wait().unwrap();
+            let retained = store
+                .remembered_processes("attempt", "att_recover")
+                .unwrap()
+                .unwrap()
+                .snapshot()
+                .unwrap();
+            assert!(retained
+                .members
+                .iter()
+                .any(|member| member.pid == descendant.pid && member.token == descendant.token));
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "recovery must not wait for the fixture TTL"
+        );
+        assert!(matches!(
+            process::observe(
+                Some(descendant.pid),
+                Some(&descendant.token),
+                Some(descendant.birth)
+            ),
+            ProcessState::Dead | ProcessState::Reused
+        ));
+        let (active, proof): (bool, String) = store
+            .conn
+            .query_row(
+                "SELECT ownership_active,cleanup_proof_json FROM attempts WHERE id='att_recover'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(!active);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&proof).unwrap()["confirmed"],
+            true
+        );
+    }
 }

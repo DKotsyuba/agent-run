@@ -9,7 +9,7 @@ use agent_run_domain::{
     domain::{AgentId, now},
     error::invalid,
 };
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Map, Value, json};
 
 /// Maximum age of an unbound completion notice before it is permanently expired.
@@ -19,14 +19,16 @@ pub const MAX_EVIDENCE_TAIL_BYTES: usize = 4096;
 /// Maximum UTF-8 bytes retained in one complete evidence JSON document.
 pub const MAX_EVIDENCE_BYTES: usize = 16 * 1024;
 
-/// Inserts the one durable completion notice associated with a terminal event.
+/// Inserts a durable completion notice for a terminal event when one is needed.
 ///
-/// A terminal run with an already-known orchestrator session is immediately
-/// `pending`. A run without a session has no delivery row because no bind hook
-/// can ever activate it; callers report that absence as `not_created`. The
-/// caller owns the surrounding transaction, so the notice cannot become
-/// visible without the terminal event it references.
-/// Returns the new notification id when a row is inserted, otherwise `None`.
+/// Successful runs in a current pool seat omit individual notices;
+/// the pool's common completion notice represents that success. Failures and
+/// other terminal outcomes still create individual notices. A run with an
+/// orchestrator session starts `pending`; without one, no delivery row can be
+/// activated. The caller owns the transaction, keeping any row atomic with its
+/// terminal event. Repeated calls for the same terminal event reuse its notice,
+/// including failed or expired rows. Returns the notification id when present, otherwise
+/// `None`.
 pub(crate) fn insert_terminal_notice(
     tx: &Transaction<'_>,
     id: &AgentId,
@@ -34,15 +36,55 @@ pub(crate) fn insert_terminal_notice(
     terminal_event_seq: i64,
     at: f64,
 ) -> Result<Option<String>> {
+    let suppress_member_success: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agents a JOIN pool_members m ON m.agent_id=COALESCE(NULLIF(a.root_agent_id,''),a.id) JOIN pools p ON p.id=m.pool_id WHERE a.id=? AND a.status='succeeded' AND m.replaced_by IS NULL)",
+        [id.as_str()],
+        |row| row.get(0),
+    )?;
+    if suppress_member_success {
+        return Ok(None);
+    }
     let Some(session) = session else {
         return Ok(None);
     };
+    let previous: Option<String> = tx
+        .query_row(
+            "SELECT id FROM deliveries WHERE agent_id=? AND terminal_event_seq=? LIMIT 1",
+            params![id.as_str(), terminal_event_seq],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if previous.is_some() {
+        return Ok(previous);
+    }
     let notification_id = format!("ntf_{}", uuid::Uuid::new_v4().simple());
     tx.execute(
         "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,terminal_event_seq,state,next_attempt_at) VALUES(?,?,?,?,?,?)",
         params![notification_id, id.as_str(), session, terminal_event_seq, "pending", at],
     )?;
     Ok(Some(notification_id))
+}
+
+/// Repairs a completion omitted before binding, atomically with the binding transaction.
+/// Only a durable terminal status event can create a notice. Existing notices are reused
+/// and successful current pool members remain suppressed; no historical row is resurrected.
+pub(crate) fn ensure_bound_terminal_notice(
+    tx: &Transaction<'_>,
+    id: &AgentId,
+    session: &str,
+    at: f64,
+) -> Result<()> {
+    let event: Option<i64> = tx.query_row(
+        "SELECT MAX(e.seq) FROM events e JOIN agents a ON a.id=e.agent_id \
+         WHERE a.id=? AND a.status IN ('succeeded','failed','timed_out','cancelled','lost') \
+         AND e.kind='status' AND e.to_status=a.status",
+        [id.as_str()],
+        |row| row.get(0),
+    )?;
+    if let Some(event) = event {
+        insert_terminal_notice(tx, id, Some(session), event, at)?;
+    }
+    Ok(())
 }
 
 /// Redacts one diagnostic suffix, retaining at most [`MAX_EVIDENCE_TAIL_BYTES`] UTF-8 bytes.
@@ -425,9 +467,13 @@ pub(crate) fn retry(
 
 /// Returns the latest validated evidence document for one delivery.
 pub(crate) fn latest(store: &Store, delivery_id: &str) -> Result<Option<Value>> {
+    latest_on(&store.conn, delivery_id)
+}
+
+/// Reads and sanitizes the latest delivery evidence through an existing database snapshot.
+pub(crate) fn latest_on(conn: &Connection, delivery_id: &str) -> Result<Option<Value>> {
     required_text("delivery_id", delivery_id)?;
-    let raw: Option<String> = store
-        .conn
+    let raw: Option<String> = conn
         .query_row(
             "SELECT evidence_json FROM delivery_attempt_evidence WHERE delivery_id=? ORDER BY attempt DESC LIMIT 1",
             [delivery_id],
@@ -473,7 +519,7 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut statement = tx.prepare(
-            "SELECT d.id FROM deliveries d JOIN agents a ON a.id=d.agent_id JOIN events e ON e.seq=d.terminal_event_seq WHERE d.state='waiting_binding' AND e.kind!='worker_notification' AND a.status IN ('succeeded','failed','timed_out','cancelled','lost') AND e.at<=? ORDER BY e.at,d.id",
+            "SELECT d.id FROM deliveries d JOIN agents a ON a.id=d.agent_id JOIN events e ON e.seq=d.terminal_event_seq WHERE d.state='waiting_binding' AND e.kind NOT IN ('worker_notification','pool_completed') AND a.status IN ('succeeded','failed','timed_out','cancelled','lost') AND e.at<=? ORDER BY e.at,d.id",
         )?;
         let ids = statement
             .query_map([at - BINDING_WINDOW_SECONDS], |row| row.get::<_, String>(0))?

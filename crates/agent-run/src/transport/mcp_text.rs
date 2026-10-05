@@ -6,8 +6,8 @@
 //! CLI keep their structured JSON contracts; only the MCP presentation is
 //! text. `start`/`resume` additionally keep a tiny structured
 //! `{"agent_id": ..., "sequence": ...}` so the PostToolUse binding hook can
-//! bind the exact execution from JSON (see `hooks::bind`); no other tool
-//! mirrors its result into structured content. Expected failures use typed
+//! bind the exact execution from JSON (see `hooks::bind`); `start_pool` keeps
+//! only its stable pool id for the common-notice binding. Expected failures use typed
 //! errors; presentation degradation preserves independent execution receipts.
 //! Whole pages either fit their byte/row/content budgets or publish no rows.
 
@@ -23,7 +23,40 @@ const TEMPLATES: &[(&str, &str)] = &[
         "notify_orchestrator",
         include_str!("../../../../assets/mcp/notify_orchestrator.txt.j2"),
     ),
+    (
+        "pool_post",
+        include_str!("../../../../assets/mcp/pool_post.txt.j2"),
+    ),
+    (
+        "pool_read",
+        include_str!("../../../../assets/mcp/pool_read.txt.j2"),
+    ),
+    (
+        "pool_propose",
+        include_str!("../../../../assets/mcp/pool_propose.txt.j2"),
+    ),
+    (
+        "pool_vote",
+        include_str!("../../../../assets/mcp/pool_vote.txt.j2"),
+    ),
     ("start", include_str!("../../../../assets/mcp/start.txt.j2")),
+    (
+        "start_pool",
+        include_str!("../../../../assets/mcp/start_pool.txt.j2"),
+    ),
+    (
+        "operator_pool_post",
+        include_str!("../../../../assets/mcp/operator_pool_post.txt.j2"),
+    ),
+    (
+        "pool_replace",
+        include_str!("../../../../assets/mcp/pool_replace.txt.j2"),
+    ),
+    ("pool", include_str!("../../../../assets/mcp/pool.txt.j2")),
+    (
+        "list_pools",
+        include_str!("../../../../assets/mcp/list_pools.txt.j2"),
+    ),
     (
         "resume",
         include_str!("../../../../assets/mcp/resume.txt.j2"),
@@ -81,6 +114,7 @@ fn environment() -> std::result::Result<&'static Environment<'static>, &'static 
             environment.set_fuel(Some(50_000));
             // Pure constant-time optional-field predicate; no implicit globals/filters.
             environment.add_test("none", |value: minijinja::Value| value.is_none());
+            environment.add_test("defined", |value: minijinja::Value| !value.is_undefined());
             for (name, source) in TEMPLATES.iter().copied().chain([("error", ERROR_TEMPLATE)]) {
                 environment
                     .add_template(name, source)
@@ -113,24 +147,63 @@ struct ExecutionReceipt {
     sequence: Option<u32>,
     /// Exact queued steering command, retained on formatting failure.
     command_id: Option<i64>,
+    /// Exact durable pool-log sequence, retained independently of its layout.
+    pool_seq: Option<u64>,
+    /// Newly admitted replacement identity, retained on presentation failure.
+    replacement_id: Option<String>,
 }
 
 impl ExecutionReceipt {
     /// Captures acknowledged effects before any projection/rendering. Only a
     /// successful mutation with a valid identity is confirmed as accepted.
     fn capture(tool: &str, value: &Value, request_id: Option<&str>) -> Self {
-        let mutating = matches!(
+        let pool = matches!(
             tool,
-            "start" | "resume" | "cancel" | "steer" | "notify_orchestrator"
+            "start_pool"
+                | "pool_replace"
+                | "operator_pool_post"
+                | "pool_post"
+                | "pool_propose"
+                | "pool_vote"
         );
         let identity = value[if tool == "notify_orchestrator" {
             "notification_id"
+        } else if pool {
+            "pool_id"
         } else {
             "agent_id"
         }]
         .as_str()
         .filter(|id| reference(id))
         .map(str::to_owned);
+        let pool_seq = value["seq"]
+            .as_u64()
+            .filter(|n| *n > 0 && *n <= i64::MAX as u64);
+        let replacement_id = value["member"]["agent_id"]
+            .as_str()
+            .filter(|id| reference(id))
+            .map(str::to_owned);
+        let accepted = identity.is_some()
+            && match tool {
+                "start" | "resume" | "cancel" | "steer" | "notify_orchestrator" => true,
+                "pool_replace" => {
+                    value["created"].is_boolean()
+                        && value["roster_revision"].as_u64().is_some_and(|n| n > 0)
+                        && replacement_id.is_some()
+                        && value["replaced"]["agent_id"]
+                            .as_str()
+                            .is_some_and(reference)
+                }
+                "start_pool" => {
+                    value["created"].is_boolean()
+                        && value["roster_revision"].as_u64().is_some_and(|n| n > 0)
+                }
+                "operator_pool_post" => pool_seq.is_some() && value["created"].is_boolean(),
+                "pool_post" | "pool_propose" | "pool_vote" => {
+                    pool_seq.is_some() && value["duplicate"].is_boolean()
+                }
+                _ => false,
+            };
         let sequence = value
             .get("sequence")
             .or_else(|| value["agent"].get("sequence"))
@@ -138,7 +211,9 @@ impl ExecutionReceipt {
             .and_then(|n| u32::try_from(n).ok())
             .filter(|n| *n > 0);
         Self {
-            accepted: mutating && identity.is_some(),
+            accepted,
+            pool_seq,
+            replacement_id,
             identity,
             sequence,
             command_id: value["command_id"].as_i64().filter(|n| *n > 0),
@@ -158,7 +233,17 @@ impl ExecutionReceipt {
             )
         } else if matches!(
             tool,
-            "start" | "resume" | "cancel" | "steer" | "notify_orchestrator"
+            "start"
+                | "resume"
+                | "cancel"
+                | "steer"
+                | "notify_orchestrator"
+                | "start_pool"
+                | "pool_replace"
+                | "operator_pool_post"
+                | "pool_post"
+                | "pool_propose"
+                | "pool_vote"
         ) {
             "OUTCOME_UNKNOWN\nPresentation: degraded (presentation_failed).\nReconcile the original request before any retry; do not create replacement work.\n".into()
         } else {
@@ -168,6 +253,12 @@ impl ExecutionReceipt {
             && let Some(id) = &self.identity
         {
             text.push_str(&format!("Target agent: {id}\n"));
+        }
+        if let Some(id) = &self.replacement_id {
+            text.push_str(&format!("Replacement agent: {id}\n"));
+        }
+        if let Some(seq) = self.pool_seq {
+            text.push_str(&format!("Pool entry: {seq}\n"));
         }
         if let Some(command) = self.command_id {
             text.push_str(&format!("Command: {command}\n"));
@@ -217,6 +308,14 @@ struct AgentTextView {
     mcp_more: usize,
     /// Display-safe task label.
     task: String,
+    /// Optional broker-assigned display name.
+    name: String,
+    /// Latest observed public usage summary; absence stays empty.
+    usage: String,
+    /// Honest lineage coverage summary.
+    usage_lineage: String,
+    /// Optional latest-execution tool counts, preserving unknown values.
+    tool_counts: Option<String>,
     /// Optional fixed failure classification.
     failure_kind: String,
     /// Display-safe failure explanation.
@@ -297,6 +396,24 @@ struct MessageTextView {
     name: Option<String>,
     /// Faithful excerpt content; never label-normalized.
     content: String,
+    /// Inclusive first source sequence for a block.
+    first_seq: Option<i64>,
+    /// Inclusive final source sequence for a block.
+    last_seq: Option<i64>,
+    /// Opaque raw evidence reference, never automatically expanded.
+    raw_ref: Option<String>,
+    /// Whether earlier block fragments lie outside this page.
+    partial_before: Option<bool>,
+    /// Whether later block fragments lie outside this page.
+    partial_after: Option<bool>,
+    /// Explicit omitted inline byte count when known.
+    omitted_bytes: Option<u64>,
+    /// Inline completeness; absence remains unknown historical coverage.
+    content_complete: Option<bool>,
+    /// Fixed native result classification: error, ok, or unknown.
+    error: String,
+    /// Allowlisted native evidence source.
+    error_source: Option<String>,
 }
 
 /// Whole transcript page with exact retrieval metadata.
@@ -308,6 +425,12 @@ struct TranscriptTextView {
     next_cursor: Option<i64>,
     /// Explicit source completeness.
     complete: bool,
+    /// Exclusive upper continuation for older blocks.
+    previous_cursor: Option<i64>,
+    /// Validated forward/backward paging direction.
+    direction: String,
+    /// Validated raw/blocks representation.
+    view: String,
     /// Every incoming message in order.
     messages: Vec<MessageTextView>,
     /// Displayed message count.
@@ -359,6 +482,252 @@ struct ReportTextView {
     duplicate: bool,
 }
 
+/// Pool admission roster, without provider, account, attempt or capability fields.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PoolAdmissionMemberTextView {
+    /// Stable actionable member identity.
+    agent_id: String,
+    /// Broker-assigned display label.
+    name: String,
+    /// Descriptive role; conveys no permission.
+    role: String,
+    /// Current lifecycle; null means an original member was replaced or pruned.
+    status: Option<crate::domain::Status>,
+}
+
+/// Public admission and binding facts of a committed cooperative pool.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PoolAdmissionTextView {
+    /// Stable pool receipt identity.
+    pool_id: String,
+    /// Newly admitted versus exact request replay.
+    created: bool,
+    /// Durable common-notice binding.
+    bound: bool,
+    /// Positive current roster revision.
+    roster_revision: u32,
+    /// Every admitted member, in roster order.
+    members: Vec<PoolAdmissionMemberTextView>,
+}
+
+/// Stable identity and labels of a retired member in a replacement receipt.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PoolReplacedTextView {
+    /// Original stable member identity.
+    agent_id: String,
+    /// Recorded member display label.
+    name: String,
+    /// Recorded descriptive role.
+    role: String,
+}
+
+/// Durable replacement receipt, independent of launch or completion claims.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PoolReplacementTextView {
+    /// Stable target pool.
+    pool_id: String,
+    /// New replacement versus an exact replay.
+    created: bool,
+    /// Positive committed roster revision.
+    roster_revision: u32,
+    /// Retired seat identity and labels.
+    replaced: PoolReplacedTextView,
+    /// Newly admitted seat and observed status.
+    member: PoolAdmissionMemberTextView,
+}
+
+/// Operator log acknowledgement; no message body enters its template.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct OperatorPoolPostTextView {
+    /// Positive durable pool-log sequence.
+    seq: u64,
+    /// New entry versus an exact request replay.
+    created: bool,
+}
+
+/// Private log acknowledgement; the caller's key is retained outside this view.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PoolWriteTextView {
+    /// Positive durable pool-log sequence.
+    seq: u64,
+    /// Exact idempotency replay indicator.
+    duplicate: bool,
+}
+
+/// Compact discovery roster member with no execution-private metadata.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PoolListMemberTextView {
+    /// Stable one-based roster position.
+    slot: u8,
+    /// Broker-assigned display name.
+    name: String,
+    /// Descriptive role.
+    role: String,
+    /// Stable join identity for agent discovery.
+    agent_id: String,
+    /// Validated current lifecycle.
+    tip_status: crate::domain::Status,
+}
+
+/// One compact pool discovery row, preserving every current member.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PoolListTextView {
+    /// Stable pool identity.
+    pool_id: String,
+    /// Stored open/completed lifecycle.
+    state: agent_run_domain::pool::PoolState,
+    /// Faithful bounded goal excerpt.
+    goal: String,
+    /// Whether the goal omits bytes.
+    goal_truncated: bool,
+    /// Positive roster revision.
+    roster_revision: u32,
+    /// Greatest retained log sequence, zero when empty.
+    last_seq: u64,
+    /// Current roster size.
+    members_count: usize,
+    /// Current valid-ready members, never a raw vote count.
+    ready: usize,
+    /// Current proposal sequence, absent before any proposal.
+    current_proposal_seq: Option<u64>,
+    /// Whole ordered current roster.
+    members: Vec<PoolListMemberTextView>,
+}
+
+/// Whole discovery page; source continuation is never advanced past unseen rows.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PoolListPageTextView {
+    /// Every returned source row.
+    items: Vec<PoolListTextView>,
+    /// Exact matching total.
+    total: u64,
+    /// Exact source offset.
+    offset: u64,
+    /// Actual next offset, absent at the end.
+    next_offset: Option<u64>,
+    /// Explicit matching-page completeness.
+    complete: bool,
+    /// Number of all rendered rows.
+    returned: usize,
+}
+
+/// Current proposal framing and faithful immutable snapshot.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PoolProposalTextView {
+    /// Positive proposal log sequence.
+    seq: u64,
+    /// Roster revision at proposal time.
+    roster_revision: u32,
+    /// Faithful snapshot; never normalized or silently shortened.
+    snapshot: String,
+}
+
+/// Vote decision only; private vote provenance and checks are omitted.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PoolVoteTextView {
+    /// Validated optional readiness decision; absent for revocation.
+    decision: Option<agent_run_domain::pool::VoteDecision>,
+}
+
+/// Current member status and public vote validity, excluding internal run ids.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PoolStatusMemberTextView {
+    /// Stable actionable member identity.
+    agent_id: String,
+    /// Broker-assigned display name.
+    name: String,
+    /// Descriptive role.
+    role: String,
+    /// Validated current lifecycle.
+    tip_status: crate::domain::Status,
+    /// Whether all lineage cleanup is proven.
+    cleanup_complete: bool,
+    /// Public vote decision when present.
+    vote: Option<PoolVoteTextView>,
+    /// Display-safe validity reason.
+    why: String,
+}
+
+/// Retired public roster labels; no replacement launch details are exposed.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PoolRetiredTextView {
+    /// Retired stable identity.
+    agent_id: String,
+    /// Recorded display label.
+    name: String,
+    /// Recorded descriptive role.
+    role: String,
+    /// Stable replacement identity.
+    replaced_by: String,
+}
+
+/// Derived status with faithful goal, criteria and proposal context.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PoolStatusTextView {
+    /// Stored open/completed lifecycle.
+    state: agent_run_domain::pool::PoolState,
+    /// Positive current roster revision.
+    roster_revision: u32,
+    /// Faithful bounded goal.
+    goal: String,
+    /// Every acceptance criterion, without dropped rows.
+    criteria: Vec<agent_run_domain::pool::AcceptanceCriterion>,
+    /// Current immutable proposal when present.
+    current_proposal: Option<PoolProposalTextView>,
+    /// Every current member.
+    members: Vec<PoolStatusMemberTextView>,
+    /// Every returned retired member.
+    replaced_members: Vec<PoolRetiredTextView>,
+    /// Formal agreement; independent of completion.
+    agreed: bool,
+    /// Public bounded explanatory text.
+    note: String,
+}
+
+/// Secret-free common delivery facts; session, messages and raw evidence are absent.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PoolDeliveryTextView {
+    /// Validated durable delivery lifecycle.
+    state: String,
+    /// Durable binding availability.
+    bound: bool,
+    /// Observed attempt count.
+    attempts: u32,
+    /// Whether transport acknowledgement is ambiguous.
+    ambiguous: bool,
+    /// Optional fixed delivery classification.
+    last_classification: Option<String>,
+}
+
+/// Whole pool read page, with every log entry rendered by the shared formatter.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PoolPageTextView {
+    /// Stable target pool.
+    pool_id: String,
+    /// Optional validated read-time activity, independent of stored lifecycle.
+    activity: Option<String>,
+    /// Derived public status.
+    status: PoolStatusTextView,
+    /// Secret-free common-notice delivery.
+    delivery: PoolDeliveryTextView,
+    /// Exact lower exclusive cursor.
+    after_seq: u64,
+    /// Exact optional upper exclusive cursor.
+    before_seq: Option<u64>,
+    /// Actual direction-specific continuation.
+    next_cursor: Option<u64>,
+    /// Explicit source completeness.
+    complete: bool,
+    /// Every rendered shared-entry string in source order.
+    entries: Vec<String>,
+    /// Exact number of all displayed entries.
+    entry_count: usize,
+    /// Whether goal and criteria belong on this read.
+    show_goal: bool,
+    /// Whether the proposal snapshot is new or explicitly requested.
+    show_proposal: bool,
+}
+
 /// Routine expected error carries only public sanitized diagnostics.
 #[derive(serde::Serialize)]
 struct ErrorTextView {
@@ -386,6 +755,26 @@ fn budget(tool: &str) -> Budget {
             bytes: 4096,
             rows: 8,
             content: 0,
+        },
+        "start_pool" | "pool_replace" => Budget {
+            bytes: 8192,
+            rows: 5,
+            content: 0,
+        },
+        "operator_pool_post" | "pool_post" | "pool_propose" | "pool_vote" => Budget {
+            bytes: 8192,
+            rows: 0,
+            content: 0,
+        },
+        "pool" | "pool_read" => Budget {
+            bytes: 600 * 1024,
+            rows: 50,
+            content: 550 * 1024,
+        },
+        "list_pools" => Budget {
+            bytes: 512 * 1024,
+            rows: 200,
+            content: 512 * 1024,
         },
         "cancel" | "steer" | "notify_orchestrator" | "error" => Budget {
             bytes: 2048,
@@ -463,6 +852,10 @@ fn projected<T: serde::de::DeserializeOwned>(value: Value) -> Result<T> {
     serde_json::from_value(value).map_err(|_| Error::Runtime("presentation_shape_invalid".into()))
 }
 
+/// Largest encoded tool result, reserving 4 KiB within the 1 MiB MCP frame
+/// for the JSON-RPC envelope. Checked before any result bytes reach stdout.
+const MAX_RESULT_WIRE_BYTES: usize = 1024 * 1024 - 4096;
+
 /// Builds a reply from successful broker JSON at the real transport boundary.
 /// Receipt capture precedes all projection and formatting; writes never replay.
 #[must_use]
@@ -471,6 +864,8 @@ pub fn success_result(tool: &str, value: &Value) -> CallToolResult {
 }
 
 /// As success_result, retaining the caller's retry key independently of the view.
+/// The complete encoded result must fit the wire budget; escaping overflow drops
+/// the entire presentation while preserving confirmed effects and binding receipts.
 #[must_use]
 pub fn success_result_with_request(
     tool: &str,
@@ -499,6 +894,18 @@ pub fn success_result_with_request(
     {
         result.structured_content = Some(json!({"agent_id": id, "sequence": sequence}));
     }
+    if tool == "start_pool" && receipt.accepted {
+        result.structured_content = Some(json!({"pool_id": receipt.identity}));
+    }
+    let mut wire = BoundedWriter {
+        bytes: Vec::new(),
+        limit: MAX_RESULT_WIRE_BYTES,
+    };
+    if serde_json::to_writer(&mut wire, &result).is_err() {
+        let binding = result.structured_content.take();
+        result = receipt.fallback(tool);
+        result.structured_content = binding;
+    }
     result
 }
 
@@ -516,7 +923,17 @@ pub fn failure_result(
 ) -> CallToolResult {
     let write = matches!(
         tool,
-        "start" | "resume" | "cancel" | "steer" | "notify_orchestrator"
+        "start"
+            | "resume"
+            | "cancel"
+            | "steer"
+            | "notify_orchestrator"
+            | "start_pool"
+            | "pool_replace"
+            | "operator_pool_post"
+            | "pool_post"
+            | "pool_propose"
+            | "pool_vote"
     );
     let uncertain = matches!(error, Error::Runtime(_) | Error::Io(_) | Error::Json(_))
         || (tool == "resume" && matches!(error, Error::BrokerUnavailable));
@@ -531,8 +948,68 @@ pub fn failure_result(
     error_result(public.kind, &public.message)
 }
 
-/// Expected business errors remain errors even if formatting fails. No raw
-/// context, Debug value, renderer source or error chain is exposed.
+/// Renders compact pool discovery for CLI using the same closed view and budgets.
+pub fn list_pools_text(value: &Value) -> Result<String> {
+    validate_result("list_pools", value)?;
+    render("list_pools", value, budget("list_pools").bytes)
+}
+
+/// Presents one operator result through the correct public template.
+#[must_use]
+pub fn public_success_result(tool: &str, value: &Value) -> CallToolResult {
+    public_success_result_with_request(tool, value, None)
+}
+
+/// Keeps operator pool formatting and retry receipts independent of presentation.
+/// The public pool_post uses its own framing; start_pool retains the binding id.
+#[must_use]
+pub fn public_success_result_with_request(
+    tool: &str,
+    value: &Value,
+    request_id: Option<&str>,
+) -> CallToolResult {
+    success_result_with_request(
+        if tool == "pool_post" {
+            "operator_pool_post"
+        } else {
+            tool
+        },
+        value,
+        request_id,
+    )
+}
+
+/// Prepares a whole read page through validated shared entries and a closed
+/// typed context. Every entry either renders or the entire page fails; private
+/// metadata is dropped before serialization. Cursors never skip unread rows.
+pub fn pool_page(mut page: Value) -> std::result::Result<Value, String> {
+    let mut prepare = || -> Result<Value> {
+        validate_pool_page(&page)?;
+        let entries = required_rows(&page, "entries", budget("pool").rows)?;
+        let rendered = entries
+            .iter()
+            .map(|entry| {
+                let entry = pool_entry(entry)?;
+                agent_run_domain::pool::render_entry(&entry)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let after = page["after_seq"].as_u64().ok_or_else(shape_error)?;
+        let from_start = after == 0 && page["before_seq"].is_null();
+        let newer = page["status"]["current_proposal"]["seq"]
+            .as_u64()
+            .is_some_and(|seq| seq > after);
+        page["entry_count"] = json!(rendered.len());
+        page["entries"] = json!(rendered);
+        page["show_goal"] = json!(from_start);
+        page["show_proposal"] = json!(from_start || newer);
+        let view: PoolPageTextView = projected(page.clone())?;
+        serde_json::to_value(view).map_err(|_| shape_error())
+    };
+    prepare().map_err(|_| "pool presentation failed".to_owned())
+}
+
+/// Expected failures remain errors even when their presentation fails.
+/// No raw context, renderer source or error chain reaches the caller.
 #[must_use]
 pub fn error_result(kind: &str, message: &str) -> CallToolResult {
     let view = ErrorTextView {
@@ -753,6 +1230,41 @@ fn validate_result(tool: &str, value: &Value) -> Result<()> {
                 return Err(shape_error());
             }
         }
+        "start_pool" => {
+            required_reference(value, "pool_id")?;
+            required_bool(value, "created")?;
+            required_bool(value, "bound")?;
+            positive_counter(value, "roster_revision")?;
+            for member in required_rows(value, "members", 5)? {
+                validate_pool_member(member)?;
+                if !member["status"].is_null() {
+                    serde_json::from_value::<crate::domain::Status>(member["status"].clone())
+                        .map_err(|_| shape_error())?;
+                }
+            }
+        }
+        "pool_replace" => {
+            required_reference(value, "pool_id")?;
+            required_bool(value, "created")?;
+            positive_counter(value, "roster_revision")?;
+            validate_pool_member(&value["replaced"])?;
+            validate_pool_member(&value["member"])?;
+            serde_json::from_value::<crate::domain::Status>(value["member"]["status"].clone())
+                .map_err(|_| shape_error())?;
+        }
+        "operator_pool_post" | "pool_post" | "pool_propose" | "pool_vote" => {
+            required_reference(value, "pool_id")?;
+            positive_counter(value, "seq")?;
+            required_bool(
+                value,
+                if tool == "operator_pool_post" {
+                    "created"
+                } else {
+                    "duplicate"
+                },
+            )?;
+        }
+        "pool" | "pool_read" => validate_pool_page(value)?,
         "notify_orchestrator" => {
             required_reference(value, "notification_id")?;
             required_bool(value, "duplicate")?;
@@ -763,10 +1275,14 @@ fn validate_result(tool: &str, value: &Value) -> Result<()> {
                 return Err(shape_error());
             }
         }
-        "list_agents" => {
+        "list_agents" | "list_pools" => {
             let rows = required_rows(value, "items", policy.rows)?;
             for row in rows {
-                validate_agent(row)?;
+                if tool == "list_agents" {
+                    validate_agent(row)?;
+                } else {
+                    validate_pool_summary(row)?;
+                }
             }
             let total = value["total"].as_u64().ok_or_else(shape_error)?;
             let offset = value["offset"].as_u64().ok_or_else(shape_error)?;
@@ -791,10 +1307,28 @@ fn validate_result(tool: &str, value: &Value) -> Result<()> {
             required_reference(value, "agent_id")?;
             let rows = required_rows(value, "messages", policy.rows)?;
             let complete = required_bool(value, "complete")?;
-            if !complete && value["next_cursor"].as_i64().is_none_or(|n| n < 0) {
+            let direction = value["direction"].as_str().unwrap_or("forward");
+            let view = value["view"].as_str().unwrap_or("raw");
+            if !matches!(direction, "forward" | "backward")
+                || !matches!(view, "raw" | "blocks")
+                || direction == "backward" && view != "blocks"
+            {
                 return Err(shape_error());
             }
-            if complete && !value["next_cursor"].is_null() {
+            let continuation = if direction == "backward" {
+                "previous_cursor"
+            } else {
+                "next_cursor"
+            };
+            let unused = if direction == "backward" {
+                "next_cursor"
+            } else {
+                "previous_cursor"
+            };
+            if (!complete && value[continuation].as_i64().is_none_or(|n| n < 0))
+                || (complete && !value[continuation].is_null())
+                || !value[unused].is_null()
+            {
                 return Err(shape_error());
             }
             let mut content = 0usize;
@@ -805,6 +1339,26 @@ fn validate_result(tool: &str, value: &Value) -> Result<()> {
                     return Err(shape_error());
                 }
                 previous = seq;
+                if let Some(first) = row["first_seq"].as_i64() {
+                    if first < 1 || first > seq || row["last_seq"].as_i64() != Some(seq) {
+                        return Err(shape_error());
+                    }
+                } else if !row["first_seq"].is_null() || !row["last_seq"].is_null() {
+                    return Err(shape_error());
+                }
+                for key in [
+                    "partial_before",
+                    "partial_after",
+                    "content_complete",
+                    "error",
+                ] {
+                    if !row[key].is_null() {
+                        required_bool(row, key)?;
+                    }
+                }
+                if !row["omitted_bytes"].is_null() && !row["omitted_bytes"].is_u64() {
+                    return Err(shape_error());
+                }
                 required_reference(row, "role")?;
                 content =
                     content.saturating_add(row["content"].as_str().ok_or_else(shape_error)?.len());
@@ -958,6 +1512,172 @@ fn validate_result(tool: &str, value: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Requires a positive SQLite-range public counter, preserving exact values.
+fn positive_counter(value: &Value, key: &str) -> Result<u64> {
+    value[key]
+        .as_u64()
+        .filter(|n| *n > 0 && *n <= i64::MAX as u64)
+        .ok_or_else(shape_error)
+}
+
+/// Validates pool roster labels and stable identity before they become framing.
+fn validate_pool_member(value: &Value) -> Result<()> {
+    required_reference(value, "agent_id")?;
+    for key in ["name", "role"] {
+        let text = required_reference(value, key)?;
+        if text.len() > 1024 || text.chars().any(|c| c.is_control()
+            || matches!(c, '\u{2028}' | '\u{2029}' | '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')) {
+            return Err(shape_error());
+        }
+    }
+    Ok(())
+}
+
+/// Checks one bounded whole discovery row; readiness cannot exceed its roster.
+fn validate_pool_summary(value: &Value) -> Result<()> {
+    let view: PoolListTextView = projected(value.clone())?;
+    required_reference(value, "pool_id")?;
+    positive_counter(value, "roster_revision")?;
+    if view.goal.len() > 512 || view.members.len() > 5 || view.ready > view.members_count {
+        return Err(shape_error());
+    }
+    for member in required_rows(value, "members", 5)? {
+        validate_pool_member(member)?;
+    }
+    Ok(())
+}
+
+/// Projects exactly the domain entry fields before its strict decoder runs.
+/// Extra broker metadata cannot reach the shared formatter or its validated body.
+fn pool_entry(value: &Value) -> Result<agent_run_domain::pool::PoolEntryView> {
+    projected(json!({
+        "seq": value["seq"], "roster_revision": value["roster_revision"],
+        "author_kind": value["author_kind"], "author_agent_id": value["author_agent_id"],
+        "author_name": value["author_name"], "author_role": value["author_role"],
+        "direction": value["direction"], "kind": value["kind"], "severity": value["severity"],
+        "proposal_seq": value["proposal_seq"], "decision": value["decision"], "body": value["body"],
+    }))
+}
+
+/// Validates every pool log row, direction-specific continuation and context
+/// before rendering. Oversize or malformed pages publish no partial entries.
+fn validate_pool_page(value: &Value) -> Result<()> {
+    let policy = budget("pool");
+    required_reference(value, "pool_id")?;
+    let after = value["after_seq"]
+        .as_u64()
+        .filter(|n| *n <= i64::MAX as u64)
+        .ok_or_else(shape_error)?;
+    let before = value["before_seq"].as_u64();
+    if (!value["before_seq"].is_null() && before.is_none())
+        || before.is_some_and(|n| n == 0 || n > i64::MAX as u64 || after > 0)
+    {
+        return Err(shape_error());
+    }
+    let complete = required_bool(value, "complete")?;
+    let rows = required_rows(value, "entries", policy.rows)?;
+    let mut bytes = 0usize;
+    let mut previous = after;
+    for row in rows {
+        let entry = pool_entry(row)?;
+        entry.validate()?;
+        if entry.seq <= previous || before.is_some_and(|n| entry.seq >= n) {
+            return Err(shape_error());
+        }
+        previous = entry.seq;
+        bytes = bytes.saturating_add(entry.body.len());
+    }
+    let continuation = if before.is_some() {
+        rows.first()
+    } else {
+        rows.last()
+    }
+    .and_then(|row| row["seq"].as_u64());
+    if (complete && !value["next_cursor"].is_null())
+        || (!complete && (continuation.is_none() || value["next_cursor"].as_u64() != continuation))
+    {
+        return Err(shape_error());
+    }
+    let status = &value["status"];
+    positive_counter(status, "roster_revision")?;
+    serde_json::from_value::<agent_run_domain::pool::PoolState>(status["state"].clone())
+        .map_err(|_| shape_error())?;
+    let goal = status["goal"].as_str().ok_or_else(shape_error)?;
+    if goal.len() > agent_run_domain::pool::MAX_GOAL_BYTES {
+        return Err(shape_error());
+    }
+    bytes = bytes.saturating_add(goal.len());
+    for criterion in required_rows(status, "criteria", agent_run_domain::pool::MAX_CRITERIA)? {
+        required_reference(criterion, "id")?;
+        bytes = bytes.saturating_add(required_reference(criterion, "text")?.len());
+    }
+    if !status["current_proposal"].is_null() {
+        positive_counter(&status["current_proposal"], "seq")?;
+        positive_counter(&status["current_proposal"], "roster_revision")?;
+        let snapshot = status["current_proposal"]["snapshot"]
+            .as_str()
+            .ok_or_else(shape_error)?;
+        if snapshot.len() > agent_run_domain::pool::MAX_SNAPSHOT_BYTES {
+            return Err(shape_error());
+        }
+        bytes = bytes.saturating_add(snapshot.len());
+    }
+    for member in required_rows(status, "members", 5)? {
+        validate_pool_member(member)?;
+    }
+    for member in required_rows(status, "replaced_members", 200)? {
+        validate_pool_member(member)?;
+        required_reference(member, "replaced_by")?;
+    }
+    if !value["activity"].is_null()
+        && !matches!(
+            value["activity"].as_str(),
+            Some(
+                "running"
+                    | "stopping"
+                    | "settling"
+                    | "needs_action"
+                    | "cancelled"
+                    | "completed"
+                    | "open"
+                    | "idle"
+                    | "starting"
+            )
+        )
+    {
+        return Err(shape_error());
+    }
+    if !matches!(
+        value["delivery"]["state"].as_str(),
+        Some(
+            "not_created"
+                | "waiting_binding"
+                | "pending"
+                | "sending"
+                | "delivered"
+                | "retry_wait"
+                | "failed"
+                | "cancelled"
+                | "expired"
+                | "unknown"
+        )
+    ) {
+        return Err(shape_error());
+    }
+    if bytes > policy.content {
+        return Err(Error::Runtime("presentation_budget_exceeded".into()));
+    }
+    Ok(())
+}
+
+/// Preserves bounded printable display labels while escaping invisible formatting.
+fn display_label(text: &str) -> String {
+    if text.len() <= 1024 && text.chars().all(|c| !c.is_control()
+        && !matches!(c, '\u{2028}' | '\u{2029}' | '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')) {
+        text.to_owned()
+    } else { label(text) }
+}
+
 /// Quotes a bounded friendly label. Unicode/control/bidi/ANSI formatting is
 /// visible, literal Jinja stays data, and shortening is explicitly marked.
 fn label(text: &str) -> String {
@@ -1041,6 +1761,33 @@ fn render(name: &str, value: &Value, limit: usize) -> Result<String> {
             },
             limit,
         ),
+        "start_pool" => render_view(
+            name,
+            &projected::<PoolAdmissionTextView>(value.clone())?,
+            limit,
+        ),
+        "pool_replace" => render_view(
+            name,
+            &projected::<PoolReplacementTextView>(value.clone())?,
+            limit,
+        ),
+        "operator_pool_post" => render_view(
+            name,
+            &projected::<OperatorPoolPostTextView>(value.clone())?,
+            limit,
+        ),
+        "pool_post" | "pool_propose" | "pool_vote" => {
+            render_view(name, &projected::<PoolWriteTextView>(value.clone())?, limit)
+        }
+        "list_pools" => {
+            let mut page = value.clone();
+            page["returned"] = json!(required_rows(value, "items", budget(name).rows)?.len());
+            render_view(name, &projected::<PoolListPageTextView>(page)?, limit)
+        }
+        "pool" | "pool_read" => {
+            let page = pool_page(value.clone()).map_err(|_| shape_error())?;
+            render_view(name, &projected::<PoolPageTextView>(page)?, limit)
+        }
         "models" => render_catalog(name, models_context(value), limit),
         "capacity_order" => render_catalog(name, order_context(value), limit),
         _ => Err(shape_error()),
@@ -1061,6 +1808,13 @@ fn agent_fields(view: &Value) -> Value {
             "succeeded" | "failed" | "lost" | "timed_out" | "cancelled"),
         "runtime": view["runtime"].as_str().map(exact_display), "model": view["model"].as_str().map(exact_display), "profile": view["profile"].as_str().map(exact_display),
         "phase": text("phase"), "effort": text("effort"),
+        "name": view["name"].as_str().map(display_label).unwrap_or_default(),
+        "usage": usage_line(&view["usage"]),
+        "usage_lineage": lineage_line(&view["usage_cumulative"]),
+        "tool_counts": view["tool_counts"].as_object().map(|counts| {
+            let number = |key: &str| counts.get(key).and_then(Value::as_u64).map(|n| n.to_string()).unwrap_or_else(|| "?".into());
+            format!("{} native calls, {} failed, {} unknown results (latest execution)", number("calls"), number("failed"), number("unknown_results"))
+        }),
         "mcp": view["mcp"].as_array().into_iter().flatten().take(8).map(|server| json!({
             "name": server["name"].as_str().map(exact_display), "source": server["source"].as_str().map(exact_display),
             "tools": server["allowed_tools"].as_array().map(|tools| tools.len().to_string()).unwrap_or_else(|| "all".into()),
@@ -1091,6 +1845,65 @@ fn start_context(value: &Value) -> Value {
     fields
 }
 
+/// One compact human usage line from a latest-execution usage object.
+///
+/// Unreported numbers render as `?` so an honest null is never mistaken for
+/// a measured zero; an absent object (no statistics row yet, typically while
+/// the run executes) and an explicitly sourceless row both stay distinct.
+fn usage_line(usage: &Value) -> String {
+    let Some(object) = usage.as_object() else {
+        return String::new();
+    };
+    if object.get("usage_source").and_then(Value::as_str) == Some("none") {
+        return "no native usage reported".to_owned();
+    }
+    let number = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_i64)
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".to_owned())
+    };
+    let turns = object
+        .get("num_turns")
+        .and_then(Value::as_i64)
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    format!(
+        "in {} out {} cache r{}/w{} turns {} ({})",
+        number("input_tokens"),
+        number("output_tokens"),
+        number("cache_read_tokens"),
+        number("cache_write_tokens"),
+        turns,
+        object
+            .get("usage_source")
+            .and_then(Value::as_str)
+            .unwrap_or("?"),
+    )
+}
+
+/// One compact lineage-aggregate line; empty when no aggregate is attached.
+///
+/// Incomplete evidence is named as such rather than shown as partial totals.
+fn lineage_line(cumulative: &Value) -> String {
+    let Some(object) = cumulative.as_object() else {
+        return String::new();
+    };
+    let executions = object
+        .get("executions")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let input = object.get("input_tokens").and_then(Value::as_i64);
+    let output = object.get("output_tokens").and_then(Value::as_i64);
+    match (input, output) {
+        (Some(input), Some(output)) => {
+            format!("lineage in {input} out {output} over {executions} execution(s)")
+        }
+        _ => format!("lineage incomplete over {executions} execution(s)"),
+    }
+}
+
 /// List context: exact total, returned page, and continuation facts.
 fn list_context(value: &Value) -> Value {
     json!({
@@ -1108,11 +1921,20 @@ fn transcript_context(value: &Value) -> Value {
     json!({
         "agent_id": value["agent_id"],
         "next_cursor": value["next_cursor"].as_i64(),
+        "previous_cursor": value["previous_cursor"].as_i64(),
+        "direction": value["direction"].as_str().unwrap_or("forward"),
+        "view": value["view"].as_str().unwrap_or("raw"),
         "complete": value["complete"],
         "messages": value["messages"].as_array().into_iter().flatten().map(|message| {
             json!({
                 "seq": message["seq"], "role": message["role"],
                 "name": message["name"].as_str().map(label), "content": message["content"],
+                "first_seq": message["first_seq"], "last_seq": message["last_seq"],
+                "raw_ref":message["raw_ref"], "partial_before":message["partial_before"],
+                "partial_after":message["partial_after"], "omitted_bytes":message["omitted_bytes"],
+                "content_complete":message["content_complete"],
+                "error":message["error"].as_bool().map(|failed| if failed {"error"} else {"ok"}).unwrap_or("unknown"),
+                "error_source":message["error_source"],
             })
         }).collect::<Vec<_>>(),
         "count": value["messages"].as_array().map(Vec::len),
@@ -1384,8 +2206,238 @@ fn exact_display(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{error_result, success_result};
+    /// Allowed pool quotes, backslashes, tabs and newlines can fit the text
+    /// budget but exceed the MCP frame once JSON escapes them. The entire page
+    /// must become a bounded error before any row or continuation is published.
+    #[test]
+    fn escaped_pool_result_is_rejected_before_publication() {
+        use agent_run_domain::pool::{
+            MAX_BODY_BYTES, MAX_CRITERIA, MAX_CRITERION_BYTES, MAX_GOAL_BYTES, MAX_ROLE_CHARS,
+            MAX_SNAPSHOT_BYTES, PoolMessage, PoolPropose,
+        };
+        let escaped = "\"\\\t\n";
+        let body = escaped.repeat(MAX_BODY_BYTES / escaped.len());
+        let snapshot = escaped.repeat(MAX_SNAPSHOT_BYTES / escaped.len());
+        PoolMessage {
+            request_id: "post".into(),
+            message: body.clone(),
+        }
+        .validate()
+        .unwrap();
+        PoolPropose {
+            request_id: "proposal".into(),
+            message: body.clone(),
+            snapshot: snapshot.clone(),
+        }
+        .validate()
+        .unwrap();
+        let name = "\"".repeat(64);
+        let role = "\"".repeat(MAX_ROLE_CHARS);
+        assert_eq!(agent_run_domain::domain::display_name(&name).unwrap(), name);
+        assert_eq!(agent_run_domain::domain::display_name(&role).unwrap(), role);
+        let page = json!({"pool_id":"p","after_seq":0,"before_seq":null,
+            "complete":false,"next_cursor":50,
+            "entries":(1..=50).map(|seq| json!({"seq":seq,"roster_revision":1,
+                "author_kind":"operator","direction":"team","kind":"message","body":body}))
+                .collect::<Vec<_>>(),
+            "status":{"state":"open","roster_revision":1,
+                "goal":escaped.repeat(MAX_GOAL_BYTES / escaped.len()),
+                "criteria":(0..MAX_CRITERIA).map(|n| json!({"id":format!("c{n}"),
+                    "text":escaped.repeat(MAX_CRITERION_BYTES / escaped.len())})).collect::<Vec<_>>(),
+                "current_proposal":{"seq":51,"roster_revision":1,"snapshot":snapshot},
+                "members":(0..2).map(|n| json!({"agent_id":format!("ag-20261005-000001-{n:010x}"),
+                    "name":format!("member-{n}"),"role":role,"tip_status":"running",
+                    "cleanup_complete":false,"vote":null,"why":"missing"})).collect::<Vec<_>>(),
+                "replaced_members":(0..200).map(|n| json!({
+                    "agent_id":format!("ag-20261005-000000-{n:010x}"),
+                    "name":name,"role":role,
+                    "replaced_by":format!("ag-20261005-000000-{:010x}", n+1)})).collect::<Vec<_>>(),
+                "agreed":false,"note":"agreement is not completion"},
+            "delivery":{"state":"not_created","bound":false,"attempts":0,
+                "ambiguous":false,"last_classification":null}});
+        super::validate_result("pool", &page).unwrap();
+        let rendered = super::render("pool", &page, super::budget("pool").bytes).unwrap();
+        let text_bytes = rendered.len();
+        let unguarded = CallToolResult::success(vec![rmcp::model::ContentBlock::text(rendered)]);
+        let encoded_bytes = serde_json::to_vec(&unguarded).unwrap().len();
+        eprintln!("pool text {text_bytes} bytes; encoded CallToolResult {encoded_bytes} bytes");
+        assert!(text_bytes < super::budget("pool").bytes);
+        assert!(encoded_bytes > 1024 * 1024);
+        let result = public_success_result("pool", &page);
+        assert_eq!(result.is_error, Some(true));
+        let encoded = serde_json::to_vec(&result).unwrap();
+        assert!(encoded.len() < 4096);
+        let wire = String::from_utf8(encoded).unwrap();
+        assert!(wire.contains("presentation_failed"));
+        assert!(!wire.contains("agent-run/pool #") && !wire.contains("next cursor"));
+    }
+
+    /// Pool writes retain committed ids, log positions and original retry keys even
+    /// when presentation fails; incomplete acknowledgements never claim acceptance.
+    #[test]
+    fn pool_receipts_survive_degradation_without_false_acceptance() {
+        for tool in ["pool_post", "pool_propose", "pool_vote"] {
+            let value = json!({"pool_id":"p","seq":7,"duplicate":false,"token":"SECRET_CANARY"});
+            let result = super::success_result_with_request(tool, &value, Some("original"));
+            let wire = serde_json::to_string(&result).unwrap();
+            assert_eq!(result.is_error, Some(false));
+            assert!(wire.contains("#7") && wire.contains("original"), "{wire}");
+            assert!(!wire.contains("SECRET_CANARY"));
+            let bad =
+                super::success_result_with_request(tool, &json!({"pool_id":"p"}), Some("original"));
+            assert_eq!(bad.is_error, Some(true));
+            let wire = serde_json::to_string(&bad).unwrap();
+            assert!(wire.contains("OUTCOME_UNKNOWN") && !wire.contains("ACCEPTED"));
+        }
+        for (tool, value) in [
+            (
+                "start_pool",
+                json!({"pool_id":"p","created":true,"roster_revision":1}),
+            ),
+            (
+                "pool_replace",
+                json!({"pool_id":"p","created":false,"roster_revision":2,"member":{"agent_id":"ag-new"},"replaced":{"agent_id":"ag-old"}}),
+            ),
+            (
+                "pool_post",
+                json!({"pool_id":"p","seq":8,"created":true,"extra":"SECRET_CANARY"}),
+            ),
+        ] {
+            let result = super::public_success_result_with_request(tool, &value, Some("original"));
+            let wire = serde_json::to_string(&result).unwrap();
+            assert_eq!(result.is_error, Some(false), "{wire}");
+            assert!(wire.contains("original") && !wire.contains("SECRET_CANARY"));
+            if tool != "pool_post" {
+                assert!(wire.contains("Do not repeat") && wire.contains("ACCEPTED"));
+            } else {
+                assert!(wire.contains("orchestrator") && !wire.contains("pool_read"));
+            }
+        }
+    }
+
+    /// Reverse transcript blocks keep their real upper continuation and native
+    /// error/omission metadata; malformed metadata cannot become an empty success.
+    #[test]
+    fn reverse_blocks_preserve_metadata_and_reject_bad_shapes() {
+        let value = json!({"agent_id":"ag-1","view":"blocks","direction":"backward",
+            "next_cursor":null,"previous_cursor":3,"complete":false,
+            "messages":[{"seq":5,"first_seq":3,"last_seq":5,"role":"tool_result",
+                "name":"shell","content":"exact\nbody","raw_ref":"opaque-ref",
+                "partial_before":true,"partial_after":false,"error":true,
+                "error_source":"is_error","content_complete":false,"omitted_bytes":12,
+                "attempt_id":"PRIVATE_CANARY"}]});
+        let page = text("transcript", &value);
+        for fact in [
+            "[3..5]",
+            "error: is_error",
+            "exact\nbody",
+            "opaque-ref",
+            "12 bytes omitted",
+            "previous_cursor: 3",
+            "before_cursor=3",
+            "earlier fragments",
+        ] {
+            assert!(page.contains(fact), "{fact}: {page}");
+        }
+        assert!(!page.contains("PRIVATE_CANARY"));
+        for (key, bad) in [
+            ("previous_cursor", Value::Null),
+            ("direction", json!("sideways")),
+        ] {
+            let mut malformed = value.clone();
+            malformed[key] = bad;
+            let result = success_result("transcript", &malformed);
+            assert_eq!(result.is_error, Some(true));
+            assert!(!serde_json::to_string(&result).unwrap().contains("exact"));
+        }
+    }
+
+    /// A compact pool page drops unknown private metadata and rejects malformed
+    /// log rows rather than publishing a cursor beyond an unseen entry.
+    #[test]
+    fn pool_pages_drop_private_metadata_and_never_skip_bad_entries() {
+        let page = json!({"pool_id":"p","entries":[{"seq":1,"roster_revision":1,
+            "author_kind":"operator","direction":"team","kind":"message","body":"faithful {{ text }}",
+            "token":"SECRET_CANARY"}],"after_seq":0,"before_seq":null,"next_cursor":null,
+            "complete":true,"status":{"state":"open","roster_revision":1,"goal":"g","criteria":[],
+                "current_proposal":null,"members":[],"replaced_members":[],"agreed":false,
+                "note":"n","private_account":"PRIVATE_CANARY"},
+            "delivery":{"state":"not_created","bound":false,"attempts":0,"ambiguous":false,
+                "last_classification":null,"orchestrator_session_id":"SESSION_CANARY"}});
+        let (rendered, _) = public_text("pool", &page);
+        assert!(rendered.contains("faithful {{ text }}"));
+        for secret in ["SECRET_CANARY", "PRIVATE_CANARY", "SESSION_CANARY"] {
+            assert!(!rendered.contains(secret));
+        }
+        let mut bad = page;
+        bad["entries"][0]["kind"] = json!("future");
+        let result = public_success_result("pool", &bad);
+        assert_eq!(result.is_error, Some(true));
+        let wire = serde_json::to_string(&result).unwrap();
+        assert!(!wire.contains("faithful") && !wire.contains("next cursor"));
+    }
+
+    use super::{error_result, public_success_result, success_result};
+    use rmcp::model::CallToolResult;
     use serde_json::{Value, json};
+
+    /// Pool discovery renders compact text with member join ids and honest paging.
+    #[test]
+    fn list_pools_renders_excerpt_readiness_and_paging() {
+        let value = json!({"items":[{"pool_id":"pool-one","state":"open","ready":1,
+            "members_count":2,"roster_revision":3,"last_seq":7,"goal":"bounded",
+            "goal_truncated":true,"current_proposal_seq":4,
+            "members":[{"slot":1,"name":"Reviewer","role":"review","agent_id":"ag-one",
+                "tip_status":"running"}]}],
+            "total":3,"offset":0,"limit":1,"next_offset":1,"complete":false});
+        let result = public_success_result("list_pools", &value);
+        let wire = serde_json::to_value(result).unwrap();
+        assert_eq!(wire["isError"], false, "{wire}");
+        let page = wire["content"][0]["text"].as_str().unwrap();
+        assert!(page.contains("1 of 3 matching"));
+        assert!(page.contains("1/2 ready"));
+        assert!(page.contains("bounded [excerpt]"));
+        assert!(page.contains("Reviewer (review): ag-one — running"));
+        assert!(page.contains("next offset: 1"));
+        assert_eq!(page, super::list_pools_text(&value).unwrap());
+        assert!(wire.get("structuredContent").is_none());
+        let empty = super::list_pools_text(&json!({"items":[],"total":0,"offset":0,
+            "limit":50,"next_offset":null,"complete":true}))
+        .unwrap();
+        assert!(empty.contains("page complete"));
+    }
+
+    /// Compact start/resume/list output preserves labels, observed zero and
+    /// unknown metrics, names incomplete lineage evidence and hides execution IDs.
+    #[test]
+    fn display_names_and_usage_remain_honest_in_compact_output() {
+        let mut agent = agent_view();
+        agent["name"] = json!("工程師 / review");
+        agent["usage"] = json!({"input_tokens":0,"output_tokens":null,
+            "cache_read_tokens":0,"cache_write_tokens":null,"num_turns":null,
+            "usage_source":"token_usage_updated","run_id":"private-execution"});
+        agent["usage_cumulative"] =
+            json!({"executions":2,"input_tokens":null,"output_tokens":null});
+        for tool in ["start", "resume"] {
+            let page = text(
+                tool,
+                &json!({"agent_id":"ag-1","sequence":1,"created":true,"agent":agent}),
+            );
+            assert!(page.contains("Name: 工程師 / review"), "{page}");
+            assert!(!page.contains("private-execution"), "{page}");
+        }
+        let page = text(
+            "list_agents",
+            &json!({"items":[agent],"total":1,"offset":0,"limit":20,"complete":true}),
+        );
+        assert!(page.contains("name: 工程師 / review"), "{page}");
+        assert!(page.contains("in 0 out ? cache r0/w? turns ?"), "{page}");
+        assert!(
+            page.contains("lineage incomplete over 2 execution(s)"),
+            "{page}"
+        );
+        assert!(!page.contains("private-execution"), "{page}");
+    }
 
     /// Minimal agent view proving sparse optional metadata remains renderable.
     fn agent_view() -> Value {
@@ -1612,8 +2664,10 @@ mod tests {
             page.contains("[2] tool_call (\"shell\"): {\"cmd\":1}"),
             "{page}"
         );
-        assert!(page.contains("continues at cursor 4"), "{page}");
-        assert!(page.contains("next_cursor: 4"), "{page}");
+        assert!(
+            page.contains("next_cursor: 4 — request the next page with this cursor"),
+            "{page}"
+        );
     }
 
     /// answer shows availability honestly and keeps retrieval facts.
@@ -2073,5 +3127,163 @@ mod tests {
             "available":true,"inline_complete":true,"content":""}),
         );
         assert!(empty.contains("empty (0 UTF-8 bytes)"));
+    }
+
+    /// Renders one public (operator) tool success and returns its text and result.
+    fn public_text(tool: &str, value: &Value) -> (String, CallToolResult) {
+        let result = public_success_result(tool, value);
+        let content = serde_json::to_value(&result.content).unwrap();
+        let page = content[0]["text"].as_str().unwrap().to_owned();
+        assert_eq!(result.is_error, Some(false), "{tool}: {page}");
+        (page, result)
+    }
+
+    /// Every operator pool tool renders one compact page with all its facts;
+    /// `start_pool` keeps only the tiny structured pool receipt for binding,
+    /// and the operator `pool_post` never reuses the private worker page.
+    #[test]
+    fn operator_pool_tools_render_compact_pages_with_field_parity() {
+        let started = json!({
+            "pool_id": "pool-20261003-120000-0123456789", "created": true, "bound": false,
+            "roster_revision": 1, "members": [
+                {"agent_id":"ag-a","name":"Ada","role":"reviewer","status":"starting"},
+                {"agent_id":"ag-b","name":"Bob","role":"tester","status":"starting"}]
+        });
+        let (page, result) = public_text("start_pool", &started);
+        for fact in [
+            "pool-20261003-120000-0123456789",
+            "created",
+            "r1",
+            "not bound",
+            "Ada (reviewer, ag-a): starting",
+            "Bob (tester, ag-b)",
+        ] {
+            assert!(page.contains(fact), "{fact}: {page}");
+        }
+        assert_eq!(
+            result.structured_content,
+            Some(json!({"pool_id": "pool-20261003-120000-0123456789"}))
+        );
+        assert!(page.len() < 900, "compact: {}", page.len());
+        let (post, _) = public_text("pool_post", &json!({"pool_id":"p","seq":4,"created":true}));
+        assert!(
+            post.contains("#4") && post.contains("orchestrator") && !post.contains("pool_read")
+        );
+        let (replaced, _) = public_text(
+            "pool_replace",
+            &json!({"pool_id":"p","created":true,"roster_revision":2,
+                    "replaced":{"agent_id":"ag-a","name":"Ada","role":"reviewer"},
+                    "member":{"agent_id":"ag-n","name":"Ada","role":"reviewer","status":"starting"}}),
+        );
+        for fact in ["r2", "ag-a", "ag-n", "starting"] {
+            assert!(replaced.contains(fact), "{fact}: {replaced}");
+        }
+    }
+
+    /// The goal and the proposal snapshot print only on a from-the-start read
+    /// or when the proposal is newer than the cursor; an incremental or empty
+    /// read never repeats them, and entries use the one shared formatter.
+    #[test]
+    fn pool_pages_print_unchanged_context_only_when_needed() {
+        let status = json!({"state":"open","roster_revision":1,"goal":"UNIQUE-GOAL-TEXT",
+            "criteria":[{"id":"goal","text":"met"}],
+            "current_proposal":{"seq":3,"snapshot":"UNIQUE-SNAPSHOT","roster_revision":1},
+            "members":[{"name":"Ada","role":"r","agent_id":"ag-a","tip_status":"running",
+                        "cleanup_complete":false,"vote":null,"why":"missing"}],
+            "replaced_members":[], "agreed":false, "note":"n"});
+        let entry = json!({"seq":4,"roster_revision":1,"author_kind":"operator","direction":"team",
+                           "kind":"message","body":"hello"});
+        let page = |after: u64, entries: Vec<Value>| {
+            json!({
+            "pool_id":"p","entries":entries,"after_seq":after,"before_seq":null,"limit":50,
+            "next_cursor":null,"last_seq":null,"complete":true,"status":status.clone(),
+            "delivery":{"state":"not_created","bound":false,"attempts":0,
+                        "ambiguous":false,"last_classification":null,"evidence":null}})
+        };
+        let (full, _) = public_text("pool", &page(0, vec![entry.clone()]));
+        assert!(
+            full.contains("UNIQUE-GOAL-TEXT") && full.contains("UNIQUE-SNAPSHOT"),
+            "{full}"
+        );
+        assert!(full.contains("from orchestrator to team") && full.contains("hello"));
+        let (empty_wait, _) = public_text("pool", &page(4, vec![]));
+        assert!(
+            !empty_wait.contains("UNIQUE-GOAL-TEXT") && !empty_wait.contains("UNIQUE-SNAPSHOT"),
+            "{empty_wait}"
+        );
+        assert!(empty_wait.contains("Current proposal #3 unchanged"));
+        let (new_proposal, _) = public_text("pool", &page(2, vec![]));
+        assert!(
+            new_proposal.contains("UNIQUE-SNAPSHOT") && !new_proposal.contains("UNIQUE-GOAL-TEXT")
+        );
+    }
+
+    /// Both pool pages lead with the read-time activity when present, say that a
+    /// cancelled open pool is restorable, and fall back to the stored state for
+    /// payloads without one.
+    #[test]
+    fn pool_headers_prefer_activity_and_fall_back_to_state() {
+        let page = |activity: Option<&str>, state: &str| {
+            let mut page = json!({
+                "pool_id":"p","entries":[],"after_seq":0,"before_seq":null,"limit":50,
+                "next_cursor":null,"last_seq":null,"complete":true,
+                "status":{"state":state,"roster_revision":1,"goal":"g","criteria":[],
+                    "current_proposal":null,"members":[],"replaced_members":[],
+                    "agreed":false,"note":"n"},
+                "delivery":{"state":"not_created","bound":false,"attempts":0,
+                            "ambiguous":false,"last_classification":null,"evidence":null}});
+            if let Some(activity) = activity {
+                page["activity"] = json!(activity);
+            }
+            page
+        };
+        let worker = |page: &Value| {
+            let content = serde_json::to_value(&success_result("pool_read", page).content).unwrap();
+            content[0]["text"].as_str().unwrap().to_owned()
+        };
+        for render in [
+            &|page: &Value| public_text("pool", page).0 as String,
+            &worker as &dyn Fn(&Value) -> String,
+        ] {
+            let header = |activity, state| render(&page(activity, state));
+            let cancelled = header(Some("cancelled"), "open");
+            assert!(
+                cancelled
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .contains("cancelled (state open; restorable by resume or replacement)"),
+                "{cancelled}"
+            );
+            for (activity, hint) in [
+                ("running", "running (state open)"),
+                ("stopping", "stopping (state open; cleanup not yet proven)"),
+                (
+                    "settling",
+                    "settling (state open; completion record pending)",
+                ),
+                (
+                    "needs_action",
+                    "needs_action (state open; needs orchestrator action)",
+                ),
+            ] {
+                let text = header(Some(activity), "open");
+                assert!(text.lines().next().unwrap().contains(hint), "{text}");
+            }
+            let completed = header(Some("completed"), "completed");
+            assert!(
+                completed
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .contains("— completed, roster"),
+                "{completed}"
+            );
+            let legacy = header(None, "open");
+            assert!(
+                legacy.lines().next().unwrap().contains("— open, roster"),
+                "{legacy}"
+            );
+        }
     }
 }

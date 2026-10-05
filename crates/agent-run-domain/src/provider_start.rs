@@ -40,6 +40,10 @@ pub struct ProviderStartRequest {
     /// Optional model effort chosen by the orchestrator.
     #[serde(default)]
     pub effort: Option<String>,
+    /// Optional human display label, validated like the historical request's
+    /// field and inherited by explicit resumes that omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     /// Existing Codex fast-mode request flag.
     #[serde(default)]
     pub fast: bool,
@@ -75,14 +79,28 @@ fn unique_constraints<'de, D: serde::Deserializer<'de>>(
 }
 
 impl ProviderStartRequest {
-    /// Applies the existing path, task, effort, timeout, and namespace checks
-    /// without accepting the historical runtime field as public v2 input.
+    /// Validates paths, task, effort, timeout, namespace, orchestrator transport
+    /// and the optional human label; stores canonical paths, labels and transport
+    /// in place. Invalid values return `ValidationError` before admission.
+    /// Historical runtime selectors remain excluded from public v2 input.
     pub fn validate(&mut self) -> Result<()> {
         let mut projection = self.storage_projection();
         projection.validate()?;
         self.workdir = projection.workdir;
         self.read_roots = projection.read_roots;
         self.timeout_seconds = projection.timeout_seconds;
+        self.display_name = projection.display_name;
+        self.orchestrator = projection.orchestrator;
+        Ok(())
+    }
+
+    /// Validates immutable fields for exact replay without requiring live directories.
+    /// A new request still calls `validate` before admission and canonicalizes paths.
+    pub fn validate_intent(&mut self) -> Result<()> {
+        let mut projection = self.storage_projection();
+        projection.validate_intent()?;
+        self.display_name = projection.display_name;
+        self.orchestrator = projection.orchestrator;
         Ok(())
     }
 
@@ -101,6 +119,7 @@ impl ProviderStartRequest {
             write: self.write,
             fast: self.fast,
             effort: self.effort.clone(),
+            display_name: self.display_name.clone(),
             timeout_seconds: self.timeout_seconds,
             read_roots: self.read_roots.clone(),
             output_schema: self.output_schema.clone(),

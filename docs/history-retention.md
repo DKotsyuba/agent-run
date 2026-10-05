@@ -13,6 +13,10 @@ rule, which still applies to them on its own schedule. A recent resume
 therefore counts once and lifts its whole lineage into the protected set,
 matching the intuition that resumed work is still current history.
 
+Pool logs and rosters remain protected whenever a member has a workflow
+reference, an active managed-service lease, or a prepared runtime layout,
+matching the underlying agent protection.
+
 Database expiry runs on startup and then hourly; a
 backlog drains in small transactions with a one-second pause between batches.
 Filesystem cleanup keeps its own independent schedule — a one-second cadence

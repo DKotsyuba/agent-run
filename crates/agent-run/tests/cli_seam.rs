@@ -136,6 +136,46 @@ fn dependencies(
     }
 }
 
+/// Both CLI discovery spellings forward validated pages through the broker;
+/// default output preserves JSON and --text reuses the compact MCP presentation.
+#[tokio::test]
+async fn pools_cli_uses_broker_and_supports_human_output() {
+    let page = json!({"items":[],"total":0,"offset":2,"limit":3,
+        "next_offset":null,"complete":true});
+    for command in ["pools", "list-pools"] {
+        let broker = Arc::new(FakeBroker::new(vec![page.clone()]));
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let service = Arc::new(FakeService::new(vec![], false));
+        let text = Arc::new(Mutex::new(String::new()));
+        let mut deps = dependencies(service, broker.clone(), output.clone());
+        let captured = text.clone();
+        deps.text_output = Arc::new(move |chunk| {
+            captured.lock().unwrap().push_str(chunk);
+            Ok(())
+        });
+        let mut argv = vec![command, "--state", "open", "--offset", "2", "--limit", "3"];
+        if command == "list-pools" {
+            argv.push("--text");
+        }
+        agent_run::cli::run_with(parse(&argv), deps).await.unwrap();
+        assert_eq!(
+            broker.calls.lock().unwrap().as_slice(),
+            &[(
+                "list_pools".to_owned(),
+                json!({"state":"open","offset":2,"limit":3})
+            )]
+        );
+        if command == "pools" {
+            assert_eq!(
+                output.lock().unwrap().as_slice(),
+                std::slice::from_ref(&page)
+            );
+        } else {
+            assert!(text.lock().unwrap().contains("agent-run pools: 0 of 0"));
+        }
+    }
+}
+
 /// Mirrors `tests/test_cli.py::test_start_decodes_the_full_request_and_returns_immediately`.
 #[tokio::test]
 async fn test_start_decodes_the_full_request_and_returns_immediately() {
@@ -172,6 +212,8 @@ async fn test_start_decodes_the_full_request_and_returns_immediately() {
         read_root.to_str().unwrap(),
         "--output-schema",
         "{\"type\":\"object\"}",
+        "--name",
+        "  工程師 / review  ",
         "--request-id",
         "request-1",
         "--session-transport",
@@ -192,6 +234,7 @@ async fn test_start_decodes_the_full_request_and_returns_immediately() {
     .await
     .unwrap();
     let request = &broker.calls.lock().unwrap()[0].1;
+    assert_eq!(request["display_name"], "工程師 / review");
     assert_eq!(request["fast"], true);
     assert_eq!(request["effort"], "high");
     assert_eq!(request["timeout_seconds"], 42.0);
@@ -201,6 +244,41 @@ async fn test_start_decodes_the_full_request_and_returns_immediately() {
         output.lock().unwrap()[0],
         json!({"agent_id":AGENT_ID,"created":true})
     );
+}
+
+/// Both CLI name spellings reach the resident resume request; omission remains
+/// absent so the service can inherit the prior label.
+#[tokio::test]
+async fn resume_display_name_alias_reaches_broker() {
+    let temp = tempdir().unwrap();
+    for alias in ["--name", "--display-name"] {
+        let broker = Arc::new(FakeBroker::new(vec![
+            json!({"agent_id":AGENT_ID,"created":true}),
+        ]));
+        agent_run::cli::run_with(
+            parse(&[
+                "--home",
+                temp.path().to_str().unwrap(),
+                "resume",
+                AGENT_ID,
+                "--task",
+                "continue",
+                alias,
+                "Мария / review",
+            ]),
+            dependencies(
+                Arc::new(FakeService::new(Vec::new(), false)),
+                broker.clone(),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            broker.calls.lock().unwrap()[0].1["display_name"],
+            "Мария / review"
+        );
+    }
 }
 
 /// Mirrors `tests/test_cli.py::test_start_account_flag_reaches_request`.
@@ -806,6 +884,108 @@ async fn test_mcp_uses_injected_stdio_for_initialize_and_tools_list() {
     let _ = server.await;
 }
 
+/// Serve one in-process MCP session, write raw JSON-RPC `requests` to its stdio and
+/// return one raw reply per request that carries an `id`.
+async fn raw_mcp_exchange(requests: &[Value]) -> Vec<Value> {
+    let temp = tempdir().unwrap();
+    let (mut input_writer, input_reader) = tokio::io::duplex(64 * 1024);
+    let (output_writer, output_reader) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(agent_run::transport::mcp::serve_io(
+        temp.path().to_owned(),
+        None,
+        Arc::new(FakeBroker::new(Vec::new())),
+        input_reader,
+        output_writer,
+    ));
+    let mut output = BufReader::new(output_reader);
+    let mut replies = Vec::new();
+    for request in requests {
+        input_writer
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        input_writer.flush().await.unwrap();
+        if request.get("id").is_some() {
+            let mut line = String::new();
+            output.read_line(&mut line).await.unwrap();
+            replies.push(serde_json::from_str(&line).unwrap());
+        }
+    }
+    drop(input_writer);
+    let _ = server.await;
+    replies
+}
+
+/// Per-request `_meta` of a self-contained 2026-07-28 request.
+fn modern_meta() -> Value {
+    json!({"_meta":{
+        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities":{}
+    }})
+}
+
+/// A 2026-07-28 `tools/list` without `initialize` carries the cache hints and the full tool table.
+#[tokio::test]
+async fn modern_tools_list_carries_cache_hints() {
+    let reply = raw_mcp_exchange(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":modern_meta()}),
+    ])
+    .await
+    .remove(0);
+    let result = &reply["result"];
+    assert_eq!(result["resultType"], "complete", "{reply}");
+    assert_eq!(result["ttlMs"], 60_000, "{reply}");
+    assert_eq!(result["cacheScope"], "private", "{reply}");
+    let names: Vec<&str> = result["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    let expected: Vec<String> = agent_run::dispatch::tools()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(!names.is_empty());
+    assert_eq!(names, expected);
+}
+
+/// A 2025-11-25 session keeps the legacy `tools/list` shape: no hints, no `resultType`.
+#[tokio::test]
+async fn legacy_tools_list_has_no_cache_hints() {
+    let replies = raw_mcp_exchange(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+    ])
+    .await;
+    let result = replies[1]["result"].as_object().unwrap();
+    assert!(!result["tools"].as_array().unwrap().is_empty());
+    for key in ["ttlMs", "cacheScope", "resultType"] {
+        assert!(!result.contains_key(key), "{key} leaked: {result:?}");
+    }
+}
+
+/// `server/discover` without `initialize` advertises 2026-07-28 and the same cache hints.
+#[tokio::test]
+async fn modern_discover_advertises_2026_07_28() {
+    let reply = raw_mcp_exchange(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":modern_meta()}),
+    ])
+    .await
+    .remove(0);
+    let result = &reply["result"];
+    assert!(
+        result["supportedVersions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("2026-07-28")),
+        "{reply}"
+    );
+    assert!(result["ttlMs"].is_u64(), "{reply}");
+    assert!(result["cacheScope"].is_string(), "{reply}");
+}
+
 /// Proves production MCP startup replaces its process image with the configured frontend.
 #[test]
 fn test_mcp_exec_preserves_pid_and_passes_exact_arguments() {
@@ -1360,6 +1540,7 @@ async fn test_transcript_text_pipe_receives_fragments_before_the_agent_finishes(
         write: false,
         fast: false,
         effort: None,
+        display_name: None,
         timeout_seconds: None,
         read_roots: vec![],
         output_schema: None,
@@ -1468,5 +1649,256 @@ async fn test_transcript_text_pipe_receives_fragments_before_the_agent_finishes(
         *pipe.lock().unwrap(),
         b"Hello world\n".to_vec(),
         "viewer exit {status:?}, stderr {stderr:?}"
+    );
+}
+
+/// A scripted `agents --follow` service: each `list` call returns the next
+/// page and records the query summary. After the script runs out the service
+/// either fails with a typed fixture error (ending the viewer loop) or parks
+/// forever (`hangs`), standing in for a broker wait that only an interrupt
+/// can end.
+/// Recorded follow request summary: both committed cursors and the wait.
+type FollowCall = (Option<i64>, Option<i64>, f64);
+
+/// One follow output sink; tests capture pages or inject pipe failures.
+type FollowSink = Arc<dyn Fn(&Value) -> agent_run::Result<()> + Send + Sync>;
+
+struct FollowService {
+    pages: Mutex<Vec<Value>>,
+    calls: Mutex<Vec<FollowCall>>,
+    hangs: bool,
+}
+
+impl CliService for FollowService {
+    fn cancel(&self, _id: &AgentId) -> agent_run::Result<Value> {
+        Ok(json!({"cancelled":true}))
+    }
+    fn steer(&self, _id: &AgentId, _text: &str) -> agent_run::Result<Value> {
+        Ok(json!({"accepted":true}))
+    }
+    fn list<'a>(&'a self, query: Query) -> CliFuture<'a> {
+        self.calls.lock().unwrap().push((
+            query.after_revision,
+            query.after_message_revision,
+            query.wait_seconds,
+        ));
+        let next = {
+            let mut pages = self.pages.lock().unwrap();
+            if pages.is_empty() {
+                None
+            } else {
+                Some(pages.remove(0))
+            }
+        };
+        match next {
+            Some(page) => Box::pin(async move { Ok(page) }),
+            None if self.hangs => Box::pin(std::future::pending()),
+            None => Box::pin(async { Err(invalid("follow fixture complete")) }),
+        }
+    }
+    fn answer(&self, id: &AgentId) -> agent_run::Result<Value> {
+        Ok(json!({"agent_id":id,"status":"running"}))
+    }
+    fn agent(&self, id: &AgentId) -> agent_run::Result<Value> {
+        Ok(json!({"agent_id":id,"status":"running"}))
+    }
+    fn transcript(&self, _id: &AgentId, _cursor: i64, _limit: usize) -> agent_run::Result<Value> {
+        Ok(json!({"messages":[]}))
+    }
+    fn models<'a>(&'a self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'a> {
+        Box::pin(async { Ok(json!([])) })
+    }
+    fn limits(&self) -> agent_run::Result<Value> {
+        Ok(json!({}))
+    }
+    fn capacity_order(
+        &self,
+        _query: agent_run_domain::CapacityOrderQuery,
+    ) -> agent_run::Result<Value> {
+        Ok(json!({}))
+    }
+    fn delegation_guide(&self) -> agent_run::Result<Value> {
+        Ok(Value::String(String::new()))
+    }
+    fn delivery_status(&self, _id: &AgentId) -> agent_run::Result<Value> {
+        Ok(json!({}))
+    }
+    fn delivery_cancel(&self, _id: &str) -> agent_run::Result<Value> {
+        Ok(json!({}))
+    }
+}
+
+/// Builds dependencies over a follow service with a capturing sink.
+fn follow_dependencies(service: Arc<FollowService>, output: FollowSink) -> CliDependencies {
+    CliDependencies {
+        service,
+        broker: Arc::new(FakeBroker::new(Vec::new())),
+        output,
+        text_output: Arc::new(|_| Ok(())),
+        doctor: Arc::new(|home| {
+            Ok(agent_run::doctor::Report {
+                home: home.to_owned(),
+                checked_at: 0.0,
+                findings: Vec::new(),
+            })
+        }),
+    }
+}
+
+/// One minimal agent snapshot with only the facts follow digests.
+fn follow_agent(status: &str, tool_calls: Value, observed_at: f64, elapsed: f64) -> Value {
+    json!({
+        "agent_id": AGENT_ID, "name": "Fixture Lead", "status": status,
+        "runtime": "mock", "model": "fixture", "profile": "review",
+        "task_summary": "fixture", "phase": "running",
+        "tool_counts": tool_calls, "usage": Value::Null, "usage_cumulative": Value::Null,
+        "delivery": {"state":"not_created","attempts":0,"ambiguous":false},
+        "observed_at": observed_at, "elapsed_seconds": elapsed, "silence_seconds": elapsed / 2.0,
+    })
+}
+
+/// The follow viewer emits the first page and then only meaningful changes:
+/// observation-time drift never reprints, while status and native tool-count
+/// changes do. Every wait after the first carries both committed cursors.
+#[tokio::test]
+async fn agents_follow_emits_initial_and_meaningful_changes_only() {
+    let service = Arc::new(FollowService {
+        pages: Mutex::new(vec![
+            json!({"items":[follow_agent("running", json!({"calls":null,"failed":null,"unknown_results":null}), 10.0, 5.0)],
+                   "total":1,"offset":0,"limit":100,"next_offset":null,"complete":true,
+                   "revision":5,"message_revision":3,"observed_at":10.0}),
+            json!({"items":[follow_agent("running", json!({"calls":null,"failed":null,"unknown_results":null}), 11.0, 6.0)],
+                   "total":1,"offset":0,"limit":100,"next_offset":null,"complete":true,
+                   "revision":6,"message_revision":3,"observed_at":11.0}),
+            json!({"items":[follow_agent("succeeded", json!({"calls":2,"failed":0,"unknown_results":0}), 12.0, 7.0)],
+                   "total":1,"offset":0,"limit":100,"next_offset":null,"complete":true,
+                   "revision":7,"message_revision":9,"observed_at":12.0}),
+        ]),
+        calls: Mutex::new(Vec::new()),
+        hangs: false,
+    });
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&output);
+    let temp = tempdir().unwrap();
+    let result = agent_run::cli::run_with(
+        parse(&[
+            "--home",
+            temp.path().to_str().unwrap(),
+            "agents",
+            "--follow",
+        ]),
+        follow_dependencies(
+            service.clone(),
+            Arc::new(move |value| {
+                sink.lock().unwrap().push(value.clone());
+                Ok(())
+            }),
+        ),
+    )
+    .await;
+    assert!(result.is_err(), "the scripted exhaustion ends the viewer");
+    let snapshots = output.lock().unwrap();
+    assert_eq!(
+        snapshots
+            .iter()
+            .map(|page| page["items"][0]["status"].clone())
+            .collect::<Vec<_>>(),
+        [json!("running"), json!("succeeded")],
+        "observation-time drift is suppressed; real changes re-emit: {snapshots:?}"
+    );
+    let calls = service.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        &[
+            (None, None, 0.0),
+            (Some(5), Some(3), 25.0),
+            (Some(6), Some(3), 25.0),
+            (Some(7), Some(9), 25.0),
+        ],
+        "each wait carries both committed cursors after the first page; the scripted error round records its request too"
+    );
+}
+
+/// Interrupting the follow viewer ends only the viewer: the process-wide
+/// SIGINT branch returns cleanly while no agent was cancelled or steered.
+#[tokio::test]
+async fn agents_follow_interrupt_ends_only_the_viewer() {
+    let _guard = FOLLOW_TESTS.lock().await;
+    let service = Arc::new(FollowService {
+        pages: Mutex::new(vec![json!({
+            "items":[follow_agent("running", Value::Null, 10.0, 5.0)],
+            "total":1,"offset":0,"limit":100,"next_offset":null,"complete":true,
+            "revision":5,"message_revision":3,"observed_at":10.0})]),
+        calls: Mutex::new(Vec::new()),
+        hangs: true,
+    });
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&output);
+    let runner = agent_run::cli::run_with(
+        parse(&["agents", "--follow"]),
+        follow_dependencies(
+            service.clone(),
+            Arc::new(move |value| {
+                sink.lock().unwrap().push(value.clone());
+                Ok(())
+            }),
+        ),
+    );
+    let task = tokio::spawn(runner);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // SAFETY: delivering SIGINT to this test process; tokio's installed
+    // handler routes it to the viewer's Ctrl-C branch instead of an abort.
+    unsafe {
+        libc::kill(std::process::id() as libc::pid_t, libc::SIGINT);
+    }
+    assert_eq!(task.await.unwrap().unwrap(), 0);
+    assert_eq!(output.lock().unwrap().len(), 1, "only the first page ran");
+}
+
+/// A closed output pipe terminates the viewer through the writer's error
+/// instead of looping on further requests.
+#[tokio::test]
+async fn agents_follow_stops_promptly_on_closed_output() {
+    let service = Arc::new(FollowService {
+        pages: Mutex::new(vec![
+            json!({"items":[follow_agent("running", Value::Null, 10.0, 5.0)],
+                   "total":1,"offset":0,"limit":100,"next_offset":null,"complete":true,
+                   "revision":5,"message_revision":3,"observed_at":10.0}),
+            json!({"items":[follow_agent("succeeded", Value::Null, 12.0, 7.0)],
+                   "total":1,"offset":0,"limit":100,"next_offset":null,"complete":true,
+                   "revision":7,"message_revision":9,"observed_at":12.0}),
+        ]),
+        calls: Mutex::new(Vec::new()),
+        hangs: false,
+    });
+    let attempts = Arc::new(Mutex::new(0));
+    let seen = Arc::clone(&attempts);
+    let temp = tempdir().unwrap();
+    let result = agent_run::cli::run_with(
+        parse(&[
+            "--home",
+            temp.path().to_str().unwrap(),
+            "agents",
+            "--follow",
+        ]),
+        follow_dependencies(
+            service.clone(),
+            Arc::new(move |_value| {
+                let mut count = seen.lock().unwrap();
+                *count += 1;
+                if *count == 1 {
+                    Ok(())
+                } else {
+                    Err(invalid("broken pipe fixture"))
+                }
+            }),
+        ),
+    )
+    .await;
+    assert!(result.is_err(), "the pipe error propagates out");
+    assert_eq!(
+        service.calls.lock().unwrap().len(),
+        2,
+        "no further request follows a failed write"
     );
 }

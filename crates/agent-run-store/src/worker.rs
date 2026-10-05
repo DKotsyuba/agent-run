@@ -22,6 +22,69 @@ fn valid_token(token: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
+/// One authenticated attempt with the durable facts its callers check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptAuth {
+    /// Stable lineage root of the authenticated execution.
+    pub root_agent_id: AgentId,
+    /// Orchestrator session binding, when one exists.
+    pub orchestrator_session_id: Option<String>,
+    /// Whether the attempt is in the `running` state right now.
+    pub running: bool,
+}
+
+/// Authenticates the exact live attempt behind a worker capability.
+///
+/// The token hash must match `worker_capabilities`, the attempt must be
+/// ownership-active and unfinished, its agent live within its deadline, and
+/// the optional orchestrator session is joined without requiring it. `None`
+/// means the credentials or liveness failed; callers add only their own
+/// predicates on top.
+pub fn authenticate_attempt(
+    conn: &rusqlite::Connection,
+    run_id: &AgentId,
+    attempt_id: &str,
+    token: &str,
+    at: f64,
+) -> Result<Option<AttemptAuth>> {
+    if !valid_token(token) || !at.is_finite() || at < 0.0 {
+        return Ok(None);
+    }
+    let row: Option<(String, Option<String>, bool)> = conn
+        .query_row(
+            "SELECT c.token_sha256,a.orchestrator_session_id,t.state='running' AND a.status='running' \
+             FROM worker_capabilities c \
+             JOIN attempts t ON t.id=c.attempt_id JOIN agents a ON a.id=t.agent_id \
+             LEFT JOIN orchestrator_sessions s ON s.id=a.orchestrator_session_id \
+             WHERE t.id=? AND t.agent_id=? AND t.ownership_active=1 AND t.finished_at IS NULL \
+               AND a.finished_at IS NULL AND a.created_at+a.timeout_seconds>?",
+            rusqlite::params![attempt_id, run_id.as_str(), at],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((digest, session, running)) = row else {
+        return Ok(None);
+    };
+    if digest != sha256(token.as_bytes()) {
+        return Ok(None);
+    }
+    Ok(Some(AttemptAuth {
+        root_agent_id: resolve_root(conn, run_id)?,
+        orchestrator_session_id: session,
+        running,
+    }))
+}
+
+/// Reads the lineage root of an existing execution row.
+fn resolve_root(conn: &rusqlite::Connection, run_id: &AgentId) -> Result<AgentId> {
+    let root: String = conn.query_row(
+        "SELECT CASE WHEN root_agent_id='' THEN id ELSE root_agent_id END FROM agents WHERE id=?",
+        [run_id.as_str()],
+        |row| row.get(0),
+    )?;
+    root.parse()
+}
+
 impl Store {
     /// Binds one ephemeral secret hash to a currently owned attempt before launch.
     /// Repeating the same binding is harmless; a replacement secret is refused.
@@ -85,27 +148,40 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let route: Option<(String, String)> = tx
-            .query_row(
-                "SELECT c.token_sha256,a.orchestrator_session_id FROM worker_capabilities c
-             JOIN attempts t ON t.id=c.attempt_id JOIN agents a ON a.id=t.agent_id
-             JOIN orchestrator_sessions s ON s.id=a.orchestrator_session_id
-             WHERE t.id=? AND t.agent_id=? AND t.ownership_active=1 AND t.finished_at IS NULL
-               AND t.state='running' AND a.status='running' AND a.finished_at IS NULL
-               AND a.created_at+a.timeout_seconds>?
-               AND s.transport IN ('codex_queue','claude_uds')",
-                params![attempt_id, run_id.as_str(), at],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let Some((digest, session)) = route else {
+        let auth = authenticate_attempt(&tx, run_id, attempt_id, token, at)?
+            .filter(|auth| auth.running)
+            .and_then(|auth| {
+                // The report route additionally requires the exact historical
+                // binding predicate: an optional session on a delivery
+                // transport, resolved inside the same transaction.
+                auth.orchestrator_session_id
+                    .as_deref()
+                    .and_then(|session| {
+                        tx.query_row(
+                            "SELECT transport FROM orchestrator_sessions WHERE id=?",
+                            [session],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .transpose()
+                    })
+                    .transpose()
+                    .ok()
+                    .flatten()
+                    .filter(|transport| {
+                        agent_run_domain::domain::OrchestratorRef::canonical_transport_name(
+                            transport,
+                        )
+                        .is_ok()
+                    })
+                    .map(|_| auth)
+            });
+        let Some(auth) = auth else {
             return Err(Error::Validation(
                 "worker attempt is not active or bound".into(),
             ));
         };
-        if digest != sha256(token.as_bytes()) {
-            return Err(Error::Validation("invalid worker capability".into()));
-        }
+        let session = auth.orchestrator_session_id.expect("checked above");
         let prior: Option<(String, String, String, String)> = tx
             .query_row(
                 "SELECT n.delivery_id,n.kind,n.message,d.state FROM worker_notifications n
@@ -159,6 +235,55 @@ impl Store {
             params![notification_id, run_id.as_str(), attempt_id, input.request_id,
                 input.kind.as_str(), input.message, at],
         )?;
+        // An active pool member also gets exactly one linked team copy of the
+        // report and one pending `pool` command per peer tip, all inside this
+        // same transaction: an insert failure rolls the notification, the
+        // copy and every command back together. The replay path above returns
+        // before this point, so a retry never duplicates the copy. The copy
+        // lives in the pool's own idempotency scope (`notify:` prefix), so a
+        // pool_post reusing the same request key can never collide with it.
+        let seat: Option<(String, String, String, u32)> = tx
+            .query_row(
+                "SELECT p.id,m.name,m.role,p.roster_revision FROM pool_members m \
+                 JOIN pools p ON p.id=m.pool_id \
+                 WHERE m.agent_id=? AND m.replaced_by IS NULL AND p.state='open'",
+                [auth.root_agent_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get::<_, i64>(3)?.max(1) as u32,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((pool_id, name, role, roster_revision)) = seat {
+            let scope = format!("notify:{}", run_id.as_str());
+            tx.execute(
+                "INSERT INTO pool_entries(pool_id,author_kind,author_agent_id,author_name,author_role,\
+                 direction,kind,severity,roster_revision,body,delivery_id,sender_run_id,sender_attempt_id,\
+                 idem_scope,request_id,created_at) \
+                 VALUES(?,'member',?,?,?,'orchestrator_copy','report',?,?,?,?,?,?,?,?,?)",
+                params![
+                    pool_id,
+                    auth.root_agent_id.as_str(),
+                    name,
+                    role,
+                    input.kind.as_str(),
+                    roster_revision,
+                    input.message,
+                    notification_id,
+                    run_id.as_str(),
+                    attempt_id,
+                    scope,
+                    input.request_id,
+                    at,
+                ],
+            )?;
+            let seq = tx.last_insert_rowid().max(0) as u64;
+            crate::pool_log::fanout_entry(&tx, &pool_id, auth.root_agent_id.as_str(), seq)?;
+        }
         tx.commit()?;
         Ok(NotifyReceipt {
             notification_id,

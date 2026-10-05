@@ -1,0 +1,17 @@
+agent-run pools: {{ returned }} of {{ total }} matching (offset {{ offset }})
+
+{% for pool in items %}
+- {{ pool.pool_id }}: {{ pool.state }} — {{ pool.ready }}/{{ pool.members_count }} ready; roster {{ pool.roster_revision }}; last seq {{ pool.last_seq }}{{ "" }}
+  goal: {{ pool.goal }}{% if pool.goal_truncated %} [excerpt]{% endif %}{{ "" }}
+{% if pool.current_proposal_seq %}
+  proposal: {{ pool.current_proposal_seq }}
+{% endif %}
+{% for member in pool.members %}
+  {{ member.slot }}. {{ member.name }} ({{ member.role }}): {{ member.agent_id }} — {{ member.tip_status }}{{ "" }}
+{% endfor %}
+{% endfor %}
+{% if complete %}
+page complete: no further matching rows (total {{ total }})
+{% else %}
+next offset: {{ next_offset }} — more matching rows remain
+{% endif %}

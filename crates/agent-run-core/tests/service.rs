@@ -10,7 +10,7 @@ use agent_run_domain::{
 };
 use agent_run_platform::{fs, verify};
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, path::Path};
+use std::{collections::BTreeSet, path::Path, time::Duration};
 
 /// Proves content-based configuration refresh skips identical bytes, accepts a
 /// valid changed revision, and rejects an invalid changed revision.
@@ -193,6 +193,54 @@ async fn python_test_service_opencode_start_has_migration_guidance() {
             .unwrap(),
         0
     );
+}
+
+/// Exact retries of a pre-normalization `codex` start replay without rewriting old rows.
+#[tokio::test]
+async fn start_replays_historical_alias_fingerprint_and_session_row() {
+    let home = common::Home::new();
+    let service = Service::new(home.path.clone());
+    let mut original = home.request();
+    original.request_id = Some("old-codex-request".into());
+    original.orchestrator = Some(OrchestratorRef {
+        transport: "codex".into(),
+        external_session_id: "old-codex-session".into(),
+        external_turn_id: None,
+    });
+    let old_fingerprint =
+        agent_run_domain::canonical::sha256_hex(&serde_json::to_value(&original).unwrap(), true);
+    let mut request = original.clone();
+    request.validate().unwrap();
+    let mut identity = identity(&home, &request);
+    identity["replay_request_sha256"] = json!(old_fingerprint);
+    let (id, _) = home
+        .store()
+        .admit(&request, &home.config, &identity, None)
+        .unwrap();
+    home.store()
+        .conn
+        .execute(
+            "UPDATE orchestrator_sessions SET transport='codex' WHERE external_session_id='old-codex-session'",
+            [],
+        )
+        .unwrap();
+
+    let replay = service.start(original).await.unwrap();
+    assert_eq!(replay["created"], false);
+    assert_eq!(replay["agent_id"], id.as_str());
+    let replay = service.start(request).await.unwrap();
+    assert_eq!(replay["created"], false);
+    assert_eq!(replay["agent_id"], id.as_str());
+    let transport: String = home
+        .store()
+        .conn
+        .query_row(
+            "SELECT transport FROM orchestrator_sessions WHERE external_session_id='old-codex-session'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(transport, "codex");
 }
 
 /// Mirrors `tests/test_service.py::AgentServiceTests::test_required_unsupported_policy_is_refused_before_admission`.
@@ -796,4 +844,104 @@ fn python_test_service_transcript_cursor_preserves_raw_ref() {
         .transcript(&id, 1, 2)
         .unwrap();
     assert_eq!(tail["messages"][0]["raw_ref"], "raw/two.json");
+}
+
+/// Journal-only progress wakes a waiting list round through the transcript
+/// watermark while the committed event revision stays unchanged.
+#[tokio::test]
+async fn list_wakes_on_journal_progress_via_message_revision() {
+    let home = common::Home::new();
+    let id = admit(&home, home.request(), json!({}));
+    let (revision, message_revision) = {
+        let store = home.store();
+        (store.revision().unwrap(), store.message_revision().unwrap())
+    };
+    assert_eq!(message_revision, 0, "a fresh fixture has no journal rows");
+    let writer = {
+        let home = home.path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let store = agent_run_core::state::Store::open(&home).unwrap();
+            store
+                .message(&id, "assistant", "progress", None, None)
+                .unwrap();
+        })
+    };
+    let value = tokio::time::timeout(
+        Duration::from_secs(3),
+        Service::new(home.path.clone()).list(Query {
+            after_revision: Some(revision),
+            after_message_revision: Some(message_revision),
+            wait_seconds: 3.0,
+            ..Query::default()
+        }),
+    )
+    .await
+    .expect("journal progress wakes the wait")
+    .unwrap();
+    writer.await.unwrap();
+    assert_eq!(value["revision"].as_i64().unwrap(), revision);
+    assert!(
+        value["message_revision"].as_i64().unwrap() > message_revision,
+        "the transcript watermark advanced"
+    );
+    assert!(
+        value["items"][0]["last_progress_at"].as_f64().is_some(),
+        "the woken page carries the new progress time"
+    );
+}
+
+/// Journal-only wakes respect their one-second pacing floor even when the
+/// watermark is already ahead when the wait begins: the page arrives after
+/// the floor and before the wait deadline, carrying the advanced watermark.
+#[tokio::test]
+async fn journal_only_wakes_respect_the_one_second_floor() {
+    let home = common::Home::new();
+    let id = admit(&home, home.request(), json!({}));
+    let store = home.store();
+    store
+        .message(&id, "assistant", "early", None, None)
+        .unwrap();
+    let revision = store.revision().unwrap();
+    let message_revision = store.message_revision().unwrap();
+    assert!(message_revision > 0);
+    let started = std::time::Instant::now();
+    let value = tokio::time::timeout(
+        Duration::from_secs(4),
+        Service::new(home.path.clone()).list(Query {
+            after_revision: Some(revision),
+            after_message_revision: Some(message_revision - 1),
+            wait_seconds: 2.5,
+            ..Query::default()
+        }),
+    )
+    .await
+    .expect("the paced wake still fires inside the wait")
+    .unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "journal wakes never fire within the first second: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2400),
+        "the wake precedes the wait deadline: {elapsed:?}"
+    );
+    assert_eq!(
+        value["message_revision"].as_i64().unwrap(),
+        message_revision
+    );
+}
+
+/// The transcript cursor shares the event cursor's validation rules.
+#[test]
+fn negative_message_cursor_is_a_validation_error() {
+    assert!(
+        Query {
+            after_message_revision: Some(-1),
+            ..Query::default()
+        }
+        .validate()
+        .is_err()
+    );
 }

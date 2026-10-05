@@ -284,7 +284,15 @@ const MAX_PENDING_REQUESTS: usize = 64;
 const CONTROL_FRAME_DEADLINE: Duration = Duration::from_millis(500);
 /// Interval between content-digest checks for a running broker's configuration.
 const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
-const CONTROL_METHODS: &[&str] = &["start", "resume", "cancel", "steer"];
+const CONTROL_METHODS: &[&str] = &[
+    "start",
+    "resume",
+    "cancel",
+    "steer",
+    "start_pool",
+    "pool_post",
+    "pool_replace",
+];
 /// Steady database maintenance interval: expiry found no work and compaction
 /// reclaimed no pages, so nothing eligible remains.
 const DATABASE_STEADY: Duration = Duration::from_secs(3600);
@@ -545,7 +553,14 @@ pub async fn respond(service: &Service, v: Value) -> Option<Value> {
         };
     }
     let known = dispatch::is_tool(method)
-        || ["tools", "ping", "wait", agent_run_domain::worker::METHOD].contains(&method);
+        || [
+            "tools",
+            "ping",
+            "wait",
+            agent_run_domain::worker::METHOD,
+            agent_run_domain::worker::TOOL_METHOD,
+        ]
+        .contains(&method);
     let response = if !known {
         err(id, -32601, "method not found", None)
     } else {
@@ -873,31 +888,22 @@ pub async fn serve_at_with_options(
             }
         }
     });
-    let maintenance = service.clone();
-    workers.spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut config_tick = tokio::time::interval_at(
-            tokio::time::Instant::now() + CONFIG_RELOAD_INTERVAL,
-            CONFIG_RELOAD_INTERVAL,
-        );
-        config_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                _ = tick.tick() => {
-                    let _ = maintenance.reconcile();
-                    if let Err(e) = crate::delivery::dispatch_once(&maintenance.home).await {
-                        eprintln!("delivery maintenance: {}", e.public().kind);
-                    }
-                }
-                _ = config_tick.tick() => match maintenance.refresh_config() {
-                    Ok(true) => eprintln!("configuration reloaded"),
-                    Ok(false) => {}
-                    Err(error) => eprintln!("configuration reload: {}", error.public().kind),
-                },
-            }
-        }
+    let reconciler = service.clone();
+    spawn_reconcile_loop(&mut workers, Duration::from_secs(1), move || {
+        let _ = reconciler.reconcile();
     });
+    let refresher = service.clone();
+    let home = service.home.clone();
+    spawn_delivery_loop(
+        &mut workers,
+        Duration::from_secs(1),
+        CONFIG_RELOAD_INTERVAL,
+        move || {
+            let home = home.clone();
+            async move { crate::delivery::dispatch_once(&home).await }
+        },
+        move || refresher.refresh_config(),
+    );
     let reserved = usize::from(options.max_connections > 1);
     let gate = Arc::new(Semaphore::new(options.max_connections - reserved));
     let control_gate = Arc::new(Semaphore::new(reserved));
@@ -942,6 +948,73 @@ pub async fn serve_at_with_options(
     handlers.abort_all();
     Ok(())
 }
+/// Spawns the serial lease/process reconciliation loop on `workers`.
+///
+/// `run` is synchronous and may block (cleanup sleeps, SQLite waits), so every
+/// pass runs on the blocking pool and is awaited before the next tick: at most
+/// one pass is active, missed ticks are delayed rather than queued, and the
+/// delivery loop never waits on it. Aborting the task (shutdown) stops the loop
+/// at its next await; an already running bounded pass is left to finish rather
+/// than being cut mid-cleanup.
+fn spawn_reconcile_loop<R>(workers: &mut JoinSet<()>, period: Duration, run: R)
+where
+    R: Fn() + Send + Sync + 'static,
+{
+    let run = Arc::new(run);
+    workers.spawn(async move {
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let run = run.clone();
+            if tokio::task::spawn_blocking(move || run()).await.is_err() {
+                eprintln!("reconcile maintenance: worker failed");
+            }
+        }
+    });
+}
+
+/// Spawns the resident delivery and configuration-reload loop on `workers`.
+///
+/// Each `period` tick awaits one bounded `dispatch` pass (the production
+/// closure drains up to the dispatcher's batch limit) and reports its failure by
+/// kind only; `refresh` reloads configuration every `config_period` (first
+/// reload one period after start). Both periods must be nonzero, as for
+/// `tokio::time::interval`. Independent of reconciliation.
+fn spawn_delivery_loop<D, Fut, C>(
+    workers: &mut JoinSet<()>,
+    period: Duration,
+    config_period: Duration,
+    mut dispatch: D,
+    refresh: C,
+) where
+    D: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<usize>> + Send,
+    C: Fn() -> Result<bool> + Send + 'static,
+{
+    workers.spawn(async move {
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut config_tick =
+            tokio::time::interval_at(tokio::time::Instant::now() + config_period, config_period);
+        config_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    if let Err(e) = dispatch().await {
+                        eprintln!("delivery maintenance: {}", e.public().kind);
+                    }
+                }
+                _ = config_tick.tick() => match refresh() {
+                    Ok(true) => eprintln!("configuration reloaded"),
+                    Ok(false) => {}
+                    Err(error) => eprintln!("configuration reload: {}", error.public().kind),
+                },
+            }
+        }
+    });
+}
+
 /// Calls the selected home's broker without sharing response-routing state.
 /// Resume uses one idempotency key across at most one transport reconnect;
 /// explicit keys are preserved and domain errors are never retried. Wait keeps
@@ -1088,6 +1161,17 @@ mod tests {
     use super::*;
     use tokio::net::UnixListener;
 
+    /// Pool discovery consumes only the read lane and no control reservation.
+    #[test]
+    fn list_pools_uses_the_read_lane() {
+        let lanes = Lanes::new(0);
+        let read = lanes.try_acquire("list_pools").unwrap();
+        assert!(lanes.try_acquire("list_agents").is_none());
+        assert!(lanes.try_acquire("start_pool").is_some());
+        drop(read);
+        assert!(lanes.try_acquire("list_pools").is_some());
+    }
+
     // Protects the client from a broker that holds a wait response open forever.
     #[tokio::test]
     async fn wait_client_deadline_closes_when_broker_holds_response() {
@@ -1200,5 +1284,80 @@ mod tests {
         assert_eq!(filesystem_maintenance_delay(0), FILESYSTEM_STEADY);
         assert_eq!(filesystem_maintenance_delay(1), FILESYSTEM_BACKLOG);
         assert_eq!(MAINTENANCE_RETRY, Duration::from_secs(60));
+    }
+
+    /// Polls `condition` every 5 ms for at most 2 s and reports whether it held.
+    async fn eventually(condition: impl Fn() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !condition() {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        true
+    }
+
+    /// A blocked reconcile pass must not stall resident delivery, and passes
+    /// never overlap: reconcile stays gated until the delivery ticks have been
+    /// observed, then resumes, and both loops stop with the `JoinSet`. Waits are
+    /// bounded readiness polls, so a loaded host only delays, never flakes.
+    #[tokio::test]
+    async fn blocked_reconcile_does_not_stall_delivery_or_overlap() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let (active, peak, passes, drained) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let gate = std::sync::Mutex::new(gate);
+        let mut workers = JoinSet::new();
+        let (a, pk, ps) = (active.clone(), peak.clone(), passes.clone());
+        spawn_reconcile_loop(&mut workers, Duration::from_millis(10), move || {
+            ps.fetch_add(1, SeqCst);
+            pk.fetch_max(a.fetch_add(1, SeqCst) + 1, SeqCst);
+            // Bounded gate: released by the test or by the 10 s ceiling.
+            let _ = gate.lock().unwrap().recv_timeout(Duration::from_secs(10));
+            a.fetch_sub(1, SeqCst);
+        });
+        let d = drained.clone();
+        spawn_delivery_loop(
+            &mut workers,
+            Duration::from_millis(10),
+            Duration::from_secs(3600),
+            move || {
+                let d = d.clone();
+                async move { Ok(d.fetch_add(1, SeqCst) + 1) }
+            },
+            || Ok(false),
+        );
+        assert!(
+            eventually(|| passes.load(SeqCst) >= 1 && drained.load(SeqCst) >= 5).await,
+            "delivery stalled behind a blocked reconcile"
+        );
+        // The gate is still held: ticks were delayed, not queued or overlapped.
+        assert_eq!(passes.load(SeqCst), 1, "one gated pass, ticks are delayed");
+        release.send(()).unwrap();
+        assert!(
+            eventually(|| passes.load(SeqCst) >= 2).await,
+            "reconcile resumes after the gate"
+        );
+        assert_eq!(peak.load(SeqCst), 1, "reconcile passes overlapped");
+        workers.abort_all();
+        while workers.join_next().await.is_some() {}
+        drop(release);
+        let (settled_d, settled_p) = (drained.load(SeqCst), passes.load(SeqCst));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            drained.load(SeqCst),
+            settled_d,
+            "delivery loop outlived shutdown"
+        );
+        assert!(
+            passes.load(SeqCst) <= settled_p + 1,
+            "reconcile loop outlived shutdown"
+        );
     }
 }

@@ -1,0 +1,31 @@
+agent-run pool {{ pool_id }} — {% if activity is defined and activity and activity != status.state %}{{ activity }} (state {{ status.state }}{% if activity == "cancelled" %}; restorable by resume or replacement{% elif activity == "stopping" %}; cleanup not yet proven{% elif activity == "settling" %}; completion record pending{% elif activity == "needs_action" %}; needs orchestrator action{% endif %}){% else %}{{ status.state }}{% endif %}, roster r{{ status.roster_revision }}{% if status.agreed %}, all current members valid-ready (agreement is not completion){% else %}, not yet unanimous{% endif %}
+{% if show_goal %}
+Goal: {{ status.goal }}
+Acceptance criteria:
+{% for criterion in status.criteria %}
+- {{ criterion.id }}: {{ criterion.text }}
+{% endfor %}
+{% endif %}
+{% if status.current_proposal and show_proposal %}
+Current proposal #{{ status.current_proposal.seq }} (roster r{{ status.current_proposal.roster_revision }}), snapshot:
+{{ status.current_proposal.snapshot }}
+{% elif status.current_proposal %}
+Current proposal #{{ status.current_proposal.seq }} unchanged (read with after_seq 0 for its snapshot)
+{% else %}
+No proposal yet.
+{% endif %}
+Members:
+{% for member in status.members %}
+- {{ member.name }} ({{ member.role }}, {{ member.agent_id }}): {{ member.tip_status }}, vote {{ member.why }}{% if member.vote and member.vote.decision %} [{{ member.vote.decision }}]{% endif %}{{ "" }}
+{% endfor %}
+{{ status.note }}
+Common notice delivery: {{ delivery.state }}{% if delivery.state == "not_created" %} (not created yet){% elif delivery.state == "waiting_binding" %} (waiting for pool binding){% elif delivery.bound %} (bound){% else %} (unbound){% endif %}{% if delivery.attempts > 0 %}, attempts {{ delivery.attempts }}{% endif %}{% if delivery.ambiguous %}, ambiguous{% endif %}{% if delivery.last_classification %}, last {{ delivery.last_classification }}{% endif %}
+Entries (after #{{ after_seq }}{% if before_seq %}, before #{{ before_seq }}{% endif %}, {{ entry_count }} shown):
+{% for entry in entries %}
+{{ entry }}
+{% endfor %}
+{% if complete %}
+page complete in this direction; this does not imply a finished pool
+{% else %}
+next cursor: {{ next_cursor }} — request the next page with {% if before_seq %}before_seq{% else %}after_seq{% endif %}={{ next_cursor }}
+{% endif %}

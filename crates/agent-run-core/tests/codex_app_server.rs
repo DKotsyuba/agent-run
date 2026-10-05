@@ -545,3 +545,371 @@ async fn codex_failure_redacts_before_truncating() {
     drop(process.input.take());
     process.reap().await;
 }
+
+/// A native tool-evidence sequence: a started+completed command with exit
+/// code evidence, a completed-only MCP call failing with a typed error, a
+/// duplicate completion of the command, and a started-only dynamic call.
+fn tool_evidence_plan() -> LaunchPlan {
+    let mut plan = fake_plan();
+    plan.args[1] = plan.args[1].replace(
+        r#"printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread","turnId":"turn","item":{"type":"commandExecution"}}}'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"completed","items":[]}}}'"#,
+        r#"printf '%s\n' '{"method":"item/started","params":{"threadId":"thread","turnId":"turn","item":{"type":"commandExecution","id":"cmd_ok"}}}'; printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread","turnId":"turn","item":{"type":"commandExecution","id":"cmd_ok","exitCode":0,"aggregatedOutput":"fine"}}}'; printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread","turnId":"turn","item":{"type":"commandExecution","id":"cmd_ok","exitCode":0,"aggregatedOutput":"fine"}}}'; printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread","turnId":"turn","item":{"type":"mcpToolCall","id":"mcp_1","server":"srv","tool":"lookup","status":"failed","error":{"message":"refused"}}}}'; printf '%s\n' '{"method":"item/started","params":{"threadId":"thread","turnId":"turn","item":{"type":"dynamicToolCall","id":"dyn_1","tool":"custom"}}}'; printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"completed","items":[]}}}'"#,
+    );
+    assert_ne!(plan.args[1], fake_plan().args[1]);
+    plan
+}
+
+/// Native invocations journal once per id with explicit evidence only: the
+/// duplicate completion adds nothing, exit code 0 is success, the typed MCP
+/// error is failure, and the unresulted dynamic call keeps its result
+/// unknown without invalidating the other counts.
+#[tokio::test]
+async fn codex_tool_evidence_journals_once_with_native_flags() {
+    let fixture = common::Home::new();
+    let mut request = fixture.request();
+    request.workdir = PathBuf::from(scratch());
+    request.validate().expect("fixture request");
+    let (id, _) = fixture
+        .store()
+        .admit(&request, &fixture.config, &json!({}), None)
+        .expect("admit fixture");
+    let mut store = fixture.store();
+    let record = store.get(&id).expect("admitted row");
+    let app_home = fixture.path.join("codex-home");
+    fs::private_dir(&app_home).expect("owned Codex home");
+    let mut process = Process::spawn(&tool_evidence_plan()).expect("fake app-server starts");
+
+    let result = codex::run(
+        &mut process,
+        &mut store,
+        &record,
+        &runtime(fixture.path.join("runtime")),
+        &profile(),
+        &app_home,
+    )
+    .await
+    .expect("fake turn succeeds");
+
+    assert_eq!(result.outcome.status, Status::Succeeded);
+    let page = store.transcript(&id, 0, 1000).expect("journal page");
+    let calls: Vec<&serde_json::Value> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool_call")
+        .collect();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["raw_ref"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["cmd_ok", "mcp_1", "dyn_1"],
+        "each native id journals exactly one call, duplicates add none: {calls:?}"
+    );
+    let results: Vec<&serde_json::Value> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool_result")
+        .collect();
+    assert_eq!(results.len(), 2, "{results:?}");
+    let command = results
+        .iter()
+        .find(|result| result["raw_ref"] == "cmd_ok")
+        .expect("command result");
+    assert_eq!(command["name"], "command");
+    assert_eq!(command["error"], false);
+    assert_eq!(command["error_source"], "codex.command.exitCode");
+    assert_eq!(command["content"], "fine");
+    let mcp = results
+        .iter()
+        .find(|result| result["raw_ref"] == "mcp_1")
+        .expect("MCP result");
+    assert_eq!(mcp["name"], "srv/lookup");
+    assert_eq!(mcp["error"], true);
+    assert_eq!(mcp["error_source"], "codex.mcp.error");
+    let counts = store.tool_counts(&id).expect("native counts");
+    assert_eq!(counts.calls, Some(3));
+    assert_eq!(counts.failed, None, "one unknown result keeps failed null");
+    assert_eq!(counts.unknown_results, Some(1));
+    drop(process.input.take());
+    process.reap().await;
+}
+
+/// One steer-exchange script: line 6 answers the steer request with `mode`
+/// (`result` or `error`), optionally flooding 65 notifications first so the
+/// bounded exchange ends in pressure before the late correlated reply.
+fn steer_plan(mode: &str, flood: bool) -> LaunchPlan {
+    let mut script = String::from(
+        r#"n=0; while IFS= read -r line; do n=$((n+1)); case "$n" in
+            1) printf '%s
+' '{"id":1,"result":{}}' ;;
+            3) printf '%s
+' '{"id":2,"result":{"data":[{"id":"fixture"}]}}' ;;
+            4) case "$line" in *'"permissions"'*) printf '%s
+' '{"id":3,"result":{"model":"fixture","cwd":"/private/tmp","runtimeWorkspaceRoots":["/private/tmp"],"sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"never","activePermissionProfile":{"id":":read-only"},"threadId":"thread"}}' ;; *) printf '%s
+' '{"id":3,"result":{"model":"fixture","cwd":"/private/tmp","roots":["/private/tmp"],"writableRoots":[],"sandbox":"read-only","approvalPolicy":"never","threadId":"thread"}}' ;; esac ;;
+            5) printf '%s
+' '{"id":4,"result":{"turn":{"id":"turn"}}}'; sleep 0.4 ;;
+            6) "#,
+    );
+    if flood {
+        for n in 1..=65u64 {
+            script.push_str(&format!(
+                "printf '%s\\n' '{{\"method\":\"item/agentMessage/delta\",\"params\":{{\"threadId\":\"thread\",\"turnId\":\"turn\",\"itemId\":\"flood\",\"delta\":\"{n}\"}}}}'; "
+            ));
+        }
+        script.push_str("sleep 0.4; printf '%s\\n' '{\"id\":5,\"result\":{\"ok\":true}}'; ");
+    } else if mode == "error" {
+        script.push_str(
+            "printf '%s\\n' '{\"id\":5,\"error\":{\"code\":\"ExpectedTurnMismatch\"}}'; ",
+        );
+    } else {
+        script.push_str("printf '%s\\n' '{\"id\":5,\"result\":{\"ok\":true}}'; ");
+    }
+    script.push_str(
+        r#"printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"completed","items":[]}}}' ;;
+        esac; done"#,
+    );
+    let mut plan = fake_plan();
+    plan.args[1] = script.replace("/private/tmp", &scratch());
+    plan
+}
+
+/// Admits one fixture row with a pending steer command and runs it to
+/// completion against `plan`, returning the agent id.
+async fn run_with_steer(
+    home: &std::path::Path,
+    plan: LaunchPlan,
+) -> agent_run_domain::domain::AgentId {
+    run_with_command(home, plan, |store, id| {
+        store
+            .enqueue(id, "steer", &json!({"text":"fixture:steer-text"}))
+            .unwrap();
+    })
+    .await
+}
+
+/// [`run_with_steer`] with the caller choosing which commands to enqueue.
+async fn run_with_command(
+    home: &std::path::Path,
+    plan: LaunchPlan,
+    enqueue: impl FnOnce(&mut agent_run_core::state::Store, &agent_run_domain::domain::AgentId),
+) -> agent_run_domain::domain::AgentId {
+    let config = agent_run_config::config::Config::load(home).unwrap();
+    let mut request: agent_run_domain::domain::StartRequest = serde_json::from_value(json!({
+        "runtime":"mock", "model":"fixture", "profile":"review",
+        "task":"fixture task", "workdir":scratch()
+    }))
+    .unwrap();
+    request.validate().unwrap();
+    let mut store = agent_run_core::state::Store::open(home).unwrap();
+    let (id, _) = store.admit(&request, &config, &json!({}), None).unwrap();
+    enqueue(&mut store, &id);
+    drop(store);
+    let mut store = agent_run_core::state::Store::open(home).unwrap();
+    let record = store.get(&id).unwrap();
+    let app_home = home.join("codex-home");
+    fs::private_dir(&app_home).unwrap();
+    let runtime_home = home.join("runtime");
+    fs::private_dir(&runtime_home).unwrap();
+    let mut process = Process::spawn(&plan).expect("fake app-server starts");
+    let result = codex::run(
+        &mut process,
+        &mut store,
+        &record,
+        &runtime(runtime_home),
+        &profile(),
+        &app_home,
+    )
+    .await
+    .expect("fake turn succeeds");
+    assert_eq!(result.outcome.status, Status::Succeeded);
+    drop(process.input.take());
+    process.reap().await;
+    id
+}
+
+/// Reads one durable command result for the agent.
+fn command_result(
+    home: &std::path::Path,
+    id: &agent_run_domain::domain::AgentId,
+) -> serde_json::Value {
+    let store = agent_run_core::state::Store::open(home).unwrap();
+    store
+        .conn
+        .query_row(
+            "SELECT result_json FROM commands WHERE agent_id=? AND kind='steer'",
+            [id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|raw| serde_json::from_str(&raw).unwrap())
+        .unwrap()
+}
+
+/// Counts journal rows containing the fixture steer text.
+fn steer_rows(home: &std::path::Path, id: &agent_run_domain::domain::AgentId) -> i64 {
+    let store = agent_run_core::state::Store::open(home).unwrap();
+    store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE agent_id=? AND content LIKE '%fixture:steer-text%'",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// Backlog pressure after the steer write is explicitly unknown: the command
+/// result records `accepted:null` with the bounded reason, no user row is
+/// journaled for an unproven delivery, the late correlated reply lands as
+/// metadata only, and the terminal completion still arrives in order.
+#[tokio::test]
+async fn steer_pressure_is_uncertain_and_late_reply_is_metadata() {
+    let fixture = common::Home::new();
+    let id = run_with_steer(&fixture.path, steer_plan("result", true)).await;
+    let result = command_result(&fixture.path, &id);
+    assert_eq!(
+        result,
+        json!({"accepted":null,"reason":"uncertain_backlog_pressure"}),
+        "pressure after a possible write is unknown, not a guessed rejection"
+    );
+    assert_eq!(
+        steer_rows(&fixture.path, &id),
+        0,
+        "unproven text is not journaled"
+    );
+    let store = agent_run_core::state::Store::open(&fixture.path).unwrap();
+    let uncertain: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='steer_uncertain'",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(uncertain, 1);
+    let late: serde_json::Value = store
+        .conn
+        .query_row(
+            "SELECT data_json FROM events WHERE agent_id=? AND kind='late_rpc_reply'",
+            [id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|raw| serde_json::from_str(&raw).unwrap())
+        .unwrap();
+    assert_eq!(late, json!({"id":5}), "the late reply is id-only metadata");
+    let malformed: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='malformed_event'",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(malformed, 0, "a late reply is not a malformed event");
+}
+
+/// A correlated native rejection proves the steer was not accepted and no
+/// user row is journaled; the turn still completes.
+#[tokio::test]
+async fn steer_rejection_is_proven_false() {
+    let fixture = common::Home::new();
+    let id = run_with_steer(&fixture.path, steer_plan("error", false)).await;
+    assert_eq!(
+        command_result(&fixture.path, &id),
+        json!({"accepted":false,"reason":"native_rejected"})
+    );
+    assert_eq!(steer_rows(&fixture.path, &id), 0);
+}
+
+/// A correlated successful reply proves native acceptance only, and the
+/// journaled user row keeps the delivered text.
+#[tokio::test]
+async fn steer_reply_journals_the_delivered_text() {
+    let fixture = common::Home::new();
+    let id = run_with_steer(&fixture.path, steer_plan("result", false)).await;
+    assert_eq!(command_result(&fixture.path, &id), json!({"accepted":true}));
+    assert_eq!(steer_rows(&fixture.path, &id), 1);
+}
+
+/// Admits a one-seat pool around `id` and an operator entry, then queues the
+/// `pool` command a peer write would have produced; returns nothing, the log
+/// entry is the authority the runner re-reads.
+fn queue_pool_push(
+    store: &mut agent_run_core::state::Store,
+    id: &agent_run_domain::domain::AgentId,
+) {
+    store
+        .conn
+        .execute(
+            "INSERT INTO pools(id,request_namespace,request_id,request_sha256,goal,acceptance_json,state,roster_revision,created_at) \
+             VALUES('pool-20260101-000000-0123456789','ns','r',lower(hex(zeroblob(32))),'goal','[]','open',1,1.0)",
+            [],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO pool_members(agent_id,pool_id,slot,name,role,personal_task,joined_roster_revision) \
+             VALUES(?,'pool-20260101-000000-0123456789',1,'Ada','reviewer','t',1)",
+            [id.as_str()],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO pool_entries(pool_id,author_kind,direction,kind,roster_revision,body,idem_scope,request_id,created_at) \
+             VALUES('pool-20260101-000000-0123456789','operator','team','message',1,'please recheck','op','k',1.0)",
+            [],
+        )
+        .unwrap();
+    store.enqueue(id, "pool", &json!({"seq":1})).unwrap();
+}
+
+/// Reads the durable result of the agent's one `pool` command.
+fn pool_result(
+    home: &std::path::Path,
+    id: &agent_run_domain::domain::AgentId,
+) -> serde_json::Value {
+    let store = agent_run_core::state::Store::open(home).unwrap();
+    store
+        .conn
+        .query_row(
+            "SELECT result_json FROM commands WHERE agent_id=? AND kind='pool'",
+            [id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|raw| serde_json::from_str(&raw).unwrap())
+        .unwrap()
+}
+
+/// A correlated native reply is `native_accepted` only: never delivery or
+/// consumption, and the operator-visible journal gains no user row.
+#[tokio::test]
+async fn pool_push_native_reply_is_accepted_not_consumed() {
+    let fixture = common::Home::new();
+    let id = run_with_command(&fixture.path, steer_plan("result", false), queue_pool_push).await;
+    let result = pool_result(&fixture.path, &id);
+    assert_eq!(result["push"], "native_accepted");
+    assert_eq!(result["reason"], "native_replied");
+    assert!(result.get("delivered").is_none() && result.get("accepted").is_none());
+}
+
+/// A correlated native rejection is a proven `rejected`; the turn completes.
+#[tokio::test]
+async fn pool_push_native_rejection_is_rejected() {
+    let fixture = common::Home::new();
+    let id = run_with_command(&fixture.path, steer_plan("error", false), queue_pool_push).await;
+    assert_eq!(pool_result(&fixture.path, &id)["push"], "rejected");
+}
+
+/// Backlog pressure after a possible write is `unknown`, never a guess.
+#[tokio::test]
+async fn pool_push_pressure_after_write_is_unknown() {
+    let fixture = common::Home::new();
+    let id = run_with_command(&fixture.path, steer_plan("result", true), queue_pool_push).await;
+    let result = pool_result(&fixture.path, &id);
+    assert_eq!(result["push"], "unknown");
+    assert_eq!(result["reason"], "uncertain_backlog_pressure");
+}

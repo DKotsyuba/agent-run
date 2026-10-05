@@ -304,9 +304,10 @@ fn symlink_escape_is_retained_without_touching_target() {
     );
 }
 
-/// A live Desktop relay stays; a refused socket with the same verified inode is removed.
+/// Live and refused relay sockets remain untouched: refusal alone cannot prove
+/// the listener is dead, because a live Unix socket can have a full backlog.
 #[test]
-fn live_and_stale_relay_sockets_are_distinguished() {
+fn live_and_refused_relay_sockets_are_retained() {
     let home = common::Home::new();
     let mut store = home.store();
     let live = home.path.join("ar-cdx-v4-live.sock");
@@ -317,7 +318,7 @@ fn live_and_stale_relay_sockets_are_distinguished() {
         sweep(&home.path, NOW, &mut store).unwrap();
     }
     assert!(live.exists());
-    assert!(!stale.exists());
+    assert!(stale.exists(), "a refused endpoint is not proven dead");
     drop(listener);
 }
 

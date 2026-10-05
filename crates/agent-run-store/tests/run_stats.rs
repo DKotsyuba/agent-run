@@ -380,3 +380,229 @@ fn python_test_run_stats_golden_v16_rows_are_read_without_shape_drift() {
     assert!(row["api_duration_ms"].is_null());
     assert_eq!(row["usage_source"], "runtime_result");
 }
+
+/// Marks one agent as a terminal Codex parent of the native thread `session`.
+fn codex_parent(store: &mut Store, id: &AgentId, session: &str) {
+    terminal(store, id, "succeeded");
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET runtime_session_id=? WHERE id=?",
+            params![session, id.as_str()],
+        )
+        .unwrap();
+}
+
+/// Admits one child row continuing `parent`'s native thread in its lineage.
+fn resumed_child(
+    store: &mut Store,
+    home: &common::Home,
+    parent: &AgentId,
+    session: &str,
+) -> AgentId {
+    let child = agent(store, home);
+    let root: String = store
+        .conn
+        .query_row(
+            "SELECT root_agent_id FROM agents WHERE id=?",
+            [parent.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET parent_agent_id=?,root_agent_id=?,sequence=2,resume_of_runtime_session_id=? WHERE id=?",
+            params![parent.as_str(), root, session, child.as_str()],
+        )
+        .unwrap();
+    child
+}
+
+/// The baseline writer copies a completed parent's last cumulative Codex
+/// usage payload once, and the resumed row's normalized statistics then
+/// report exactly this execution's delta, never the thread total twice.
+#[test]
+fn resume_baseline_writer_copies_parent_usage_and_counts_only_the_delta() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let parent = agent(&mut store, &home);
+    codex_parent(&mut store, &parent, "thread-old");
+    store
+        .event(&parent, "thread/tokenUsage/updated", &token_usage_payload())
+        .unwrap();
+    let child = resumed_child(&mut store, &home, &parent, "thread-old");
+    terminal(&mut store, &child, "succeeded");
+
+    store.record_resume_usage_baseline(&child).unwrap();
+    store
+        .event(&child, "thread/tokenUsage/updated", &token_usage_payload())
+        .unwrap();
+    run_stats::record(&mut store, &child).unwrap();
+    assert_eq!(statistics(&store, &child)["input_tokens"], 0);
+    assert!(statistics(&store, &child)["num_turns"].is_null());
+    // Repeating the launch-time writer must not append a second baseline.
+    store.record_resume_usage_baseline(&child).unwrap();
+    store
+        .event(
+            &child,
+            "thread/tokenUsage/updated",
+            &json!({"tokenUsage":{"total":{
+                "inputTokens":6001,"outputTokens":1002,"cachedInputTokens":3500,
+                "cacheWriteInputTokens":800,"reasoningOutputTokens":311,"totalTokens":6903
+            },"_source":"token_usage_updated"}}),
+        )
+        .unwrap();
+    run_stats::record(&mut store, &child).unwrap();
+
+    let row = statistics(&store, &child);
+    assert_eq!(row["usage_source"], "token_usage_updated");
+    assert_eq!(row["input_tokens"], 1000);
+    assert_eq!(row["output_tokens"], 100);
+    assert_eq!(row["cache_read_tokens"], 500);
+    assert_eq!(row["cache_write_tokens"], 100);
+    assert_eq!(row["reasoning_tokens"], 100);
+    assert_eq!(row["total_tokens"], 1000);
+    let baselines: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='resume_usage_baseline'",
+            [child.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(baselines, 1, "the writer must be idempotent per agent");
+}
+
+/// A parent whose last usage belongs to another native session, or that
+/// never reported usage, produces no baseline: the resumed row keeps every
+/// measurement null instead of inventing a zero or a wrong delta.
+#[test]
+fn resume_baseline_writer_skips_incomparable_parents() {
+    let home = common::Home::new();
+    let mut store = home.store();
+
+    // Another native session: the thread this child continues is not the one
+    // the parent's usage was measured on.
+    let parent = agent(&mut store, &home);
+    codex_parent(&mut store, &parent, "thread-other");
+    store
+        .event(&parent, "thread/tokenUsage/updated", &token_usage_payload())
+        .unwrap();
+    let child = resumed_child(&mut store, &home, &parent, "thread-old");
+    store.record_resume_usage_baseline(&child).unwrap();
+    let baselines: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='resume_usage_baseline'",
+            [child.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(baselines, 0, "a foreign session must not seed a baseline");
+
+    // No parent usage at all.
+    let quiet = agent(&mut store, &home);
+    codex_parent(&mut store, &quiet, "thread-quiet");
+    let quiet_child = resumed_child(&mut store, &home, &quiet, "thread-quiet");
+    store.record_resume_usage_baseline(&quiet_child).unwrap();
+    terminal(&mut store, &quiet_child, "succeeded");
+    store
+        .event(
+            &quiet_child,
+            "thread/tokenUsage/updated",
+            &token_usage_payload(),
+        )
+        .unwrap();
+    run_stats::record(&mut store, &quiet_child).unwrap();
+    let row = statistics(&store, &quiet_child);
+    assert_eq!(row["usage_source"], "none");
+    assert!(row["input_tokens"].is_null());
+    assert!(row["total_tokens"].is_null());
+}
+
+/// A parent that ran a different model than the resumed child reports usage
+/// that is not comparable; the writer keeps the child's measurements null.
+#[test]
+fn resume_baseline_writer_skips_foreign_model() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let parent = agent(&mut store, &home);
+    codex_parent(&mut store, &parent, "thread-model");
+    store
+        .event(&parent, "thread/tokenUsage/updated", &token_usage_payload())
+        .unwrap();
+    let child = resumed_child(&mut store, &home, &parent, "thread-model");
+    // The comparability guard reads the durable request, so the child is
+    // admitted with a different requested model rather than a column edit.
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET request_json=json_set(request_json,'$.model','other-model') WHERE id=?",
+            [child.as_str()],
+        )
+        .unwrap();
+    store.record_resume_usage_baseline(&child).unwrap();
+    let baselines: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='resume_usage_baseline'",
+            [child.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(baselines, 0, "a foreign model must not seed a baseline");
+}
+
+/// Native payload thread mismatches, malformed parent JSON, runtime changes
+/// and counter resets cannot supply comparable resumed usage.
+#[test]
+fn resume_usage_rejects_incomparable_native_evidence() {
+    for scenario in [
+        "parent-thread",
+        "child-thread",
+        "malformed",
+        "runtime",
+        "reset",
+    ] {
+        let home = common::Home::new();
+        let mut store = home.store();
+        let parent = agent(&mut store, &home);
+        codex_parent(&mut store, &parent, "thread-old");
+        let mut payload = token_usage_payload();
+        payload["threadId"] = json!(if scenario == "parent-thread" {
+            "foreign"
+        } else {
+            "thread-old"
+        });
+        store
+            .event(&parent, "thread/tokenUsage/updated", &payload)
+            .unwrap();
+        if scenario == "malformed" {
+            store.conn.execute("UPDATE events SET data_json='invalid' WHERE agent_id=? AND kind='thread/tokenUsage/updated'", [parent.as_str()]).unwrap();
+        }
+        let child = resumed_child(&mut store, &home, &parent, "thread-old");
+        if scenario == "runtime" {
+            store.conn.execute("UPDATE agents SET request_json=json_set(request_json,'$.runtime','other-runtime') WHERE id=?", [child.as_str()]).unwrap();
+        }
+        store.record_resume_usage_baseline(&child).unwrap();
+        let mut current = token_usage_payload();
+        current["threadId"] = json!(if scenario == "child-thread" {
+            "foreign"
+        } else {
+            "thread-old"
+        });
+        if scenario == "reset" {
+            current["tokenUsage"]["total"]["inputTokens"] = json!(1);
+        }
+        store
+            .event(&child, "thread/tokenUsage/updated", &current)
+            .unwrap();
+        run_stats::record(&mut store, &child).unwrap();
+        let row = statistics(&store, &child);
+        assert_eq!(row["usage_source"], "none", "{scenario}: {row}");
+        assert!(row["input_tokens"].is_null(), "{scenario}: {row}");
+        assert!(row["output_tokens"].is_null(), "{scenario}: {row}");
+        assert!(row["num_turns"].is_null(), "{scenario}: {row}");
+    }
+}

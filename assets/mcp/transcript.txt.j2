@@ -1,10 +1,23 @@
-agent-run transcript for {{ agent_id }} ({{ count }} messages, {% if complete %}complete page{% else %}continues at cursor {{ next_cursor }}{% endif %})
+agent-run transcript for {{ agent_id }} ({{ count }} {{ view }} entries, {{ direction }} page)
 
 {% for message in messages %}
-[{{ message.seq }}] {{ message.role }}{% if message.name %} ({{ message.name }}){% endif %}: {{ message.content }}{{ "" }}
+[{{ message.first_seq if message.first_seq else message.seq }}{% if message.last_seq %}..{{ message.last_seq }}{% endif %}] {{ message.role }}{% if message.name %} ({{ message.name }}){% endif %}{% if message.role == "tool_result" %} [{{ message.error }}{% if message.error_source %}: {{ message.error_source }}{% endif %}]{% endif %}: {{ message.content }}{{ "" }}
+{% if message.raw_ref %}
+raw_ref: {{ message.raw_ref }} (opaque)
+{% endif %}
+{% if message.partial_before or message.partial_after %}
+partial block: {% if message.partial_before %}earlier fragments omitted from this page{% endif %}{% if message.partial_before and message.partial_after %}; {% endif %}{% if message.partial_after %}later fragments continue{% endif %}
+{% endif %}
+{% if message.content_complete == false %}
+inline content incomplete{% if message.omitted_bytes %}: {{ message.omitted_bytes }} bytes omitted{% endif %}; request raw view at cursor {{ message.first_seq - 1 if message.first_seq else message.seq - 1 }} or inspect the opaque raw_ref
+{% endif %}
 {% endfor %}
 {% if not complete %}
-next_cursor: {{ next_cursor }} — request the next page with this cursor and the same agent_id; a complete page does not imply a terminal agent
+{% if direction == "backward" %}
+previous_cursor: {{ previous_cursor }} — request blocks with before_cursor={{ previous_cursor }} and the same agent_id
 {% else %}
-page complete: no further transcript rows follow this cursor
+next_cursor: {{ next_cursor }} — request the next page with this cursor and the same agent_id
+{% endif %}
+{% else %}
+page complete: no further transcript rows in this direction; this does not imply a terminal agent or complete inline content
 {% endif %}

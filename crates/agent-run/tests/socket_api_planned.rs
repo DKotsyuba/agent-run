@@ -468,6 +468,31 @@ async fn python_capacity_order_and_durable_cancel_use_independent_paths() {
     drop(home);
 }
 
+/// The live Unix socket discovers and dispatches list_pools with typed validation.
+#[tokio::test]
+async fn list_pools_live_socket_round_trip() {
+    let (_temp, path, task) = broker().await;
+    let response = request(
+        &path,
+        json!({"jsonrpc":"2.0","id":1,
+        "method":"list_pools","params":{"state":"open","limit":1,"offset":0}}),
+    )
+    .await;
+    assert_eq!(response["result"]["items"], json!([]));
+    assert_eq!(response["result"]["total"], 0);
+    assert_eq!(response["result"]["complete"], true);
+    assert_eq!(response["result"]["limit"], 1);
+    let bad = request(
+        &path,
+        json!({"jsonrpc":"2.0","id":2,
+        "method":"list_pools","params":{"limit":201}}),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], -32602);
+    assert_eq!(bad["error"]["message"], "invalid pool list page arguments");
+    stop(task).await;
+}
+
 /// Mirrors `tests/test_api_socket.py::ApiSocketTests::test_successful_tool_round_trip`.
 #[tokio::test]
 async fn python_successful_tool_round_trip() {
@@ -494,7 +519,8 @@ async fn python_successful_tool_round_trip() {
 }
 
 /// Mirrors `tests/test_api_socket.py::ApiSocketTests::test_surface_is_dispatch_tools_plus_control_methods`.
-/// The current shared surface additionally exposes the compact delegation guide.
+/// The current shared surface additionally exposes the compact delegation guide
+/// and the five cooperative-pool operator tools, including read-only discovery.
 #[test]
 fn python_socket_surface_is_shared_tools_plus_controls() {
     let names = agent_run::dispatch::tools()
@@ -503,7 +529,21 @@ fn python_socket_surface_is_shared_tools_plus_controls() {
         .collect::<std::collections::BTreeSet<_>>();
     assert!(names.contains("start") && names.contains("list_agents"));
     assert!(names.contains("delegation_guide"));
-    assert_eq!(names.len(), 12);
+    for pool in [
+        "start_pool",
+        "pool_post",
+        "pool_replace",
+        "pool",
+        "list_pools",
+    ] {
+        assert!(names.contains(pool), "{pool}");
+    }
+    let registry: std::collections::BTreeSet<_> = agent_run_domain::registry()
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect();
+    assert_eq!(names, registry, "the socket surface is the shared table");
+    assert_eq!(names.len(), 17);
 }
 
 /// Mirrors `tests/test_api_socket.py::ApiSocketTests::test_wait_timeout_validation`.
@@ -547,4 +587,55 @@ async fn python_wait_timeout_is_a_normal_result() {
     .unwrap();
     assert_eq!(response["result"]["timed_out"], true);
     assert_eq!(response["result"]["terminal"], false);
+}
+
+/// A journal-only change (a transcript row, no event) wakes a waiting
+/// `list_agents` round through `after_message_revision`, inside the paced
+/// floor and before the wait deadline, without advancing the event revision.
+#[tokio::test]
+async fn list_long_poll_wakes_on_journal_progress() {
+    let (home, path, task) = broker().await;
+    let id = admitted(&home);
+    let (revision, message_revision) = {
+        let store = agent_run::state::Store::open(home.path()).unwrap();
+        (store.revision().unwrap(), store.message_revision().unwrap())
+    };
+    assert_eq!(message_revision, 0, "a fresh fixture has no journal rows");
+    tokio::spawn({
+        let home = home.path().to_owned();
+        async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            agent_run::state::Store::open(&home)
+                .unwrap()
+                .message(&id, "assistant", "progress", None, None)
+                .unwrap();
+        }
+    });
+    let started = std::time::Instant::now();
+    let response = request(
+        &path,
+        json!({"jsonrpc":"2.0","id":1,"method":"list_agents","params":{
+            "after_revision":revision,"after_message_revision":message_revision,"wait_seconds":3.0
+        }}),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert_eq!(
+        response["result"]["revision"], revision,
+        "no event advanced: {response}"
+    );
+    assert!(
+        response["result"]["message_revision"].as_i64().unwrap() > message_revision,
+        "the transcript watermark advanced: {response}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(1000),
+        "journal wakes respect the one-second floor: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "the wake precedes the wait deadline: {elapsed:?}"
+    );
+    stop(task).await;
+    drop(home);
 }

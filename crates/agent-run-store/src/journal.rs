@@ -196,6 +196,7 @@ impl Store {
         if !["user", "assistant", "system", "tool_call", "tool_result"].contains(&role) {
             return Err(invalid("unknown transcript role"));
         }
+        let content_complete = content.len() <= MAX_INLINE_MESSAGE_BYTES;
         let (content, raw_ref) = message_storage(&self.home, id, content, raw_ref)?;
         let tx = self
             .conn
@@ -218,18 +219,19 @@ impl Store {
                 return Err(invalid("attempt is unknown or owned by another agent"));
             }
         }
-        tx.execute("INSERT INTO messages(agent_id,attempt_id,at,role,name,content,raw_ref) VALUES(?,?,?,?,?,?,?)", params![id.as_str(), attempt_id, now(), role, name, content, raw_ref])?;
+        tx.execute("INSERT INTO messages(agent_id,attempt_id,at,role,name,content,raw_ref,content_complete,root_agent_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,(SELECT COALESCE(NULLIF(root_agent_id,''),id) FROM agents WHERE id=?1))", params![id.as_str(), attempt_id, now(), role, name, content, raw_ref, content_complete])?;
         let seq = tx.last_insert_rowid();
         tx.commit()?;
         Ok(seq)
     }
 
-    /// Claims the oldest pending command, preferring cancellation over steering, exactly once.
+    /// Claims the oldest pending command, preferring cancellation over
+    /// steering over pool delivery, exactly once.
     pub fn claim_command(&mut self, id: &AgentId) -> Result<Option<(i64, String, Value)>> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row = tx.query_row("SELECT id,kind,payload_json FROM commands WHERE agent_id=? AND state='pending' ORDER BY CASE kind WHEN 'cancel' THEN 0 ELSE 1 END,id LIMIT 1", [id.as_str()], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))).optional()?;
+        let row = tx.query_row("SELECT id,kind,payload_json FROM commands WHERE agent_id=? AND state='pending' ORDER BY CASE kind WHEN 'cancel' THEN 0 WHEN 'steer' THEN 1 ELSE 2 END,id LIMIT 1", [id.as_str()], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))).optional()?;
         let Some((command_id, kind, payload)) = row else {
             tx.commit()?;
             return Ok(None);

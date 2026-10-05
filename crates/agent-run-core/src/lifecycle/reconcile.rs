@@ -349,11 +349,11 @@ fn release_orphaned_attempts(store: &mut Store, limit: usize) -> Result<()> {
             (None, _, _) if attempt.phase.as_deref() == Some("prepared") => {
                 Ok(Some(json!({"never_spawned":true,"reconciled":true})))
             }
-            (Some(token), Some(birth), Some(pid)) if saved_processes.is_some() => {
+            (Some(token), Some(birth), _) if saved_processes.is_some() => {
                 let mut owned = saved_processes.expect("checked persisted ownership");
                 let matches_attempt = owned.leader.as_ref().is_some_and(|root| {
-                    root.pid == pid
-                        && root.group == pid
+                    root.pid > 1
+                        && root.group == root.pid
                         && root.token == *token
                         && root.birth == birth
                 });
@@ -362,7 +362,11 @@ fn release_orphaned_attempts(store: &mut Store, limit: usize) -> Result<()> {
                 } else {
                     // The original root may be gone: captured detached children
                     // still receive their own fresh PID/token/birth checks.
-                    match owned.cleanup_blocking(ORPHAN_GRACE) {
+                    let cleanup = owned.cleanup_blocking(ORPHAN_GRACE);
+                    if let Some(snapshot) = owned.snapshot() {
+                        store.remember_processes("attempt", &attempt.id, &snapshot)?;
+                    }
+                    match cleanup {
                         Ok(cleanup) if cleanup.confirmed => {
                             let mut proof = serde_json::to_value(&cleanup)?;
                             proof["reconciled"] = json!(true);
@@ -384,7 +388,11 @@ fn release_orphaned_attempts(store: &mut Store, limit: usize) -> Result<()> {
                             token: token.clone(),
                             zombie: false,
                         });
-                        match owned.cleanup_blocking(ORPHAN_GRACE) {
+                        let cleanup = owned.cleanup_blocking(ORPHAN_GRACE);
+                        if let Some(snapshot) = owned.snapshot() {
+                            store.remember_processes("attempt", &attempt.id, &snapshot)?;
+                        }
+                        match cleanup {
                             Ok(cleanup) if cleanup.confirmed => {
                                 let mut proof = serde_json::to_value(&cleanup)?;
                                 proof["reconciled"] = json!(true);

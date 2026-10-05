@@ -136,6 +136,8 @@ pub struct Renderer {
     streamed_role: bool,
     /// `raw_ref` identity of the item currently streamed.
     identity: Option<String>,
+    /// Optional native speaker name; a name change is a real message boundary.
+    name: Option<String>,
     /// Incremental terminal-escape scanner state of the current item.
     escape: Escape,
     /// Whether emitted output currently ends without a newline.
@@ -175,7 +177,13 @@ impl Renderer {
             // Codex producer journals delta fragments and completion tails of
             // one agentMessage under the same itemId. Any other role, or a
             // changed/absent identity, starts a new rendered item.
-            let continues = role == "assistant" && self.streamed_role && identity == self.identity;
+            let name = message["name"].as_str().map(str::to_owned);
+            let continues = role == "assistant"
+                && self.streamed_role
+                && identity.is_some()
+                && identity == self.identity
+                && name == self.name
+                && message["starts_block"] != true;
             if continues {
                 self.stream(message["content"].as_str().unwrap_or(""), emit)?;
             } else {
@@ -187,6 +195,7 @@ impl Renderer {
                     "assistant" => {
                         self.streamed_role = true;
                         self.identity = identity;
+                        self.name = name;
                         self.stream(message["content"].as_str().unwrap_or(""), emit)?;
                     }
                     role => {
@@ -194,6 +203,7 @@ impl Renderer {
                         // never leave one open behind them.
                         self.streamed_role = false;
                         self.identity = None;
+                        self.name = None;
                         self.standalone(
                             role,
                             message["name"].as_str(),

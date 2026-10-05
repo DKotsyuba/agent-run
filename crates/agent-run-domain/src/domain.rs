@@ -187,17 +187,91 @@ pub fn external_id(label: &str, s: &str) -> Result<()> {
     Ok(())
 }
 
+/// The largest accepted display label length, in Unicode scalar values.
+pub const MAX_DISPLAY_NAME_CHARS: usize = 64;
+
+/// Normalizes one optional human display label for durable storage.
+///
+/// The label is a human-facing UTF-8 string, not an identifier: it is trimmed,
+/// must stay nonblank, hold at most [`MAX_DISPLAY_NAME_CHARS`] Unicode scalar
+/// values, and contain no control, bidirectional-embedding, or other format
+/// characters that a terminal or list view could render as executable
+/// formatting. Anything else is a validation error; the label is never
+/// derived from task text and confers no authority.
+pub fn display_name(label: &str) -> Result<String> {
+    let trimmed = label.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return Err(invalid("display name must be a nonblank NUL-free string"));
+    }
+    if trimmed.chars().count() > MAX_DISPLAY_NAME_CHARS {
+        return Err(invalid("display name exceeds 64 characters"));
+    }
+    if trimmed.chars().any(is_unsafe_label_char) {
+        return Err(invalid(
+            "display name must not contain control, bidi or format characters",
+        ));
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// Reports one character a display label must not carry: C0/C1 controls and
+/// the directional isolates, overrides, and invisible format marks whose
+/// rendering could mislabel or execute in terminal output.
+fn is_unsafe_label_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00ad}'
+                | '\u{200e}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{feff}'
+        )
+}
+
+/// Identifies one external conversation for binding and completion delivery.
+///
+/// `transport` accepts canonical `codex_queue` and `claude_uds`, plus the
+/// `codex` and `claude` aliases; normalization stores only canonical names.
+/// Session and optional turn ids are opaque, nonblank external ids. Session
+/// identity excludes the turn so later turns remain in the same durable scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrchestratorRef {
+    /// Supported delivery transport or its known user-facing alias.
     pub transport: String,
+    /// Opaque host conversation identity; not exposed in delivery diagnostics.
     pub external_session_id: String,
+    /// Optional opaque id for the current external turn.
     #[serde(default)]
     pub external_turn_id: Option<String>,
 }
 impl OrchestratorRef {
+    /// Returns the canonical delivery transport for this supported name or alias.
+    pub fn canonical_transport(&self) -> Result<&'static str> {
+        Self::canonical_transport_name(&self.transport)
+    }
+
+    /// Maps one persisted or caller-supplied name to its supported canonical transport.
+    /// Unknown names return a typed validation error.
+    pub fn canonical_transport_name(transport: &str) -> Result<&'static str> {
+        match transport {
+            "codex" | "codex_queue" => Ok("codex_queue"),
+            "claude" | "claude_uds" => Ok("claude_uds"),
+            _ => Err(invalid("unsupported orchestrator transport")),
+        }
+    }
+
+    /// Replaces a known alias with its canonical name after validating all ids.
+    pub fn normalize(&mut self) -> Result<()> {
+        self.validate()?;
+        self.transport = self.canonical_transport()?.to_owned();
+        Ok(())
+    }
+
+    /// Validates opaque ids and rejects unsupported delivery transports.
     pub fn validate(&self) -> Result<()> {
-        external_id("transport", &self.transport)?;
+        self.canonical_transport()?;
         external_id("external_session_id", &self.external_session_id)?;
         if let Some(v) = &self.external_turn_id {
             external_id("external_turn_id", v)?;
@@ -205,6 +279,10 @@ impl OrchestratorRef {
         Ok(())
     }
 }
+/// Historical runtime request and provider storage projection for one execution.
+/// Callers validate before admission; canonical paths and normalized optional
+/// labels participate in replay identity. An absent label stays omitted in JSON
+/// to preserve pre-label fingerprints. Requests grant no authority on their own.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartRequest {
@@ -219,6 +297,10 @@ pub struct StartRequest {
     pub fast: bool,
     #[serde(default)]
     pub effort: Option<String>,
+    /// Optional human display label for the agent; normalized in place by
+    /// [`display_name`] during validation so equal labels replay identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     /// The run's whole-run deadline in seconds from admission, at most
     /// [`MAX_TIMEOUT_SECONDS`]; absence takes the configured default.
     #[serde(default)]
@@ -247,26 +329,13 @@ fn unique_constraints<'de, D: serde::Deserializer<'de>>(
     Ok(b)
 }
 impl StartRequest {
+    /// Validates admission inputs and canonicalizes directory paths, the optional
+    /// human label and known orchestrator aliases in place. Task text is nonblank
+    /// and at most 512 KiB; timeout, namespace and request-id bounds use shared
+    /// validators. Unsupported transports and duplicate canonical read roots are
+    /// rejected before durable admission.
     pub fn validate(&mut self) -> Result<()> {
-        for (name, s) in [
-            ("runtime", &self.runtime),
-            ("model", &self.model),
-            ("profile", &self.profile),
-            ("task", &self.task),
-        ] {
-            nonblank(name, s)?;
-        }
-        if self.task.len() > 512 * 1024 {
-            return Err(invalid("task exceeds 512 KiB"));
-        }
-        for (name, s) in [("effort", &self.effort), ("account", &self.account)] {
-            if let Some(s) = s {
-                nonblank(name, s)?;
-            }
-        }
-        if let Some(v) = self.timeout_seconds {
-            timeout_seconds(v)?;
-        }
+        self.validate_intent()?;
         self.workdir = existing_dir(&self.workdir)?;
         self.read_roots = self
             .read_roots
@@ -277,8 +346,41 @@ impl StartRequest {
         if self.read_roots.iter().any(|p| !seen.insert(p.clone())) {
             return Err(invalid("read_roots must not contain duplicates"));
         }
-        if let Some(r) = &self.orchestrator {
-            r.validate()?;
+        Ok(())
+    }
+
+    /// Validates and normalizes immutable request fields without accessing the filesystem.
+    /// Paths must be absolute; only a new admission subsequently requires them to exist.
+    /// This permits an exact durable replay after a workspace has been removed.
+    pub fn validate_intent(&mut self) -> Result<()> {
+        for (name, s) in [
+            ("runtime", &self.runtime),
+            ("model", &self.model),
+            ("profile", &self.profile),
+        ] {
+            nonblank(name, s)?;
+        }
+        task_text(&self.task)?;
+        for (name, s) in [("effort", &self.effort), ("account", &self.account)] {
+            if let Some(s) = s {
+                nonblank(name, s)?;
+            }
+        }
+        if let Some(label) = &self.display_name {
+            self.display_name = Some(display_name(label)?);
+        }
+        if let Some(v) = self.timeout_seconds {
+            timeout_seconds(v)?;
+        }
+        if !self.workdir.is_absolute() || self.read_roots.iter().any(|path| !path.is_absolute()) {
+            return Err(invalid("paths must be absolute"));
+        }
+        let mut seen = BTreeSet::new();
+        if self.read_roots.iter().any(|p| !seen.insert(p.clone())) {
+            return Err(invalid("read_roots must not contain duplicates"));
+        }
+        if let Some(r) = &mut self.orchestrator {
+            r.normalize()?;
         }
         if let Some(r) = &self.request_id {
             external_id("request_id", r)?;
@@ -286,6 +388,18 @@ impl StartRequest {
         Ok(())
     }
 }
+/// The largest accepted task text, in UTF-8 bytes.
+pub const MAX_TASK_BYTES: usize = 512 * 1024;
+
+/// Accepts a nonblank NUL-free task of at most [`MAX_TASK_BYTES`] bytes.
+pub fn task_text(task: &str) -> Result<()> {
+    nonblank("task", task)?;
+    if task.len() > MAX_TASK_BYTES {
+        return Err(invalid("task exceeds 512 KiB"));
+    }
+    Ok(())
+}
+
 /// The largest accepted run timeout: 30 days in seconds.
 ///
 /// The bound keeps `created_at + timeout` and every remaining-time duration
@@ -322,6 +436,7 @@ pub struct Outcome {
     pub failure_text: Option<String>,
     pub runtime_session_id: Option<String>,
 }
+
 impl Outcome {
     pub fn success(session: Option<String>) -> Self {
         Self {
@@ -340,5 +455,39 @@ impl Outcome {
             failure_text: None,
             runtime_session_id: None,
         }
+    }
+}
+
+#[cfg(test)]
+/// Contract checks for supported orchestrator names and validation.
+mod orchestrator_ref_tests {
+    use super::*;
+
+    /// Known user-facing names normalize to the transport used by delivery adapters.
+    #[test]
+    fn known_transport_aliases_normalize() {
+        for (alias, canonical) in [("codex", "codex_queue"), ("claude", "claude_uds")] {
+            let mut reference = OrchestratorRef {
+                transport: alias.into(),
+                external_session_id: "session".into(),
+                external_turn_id: None,
+            };
+            reference.normalize().unwrap();
+            assert_eq!(reference.transport, canonical);
+        }
+    }
+
+    /// Unknown transport names fail with the shared typed validation code.
+    #[test]
+    fn unknown_transport_is_rejected() {
+        let reference = OrchestratorRef {
+            transport: "other".into(),
+            external_session_id: "session".into(),
+            external_turn_id: None,
+        };
+        assert_eq!(
+            reference.validate().unwrap_err().machine_code(),
+            crate::error::MachineCode::ValidationError
+        );
     }
 }

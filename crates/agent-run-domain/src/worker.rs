@@ -2,6 +2,7 @@
 
 use crate::{Error, Result, domain::AgentId};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fmt;
 
 /// Private worker MCP server identity exposed only to launched subagents.
@@ -50,6 +51,37 @@ impl fmt::Display for WorkerMessageKind {
     }
 }
 
+/// Accepts an idempotency key of 1–128 ASCII letters, digits, `_`, `-` or `.`.
+pub(crate) fn request_key(key: &str) -> Result<()> {
+    if key.is_empty()
+        || key.len() > 128
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    {
+        return Err(Error::Validation(
+            "request_id must be 1–128 safe ASCII bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Accepts nonblank text of at most `max` UTF-8 bytes whose only controls are
+/// newline and tab, so relay frames and terminals cannot be inflated or driven.
+pub(crate) fn bounded_text(label: &str, text: &str, max: usize) -> Result<()> {
+    if text.trim().is_empty()
+        || text.len() > max
+        || text
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        return Err(Error::Validation(format!(
+            "{label} must be 1–{max} UTF-8 bytes without unsupported control characters"
+        )));
+    }
+    Ok(())
+}
+
 /// A single worker report with a caller-chosen idempotency key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -66,28 +98,8 @@ pub struct NotifyRequest {
 impl NotifyRequest {
     /// Rejects unsafe keys, blank or oversized bodies, and controls that inflate relay frames.
     pub fn validate(&self) -> Result<()> {
-        if self.request_id.is_empty()
-            || self.request_id.len() > 128
-            || !self
-                .request_id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-        {
-            return Err(Error::Validation(
-                "request_id must be 1–128 safe ASCII bytes".into(),
-            ));
-        }
-        if self.message.trim().is_empty()
-            || self.message.len() > 2048
-            || self
-                .message
-                .chars()
-                .any(|c| c.is_control() && c != '\n' && c != '\t')
-        {
-            return Err(Error::Validation(
-                "message must be 1–2048 UTF-8 bytes without unsupported control characters".into(),
-            ));
-        }
+        request_key(&self.request_id)?;
+        bounded_text("message", &self.message, 2048)?;
         Ok(())
     }
 }
@@ -104,6 +116,68 @@ pub struct WorkerCall {
     pub token: String,
     /// Validated worker report.
     pub input: NotifyRequest,
+}
+
+/// Private broker method routing one named worker tool with hidden credentials.
+pub const TOOL_METHOD: &str = "worker/call";
+
+/// One fixed private worker tool name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerTool {
+    /// Report a material finding to this run's orchestrator.
+    Notify,
+    /// Ordinary informational chat to the pool.
+    PoolPost,
+    /// Bounded read of the pool log and derived status.
+    PoolRead,
+    /// Propose one result snapshot for unanimous agreement.
+    PoolPropose,
+    /// Vote ready, block, or revoke on the current proposal.
+    PoolVote,
+}
+
+impl WorkerTool {
+    /// The stable tool name shared by the fixed catalog and the dispatcher.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Notify => "notify_orchestrator",
+            Self::PoolPost => "pool_post",
+            Self::PoolRead => "pool_read",
+            Self::PoolPropose => "pool_propose",
+            Self::PoolVote => "pool_vote",
+        }
+    }
+
+    /// Decodes exactly one catalog name; anything else is not a worker tool.
+    pub fn parse(name: &str) -> Option<Self> {
+        [
+            (Self::Notify.as_str(), Self::Notify),
+            (Self::PoolPost.as_str(), Self::PoolPost),
+            (Self::PoolRead.as_str(), Self::PoolRead),
+            (Self::PoolPropose.as_str(), Self::PoolPropose),
+            (Self::PoolVote.as_str(), Self::PoolVote),
+        ]
+        .into_iter()
+        .find(|(candidate, _)| *candidate == name)
+        .map(|(_, tool)| tool)
+    }
+}
+
+/// Private broker envelope for one named worker tool; the credentials are the
+/// same hidden capability fields as [`WorkerCall`] and are never echoed back.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerToolCall {
+    /// Exact execution that owns the capability.
+    pub run_id: AgentId,
+    /// Exact active attempt that owns the capability.
+    pub attempt_id: String,
+    /// Ephemeral bearer secret, sent only on the private broker route.
+    pub token: String,
+    /// One fixed catalog tool name.
+    pub tool: String,
+    /// The tool's strict object input, decoded and validated by the broker.
+    pub input: Value,
 }
 
 /// Durable enqueue acknowledgement; duplicate replay retains the same identifier.

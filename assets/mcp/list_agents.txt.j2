@@ -2,8 +2,17 @@ agent-run agents: {{ returned }} of {{ total }} matching (offset {{ offset }})
 
 {% for agent in agents %}
 - {{ agent.id }}: {{ agent.status }}{% if agent.phase %} ({{ agent.phase }}){% endif %} — {{ agent.runtime }}/{{ agent.model }} profile {{ agent.profile }}{{ "" }}
+{% if agent.name %}
+  name: {{ agent.name }}
+{% endif %}
 {% if agent.task %}
   task: {{ agent.task }}
+{% endif %}
+{% if agent.usage %}
+  usage: {{ agent.usage }}{% if agent.usage_lineage %}; {{ agent.usage_lineage }}{% endif %}{{ "" }}
+{% endif %}
+{% if agent.tool_counts %}
+  tools: {{ agent.tool_counts }}
 {% endif %}
 {% if agent.failure_kind %}
   failure: {{ agent.failure_kind }}{% if agent.failure_text %}: {{ agent.failure_text }}{% endif %}{{ "" }}

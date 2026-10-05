@@ -61,6 +61,43 @@ fn evidence(classifier: &str, duration_ms: u64) -> Value {
     })
 }
 
+/// Finishing without a recipient then binding creates exactly one notice;
+/// later binds preserve a failed notice rather than resurrecting it.
+#[test]
+fn stability_terminal_before_binding_creates_notice_once() {
+    let home = common::Home::new();
+    let id = create(&home);
+    let mut store = home.store();
+    store
+        .finish(&id, &Outcome::failure("prepare_failed"), None, None)
+        .unwrap();
+    let reference = OrchestratorRef {
+        transport: "codex_queue".into(),
+        external_session_id: "late".into(),
+        external_turn_id: None,
+    };
+    let count = |store: &agent_run_store::Store| -> i64 {
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM deliveries", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(count(&store), 0);
+    store.bind_orchestrator(&id, &reference, 10.0).unwrap();
+    store.bind_orchestrator(&id, &reference, 11.0).unwrap();
+    assert_eq!(count(&store), 1);
+    store
+        .conn
+        .execute(
+            "UPDATE deliveries SET state='failed',last_error='fixture'",
+            [],
+        )
+        .unwrap();
+    store.bind_orchestrator(&id, &reference, 12.0).unwrap();
+    assert_eq!(count(&store), 1);
+    assert_eq!(store.delivery_status(&id).unwrap()["state"], "failed");
+}
+
 /// Mirrors `tests/test_state_outbox.py::test_terminal_before_binding_activates_once_and_expired_lease_reclaims_once`.
 #[test]
 fn python_test_state_outbox_claim_reclaims_expired_lease_once() {

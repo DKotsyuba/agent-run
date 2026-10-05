@@ -7,7 +7,7 @@
 
 use crate::{Record, Store};
 use agent_run_domain::{Result, domain::AgentId};
-use rusqlite::{Transaction, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::Value;
 
 /// One normalized, nullable run-usage snapshot ready for SQLite insertion.
@@ -106,13 +106,44 @@ fn token_usage(payload: &Value) -> Stats {
     }
 }
 
-/// Subtracts a resumed-thread baseline from its latest cumulative counters.
-fn resumed_token_usage(current: Option<&Value>, baseline: Option<&Value>) -> Stats {
+/// Subtracts comparable cumulative counters for the resumed native `session`.
+/// Missing payloads, foreign thread ids, malformed totals or decreasing counters
+/// leave the whole snapshot unknown. Missing individual metrics remain null;
+/// equal observed counters produce a measured zero. Historical payloads without
+/// thread ids rely on their durable execution attribution. Turns are never inferred.
+fn resumed_token_usage(current: Option<&Value>, baseline: Option<&Value>, session: &str) -> Stats {
     let (Some(current), Some(baseline)) = (current, baseline) else {
         return empty();
     };
+    for payload in [current, baseline] {
+        if payload
+            .get("threadId")
+            .is_some_and(|id| id.as_str() != Some(session))
+            || payload
+                .pointer("/tokenUsage/total")
+                .and_then(Value::as_object)
+                .is_none()
+        {
+            return empty();
+        }
+    }
     let current = token_usage(current);
     let baseline = token_usage(baseline);
+    for (current, baseline) in [
+        (current.input_tokens, baseline.input_tokens),
+        (current.output_tokens, baseline.output_tokens),
+        (current.cache_read_tokens, baseline.cache_read_tokens),
+        (current.cache_write_tokens, baseline.cache_write_tokens),
+        (current.reasoning_tokens, baseline.reasoning_tokens),
+        (current.total_tokens, baseline.total_tokens),
+    ] {
+        if current
+            .zip(baseline)
+            .is_some_and(|(current, baseline)| current < baseline)
+        {
+            return empty();
+        }
+    }
     let subtract = |current: Option<f64>, baseline: Option<f64>| match (current, baseline) {
         (Some(current), Some(baseline)) if current >= baseline => Some(current - baseline),
         _ => None,
@@ -200,8 +231,8 @@ pub(crate) fn record_in_transaction(
     let (runtime, current, baseline) = usage_events(tx, id)?;
     let stats = if let Some(runtime) = runtime.as_ref() {
         runtime_result(runtime)
-    } else if record.resume_of_runtime_session_id.is_some() {
-        resumed_token_usage(current.as_ref(), baseline.as_ref())
+    } else if let Some(session) = record.resume_of_runtime_session_id.as_deref() {
+        resumed_token_usage(current.as_ref(), baseline.as_ref(), session)
     } else {
         current.as_ref().map_or_else(empty, token_usage)
     };
@@ -248,4 +279,70 @@ pub fn backfill(store: &mut Store) -> Result<(usize, usize)> {
         }
     }
     Ok((backfilled, skipped))
+}
+
+impl Store {
+    /// Records the resume usage baseline of one resumed execution, exactly once.
+    ///
+    /// The baseline is the parent execution's last cumulative
+    /// `thread/tokenUsage/updated` payload copied verbatim, so the resumed
+    /// row's terminal normalization can subtract it and report this
+    /// execution's own delta instead of the whole thread's cumulative total.
+    /// Nothing is written unless the parent's usage is applicable: the row
+    /// really continues the parent's native session, both executions name the
+    /// same runtime and model, and the parent's payload has the expected
+    /// shape and, when present, matching thread id. Malformed event JSON is
+    /// ignored. Database/record errors propagate; this writes one durable event
+    /// and no statistics row. An absent or incomparable baseline leaves every measurement
+    /// null with `usage_source` `none`; a zero is never invented.
+    pub fn record_resume_usage_baseline(&mut self, id: &AgentId) -> Result<()> {
+        let row = self.get(id)?;
+        let Some(resume_session) = row.resume_of_runtime_session_id.as_deref() else {
+            return Ok(());
+        };
+        let Some(parent_id) = row.parent_agent_id.as_ref() else {
+            return Ok(());
+        };
+        let parent = self.get(parent_id)?;
+        if parent.runtime_session_id.as_deref() != Some(resume_session)
+            || parent.request.runtime != row.request.runtime
+            || parent.request.model != row.request.model
+        {
+            return Ok(());
+        }
+        let already: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE agent_id=? AND kind='resume_usage_baseline')",
+            [id.as_str()],
+            |row| row.get(0),
+        )?;
+        if already {
+            return Ok(());
+        }
+        let payload: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT data_json FROM events WHERE agent_id=? AND kind='thread/tokenUsage/updated' ORDER BY seq DESC LIMIT 1",
+                [parent_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(payload) = payload else {
+            return Ok(());
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&payload) else {
+            return Ok(());
+        };
+        if value
+            .get("threadId")
+            .is_some_and(|id| id.as_str() != Some(resume_session))
+            || value
+                .pointer("/tokenUsage/total")
+                .and_then(Value::as_object)
+                .is_none()
+        {
+            return Ok(());
+        }
+        self.append_event(id, "resume_usage_baseline", &value, None)?;
+        Ok(())
+    }
 }

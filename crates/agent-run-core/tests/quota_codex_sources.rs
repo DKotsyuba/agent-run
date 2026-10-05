@@ -204,7 +204,7 @@ account = "acct-work"
             .as_array()
             .unwrap()
             .iter()
-            .all(|row| row["status"] == "failed" && row["issues"][0] == "collector_exit_failed")
+            .all(|row| row["status"] == "failed" && row["issues"][0] == "collector_exit_status:5")
     );
     assert_eq!(stored(&home, "acct-native").len(), 2);
     // The durable ledger now suppresses the next round across processes.

@@ -13,12 +13,15 @@ use agent_run_platform::verify::{self, Proof};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 
-/// Commits one terminal result and the completion notice that announces it.
+/// Commits one terminal result and any individual completion notice it needs.
 ///
 /// The answer proof is verified before opening the transaction. Once started,
-/// the state update, attempt close, event append, answer metadata, outbox row,
-/// and aggregate run statistics either commit together or SQLite rolls all of
-/// them back. A pending cancel observed while a successful or timed-out run is
+/// the state update, attempt close, event append, answer metadata, eligible
+/// outbox row, and aggregate run statistics either commit together or SQLite
+/// rolls all of them back. Confirmed legacy cleanup releases ownership in this
+/// transaction; unconfirmed attempts remain owned for recovery. Successful current pool members
+/// omit the individual notice because pool settlement owns the common success
+/// notice. A pending cancel observed while a successful or timed-out run is
 /// being committed wins in this same transaction and receives its terminal
 /// command result. Repeating a completion after a prior terminal commit is a
 /// no-op.
@@ -154,6 +157,14 @@ pub fn finish(
         tx.execute(
             "UPDATE attempts SET ownership_active=0 WHERE id=? AND agent_id=?",
             params![attempt, id.as_str()],
+        )?;
+    } else {
+        // Legacy attempts release only confirmed cleanup, atomically with the terminal row.
+        // Unconfirmed ownership stays active for reconciliation, even after a failed run.
+        tx.execute(
+            "UPDATE attempts SET ownership_active=0 WHERE agent_id=? AND ownership_active=1 \
+             AND phase='cleanup_complete' AND json_extract(cleanup_proof_json,'$.confirmed')=1",
+            [id.as_str()],
         )?;
     }
     tx.commit()?;

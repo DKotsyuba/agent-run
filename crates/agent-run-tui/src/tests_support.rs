@@ -3,6 +3,12 @@
 use agent_run_domain::AgentView;
 use serde_json::json;
 
+/// Pins the truecolor palette so golden rendering tests are independent of
+/// the running environment's `COLORTERM`.
+pub fn force_truecolor() {
+    crate::ui::theme::set_palette(crate::ui::theme::palette_for(Some("truecolor")));
+}
+
 /// Builds one session view from a sparse fixture with valid identities.
 ///
 /// Ids must already be valid stable ids (`ag-YYYYMMDD-HHMMSS-<10 lowercase hex>`).
@@ -65,4 +71,171 @@ pub fn message(seq: i64, role: &str, content: &str) -> agent_run_domain::Message
         "raw_ref": None::<String>,
     }))
     .expect("message fixture parses")
+}
+
+/// Deterministic broker replaying owned responses and exposing exact request
+/// parameters. Exhausted scripts stay pending until the worker is cancelled.
+pub struct FakeBroker {
+    /// Responses consumed once in order; strings become runtime errors.
+    replies: std::sync::Mutex<std::collections::VecDeque<Result<serde_json::Value, String>>>,
+    /// Recorded parameters sent without blocking the request lane.
+    requests: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+}
+
+impl FakeBroker {
+    /// Creates a shared broker and request receiver for worker integration tests.
+    pub fn scripted(
+        replies: Vec<Result<serde_json::Value, String>>,
+    ) -> (
+        crate::net::SharedBroker,
+        tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+    ) {
+        let (requests, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            std::sync::Arc::new(Self {
+                replies: std::sync::Mutex::new(replies.into()),
+                requests,
+            }),
+            rx,
+        )
+    }
+}
+
+impl crate::net::Broker for FakeBroker {
+    /// Records parameters, serves the next response, or waits for cancellation.
+    fn call<'a>(
+        &'a self,
+        _method: &'a str,
+        params: serde_json::Value,
+    ) -> crate::net::BrokerFuture<'a> {
+        Box::pin(async move {
+            self.requests.send(params).expect("test request receiver");
+            let reply = self.replies.lock().expect("script").pop_front();
+            match reply {
+                Some(Ok(value)) => Ok(value),
+                Some(Err(reason)) => Err(agent_run::Error::Runtime(reason)),
+                None => std::future::pending().await,
+            }
+        })
+    }
+}
+
+/// Projects one bounded known-identity block spanning inclusive sequences.
+/// Edge flags default false; tests may set them to model capped pages.
+pub fn block_message(
+    first: i64,
+    last: i64,
+    role: &str,
+    content: &str,
+    raw_ref: &str,
+) -> agent_run_domain::MessageView {
+    agent_run_domain::MessageView {
+        first_seq: Some(first),
+        last_seq: Some(last),
+        partial_before: Some(false),
+        partial_after: Some(false),
+        starts_block: Some(true),
+        raw_ref: Some(raw_ref.to_owned()),
+        content_complete: Some(true),
+        ..message(last, role, content)
+    }
+}
+
+/// Builds a domain block page with directional cursors from sparse messages.
+/// Reverse `previous` is exclusive; `resume` always belongs to forward follow.
+pub fn block_page(
+    messages: Vec<agent_run_domain::MessageView>,
+    before: Option<i64>,
+    previous: Option<i64>,
+    resume: i64,
+    reverse: bool,
+) -> agent_run_domain::TranscriptPage {
+    serde_json::from_value(serde_json::json!({
+        "agent_id": "ag-20260928-101500-aaaaaaaaaa",
+        "messages": messages, "cursor": if reverse { 0 } else { resume },
+        "limit": 200, "view": "blocks",
+        "direction": if reverse { "backward" } else { "forward" },
+        "before_cursor": before, "previous_cursor": previous, "resume_cursor": resume,
+        "next_cursor": null, "complete": !reverse || previous.is_none(),
+    }))
+    .expect("valid block page")
+}
+
+/// Message fixtures of the realistic live transcript the timing probes use:
+/// 500 rounds of one `Read` call, its 16 KiB result paired by `raw_ref`, and
+/// six same-native-message assistant deltas — 4000 messages, about 8 MB
+/// of content. Matching tool names and known text references exercise the
+/// real 0.20 grouping contract; unknown identities must never coalesce.
+///
+/// Returns the JSON messages in sequence order (sequences start at 1) and
+/// the last sequence, so probes can append past it.
+pub fn probe_messages() -> (Vec<serde_json::Value>, i64) {
+    const KIB16: usize = 16 * 1024;
+    let mut messages = Vec::new();
+    let mut seq = 0i64;
+    for round in 0..500 {
+        seq += 1;
+        messages.push(json!({
+            "seq": seq, "at": 100.0 + seq as f64, "role": "tool_call", "name": "Read",
+            "content": "{\"file_path\":\"src/big.rs\"}", "raw_ref": format!("call-{round}"),
+        }));
+        seq += 1;
+        messages.push(json!({
+            "seq": seq, "at": 100.0 + seq as f64, "role": "tool_result", "name": "Read",
+            "content": "x".repeat(KIB16), "raw_ref": format!("call-{round}"),
+        }));
+        for _ in 0..6 {
+            seq += 1;
+            messages.push(json!({
+                "seq": seq, "at": 100.0 + seq as f64, "role": "assistant", "name": null,
+                "content": format!("delta {round} "), "raw_ref": format!("text-{round}"),
+            }));
+        }
+    }
+    (messages, seq)
+}
+
+/// Terminal writer that discards output and counts its bytes into a shared
+/// counter, so a `CrosstermBackend` over it measures exactly what a frame
+/// would write to the tty (cell diffs, style changes, cursor moves).
+#[derive(Debug)]
+pub struct CountingWriter {
+    /// Bytes written; shared with the caller, who may read and reset it.
+    bytes: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl std::io::Write for CountingWriter {
+    /// Counts and accepts the whole buffer; never fails.
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes.set(self.bytes.get() + buf.len());
+        Ok(buf.len())
+    }
+
+    /// Nothing is buffered; always succeeds.
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A fixed-size terminal of `width` × `height` cells over a byte-counting
+/// crossterm backend, plus the shared byte counter; the fixed viewport never
+/// queries a real tty.
+pub fn counting_terminal(
+    width: u16,
+    height: u16,
+) -> (
+    ratatui::Terminal<ratatui::backend::CrosstermBackend<CountingWriter>>,
+    std::rc::Rc<std::cell::Cell<usize>>,
+) {
+    let bytes = std::rc::Rc::new(std::cell::Cell::new(0));
+    let terminal = ratatui::Terminal::with_options(
+        ratatui::backend::CrosstermBackend::new(CountingWriter {
+            bytes: std::rc::Rc::clone(&bytes),
+        }),
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, width, height)),
+        },
+    )
+    .expect("fixed terminal builds");
+    (terminal, bytes)
 }

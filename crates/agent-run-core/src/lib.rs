@@ -61,3 +61,31 @@ pub fn journal(
     }
     Ok(())
 }
+
+/// Stores redacted native tool text in bounded UTF-8 chunks with shared
+/// invocation identity and optional explicit error/provenance. An empty native
+/// tool result still records evidence. The caller owns native interpretation;
+/// storage validates provenance, ownership and spool guards. Errors propagate.
+pub fn journal_with_error(
+    store: &state::Store,
+    id: &domain::AgentId,
+    role: &str,
+    text: &str,
+    name: Option<&str>,
+    raw_ref: Option<&str>,
+    error: Option<(bool, &str)>,
+) -> Result<()> {
+    let mut remaining = text;
+    loop {
+        let mut end = remaining.len().min(16 * 1024);
+        while !remaining.is_char_boundary(end) {
+            end -= 1;
+        }
+        store.message_with_error(id, role, &remaining[..end], name, raw_ref, error)?;
+        remaining = &remaining[end..];
+        if remaining.is_empty() {
+            break;
+        }
+    }
+    Ok(())
+}

@@ -280,3 +280,397 @@ async fn zero_exit_without_terminal_result_is_not_success() {
         .unwrap();
     assert!(!transcript["messages"].as_array().unwrap().is_empty());
 }
+
+/// One `agents --follow` viewer child, killed and reaped on drop even when an
+/// assertion panics, so no viewer outlives its test.
+struct Viewer(Child);
+impl Drop for Viewer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Spawns the real `agent-run agents --follow` binary against `home` and
+/// records its NDJSON snapshots until it exits or a 30 s reader TTL ends.
+fn spawn_follow_viewer(
+    home: &std::path::Path,
+) -> (Viewer, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agent-run"))
+        .arg("--home")
+        .arg(home)
+        .args(["agents", "--follow", "--limit", "5"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("follow viewer starts");
+    let snapshots = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = std::sync::Arc::clone(&snapshots);
+    let stdout = child.stdout.take().expect("viewer stdout");
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        for line in std::io::BufRead::lines(std::io::BufReader::new(stdout)) {
+            if Instant::now() > deadline {
+                break;
+            }
+            let Ok(line) = line else { break };
+            if let Ok(value) = serde_json::from_str(&line) {
+                recorded.lock().unwrap().push(value);
+            }
+        }
+    });
+    (Viewer(child), snapshots)
+}
+
+/// Waits until a recorded snapshot satisfies `predicate`, bounded to 12 s.
+async fn wait_for_snapshot(
+    snapshots: &std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    predicate: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        if let Some(found) = snapshots
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|page| predicate(page))
+            .cloned()
+        {
+            return found;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no matching follow snapshot in {:?}",
+            snapshots.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The real follow binary, driven through the real broker and the fake
+/// engine's marker-controlled lifecycle, proves change delivery: each viewer
+/// first observes the settled baseline, the marker-released tool-count and
+/// terminal changes then arrive on that same viewer, a store event that
+/// changes no displayed fact never re-emits a page, and interrupting a
+/// viewer never cancels the agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_follow_binary_tracks_the_real_lifecycle_without_duplicates() {
+    let mut harness = Harness::new();
+    harness.start_broker().await;
+    let id = harness.submit_cli("fixture:follow-tools");
+
+    // First viewer, started before any marker: its baseline page predates
+    // every change this test releases.
+    let (mut first, seen_first) = spawn_follow_viewer(&harness.home);
+    let baseline = wait_for_snapshot(&seen_first, |page| {
+        page["items"][0]["status"] == "running"
+            && page["items"][0]["tool_counts"]["calls"] == 0
+            && page["items"][0]["tool_counts"]["failed"] == 0
+    })
+    .await;
+    assert_eq!(baseline["items"][0]["agent_id"], id.as_str());
+
+    // Release the tool phase and observe the native-count change arrive.
+    std::fs::write(harness.home.join("follow-tools"), b"").unwrap();
+    let tool_page = wait_for_snapshot(&seen_first, |page| {
+        page["items"][0]["status"] == "running"
+            && page["items"][0]["tool_counts"]["calls"] == 1
+            && page["items"][0]["tool_counts"]["failed"] == 0
+    })
+    .await;
+    assert_eq!(tool_page["items"][0]["tool_counts"]["unknown_results"], 0);
+
+    // A store event that changes no displayed fact must not re-emit a page:
+    // the wake rebuilds the page with fresh observation timestamps only.
+    let settled = {
+        let store = Store::open(&harness.home).unwrap();
+        store
+            .event(&id, "fixture_follow_probe", &serde_json::json!({}))
+            .unwrap();
+        seen_first.lock().unwrap().len()
+    };
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        seen_first.lock().unwrap().len(),
+        settled,
+        "an unchanged page was re-emitted after the probe event"
+    );
+
+    // Interrupting the viewer leaves the supervised agent running.
+    // SAFETY: the signal targets only the owned viewer child process.
+    unsafe {
+        libc::kill(first.0.id() as libc::pid_t, libc::SIGINT);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !matches!(first.0.try_wait(), Ok(Some(_))) {
+        assert!(Instant::now() < deadline, "viewer ignored SIGINT");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        Store::open(&harness.home).unwrap().get(&id).unwrap().status,
+        Status::Running,
+        "the viewer never cancels the agent"
+    );
+
+    // Second viewer, also started before its marker: its baseline is the
+    // settled tool state, and only then is the terminal change released.
+    let (mut second, seen_second) = spawn_follow_viewer(&harness.home);
+    let running = wait_for_snapshot(&seen_second, |page| {
+        page["items"][0]["status"] == "running"
+            && page["items"][0]["tool_counts"]["calls"] == 1
+            && page["items"][0]["tool_counts"]["failed"] == 0
+    })
+    .await;
+    assert_eq!(running["items"][0]["agent_id"], id.as_str());
+    std::fs::write(harness.home.join("follow-release"), b"").unwrap();
+    let terminal_page = wait_for_snapshot(&seen_second, |page| {
+        page["items"][0]["status"] == "succeeded" && page["items"][0]["answer_available"] == true
+    })
+    .await;
+    assert_eq!(terminal_page["items"][0]["agent_id"], id.as_str());
+    // SAFETY: the signal targets only the owned viewer child process.
+    unsafe {
+        libc::kill(second.0.id() as libc::pid_t, libc::SIGINT);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !matches!(second.0.try_wait(), Ok(Some(_))) {
+        assert!(Instant::now() < deadline, "second viewer ignored SIGINT");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let answer = harness.terminal(&id).await;
+    assert_eq!(answer["content"], "fixture final answer\n");
+}
+
+/// A finite real-broker pool run accepts the `codex` alias, persists its
+/// canonical transport, and delivers exactly one common notice through the
+/// bound fake Desktop relay after both private-catalog members finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scripted_pool_completes_with_one_correlated_common_notice() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut h = Harness::new();
+    h.start_broker().await;
+    let listener = tokio::net::UnixListener::bind(h.home.join("ar-cdx-v4-pool.sock")).unwrap();
+    // Successful members use the pool's common notice; the finite relay records
+    // that notice and any unrelated delivery frames. The task is aborted by the
+    // guard on every exit path.
+    struct Relay(tokio::task::JoinHandle<()>);
+    impl Drop for Relay {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let sink = received.clone();
+    let probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let probe_count = probes.clone();
+    let relay = Relay(tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // The broker's own filesystem housekeeping probes every relay
+            // socket at the home root with a bare connect-and-close
+            // (`housekeeping::probe_socket`, reclaiming only refused sockets).
+            // That is legitimate: count it and keep serving, never die on it.
+            let Ok(length) = stream.read_u32_le().await else {
+                probe_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                continue;
+            };
+            // Same frame bound as the real relay; anything else is dropped.
+            if length == 0 || length > 8192 {
+                continue;
+            }
+            let mut data = vec![0; length as usize];
+            if stream.read_exact(&mut data).await.is_err() {
+                continue;
+            }
+            let Ok(frame) = serde_json::from_slice::<Value>(&data) else {
+                continue;
+            };
+            sink.lock().unwrap().push(frame);
+            let reply = br#"{"outcome":"accepted"}"#;
+            if stream.write_u32_le(reply.len() as u32).await.is_ok() {
+                let _ = stream.write_all(reply).await;
+            }
+        }
+    }));
+    // Deterministic regression: one owned empty connection before any real
+    // notice. A relay that unwraps the missing frame dies here, the counter
+    // never moves, and this wait fails instead of the run losing every notice.
+    drop(
+        tokio::net::UnixStream::connect(h.home.join("ar-cdx-v4-pool.sock"))
+            .await
+            .unwrap(),
+    );
+    let probe_deadline = Instant::now() + Duration::from_secs(5);
+    while probes.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+        assert!(
+            Instant::now() < probe_deadline && !relay.0.is_finished(),
+            "the fake relay did not survive a connect-and-close liveness probe"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let member = |role: &str, task: &str| {
+        json!({"role": role, "start": {
+            "provider":"mock","model":"fixture","profile":"review","task":task,
+            "workdir":h.home,"timeout_seconds":40}})
+    };
+    let pool_start = json!({
+        "request_id": "scripted-pool", "goal": "ship the fixture result",
+        "orchestrator": {"transport":"codex","external_session_id":"fixture-pool-thread"},
+        "members": [member("lead","fixture:pool-script lead"), member("peer","fixture:pool-script peer")]
+    });
+    let before: (i64, i64) = Store::open(&h.home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM agents),(SELECT COUNT(*) FROM pools)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut unsupported = pool_start.clone();
+    unsupported["orchestrator"]["transport"] = json!("other");
+    let error = socket::client(&h.home, "start_pool", unsupported)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.machine_code(),
+        agent_run_domain::error::MachineCode::ValidationError
+    );
+    let after: (i64, i64) = Store::open(&h.home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM agents),(SELECT COUNT(*) FROM pools)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "unknown transport is rejected before admission"
+    );
+    let started = socket::client(&h.home, "start_pool", pool_start.clone())
+        .await
+        .unwrap();
+    assert_eq!(started["bound"], true);
+    let stored_transport: String = Store::open(&h.home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT transport FROM orchestrator_sessions WHERE external_session_id=?",
+            ["fixture-pool-thread"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_transport, "codex_queue");
+    let pool_id = started["pool_id"].as_str().unwrap().to_owned();
+    // Model a 0.20.2 row: replay namespace, fingerprint, and session retain
+    // the raw alias. A canonical retry must find that exact request unchanged.
+    let mut historical: agent_run_domain::pool::PoolStartRequest =
+        serde_json::from_value(pool_start.clone()).unwrap();
+    historical.validate().unwrap();
+    let mut historical_value = serde_json::to_value(&historical).unwrap();
+    historical_value["orchestrator"]["transport"] = json!("codex");
+    let old_namespace =
+        agent_run_domain::canonical::sha256_hex(&json!(["codex", "fixture-pool-thread"]), true);
+    let old_sha = agent_run_domain::canonical::sha256_hex(&historical_value, true);
+    Store::open(&h.home)
+        .unwrap()
+        .conn
+        .execute(
+            "UPDATE pools SET request_namespace=?,request_sha256=? WHERE id=?",
+            rusqlite::params![old_namespace, old_sha, pool_id],
+        )
+        .unwrap();
+    let mut canonical_retry = pool_start;
+    canonical_retry["orchestrator"]["transport"] = json!("codex_queue");
+    let replay = socket::client(&h.home, "start_pool", canonical_retry)
+        .await
+        .unwrap();
+    assert_eq!(replay["created"], false);
+    assert_eq!(replay["pool_id"], pool_id);
+    let ids: Vec<AgentId> = started["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| serde_json::from_value(m["agent_id"].clone()).unwrap())
+        .collect();
+    for id in &ids {
+        let answer = h.terminal(id).await;
+        let row = Store::open(&h.home).unwrap().get(id).unwrap();
+        assert_eq!(
+            answer["status"], "succeeded",
+            "{:?} {:?}",
+            row.failure_kind, row.failure_text
+        );
+    }
+    // No successful member notices and exactly one common notice, acknowledged.
+    let relay_deadline = Instant::now() + Duration::from_secs(30);
+    let request = loop {
+        let seen = received.lock().unwrap().clone();
+        let pool_notices: Vec<_> = seen
+            .iter()
+            .filter(|r| r["op"] == "pool_completion")
+            .collect();
+        let member_notices = seen.iter().filter(|r| r["op"] == "completion").count();
+        if pool_notices.len() == 1 && member_notices == 0 {
+            break pool_notices[0].clone();
+        }
+        assert!(
+            pool_notices.len() <= 1 && member_notices == 0 && Instant::now() < relay_deadline,
+            "relay saw {} pool and {member_notices} successful member notices",
+            pool_notices.len()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(request["op"], "pool_completion");
+    assert_eq!(request["pool_id"], pool_id.as_str());
+    let message = request["message"].as_str().unwrap();
+    assert!(message.contains("commit abc123") && message.contains("ship the fixture result"));
+    assert!(request.get("agent_id").is_none() && request.get("run_id").is_none());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let store = loop {
+        let store = Store::open(&h.home).unwrap();
+        let state: String = store
+            .conn
+            .query_row(
+                "SELECT d.state FROM pools p JOIN deliveries d ON d.id=p.completion_delivery_id",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
+        if state == "delivered" {
+            break store;
+        }
+        assert!(Instant::now() < deadline, "notice not delivered: {state}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let count = |sql: &str| -> i64 { store.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+    assert_eq!(
+        count("SELECT COUNT(*) FROM events WHERE kind='pool_completed'"),
+        1
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM pools WHERE state='completed'"),
+        1
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM deliveries d JOIN events e ON e.seq=d.terminal_event_seq WHERE e.kind='status' AND e.to_status='succeeded'"),
+        0,
+        "successful pool members must not queue individual completion notices"
+    );
+    // The closed pool reads frozen and refuses further operator writes.
+    let page = socket::client(&h.home, "pool", json!({"pool_id": pool_id}))
+        .await
+        .unwrap();
+    assert_eq!(page["status"]["state"], "completed");
+    assert!(socket::client(
+        &h.home,
+        "pool_post",
+        json!({"pool_id": pool_id, "request_id": "late", "message": "too late"})
+    )
+    .await
+    .is_err());
+}

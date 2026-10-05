@@ -144,7 +144,7 @@ fn dry_run_is_read_only_and_reports_both_size_bases() {
     let before_db = stdfs::read(fixture.path.join("state.db")).expect("database");
     let before_tree = tree_digest(&fixture.path);
     let status = storage_admin::status(&fixture.path).expect("status");
-    assert_eq!(status["state_schema_version"], 22);
+    assert_eq!(status["state_schema_version"], agent_run::state::VERSION);
     assert_eq!(status["homes"]["entries"].as_array().map(Vec::len), Some(1));
     let entry = &status["homes"]["entries"][0];
     assert_eq!(entry["state"], "eligible");

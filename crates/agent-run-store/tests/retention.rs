@@ -1248,3 +1248,222 @@ fn count_retirement_is_proved_by_a_fresh_row_not_id_timestamps() {
     );
     integrity(&store);
 }
+
+/// Inserts one open pool whose current members are `members` (slot order) with
+/// one operator entry, and returns its identity.
+fn pool(store: &Store, members: &[&AgentId]) -> String {
+    let id = "pool-20200101-000000-0123456789".to_owned();
+    store
+        .conn
+        .execute(
+            "INSERT INTO pools(id,request_namespace,request_id,request_sha256,goal,acceptance_json,state,roster_revision,created_at) \
+             VALUES(?,'ns','r',lower(hex(zeroblob(32))),'goal','[]','open',1,1.0)",
+            [&id],
+        )
+        .unwrap();
+    for (slot, member) in members.iter().enumerate() {
+        store
+            .conn
+            .execute(
+                "INSERT INTO pool_members(agent_id,pool_id,slot,name,role,personal_task,joined_roster_revision) VALUES(?,?,?,?,'r','t',1)",
+                params![member.as_str(), id, slot + 1, format!("m{slot}")],
+            )
+            .unwrap();
+    }
+    store
+        .conn
+        .execute(
+            "INSERT INTO pool_entries(pool_id,author_kind,direction,kind,roster_revision,body,idem_scope,request_id,created_at) VALUES(?,'operator','team','message',1,'hi','op','k',1.0)",
+            [&id],
+        )
+        .unwrap();
+    id
+}
+
+/// A workflow-protected member keeps the pool log and roster until its dependency expires.
+#[test]
+fn stability_pool_history_follows_member_workflow_protection() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let old = NOW - HISTORY_SECONDS - 1.0;
+    let id = agent(&home, &mut store, "failed", Some(old));
+    pool(&store, &[&id]);
+    store.conn.execute("INSERT INTO workflow_runs(id,name,script_sha,status,created_at,finished_at) VALUES('workflow','fixture','x','running',0,?)", [old]).unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO workflow_steps VALUES('workflow','step','{}',?,'failed',NULL,NULL,NULL)",
+            [id.as_str()],
+        )
+        .unwrap();
+    assert_eq!(drain(&mut store, 8), 0);
+    assert_eq!(count(&store, "pool_entries"), 1);
+    store
+        .conn
+        .execute("UPDATE workflow_runs SET status='failed'", [])
+        .unwrap();
+    assert!(drain(&mut store, 8) > 0);
+    assert_eq!(count(&store, "pools"), 0);
+    integrity(&store);
+}
+
+/// Every member lineage of a pool, replaced members included, stays stored
+/// while any member is not expired; once all are, the pool log, roster and
+/// pool rows go before the agents and every foreign key still resolves.
+#[test]
+fn pool_members_are_protected_until_the_whole_pool_expires_then_purged_first() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let cutoff = NOW - HISTORY_SECONDS;
+    let old = agent(&home, &mut store, "succeeded", Some(cutoff - 1.0));
+    let replaced = agent(&home, &mut store, "failed", Some(cutoff - 1.0));
+    let recent = agent(&home, &mut store, "succeeded", Some(NOW));
+    let pool_id = pool(&store, &[&old, &replaced]);
+    // `replaced` is retired in favour of `recent`: history keeps its row.
+    store
+        .conn
+        .execute(
+            "INSERT INTO pool_members(agent_id,pool_id,slot,name,role,personal_task,joined_roster_revision) VALUES(?,?,3,'m9','r','t',2)",
+            params![recent.as_str(), pool_id],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE pool_members SET replaced_by=? WHERE agent_id=?",
+            params![recent.as_str(), replaced.as_str()],
+        )
+        .unwrap();
+    assert_eq!(drain(&mut store, 8), 0, "nothing is releasable yet");
+    for id in [&old, &replaced, &recent] {
+        assert!(store.get(id).is_ok(), "must retain {id}");
+    }
+    assert_eq!(count(&store, "pool_entries"), 1);
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET finished_at=? WHERE id=?",
+            params![cutoff - 1.0, recent.as_str()],
+        )
+        .unwrap();
+    assert!(drain(&mut store, 8) > 0);
+    for table in ["pools", "pool_members", "pool_entries"] {
+        assert_eq!(count(&store, table), 0, "{table}");
+    }
+    for id in [&old, &replaced, &recent] {
+        assert!(store.get(id).is_err(), "expired agent {id} must be gone");
+    }
+    integrity(&store);
+}
+
+/// A queued linked notice or an owned or uncleaned attempt keeps the pool;
+/// once final and clean the pool is released.
+#[test]
+fn pool_with_pending_notice_or_unknown_cleanup_is_kept() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let cutoff = NOW - HISTORY_SECONDS;
+    let first = agent(&home, &mut store, "succeeded", Some(cutoff - 1.0));
+    let second = agent(&home, &mut store, "succeeded", Some(cutoff - 1.0));
+    pool(&store, &[&first, &second]);
+    store
+        .conn
+        .execute(
+            "INSERT INTO deliveries(id,agent_id,state,next_attempt_at) VALUES('ntf_pending',?,'pending',1.0)",
+            [first.as_str()],
+        )
+        .unwrap();
+    let attempt = store
+        .create_attempt(&second, "succeeded", &json!({}))
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE attempts SET ownership_active=0,phase='running',cleanup_proof_json=NULL WHERE id=?",
+            [&attempt],
+        )
+        .unwrap();
+    assert_eq!(drain(&mut store, 8), 0);
+    assert_eq!(count(&store, "pools"), 1);
+    store
+        .conn
+        .execute("UPDATE deliveries SET state='retry_wait'", [])
+        .unwrap();
+    assert_eq!(drain(&mut store, 8), 0, "retry_wait still protects");
+    store
+        .conn
+        .execute("UPDATE deliveries SET state='delivered'", [])
+        .unwrap();
+    assert_eq!(drain(&mut store, 8), 0, "unknown cleanup still protects");
+    store
+        .conn
+        .execute(
+            "UPDATE attempts SET phase='cleanup_complete',cleanup_proof_json='{}' WHERE id=?",
+            [&attempt],
+        )
+        .unwrap();
+    assert!(drain(&mut store, 8) > 0);
+    assert_eq!(count(&store, "pools"), 0);
+    integrity(&store);
+}
+
+/// A completed but never bound pool's waiting common notice is expired
+/// explicitly once the whole pool has aged out, then purged cleanly.
+#[test]
+fn unbound_waiting_completion_notice_expires_with_the_aged_out_pool() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let cutoff = NOW - HISTORY_SECONDS;
+    let first = agent(&home, &mut store, "succeeded", Some(cutoff - 1.0));
+    let second = agent(&home, &mut store, "succeeded", Some(cutoff - 1.0));
+    let pool_id = pool(&store, &[&first, &second]);
+    store
+        .conn
+        .execute(
+            "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?,1.0,'pool_completed','{}')",
+            [first.as_str()],
+        )
+        .unwrap();
+    let event = store.conn.last_insert_rowid();
+    store
+        .conn
+        .execute(
+            "INSERT INTO deliveries(id,agent_id,terminal_event_seq,state) VALUES('ntf_wait',?,?,'waiting_binding')",
+            params![first.as_str(), event],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE pools SET state='completed',completed_at=2.0,completion_delivery_id='ntf_wait' WHERE id=?",
+            [&pool_id],
+        )
+        .unwrap();
+    assert!(drain(&mut store, 8) > 0);
+    for table in ["pools", "pool_members", "pool_entries", "deliveries"] {
+        assert_eq!(count(&store, table), 0, "{table}");
+    }
+    integrity(&store);
+}
+
+/// Protected pool members alone never make a pass take the writer lock: the
+/// read-only preflight proves there is nothing to do.
+#[test]
+fn protected_only_pools_do_not_wake_the_writer() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let cutoff = NOW - HISTORY_SECONDS;
+    let old = agent(&home, &mut store, "succeeded", Some(cutoff - 1.0));
+    let recent = agent(&home, &mut store, "succeeded", Some(NOW));
+    pool(&store, &[&old, &recent]);
+    // Another connection holds the writer lock: a pass that tried to write
+    // would fail with contention, while a preflight-clean pass returns Ok(0).
+    let holder = home.store();
+    holder.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    store
+        .conn
+        .busy_timeout(std::time::Duration::from_millis(0))
+        .unwrap();
+    assert_eq!(store.prune_history(NOW).unwrap(), 0);
+    holder.conn.execute_batch("ROLLBACK").unwrap();
+}

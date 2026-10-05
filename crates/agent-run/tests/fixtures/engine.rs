@@ -2,7 +2,7 @@
 //! Only explicit fixture-mode keywords change deterministic test behavior.
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 fn emit(value: Value) {
     println!("{value}");
     io::stdout().flush().expect("fixture stdout");
@@ -42,8 +42,9 @@ fn worker_report(args: &[String]) {
             frame::write(&mut input,&json!({"jsonrpc":"2.0","method":"notifications/initialized"}),socket::MAX_FRAME).await.unwrap();
             frame::write(&mut input,&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),socket::MAX_FRAME).await.unwrap();
             let roster: Value=serde_json::from_slice(&frame::read(&mut output,socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
-            assert_eq!(roster["result"]["tools"].as_array().unwrap().len(),1);
-            assert_eq!(roster["result"]["tools"][0]["name"],"notify_orchestrator");
+            let mut names: Vec<&str>=roster["result"]["tools"].as_array().unwrap().iter().map(|tool|tool["name"].as_str().unwrap()).collect();
+            names.sort_unstable();
+            assert_eq!(names,["notify_orchestrator","pool_post","pool_propose","pool_read","pool_vote"]);
             frame::write(&mut input,&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"notify_orchestrator","arguments":{"request_id":"fixture-report","kind":"risk","message":"Fixture material finding"}}}),socket::MAX_FRAME).await.unwrap();
             let reply: Value=serde_json::from_slice(&frame::read(&mut output,socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
             assert_ne!(reply["result"]["isError"],true,"{reply}");
@@ -54,6 +55,95 @@ fn worker_report(args: &[String]) {
         }).await.expect("bounded worker MCP fixture");
     });
 }
+/// Scripted pool member over the real private worker MCP boundary: confirms the
+/// five-tool catalog, reads the pool log, the lead proposes, every member votes
+/// ready on the current proposal, and the child then exits. Bounded to twenty
+/// seconds so a lost peer still ends this child finitely.
+fn pool_script(args: &[String], lead: bool) {
+    let config: Value = serde_json::from_str(
+        &std::fs::read_to_string(argument(args, "--mcp-config").expect("worker config path"))
+            .unwrap(),
+    )
+    .unwrap();
+    let server = &config["mcpServers"]["agent_run_worker"];
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        use agent_run::transport::{frame, socket};
+        use std::process::Stdio;
+        use tokio::io::BufReader;
+        let mut child = tokio::process::Command::new(server["command"].as_str().unwrap())
+            .args(server["args"].as_array().unwrap().iter().map(|arg| arg.as_str().unwrap()))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut next_id = 0u64;
+            let mut request = |method: &str, params: Value| {
+                next_id += 1;
+                json!({"jsonrpc":"2.0","id":next_id,"method":method,"params":params})
+            };
+            frame::write(&mut input, &request("initialize", json!({"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"pool-fixture","version":"1"}})), socket::MAX_FRAME).await.unwrap();
+            frame::read(&mut output, socket::MAX_FRAME).await.unwrap().unwrap();
+            frame::write(&mut input, &json!({"jsonrpc":"2.0","method":"notifications/initialized"}), socket::MAX_FRAME).await.unwrap();
+            frame::write(&mut input, &request("tools/list", json!({})), socket::MAX_FRAME).await.unwrap();
+            let roster: Value = serde_json::from_slice(&frame::read(&mut output, socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
+            let mut names: Vec<_> = roster["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_owned()).collect();
+            names.sort();
+            assert_eq!(names, ["notify_orchestrator", "pool_post", "pool_propose", "pool_read", "pool_vote"]);
+            let mut call = |name: &str, arguments: Value| {
+                request("tools/call", json!({"name":name,"arguments":arguments}))
+            };
+            let (mut proposed, mut voted) = (false, false);
+            let mut transcript = String::new();
+            while !voted {
+                frame::write(&mut input, &call("pool_read", json!({"after_seq":0,"limit":50,"wait_seconds":1})), socket::MAX_FRAME).await.unwrap();
+                let reply: Value = serde_json::from_slice(&frame::read(&mut output, socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
+                let text = reply["result"]["content"][0]["text"].as_str().unwrap_or_default().to_owned();
+                transcript.push_str(&text);
+                let proposal = text.split("Current proposal #").nth(1).and_then(|rest| {
+                    rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u64>().ok()
+                });
+                match proposal {
+                    None if lead && !proposed => {
+                        frame::write(&mut input, &call("pool_propose", json!({"request_id":"fixture-proposal","message":"fixture result is ready","snapshot":"commit abc123"})), socket::MAX_FRAME).await.unwrap();
+                        let reply: Value = serde_json::from_slice(&frame::read(&mut output, socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
+                        assert_ne!(reply["result"]["isError"], true, "{reply}");
+                        proposed = true;
+                    }
+                    Some(seq) => {
+                        frame::write(&mut input, &call("pool_vote", json!({"request_id":"fixture-vote","proposal_seq":seq,"decision":"ready","checks":[{"criterion_id":"goal","status":"met","evidence":"fixture verified"}]})), socket::MAX_FRAME).await.unwrap();
+                        let reply: Value = serde_json::from_slice(&frame::read(&mut output, socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
+                        assert_ne!(reply["result"]["isError"], true, "{reply}");
+                        voted = true;
+                    }
+                    None => {}
+                }
+            }
+            std::fs::write(if lead { "pool-script-lead.txt" } else { "pool-script-peer.txt" }, transcript).unwrap();
+            drop(input);
+            assert!(child.wait().await.unwrap().success());
+        })
+        .await
+        .expect("bounded pool member fixture");
+    });
+}
+/// Blocks until the marker file exists in the current workdir, bounded to
+/// twenty seconds so a lost test driver still ends this child finitely.
+fn wait_marker(name: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !std::path::Path::new(name).exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Runs one offline native-protocol scenario selected only by fixture task text.
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -94,6 +184,11 @@ fn main() {
             .unwrap_or("")
             .to_owned()
     };
+    // Pool fixtures record the exact first-turn text this child received, as
+    // proof that every peer identity was already committed when it started.
+    if task.contains("fixture:pool-observe") {
+        std::fs::write("pool-observed.txt", &task).expect("fixture pool record");
+    }
     if task == "fixture:slow-start" {
         std::thread::sleep(Duration::from_secs(2));
     }
@@ -186,13 +281,33 @@ fn main() {
             .expect("fixture workdir")
             .join("escaped.pid");
         std::fs::write(marker, child.id().to_string()).expect("fixture escaped pid");
-        std::thread::sleep(Duration::from_millis(500));
+        // Capture handshake. The supervisor records a descendant only from a
+        // refresh made while this leader lives, and refreshes at the top of each
+        // stdout read once 200 ms have passed since the last one. After this
+        // pause any earlier refresh is stale, so the read that returns frame
+        // `ready` (which begins only after frame `warmup` was processed) must
+        // refresh with the helper present. The leader then stays alive until the
+        // owning test has seen `ready` journaled and releases it, bounded to
+        // twenty seconds so a lost driver still ends this child finitely.
+        std::thread::sleep(Duration::from_millis(250));
+        for text in [
+            "fixture escaped warmup\n",
+            "fixture escaped capture ready\n",
+        ] {
+            emit(
+                json!({"type":"assistant","session_id":session,"message":{"content":[{"type":"text","text":text}]}}),
+            );
+        }
+        wait_marker("escaped-release");
     }
     if task == "fixture:missing-result" {
         return;
     }
     if task == "fixture:slow" {
         std::thread::sleep(Duration::from_secs(3));
+    }
+    if task.contains("fixture:pool-script") {
+        pool_script(&args, task.contains("fixture:pool-script lead"));
     }
     if task == "fixture:worker-notify" {
         worker_report(&args);
@@ -202,6 +317,23 @@ fn main() {
         {
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+    if task == "fixture:follow-tools" {
+        // Phase one waits for the driver's marker, then one native tool
+        // invocation is streamed so a follow viewer observes a tool-count
+        // change; phase two waits for the release marker before the turn's
+        // normal completion path runs.
+        wait_marker("follow-tools");
+        emit(
+            json!({"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_1","name":"shell"}}}),
+        );
+        emit(
+            json!({"type":"assistant","session_id":session,"message":{"id":"msg_one","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"shell","input":{"cmd":"ls"}}]}}),
+        );
+        emit(
+            json!({"type":"user","session_id":session,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":false,"content":"file.txt"}]}}),
+        );
+        wait_marker("follow-release");
     }
     native_history(&session, &task);
     // A Claude Code 2.1.280 protocol frame rejecting a usage window, and the
@@ -240,6 +372,16 @@ fn main() {
     emit(
         json!({"type":"result","subtype":if failed{"error_during_execution"}else{"success"},"is_error":failed,"session_id":session,"result":if failed{"fixture failure"}else{"fixture final answer\n"},"usage":{"input_tokens":2,"output_tokens":3},"num_turns":1}),
     );
+    if task == "fixture:result-then-hang" {
+        // A complete, valid success result followed by a root process that keeps
+        // its stdout open and never exits on its own accord: only the run
+        // deadline's cleanup should end it. The twenty second ceiling is a
+        // safety net so a failed cleanup still ends this child finitely.
+        let ceiling = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < ceiling {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
     if task == "fixture:nonzero-after-result" {
         io::stdout().flush().expect("fixture stdout");
         std::process::exit(3);
@@ -354,7 +496,10 @@ fn native_history(session: &str, task: &str) {
 /// user input is recorded (meta-only history), and with `rewrite` the whole
 /// rollout is replaced by a structurally valid meta-only file before that
 /// failure (earlier turns vanish). Otherwise it completes with an agent
-/// message naming the thread.
+/// message naming the thread. The task marker `fixture:usage` also emits native
+/// cumulative token counters scaled by the number of recorded user turns;
+/// resumed processes therefore preserve the thread total without claiming a
+/// native turn counter.
 fn app_server() {
     let home = std::path::PathBuf::from(std::env::var_os("CODEX_HOME").expect("CODEX_HOME"));
     let exhausted = std::fs::read_to_string(home.join("auth.json"))
@@ -473,6 +618,24 @@ fn app_server() {
                         &rollout,
                         &json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":text}}),
                     );
+                    if input.contains("fixture:usage") {
+                        let history = std::fs::read_to_string(&rollout).expect("usage rollout");
+                        let observed = history
+                            .lines()
+                            .filter(|line| {
+                                serde_json::from_str::<Value>(line)
+                                    .ok()
+                                    .is_some_and(|entry| entry["payload"]["role"] == "user")
+                            })
+                            .count() as u64;
+                        emit(json!({"method":"thread/tokenUsage/updated","params":{
+                            "threadId":thread,"tokenUsage":{"total":{
+                                "inputTokens":100 * observed,"outputTokens":20 * observed,
+                                "cachedInputTokens":10 * observed,"reasoningOutputTokens":5 * observed,
+                                "totalTokens":120 * observed
+                            }}
+                        }}));
+                    }
                     emit(
                         json!({"method":"turn/completed","params":{"threadId":thread,"turn":{"id":turn,"status":"completed","items":[{"type":"agentMessage","id":format!("msg-{turns}"),"text":text}]}}}),
                     );

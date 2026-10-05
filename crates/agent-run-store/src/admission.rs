@@ -15,41 +15,39 @@ use agent_run_platform::process;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 
-/// Return the recorded request-id replay in its orchestrator namespace.
+/// Return the recorded request-id replay in its canonical or exact legacy namespace.
 ///
-/// This read deliberately has no mutable-config dependency, letting the
-/// service return an already admitted request after configuration was edited or
-/// made invalid. Concurrent first submissions are resolved again inside
-/// [`Store::admit`]'s immediate transaction.
+/// This read does not alter historical rows or load mutable configuration.
 pub fn replay_request(store: &Store, request: &StartRequest) -> Result<Option<Record>> {
     let Some(request_id) = request.request_id.as_deref() else {
         return Ok(None);
     };
-    let transport = request
-        .orchestrator
-        .as_ref()
-        .map(|item| item.transport.as_str());
-    let session = request
-        .orchestrator
-        .as_ref()
-        .map(|item| item.external_session_id.as_str());
-    let sql = if request.orchestrator.is_none() {
-        "SELECT a.* FROM agents a WHERE a.request_id=? AND (a.orchestrator_session_id IS NULL OR json_extract(a.request_json,'$.orchestrator') IS NULL) ORDER BY a.created_at LIMIT 1"
-    } else {
-        "SELECT a.* FROM agents a LEFT JOIN orchestrator_sessions o ON o.id=a.orchestrator_session_id WHERE a.request_id=? AND o.transport=? AND o.external_session_id=? ORDER BY a.created_at LIMIT 1"
-    };
-    let row = if request.orchestrator.is_none() {
-        store
+    let Some(reference) = &request.orchestrator else {
+        return Ok(store
             .conn
-            .query_row(sql, params![request_id], Record::read)
-            .optional()?
-    } else {
-        store
-            .conn
-            .query_row(sql, params![request_id, transport, session], Record::read)
-            .optional()?
+            .query_row(
+                "SELECT a.* FROM agents a WHERE a.request_id=? AND (a.orchestrator_session_id IS NULL OR json_extract(a.request_json,'$.orchestrator') IS NULL) ORDER BY a.created_at LIMIT 1",
+                [request_id],
+                Record::read,
+            )
+            .optional()?);
     };
-    Ok(row)
+    let transport = reference.canonical_transport()?;
+    let legacy = match transport {
+        "codex_queue" => "codex",
+        "claude_uds" => "claude",
+        _ => unreachable!(),
+    };
+    Ok(store
+        .conn
+        .query_row(
+            "SELECT a.* FROM agents a LEFT JOIN orchestrator_sessions o ON o.id=a.orchestrator_session_id \
+             WHERE a.request_id=? AND o.transport IN (?,?) AND o.external_session_id=? \
+             ORDER BY (o.transport=?) DESC,a.created_at LIMIT 1",
+            params![request_id, transport, legacy, reference.external_session_id, transport],
+            Record::read,
+        )
+        .optional()?)
 }
 
 /// Atomically create one `starting` agent or return its exact request replay.
@@ -160,7 +158,7 @@ pub fn admit_with_config_revision(
     let resume_session = lineage
         .as_ref()
         .map(|lineage| lineage.runtime_session_id.as_str());
-    let inserted = tx.execute("INSERT INTO agents(id,request_id,orchestrator_session_id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,parent_agent_id,root_agent_id,sequence,resume_of_runtime_session_id,identity_json) VALUES(?,?,?,?,?,?,?,?,?,?,'starting',?,?,?,?,?,?,?,?)", params![id.as_str(), checked.request_id, session, checked.runtime, checked.model, checked.profile, checked.task, summary, checked.workdir.to_string_lossy(), serde_json::to_string(&checked)?, accepted_at, checked.timeout_seconds.unwrap_or_else(|| config.core.effective_default_timeout_seconds()), config_revision, parent.map(|record| record.id.as_str()), root, sequence, resume_session, serde_json::to_string(&identity)?]);
+    let inserted = tx.execute("INSERT INTO agents(id,request_id,orchestrator_session_id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,parent_agent_id,root_agent_id,sequence,resume_of_runtime_session_id,identity_json,display_name) VALUES(?,?,?,?,?,?,?,?,?,?,'starting',?,?,?,?,?,?,?,?,?)", params![id.as_str(), checked.request_id, session, checked.runtime, checked.model, checked.profile, checked.task, summary, checked.workdir.to_string_lossy(), serde_json::to_string(&checked)?, accepted_at, checked.timeout_seconds.unwrap_or_else(|| config.core.effective_default_timeout_seconds()), config_revision, parent.map(|record| record.id.as_str()), root, sequence, resume_session, serde_json::to_string(&identity)?, checked.display_name]);
     if let Err(error) = inserted {
         let latest: Option<String> = tx
             .query_row(
@@ -193,24 +191,20 @@ pub fn admit_with_config_revision(
     Ok((id, true))
 }
 
-/// Look up replay's namespace without creating or updating its session row.
+/// Resolves the canonical-first existing session family without touching it.
 pub(crate) fn replay_session(
     tx: &rusqlite::Transaction<'_>,
     request: &StartRequest,
 ) -> Result<Option<String>> {
-    let Some(orchestrator) = &request.orchestrator else {
+    let Some(reference) = &request.orchestrator else {
         return Ok(None);
     };
-    Ok(tx
-        .query_row(
-            "SELECT id FROM orchestrator_sessions WHERE transport=? AND external_session_id=?",
-            params![orchestrator.transport, orchestrator.external_session_id],
-            |row| row.get(0),
-        )
-        .optional()?)
+    Ok(crate::session_ids_for_reference(tx, reference)?
+        .into_iter()
+        .next())
 }
 
-/// Find an existing request id scoped by the already-resolved session id.
+/// Finds a request id under the exact session family already present in the transaction.
 pub(crate) fn replay_in_transaction(
     tx: &rusqlite::Transaction<'_>,
     request: &StartRequest,
@@ -219,69 +213,124 @@ pub(crate) fn replay_in_transaction(
     let Some(request_id) = request.request_id.as_deref() else {
         return Ok(None);
     };
-    let row = if session.is_none() {
-        tx.query_row(
-            "SELECT * FROM agents WHERE request_id=? AND (orchestrator_session_id IS NULL OR json_extract(request_json,'$.orchestrator') IS NULL) ORDER BY created_at LIMIT 1",
-            params![request_id],
-            Record::read,
-        ).optional()?
-    } else {
-        tx.query_row(
-            "SELECT * FROM agents WHERE request_id=? AND orchestrator_session_id IS ? ORDER BY created_at LIMIT 1",
-            params![request_id, session],
-            Record::read,
-        ).optional()?
+    let Some(reference) = &request.orchestrator else {
+        return Ok(tx
+            .query_row(
+                "SELECT * FROM agents WHERE request_id=? AND (orchestrator_session_id IS NULL OR json_extract(request_json,'$.orchestrator') IS NULL) ORDER BY created_at LIMIT 1",
+                params![request_id],
+                Record::read,
+            )
+            .optional()?);
     };
-    Ok(row)
+    if session.is_none() {
+        return Ok(None);
+    }
+    let canonical = reference.canonical_transport()?;
+    let legacy = match canonical {
+        "codex_queue" => "codex",
+        "claude_uds" => "claude",
+        _ => unreachable!(),
+    };
+    Ok(tx
+        .query_row(
+            "SELECT a.* FROM agents a JOIN orchestrator_sessions o ON o.id=a.orchestrator_session_id \
+             WHERE a.request_id=? AND o.external_session_id=? AND o.transport IN (?,?) \
+             ORDER BY (o.transport=?) DESC,a.created_at LIMIT 1",
+            params![request_id, reference.external_session_id, canonical, legacy, canonical],
+            Record::read,
+        )
+        .optional()?)
 }
 
-/// Reject a request id if its immutable request hash or resume parent differs.
+/// Compares every frozen request field while ignoring only known transport spelling.
+/// Unknown names or differing session ids do not normalize as equivalent.
+fn replay_request_equivalent(found: &StartRequest, request: &StartRequest) -> bool {
+    let mut found = found.clone();
+    let mut request = request.clone();
+    match (&mut found.orchestrator, &mut request.orchestrator) {
+        (Some(found_ref), Some(request_ref)) => {
+            let Ok(found_transport) = found_ref.canonical_transport() else {
+                return false;
+            };
+            let Ok(request_transport) = request_ref.canonical_transport() else {
+                return false;
+            };
+            if found_transport != request_transport {
+                return false;
+            }
+            found_ref.transport = found_transport.to_owned();
+            request_ref.transport = request_transport.to_owned();
+        }
+        (None, None) => {}
+        _ => return false,
+    }
+    found == request
+}
+
+/// Reject a request id if its immutable request intent or resume parent differs.
+///
+/// Present request hashes must match. Service replay checks historical transport
+/// hash variants before admission; a spelling difference never waives a mismatch
+/// here. Without hashes on both sides, the requests must equal apart from known
+/// transport spelling.
 fn ensure_same_replay(
     found: &Record,
     request: &StartRequest,
     identity: &Value,
     parent: Option<&Record>,
 ) -> Result<()> {
-    let same_request = identity
-        .get("replay_request_sha256")
-        .and_then(Value::as_str)
-        .zip(
-            found
-                .identity
-                .as_ref()
-                .and_then(|value| value.get("replay_request_sha256"))
-                .and_then(Value::as_str),
-        )
-        .map(|(current, previous)| current == previous)
-        .unwrap_or(found.request == *request);
+    let hash = |value: &Value| {
+        value
+            .get("replay_request_sha256")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    let same_request = match (hash(identity), found.identity.as_ref().and_then(hash)) {
+        (Some(current), Some(previous)) => current == previous,
+        _ => replay_request_equivalent(&found.request, request),
+    };
     if !same_request || found.parent_agent_id.as_ref() != parent.map(|record| &record.id) {
         return Err(Error::Conflict);
     }
     Ok(())
 }
 
-/// Upsert the session only for a new admission, after replay and capacity pass.
+/// Reuses the shared identity lookup when a new admission has an orchestrator.
+/// Existing exact legacy aliases keep their row id; fresh rows use canonical names.
 pub(crate) fn upsert_session(
     tx: &rusqlite::Transaction<'_>,
     request: &StartRequest,
     accepted_at: f64,
 ) -> Result<Option<String>> {
-    let Some(orchestrator) = &request.orchestrator else {
-        return Ok(None);
-    };
-    let id = format!("os-{}", uuid::Uuid::new_v4().simple());
-    tx.execute("INSERT INTO orchestrator_sessions(id,transport,external_session_id,external_turn_id,created_at,last_seen_at) VALUES(?,?,?,?,?,?) ON CONFLICT(transport,external_session_id) DO UPDATE SET last_seen_at=excluded.last_seen_at,external_turn_id=excluded.external_turn_id", params![id, orchestrator.transport, orchestrator.external_session_id, orchestrator.external_turn_id, accepted_at, accepted_at])?;
-    Ok(Some(tx.query_row(
-        "SELECT id FROM orchestrator_sessions WHERE transport=? AND external_session_id=?",
-        params![orchestrator.transport, orchestrator.external_session_id],
-        |row| row.get(0),
-    )?))
+    request
+        .orchestrator
+        .as_ref()
+        .map(|reference| crate::session_for_reference(tx, reference, accepted_at))
+        .transpose()
 }
 
 impl Store {
     /// Return a prior request-id admission without loading mutable configuration.
     pub fn replay_request(&self, request: &StartRequest) -> Result<Option<Record>> {
         replay_request(self, request)
+    }
+
+    /// Return the already-admitted child of exactly `parent` for this resume intent.
+    ///
+    /// Reads only durable rows, never configuration, so a retry of an old
+    /// parent still finds its child after later continuations advanced the
+    /// lineage. A recorded request id with a different parent or request
+    /// (other than known transport spelling) is not a replay: `None`, leaving
+    /// the ordinary admission to refuse it.
+    pub fn replay_resume_child(
+        &self,
+        request: &StartRequest,
+        parent: &Record,
+    ) -> Result<Option<Record>> {
+        Ok(replay_request(self, request)?.filter(|found| {
+            found.parent_agent_id.as_ref() == Some(&parent.id)
+                && replay_request_equivalent(&found.request, request)
+        }))
     }
 
     /// Atomically reserve capacity and persist one durable admission or replay.

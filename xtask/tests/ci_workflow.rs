@@ -52,6 +52,54 @@ fn ci_checks_native_release_and_desktop_transport() {
     }
 }
 
+/// Keeps dependency caches pinned and shared between compatible macOS jobs,
+/// while only trusted main/tag runs may save them and installed binaries stay uncached.
+#[test]
+fn rust_dependency_cache_policy_preserves_trust_and_runner_boundaries() {
+    let action = "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6";
+    for (path, save_rule) in [
+        (
+            ".github/workflows/ci.yml",
+            "github.ref == 'refs/heads/main'",
+        ),
+        (
+            ".github/workflows/release.yml",
+            "startsWith(github.ref, 'refs/tags/')",
+        ),
+    ] {
+        let workflow = repository_file(path);
+        assert_eq!(workflow.matches(action).count(), 2, "{path}");
+        for block in workflow.split(action).skip(1) {
+            let cache = block
+                .split("      - name: Fetch locked dependencies")
+                .next()
+                .unwrap();
+            assert!(
+                cache.contains("cache-bin: false"),
+                "{path}: no cached binaries"
+            );
+            assert!(
+                cache.contains("github.event_name == 'push'"),
+                "{path}: PRs only restore"
+            );
+            assert!(cache.contains(save_rule), "{path}: trusted save condition");
+        }
+    }
+    let ci = repository_file(".github/workflows/ci.yml");
+    assert!(ci.contains("shared-key: agent-run-${{ matrix.os }}-${{ matrix.architecture }}"));
+    assert_eq!(
+        ci.matches("shared-key: agent-run-macos-15-arm64").count(),
+        1
+    );
+    let release = repository_file(".github/workflows/release.yml");
+    assert_eq!(
+        release
+            .matches("shared-key: agent-run-macos-15-arm64")
+            .count(),
+        2
+    );
+}
+
 /// Ensures tagged releases aggregate one verified macOS archive and one source archive.
 #[test]
 fn release_publishes_checksummed_native_assets() {

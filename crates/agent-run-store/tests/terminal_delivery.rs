@@ -71,12 +71,26 @@ fn python_test_state_store_terminal_transition_is_atomic() {
 #[test]
 fn python_test_state_store_terminal_success_loses_to_pending_cancel_atomically() {
     let home = common::Home::new();
+    let mut request = home.request();
+    request.orchestrator = Some(OrchestratorRef {
+        transport: "codex_queue".into(),
+        external_session_id: "fixture-session".into(),
+        external_turn_id: None,
+    });
     let (id, _) = home
         .store()
-        .admit(&home.request(), &home.config, &json!({}), None)
+        .admit(&request, &home.config, &json!({}), None)
         .unwrap();
     let mut store = home.store();
     store.running(&id, 42).unwrap();
+    store.conn.execute(
+        "INSERT INTO pools(id,request_namespace,request_id,request_sha256,goal,acceptance_json,state,roster_revision,created_at) VALUES('pool-cancel-20260101-000000-0123456789','ns','cancel','1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef','cancel test','[]','open',1,1.0)",
+        [],
+    ).unwrap();
+    store.conn.execute(
+        "INSERT INTO pool_members(agent_id,pool_id,slot,name,role,personal_task,joined_roster_revision) VALUES(?,'pool-cancel-20260101-000000-0123456789',1,'member','doer','task',1)",
+        [id.as_str()],
+    ).unwrap();
     let root = home.path.join("agents").join(id.as_str());
     fs::private_dir(&root).unwrap();
     let proof = verify::seal(&root, Path::new("answer.md"), "fixture answer").unwrap();
@@ -95,6 +109,18 @@ fn python_test_state_store_terminal_success_loses_to_pending_cancel_atomically()
         .unwrap();
     assert_eq!(state, "completed");
     assert_eq!(result, r#"{"accepted":true,"reason":"terminal_cancel"}"#);
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM deliveries WHERE agent_id=?",
+                [id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1,
+        "the committed cancelled status still receives an individual notice"
+    );
 }
 
 /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_final_drain_completes_late_cancel_steer_and_unknown`.
@@ -256,4 +282,220 @@ fn python_test_state_outbox_evidence_and_verdict_share_one_transaction() {
     assert_eq!(state, "delivered");
     assert!(stored.contains("[redacted]"));
     assert!(!stored.contains("top-secret"));
+}
+
+/// Suppresses only successful terminal notices for current members of open pools.
+///
+/// Resumed and replacement seats use the current roster; non-success outcomes,
+/// closed pools, and standalone successes retain individual completion notices.
+#[test]
+fn open_pool_success_uses_only_the_common_notice() {
+    let home = common::Home::new();
+    let mut request = home.request();
+    request.orchestrator = Some(OrchestratorRef {
+        transport: "codex_queue".into(),
+        external_session_id: "fixture-session".into(),
+        external_turn_id: None,
+    });
+    let (root, _) = home
+        .store()
+        .admit(&request, &home.config, &json!({}), None)
+        .unwrap();
+    let mut store = home.store();
+    store.running(&root, 42).unwrap();
+    store.conn.execute(
+        "INSERT INTO pools(id,request_namespace,request_id,request_sha256,goal,acceptance_json,state,roster_revision,created_at) VALUES('pool-20260101-000000-0123456789','ns','r1','0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef','ship it','[]','open',1,1.0)",
+        [],
+    ).unwrap();
+    store.conn.execute(
+        "INSERT INTO pool_members(agent_id,pool_id,slot,name,role,personal_task,joined_roster_revision) VALUES(?,'pool-20260101-000000-0123456789',1,'member','doer','task',1)",
+        [root.as_str()],
+    ).unwrap();
+    let root_dir = home.path.join("agents").join(root.as_str());
+    fs::private_dir(&root_dir).unwrap();
+    let proof = verify::seal(&root_dir, Path::new("answer.md"), "answer").unwrap();
+    store
+        .finish(&root, &Outcome::success(None), Some(&proof), None)
+        .unwrap();
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM deliveries", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+
+    let (resumed, _) = home
+        .store()
+        .admit(&request, &home.config, &json!({}), None)
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET root_agent_id=? WHERE id=?",
+            rusqlite::params![root.as_str(), resumed.as_str()],
+        )
+        .unwrap();
+    store.running(&resumed, 42).unwrap();
+    let resumed_dir = home.path.join("agents").join(resumed.as_str());
+    fs::private_dir(&resumed_dir).unwrap();
+    let resumed_proof = verify::seal(&resumed_dir, Path::new("answer.md"), "answer").unwrap();
+    store
+        .finish(
+            &resumed,
+            &Outcome::success(None),
+            Some(&resumed_proof),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM deliveries", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+
+    let (replacement, _) = home
+        .store()
+        .admit(&request, &home.config, &json!({}), None)
+        .unwrap();
+    let tx = store.conn.transaction().unwrap();
+    tx.execute(
+        "UPDATE pool_members SET replaced_by=? WHERE agent_id=?",
+        rusqlite::params![replacement.as_str(), root.as_str()],
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO pool_members(agent_id,pool_id,slot,name,role,personal_task,joined_roster_revision) VALUES(?,'pool-20260101-000000-0123456789',1,'replacement','doer','task',2)",
+        [replacement.as_str()],
+    )
+    .unwrap();
+    tx.execute(
+        "UPDATE pools SET roster_revision=2 WHERE id='pool-20260101-000000-0123456789'",
+        [],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    store.running(&replacement, 42).unwrap();
+    let replacement_dir = home.path.join("agents").join(replacement.as_str());
+    fs::private_dir(&replacement_dir).unwrap();
+    let replacement_proof =
+        verify::seal(&replacement_dir, Path::new("answer.md"), "answer").unwrap();
+    store
+        .finish(
+            &replacement,
+            &Outcome::success(None),
+            Some(&replacement_proof),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM deliveries", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+
+    let (failed, _) = home
+        .store()
+        .admit(&request, &home.config, &json!({}), None)
+        .unwrap();
+    let tx = store.conn.transaction().unwrap();
+    tx.execute(
+        "UPDATE pool_members SET replaced_by=? WHERE agent_id=?",
+        rusqlite::params![failed.as_str(), replacement.as_str()],
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO pool_members(agent_id,pool_id,slot,name,role,personal_task,joined_roster_revision) VALUES(?,'pool-20260101-000000-0123456789',1,'failed replacement','doer','task',3)",
+        [failed.as_str()],
+    )
+    .unwrap();
+    tx.execute(
+        "UPDATE pools SET roster_revision=3 WHERE id='pool-20260101-000000-0123456789'",
+        [],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    store.running(&failed, 42).unwrap();
+    store
+        .finish(&failed, &Outcome::failure("fixture"), None, None)
+        .unwrap();
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM deliveries", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+
+    store
+        .conn
+        .execute(
+            "UPDATE pools SET state='completed',completed_at=2.0 WHERE id='pool-20260101-000000-0123456789'",
+            [],
+        )
+        .unwrap();
+    let (closed_resume, _) = home
+        .store()
+        .admit(&request, &home.config, &json!({}), None)
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET root_agent_id=? WHERE id=?",
+            rusqlite::params![root.as_str(), closed_resume.as_str()],
+        )
+        .unwrap();
+    store.running(&closed_resume, 42).unwrap();
+    let closed_dir = home.path.join("agents").join(closed_resume.as_str());
+    fs::private_dir(&closed_dir).unwrap();
+    let closed_proof = verify::seal(&closed_dir, Path::new("answer.md"), "answer").unwrap();
+    store
+        .finish(
+            &closed_resume,
+            &Outcome::success(None),
+            Some(&closed_proof),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM deliveries", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+
+    let (standalone, _) = home
+        .store()
+        .admit(&request, &home.config, &json!({}), None)
+        .unwrap();
+    store.running(&standalone, 42).unwrap();
+    let standalone_dir = home.path.join("agents").join(standalone.as_str());
+    fs::private_dir(&standalone_dir).unwrap();
+    let standalone_proof = verify::seal(&standalone_dir, Path::new("answer.md"), "answer").unwrap();
+    store
+        .finish(
+            &standalone,
+            &Outcome::success(None),
+            Some(&standalone_proof),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM deliveries", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
 }

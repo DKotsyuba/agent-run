@@ -510,7 +510,7 @@ pub fn rollback(prefix: &Path, home: &Path, force: bool) -> Result<(), String> {
     schema_compatible(home, &old)?;
     for name in ["state.db", "config.toml"] {
         if backup.join(name).is_file() {
-            fs::copy(backup.join(name), home.join(name)).map_err(|error| error.to_string())?;
+            restore_file(&backup.join(name), &home.join(name))?;
         }
     }
     switch(prefix, &old)?;
@@ -523,6 +523,40 @@ pub fn rollback(prefix: &Path, home: &Path, force: bool) -> Result<(), String> {
     write_journal(prefix, &rolled_back)
 }
 
+/// Restores one retained file using a same-directory temporary and atomic rename.
+/// The caller must establish quiescence. A failed copy leaves the destination intact;
+/// the copied bytes and renamed directory entry are synced. SQLite sidecars are untouched.
+fn restore_file(source: &Path, destination: &Path) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let parent = destination
+        .parent()
+        .ok_or("restore destination has no parent")?;
+    let temporary = parent.join(format!(".restore-{}", stamp()?));
+    let mut created = false;
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|e| e.to_string())?;
+        created = true;
+        let mut input = fs::File::open(source).map_err(|e| e.to_string())?;
+        std::io::copy(&mut input, &mut file).map_err(|e| e.to_string())?;
+        file.set_permissions(input.metadata().map_err(|e| e.to_string())?.permissions())
+            .map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        fs::rename(&temporary, destination).map_err(|e| e.to_string())?;
+        fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| e.to_string())
+    })();
+    if result.is_err() && created {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CutoverStage, deploy, deploy_with_failure, recover, roll_forward, rollback};
@@ -530,6 +564,21 @@ mod tests {
     use rusqlite::Connection;
     use std::fs;
     use tempfile::tempdir;
+
+    /// A failed restore leaves the previous file intact and removes its private temporary.
+    #[test]
+    fn stability_atomic_restore_keeps_destination_on_copy_failure() {
+        let root = tempdir().unwrap();
+        let destination = root.path().join("state.db");
+        fs::write(&destination, b"retained database").unwrap();
+        assert!(super::restore_file(&root.path().join("missing-backup"), &destination).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"retained database");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        let source = root.path().join("backup");
+        fs::write(&source, b"restored database").unwrap();
+        super::restore_file(&source, &destination).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"restored database");
+    }
 
     /// Creates two sealed releases and installs the first one as the cutover baseline.
     fn cutover_fixture() -> (

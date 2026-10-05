@@ -109,20 +109,61 @@ async fn changed_script_failure_preserves_facts_and_backs_off() {
     );
     fs::write(
         root.path().join("collector.sh"),
-        "cat >/dev/null; echo private-fixture-token >&2; exit 7",
+        "cat >/dev/null; echo private-fixture-token >&2; exit 22",
     )
     .unwrap();
     let failed = collect_providers(root.path(), &config).await.unwrap();
     assert_eq!(failed["ok"], false, "{failed}");
+    assert_eq!(
+        failed["results"][0]["issues"],
+        json!(["collector_exit_status:22"])
+    );
     assert!(!failed.to_string().contains("private-fixture-token"));
     let later = collect_providers(root.path(), &config).await.unwrap();
-    assert_eq!(later["results"][0]["issues"], json!(["backoff"]));
+    assert_eq!(
+        later["results"][0]["issues"],
+        json!(["backoff", "last_failure:collector_exit_status:22"])
+    );
+    fs::write(
+        root.path().join("capacity/backoff.json"),
+        r#"[[["acct-test","fixture"],[1,9999999999,"token-sentinel-unrecognized"]]]"#,
+    )
+    .unwrap();
+    let poisoned = collect_providers(root.path(), &config).await.unwrap();
+    assert_eq!(poisoned["results"][0]["issues"], json!(["backoff"]));
+    assert!(!poisoned.to_string().contains("token-sentinel"));
+    assert!(
+        !fs::read_to_string(root.path().join("capacity/backoff.json"))
+            .unwrap()
+            .contains("token-sentinel")
+    );
+    fs::write(
+        root.path().join("capacity/backoff.json"),
+        r#"[[["acct-test","fixture"],[1,9999999999]]]"#,
+    )
+    .unwrap();
+    let legacy = collect_providers(root.path(), &config).await.unwrap();
+    assert_eq!(legacy["results"][0]["issues"], json!(["backoff"]));
+    fs::write(
+        root.path().join("capacity/backoff.json"),
+        r#"[[["acct-test","fixture"],[1,0,"collector_exit_status:22"]]]"#,
+    )
+    .unwrap();
+    fs::write(root.path().join("collector.sh"), r#"jq '{version:1,windows:[{pool:"shared",window:"five_hour",models:(.models|keys),remaining_percent:50,observed_at:.now}]}'"#).unwrap();
+    let recovered = collect_providers(root.path(), &config).await.unwrap();
+    assert_eq!(recovered["results"][0]["status"], "collected");
+    assert_eq!(recovered["results"][0]["issues"], json!([]));
+    assert!(
+        !fs::read_to_string(root.path().join("capacity/backoff.json"))
+            .unwrap()
+            .contains("collector_exit_status:22")
+    );
     let store = agent_run_store::Store::open(root.path()).unwrap();
     let count: i64 = store
         .conn
         .query_row("SELECT count(*) FROM capacity_samples", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(count, 1);
+    assert_eq!(count, 2);
 }
 
 /// An emitted credential, a foreign model and malformed output cannot become durable quota facts.
@@ -222,7 +263,7 @@ async fn timeout_and_cancel_clean_children() {
             task.abort();
             assert!(task.await.unwrap_err().is_cancelled());
         } else {
-            assert_eq!(task.await.unwrap(), Err("collector_timeout"));
+            assert_eq!(task.await.unwrap(), Err("collector_timeout".into()));
         }
         assert_gone(&owned);
     }
@@ -260,7 +301,7 @@ async fn oversized_stdout_is_bounded() {
     );
     assert_eq!(
         executable::run(&command, &json!({}), root.path()).await,
-        Err("collector_output_too_large")
+        Err("collector_output_too_large".into())
     );
 }
 
@@ -351,6 +392,26 @@ fn supplied_parsers_reject_unknown_and_contradictory_windows() {
             "glm",
             r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":99,"number":5,"percentage":25}]}}"#,
         ),
+        (
+            "glm",
+            r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":100,"currentValue":101,"percentage":0}]}}"#,
+        ),
+        (
+            "glm",
+            r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":0,"currentValue":0,"percentage":0}]}}"#,
+        ),
+        (
+            "glm",
+            r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":100,"currentValue":-1,"percentage":0}]}}"#,
+        ),
+        (
+            "glm",
+            r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":"100","currentValue":1,"percentage":1}]}}"#,
+        ),
+        (
+            "glm",
+            r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"currentValue":1,"percentage":1}]}}"#,
+        ),
         ("claude", r#"{"limits":[{"kind":"session","percent":101}]}"#),
         (
             "claude",
@@ -387,6 +448,63 @@ fn supplied_parsers_reject_unknown_and_contradictory_windows() {
             !child.wait().unwrap().success(),
             "{script_name}: invalid payload was accepted"
         );
+    }
+}
+
+/// GLM counters above budget normalize to exhaustion while unrelated windows remain usable.
+#[test]
+fn glm_over_budget_counters_remain_exhausted() {
+    use std::io::Write;
+    for (body, expected) in [
+        (
+            r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":100,"currentValue":101,"percentage":100},{"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":100,"currentValue":40,"percentage":40}]}}"#,
+            vec![0.0, 60.0],
+        ),
+        (
+            r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":100,"currentValue":100,"percentage":99.5}]}}"#,
+            vec![0.0],
+        ),
+        (
+            r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":0.68,"currentValue":0.68,"percentage":99.5}]}}"#,
+            vec![0.0],
+        ),
+        (
+            r#"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":0.68,"currentValue":0.69,"percentage":99.5}]}}"#,
+            vec![0.0],
+        ),
+    ] {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/collectors");
+        let mut child = std::process::Command::new("jq")
+            .args(["-e", "-L"])
+            .arg(&directory)
+            .args([
+                "--argjson",
+                "ctx",
+                r#"{"models":{"sonnet":{}},"now":1000}"#,
+                "-f",
+            ])
+            .arg(directory.join("glm.jq"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(body.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let remaining: Vec<f64> = parsed["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|window| window["remaining_percent"].as_f64().unwrap())
+            .collect();
+        assert_eq!(remaining, expected);
     }
 }
 

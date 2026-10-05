@@ -112,7 +112,7 @@ async fn grant_tampering_and_unsealed_home_are_typed_refusals() {
     assert!(
         matches!(
             service
-                .resume(&parent, "continue".into(), None, None, None)
+                .resume(&parent, "continue".into(), None, None, None, None)
                 .await,
             Err(Error::Integrity(_))
         ),
@@ -131,7 +131,7 @@ async fn grant_tampering_and_unsealed_home_are_typed_refusals() {
         .unwrap();
     drop(store);
     let error = service
-        .resume(&parent, "continue".into(), None, None, None)
+        .resume(&parent, "continue".into(), None, None, None, None)
         .await
         .expect_err("an unsealed runtime home must not resume");
     assert!(

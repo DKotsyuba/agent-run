@@ -749,6 +749,13 @@ pub async fn run(
     let mut streamed: BTreeMap<String, String> = BTreeMap::new();
     let mut emitted: BTreeMap<String, String> = BTreeMap::new();
     let mut redactors: BTreeMap<String, StreamingRedactor> = BTreeMap::new();
+    store.event(
+        &record.id,
+        "native_tool_observer_v1",
+        &json!({"protocol":"codex","version":1}),
+    )?;
+    let mut tools_started = BTreeSet::new();
+    let mut tools_completed = BTreeSet::new();
     let mut completed: BTreeMap<String, String> = BTreeMap::new();
     let mut final_answer: Option<String> = None;
     let mut usage = None;
@@ -774,13 +781,40 @@ pub async fn run(
                     // command is claimed, return to the supervisor so its
                     // verified process-group cleanup enforces cancellation
                     // and escalates only after the documented grace period.
-                    let _ = process
-                        .rpc(
+                    // The bounded exchange's disposition is recorded as
+                    // metadata only; it never changes the cancel outcome.
+                    let interrupt = process
+                        .rpc_exchange(
                             "turn/interrupt",
                             json!({"threadId":tid,"turnId":turn_id}),
                             Duration::from_secs(1),
                         )
                         .await;
+                    let disposition = match interrupt {
+                        Ok(agent_run_adapters::io::RpcDisposition::Replied(_)) => "replied",
+                        Ok(agent_run_adapters::io::RpcDisposition::Rejected { .. }) => {
+                            "native_rejected"
+                        }
+                        Ok(agent_run_adapters::io::RpcDisposition::UnsentPressure) => {
+                            "backlog_pressure_unsent"
+                        }
+                        Ok(agent_run_adapters::io::RpcDisposition::Uncertain(reason)) => {
+                            if let agent_run_adapters::io::RpcUncertain::Transport(kind) = reason {
+                                store.event(
+                                    &record.id,
+                                    "rpc_transport_failure",
+                                    &json!({"failure_kind":kind}),
+                                )?;
+                            }
+                            reason.reason()
+                        }
+                        Err(_) => "exchange_failed",
+                    };
+                    store.event(
+                        &record.id,
+                        "interrupt_disposition",
+                        &json!({"disposition":disposition}),
+                    )?;
                     store.complete_command(&record.id, cid, &json!({"accepted":true}))?;
                     flush_pending_assistant(
                         process,
@@ -805,15 +839,45 @@ pub async fn run(
                 }
                 if kind == "steer" {
                     if let Some(text) = commands::steer_text(&payload) {
-                        let result=process.rpc("turn/steer",json!({"threadId":tid,"expectedTurnId":turn_id,"input":[{"type":"text","text":text}]}),Duration::from_secs(30)).await;
-                        store.complete_command(
-                            &record.id,
-                            cid,
-                            &json!({"accepted":result.is_ok()}),
-                        )?;
-                        if result.is_ok() {
-                            journal(store, &record.id, "user", text, None, None)?;
-                        }
+                        let exchange = turn_steer(process, &tid, &turn_id, text).await;
+                        // Only a correlated native reply proves delivery in
+                        // either direction: a rejection proves the engine
+                        // refused it, and an unsent exchange proves nothing
+                        // was written. Every bounded end after a possible
+                        // write is explicitly unknown — the request may have
+                        // been taken — never a guessed rejection.
+                        let result = match exchange {
+                            Ok(agent_run_adapters::io::RpcDisposition::Replied(_)) => {
+                                journal(store, &record.id, "user", text, None, None)?;
+                                json!({"accepted":true})
+                            }
+                            Ok(agent_run_adapters::io::RpcDisposition::Rejected { .. }) => {
+                                json!({"accepted":false,"reason":"native_rejected"})
+                            }
+                            Ok(agent_run_adapters::io::RpcDisposition::UnsentPressure) => {
+                                json!({"accepted":false,"reason":"backlog_pressure_unsent"})
+                            }
+                            Ok(agent_run_adapters::io::RpcDisposition::Uncertain(reason)) => {
+                                if let agent_run_adapters::io::RpcUncertain::Transport(kind) =
+                                    reason
+                                {
+                                    store.event(
+                                        &record.id,
+                                        "rpc_transport_failure",
+                                        &json!({"failure_kind":kind}),
+                                    )?;
+                                }
+                                store.event(
+                                    &record.id,
+                                    "steer_uncertain",
+                                    &json!({"reason":reason.reason()}),
+                                )?;
+                                json!({"accepted":null,"reason":reason.reason()})
+                            }
+                            // Only pre-send validation can return Err.
+                            Err(error) => Err(error)?,
+                        };
+                        store.complete_command(&record.id, cid, &result)?;
                     } else {
                         store.complete_command(
                             &record.id,
@@ -821,6 +885,33 @@ pub async fn run(
                             &json!({"accepted":false,"reason":"empty_steer_text"}),
                         )?;
                     }
+                } else if kind == "pool" {
+                    // Same bounded exchange as steer, with explicit finite
+                    // push dispositions: only a correlated native reply is
+                    // `native_accepted` (never delivery or consumption), a
+                    // pre-send failure is `unsent`, and every bounded end
+                    // after a possible write is `unknown`. The durable log
+                    // keeps the entry in every case.
+                    let result = match commands::pool_push_text(store, &record.id, &payload) {
+                        Ok(text) => match turn_steer(process, &tid, &turn_id, &text).await {
+                            Ok(agent_run_adapters::io::RpcDisposition::Replied(_)) => {
+                                commands::pool_result("native_accepted", "native_replied")
+                            }
+                            Ok(agent_run_adapters::io::RpcDisposition::Rejected { .. }) => {
+                                commands::pool_result("rejected", "native_rejected")
+                            }
+                            Ok(agent_run_adapters::io::RpcDisposition::UnsentPressure) => {
+                                commands::pool_result("unsent", "backlog_pressure_unsent")
+                            }
+                            Ok(agent_run_adapters::io::RpcDisposition::Uncertain(reason)) => {
+                                commands::pool_result("unknown", reason.reason())
+                            }
+                            // Only pre-send validation returns Err.
+                            Err(_) => commands::pool_result("unsent", "exchange_not_sent"),
+                        },
+                        Err(refusal) => refusal,
+                    };
+                    store.complete_command(&record.id, cid, &result)?;
                 } else {
                     store.complete_command(
                         &record.id,
@@ -869,6 +960,17 @@ pub async fn run(
         };
         if v.get("method").is_some() && v.get("id").is_some() {
             process.deny_request(&v).await?;
+            continue;
+        }
+        if v.get("method").is_none() && v.get("id").is_some() {
+            // Only a previously issued numeric response id leaves this branch.
+            // Arbitrary native ids, reply bodies, arguments and session payloads
+            // are discarded; late replies never rewrite a completed command.
+            if let Some(reply_id) = process.rpc_reply_id(&v) {
+                store.event(&record.id, "late_rpc_reply", &json!({"id":reply_id}))?;
+            } else {
+                store.event(&record.id, "unrecognized_rpc_reply", &json!({}))?;
+            }
             continue;
         }
         let Some(method) = v
@@ -947,6 +1049,28 @@ pub async fn run(
                     text.clear();
                 }
             }
+            "item/started" => {
+                let item = &p["item"];
+                if let Some(name) = tool_name(item) {
+                    let key = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty());
+                    if key.is_none_or(|key| tools_started.insert(key.to_owned())) {
+                        crate::journal_with_error(
+                            store,
+                            &record.id,
+                            "tool_call",
+                            "",
+                            Some(&process.redact(&name)),
+                            key,
+                            None,
+                        )?;
+                    }
+                } else {
+                    record_native_event(process, store, &record.id, method, p)?;
+                }
+            }
             "item/completed" => {
                 let item = &p["item"];
                 let key = item.get("id").and_then(Value::as_str).unwrap_or("");
@@ -989,17 +1113,54 @@ pub async fn run(
                     if !text.trim().is_empty() {
                         final_answer = Some(text.to_owned());
                     }
-                } else if let Some(text) = item.get("aggregatedOutput").and_then(Value::as_str) {
-                    journal(
+                } else if let Some(name) = tool_name(item) {
+                    let native_id = (!key.is_empty()).then_some(key);
+                    if native_id.is_some_and(|key| !tools_completed.insert(key.to_owned())) {
+                        continue;
+                    }
+                    let name = process.redact(&name);
+                    if native_id.is_none_or(|key| tools_started.insert(key.to_owned())) {
+                        crate::journal_with_error(
+                            store,
+                            &record.id,
+                            "tool_call",
+                            "",
+                            Some(&name),
+                            native_id,
+                            None,
+                        )?;
+                    }
+                    let text = item
+                        .get("aggregatedOutput")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .or_else(|| item.pointer("/result/content").map(Value::to_string))
+                        .or_else(|| {
+                            item.pointer("/error/message")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .unwrap_or_default();
+                    crate::journal_with_error(
                         store,
                         &record.id,
                         "tool_result",
-                        &process.redact(text),
-                        Some("command"),
-                        Some(key),
+                        &process.redact(&text),
+                        Some(&name),
+                        native_id,
+                        tool_error(item),
                     )?;
+                    if native_id.is_none() {
+                        record_native_event(process, store, &record.id, method, p)?;
+                    }
                 } else {
                     record_native_event(process, store, &record.id, method, p)?;
+                    if !matches!(
+                        item.get("type").and_then(Value::as_str),
+                        Some("reasoning" | "plan" | "userMessage" | "contextCompaction")
+                    ) {
+                        store.event(&record.id, "native_tool_coverage_gap_v1", &json!({}))?;
+                    }
                 }
             }
             "thread/tokenUsage/updated" => {
@@ -1089,6 +1250,63 @@ pub async fn run(
     }
 }
 
+/// Returns explicit error evidence for a completed native command or MCP item.
+/// Command exitCode applies only to commandExecution; a failed command status
+/// is authoritative, while completion without an exit remains unknown. MCP
+/// completed/failed status reflects native call success; a typed MCP error is
+/// explicit failure. Unknown types/fields stay unknown; content words, task or
+/// runtime outcomes and unrelated statuses never contribute.
+fn tool_error(item: &Value) -> Option<(bool, &'static str)> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("commandExecution") => {
+            if let Some(exit) = item.get("exitCode").and_then(Value::as_i64) {
+                Some((exit != 0, "codex.command.exitCode"))
+            } else if item.get("status").and_then(Value::as_str) == Some("failed") {
+                Some((true, "codex.command.status"))
+            } else {
+                None
+            }
+        }
+        Some("mcpToolCall") => {
+            if item
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .is_some()
+            {
+                Some((true, "codex.mcp.error"))
+            } else {
+                match item.get("status").and_then(Value::as_str) {
+                    Some("completed") => Some((false, "codex.mcp.status")),
+                    Some("failed") => Some((true, "codex.mcp.status")),
+                    _ => None,
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Names known native invocation variants without retaining commands/arguments.
+/// Other known invocation kinds count calls but keep errors unknown until their
+/// protocol-specific evidence is supported; unknown item kinds are not guessed.
+fn tool_name(item: &Value) -> Option<String> {
+    match item.get("type").and_then(Value::as_str)? {
+        "commandExecution" => Some("command".into()),
+        "mcpToolCall" => Some(format!(
+            "{}/{}",
+            item["server"].as_str().unwrap_or("?"),
+            item["tool"].as_str().unwrap_or("?")
+        )),
+        "dynamicToolCall" => Some(item["tool"].as_str().unwrap_or("dynamic_tool").into()),
+        "fileChange" => Some("file_change".into()),
+        "webSearch" => Some("web_search".into()),
+        "imageView" => Some("image_view".into()),
+        "imageGeneration" => Some("image_generation".into()),
+        "collabAgentToolCall" => Some(item["tool"].as_str().unwrap_or("agent_tool").into()),
+        _ => None,
+    }
+}
+
 /// Wraps Codex's cumulative total in the durable Python event payload shape.
 ///
 /// The returned value intentionally preserves malformed or missing fields so
@@ -1104,6 +1322,24 @@ pub async fn query(process: &mut Process, method: &str) -> Result<Value> {
     }
     process
         .rpc(method, json!({}), Duration::from_secs(20))
+        .await
+}
+
+/// Sends one text input to the active turn through the bounded native steer
+/// exchange; shared by operator steering and pool delivery so both keep the
+/// same one-second-class 30 s bound and disposition semantics.
+async fn turn_steer(
+    process: &mut agent_run_adapters::io::Process,
+    thread_id: &str,
+    turn_id: &str,
+    text: &str,
+) -> Result<agent_run_adapters::io::RpcDisposition> {
+    process
+        .rpc_exchange(
+            "turn/steer",
+            json!({"threadId":thread_id,"expectedTurnId":turn_id,"input":[{"type":"text","text":text}]}),
+            Duration::from_secs(30),
+        )
         .await
 }
 

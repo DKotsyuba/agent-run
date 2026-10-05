@@ -210,13 +210,24 @@ fn extend_start_description(value: &mut Value) {
 /// registry entry with null result declarations omitted, as the SDK omits
 /// nulls on the wire. The frozen Python fixture has no such tool; parity
 /// expectations account for the addition explicitly instead of editing it.
-fn delegation_guide_wire() -> Value {
-    let mut value =
-        serde_json::to_value(agent_run_domain::tool("delegation_guide").unwrap()).unwrap();
-    value.as_object_mut().unwrap().retain(|key, value| {
-        !matches!(key.as_str(), "outputSchema" | "resultShape") || !value.is_null()
-    });
-    value
+fn additive_wires() -> Vec<Value> {
+    [
+        "delegation_guide",
+        "start_pool",
+        "pool_post",
+        "pool_replace",
+        "pool",
+        "list_pools",
+    ]
+    .into_iter()
+    .map(|name| {
+        let mut value = serde_json::to_value(agent_run_domain::tool(name).unwrap()).unwrap();
+        value.as_object_mut().unwrap().retain(|key, value| {
+            !matches!(key.as_str(), "outputSchema" | "resultShape") || !value.is_null()
+        });
+        value
+    })
+    .collect()
 }
 
 /// Appends the additive `delegation_guide` entry to every captured tools
@@ -226,7 +237,7 @@ fn append_delegation_guide(value: &mut Value) {
     match value {
         Value::Object(object) => {
             if let Some(Value::Array(tools)) = object.get_mut("tools") {
-                tools.push(delegation_guide_wire());
+                tools.extend(additive_wires());
             }
             object.values_mut().for_each(append_delegation_guide);
         }
@@ -283,10 +294,15 @@ fn mcp_matches_python_handshake_tools_calls_notifications_and_eof() {
             mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}})),
             None
         );
-        assert_eq!(
-            mcp.send(expected[2]["request"].clone()).unwrap(),
-            expected[2]["response"]
-        );
+        let listed = mcp.send(expected[2]["request"].clone()).unwrap();
+        assert_eq!(listed, expected[2]["response"]);
+        // Legacy sessions must not acquire the 2026-07-28 cache hints.
+        for key in ["ttlMs", "cacheScope"] {
+            assert!(
+                listed["result"].get(key).is_none(),
+                "{version}: {key} leaked to a legacy session"
+            );
+        }
         for index in [3usize, 4, 5] {
             let reply = mcp.send(expected[index]["request"].clone()).unwrap();
             let captured = &expected[index]["response"];
@@ -344,6 +360,27 @@ fn mcp_matches_python_handshake_tools_calls_notifications_and_eof() {
     }
 }
 
+/// The real MCP proxy calls list_pools over the broker socket and renders its page.
+#[test]
+fn list_pools_live_mcp_round_trip() {
+    let mut harness = Harness::new();
+    harness.start_broker();
+    let mut mcp = harness.mcp();
+    mcp.send(initialize("2025-11-25")).unwrap();
+    mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}));
+    let reply = mcp
+        .send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+        "params":{"name":"list_pools","arguments":{"state":"open","limit":1}}}))
+        .unwrap();
+    assert_eq!(reply["result"]["isError"], false);
+    assert!(reply["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("agent-run pools: 0 of 0"));
+    assert!(reply["result"].get("structuredContent").is_none());
+    mcp.finish();
+}
+
 /// Ensure the advertised list is exactly the captured schema table after null omission on the wire.
 #[test]
 fn mcp_tools_list_matches_the_packaged_python_table() {
@@ -359,10 +396,7 @@ fn mcp_tools_list_matches_the_packaged_python_table() {
     extend_start_description(&mut expected);
     // This fixture is the bare tool array (no "tools" wrapper), so the
     // additive entry is appended directly, in registry declaration order.
-    expected
-        .as_array_mut()
-        .unwrap()
-        .push(delegation_guide_wire());
+    expected.as_array_mut().unwrap().extend(additive_wires());
     for tool in expected.as_array_mut().unwrap() {
         tool.as_object_mut().unwrap().retain(|key, value| {
             !matches!(key.as_str(), "outputSchema" | "resultShape") || !value.is_null()

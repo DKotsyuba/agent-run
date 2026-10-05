@@ -161,6 +161,11 @@ impl ToolDefinition {
                 MachineCode::IOError,
                 MachineCode::StorageError,
             ],
+            "list_pools" => &[
+                MachineCode::ValidationError,
+                MachineCode::IOError,
+                MachineCode::StorageError,
+            ],
             "list_agents" | "transcript" => &[
                 MachineCode::ValidationError,
                 MachineCode::AgentNotFound,
@@ -169,6 +174,33 @@ impl ToolDefinition {
             ],
             "capacity_order" | "models" | "limits" | "delegation_guide" => &[
                 MachineCode::ValidationError,
+                MachineCode::Unsupported,
+                MachineCode::RuntimeError,
+                MachineCode::IOError,
+                MachineCode::StorageError,
+            ],
+            "start_pool" => &[
+                MachineCode::ValidationError,
+                MachineCode::PathEscapeError,
+                MachineCode::RequestConflict,
+                MachineCode::SelectionBusy,
+                MachineCode::NoEligibleAccount,
+                MachineCode::QuotaExhausted,
+                MachineCode::CapacityExhausted,
+                MachineCode::Unsupported,
+                MachineCode::RuntimeError,
+                MachineCode::IOError,
+                MachineCode::StorageError,
+            ],
+            "pool_post" | "pool_replace" | "pool" => &[
+                MachineCode::ValidationError,
+                MachineCode::AgentNotFound,
+                MachineCode::StateTransitionError,
+                MachineCode::RequestConflict,
+                MachineCode::CapacityExhausted,
+                MachineCode::SelectionBusy,
+                MachineCode::NoEligibleAccount,
+                MachineCode::QuotaExhausted,
                 MachineCode::Unsupported,
                 MachineCode::RuntimeError,
                 MachineCode::IOError,
@@ -221,7 +253,7 @@ pub fn tool(name: &str) -> Option<&'static ToolDefinition> {
     registry().iter().find(|definition| definition.name == name)
 }
 
-/// Reports whether a method is one of the twelve public tools.
+/// Reports whether a method is one of the public tools.
 pub fn is_tool(name: &str) -> bool {
     tool(name).is_some()
 }
@@ -248,13 +280,25 @@ fn argument_default(tool: &str, argument: &str) -> Option<ArgumentDefault> {
         | ("doc", "topic")
         | ("models", "provider" | "profile" | "model")
         | ("capacity_order", "model") => Some(ArgumentDefault::Null),
+        ("start_pool", "acceptance" | "orchestrator")
+        | ("pool_replace", "start")
+        | ("pool", "after_seq" | "before_seq" | "limit") => Some(ArgumentDefault::Null),
         ("resume" | "cancel" | "steer" | "answer" | "transcript", "run_id") => {
             Some(ArgumentDefault::Null)
         }
-        ("list_agents", "offset") | ("transcript", "cursor") => Some(ArgumentDefault::Integer(0)),
+        ("list_pools", "state") => Some(ArgumentDefault::Null),
+        ("list_pools", "limit") => Some(ArgumentDefault::Integer(50)),
+        ("list_pools" | "list_agents", "offset") | ("transcript", "cursor") => {
+            Some(ArgumentDefault::Integer(0))
+        }
+        ("list_agents", "after_message_revision") => Some(ArgumentDefault::Null),
+        ("transcript", "view") => Some(ArgumentDefault::Null),
         ("list_agents", "limit") => Some(ArgumentDefault::Integer(100)),
         ("transcript", "limit") => Some(ArgumentDefault::Integer(200)),
         ("list_agents", "wait_seconds") => Some(ArgumentDefault::Number(0)),
+        ("transcript", "tail_blocks") | ("transcript", "before_cursor") => {
+            Some(ArgumentDefault::Null)
+        }
         _ => None,
     }
 }

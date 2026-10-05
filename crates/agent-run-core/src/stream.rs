@@ -15,7 +15,7 @@ use agent_run_adapters::{
     redact::StreamingRedactor,
 };
 use serde_json::{Value, json};
-use std::{path::Path, time::Duration};
+use std::{collections::BTreeMap, path::Path, time::Duration};
 
 /// Flushes the unresolved suffix of one assistant message only after applying
 /// its launch-secret policy across all streamed fragment boundaries.
@@ -266,8 +266,14 @@ pub async fn run(
     } else {
         process.input.take();
     }
+    store.event(
+        &record.id,
+        "native_tool_observer_v1",
+        &json!({"protocol":"claude","version":1}),
+    )?;
     let mut session = None;
     let mut final_result: Option<EngineResult> = None;
+    let mut tool_names: BTreeMap<String, String> = BTreeMap::new();
     // The attempt's current authoritative native state (rate-limit events
     // and assistant error controls, in protocol order).
     let mut signals = crate::adapters::native_failure::ClaudeSignals::default();
@@ -316,13 +322,7 @@ pub async fn run(
                 }
                 if command == "steer" {
                     if let Some(text) = commands::steer_text(&payload) {
-                        let accepted = process
-                            .send_before(
-                                &json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":text}]}}),
-                                deadline,
-                            )
-                            .await
-                            .is_ok();
+                        let accepted = send_user_text(process, text, deadline).await;
                         store.complete_command(&record.id, cid, &json!({"accepted":accepted}))?;
                         if accepted {
                             journal(store, &record.id, "user", &process.redact(text), None, None)?;
@@ -334,6 +334,20 @@ pub async fn run(
                             &json!({"accepted":false,"reason":"empty_steer_text"}),
                         )?;
                     }
+                } else if command == "pool" {
+                    // Same stdin path and deadline as steer. A successful
+                    // write is `written` only — never engine acceptance or
+                    // consumption — and any error may follow a partial write,
+                    // so it is `unknown`, not "not delivered". The durable log
+                    // keeps the entry either way.
+                    let result = match commands::pool_push_text(store, &record.id, &payload) {
+                        Ok(text) => match send_user_text(process, &text, deadline).await {
+                            true => commands::pool_result("written", "stdin_write"),
+                            false => commands::pool_result("unknown", "stdin_write_failed"),
+                        },
+                        Err(refusal) => refusal,
+                    };
+                    store.complete_command(&record.id, cid, &result)?;
                 } else {
                     store.complete_command(
                         &record.id,
@@ -465,6 +479,26 @@ pub async fn run(
                         emitted.clear();
                         saw_delta = false;
                     }
+                    Some("content_block_start")
+                        if event.pointer("/content_block/type").and_then(Value::as_str)
+                            == Some("tool_use") =>
+                    {
+                        let block = &event["content_block"];
+                        let native_id = block["id"].as_str().filter(|id| !id.is_empty());
+                        let name = block["name"].as_str().map(|name| process.redact(name));
+                        if let (Some(id), Some(name)) = (native_id, name.as_ref()) {
+                            tool_names.insert(id.to_owned(), name.clone());
+                        }
+                        crate::journal_with_error(
+                            store,
+                            &record.id,
+                            "tool_call",
+                            "",
+                            name.as_deref(),
+                            native_id,
+                            None,
+                        )?;
+                    }
                     Some("content_block_delta")
                         if event.pointer("/delta/type").and_then(Value::as_str)
                             == Some("text_delta") =>
@@ -508,16 +542,27 @@ pub async fn run(
                                 saw_answer |= !block_text.is_empty();
                                 text.push_str(block_text);
                             }
-                            Some("tool_use") => journal(
-                                store,
-                                &record.id,
-                                "tool_call",
-                                &process.redact(&serde_json::to_string(
-                                    block.get("input").unwrap_or(&Value::Null),
-                                )?),
-                                block.get("name").and_then(Value::as_str),
-                                block.get("id").and_then(Value::as_str),
-                            )?,
+                            Some("tool_use") => {
+                                if let (Some(id), Some(name)) =
+                                    (block["id"].as_str(), block["name"].as_str())
+                                {
+                                    tool_names.insert(id.to_owned(), process.redact(name));
+                                }
+                                crate::journal_with_error(
+                                    store,
+                                    &record.id,
+                                    "tool_call",
+                                    &process.redact(&serde_json::to_string(
+                                        block.get("input").unwrap_or(&Value::Null),
+                                    )?),
+                                    block.get("name").and_then(Value::as_str),
+                                    block
+                                        .get("id")
+                                        .and_then(Value::as_str)
+                                        .filter(|id| !id.is_empty()),
+                                    None,
+                                )?;
+                            }
                             _ => {}
                         }
                     }
@@ -591,13 +636,23 @@ pub async fn run(
                                 .unwrap_or_else(|| {
                                     block.get("content").unwrap_or(&Value::Null).to_string()
                                 });
-                            journal(
+                            crate::journal_with_error(
                                 store,
                                 &record.id,
                                 "tool_result",
                                 &process.redact(&text),
-                                None,
-                                block.get("tool_use_id").and_then(Value::as_str),
+                                block["tool_use_id"]
+                                    .as_str()
+                                    .and_then(|id| tool_names.get(id))
+                                    .map(String::as_str),
+                                block
+                                    .get("tool_use_id")
+                                    .and_then(Value::as_str)
+                                    .filter(|id| !id.is_empty()),
+                                block
+                                    .get("is_error")
+                                    .and_then(Value::as_bool)
+                                    .map(|error| (error, "claude.is_error")),
                             )?;
                         }
                     }
@@ -663,6 +718,23 @@ pub async fn run(
 /// shared numeric/nullability rules after the terminal event is durable.
 fn runtime_result_usage(result: &Value) -> Value {
     json!({"duration_ms":result["duration_ms"],"duration_api_ms":result["duration_api_ms"],"num_turns":result["num_turns"],"ttft_ms":result["ttft_ms"],"total_cost_usd":result["total_cost_usd"],"usage":result["usage"]})
+}
+
+/// Writes one user text message to the engine's stdin before `deadline`;
+/// shared by operator steering and pool delivery. `false` after a possible
+/// partial write is not proof that nothing was sent.
+async fn send_user_text(
+    process: &mut agent_run_adapters::io::Process,
+    text: &str,
+    deadline: tokio::time::Instant,
+) -> bool {
+    process
+        .send_before(
+            &json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":text}]}}),
+            deadline,
+        )
+        .await
+        .is_ok()
 }
 
 #[cfg(test)]

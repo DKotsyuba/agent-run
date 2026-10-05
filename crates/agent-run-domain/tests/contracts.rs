@@ -129,6 +129,7 @@ fn python_view_dtos_keep_field_order_and_nulls() {
         parent_run_id: None,
         run_id: None,
         agent_id: id.clone(),
+        name: None,
         runtime: "codex".into(),
         model: "model".into(),
         profile: "profile".into(),
@@ -171,6 +172,9 @@ fn python_view_dtos_keep_field_order_and_nulls() {
         runtime_outcome: None,
         acceptance: "pending".into(),
         workdir: None,
+        usage: None,
+        usage_cumulative: None,
+        tool_counts: None,
     };
     let page = AgentPage {
         items: vec![view],
@@ -180,6 +184,7 @@ fn python_view_dtos_keep_field_order_and_nulls() {
         next_offset: None,
         complete: true,
         revision: 0,
+        message_revision: 0,
         observed_at: 1.0,
     };
     let value = serde_json::to_value(page).unwrap();

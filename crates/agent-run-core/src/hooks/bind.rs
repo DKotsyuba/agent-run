@@ -95,6 +95,73 @@ pub fn run_hook(
     .map_err(|error| loud(&agent_id, &error))
 }
 
+/// One successful immutable whole-pool binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PoolBindResult {
+    /// The pool bound together with every current member.
+    pub pool_id: String,
+    /// The opaque durable orchestrator-session primary key.
+    #[serde(skip_serializing)]
+    pub session_id: String,
+}
+
+impl PoolBindResult {
+    /// Returns the exact safe confirmation injected into the post-tool host turn.
+    pub fn message(&self) -> String {
+        format!(
+            "agent-run: pool {} and all its members are bound; the one common completion will be delivered to this chat.",
+            self.pool_id
+        )
+    }
+}
+
+/// What one post-tool hook bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookBound {
+    /// One durable agent.
+    Agent(BindResult),
+    /// A whole pool.
+    Pool(PoolBindResult),
+}
+
+impl HookBound {
+    /// Returns the confirmation text the host shows the model.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Agent(bound) => bound.message(),
+            Self::Pool(bound) => bound.message(),
+        }
+    }
+}
+
+/// [`run_hook`] that also recognizes a structured `start_pool` receipt, which
+/// binds the pool and every current member tip atomically (conflicts change
+/// nothing) and activates the pool's waiting common notice once.
+pub fn run_hook_bound(
+    store: &mut Store,
+    payload: &Value,
+    transport: &str,
+    at: Option<f64>,
+) -> Result<HookBound> {
+    let hint = payload
+        .get("pool_id")
+        .and_then(Value::as_str)
+        .unwrap_or("None");
+    let normalized = normalize(payload, true, transport).map_err(|error| loud(hint, &error))?;
+    let Some(pool_id) = normalized.pool_id else {
+        return run_hook(store, payload, transport, at).map(HookBound::Agent);
+    };
+    let pool: agent_run_domain::pool::PoolId =
+        pool_id.parse().map_err(|error| loud(&pool_id, &error))?;
+    let session_id = store
+        .bind_pool(&pool, &normalized.reference, at.unwrap_or_else(now))
+        .map_err(|error| loud(&pool_id, &error))?;
+    Ok(HookBound::Pool(PoolBindResult {
+        pool_id,
+        session_id,
+    }))
+}
+
 /// Represents the normalized session reference and optional discovered agent id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookPayload {
@@ -104,6 +171,8 @@ pub struct HookPayload {
     pub agent_id: Option<String>,
     /// Exact internal receipt counter; absent for legacy exact-id payloads.
     pub sequence: Option<u32>,
+    /// A whole-pool receipt (from `start_pool`); exclusive with `agent_id`.
+    pub pool_id: Option<String>,
 }
 
 /// Converts raw or normalized context/bind payloads into one strict host-neutral form.
@@ -136,7 +205,14 @@ pub fn normalize(payload: &Value, bind: bool, transport: &str) -> Result<HookPay
             external_turn_id: object.get("turn_id").map(value_string).transpose()?,
         };
         reference.validate()?;
-        let (agent_id, sequence) = if bind {
+        // A structured `start_pool` reply binds the whole pool and is checked
+        // before any single-agent receipt detection.
+        let pool_id = if bind {
+            raw_pool(object.get("tool_response"))?
+        } else {
+            None
+        };
+        let (agent_id, sequence) = if bind && pool_id.is_none() {
             let (id, sequence) = raw_selection(object.get("tool_response"))?;
             (Some(id), sequence)
         } else {
@@ -146,10 +222,12 @@ pub fn normalize(payload: &Value, bind: bool, transport: &str) -> Result<HookPay
             reference,
             agent_id,
             sequence,
+            pool_id,
         });
     }
     let allowed: BTreeSet<&str> = if bind {
         BTreeSet::from([
+            "pool_id",
             "agent_id",
             "run_id",
             "sequence",
@@ -175,6 +253,19 @@ pub fn normalize(payload: &Value, bind: bool, transport: &str) -> Result<HookPay
             .transpose()?,
     };
     reference.validate()?;
+    if bind && object.contains_key("pool_id") {
+        if object.contains_key("agent_id") || object.contains_key("run_id") {
+            return Err(invalid("a pool binding names no agent"));
+        }
+        let pool = required_string(object.get("pool_id"), "pool_id")?;
+        pool.parse::<agent_run_domain::pool::PoolId>()?;
+        return Ok(HookPayload {
+            reference,
+            agent_id: None,
+            sequence: None,
+            pool_id: Some(pool),
+        });
+    }
     let agent_id = bind
         .then(|| {
             let field = if object.contains_key("run_id") {
@@ -193,7 +284,46 @@ pub fn normalize(payload: &Value, bind: bool, transport: &str) -> Result<HookPay
         } else {
             None
         },
+        pool_id: None,
     })
+}
+
+/// Finds one `start_pool` receipt: an object with a valid `pool_id` that is
+/// either the bare machine identity or carries the member roster. Replies of
+/// the other pool tools never bind. Distinct pool ids conflict.
+fn raw_pool(value: Option<&Value>) -> Result<Option<String>> {
+    fn walk(value: &Value, found: &mut BTreeSet<String>) {
+        match value {
+            Value::Object(object) => {
+                if let Some(id) = object.get("pool_id").and_then(Value::as_str) {
+                    let receipt =
+                        object.len() == 1 || object.get("members").is_some_and(Value::is_array);
+                    if receipt && id.parse::<agent_run_domain::pool::PoolId>().is_ok() {
+                        found.insert(id.to_owned());
+                    }
+                }
+                object.values().for_each(|item| walk(item, found));
+            }
+            Value::Array(items) => items.iter().for_each(|item| walk(item, found)),
+            Value::String(text) => {
+                if let Ok(decoded) = serde_json::from_str::<Value>(text) {
+                    walk(&decoded, found);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut found = BTreeSet::new();
+    if let Some(value) = value {
+        walk(value, &mut found);
+    }
+    match found.len() {
+        0 => Ok(None),
+        1 => Ok(found.pop_first()),
+        _ => Err(invalid(
+            "raw PostToolUse payload has conflicting pool_id values",
+        )),
+    }
 }
 
 /// Parses the positive bounded counter carried only by machine binding receipts.

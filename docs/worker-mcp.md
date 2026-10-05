@@ -1,8 +1,12 @@
 # Worker-to-orchestrator reports
 
 New schema-2 runs automatically receive a separate `agent_run_worker` stdio MCP
-server. It advertises exactly one tool, `notify_orchestrator`. It never advertises
-or dispatches operator tools such as `start`, `resume`, `cancel` or `steer`.
+server. Ordinary runs see exactly one tool, `notify_orchestrator`; members of a
+cooperative pool additionally get the fixed private tools `pool_post`,
+`pool_read`, `pool_propose` and `pool_vote` (nothing else, and no pool or author
+argument: the pool and the author are derived from the run's membership). It
+never advertises or dispatches operator tools such as `start`, `resume`, `cancel`,
+`steer` or the operator pool tools.
 Configured work MCPs remain available according to the frozen role.
 
 The worker uses the tool for material findings, risks, questions or blockers:
