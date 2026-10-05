@@ -1,6 +1,8 @@
+#![cfg(feature = "test-fixtures")]
 //! Real public-boundary checks for provider admission: a disposable schema-2
 //! home, the real `api serve` broker, the real CLI and MCP child processes,
 //! and the exported socket client, all driving the fake engine only.
+//! The fixture engine and stale-revision admission seam require `test-fixtures`.
 
 use agent_run::transport::socket::BrokerClient;
 use agent_run_domain::{Error, ProviderStartRequest, views::StartResult};
