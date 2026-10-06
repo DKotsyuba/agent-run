@@ -17,13 +17,19 @@ use rmcp::{
     service::{RequestContext, RoleServer},
 };
 use serde_json::{Value, json};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 /// One authenticated attempt's transport context. Never serializable or Debug:
 /// the token is a transient capability, not a model-supplied tool argument.
 #[derive(Clone)]
 pub struct WorkerProxy {
-    /// Existing resident broker; only the private TOOL_METHOD route can be invoked.
+    /// Existing resident broker, restricted to authenticated private catalog/tool routes.
     broker: Arc<dyn CliBroker>,
     /// Exact run, not a moving stable-agent alias.
     run_id: AgentId,
@@ -31,6 +37,8 @@ pub struct WorkerProxy {
     attempt_id: String,
     /// Ephemeral run capability; only its hash is persisted by the broker.
     token: String,
+    /// Durable proof success for this attempt, shared by server clones only.
+    catalog_registered: Arc<AtomicBool>,
 }
 
 /// Converts every domain-owned worker definition through the pinned SDK.
@@ -46,10 +54,14 @@ fn tools() -> std::result::Result<Vec<Tool>, ErrorData> {
 }
 
 impl WorkerProxy {
-    /// Best-effort bounded registration from this actual native server. Failure
-    /// leaves the launch contract unknown and never prevents ordinary startup;
-    /// legitimate later discovery/calls retry after broker readiness races.
+    /// Registers this actual native catalog once per exact immutable attempt.
+    /// Only an explicit successful broker receipt is memoized across clones;
+    /// errors, unknown replies and timeouts remain retryable on legitimate
+    /// discovery/calls and never prevent healthy ordinary MCP startup.
     async fn register_catalog(&self) {
+        if self.catalog_registered.load(Ordering::Acquire) {
+            return;
+        }
         let proof = agent_run_domain::worker::WorkerCatalogProof {
             run_id: self.run_id.clone(),
             attempt_id: self.attempt_id.clone(),
@@ -57,13 +69,16 @@ impl WorkerProxy {
             version: agent_run_domain::worker::POOL_CATALOG_VERSION,
             digest: agent_run_domain::worker::pool_catalog_digest(),
         };
-        if let Ok(value) = serde_json::to_value(proof) {
-            let _ = tokio::time::timeout(
+        if let Ok(value) = serde_json::to_value(proof)
+            && let Ok(Ok(receipt)) = tokio::time::timeout(
                 std::time::Duration::from_millis(250),
                 self.broker
                     .call(agent_run_domain::worker::CATALOG_METHOD, value),
             )
-            .await;
+            .await
+            && receipt["registered"] == true
+        {
+            self.catalog_registered.store(true, Ordering::Release);
         }
     }
 
@@ -300,6 +315,7 @@ pub async fn serve_from_env() -> Result<()> {
         run_id,
         attempt_id,
         token,
+        catalog_registered: Arc::new(AtomicBool::new(false)),
     };
     proxy.register_catalog().await;
     let service = proxy
@@ -329,6 +345,7 @@ mod tests {
             run_id: "ag-20260928-000000-0000000001".parse().unwrap(),
             attempt_id: "attempt".into(),
             token: "a".repeat(64),
+            catalog_registered: Arc::new(AtomicBool::new(false)),
         };
         for (tool, input) in [
             (
@@ -397,6 +414,54 @@ mod tests {
         }
     }
 
+    /// Finite catalog-only broker double: failure, timeout, unknown reply, then
+    /// explicit success. Counts RPCs without persisting transient capability data.
+    #[derive(Default)]
+    struct CatalogBroker(std::sync::atomic::AtomicUsize);
+
+    impl CliBroker for CatalogBroker {
+        /// Checks the immutable private route/context and models startup races;
+        /// no provider or socket is contacted and every delayed reply is finite.
+        fn call<'a>(&'a self, method: &'a str, params: Value) -> CliFuture<'a> {
+            Box::pin(async move {
+                assert_eq!(method, agent_run_domain::worker::CATALOG_METHOD);
+                assert_eq!(params["attempt_id"], "attempt");
+                match self.0.fetch_add(1, Ordering::Relaxed) {
+                    0 => Err(Error::Runtime("fixture broker unavailable".into())),
+                    1 => {
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        Ok(json!({"registered":true}))
+                    }
+                    2 => Ok(json!({"unconfirmed":true})),
+                    _ => Ok(json!({"registered":true})),
+                }
+            })
+        }
+    }
+
+    /// Failed/late/unknown startup proof retries; verified success suppresses
+    /// subsequent hello RPCs for both the current proxy and its server clones.
+    #[tokio::test]
+    async fn catalog_registration_retries_unknown_and_memoizes_only_success() {
+        let broker = Arc::new(CatalogBroker::default());
+        let proxy = WorkerProxy {
+            broker: broker.clone(),
+            run_id: "ag-20260928-000000-0000000001".parse().unwrap(),
+            attempt_id: "attempt".into(),
+            token: "a".repeat(64),
+            catalog_registered: Arc::new(AtomicBool::new(false)),
+        };
+        for _ in 0..3 {
+            proxy.register_catalog().await;
+            assert!(!proxy.catalog_registered.load(Ordering::Acquire));
+        }
+        proxy.register_catalog().await;
+        assert!(proxy.catalog_registered.load(Ordering::Acquire));
+        proxy.register_catalog().await;
+        proxy.clone().register_catalog().await;
+        assert_eq!(broker.0.load(Ordering::Relaxed), 4);
+    }
+
     /// Operator tools and destination injection never reach the broker; valid
     /// reports carry fixed run context and return plain text without the capability.
     #[tokio::test]
@@ -407,6 +472,7 @@ mod tests {
             run_id: "ag-20260928-000000-0000000001".parse().unwrap(),
             attempt_id: "attempt".into(),
             token: "a".repeat(64),
+            catalog_registered: Arc::new(AtomicBool::new(false)),
         };
         let names: Vec<_> = tools()
             .unwrap()
@@ -472,6 +538,7 @@ mod tests {
             run_id: "ag-20260928-000000-0000000001".parse().unwrap(),
             attempt_id: "attempt".into(),
             token: "a".repeat(64),
+            catalog_registered: Arc::new(AtomicBool::new(false)),
         };
         let (mut input_writer, input_reader) = tokio::io::duplex(64 * 1024);
         let (output_writer, output_reader) = tokio::io::duplex(64 * 1024);

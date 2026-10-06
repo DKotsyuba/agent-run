@@ -1141,3 +1141,53 @@ fn attention_delivery_gc_does_not_reissue_join_notice() {
             .is_err()
     );
 }
+
+/// Holds another WAL writer and uses a zero busy budget as a strict proof that
+/// an unchanged settlement path never asks SQLite for a writer reservation.
+fn assert_settlement_uses_only_reads(f: &Fixture, pool: &Value) {
+    let mut store = Store::open(&f.root).unwrap();
+    let mut writer = Store::open(&f.root).unwrap();
+    assert_eq!(
+        store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "wal"
+    );
+    store.conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+    let held = writer
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    assert!(
+        store
+            .settle_pool(&serde_json::from_value(pool["pool_id"].clone()).unwrap())
+            .unwrap()
+            .is_none()
+    );
+    drop(held);
+}
+
+/// New-only pools and healthy pending enrollment do not acquire a per-tick
+/// writer lock; a previously recorded identical join failure is read-only too.
+#[test]
+fn unchanged_pool_settlement_does_not_reserve_wal_writer() {
+    let f = Fixture::new(None, 8);
+    let mut request = f.request("pure-new-wal", 2, None);
+    request.members.remove(0);
+    let pool = f.service.admit_pool(request).unwrap();
+    assert_settlement_uses_only_reads(&f, &pool);
+
+    let f = Fixture::new(None, 8);
+    let pool = f
+        .service
+        .admit_pool(f.request("pending-wal", 1, None))
+        .unwrap();
+    assert_settlement_uses_only_reads(&f, &pool);
+    let mut store = Store::open(&f.root).unwrap();
+    store.conn.execute("UPDATE commands SET state='completed',result_json='{\"accepted\":false}' WHERE agent_id=? AND kind='steer'",[f.agent.as_str()]).unwrap();
+    store
+        .reconcile_pool_enrollments(&serde_json::from_value(pool["pool_id"].clone()).unwrap())
+        .unwrap();
+    assert_settlement_uses_only_reads(&f, &pool);
+}

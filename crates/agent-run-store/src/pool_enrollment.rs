@@ -274,44 +274,78 @@ fn failure_reason(
     })
 }
 
+/// Read-only preflight for actual enrollment mutations. Empty/new-only pools,
+/// healthy pending workers and identical recorded failures return no work.
+/// The same reads repeat under the admission writer transaction before any
+/// update; a concurrent ACK/GC can only remove a proposed change.
+fn enrollment_changes(
+    conn: &Connection,
+    pool: &agent_run_domain::pool::PoolId,
+    at: f64,
+) -> Result<Vec<(String, &'static str)>> {
+    let mut q=conn.prepare("SELECT j.agent_id,j.run_id,j.attempt_id,j.deadline FROM pool_enrollments j JOIN pool_members m ON m.agent_id=j.agent_id WHERE m.pool_id=? AND m.replaced_by IS NULL AND j.state<>'joined'")?;
+    let rows = q
+        .query_map([pool.as_str()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, f64>(3)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(q);
+    let mut changed = Vec::new();
+    for (root, run, attempt, deadline) in rows {
+        let delivery_failed:bool=conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM commands WHERE agent_id=? AND kind='steer' AND json_extract(payload_json,'$.pool_enrollment')=? AND state='completed' AND COALESCE(json_extract(result_json,'$.accepted'),0)=0)",
+            params![run,root],|r|r.get(0))?;
+        let reason =
+            failure_reason(conn, &root, &run, &attempt, deadline, at)?.or(if delivery_failed {
+                Some("delivery_unconfirmed")
+            } else {
+                None
+            });
+        let Some(reason) = reason else {
+            continue;
+        };
+        let recorded:Option<(String,Option<String>,bool)>=conn.query_row(
+            "SELECT state,failure_reason,attention_issued=1 FROM pool_enrollments WHERE agent_id=?",
+            [&root],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        let Some((state, previous, issued)) = recorded else {
+            continue;
+        };
+        if state != "joined"
+            && (state != "needs_action" || previous.as_deref() != Some(reason) || !issued)
+        {
+            changed.push((root, reason));
+        }
+    }
+    Ok(changed)
+}
+
 impl Store {
-    /// Converges a pool's pending attachments under an immediate transaction.
-    /// Each failed join records at most one broker-authored attention outbox
-    /// event; existing individual error notices suppress duplicate attention.
+    /// Converges only changed attachment state/attention under an immediate
+    /// transaction after a read-only preflight. Empty pools, healthy pending and
+    /// identical failures never reserve the per-tick writer lock. Every decision
+    /// repeats under that lock; terminal error notices suppress duplicate attention.
     pub fn reconcile_pool_enrollments(
         &mut self,
         pool: &agent_run_domain::pool::PoolId,
     ) -> Result<()> {
+        if enrollment_changes(&self.conn, pool, now())?.is_empty() {
+            return Ok(());
+        }
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let mut q=tx.prepare("SELECT j.agent_id,j.run_id,j.attempt_id,j.deadline FROM pool_enrollments j JOIN pool_members m ON m.agent_id=j.agent_id WHERE m.pool_id=? AND m.replaced_by IS NULL AND j.state<>'joined'")?;
-        let rows = q
-            .query_map([pool.as_str()], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, f64>(3)?,
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        drop(q);
-        for (root, run, attempt, deadline) in rows {
-            let delivery_failed:bool=tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM commands WHERE agent_id=? AND kind='steer' AND json_extract(payload_json,'$.pool_enrollment')=? AND state='completed' AND COALESCE(json_extract(result_json,'$.accepted'),0)=0)",
-                params![run,root],|r|r.get(0))?;
-            let reason = failure_reason(&tx, &root, &run, &attempt, deadline, now())?.or(
-                if delivery_failed {
-                    Some("delivery_unconfirmed")
-                } else {
-                    None
-                },
-            );
-            let Some(reason) = reason else {
-                continue;
-            };
-            tx.execute("UPDATE pool_enrollments SET state='needs_action',failure_reason=? WHERE agent_id=? AND state<>'joined'",params![reason,root])?;
+        for (root, reason) in enrollment_changes(&tx, pool, now())? {
+            let (run, attempt): (String, String) = tx.query_row(
+                "SELECT run_id,attempt_id FROM pool_enrollments WHERE agent_id=?",
+                [&root],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            tx.execute("UPDATE pool_enrollments SET state='needs_action',failure_reason=? WHERE agent_id=? AND state<>'joined' AND (state<>'needs_action' OR failure_reason IS NOT ?)",params![reason,root,reason])?;
             let covered:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM deliveries d JOIN agents a ON a.id=d.agent_id JOIN events e ON e.seq=d.terminal_event_seq WHERE d.agent_id=? AND a.status IN ('failed','lost','timed_out','cancelled') AND e.kind='status' AND e.to_status=a.status)",[&run],|r|r.get(0))?;
             let already: bool = tx.query_row(
                 "SELECT attention_issued=1 FROM pool_enrollments WHERE agent_id=?",

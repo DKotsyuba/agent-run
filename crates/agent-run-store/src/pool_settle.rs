@@ -312,8 +312,10 @@ fn settle_in_tx(tx: &Transaction<'_>, pool_id: &PoolId) -> Result<Option<PoolCom
 
 impl Store {
     /// Completes `pool_id` when every condition holds, in one immediate
-    /// transaction. Repeats and concurrent callers record at most one event
-    /// and one delivery; `None` means the pool is not (yet) complete.
+    /// transaction after read-only preflight. Pending enrollment acquires a
+    /// writer only for changed join state/attention; ordinary unchanged pools
+    /// never reserve it. Repeats record at most one completion event/delivery;
+    /// `None` means the pool is not (yet) complete.
     pub fn settle_pool(&mut self, pool_id: &PoolId) -> Result<Option<PoolCompletion>> {
         self.reconcile_pool_enrollments(pool_id)?;
         // Read-only preflight: pools that are running, unproven or unvoted
