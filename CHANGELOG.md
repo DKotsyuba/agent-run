@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.22.1
+
 - fix(tui): accept empty pool responses with nullable proposals and simplify the
   pool header while retaining roster, vote and delivery details
 - perf(tui): keep cached content visible during nonblocking refreshes, separate
