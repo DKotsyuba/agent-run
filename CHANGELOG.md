@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.22.0
+
 - feat(pools): admit mixed new and active independent members atomically without
   restarting existing work, renewing deadlines or duplicating quota reservations
 - feat(pools): require attempt-pinned summary acknowledgements for attached seats;
