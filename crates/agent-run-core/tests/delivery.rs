@@ -614,7 +614,7 @@ async fn host_exchange(request: Value, mode: &str) -> (Value, Option<Value>) {
                     path.file_name()
                         .unwrap()
                         .to_string_lossy()
-                        .starts_with("ar-cdx-v4-")
+                        .starts_with("ar-cdx-v5-")
                 })
             {
                 break path;
