@@ -2,10 +2,9 @@
 
 ## Historical schema 1: claude, codex, and glm
 
-Static rosters: whatever model ids are listed in each runtime's `models =
-[...]` in config.toml. There is nothing else to sync: the broker loads a valid
-changed config automatically, and new starts materialize the updated roster.
-Existing sessions retain their admitted model identity.
+Static rosters come from each runtime's `models = [...]` in config.toml.
+The broker reloads valid changes automatically; new starts use the new roster
+and existing sessions retain their admitted model identity.
 
 ### Verifying
 
@@ -17,12 +16,11 @@ admitting work with that model.
 ## Schema 2: the provider catalog
 
 MCP discovery exposes two routing reads: `delegation_guide` and `limits`.
-With `schema_version = 2`, the call-only compatibility methods `models` and
-`capacity_order` retain the structured provider catalog and capacity order. Both are read-only views of
-the current valid config, the canonical role files, and committed quota
-observations: they never collect quota, probe a harness, reserve capacity or
-start work. The caller alone picks provider, model, effort and profile; the
-catalog reports facts and never recommends by itself.
+Schema 2 keeps `models` and `capacity_order` as call-only compatibility views.
+They read valid config, canonical role files and committed quota observations;
+they never collect quota, probe a harness, reserve capacity or start work.
+The caller picks provider, model, effort and profile; configured guidance is
+prose, not an automatic model-suitability decision.
 
 Filters are exact identifiers; an unknown value is a `ValidationError`:
 
@@ -64,34 +62,22 @@ offerings that role can use. No account id, label or credential reference
 appears; per-account facts stay in `limits` (each account-bound row names
 its `account` and physical `pool`) and `accounts list`.
 
-Recommendations are plain configured prose. Editing them in `config.toml`
-changes the next `models` result (and its `config_revision`); no skill needs
-model or account constants:
+Edit provider/model `recommendations` in `config.toml`; valid reload changes
+the next guide/catalog result and its `config_revision`. Skills need no model
+or account constants. Configuration excerpt:
 
 ```toml
 [providers.codex]
-harness = "codex"
-connection = { kind = "native" }
-auth_family = "openai"
-limits_source = "exec"
-collector = { command = "/bin/bash", args = ["/opt/agent-run/collectors/codex.sh"], source = "codex-appserver" }
-recommendations = ["native subscription; strongest for long refactors"]
+recommendations = ["native subscription; long refactors"]
 [[providers.codex.models]]
 id = "gpt-main"
-native_model = "gpt-native"
 allowed_params = { effort = ["medium", "high"] }
 params = { effort = "medium" }
 recommendations = ["broad coding"]
-[[providers.codex.models]]
-id = "gpt-review"
-restrictions = ["web_tools_disabled"]
-[[providers.codex.bindings]]
-label = "personal"
-account = "acct-codex"
 ```
 
-`params.effort` is the effective default when a start omits effort. Other
-parameter keys are rejected until a launch adapter can execute them.
+Omitted effort uses `params.effort`. Other parameter keys are rejected until a
+launch adapter can execute them. See `agent-run doc config` for full config.
 
 A schema-1 file keeps its historical runtime roster and route order; the
 filters are `Unsupported` there.
@@ -133,19 +119,15 @@ the same exact optional `provider`, `model`, and `profile` filters, with typed
 agent-run delegation-guide --provider codex --model gpt-main --profile review
 ```
 
-Omitted filters retain the default guide. It renders the same committed snapshot
-as one compact
-plain-text page for an orchestrator choosing a route: a compact operating header,
-then each provider in capacity order with its harness, configured provider
-guidance, and one short line per exact selectable model id — cached quota
-status and evidence (with sample age and reset horizon derived from
-`ranked_at`, never raw timestamps), the admissible canonical profiles
-(`profiles: none` marks a model no role may use), nonempty default and allowed
-params, hard restrictions, and configured model guidance. Schema 1 is
-`Unsupported`; an explicitly empty catalog says so. The text omits skills, MCP
-arrays, hashes, accounts, credentials, and endpoints, and normalizes whitespace
-and control characters in configured recommendation prose — it adds no
-model-ability ranking and no facts beyond the `models` snapshot it renders.
+Omitted filters retain the default guide. One committed snapshot renders a
+compact operating header, providers in capacity order with harness/guidance,
+and each exact selectable model: cached quota status/evidence, sample age and
+reset horizon derived from `ranked_at`, admissible canonical profiles
+(`profiles: none` means no role may use it), nonempty default/allowed params,
+restrictions and configured guidance. Schema 1 is `Unsupported`; an empty
+catalog is explicit. Text omits skills, MCP arrays, hashes, accounts,
+credentials and endpoints, normalizes recommendation whitespace/control
+characters, and adds no model-ability ranking or facts beyond its snapshot.
 
 Before delegating a task, the orchestrator must call this tool and read its
 output before choosing provider, model, effort or profile. Keep task-suitability
