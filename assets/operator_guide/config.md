@@ -50,7 +50,12 @@ last good observations. `limits_source = "none"` disables collection. Former
 fallback. Account aliases share observations and failure backoff.
 
 Canonical Markdown profiles select skills, MCP servers, permissions and required
-constraints. Shared `[mcp.<name>]` declarations contain a transport, command,
+constraints. Entries in `[skills].directory` may be directory symlinks to shared
+skills elsewhere. Absolute and relative links are resolved into immutable run
+snapshots, so later source or link changes do not affect resume. Broken links,
+cycles, non-directory targets and links inside skill contents are rejected.
+
+Shared `[mcp.<name>]` declarations contain a transport, command,
 arguments and optional environment names. In schema 2, `global = true` selects
 a server for all new runs. `allowed_tools = ["read"]` limits its tools; omit
 the field for all tools or use `[]` for none. Profiles accept both server names
