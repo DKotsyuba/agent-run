@@ -232,13 +232,19 @@ fn additive_wires() -> Vec<Value> {
     .collect()
 }
 
-/// Appends the additive `delegation_guide` entry to every captured tools
-/// array anywhere in `value`, matching the registry's declaration order
-/// (last) so the expected list stays the advertised list.
+/// Applies the explicit discovery delta to frozen Python tool arrays: call-only
+/// legacy methods disappear and current additions retain declaration order.
+/// Historical call fixtures and structured compatibility responses are unchanged.
 fn append_delegation_guide(value: &mut Value) {
     match value {
         Value::Object(object) => {
             if let Some(Value::Array(tools)) = object.get_mut("tools") {
+                tools.retain(|entry| {
+                    entry["name"]
+                        .as_str()
+                        .and_then(agent_run_domain::tool)
+                        .is_none_or(|definition| definition.legacy_for.is_none())
+                });
                 tools.extend(additive_wires());
             }
             object.values_mut().for_each(append_delegation_guide);
@@ -385,7 +391,8 @@ fn list_pools_live_mcp_round_trip() {
     mcp.finish();
 }
 
-/// Ensure the advertised list is exactly the captured schema table after null omission on the wire.
+/// Pins the explicit call-only/additive discovery delta over the frozen
+/// schema table, after the SDK's null omission; historical calls remain covered.
 #[test]
 fn mcp_tools_list_matches_the_packaged_python_table() {
     let mut harness = Harness::new();
@@ -400,6 +407,12 @@ fn mcp_tools_list_matches_the_packaged_python_table() {
     extend_start_description(&mut expected);
     // This fixture is the bare tool array (no "tools" wrapper), so the
     // additive entry is appended directly, in registry declaration order.
+    expected.as_array_mut().unwrap().retain(|entry| {
+        entry["name"]
+            .as_str()
+            .and_then(agent_run_domain::tool)
+            .is_none_or(|definition| definition.legacy_for.is_none())
+    });
     expected.as_array_mut().unwrap().extend(additive_wires());
     for tool in expected.as_array_mut().unwrap() {
         tool.as_object_mut().unwrap().retain(|key, value| {

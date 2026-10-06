@@ -2,28 +2,6 @@
   {
     "annotations": {
       "destructiveHint": false,
-      "idempotentHint": true,
-      "openWorldHint": false,
-      "readOnlyHint": true
-    },
-    "description": "Return the committed, transport-neutral capacity routing order. With schema_version 2 providers (never accounts) are listed by descending score with every offered model's own cached standing. Over MCP it renders as one compact plain-text page (ordered providers with scores/multipliers and per-model quota status and evidence); the broker socket and CLI keep the full structured JSON.",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "model": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "name": "capacity_order"
-  },
-  {
-    "annotations": {
-      "destructiveHint": false,
       "idempotentHint": false,
       "openWorldHint": true,
       "readOnlyHint": false
@@ -450,10 +428,25 @@
     "annotations": {
       "destructiveHint": false,
       "idempotentHint": true,
-      "openWorldHint": true,
+      "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "List enabled runtime model rosters with capability and health evidence. With schema_version 2 this is the revisioned provider catalog over one committed read; exact provider/profile/model filters are validation-checked. Over MCP it renders as one compact plain-text page (providers in capacity order with harness, per-model quota status and evidence, admissible profiles stated once when shared, default/allowed params, hard restrictions, and configured guidance prose); the broker socket and CLI keep the full structured JSON.",
+    "description": "Diagnose stored quota windows, percentages, resets and freshness plus ranked provider/model standing, numeric priorities and provider multipliers from one committed snapshot. Unknown or stale capacity remains explicit; no collection or model turn is started. MCP text omits private account and pool identities. Schema 1 retains its historical quota-window response.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "limits"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Before delegating any task, the orchestrator MUST call this tool and read its output before choosing a provider, model, effort, or profile. Do not route from a remembered model list or a separate delegation skill. Returns a compact plain-text guide from current configuration and committed quota observations: providers in capacity order, exact models, quota standing/freshness, admissible profiles, supported parameters, restrictions, and configured recommendations. The orchestrator makes the task-specific choice; the broker selects the account unless explicitly pinned. Follow the start/resume tool contracts for launch, binding, continuation and verified results. Read-only; schema_version 1 is Unsupported. Configured recommendations are guidance, not an automatic model-ability ranking. Optional provider, model and profile filters are exact configured names; unknown names return ValidationError. Omitted filters retain the compact default guide.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -476,36 +469,6 @@
           ]
         }
       },
-      "type": "object"
-    },
-    "name": "models"
-  },
-  {
-    "annotations": {
-      "destructiveHint": false,
-      "idempotentHint": true,
-      "openWorldHint": false,
-      "readOnlyHint": true
-    },
-    "description": "Read current fresh capacity readings without projections.",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {},
-      "type": "object"
-    },
-    "name": "limits"
-  },
-  {
-    "annotations": {
-      "destructiveHint": false,
-      "idempotentHint": true,
-      "openWorldHint": false,
-      "readOnlyHint": true
-    },
-    "description": "Before delegating any task, the orchestrator MUST call this tool and read its output before choosing a provider, model, effort, or profile. Do not route from a remembered model list or a separate delegation skill. Returns a compact plain-text guide from current configuration and committed quota observations: providers in capacity order, exact models, quota standing/freshness, admissible profiles, supported parameters, restrictions, and configured recommendations. The orchestrator makes the task-specific choice; the broker selects the account unless explicitly pinned. Follow the start/resume tool contracts for launch, binding, continuation and verified results. Read-only; schema_version 1 is Unsupported. Configured recommendations are guidance, not an automatic model-ability ranking.",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {},
       "type": "object"
     },
     "name": "delegation_guide"

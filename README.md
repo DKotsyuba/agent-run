@@ -197,8 +197,13 @@ The MCP process is a thin stdio proxy over the resident broker:
 {"command":"agent-run","args":["--home","/absolute/path/to/agent-run-home","mcp"]}
 ```
 
-It exposes `start`, `resume`, `cancel`, `steer`, `list_agents`, `answer`,
-`transcript`, `capacity_order`, `doc`, `models`, `delegation_guide`, and `limits`.
+It advertises 15 tools: `start`, `resume`, `cancel`, `steer`, `list_agents`,
+`answer`, `transcript`, `doc`, `delegation_guide`, `limits`, `start_pool`,
+`pool_post`, `pool_replace`, `pool`, and `list_pools`. Use `delegation_guide`
+with optional exact `provider`, `model`, and `profile` filters for routing;
+use `limits` for quota windows plus numerical provider/model standing.
+`models` and `capacity_order` remain callable compatibility methods with their
+original CLI/socket JSON shapes, but do not appear in MCP discovery.
 
 New schema-2 workers receive a separate built-in MCP with only
 `notify_orchestrator`: a durable report to their bound orchestrator without

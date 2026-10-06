@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- feat(routing): consolidate advertised routing tools into filtered delegation
+  guidance and quota/ranking diagnostics; retain models and capacity-order
+  as call-only compatibility methods with their original structured responses
+
 ## 0.21.2
 
 - fix(release): discover authenticated draft releases through bounded list and

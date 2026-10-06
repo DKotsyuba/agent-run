@@ -29,11 +29,17 @@ fn golden() -> Vec<Value> {
 #[test]
 fn registry_matches_python_golden_field_by_field() {
     let expected = golden();
-    let actual: Vec<Value> = tools_json()
-        .into_iter()
+    let actual: Vec<Value> = registry()
+        .iter()
+        .map(|definition| serde_json::to_value(definition).unwrap())
         .filter(|tool| !ADDITIVE.contains(&tool["name"].as_str().unwrap_or_default()))
         .collect();
-    assert_eq!(tools_json().len(), 17);
+    assert_eq!(tools_json().len(), 15);
+    for (name, canonical) in [("models", "delegation_guide"), ("capacity_order", "limits")] {
+        assert_eq!(tool(name).unwrap().legacy_for.as_deref(), Some(canonical));
+        assert!(!tools_json().iter().any(|entry| entry["name"] == name));
+        assert!(tool(canonical).unwrap().legacy_for.is_none());
+    }
     assert_eq!(actual.len(), expected.len());
 
     for (definition, (actual, mut expected)) in registry()
@@ -116,6 +122,11 @@ fn registry_matches_python_golden_field_by_field() {
             expected["inputSchema"]["properties"]["before_cursor"] = serde_json::json!({
                 "type":["integer","null"],"minimum":1
             });
+        }
+        if definition.name == "limits" {
+            expected["description"] = serde_json::json!(
+                "Diagnose stored quota windows, percentages, resets and freshness plus ranked provider/model standing, numeric priorities and provider multipliers from one committed snapshot. Unknown or stale capacity remains explicit; no collection or model turn is started. MCP text omits private account and pool identities. Schema 1 retains its historical quota-window response."
+            );
         }
         if definition.name != "start" {
             assert_eq!(actual["description"], expected["description"]);
@@ -318,7 +329,7 @@ fn annotations_preserve_effect_and_worker_boundaries() {
 }
 
 /// The additive `delegation_guide` read extends the frozen Python table by
-/// exactly one no-argument, strict-object tool with its own error classes;
+/// one strict-object tool with exact catalog filters and its own error classes;
 /// no baseline entry exists for it and none is invented.
 #[test]
 fn delegation_guide_is_the_additive_twelfth_tool() {
@@ -328,9 +339,25 @@ fn delegation_guide_is_the_additive_twelfth_tool() {
             .iter()
             .all(|tool| tool["name"] != "delegation_guide")
     );
-    assert!(definition.arguments().is_empty());
+    assert_eq!(definition.arguments().len(), 3);
+    assert_eq!(
+        definition.input_schema,
+        tool("models").unwrap().input_schema
+    );
+    assert!(
+        definition
+            .arguments()
+            .iter()
+            .all(|arg| !arg.required && arg.default == Some(ArgumentDefault::Null))
+    );
     assert_eq!(definition.input_schema["additionalProperties"], false);
-    assert_eq!(definition.input_schema["properties"], serde_json::json!({}));
+    assert_eq!(
+        definition.input_schema["properties"]
+            .as_object()
+            .unwrap()
+            .len(),
+        3
+    );
     assert!(!definition.error_classes().is_empty());
 }
 

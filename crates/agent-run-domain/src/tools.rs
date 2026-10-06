@@ -21,17 +21,24 @@ pub struct ToolAnnotations {
     pub open_world_hint: bool,
 }
 
-/// A tool in the schema-first discovery contract.
+/// One callable method in the schema-first registry, optionally advertised.
 ///
 /// Input schemas preserve the frozen Python oracle plus explicitly tested
 /// product extensions. Descriptions and typed effect annotations come from the
 /// same reviewed assets; current snapshots pin them together. Error classes and
 /// dispatch defaults are derived metadata, separate from MCP discovery.
+/// Call-only replacements retain their original schemas and dispatch semantics.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ToolDefinition {
     /// Stable method name shared by CLI, MCP, and the Unix socket API.
     pub name: String,
+    /// Canonical replacement for a call-only compatibility method. Omission
+    /// advertises the method; a named replacement hides it from all discovery
+    /// while preserving its original argument schema and dispatcher behavior.
+    /// This internal routing metadata never appears in the MCP tool object.
+    #[serde(default, skip_serializing)]
+    pub legacy_for: Option<String>,
     /// Discovery guidance, including the completion-notice contract for start.
     pub description: String,
     /// Reviewed effect hints from this asset, never transport-local defaults.
@@ -212,7 +219,8 @@ impl ToolDefinition {
     }
 }
 
-/// Returns the sole registry, parsed once from the checked-in public asset.
+/// Returns the sole callable registry, including call-only compatibility
+/// methods, parsed once from the checked-in public asset.
 ///
 /// `assets/tools.json` preserves the Python-compatible schemas and carries
 /// current operator guidance in each description. The domain crate owns parsing,
@@ -248,7 +256,7 @@ pub fn worker_tools_json() -> Vec<Value> {
         .collect()
 }
 
-/// Finds a public tool by its stable method name.
+/// Finds an advertised or call-only compatibility method by its stable name.
 pub fn tool(name: &str) -> Option<&'static ToolDefinition> {
     registry().iter().find(|definition| definition.name == name)
 }
@@ -258,10 +266,12 @@ pub fn is_tool(name: &str) -> bool {
     tool(name).is_some()
 }
 
-/// Renders the current registry for every public discovery transport.
+/// Renders the shared discovery projection, omitting call-only compatibility
+/// entries. Direct lookup retains their original schemas for legacy calls.
 pub fn tools_json() -> Vec<Value> {
     registry()
         .iter()
+        .filter(|definition| definition.legacy_for.is_none())
         .cloned()
         .map(|definition| serde_json::to_value(definition).expect("tool definition is JSON"))
         .collect()
@@ -278,7 +288,7 @@ fn argument_default(tool: &str, argument: &str) -> Option<ArgumentDefault> {
         | ("resume", "timeout_seconds" | "request_id" | "orchestrator")
         | ("list_agents", "orchestrator" | "after_revision")
         | ("doc", "topic")
-        | ("models", "provider" | "profile" | "model")
+        | ("models" | "delegation_guide", "provider" | "profile" | "model")
         | ("capacity_order", "model") => Some(ArgumentDefault::Null),
         ("start_pool", "acceptance" | "orchestrator")
         | ("pool_replace", "start")

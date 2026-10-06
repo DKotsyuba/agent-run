@@ -5,3 +5,14 @@ agent-run limits — latest stored capacity samples
 {% else %}
 no stored capacity samples
 {% endfor %}
+{% if ranking %}
+Provider/model standing — capacity revision {{ ranking.capacity_revision }} (quota standing, not model ability)
+{% for provider in ranking.providers %}
+{{ loop.index }}. {{ provider.id }}: score {{ provider.score if provider.score is not none else "unknown" }}, multiplier {{ provider.multiplier if provider.multiplier is not none else "unknown" }}{{ "" }}
+{% for model in provider.models %}
+   - {{ model.id }}: {{ model.status }}, evidence {{ model.evidence }}, priority {{ model.priority if model.priority is not none else "unknown" }}{{ "" }}
+{% endfor %}
+{% else %}
+no providers are currently configured
+{% endfor %}
+{% endif %}

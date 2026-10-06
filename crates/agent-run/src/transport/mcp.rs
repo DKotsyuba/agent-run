@@ -324,12 +324,12 @@ impl ServerHandler for Proxy {
             &context, tools,
         ))
     }
-    /// Look up one advertised tool so rmcp can route its call without a second registry.
+    /// Looks up an advertised or call-only compatibility method in the same
+    /// domain registry, retaining its original schema without advertising it.
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        dispatch::tools()
-            .into_iter()
-            .find(|v| v["name"].as_str() == Some(name))
-            .and_then(|v| serde_json::from_value(v).ok())
+        dispatch::tool(name)
+            .and_then(|definition| serde_json::to_value(definition).ok())
+            .and_then(|value| serde_json::from_value(value).ok())
     }
     /// Inject the host binding and forward the call through the resident broker.
     /// Return completed text results, including typed tool failures; SDK negotiation owns framing.
@@ -343,8 +343,8 @@ impl ServerHandler for Proxy {
         }
         let mut arguments = request.arguments.unwrap_or_default();
         // Read tools accept exactly the arguments their shared registry
-        // schema declares (none for `limits` and `delegation_guide`, exact
-        // filters for the others).
+        // schema declares: none for `limits`, exact filters for guide and
+        // the call-only catalog/order compatibility methods.
         if matches!(
             request.name.as_ref(),
             "capacity_order" | "models" | "limits" | "delegation_guide"

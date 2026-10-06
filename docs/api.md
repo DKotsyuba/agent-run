@@ -154,10 +154,12 @@ channels, and status-preserving presentation fallback are documented in
 `schemas/mcp-registration.json` describes commands and environment names
 without registering anything with a host.
 
-The tool set (same names as the MCP server) is exactly `start`, `resume`,
-`cancel`, `steer`, `list_agents`, `answer`, `transcript`, `capacity_order`,
-`doc`, `models`, `delegation_guide`, `limits`, `start_pool`, `pool_post`,
-`pool_replace`, `pool`, and `list_pools`.
+Shared MCP/socket discovery advertises 15 tools: `start`, `resume`, `cancel`,
+`steer`, `list_agents`, `answer`, `transcript`, `doc`, `delegation_guide`,
+`limits`, `start_pool`, `pool_post`, `pool_replace`, `pool`, and `list_pools`.
+`models` and `capacity_order` remain call-only compatibility methods in the
+same registry/dispatcher; their original structured CLI/socket responses and
+schema-1 behavior remain available, including direct MCP calls by known name.
 
 `list_pools` accepts a strict object with optional `state` (`"open"` or
 `"completed"`; omitted/null means all), `limit` (integer 1..200, default 50)
@@ -368,15 +370,23 @@ Notes for the loop:
   daemon is reported as `BrokerUnavailable` instead of falling back locally.
 - CLI `start --wait` repeatedly uses the private socket `wait` method and emits
   its terminal answer; interrupting that client leaves the durable run active.
-- Use `capacity_order` for provider capacity order, optionally for one model.
-- Use `models` for the configured provider catalog, admissible roles and cached
-  quota standing; `limits` returns the latest stored samples without provider calls.
-- `delegation_guide` (no params, schema 2 only) returns one compact plain-text
+- Use `limits` for stored quota windows, percentages, reset times and freshness.
+  With schema 2 it adds `ranking`: provider/model standing, numerical scores and
+  provider multipliers from the same committed snapshot, config revision and
+  advice clock as `items`/`observed_at`. All governing windows and exhaustion
+  facts participate; a healthy short window does not override a weekly zero.
+  Schema 1 keeps its historical window response. MCP text omits account/pool
+  identities and stays within the existing whole-response byte/row bounds.
+- `models` and `capacity_order` retain their structured compatibility responses
+  for existing CLI/socket clients, without joining the advertised MCP catalog.
+- `delegation_guide` (optional exact `provider`, `model`, `profile` filters;
+  schema 2 only) returns one compact plain-text
   routing guide — providers in capacity order with each exact model id, cached
   quota standing, admissible profiles, params, restrictions, and configured
   guidance prose — instead of reading the full `models` JSON just to pick a
   route. Its result is a JSON string here and real MCP text content on the MCP
-  transport; the CLI equivalent is `agent-run delegation-guide`.
+  transport; the default CLI equivalent is `agent-run delegation-guide`.
+  Unknown filters are `ValidationError`; omitted filters keep default guidance.
   Before delegating a task, the orchestrator must call it and read the result
   before choosing provider, model, effort or profile. Routing advice belongs in
   provider/model `recommendations`, not a separately maintained delegation skill.

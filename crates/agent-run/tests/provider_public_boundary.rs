@@ -198,11 +198,26 @@ fn cli(home: &Path, args: &[&str]) -> Output {
 
 /// Execute one real MCP tool call with bounded I/O and guaranteed child cleanup.
 async fn mcp_tool(home: &Path, name: &str, arguments: Value) -> Value {
+    mcp_request(
+        home,
+        "2026-07-28",
+        "tools/call",
+        json!({"name":name,"arguments":arguments}),
+    )
+    .await
+}
+
+/// Executes one raw SDK request against the fixture broker after initialization.
+/// Input/output and exit waits are finite; the exact child is killed/reaped even
+/// on an observation timeout. Host Desktop routing is disabled for this fixture.
+async fn mcp_request(home: &Path, protocol: &str, method: &str, params: Value) -> Value {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_agent-run"))
         .arg("--home")
         .arg(home)
         .arg("mcp")
+        .env_remove("CODEX_MCP_NODE_PATH")
+        .env_remove("CODEX_APP_TOOLS_PIPE_PATH")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -213,9 +228,9 @@ async fn mcp_tool(home: &Path, name: &str, arguments: Value) -> Value {
         let mut input = child.stdin.take().unwrap();
         let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap());
         for message in [
-            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"stable-id-test","version":"1"}}}),
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":protocol,"capabilities":{},"clientInfo":{"name":"stable-id-test","version":"1"}}}),
             json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
-            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":arguments}}),
+            json!({"jsonrpc":"2.0","id":2,"method":method,"params":params}),
         ] {
             input.write_all(format!("{message}\n").as_bytes()).await.unwrap();
         }
@@ -228,7 +243,7 @@ async fn mcp_tool(home: &Path, name: &str, arguments: Value) -> Value {
                 break reply;
             }
         }
-    }).await.expect("MCP call deadline");
+    }).await;
     if tokio::time::timeout(Duration::from_secs(3), child.wait())
         .await
         .is_err()
@@ -236,7 +251,7 @@ async fn mcp_tool(home: &Path, name: &str, arguments: Value) -> Value {
         child.kill().await.unwrap();
         child.wait().await.unwrap();
     }
-    reply
+    reply.expect("MCP call deadline")
 }
 
 /// The exported socket client sends the strict provider request the real
@@ -555,6 +570,93 @@ async fn profile_symlink_escape_keeps_path_escape_error_on_every_transport() {
         .unwrap_err();
     assert!(matches!(malformed, Error::Validation(_)), "{malformed:?}");
     assert_eq!(malformed.public().kind, "ValidationError");
+}
+
+/// One isolated broker and real raw MCP exchanges prove fifteen advertised
+/// tools, filtered guidance, typed errors, diagnostic privacy/numbers, and
+/// unchanged structured CLI/socket compatibility aliases without provider turns.
+#[tokio::test]
+async fn consolidated_routing_discovery_and_legacy_aliases_work_live() {
+    let broker = Broker::start();
+    let client = BrokerClient::new(broker.home.join("api.sock"));
+    let store = agent_run_store::Store::open(&broker.home).unwrap();
+    let at = agent_run_core::domain::now();
+    store.conn.execute(
+        "INSERT INTO capacity_samples(runtime,lane,window,target,source,remaining_percent,reset_at,observed_at,valid_until,payload_json,account_id,quota_key)
+         VALUES('glm-user','fixture','5h',NULL,'fixture',60,?1,?2,?3,'null','acct-work','acct-work::fixture')",
+        rusqlite::params![at + 3600.0, at, at + 600.0],
+    ).unwrap();
+    let discovery = mcp_request(&broker.home, "2026-07-28", "tools/list", json!({})).await;
+    let legacy_discovery = mcp_request(&broker.home, "2025-06-18", "tools/list", json!({})).await;
+    assert_eq!(
+        legacy_discovery["result"]["tools"],
+        discovery["result"]["tools"]
+    );
+    let tools = discovery["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 15, "{discovery}");
+    for name in ["models", "capacity_order"] {
+        assert!(!tools.iter().any(|tool| tool["name"] == name));
+    }
+    let socket_tools = client.call("tools", Some(json!({}))).await.unwrap();
+    assert_eq!(socket_tools.as_array().unwrap().len(), 15);
+    let guide = mcp_tool(
+        &broker.home,
+        "delegation_guide",
+        json!({"provider":"glm-user","model":"fixture","profile":"review"}),
+    )
+    .await;
+    assert_eq!(guide["result"]["isError"], false, "{guide}");
+    let text = guide["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("fixture") && text.contains("review"));
+    for key in ["provider", "model", "profile"] {
+        let bad = mcp_tool(&broker.home, "delegation_guide", json!({key:"missing"})).await;
+        assert_eq!(bad["result"]["isError"], true, "{bad}");
+        assert!(
+            bad["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("ValidationError")
+        );
+    }
+    let limits = mcp_tool(&broker.home, "limits", json!({})).await;
+    assert_eq!(limits["result"]["isError"], false, "{limits}");
+    let text = limits["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("60.0% remaining") && text.contains("resets in"));
+    assert!(text.contains("score") && text.contains("multiplier") && text.contains("priority"));
+    for private in [
+        "acct-work",
+        "synthetic-token",
+        "gateway.example",
+        "FAKE_TOKEN",
+    ] {
+        assert!(!text.contains(private), "{private}: {text}");
+    }
+    for (method, command) in [
+        ("models", &["models"][..]),
+        ("capacity_order", &["capacity", "order"][..]),
+    ] {
+        let legacy = client.call(method, Some(json!({}))).await.unwrap();
+        assert_eq!(legacy["schema_version"], 2);
+        assert!(legacy.get("ranking").is_none());
+        let output = cli(&broker.home, command);
+        assert!(output.status.success(), "{output:?}");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            value["providers"][0]["provider"],
+            legacy["providers"][0]["provider"]
+        );
+        assert_eq!(
+            value.as_object().unwrap().keys().collect::<Vec<_>>(),
+            legacy.as_object().unwrap().keys().collect::<Vec<_>>()
+        );
+        let alias = mcp_tool(&broker.home, method, json!({})).await;
+        assert_eq!(alias["result"]["isError"], false, "{alias}");
+    }
+    let agents: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM agents", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(agents, 0, "read-only smoke must not launch provider turns");
 }
 
 /// The delegation guide is one plain-text result on every public transport:

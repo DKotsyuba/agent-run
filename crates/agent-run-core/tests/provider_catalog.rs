@@ -615,6 +615,151 @@ async fn delegation_guide_is_strict_schema2_and_states_empty_catalogs() {
     );
 }
 
+/// Consolidated reads reuse exact catalog filters, typed errors and stored
+/// window facts while diagnostic ranking preserves numerical/account-free standing.
+#[tokio::test]
+async fn consolidated_guide_filters_and_limits_scores_are_read_only() {
+    let temp = home();
+    let root = temp.path();
+    let service = Service::new(root.to_path_buf());
+    let before = footprint(root);
+    let text = dispatch::call(
+        &service,
+        "delegation_guide",
+        json!({"provider":"codex","model":"gpt-main","profile":"review"}),
+    )
+    .await
+    .unwrap()
+    .as_str()
+    .unwrap()
+    .to_owned();
+    assert!(text.contains("provider codex"));
+    assert!(text.contains("gpt-main"));
+    assert!(text.contains("review"));
+    assert!(text.contains("effort=medium; allowed effort: medium|high"));
+    assert!(!text.contains("gpt-review"));
+    assert!(!text.contains("provider glm"));
+    for bad in [
+        json!({"provider":"missing"}),
+        json!({"model":"gpt"}),
+        json!({"profile":"missing"}),
+        json!({"unknown":1}),
+    ] {
+        let error = dispatch::call(&service, "delegation_guide", bad)
+            .await
+            .unwrap_err();
+        assert_eq!(error.machine_code().as_str(), "ValidationError");
+    }
+    let limits = service.limits().unwrap();
+    assert_eq!(limits["observed_at"], limits["ranking"]["ranked_at"]);
+    assert_eq!(limits["ranking"]["schema_version"], 2);
+    let item = &limits["items"][0];
+    assert_eq!(item["remaining_percent"], 60.0);
+    assert_eq!(item["known"], true);
+    assert!(item["reset_at"].as_f64().unwrap() > item["observed_at"].as_f64().unwrap());
+    assert!(item["valid_until"].as_f64().unwrap() > limits["observed_at"].as_f64().unwrap());
+    let provider = &limits["ranking"]["providers"][0];
+    assert_eq!(provider["provider"], "glm");
+    assert_eq!(provider["priority_multiplier"], 1.0);
+    assert!(provider["score"].as_f64().unwrap() > 0.0);
+    assert!(
+        provider["models"][0]["quota"]["best_priority"]
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
+    assert!(!limits["ranking"].to_string().contains("acct-"));
+    assert_eq!(before, footprint(root));
+}
+
+/// A quota commit between registry and windows cannot split the diagnostic
+/// response: old windows/standing/revision stay together until the next read.
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn diagnostic_windows_and_ranking_share_one_committed_snapshot() {
+    let temp = home();
+    let root = temp.path();
+    let (config, revision) = agent_run_config::provider_config::ProviderConfig::load(root).unwrap();
+    let before = footprint(root)[4];
+    let at = agent_run_core::domain::now();
+    let value = agent_run_core::capacity::provider_catalog::diagnostics_observed(
+        root, &config, &revision, &mut || {
+            let mut store = agent_run_store::Store::open(root).unwrap();
+            store.disable_account(&"acct-glm".parse().unwrap()).unwrap();
+            store.conn.execute(
+                "UPDATE capacity_samples SET remaining_percent=0, valid_until=?1 WHERE account_id='acct-glm'",
+                [at + 600.0],
+            ).unwrap();
+        },
+    ).unwrap();
+    assert_eq!(value["ranking"]["capacity_revision"], before);
+    assert_eq!(value["observed_at"], value["ranking"]["ranked_at"]);
+    assert_eq!(value["items"][0]["remaining_percent"], 60.0);
+    assert_eq!(
+        value["ranking"]["providers"][0]["models"][0]["quota"]["status"],
+        "available"
+    );
+    let after =
+        agent_run_core::capacity::provider_catalog::diagnostics(root, &config, &revision).unwrap();
+    assert_eq!(after["items"][0]["remaining_percent"], 0.0);
+    let glm = after["ranking"]["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["provider"] == "glm")
+        .unwrap();
+    assert_eq!(glm["models"][0]["quota"]["status"], "no_eligible_account");
+}
+
+/// A healthy short window never hides an exhausted weekly window. Expired
+/// diagnostics keep reset timestamps and explicit stale/unknown standing.
+#[test]
+fn diagnostic_standing_uses_all_windows_and_keeps_stale_facts() {
+    let temp = home();
+    let root = temp.path();
+    let at = agent_run_core::domain::now();
+    let store = agent_run_store::Store::open(root).unwrap();
+    store
+        .conn
+        .execute("UPDATE capacity_samples SET remaining_percent=100", [])
+        .unwrap();
+    store.conn.execute(
+        "INSERT INTO capacity_samples(runtime,lane,window,target,source,remaining_percent,reset_at,observed_at,valid_until,payload_json,account_id,quota_key)
+         VALUES('glm','glm-5.3','weekly',NULL,'collector',0,?1,?2,?3,'null','acct-glm','acct-glm::glm-5.3')",
+        rusqlite::params![at + 7200.0, at, at + 600.0],
+    ).unwrap();
+    let service = Service::new(root.to_path_buf());
+    let limits = service.limits().unwrap();
+    let items = limits["items"].as_array().unwrap();
+    assert!(items.iter().any(|item| item["remaining_percent"] == 100.0));
+    assert!(items.iter().any(|item| item["remaining_percent"] == 0.0));
+    let glm = limits["ranking"]["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["provider"] == "glm")
+        .unwrap();
+    assert_eq!(glm["models"][0]["quota"]["status"], "exhausted");
+    store
+        .conn
+        .execute("UPDATE capacity_samples SET valid_until=?1", [at - 1.0])
+        .unwrap();
+    let stale = service.limits().unwrap();
+    for item in stale["items"].as_array().unwrap() {
+        assert_eq!(item["known"], false);
+        assert!(item["remaining_percent"].is_null());
+        assert!(item["reset_at"].is_number());
+    }
+    let glm = stale["ranking"]["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["provider"] == "glm")
+        .unwrap();
+    assert_eq!(glm["models"][0]["quota"]["status"], "unknown");
+    assert_eq!(glm["models"][0]["quota"]["evidence"], "stale");
+}
+
 /// Operator `limits` keeps two accounts sharing one provider lane apart.
 #[test]
 fn limits_keep_account_bound_rows_distinct() {

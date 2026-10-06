@@ -540,10 +540,13 @@ fn python_socket_surface_is_shared_tools_plus_controls() {
     }
     let registry: std::collections::BTreeSet<_> = agent_run_domain::registry()
         .iter()
+        .filter(|tool| tool.legacy_for.is_none())
         .map(|tool| tool.name.clone())
         .collect();
     assert_eq!(names, registry, "the socket surface is the shared table");
-    assert_eq!(names.len(), 17);
+    assert_eq!(names.len(), 15);
+    assert!(!names.contains("models"));
+    assert!(!names.contains("capacity_order"));
 }
 
 /// Mirrors `tests/test_api_socket.py::ApiSocketTests::test_wait_timeout_validation`.

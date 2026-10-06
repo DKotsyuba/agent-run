@@ -1933,8 +1933,17 @@ impl Service {
             )),
         }
     }
+    /// Returns stored quota windows and, for schema 2, provider/model numerical
+    /// ranking from one committed snapshot and active config revision. Schema 1
+    /// retains the historical JSON shape. No collection or engine launch occurs.
     pub fn limits(&self) -> Result<Value> {
-        crate::capacity::limits(&self.home)
+        let active = self.active_config()?;
+        match &active.value {
+            CachedConfigValue::Providers(config) => {
+                crate::capacity::provider_catalog::diagnostics(&self.home, config, &active.revision)
+            }
+            CachedConfigValue::Legacy(_) => crate::capacity::limits(&self.home),
+        }
     }
 
     /// Public `capacity_order` read: the provider-only order of
@@ -1965,6 +1974,14 @@ impl Service {
     /// any new quota read, collection, or ranking. A schema-1 config has no
     /// provider catalog, so the whole read is `Unsupported` there.
     pub fn delegation_guide(&self) -> Result<Value> {
+        self.delegation_guide_filtered(agent_run_domain::ModelsQuery::default())
+    }
+
+    /// Renders the same compact account-free guidance for exact provider/model/
+    /// profile filters, using the catalog's admission rules and one committed
+    /// snapshot. Unknown filters are typed ValidationError; schema 1 remains
+    /// Unsupported. Omitted filters retain the historical default guidance.
+    pub fn delegation_guide_filtered(&self, query: agent_run_domain::ModelsQuery) -> Result<Value> {
         let active = self.active_config()?;
         match &active.value {
             CachedConfigValue::Providers(config) => {
@@ -1972,7 +1989,7 @@ impl Service {
                     &self.home,
                     config,
                     &active.revision,
-                    &agent_run_domain::ModelsQuery::default(),
+                    &query,
                 )?;
                 Ok(Value::String(crate::delegation_guide::render(&catalog)?))
             }

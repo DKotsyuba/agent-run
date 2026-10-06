@@ -45,7 +45,7 @@ fn environment() -> &'static Environment<'static> {
 /// Renders the guide text for one `models`-shaped catalog snapshot.
 ///
 /// `catalog` must be the value [`crate::capacity::provider_catalog::models`]
-/// returned for the default (unfiltered) query: providers already stand in
+/// returned for the caller's exact filters (or default query): providers stand in
 /// capacity order with each model's cached quota standing, admissible
 /// profiles, configured params, restrictions, and recommendation prose. The
 /// template owns prose and conditional omission over the compact projection

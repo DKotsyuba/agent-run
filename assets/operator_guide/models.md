@@ -16,8 +16,9 @@ admitting work with that model.
 
 ## Schema 2: the provider catalog
 
-With `schema_version = 2`, `models` is the public provider catalog and
-`capacity_order` the provider-only capacity order. Both are read-only views of
+MCP discovery exposes two routing reads: `delegation_guide` and `limits`.
+With `schema_version = 2`, the call-only compatibility methods `models` and
+`capacity_order` retain the structured provider catalog and capacity order. Both are read-only views of
 the current valid config, the canonical role files, and committed quota
 observations: they never collect quota, probe a harness, reserve capacity or
 start work. The caller alone picks provider, model, effort and profile; the
@@ -30,8 +31,8 @@ agent-run models --provider codex --profile review --model gpt-main
 agent-run capacity order --model gpt-main
 ```
 
-The same filters are the `models` / `capacity_order` tool arguments over MCP
-and the broker socket (`{"provider":..,"profile":..,"model":..}`,
+The same filters remain accepted by direct compatibility calls to `models` /
+`capacity_order` over MCP and the broker socket (`{"provider":..,"profile":..,"model":..}`,
 `{"model":..}`). Each result carries `config_revision` (SHA-256 of the exact
 `config.toml` bytes), `capacity_revision` (the committed quota/registry
 snapshot it was read from) and `ranked_at` (the clock the standing was
@@ -111,17 +112,22 @@ ranking; only use values admitted by the configured `allowed_params`.
 
 ## MCP compact presentation
 
-Over MCP, `models` renders providers in order with their harness, per-model
-quota status and freshness evidence, admissible profiles (stated once when
-identical across models), params, restrictions and configured guidance.
-`capacity_order` renders provider scores/multipliers and each model's quota
-status and evidence. Both omit skills/MCP arrays, hashes, accounts and
-endpoints; the broker socket and CLI keep the full structured JSON above.
+Use `delegation_guide` for compact provider/model guidance and `limits` for
+diagnosis. Limits retain quota windows, percentages, reset times and freshness
+and add schema-2 provider/model standing, scores and provider multipliers in
+`ranking`. Windows and ranking share one committed snapshot, config revision
+and advice clock (`observed_at` equals `ranking.ranked_at`); the existing ranker
+considers every governing window and exhaustion fact. Unknown/stale capacity
+is never presented as healthy. MCP text omits account/pool identities and
+retains whole-response size/row bounds; CLI/socket diagnostic JSON keeps those
+original physical-window identities. Call-only `models` and `capacity_order`
+retain their original compact MCP layouts and structured CLI/socket shapes.
 
 ## Delegation guide
 
-`agent-run delegation-guide` (or the no-argument `delegation_guide` tool over
-MCP and the broker socket) renders the same committed snapshot as one compact
+`agent-run delegation-guide` renders the default guide. The `delegation_guide`
+read over MCP/socket also accepts exact optional `provider`, `model`, and
+`profile` filters, with typed `ValidationError` for unknown names. It renders the same committed snapshot as one compact
 plain-text page for an orchestrator choosing a route: a compact operating header,
 then each provider in capacity order with its harness, configured provider
 guidance, and one short line per exact selectable model id — cached quota

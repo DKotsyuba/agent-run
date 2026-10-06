@@ -1052,6 +1052,8 @@ struct ModelTextView {
     status: String,
     /// Explicit observation evidence classification.
     evidence: String,
+    /// Existing best model priority, including zero; unknown stays absent.
+    priority: Option<f64>,
     /// Exact admissible profile list, optionally hoisted to the provider.
     profiles: Option<String>,
     /// Faithful configured parameter choices.
@@ -1148,6 +1150,8 @@ struct LimitTextView {
 struct LimitsTextView {
     /// Every source diagnostic in order.
     items: Vec<LimitTextView>,
+    /// Optional account-free schema-2 standing from the same diagnostic snapshot.
+    ranking: Option<CatalogTextView>,
 }
 
 /// Converts the existing dynamic catalog projection to its allowlisted typed view.
@@ -1503,6 +1507,12 @@ fn validate_result(tool: &str, value: &Value) -> Result<()> {
             required_rows(value, "unavailable_runtimes", policy.rows)?;
         }
         "limits" => {
+            if let Some(ranking) = value.get("ranking") {
+                if ranking["schema_version"] != 2 || ranking["ranked_at"] != value["observed_at"] {
+                    return Err(shape_error());
+                }
+                validate_result("capacity_order", ranking)?;
+            }
             for item in required_rows(value, "items", policy.rows)? {
                 let known = required_bool(item, "known")?;
                 for key in ["runtime", "lane", "window"] {
@@ -2074,6 +2084,7 @@ fn order_context(value: &Value) -> Value {
                         json!({
                             "id": model["model"].as_str().map(exact_display), "status": model["quota"]["status"],
                             "evidence": model["quota"]["evidence"],
+                            "priority": model["quota"]["best_priority"].as_f64(),
                         })
                     }).collect::<Vec<_>>(),
                 })
@@ -2103,6 +2114,7 @@ fn order_context(value: &Value) -> Value {
 fn limits_context(value: &Value) -> Value {
     let observed_at = value["observed_at"].as_f64();
     json!({
+        "ranking": value.get("ranking").map(order_context),
         "items": value["items"].as_array().into_iter().flatten().map(|item| {
             let key = &item["key"];
             json!({
@@ -3329,5 +3341,41 @@ mod tests {
                 "{legacy}"
             );
         }
+    }
+
+    /// Diagnostic text preserves zero scores and explicit multipliers while
+    /// private physical identities, invalid standing/clock and oversized rows fail closed.
+    #[test]
+    fn limits_ranking_preserves_numbers_privacy_and_existing_bounds() {
+        let value = json!({
+            "observed_at":100.0,
+            "items":[{"key":{"runtime":"glm","lane":"m","window":"5h"},
+                "known":true,"remaining_percent":100.0,"reset_at":200.0,
+                "account":"PRIVATE_ACCOUNT","pool":"PRIVATE_POOL"}],
+            "ranking":{"schema_version":2,"capacity_revision":5,"ranked_at":100.0,
+                "config_revision":"PRIVATE_REVISION",
+                "providers":[{"provider":"glm","score":0.0,"priority_multiplier":2.5,
+                    "models":[{"model":"m","quota":{"status":"exhausted","evidence":"fresh","best_priority":0.0}}]}]}
+        });
+        let rendered = text("limits", &value);
+        assert!(rendered.contains("100.0% remaining"), "{rendered}");
+        assert!(rendered.contains("score 0"), "{rendered}");
+        assert!(rendered.contains("multiplier 2.5"), "{rendered}");
+        assert!(rendered.contains("exhausted") && rendered.contains("priority 0"));
+        for private in ["PRIVATE_ACCOUNT", "PRIVATE_POOL", "PRIVATE_REVISION"] {
+            assert!(!rendered.contains(private));
+        }
+        let mut wrong = value.clone();
+        wrong["ranking"]["ranked_at"] = json!(99.0);
+        assert_eq!(success_result("limits", &wrong).is_error, Some(true));
+        wrong = value.clone();
+        wrong["ranking"]["providers"][0]["models"][0]["quota"]["status"] = json!("made_up");
+        assert_eq!(success_result("limits", &wrong).is_error, Some(true));
+        wrong = value.clone();
+        wrong["items"] = json!(vec![value["items"][0].clone(); 21]);
+        assert_eq!(success_result("limits", &wrong).is_error, Some(true));
+        wrong = value.clone();
+        wrong["ranking"]["providers"] = json!(vec![value["ranking"]["providers"][0].clone(); 101]);
+        assert_eq!(success_result("limits", &wrong).is_error, Some(true));
     }
 }
