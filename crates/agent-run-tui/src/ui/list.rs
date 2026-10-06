@@ -337,7 +337,10 @@ fn render_empty_hint(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("  ", Style::new()),
-            Span::styled(app.spinner(), theme::accent()),
+            Span::styled(
+                if app.loaded { "○" } else { app.spinner() },
+                theme::accent(),
+            ),
             Span::raw(" "),
             Span::styled(text, theme::dim()),
         ])),

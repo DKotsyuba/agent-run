@@ -1476,9 +1476,9 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, split: bool) {
     if buffer.messages.is_empty() {
         let placeholder = Line::from(Span::styled(
             if buffer.history_complete {
-                "No transcript messages yet."
+                "No transcript messages yet.".to_string()
             } else {
-                "Loading transcript…"
+                format!("{} Loading transcript…", app.spinner())
             },
             theme::dim(),
         ));
@@ -1502,11 +1502,11 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, split: bool) {
         if top > 0 && line == 0 {
             lines.push(Line::from(Span::styled(
                 if buffer.loading_older {
-                    "  loading older history…"
+                    format!("  {} loading older history…", app.spinner())
                 } else if buffer.previous_cursor.is_none() {
-                    "  beginning of transcript"
+                    "  beginning of transcript".into()
                 } else {
-                    "  scroll up for older history"
+                    "  scroll up for older history".into()
                 },
                 theme::dim(),
             )));

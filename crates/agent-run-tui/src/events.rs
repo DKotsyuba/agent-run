@@ -31,20 +31,20 @@ const RETRY_DELAY: Duration = Duration::from_secs(2);
 /// Engines stream in bursts; a fast cadence keeps follow mode visually at
 /// the tail instead of chasing it a second behind.
 const TRANSCRIPT_TAIL_POLL: Duration = Duration::from_millis(300);
-/// Terminal redraw cadence for the spinner and locally derived clocks.
-const TICK: Duration = Duration::from_secs(1);
+/// Visible spinner cadence; quiet ticks never request a redraw or broker fetch.
+const TICK: Duration = Duration::from_millis(100);
 /// Session rows the selection logic assumes between redraws; rendering
 /// clamps with the real height, this only keeps `list_scroll` current.
 const ASSUMED_CARD_ROWS: usize = 12;
 /// Minimum spacing between sessions listings once data is flowing; bursts
 /// of revision commits coalesce into one fetch per interval.
 const LISTING_INTERVAL: Duration = Duration::from_millis(500);
-/// Minimum spacing between two draws: the frame-rate cap (33 ms, ~30 fps).
+/// Minimum spacing between draws, rounded up to guarantee at most 30 frames/second.
 ///
 /// Events apply to the state as they arrive; draws are paced by
 /// [`FramePacer`], so a firehose of broker commits or input costs at most
 /// one draw per interval.
-pub const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+pub const FRAME_INTERVAL: Duration = Duration::from_nanos(33_333_334);
 
 /// Events produced by the terminal (keys, mouse, resizes).
 #[derive(Debug)]
@@ -101,6 +101,15 @@ pub enum BrokerEvent {
     },
     /// Public status read for a selected roster member.
     PoolMember(Result<Box<agent_run_domain::AgentView>, String>),
+    /// One clipboard job's actual outcome; generation rejects completions superseded by a newer job.
+    Copied {
+        /// Frozen local job generation.
+        generation: u64,
+        /// Frozen target whose native write actually completed or was cancelled.
+        target: crate::clipboard::Target,
+        /// Copied UTF-8 bytes; read failures leave clipboard unchanged, native write races report unknown outcome.
+        result: Result<usize, String>,
+    },
 }
 
 /// Commands addressed to the transcript watcher.
@@ -427,6 +436,10 @@ pub enum Action {
     Tab(bool),
     /// Pure read-only pool navigation.
     Pool(crate::pools::Action),
+    /// Copy the entire frozen selected chat in the background.
+    Copy,
+    /// Cancel the pending copy and wait for owned worker cleanup.
+    CancelCopy,
 }
 
 /// Maps one key press to an action given the current screen and popup state.
@@ -463,6 +476,12 @@ pub fn key_action(app: &App, key: KeyEvent) -> Action {
         KeyCode::Char('2') => return Action::Tab(true),
         KeyCode::BackTab => return Action::Tab(!app.pools.visible),
         _ => {}
+    }
+    if key.code == KeyCode::Char('y') && !app.pools.criteria {
+        return Action::Copy;
+    }
+    if key.code == KeyCode::Esc && app.copy_request.is_some() {
+        return Action::CancelCopy;
     }
     if app.pools.visible && !app.pools.member_transcript {
         return crate::pools::key(app, key.code);
@@ -526,12 +545,59 @@ pub fn apply_action(app: &mut App, action: Action) -> Dispatched {
             if app.pools.visible != pools {
                 app.close_transcript();
                 app.pools.visible = pools;
+                if pools {
+                    app.pools.focused = false;
+                    app.pools.refresh = app.pools.refresh.wrapping_add(1);
+                }
                 app.pools.member_transcript = false;
                 app.pools.member_watch = false;
                 app.pools.pending_member = None;
                 app.dirty = true;
                 return Dispatched::Clear;
             }
+            Dispatched::None
+        }
+        Action::Copy => {
+            if app.copy_request.is_some() {
+                return Dispatched::None;
+            }
+            let target = if app.pools.visible && !app.pools.member_transcript {
+                app.pools
+                    .selected
+                    .clone()
+                    .map(crate::clipboard::Target::Pool)
+            } else if app.screen == crate::app::Screen::Transcript || app.pools.member_transcript {
+                app.transcript
+                    .as_ref()
+                    .map(|b| crate::clipboard::Target::Agent {
+                        agent: b.agent.agent_id.clone(),
+                        run: b.agent.run_id.clone(),
+                    })
+            } else {
+                app.selected_agent_id()
+                    .map(|agent| crate::clipboard::Target::Agent {
+                        agent,
+                        run: app.selected_run_id(),
+                    })
+            };
+            if let Some(target) = target {
+                app.copy_generation = app.copy_generation.wrapping_add(1);
+                app.copy_request = Some(crate::clipboard::Request {
+                    generation: app.copy_generation,
+                    target,
+                });
+                app.copy_feedback = None;
+                app.dirty = true;
+            } else {
+                app.copy_feedback = Some("Select an agent or pool to copy".into());
+                app.dirty = true;
+            }
+            Dispatched::None
+        }
+        Action::CancelCopy => {
+            app.copy_request = None;
+            app.copy_feedback = Some("Stopping copy…".into());
+            app.dirty = true;
             Dispatched::None
         }
         Action::Pool(action) => crate::pools::apply(app, action),
@@ -610,6 +676,11 @@ pub fn apply_action(app: &mut App, action: Action) -> Dispatched {
             Dispatched::None
         }
         Action::Refresh => {
+            if app.pools.visible && !app.pools.member_transcript {
+                app.pools.refresh = app.pools.refresh.wrapping_add(1);
+                app.dirty = true;
+                return Dispatched::None;
+            }
             app.loaded = false;
             Dispatched::Scope
         }
@@ -1020,8 +1091,10 @@ impl Pipeline {
                 }
                 _ => Dispatched::None,
             },
-            TerminalEvent::Resize(_, _) => {
+            TerminalEvent::Resize(width, height) => {
                 self.input.flush(app);
+                app.last_width = width.max(1);
+                app.last_height = height.max(1);
                 app.dirty = true;
                 Dispatched::None
             }
@@ -1092,6 +1165,21 @@ impl Pipeline {
             BrokerEvent::PoolMember(Ok(agent)) => {
                 let _ = crate::pools::open_member(app, *agent);
             }
+            BrokerEvent::Copied {
+                generation,
+                target,
+                result,
+            } => {
+                if app.copy_generation == generation {
+                    let label = target.label();
+                    app.copy_feedback = Some(match result {
+                        Ok(bytes) => format!("Copied {label} · {bytes} bytes"),
+                        Err(error) => format!("Copy failed for {label}: {error}"),
+                    });
+                    app.copy_request = None;
+                    app.dirty = true;
+                }
+            }
             BrokerEvent::PoolMember(Err(error)) => {
                 app.pools.error = Some(error);
                 app.dirty = true;
@@ -1127,6 +1215,7 @@ impl Pipeline {
             if !app.pools.member_transcript {
                 if let Some(position) = self.input.hover.take() {
                     self.pointer = Some(position);
+                    app.dirty |= crate::pools::hover(app, position.0, position.1);
                 }
                 crate::pools::older(app);
                 return Dispatched::None;
@@ -1319,6 +1408,14 @@ pub async fn run(
         broker_tx.clone(),
     ));
 
+    let (copy_tx, copy_rx) = watch::channel(app.copy_request.clone());
+    let copy_worker = tokio::spawn(crate::clipboard::worker(
+        broker.clone(),
+        Arc::new(crate::clipboard::NativeClipboard),
+        copy_rx,
+        broker_tx.clone(),
+    ));
+
     let loop_ctx = Loop {
         watch_tx,
         scope_tx,
@@ -1332,6 +1429,14 @@ pub async fn run(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
+        copy_tx.send_if_modified(|current| {
+            if *current == app.copy_request {
+                false
+            } else {
+                *current = app.copy_request.clone();
+                true
+            }
+        });
         pool_tx.send_if_modified(|current| {
             let next = app.pools.request(&app.sessions);
             if *current == next {
@@ -1378,6 +1483,8 @@ pub async fn run(
             }
         }
         if app.quit {
+            drop(copy_tx);
+            let _ = copy_worker.await;
             return Ok(());
         }
         let now = Instant::now();
@@ -2327,6 +2434,187 @@ mod tests {
         }
     }
 
+    /// A genuinely suspended broker worker cannot delay input, resize, cached rendering or quit.
+    #[tokio::test]
+    async fn delayed_broker_keeps_input_resize_and_cached_frame_responsive() {
+        /// Signals that a real worker entered its read, then stays pending until cancellation.
+        struct DelayedBroker {
+            /// One notification consumed by the test before applying UI events.
+            entered: tokio::sync::Notify,
+        }
+        impl Broker for DelayedBroker {
+            /// Reports the pending read without touching any external service or starting a turn.
+            fn call<'a>(&'a self, _: &'a str, _: serde_json::Value) -> net::BrokerFuture<'a> {
+                Box::pin(async move {
+                    self.entered.notify_one();
+                    std::future::pending().await
+                })
+            }
+        }
+        let broker = Arc::new(DelayedBroker {
+            entered: tokio::sync::Notify::new(),
+        });
+        let (commands, rx) = watch::channel(WatchCommand::Watch {
+            agent: STABLE.parse().unwrap(),
+            run: Some(RUN.parse().unwrap()),
+            cursor: 1,
+        });
+        let (tx, _events) = mpsc::channel(2);
+        let worker = tokio::spawn(transcript_worker(broker.clone(), rx, tx));
+        tokio::time::timeout(Duration::from_secs(2), broker.entered.notified())
+            .await
+            .unwrap();
+        let mut app = split_app(
+            serde_json::json!([{"seq":1,"at":1.0,"role":"assistant","name":null,"content":"cached response","raw_ref":null}]),
+        );
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+        let mut pipeline = Pipeline::new(FRAME_INTERVAL);
+        let start = Instant::now();
+        let timed = Instant::now();
+        pipeline.ui_event(&mut app, UiEvent::Terminal(TerminalEvent::Resize(120, 36)));
+        for _ in 0..100 {
+            pipeline.ui_event(&mut app, press(KeyCode::Down));
+        }
+        assert!(frame_step(&mut pipeline, &mut app, &mut terminal, start));
+        assert_eq!((app.last_width, app.last_height), (120, 36));
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("cached response"));
+        assert!(!screen.contains("Loading transcript"));
+        assert!(
+            !worker.is_finished(),
+            "broker remains suspended throughout the UI update"
+        );
+        pipeline.ui_event(&mut app, press(KeyCode::Char('q')));
+        assert!(app.quit);
+        let elapsed = timed.elapsed();
+        println!(
+            "100 input events + resize + cached draw + quit during pending broker: {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_secs(1), "UI waited on broker");
+        drop(commands);
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+    }
+
+    /// The production interval never permits a 31st draw inside one second.
+    #[test]
+    fn production_frame_cap_is_strictly_thirty() {
+        assert!(FRAME_INTERVAL * 30 >= Duration::from_secs(1));
+        let mut pacer = FramePacer::new(FRAME_INTERVAL);
+        let start = Instant::now();
+        let mut now = start;
+        let mut count = 0;
+        while now < start + Duration::from_secs(1) {
+            count += 1;
+            pacer.record(now);
+            now = pacer.due(now);
+        }
+        assert_eq!(count, 30);
+    }
+
+    /// Resizing updates view state before rendering and needs one frame across the split threshold.
+    #[test]
+    fn resize_updates_state_before_one_draw() {
+        let mut app = App::new();
+        app.loaded = true;
+        app.last_width = 80;
+        app.last_height = 24;
+        let mut pipeline = Pipeline::new(FRAME_INTERVAL);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+        pipeline.ui_event(&mut app, UiEvent::Terminal(TerminalEvent::Resize(120, 36)));
+        assert_eq!((app.last_width, app.last_height), (120, 36));
+        let now = Instant::now();
+        assert!(frame_step(&mut pipeline, &mut app, &mut terminal, now));
+        assert_eq!(pipeline.next_frame(&app, now + FRAME_INTERVAL), None);
+    }
+
+    /// First transcript loads animate without input, then cached content restores without loaders.
+    #[tokio::test]
+    async fn loader_timer_advances_without_input_and_stops_after_load() {
+        crate::tests_support::force_truecolor();
+        let agent = crate::tests_support::agent_view(STABLE, RUN, "succeeded");
+        let mut app = App::new();
+        app.completed_open = true;
+        app.last_width = 120;
+        app.last_height = 36;
+        app.apply_sessions(&sessions_page(vec![agent.clone()], 1));
+        app.watch_agent(agent.clone());
+        let mut pipeline = Pipeline::new(FRAME_INTERVAL);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+        let start = Instant::now();
+        assert!(frame_step(&mut pipeline, &mut app, &mut terminal, start));
+        let mut ticker = tokio::time::interval(TICK);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await;
+        let glyph = app.spinner();
+        let mut previous = glyph;
+        let mut draws = 0;
+        for index in 1..=10 {
+            ticker.tick().await;
+            app.tick();
+            assert_ne!(app.spinner(), previous);
+            previous = app.spinner();
+            draws += usize::from(frame_step(
+                &mut pipeline,
+                &mut app,
+                &mut terminal,
+                start + TICK * index,
+            ));
+        }
+        assert_eq!(draws, 10);
+        assert_eq!(
+            app.spinner(),
+            glyph,
+            "one complete spinner cycle without keyboard input"
+        );
+        pipeline.broker_event(&mut app, delta(1));
+        app.transcript.as_mut().unwrap().history_complete = true;
+        frame_step(
+            &mut pipeline,
+            &mut app,
+            &mut terminal,
+            start + Duration::from_secs(2),
+        );
+        assert!(!app.tick_animates());
+        for index in 1..=10 {
+            ticker.tick().await;
+            app.tick();
+            assert!(!frame_step(
+                &mut pipeline,
+                &mut app,
+                &mut terminal,
+                start + Duration::from_secs(2) + TICK * index
+            ));
+        }
+        app.close_transcript();
+        app.watch_agent(agent);
+        app.dirty = true;
+        frame_step(
+            &mut pipeline,
+            &mut app,
+            &mut terminal,
+            start + Duration::from_secs(4),
+        );
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("delta-1"));
+        assert!(!screen.contains("Loading transcript"));
+        println!(
+            "no-input loader: 10 draws/second while loading, 0 after completion; cached transcript visible"
+        );
+    }
+
     #[test]
     fn frame_pacer_leads_after_idle_and_trails_within_the_interval() {
         let t0 = Instant::now();
@@ -2701,15 +2989,15 @@ mod tests {
     }
 
     /// End-to-end probe of the frame-capped pipeline under an event storm;
-    /// run with `cargo test --release --locked -p agent-run-tui -- --ignored
-    /// --nocapture`. The same storm with the cap disabled (draw whenever
-    /// dirty) is printed for comparison.
+    /// run with `cargo test --release --locked -p agent-run-tui end_to_end_event_storm_probe -- --ignored
+    /// --nocapture`. The same storm at the previous 33ms spacing is printed
+    /// for comparison; both cases use the production state and renderer.
     #[test]
     #[ignore = "timing probe"]
     fn end_to_end_event_storm_probe() {
         for (label, interval) in [
-            ("capped at FRAME_INTERVAL", FRAME_INTERVAL),
-            ("cap disabled", Duration::ZERO),
+            ("previous 33ms cap", Duration::from_millis(33)),
+            ("strict 30FPS cap", FRAME_INTERVAL),
         ] {
             let report = event_storm(interval);
             println!(

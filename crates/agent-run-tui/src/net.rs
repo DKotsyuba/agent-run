@@ -36,6 +36,16 @@ pub trait Broker: Send + Sync {
     /// Send one method and JSON object to the resident broker.
     fn call<'a>(&'a self, method: &'a str, params: Value) -> BrokerFuture<'a>;
 
+    /// Uses the discovery lane even for compatibility pool probes; tests may share their call seam.
+    fn discovery_call<'a>(&'a self, method: &'a str, params: Value) -> BrokerFuture<'a> {
+        self.call(method, params)
+    }
+
+    /// Reads on the independent export lane; test brokers may share their scripted call seam.
+    fn copy_call<'a>(&'a self, method: &'a str, params: Value) -> BrokerFuture<'a> {
+        self.call(method, params)
+    }
+
     /// Returns the pool socket generation, incremented whenever its connection is retired.
     fn pool_connection_generation(&self) -> u64 {
         0
@@ -45,13 +55,13 @@ pub trait Broker: Send + Sync {
 /// Shared dynamic broker seam handed to the event workers.
 pub type SharedBroker = Arc<dyn Broker>;
 
-/// Production broker with independent sessions, transcript, answer and pool sockets.
+/// Production broker with independent sessions, transcript, answer, pool detail/discovery and copy sockets.
 /// Dropping an incomplete call retires its socket before it can serve a new call.
 pub struct SocketBroker {
     /// Socket endpoint for lazy replacements after cancellation.
     socket: PathBuf,
-    /// Persistent connection per worker lane (list, transcript, one-shot, pools).
-    clients: [std::sync::Mutex<Arc<BrokerClient>>; 4],
+    /// Persistent connection per worker lane (list, transcript, one-shot, pool, discovery, copy).
+    clients: [std::sync::Mutex<Arc<BrokerClient>>; 6],
     /// Pool lane generation observed by compatibility discovery.
     pool_generation: AtomicU64,
     /// Filesystem identity of the currently published pool socket.
@@ -59,7 +69,7 @@ pub struct SocketBroker {
 }
 
 impl SocketBroker {
-    /// Creates four lazy clients; no socket opens before its first call.
+    /// Creates six lazy clients; no socket opens before its first call.
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         let socket = socket_path.into();
         let pool_socket_identity = socket
@@ -125,9 +135,25 @@ impl Broker for SocketBroker {
         let index = match method {
             "list_agents" => 0,
             "transcript" => 1,
-            "pool" | "list_pools" => 3,
+            "pool" => 3,
+            "list_pools" => 4,
             _ => 2,
         };
+        self.call_on(index, method, params)
+    }
+    /// Keeps legacy pool probes independent of selected detail reads.
+    fn discovery_call<'a>(&'a self, method: &'a str, params: Value) -> BrokerFuture<'a> {
+        self.call_on(4, method, params)
+    }
+    /// Copies history without holding the active transcript or pool watcher socket.
+    fn copy_call<'a>(&'a self, method: &'a str, params: Value) -> BrokerFuture<'a> {
+        self.call_on(5, method, params)
+    }
+}
+
+impl SocketBroker {
+    /// Runs one read on a dedicated lane and retires its connection if cancelled or broken.
+    fn call_on<'a>(&'a self, index: usize, method: &'a str, params: Value) -> BrokerFuture<'a> {
         Box::pin(async move {
             let lane = &self.clients[index];
             let client = lane.lock().expect("broker lane").clone();
@@ -135,10 +161,10 @@ impl Broker for SocketBroker {
                 lane,
                 socket: &self.socket,
                 complete: false,
-                pool_generation: (index == 3).then_some(&self.pool_generation),
+                pool_generation: matches!(index, 3 | 4).then_some(&self.pool_generation),
             };
             let result = client.call(method, Some(params)).await;
-            if index == 3
+            if matches!(index, 3 | 4)
                 && result.as_ref().err().is_some_and(|error| {
                     matches!(
                         error,

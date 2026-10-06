@@ -31,8 +31,8 @@ pub struct Page {
     pub entries: Vec<PoolEntryView>,
     /// Exclusive reverse cursor, absent for forward reads.
     pub before_seq: Option<u64>,
-    /// Last durable sequence, independent of page direction.
-    pub last_seq: u64,
+    /// Last durable sequence, independent of page direction; null for an empty log.
+    pub last_seq: Option<u64>,
     /// No further entries in the requested direction.
     pub complete: bool,
     /// Current or frozen status, supplied even by empty polls.
@@ -130,8 +130,8 @@ pub struct Buffer {
     pub entries: Vec<PoolEntryView>,
     /// Latest sequence actually loaded, never the server's unseen last_seq.
     pub after: u64,
-    /// Durable tail known from the last status page; retained window may end earlier.
-    pub last_seq: u64,
+    /// Durable tail known from status; absent for an empty log, never invented as zero.
+    pub last_seq: Option<u64>,
     /// Whether all older history is loaded.
     pub history_complete: bool,
     /// In-flight reverse cursor; cleared on response or target switch.
@@ -165,7 +165,7 @@ impl Buffer {
             status: None,
             entries: vec![],
             after: 0,
-            last_seq: 0,
+            last_seq: None,
             history_complete: false,
             older: None,
             follow: true,
@@ -238,7 +238,10 @@ impl Buffer {
         }
         // Initial tail reads establish a forward cursor; later reverse pages never rewind it.
         if self.after == 0 {
-            self.after = self.entries.last().map_or(page.last_seq, |e| e.seq);
+            self.after = self
+                .entries
+                .last()
+                .map_or(page.last_seq.unwrap_or(0), |e| e.seq);
         }
         if self.entries.len() > ENTRY_CAP {
             if backward {
@@ -319,6 +322,8 @@ pub struct Pools {
     pub completed_total: u64,
     /// Shared offset of the two independently filtered discovery pages.
     pub offset: usize,
+    /// Explicit tab activation/refresh generation; never invalidates usable cached content.
+    pub refresh: u64,
     /// Selected stable pool, including direct CLI targets absent from discovery.
     pub selected: Option<PoolId>,
     /// Selected buffer followed by at most three older selections.
@@ -403,6 +408,7 @@ impl Pools {
         Request {
             visible: self.visible,
             offset: self.offset,
+            refresh: self.refresh,
             id: self.selected.clone(),
             after: b.map_or(0, |b| b.after),
             initialized: b.is_some_and(|b| b.status.is_some()),
@@ -410,7 +416,7 @@ impl Pools {
             completed: b
                 .and_then(|b| b.status.as_ref())
                 .is_some_and(|s| s.state == PoolState::Completed)
-                && b.is_some_and(|b| b.after >= b.last_seq),
+                && b.is_some_and(|b| b.last_seq.is_none_or(|last| b.after >= last)),
             candidates: candidates(sessions, self.selected.as_ref()),
         }
     }
@@ -422,6 +428,8 @@ pub struct Request {
     pub visible: bool,
     /// Discovery offset for both state filters.
     pub offset: usize,
+    /// Explicit tab activation/refresh generation, forcing immediate discovery and detail reads.
+    pub refresh: u64,
     /// Selected stable pool.
     pub id: Option<PoolId>,
     /// Last loaded forward entry sequence.
@@ -496,49 +504,56 @@ pub async fn read(broker: &dyn Broker, request: &Request) -> agent_run::Result<P
     }
     Ok(page)
 }
-/// Polls visible discovery/status on the fourth socket, cancelling target changes.
-/// List refreshes and regular forward polls are throttled independently; older pages
-/// and target switches are immediate. Method-not-found selects the read-confirmed,
-/// session-derived compatibility path until the pool socket generation changes;
-/// failed rounds keep last valid UI data.
+/// Runs independent bounded discovery and selected-pool reads; hidden tabs cancel both lanes.
+/// Switching a detail target never cancels discovery, so keyboard/hover bursts cannot starve the list.
 pub async fn worker(
+    broker: SharedBroker,
+    requests: watch::Receiver<Request>,
+    tx: mpsc::Sender<BrokerEvent>,
+) {
+    tokio::join!(
+        discovery_worker(broker.clone(), requests.clone(), tx.clone()),
+        detail_worker(broker, requests, tx)
+    );
+}
+
+/// Refreshes discovery on tab activation, explicit refresh or page change, and otherwise once per second.
+/// Selection-only changes leave an admitted listing read intact; genuine failures stay visible.
+async fn discovery_worker(
     broker: SharedBroker,
     mut requests: watch::Receiver<Request>,
     tx: mpsc::Sender<BrokerEvent>,
 ) {
     let mut list_supported = true;
     let mut connection_generation = broker.pool_connection_generation();
-    let mut list_at = tokio::time::Instant::now();
-    let mut pool_at = list_at;
+    let mut at = tokio::time::Instant::now();
     let mut last = Request::default();
-    loop {
-        let current_generation = broker.pool_connection_generation();
-        if current_generation != connection_generation {
-            connection_generation = current_generation;
-            list_supported = true;
-        }
+    'discover: loop {
         let target = requests.borrow_and_update().clone();
         if !target.visible {
+            last.visible = false;
             if requests.changed().await.is_err() {
                 return;
             }
             continue;
         }
-        let changed_pool = target.id != last.id || (!last.visible && target.visible);
-        if changed_pool || target.before != last.before && target.before.is_some() {
-            pool_at = tokio::time::Instant::now();
+        if !last.visible || target.offset != last.offset || target.refresh != last.refresh {
+            at = tokio::time::Instant::now();
         }
         last = target.clone();
-        let now = tokio::time::Instant::now();
-        if now < list_at.min(pool_at) {
+        if tokio::time::Instant::now() < at {
             tokio::select! {
-                _ = tokio::time::sleep_until(list_at.min(pool_at)) => {},
-                result = requests.changed() => { if result.is_err() { return; } }
+                _ = tokio::time::sleep_until(at) => {},
+                changed = requests.changed() => { if changed.is_err() { return; } }
             }
             continue;
         }
-        if now >= list_at {
-            list_at = tokio::time::Instant::now() + POLL;
+        let generation = broker.pool_connection_generation();
+        if generation != connection_generation {
+            list_supported = true;
+            connection_generation = generation;
+        }
+        let result = {
             let round = async {
                 if list_supported {
                     match listing(&*broker, PoolState::Open, target.offset).await {
@@ -562,7 +577,9 @@ pub async fn worker(
                 let mut open_items = Vec::new();
                 let mut completed_items = Vec::new();
                 for id in &target.candidates {
-                    let Ok(value) = broker.call("pool", json!({"pool_id":id,"limit":1})).await
+                    let Ok(value) = broker
+                        .discovery_call("pool", json!({"pool_id":id,"limit":1}))
+                        .await
                     else {
                         continue;
                     };
@@ -576,7 +593,7 @@ pub async fn worker(
                         goal: s.goal.chars().take(128).collect(),
                         goal_truncated: s.goal.chars().count() > 128,
                         created_at: 0.0,
-                        last_seq: page.last_seq,
+                        last_seq: page.last_seq.unwrap_or(0),
                         completed_at: None,
                         roster_revision: s.roster_revision,
                         members_count: s.members.len(),
@@ -610,44 +627,99 @@ pub async fn worker(
                 };
                 Ok((page(open_items), page(completed_items), true))
             };
-            let result = tokio::select! {
-                result = round => result.map_err(|e| e.to_string()),
-                changed = requests.changed() => { if changed.is_err() { return; } continue; }
-            };
-            list_at = tokio::time::Instant::now() + POLL;
-            if tx
-                .send(BrokerEvent::Pools {
-                    offset: target.offset,
-                    fallback: result.as_ref().is_ok_and(|(_, _, fallback)| *fallback)
-                        || !list_supported,
-                    page: result.map(|(open, completed, _)| (open, completed)),
-                })
-                .await
-                .is_err()
-            {
-                return;
-            }
-        }
-        if tokio::time::Instant::now() >= pool_at {
-            if target.id.is_some() && (!target.completed || target.before.is_some()) {
-                let result = tokio::select! {
-                    result = read(&*broker, &target) => result.map(Box::new).map_err(|e| e.to_string()),
-                    changed = requests.changed() => { if changed.is_err() { return; } continue; }
-                };
-                let id = target.id.clone().expect("checked pool");
-                if tx
-                    .send(BrokerEvent::Pool {
-                        id,
-                        before: target.before,
-                        page: result,
-                    })
-                    .await
-                    .is_err()
-                {
-                    return;
+            tokio::pin!(round);
+            loop {
+                tokio::select! {
+                    result = &mut round => break result.map_err(|e| e.to_string()),
+                    changed = requests.changed() => {
+                        if changed.is_err() { return; }
+                        let next = requests.borrow_and_update().clone();
+                        if !next.visible || next.offset != target.offset || next.refresh != target.refresh {
+                            continue 'discover;
+                        }
+                    }
                 }
             }
-            pool_at = tokio::time::Instant::now() + POLL;
+        };
+        at = tokio::time::Instant::now() + POLL;
+        if tx
+            .send(BrokerEvent::Pools {
+                offset: target.offset,
+                fallback: result.as_ref().is_ok_and(|(_, _, fallback)| *fallback)
+                    || !list_supported,
+                page: result.map(|(open, completed, _)| (open, completed)),
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// Loads only the selected pool immediately, preserving cached content and cancelling superseded reads.
+/// Discovery requests have their own socket/task; normal completed pools stop polling until refresh.
+async fn detail_worker(
+    broker: SharedBroker,
+    mut requests: watch::Receiver<Request>,
+    tx: mpsc::Sender<BrokerEvent>,
+) {
+    let mut at = tokio::time::Instant::now();
+    let mut last = Request::default();
+    'detail: loop {
+        let target = requests.borrow_and_update().clone();
+        if !target.visible {
+            last.visible = false;
+            if requests.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
+        let forced = !last.visible || target.id != last.id || target.refresh != last.refresh;
+        if forced || target.before.is_some() && target.before != last.before {
+            at = tokio::time::Instant::now();
+        }
+        last = target.clone();
+        if target.id.is_none() || target.completed && target.before.is_none() && !forced {
+            if requests.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
+        if tokio::time::Instant::now() < at {
+            tokio::select! {
+                _ = tokio::time::sleep_until(at) => {},
+                changed = requests.changed() => { if changed.is_err() { return; } }
+            }
+            continue;
+        }
+        let read = read(&*broker, &target);
+        tokio::pin!(read);
+        let result = loop {
+            tokio::select! {
+                result = &mut read => break result.map(Box::new).map_err(|e|e.to_string()),
+                changed = requests.changed() => {
+                    if changed.is_err() { return; }
+                    let next = requests.borrow_and_update().clone();
+                    if !next.visible || next.id != target.id || next.before != target.before
+                        || next.after != target.after || next.refresh != target.refresh
+                        || next.initialized != target.initialized {
+                        continue 'detail;
+                    }
+                }
+            }
+        };
+        at = tokio::time::Instant::now() + POLL;
+        if tx
+            .send(BrokerEvent::Pool {
+                id: target.id.clone().expect("selected pool"),
+                before: target.before,
+                page: result,
+            })
+            .await
+            .is_err()
+        {
+            return;
         }
     }
 }
@@ -700,6 +772,7 @@ pub fn key(app: &App, code: KeyCode) -> crate::events::Action {
         KeyCode::Char(']') => Action::Page(1),
         KeyCode::Char('q') => return Global::Quit,
         KeyCode::Char('?') => return Global::Help,
+        KeyCode::Char('r') if !app.pools.criteria => return Global::Refresh,
         _ => return Global::None,
     };
     if app.pools.criteria
@@ -923,6 +996,33 @@ pub fn open_member(app: &mut App, agent: AgentView) -> Dispatched {
         Dispatched::Watch(id, run, cursor)
     })
 }
+/// Selects the currently drawn pool row under a moved pointer without opening its detail focus.
+/// Stale rows absent from the latest listing are ignored; unchanged selection costs no redraw.
+pub fn hover(app: &mut App, column: u16, row: u16) -> bool {
+    if app.pools.criteria {
+        return false;
+    }
+    let id = app.pools.hits.borrow().iter().find_map(|(rect, target)| {
+        if rect.contains((column, row).into())
+            && let Target::Pool(id) = target
+        {
+            return Some(id.clone());
+        }
+        None
+    });
+    let Some(id) = id else {
+        return false;
+    };
+    if app.pools.selected.as_ref() == Some(&id)
+        || !app.pools.items.iter().any(|item| item.pool_id == id)
+    {
+        return false;
+    }
+    app.pools.select(id);
+    app.pools.focused = false;
+    true
+}
+
 /// Handles stable pool row/member/entry clicks; coordinates refer to the last completed frame.
 pub fn mouse(app: &mut App, mouse: MouseEvent) -> Dispatched {
     if mouse.kind != MouseEventKind::Down(MouseButton::Left) {

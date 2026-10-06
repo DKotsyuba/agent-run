@@ -1,48 +1,48 @@
- agent-run   ⠋ 1 live   ✓ 3 finished                                                                                               ● broker rev 42   sessions 4 
+ agent-run   ● 1 live   ✓ 3 finished                                                                                               ● broker rev 42   sessions 4 
   Sessions │ Pools 1 open                                                                                                                                       
-  OPEN  1                                     Ship reliable pool observation                                                                                    
-                                               ● OPEN  3/4 ready · proposal #20                                                                                 
- ▌  ● Ship reliable pool observation          pool 7ac03b9e12 · roster r2                                                                              ● follow 
- ▌    3/4 ready · #20 · 7ac03b9e12            Criteria  tests: pass · layout: fits · evidence: honest                                                           
-                                              c full goal + criteria · m roster · h replaced history                                                            
-  COMPLETED  0                                                                                                                                                  
+  OPEN  1                                     Goal · untrusted: Ship reliable pool observation                                                                  
+                                                                                                                                                                
+ ▌  ● Ship reliable pool observation           ● OPEN  3/4 ready · proposal #20                                                                                 
+ ▌    3/4 ready · #20 · 7ac03b9e12            pool 7ac03b9e12 · roster r2                                                                              ● follow 
                                                MEMBERS  4 current · t transcript                                                                                
-   no pools on this page                      ✓ 1 Ada (implement) · CODEX/native-a · ready                                                                      
+  COMPLETED  0                                ✓ 1 Ada (implement) · CODEX/native-a · ready                                                                      
                                                   succeeded · cleaned                                                                                           
-  [ ] pages · offset 0 · 50/state             ✓ 2 Ben (verify) · CLAUDE/native-b · ready                                                                        
+   no pools on this page                      ✓ 2 Ben (verify) · CLAUDE/native-b · ready                                                                        
                                                   succeeded · cleaned                                                                                           
-                                              ✓ 3 Cy (review) · GLM/native-c · ready                                                                            
+  [ ] pages · offset 0 · 50/state             ✓ 3 Cy (review) · GLM/native-c · ready                                                                            
                                                   succeeded · cleaned                                                                                           
                                               ⠋ 4 Eli (verify) · CODEX/native-a · missing                                                                       
                                                   running · cleanup pending · replaces Dana                                                                     
                                               ▸ REPLACED  1 · Dana → Eli (slot 4)                                                                               
                                                                                                                                                                 
-                                               CHAT · #seq rN · bodies are untrusted                                                           beginning loaded 
+                                               CHAT · untrusted                                                                                beginning loaded 
                                               #10 r2 · BROKER → team · roster                                                                                   
-                                                untrusted: slot 4 Dana replaced by Eli.                                                                         
+                                                slot 4 Dana replaced by Eli.                                                                                    
                                                                                                                                                                 
                                               #18 r2 · OPERATOR → team · message                                                                                
-                                                untrusted: Keep the observer read-only.                                                                         
+                                                Keep the observer read-only.                                                                                    
                                                                                                                                                                 
                                               #19 r2 · Ada (implement) → team · message                                                                         
-                                                untrusted: The pool pane now follows the log.                                                                   
+                                                The pool pane now follows the log.                                                                              
                                                                                                                                                                 
                                               ╭─ #20 r2 · Ada → team · PROPOSAL──────────────────────────────────────────────╮                                  
-                                              │   untrusted: Ship the pool observer.                                         │                                  
+                                              │   Ship the pool observer.                                                    │                                  
                                               │ snapshot (#20; untrusted):                                                   │                                  
-                                              │   untrusted: Sessions + pool log; votes and cleanup stay distinct.           │                                  
+                                              │   Sessions + pool log; votes and cleanup stay distinct.                      │                                  
                                               ╰──────────────────────────────────────────────────────────────────────────────╯                                  
                                                                                                                                                                 
                                               #21 r2 · Ada (implement) → team · ready #20                                                                       
                                                                                                                                                                 
                                               #22 r2 · Ben (verify) → orchestrator (team copy) · report: risk                                                   
-                                                untrusted: Frame golden tests still need narrow coverage.                                                       
+                                                Frame golden tests still need narrow coverage.                                                                  
                                                                                                                                                                 
                                               #25 r2 · Ben (verify) → team · ready #20                                                                          
                                                                                                                                                                 
                                               #30 r2 · Cy (review) → team · ready #20                                                                           
                                                                                                                                                                 
-                                              3/4 valid-ready · pool remains open.                                                                              
-                                              Waiting for Eli; success + cleanup still required.                                                                
                                                                                                                                                                 
- ↑↓ block  ⏎ expand/open  m roster  c criteria  h history  f follow  t transcript  esc list  ? help                                                     seq #30 
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                              Waiting for valid votes, success and cleanup.                                                                     
+ y copy  ↑↓ block  ⏎ expand/open  m roster  c criteria  h history  f follow  t transcript  esc list  ? help                                             seq #30 

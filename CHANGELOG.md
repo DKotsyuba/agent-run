@@ -4,6 +4,15 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.22.1
+
+- fix(tui): accept empty pool responses with nullable proposals and simplify the
+  pool header while retaining roster, vote and delivery details
+- perf(tui): keep cached content visible during nonblocking refreshes, separate
+  view state from updates and cap dirty redraws at 30 frames per second
+- feat(tui): autoload selected pools and copy complete retained agent or pool
+  chats in the background; refuse incomplete coverage and bound export size
+
 ## 0.22.0
 
 - feat(pools): admit mixed new and active independent members atomically without

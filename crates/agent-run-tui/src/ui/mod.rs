@@ -197,7 +197,7 @@ fn render_app_bar(f: &mut Frame, app: &App, area: Rect) {
             ));
         }
     } else {
-        left.push(Span::styled(app.spinner(), Style::new().fg(p.yellow)));
+        left.push(Span::styled("●", Style::new().fg(p.yellow)));
         left.push(Span::styled(format!(" {live} live   "), white));
         left.push(Span::styled("✓", Style::new().fg(p.green)));
         left.push(Span::styled(
@@ -247,7 +247,13 @@ fn render_app_bar(f: &mut Frame, app: &App, area: Rect) {
 fn render_key_bar(f: &mut Frame, app: &App, area: Rect, panes: Panes) {
     let p = theme::palette();
     let mut left = vec![Span::raw(" ")];
-    for (key, description) in key_hints(app) {
+    let mut hints = key_hints(app);
+    if app.copy_request.is_some() {
+        hints = vec![("esc", "cancel copy"), ("q", "quit")];
+    } else if app.answer.is_none() && !app.help && !app.project_picker && !app.pools.criteria {
+        hints.insert(0, ("y", "copy"));
+    }
+    for (key, description) in hints {
         left.push(Span::styled(key, theme::accent()));
         left.push(Span::styled(format!(" {description}  "), theme::dim()));
     }
@@ -273,6 +279,9 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                         ("↑↓", "member"),
                         ("t", "transcript"),
                         ("m", "chat"),
+                        ("c", "details"),
+                        ("h", "history"),
+                        ("?", "help"),
                         ("esc", "back"),
                     ]
                 } else {
@@ -280,7 +289,9 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                         ("↑↓", "block"),
                         ("⏎", "expand"),
                         ("m", "roster"),
-                        ("f", "follow"),
+                        ("c", "details"),
+                        ("h", "history"),
+                        ("?", "help"),
                         ("esc", "back"),
                     ]
                 };
@@ -350,12 +361,28 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
 
 /// The right-aligned readout of the key bar: `<last visible>/<total> lines`.
 fn key_bar_right(app: &App, panes: Panes) -> Vec<Span<'static>> {
+    if let Some(request) = &app.copy_request {
+        return vec![Span::styled(
+            format!("{} Copying {} ", app.spinner(), request.target.label()),
+            theme::accent(),
+        )];
+    }
+    if let Some(feedback) = &app.copy_feedback {
+        return vec![Span::styled(
+            text::Sanitizer::default().push(feedback),
+            theme::dim(),
+        )];
+    }
     if app.answer.is_some() || app.help || app.project_picker {
         return Vec::new();
     }
     if app.pools.visible && !app.pools.member_transcript {
         return app.pools.buffer().map_or_else(Vec::new, |b| {
-            vec![Span::styled(format!("seq #{} ", b.after), theme::dim())]
+            vec![Span::styled(
+                b.last_seq
+                    .map_or("seq — ".into(), |_| format!("seq #{} ", b.after)),
+                theme::dim(),
+            )]
         });
     }
     let (Some(pane), Some(buffer)) = (panes.transcript, app.transcript.as_ref()) else {
@@ -423,10 +450,7 @@ mod tests {
         let screen = render_to_string(&app, 120, 20);
         assert!(screen.contains("agent-run"), "brand: {screen}");
         assert!(screen.contains("LIVE"), "section header: {screen}");
-        assert!(
-            screen.contains("⠋ 1 live"),
-            "spinner and live count: {screen}"
-        );
+        assert!(screen.contains("● 1 live"), "stable live count: {screen}");
         assert!(screen.contains("✓ 1 finished"), "finished count: {screen}");
         // Finished sessions stay behind the collapsed header.
         assert!(screen.contains("▸ FINISHED"), "collapsed section: {screen}");

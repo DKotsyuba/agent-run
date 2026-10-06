@@ -1,11 +1,9 @@
- agent-run   ⠋ 4 live   ✓ 0 finished                     ● rev 42 
+ agent-run   ● 4 live   ✓ 0 finished                     ● rev 42 
   Sessions │ Pools 1 open                                         
- Ship reliable pool observation                                   
+ Goal · untrusted: Ship reliable pool observation                 
+                                                                  
   ● OPEN  1/4 ready · proposal #20                                
  pool 7ac03b9e12 · roster r2                            ● follow  
- Criteria  tests: pass · layout: fits · evidence: honest          
- c full goal + criteria · m roster · h replaced history           
-                                                                  
   MEMBERS  4 current · t transcript                               
  ⠋ 1 Ada (implement) · CODEX/native-a · ready                     
      running · cleanup pending                                    
@@ -17,27 +15,26 @@
      running · cleanup pending · replaces Dana                    
  ▸ REPLACED  1 · Dana → Eli (slot 4)                              
                                                                   
-  CHAT · #seq rN · bodies are untrusted         beginning loaded  
+  CHAT · untrusted                              beginning loaded  
  #10 r2 · BROKER → team · roster                                  
-   untrusted: slot 4 Dana replaced by Eli.                        
+   slot 4 Dana replaced by Eli.                                   
                                                                   
  #18 r2 · OPERATOR → team · message                               
-   untrusted: Keep the observer read-only.                        
+   Keep the observer read-only.                                   
                                                                   
  #19 r2 · Ada (implement) → team · message                        
-   untrusted: The pool pane now follows the log.                  
+   The pool pane now follows the log.                             
                                                                   
  ╭─ #20 r2 · Ada → team · PROPOSAL─────────────────────────────╮  
- │   untrusted: Ship the pool observer.                        │  
+ │   Ship the pool observer.                                   │  
  │ snapshot (#20; untrusted):                                  │  
- │   untrusted: Sessions + pool log; votes and cleanup stay    │  
- │   distinct.                                                 │  
+ │   Sessions + pool log; votes and cleanup stay distinct.     │  
  ╰─────────────────────────────────────────────────────────────╯  
                                                                   
  #21 r2 · Ada (implement) → team · ready #20                      
                                                                   
  #22 r2 · Ben (verify) → orchestrator (team copy) · report: risk  
-   untrusted: Frame golden tests still need narrow coverage.      
+   Frame golden tests still need narrow coverage.                 
                                                                   
  #24 r2 · Cy (review) → team · block #20                          
                                                                   
@@ -46,7 +43,10 @@
                                                                   
                                                                   
                                                                   
- 1/4 valid-ready · pool remains open.                             
- Waiting for Ben, Cy, Eli; success + cleanup still required.      
                                                                   
- ↑↓ block  ⏎ expand  m roster  f follow  esc back         seq #24 
+                                                                  
+                                                                  
+                                                                  
+                                                                  
+ Waiting for valid votes, success and cleanup.                    
+ y copy  ↑↓ block  ⏎ expand  m roster  c details  h histo…seq #24 

@@ -458,6 +458,12 @@ pub struct App {
     pub home_prefix: Option<String>,
     /// Monotonic tick counter driving the spinner and local clocks.
     pub ticks: u64,
+    /// Frozen pending copy; repeated presses coalesce until completion or cancellation.
+    pub copy_request: Option<crate::clipboard::Request>,
+    /// Monotonic local copy generation used to reject late worker completions.
+    pub copy_generation: u64,
+    /// Transient explicit copy result; contains no copied body content.
+    pub copy_feedback: Option<String>,
     /// Whether anything visible changed since the last draw; the event loop
     /// draws only while this is set and clears it after.
     pub dirty: bool,
@@ -495,6 +501,9 @@ impl App {
             hits: std::cell::RefCell::default(),
             home_prefix: None,
             ticks: 0,
+            copy_request: None,
+            copy_generation: 0,
+            copy_feedback: None,
             dirty: true,
             quit: false,
         }
@@ -955,11 +964,37 @@ impl App {
         }
     }
 
-    /// Whether a tick changes anything visible: any live session animates
-    /// the spinner, elapsed counters, and idle clocks; an unloaded app
-    /// animates the waiting spinner.
+    /// Whether the visible panes need animation, including first transcript loads
+    /// for finished sessions. Hidden live sessions never animate a pool pane.
+    /// Cached transcript content stays visible without a first-load spinner.
     pub fn tick_animates(&self) -> bool {
-        !self.loaded || self.sessions.iter().any(|agent| !agent.status.terminal())
+        if self.copy_request.is_some() {
+            return true;
+        }
+        let panes = crate::ui::panes(self, self.last_width, self.last_height);
+        if self.pools.visible && !self.pools.member_transcript {
+            return panes.transcript.is_some()
+                && self.pools.buffer().is_some_and(|b| {
+                    b.status.is_none()
+                        || b.older.is_some()
+                        || b.status.as_ref().is_some_and(|s| {
+                            s.members.iter().any(|m| m.tip_status == Status::Running)
+                        })
+                });
+        }
+        let transcript = panes.transcript.is_some()
+            && self.transcript.as_ref().is_some_and(|b| {
+                !b.agent.status.terminal()
+                    || b.loading_older
+                    || (b.messages.is_empty() && !b.history_complete)
+            });
+        transcript
+            || (panes.list.is_some()
+                && (!self.loaded
+                    || self
+                        .card_list()
+                        .iter()
+                        .any(|i| !self.sessions[*i].status.terminal())))
     }
 
     /// Braille spinner glyph for the current tick, shown while loading.
