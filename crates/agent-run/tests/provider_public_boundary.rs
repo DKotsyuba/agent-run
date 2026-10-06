@@ -255,6 +255,98 @@ async fn mcp_request(home: &Path, protocol: &str, method: &str, params: Value) -
     reply.expect("MCP call deadline")
 }
 
+/// A real broker, public raw MCP admission and an already initialized private
+/// worker MCP join one pool without restarting or reserving the existing run.
+/// Fixture TTLs bound every child; no provider endpoint or production home runs.
+#[tokio::test]
+async fn mixed_pool_attaches_active_worker_over_live_mcp_without_restart() {
+    let broker = Broker::start();
+    let client = BrokerClient::new(broker.home.join("api.sock"));
+    let mut request = broker.request("fixture:pool-enroll", "independent-join");
+    request.timeout_seconds = Some(30.0);
+    let started = client.start(&request).await.unwrap();
+    let agent: agent_run_domain::domain::AgentId = started.agent_id.parse().unwrap();
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let store = agent_run::state::Store::open(&broker.home).unwrap();
+        let ready:bool=store.conn.query_row("SELECT EXISTS(SELECT 1 FROM worker_capabilities c JOIN attempts t ON t.id=c.attempt_id WHERE t.agent_id=? AND c.pool_catalog_version=1 AND t.state='running' AND t.ownership_active=1)",[agent.as_str()],|r|r.get(0)).unwrap();
+        if ready && broker.home.join("enrollment-worker-ready").exists() {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "actual worker catalog proof must arrive"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let before = agent_run::state::Store::open(&broker.home)
+        .unwrap()
+        .get(&agent)
+        .unwrap();
+    let response=mcp_tool(&broker.home,"start_pool",json!({"request_id":"live-mixed","goal":"Verify mixed pool enrollment","acceptance":[{"id":"goal","text":"Existing work remains intact"}],"members":[{"existing_agent_id":agent,"role":"review"},{"start":{"provider":"glm-user","model":"fixture","profile":"review","task":"fixture:pool-observe","workdir":broker.home,"timeout_seconds":30.0,"display_name":"new helper"},"role":"helper"}]})).await;
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    assert!(response.get("error").is_none(), "{response}");
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        if broker.home.join("enrollment-acked").exists() {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "current worker must ACK over private MCP"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let store = agent_run::state::Store::open(&broker.home).unwrap();
+    let after = store.get(&agent).unwrap();
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.request, before.request);
+    assert_eq!(after.identity, before.identity);
+    assert_eq!(after.runtime_session_id, before.runtime_session_id);
+    assert_eq!(after.created_at, before.created_at);
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM attempts WHERE agent_id=?",
+                [agent.as_str()],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT state FROM pool_enrollments WHERE agent_id=?",
+                [agent.as_str()],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "joined"
+    );
+    let until = Instant::now() + Duration::from_secs(10);
+    while !broker.home.join("pool-observed.txt").exists() {
+        assert!(
+            Instant::now() < until,
+            "only the new member must launch with the committed roster"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(
+        std::fs::read_to_string(broker.home.join("pool-observed.txt"))
+            .unwrap()
+            .contains(agent.as_str())
+    );
+    std::fs::write(
+        broker.home.join("enrollment-release"),
+        "release owned fixture",
+    )
+    .unwrap();
+    broker.wait_terminal(agent.as_str());
+}
+
 /// The exported socket client sends the strict provider request the real
 /// schema-2 dispatcher accepts without exposing an attempt id, and the
 /// real start response decodes as the exported `StartResult`.

@@ -102,7 +102,7 @@ check the recipient Claude session's queue before resending it by hand.
 Desktop relay discovery requires the MCP process to have started with absolute
 `CODEX_MCP_NODE_PATH` and `CODEX_APP_TOOLS_PIPE_PATH` values. In that mode the
 MCP PID belongs to the supplied signed Node frontend, while its distinct Rust
-child has neither variable. A missing `ar-cdx-v4-*.sock` beside the agent-run
+child has neither variable. A missing `ar-cdx-v5-*.sock` beside the agent-run
 home indicates that the frontend could not bind its private relay; MCP continues
 without relay delivery and reports the failure on stderr.
 

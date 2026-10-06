@@ -46,6 +46,27 @@ fn tools() -> std::result::Result<Vec<Tool>, ErrorData> {
 }
 
 impl WorkerProxy {
+    /// Best-effort bounded registration from this actual native server. Failure
+    /// leaves the launch contract unknown and never prevents ordinary startup;
+    /// legitimate later discovery/calls retry after broker readiness races.
+    async fn register_catalog(&self) {
+        let proof = agent_run_domain::worker::WorkerCatalogProof {
+            run_id: self.run_id.clone(),
+            attempt_id: self.attempt_id.clone(),
+            token: self.token.clone(),
+            version: agent_run_domain::worker::POOL_CATALOG_VERSION,
+            digest: agent_run_domain::worker::pool_catalog_digest(),
+        };
+        if let Ok(value) = serde_json::to_value(proof) {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                self.broker
+                    .call(agent_run_domain::worker::CATALOG_METHOD, value),
+            )
+            .await;
+        }
+    }
+
     /// Validate model arguments locally, attach immutable hidden context and
     /// route one fixed catalog tool through the private broker method. Unknown
     /// tools/arguments cannot reach an operator dispatch path, and denials
@@ -218,6 +239,7 @@ impl ServerHandler for WorkerProxy {
         _: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, ErrorData> {
+        self.register_catalog().await;
         Ok(super::mcp_cache::tools_list_result(&context, tools()?))
     }
 
@@ -232,6 +254,7 @@ impl ServerHandler for WorkerProxy {
         request: CallToolRequestParams,
         _: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResponse, ErrorData> {
+        self.register_catalog().await;
         if self.get_tool(&request.name).is_none() {
             return Err(ErrorData::invalid_params("unknown worker tool", None));
         }
@@ -278,6 +301,7 @@ pub async fn serve_from_env() -> Result<()> {
         attempt_id,
         token,
     };
+    proxy.register_catalog().await;
     let service = proxy
         .serve((
             super::mcp::BoundedReader::new(),

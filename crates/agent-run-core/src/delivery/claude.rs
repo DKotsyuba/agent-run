@@ -98,6 +98,35 @@ pub async fn send_pool(
     .await
 }
 
+/// Delivers a distinct broker enrollment attention through the existing inbox.
+/// The original stored notice and identity stay unchanged; only body fitting
+/// uses the same finite message limit as common-completion delivery.
+pub async fn send_pool_attention(
+    registry: &Path,
+    session: &str,
+    notice: &agent_run_domain::pool::PoolNotice,
+) -> Evidence {
+    let fitted = notice
+        .fitted(|n| {
+            n.render_attention()
+                .is_ok_and(|text| text.len() <= MESSAGE_LIMIT)
+        })
+        .and_then(|n| {
+            n.render_attention()
+                .ok()
+                .map(|text| (n.notification_id, text))
+        });
+    send_text_after(
+        registry,
+        session,
+        fitted
+            .as_ref()
+            .map(|(id, text)| (id.as_str(), text.clone())),
+        async {},
+    )
+    .await
+}
+
 /// [`send`] with `before_write` awaited after the connection is established
 /// and before any frame is written. Production passes an already-ready
 /// future; tests use it to order a peer close before the write, so an

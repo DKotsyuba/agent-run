@@ -231,7 +231,7 @@ fn v25_manifest_entry_matches_fixture() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(DB_DIR);
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("manifest.json")).unwrap()).unwrap();
-    assert_eq!(manifest["schema_version"], 25);
+    assert_eq!(manifest["schema_version"], agent_run_store::VERSION);
     let entry = manifest["files"]
         .as_array()
         .unwrap()

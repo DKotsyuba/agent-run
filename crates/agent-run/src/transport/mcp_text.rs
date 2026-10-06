@@ -482,6 +482,20 @@ struct ReportTextView {
     duplicate: bool,
 }
 
+/// Public enrollment overlay; private ACK key is present only for the
+/// authenticated recipient's pool_read. No attempt/token/native-session data.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PoolEnrollmentTextView {
+    /// Pending, joined or needs_action; validated before rendering.
+    state: String,
+    /// Original execution deadline remaining, never an extension.
+    remaining_seconds: f64,
+    /// Optional exact opaque broker-issued request key for the recipient ACK.
+    request_id: Option<String>,
+    /// Fixed safe failure reason, absent while healthy/pending.
+    reason: Option<String>,
+}
+
 /// Pool admission roster, without provider, account, attempt or capability fields.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PoolAdmissionMemberTextView {
@@ -493,6 +507,8 @@ struct PoolAdmissionMemberTextView {
     role: String,
     /// Current lifecycle; null means an original member was replaced or pruned.
     status: Option<crate::domain::Status>,
+    /// Existing worker enrollment, absent for backward-compatible new-only seats.
+    enrollment: Option<PoolEnrollmentTextView>,
 }
 
 /// Public admission and binding facts of a committed cooperative pool.
@@ -646,6 +662,8 @@ struct PoolStatusMemberTextView {
     vote: Option<PoolVoteTextView>,
     /// Display-safe validity reason.
     why: String,
+    /// Optional enrollment overlay, absent on legacy/new-only status rows.
+    enrollment: Option<PoolEnrollmentTextView>,
 }
 
 /// Retired public roster labels; no replacement launch details are exposed.
@@ -726,6 +744,8 @@ struct PoolPageTextView {
     show_goal: bool,
     /// Whether the proposal snapshot is new or explicitly requested.
     show_proposal: bool,
+    /// Recipient-only structured challenge; never present on operator reads.
+    enrollment: Option<PoolEnrollmentTextView>,
 }
 
 /// Routine expected error carries only public sanitized diagnostics.
@@ -1220,6 +1240,32 @@ fn validate_agent(value: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Validates a bounded enrollment overlay before any ACK key can be printed.
+/// State/remaining time remain exact, and an opaque challenge is never shortened.
+fn validate_enrollment(value: &Value) -> Result<()> {
+    if !matches!(
+        value["state"].as_str(),
+        Some("pending" | "joined" | "needs_action")
+    ) || value["remaining_seconds"]
+        .as_f64()
+        .is_none_or(|v| !v.is_finite() || v < 0.0)
+    {
+        return Err(shape_error());
+    }
+    if let Some(key) = value.get("request_id") {
+        let key = key.as_str().ok_or_else(shape_error)?;
+        if key.is_empty()
+            || key.len() > 128
+            || !key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        {
+            return Err(shape_error());
+        }
+    }
+    Ok(())
+}
+
 /// Checks source shapes, all page rows/cursors and faithful content before
 /// allocating projected rows. Unknown states never become success or empty pages.
 fn validate_result(tool: &str, value: &Value) -> Result<()> {
@@ -1538,6 +1584,9 @@ fn positive_counter(value: &Value, key: &str) -> Result<u64> {
 
 /// Validates pool roster labels and stable identity before they become framing.
 fn validate_pool_member(value: &Value) -> Result<()> {
+    if let Some(enrollment) = value.get("enrollment") {
+        validate_enrollment(enrollment)?;
+    }
     required_reference(value, "agent_id")?;
     for key in ["name", "role"] {
         let text = required_reference(value, key)?;
@@ -1578,6 +1627,9 @@ fn pool_entry(value: &Value) -> Result<agent_run_domain::pool::PoolEntryView> {
 /// Validates every pool log row, direction-specific continuation and context
 /// before rendering. Oversize or malformed pages publish no partial entries.
 fn validate_pool_page(value: &Value) -> Result<()> {
+    if let Some(enrollment) = value.get("enrollment") {
+        validate_enrollment(enrollment)?;
+    }
     let policy = budget("pool");
     required_reference(value, "pool_id")?;
     let after = value["after_seq"]

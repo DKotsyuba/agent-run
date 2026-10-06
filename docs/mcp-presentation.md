@@ -2,7 +2,7 @@
 
 The operator `agent-run` and private `agent-run-worker` servers advertise the
 Cargo product version. It is independent of rmcp 3.4.0, the negotiated MCP
-protocol, state schema 25, and family response profile `rust-minijinja-v1/0.1.0`.
+protocol, state schema 26, and family response profile `rust-minijinja-v1/0.1.0`.
 Tool names, resident execution, stable agent IDs and worker capabilities keep
 their existing contracts. The worker registration namespace remains
 `agent_run_worker`; only the supervisor supplies its attempt context.

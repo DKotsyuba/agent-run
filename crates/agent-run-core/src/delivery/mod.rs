@@ -373,6 +373,8 @@ enum Payload {
     Worker(WorkerNotice),
     /// The broker's one common conclusion of a completed pool.
     Pool(agent_run_domain::pool::PoolNotice),
+    /// Broker-authored enrollment failure, with no completion/lifecycle claim.
+    PoolAttention(agent_run_domain::pool::PoolNotice),
 }
 
 /// Counts one bounded outbox drain and reports whether another process owns it.
@@ -500,6 +502,18 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
         Ok(canonical) => canonical.to_owned(),
         Err(_) => transport,
     };
+    let policy = delivery_policy(home)?;
+    let is_attention:bool=tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events e JOIN deliveries d ON d.terminal_event_seq=e.seq WHERE d.id=? AND e.kind='pool_join_needs_action')",
+        [&delivery_id],|r|r.get(0))?;
+    if transport == "codex_queue" && is_attention && !relay::has_attention_peer(home) {
+        // Known unsupported capability is not a send attempt. Defer within the
+        // existing notice deadline/backoff, advancing the queue so others run.
+        tx.execute("UPDATE deliveries SET state='retry_wait',next_attempt_at=?,last_error='relay_v5_required' WHERE id=?",
+            params![time+policy.retry_base_seconds.max(1.0).min(policy.retry_cap_seconds),delivery_id])?;
+        tx.commit()?;
+        return Ok(None);
+    }
     if transport == "claude_uds" && attempts > 0 {
         // Evidence for exactly the current attempt count decides. Missing
         // evidence (a dispatcher that crashed around the write, e.g. an
@@ -578,9 +592,20 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
+    let attention:Option<(String,String)>=tx.query_row(
+        "SELECT json_extract(e.data_json,'$.pool_id'),json_extract(e.data_json,'$.notice') FROM deliveries d JOIN events e ON e.seq=d.terminal_event_seq WHERE d.id=? AND e.kind='pool_join_needs_action'",
+        [&delivery_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     // A malformed stored payload must end only its own row, never poison the outbox.
     let payload = (|| -> Result<Payload> {
-        Ok(if let Some((pool_id, message)) = pool {
+        Ok(if let Some((pool_id, message)) = attention {
+            let notice = agent_run_domain::pool::PoolNotice {
+                notification_id: delivery_id.clone(),
+                pool_id: pool_id.parse()?,
+                message,
+            };
+            notice.validate()?;
+            Payload::PoolAttention(notice)
+        } else if let Some((pool_id, message)) = pool {
             let notice = agent_run_domain::pool::PoolNotice {
                 notification_id: delivery_id.clone(),
                 pool_id: pool_id.parse()?,
@@ -654,7 +679,6 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
         }
         Err(error) => return Err(error),
     };
-    let policy = delivery_policy(home)?;
     let attempt = attempts
         .checked_add(1)
         .ok_or_else(|| invalid("delivery attempt counter overflow"))?;
@@ -773,6 +797,12 @@ async fn dispatch_one(home: &Path) -> Result<Option<(String, bool)>> {
         }
         ("claude_uds", Payload::Worker(notice)) => {
             claude::send_worker(&claude_registry(), &claim.session, notice).await
+        }
+        ("codex_queue", Payload::PoolAttention(notice)) => {
+            relay::send_pool_attention(home, &claim.session, notice).await
+        }
+        ("claude_uds", Payload::PoolAttention(notice)) => {
+            claude::send_pool_attention(&claude_registry(), &claim.session, notice).await
         }
         ("codex_queue", Payload::Pool(notice)) => {
             relay::send_pool(home, &claim.session, notice).await

@@ -4,6 +4,15 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- feat(pools): admit mixed new and active independent members atomically without
+  restarting existing work, renewing deadlines or duplicating quota reservations
+- feat(pools): require attempt-pinned summary acknowledgements for attached seats;
+  preserve replay, live membership, binding, cleanup and completion guards
+- feat(delivery): expose failed enrollment as needs_action with one broker attention;
+  defer unsupported v5 attention without blocking ordinary v4 notices
+- feat(store): migrate to schema 26 with catalog proof, retained enrollment evidence
+  and lifetime membership markers; refuse unknown historical attach capability
+
 - feat(routing): consolidate advertised routing tools into filtered delegation
   guidance and quota/ranking diagnostics; retain models and capacity-order
   as call-only compatibility methods with their original structured responses

@@ -208,9 +208,10 @@ use `limits` for quota windows plus numerical provider/model standing.
 `models` and `capacity_order` remain callable compatibility methods with their
 original CLI/socket JSON shapes, but do not appear in MCP discovery.
 
-New schema-2 workers receive a separate built-in MCP with only
-`notify_orchestrator`: a durable report to their bound orchestrator without
-ending the run. Ordinary work MCPs remain profile-controlled.
+New schema-2 workers receive a separate built-in MCP with five fixed tools:
+`notify_orchestrator` plus four pool tools authorized by live membership.
+`start_pool` can mix new members with supported independent RUNNING workers;
+attached workers keep their work and must acknowledge enrollment before voting. Ordinary work MCPs remain profile-controlled.
 See [worker reports](docs/worker-mcp.md) for bounds, replies and upgrade behavior.
 
 ## Use the socket API

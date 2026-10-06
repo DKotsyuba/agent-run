@@ -1,4 +1,4 @@
-/** Signed-Node MCP frontend: fixed completion notices, never arbitrary RPC. */
+/** Signed-Node frontend: fixed lifecycle/worker/broker notices, never arbitrary RPC. */
 "use strict";
 const crypto = require("node:crypto");
 const fs = require("node:fs");
@@ -15,7 +15,7 @@ if (!path.isAbsolute(executable || "") || !path.isAbsolute(home || "") || !contr
 /** Desktop native-tools pipe inherited only by this signed frontend. @type {string | undefined} */
 const pipe = process.env.CODEX_APP_TOOLS_PIPE_PATH;
 /** Private relay endpoint with a random suffix so PID reuse cannot collide. @type {string} */
-const relayPath = path.join(home, `ar-cdx-v4-${process.pid}-${crypto.randomBytes(3).toString("hex")}.sock`);
+const relayPath = path.join(home, `ar-cdx-v5-${process.pid}-${crypto.randomBytes(3).toString("hex")}.sock`);
 /** Trusted notice templates embedded by the Rust executable. @type {{template: string, worker_template: string, status_guidance: Record<string, {reason: string, advice: string}>, failure_guidance: Record<string, {reason: string, advice: string}>, default_failure: {reason: string, advice: string}}} */
 const NOTICE_CONTRACT = JSON.parse(contractJson);
 /** Notice marker version, independent of the accepted relay wire versions. @type {number} */
@@ -254,7 +254,8 @@ function workerMessage(request) {
 }
 
 /**
- * Validate and render one frozen common pool conclusion under trusted framing.
+ * Validate and render a frozen common conclusion or broker enrollment attention.
+ * Attention is explicit non-completion framing with no worker or permission claim.
  * @param {unknown} request Decoded v4 relay value.
  * @returns {string} Trusted framing around the broker's frozen pool text.
  * @throws {Error} If fields, identifiers, text, or size violate the fixed contract.
@@ -262,7 +263,7 @@ function workerMessage(request) {
 function poolCompletion(request) {
   if (!request || typeof request !== "object" || Array.isArray(request) ||
       JSON.stringify(Object.keys(request).sort()) !== JSON.stringify(POOL_KEYS) ||
-      request.version !== 4 || request.op !== "pool_completion") throw new Error("invalid pool request");
+      !((request.op==="pool_completion" && request.version===4) || (request.op==="pool_attention" && request.version===5))) throw new Error("invalid pool request");
   if (typeof request.thread_id !== "string" || !request.thread_id.trim() ||
       [...request.thread_id].length > 512 || request.thread_id.includes("\0") ||
       typeof request.notification_id !== "string" || !/^ntf_[A-Za-z0-9_-]+$/.test(request.notification_id) ||
@@ -270,7 +271,7 @@ function poolCompletion(request) {
       typeof request.message !== "string" || !request.message.trim() ||
       Buffer.byteLength(request.message, "utf8") > 4096 ||
       /[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(request.message)) throw new Error("invalid pool completion");
-  return renderTemplate(request, NOTICE_CONTRACT.pool_template);
+  return renderTemplate(request, request.op==="pool_attention" ? NOTICE_CONTRACT.pool_attention_template : NOTICE_CONTRACT.pool_template);
 }
 
 /**
@@ -279,7 +280,7 @@ function poolCompletion(request) {
  * @returns {string} Trusted framing with validated facts or bounded worker prose.
  */
 function renderRequest(request) {
-  if (request && request.op === "pool_completion") return poolCompletion(request);
+  if (request && ["pool_completion","pool_attention"].includes(request.op)) return poolCompletion(request);
   return request && request.op === "worker_message" ? workerMessage(request) : notice(request);
 }
 

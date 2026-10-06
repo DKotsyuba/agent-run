@@ -420,9 +420,10 @@ impl Store {
         }))).optional().map_err(Into::into)
     }
 
-    /// Reads the latest delivery row and its safe evidence into the nested public shape.
+    /// Reads the latest individual completion delivery and safe evidence; worker,
+    /// common-pool and enrollment attention notices never imply task completion.
     fn delivery_view(&self, record: &Record) -> Result<DeliveryView> {
-        let delivery = self.conn.query_row("SELECT id,state,attempts,ambiguous_result,last_error FROM deliveries WHERE agent_id=? AND id NOT IN (SELECT delivery_id FROM worker_notifications) AND id NOT IN (SELECT completion_delivery_id FROM pools WHERE completion_delivery_id IS NOT NULL) ORDER BY terminal_event_seq DESC LIMIT 1", [record.id.as_str()], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u32>(2)?, row.get::<_, bool>(3)?, row.get::<_, Option<String>>(4)?))).optional()?;
+        let delivery = self.conn.query_row("SELECT id,state,attempts,ambiguous_result,last_error FROM deliveries WHERE agent_id=? AND id NOT IN (SELECT delivery_id FROM worker_notifications) AND id NOT IN (SELECT completion_delivery_id FROM pools WHERE completion_delivery_id IS NOT NULL) AND terminal_event_seq NOT IN (SELECT seq FROM events WHERE kind='pool_join_needs_action') ORDER BY terminal_event_seq DESC LIMIT 1", [record.id.as_str()], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u32>(2)?, row.get::<_, bool>(3)?, row.get::<_, Option<String>>(4)?))).optional()?;
         let Some((notification_id, state, attempts, ambiguous, last_error)) = delivery else {
             return Ok(DeliveryView {
                 run_id: None,

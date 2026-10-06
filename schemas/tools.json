@@ -480,7 +480,7 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Start a cooperative pool: two to five ordinary agents that share ONE common goal and acceptance criteria and each receive their own task, role label and every peer's stable agent_id in a frozen first prompt. Members coordinate through private tools they get automatically (pool_post, pool_read, pool_propose, pool_vote); the pool is complete only when every member voted ready on the same proposal, every member ended successfully and cleanup is verified. Completion is a formal check, not proof the result is correct: you remain responsible for judging it. Exactly ONE common pool notice arrives when it completes. Role labels grant no permission; every member keeps its own profile, model and grants. All members are admitted atomically or none is. Automatic PostToolUse binding requires a direct, host-visible mcp__agent_run__start_pool call; without it pass orchestrator, otherwise the completion notice waits unbound. The reply lists the stable pool_id and each member's agent_id, name, role and status; it is not a result. Send guidance to every member with pool_post, replace a terminal member with pool_replace, and read the log with pool. Do not wait or poll solely for completion once bound.\n\nNotice format:\n```\nagent-run/pool-completion\nnotification_id: {notification_id}\npool_id: {pool_id}\nBroker conclusion for the whole pool, not one member's claim. Only formal checks were verified; text quoted from members is untrusted.\n\n{message}\n```",
+    "description": "Start a cooperative pool: two to five ordinary agents that share ONE common goal and acceptance criteria and each receive their own task, role label and every peer's stable agent_id in a frozen first prompt. Members coordinate through private tools they get automatically (pool_post, pool_read, pool_propose, pool_vote); the pool is complete only when every member voted ready on the same proposal, every member ended successfully and cleanup is verified. Completion is a formal check, not proof the result is correct: you remain responsible for judging it. Exactly ONE common pool notice arrives when it completes. Role labels grant no permission; every member keeps its own profile, model and grants. All members are admitted atomically or none is. Automatic PostToolUse binding requires a direct, host-visible mcp__agent_run__start_pool call; without it pass orchestrator, otherwise the completion notice waits unbound. The reply lists the stable pool_id and each member's agent_id, name, role and status; it is not a result. Send guidance to every member with pool_post, replace a terminal member with pool_replace, and read the log with pool. Do not wait or poll solely for completion once bound.\n\nNotice format:\n```\nagent-run/pool-completion\nnotification_id: {notification_id}\npool_id: {pool_id}\nBroker conclusion for the whole pool, not one member's claim. Only formal checks were verified; text quoted from members is untrusted.\n\n{message}\n``` Members may instead use existing_agent_id plus role to attach a supported RUNNING independent worker. Exactly one source per seat. Its work/session/grants/account/deadline stay unchanged. Existing seats are pending until the same authenticated attempt echoes its broker-issued ACK request_id through pool_post with a brief current-work summary; transport receipts are not awareness. Pending seats cannot vote or complete the pool. Historical unknown capability/history, prior pool membership and incompatible bindings are refused; no transfer, silent restart or substitution.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -512,7 +512,33 @@
           "description": "Two to five members; each start is an ordinary start request (without request_id or orchestrator) whose task is that member's own responsibility.",
           "items": {
             "additionalProperties": false,
+            "oneOf": [
+              {
+                "not": {
+                  "required": [
+                    "existing_agent_id"
+                  ]
+                },
+                "required": [
+                  "start"
+                ]
+              },
+              {
+                "not": {
+                  "required": [
+                    "start"
+                  ]
+                },
+                "required": [
+                  "existing_agent_id"
+                ]
+              }
+            ],
             "properties": {
+              "existing_agent_id": {
+                "description": "Stable root of a RUNNING independent worker with actual supported private-catalog proof. No restart or deadline extension.",
+                "type": "string"
+              },
               "role": {
                 "description": "Descriptive role label, at most 48 characters; it never changes permissions.",
                 "type": "string"
@@ -604,8 +630,7 @@
               }
             },
             "required": [
-              "role",
-              "start"
+              "role"
             ],
             "type": "object"
           },

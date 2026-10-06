@@ -1,4 +1,4 @@
-//! v1-v4 Desktop relay interoperability, bounded to ten seconds.
+//! v1-v5 Desktop relay interoperability, bounded to ten seconds.
 use super::{Evidence, Notice};
 use crate::{Result, error::invalid};
 use agent_run_domain::worker::WorkerNotice;
@@ -13,6 +13,24 @@ use tokio::{
     net::UnixStream,
 };
 const LIMIT: usize = 8192;
+
+/// Checks advertised v5 support without connecting or claiming a send attempt.
+/// Only current-user regular Unix sockets can make attention eligible.
+pub(super) fn has_attention_peer(home: &Path) -> bool {
+    // SAFETY: geteuid reads this process's effective UID and has no pointer arguments.
+    let uid = unsafe { libc::geteuid() };
+    std::fs::read_dir(home)
+        .into_iter()
+        .flatten()
+        .filter_map(std::result::Result::ok)
+        .any(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.starts_with("ar-cdx-v5-")
+                && name.ends_with(".sock")
+                && std::fs::symlink_metadata(entry.path())
+                    .is_ok_and(|m| m.file_type().is_socket() && m.uid() == uid)
+        })
+}
 async fn write<W: AsyncWrite + Unpin>(stream: &mut W, value: &Value) -> Result<()> {
     let data = serde_json::to_vec(value)?;
     if data.is_empty() || data.len() > LIMIT {
@@ -48,7 +66,7 @@ pub async fn send(home: &Path, thread: &str, notice: &Notice) -> Evidence {
     send_payload(home, thread, RelayPayload::Completion(notice)).await
 }
 
-/// Sends a worker report only to a v4 relay that understands `worker_message`.
+/// Sends a worker report only to a v4-or-newer relay that understands `worker_message`.
 pub async fn send_worker(home: &Path, thread: &str, notice: &WorkerNotice) -> Evidence {
     if notice.validate().is_err() {
         return Evidence::new("relay_rejected", false, false);
@@ -88,6 +106,30 @@ pub async fn send_pool(
     }
 }
 
+/// Sends a distinct broker attention via the existing v5-capable queue, with exact
+/// identities/body bounds and no worker or completion impersonation.
+pub async fn send_pool_attention(
+    home: &Path,
+    thread: &str,
+    notice: &agent_run_domain::pool::PoolNotice,
+) -> Evidence {
+    if notice.validate().is_err() {
+        return Evidence::new("relay_rejected", false, false);
+    }
+    let fitted = notice.fitted(|n| {
+        serde_json::to_vec(&attention_frame(thread, n)).is_ok_and(|frame| frame.len() <= LIMIT)
+    });
+    match fitted {
+        Some(n) => send_payload(home, thread, RelayPayload::PoolAttention(&n)).await,
+        None => Evidence::new("relay_rejected", false, false),
+    }
+}
+
+/// The additive v5 broker-attention operation, with no agent/run/session claims.
+fn attention_frame(thread: &str, notice: &agent_run_domain::pool::PoolNotice) -> Value {
+    json!({"version":5,"op":"pool_attention","thread_id":thread,"notification_id":notice.notification_id,"pool_id":notice.pool_id,"message":notice.message})
+}
+
 /// Distinguishes the fixed relay operations without accepting arbitrary methods.
 enum RelayPayload<'a> {
     /// Existing completion wire shape.
@@ -96,6 +138,8 @@ enum RelayPayload<'a> {
     Worker(&'a WorkerNotice),
     /// v4-only common pool completion shape.
     Pool(&'a agent_run_domain::pool::PoolNotice),
+    /// Distinct broker attention, never a completed-pool claim.
+    PoolAttention(&'a agent_run_domain::pool::PoolNotice),
 }
 
 /// Shares socket selection, framing, deadlines, and evidence classification.
@@ -133,7 +177,9 @@ async fn send_payload(home: &Path, thread: &str, payload: RelayPayload<'_>) -> E
             continue;
         }
         let name = path.file_name().unwrap_or_default().to_string_lossy();
-        let version = if name.starts_with("ar-cdx-v4-") {
+        let version = if name.starts_with("ar-cdx-v5-") {
+            5
+        } else if name.starts_with("ar-cdx-v4-") {
             4
         } else if name.starts_with("ar-cdx-v3-") {
             3
@@ -149,6 +195,8 @@ async fn send_payload(home: &Path, thread: &str, payload: RelayPayload<'_>) -> E
                 "run_id":notice.run_id,"kind":notice.kind,"message":notice.message,
             }),
             RelayPayload::Worker(_) => continue,
+            RelayPayload::PoolAttention(notice) if version >= 5 => attention_frame(thread, notice),
+            RelayPayload::PoolAttention(_) => continue,
             RelayPayload::Pool(notice) if version >= 4 => pool_frame(thread, notice),
             RelayPayload::Pool(_) => continue,
             RelayPayload::Completion(notice) => {
@@ -159,7 +207,7 @@ async fn send_payload(home: &Path, thread: &str, payload: RelayPayload<'_>) -> E
                 } else {
                     exact
                 };
-                let mut request = json!({"version":version,"op":"completion","thread_id":thread,"notification_id":notice.notification_id,"agent_id":agent_id,"status":notice.status});
+                let mut request = json!({"version":version.min(4),"op":"completion","thread_id":thread,"notification_id":notice.notification_id,"agent_id":agent_id,"status":notice.status});
                 if version >= 4 {
                     request["run_id"] = json!(exact);
                 }

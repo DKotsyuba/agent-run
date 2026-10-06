@@ -5089,7 +5089,7 @@ async fn pool_admission_rolls_back_every_row_on_cap_or_invalid_member() {
         false,
         &[("a", "t1", Some("work")), ("b", "t2", Some("work"))],
     );
-    bad.members[1].start.model = "nope".into();
+    bad.members[1].start_mut().unwrap().model = "nope".into();
     assert!(service.admit_pool_trusted(bad, candidates(before)).is_err());
     assert_eq!(table_rows(&home, "agents"), 0);
 }

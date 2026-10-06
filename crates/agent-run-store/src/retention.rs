@@ -557,6 +557,9 @@ impl Store {
              (SELECT completion_delivery_id FROM pools WHERE id IN retention_pools)",
             [],
         )?;
+        // Only fully releasable pools lose enrollment/ACK pins. Delete them
+        // before log rows; active/reference-protected pools retain every proof.
+        deleted += tx.execute("DELETE FROM pool_enrollments WHERE agent_id IN (SELECT agent_id FROM pool_members WHERE pool_id IN retention_pools)", [])?;
         for table in ["pool_entries", "pool_members"] {
             deleted += tx.execute(
                 &format!("DELETE FROM {table} WHERE pool_id IN retention_pools"),

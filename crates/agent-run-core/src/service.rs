@@ -681,38 +681,94 @@ impl Service {
         let accounts = Store::open(&self.home)?.list_accounts()?;
         let catalog = config.resolve_catalog(accounts)?;
         let pool_id = PoolId::new();
+        let existing = request
+            .members
+            .iter()
+            .map(|member| {
+                member
+                    .existing_agent_id()
+                    .map(|id| store.existing_pool_member(id))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut binding = request.orchestrator.clone();
+        for pin in existing.iter().flatten() {
+            if let Some(reference) = &pin.orchestrator {
+                if let Some(current) = &binding {
+                    if !agent_run_store::pool_enrollment::same_binding(
+                        Some(current),
+                        Some(reference),
+                    )? {
+                        return Err(invalid(
+                            "existing workers must share the pool orchestrator binding",
+                        ));
+                    }
+                } else {
+                    binding = Some(reference.clone());
+                }
+            }
+        }
         let seats: Vec<PoolSeat> = request
             .members
             .iter()
+            .zip(&existing)
             .enumerate()
-            .map(|(index, member)| PoolSeat {
-                slot: index as u8 + 1,
-                name: member.start.display_name.clone().unwrap_or_default(),
-                role: member.role.clone(),
-                agent_id: AgentId::new(),
+            .map(|(index, (member, pin))| {
+                let slot = index as u8 + 1;
+                PoolSeat {
+                    slot,
+                    name: member
+                        .start()
+                        .and_then(|start| start.display_name.clone())
+                        .or_else(|| pin.as_ref().and_then(|p| p.name.clone()))
+                        .unwrap_or_else(|| format!("{} {slot}", member.role())),
+                    role: member.role().to_owned(),
+                    agent_id: pin
+                        .as_ref()
+                        .map(|p| p.agent_id.clone())
+                        .unwrap_or_else(AgentId::new),
+                }
             })
             .collect();
+        let pending = existing
+            .iter()
+            .flatten()
+            .map(|pin| pin.agent_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         let mut prepared = Vec::new();
         for (member, seat) in request.members.iter().zip(&seats) {
-            let mut start = member.start.clone();
-            start.task = compose_member_task(
-                &pool_id,
-                &request.goal,
-                &request.acceptance,
-                &seats,
-                seat,
-                &member.start.task,
-            )?;
-            start.orchestrator = request.orchestrator.clone();
-            start.validate()?;
-            prepared.push(prepare_provider(&config, &revision, &catalog, start)?);
+            if let Some(original) = member.start() {
+                let mut start = original.clone();
+                start.task = compose_member_task(
+                    &pool_id,
+                    &request.goal,
+                    &request.acceptance,
+                    &seats,
+                    seat,
+                    &original.task,
+                )?;
+                if !pending.is_empty() {
+                    start.task.push_str(&format!("\nExisting seats pending authenticated enrollment acknowledgement: {pending}. They retain their current work and deadline; do not assume they read the context until joined.\n"));
+                }
+                start.orchestrator = binding.clone();
+                start.validate()?;
+                prepared.push(Some(prepare_provider(&config, &revision, &catalog, start)?));
+            } else {
+                prepared.push(None);
+            }
         }
         let mut submission = 0;
         let admission = loop {
             let mut sets = Vec::new();
             let store = Store::open(&self.home)?;
             for member in &prepared {
-                sets.push(produce(&store, &catalog, &member.request, submission)?);
+                sets.push(
+                    member
+                        .as_ref()
+                        .map(|p| produce(&store, &catalog, &p.request, submission))
+                        .transpose()?,
+                );
             }
             let members = request
                 .members
@@ -720,25 +776,38 @@ impl Service {
                 .zip(&seats)
                 .zip(&prepared)
                 .zip(&sets)
-                .map(
-                    |(((member, seat), prepared), candidates)| PoolMemberAdmission {
+                .zip(&existing)
+                .map(|((((member, seat), prepared), candidates), pin)| {
+                    let source = if let (Some(p), Some(c)) =
+                        (prepared.as_ref(), candidates.as_ref())
+                    {
+                        agent_run_store::pool_admission::PoolAdmissionSource::New(AdmissionInputs {
+                            request: &p.request,
+                            effective: &p.effective,
+                            authority: &p.authority,
+                            candidates: c,
+                            identity: &p.identity,
+                            global_cap: config.core.max_active_agents,
+                            harness_cap: p.cap,
+                            pinned: p.pinned.as_ref(),
+                        })
+                    } else {
+                        agent_run_store::pool_admission::PoolAdmissionSource::Existing(
+                            pin.as_ref().expect("validated existing source").clone(),
+                        )
+                    };
+                    PoolMemberAdmission {
                         id: seat.agent_id.clone(),
                         slot: seat.slot,
                         name: seat.name.clone(),
                         role: seat.role.clone(),
-                        personal_task: member.start.task.clone(),
-                        inputs: AdmissionInputs {
-                            request: &prepared.request,
-                            effective: &prepared.effective,
-                            authority: &prepared.authority,
-                            candidates,
-                            identity: &prepared.identity,
-                            global_cap: config.core.max_active_agents,
-                            harness_cap: prepared.cap,
-                            pinned: prepared.pinned.as_ref(),
-                        },
-                    },
-                )
+                        personal_task: member
+                            .start()
+                            .map(|start| start.task.clone())
+                            .unwrap_or_else(|| pin.as_ref().expect("existing source").task.clone()),
+                        source,
+                    }
+                })
                 .collect();
             let outcome = Store::open(&self.home)?.admit_pool(PoolAdmissionInput {
                 pool_id: &pool_id,
@@ -749,6 +818,7 @@ impl Service {
                 acceptance: &request.acceptance,
                 catalog: &catalog,
                 members,
+                orchestrator: binding.as_ref(),
             });
             match outcome {
                 Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
@@ -1046,20 +1116,24 @@ impl Service {
         })))
     }
 
-    /// Launches each member of a freshly created pool, then re-reads statuses.
+    /// Launches only newly admitted members; existing workers retain their
+    /// exact execution/session, then every status is read from its current tip.
     async fn hand_off_pool(&self, mut result: Value) -> Result<Value> {
         if result["created"] == true {
             let members = result["members"].as_array().cloned().unwrap_or_default();
             for member in &members {
+                if member["existing"] == true {
+                    continue;
+                }
                 let mut single = json!({"created": true, "agent_id": member["agent_id"]});
                 // A failure of one member is recorded on that member; it must
                 // not abandon the members after it.
                 let _ = self.hand_off_provider(&mut single).await;
             }
-            let store = Store::open(&self.home)?;
             for member in result["members"].as_array_mut().into_iter().flatten() {
                 let id: AgentId = serde_json::from_value(member["agent_id"].clone())?;
-                member["status"] = json!(store.get(&id)?.status.as_str());
+                let run = self.resolve_run(&id, None)?;
+                member["status"] = json!(run.status.as_str());
             }
         }
         Ok(result)
@@ -1087,12 +1161,20 @@ impl Service {
             .members
             .iter()
             .map(|member| {
-                Ok(json!({
-                    "agent_id": member.agent_id,
-                    "name": member.name,
-                    "role": member.role,
-                    "status": store.get(&member.agent_id).ok().map(|row| row.status.as_str()),
-                }))
+                let run = self.resolve_run(&member.agent_id, None).ok();
+                let mut item = json!({
+                    "agent_id":member.agent_id,"name":member.name,"role":member.role,
+                    "status":run.map(|row|row.status.as_str()),
+                });
+                if let Some(enrollment) = agent_run_store::pool_enrollment::view(
+                    &store.conn,
+                    &member.agent_id,
+                    crate::domain::now(),
+                )? {
+                    item["existing"] = json!(true);
+                    item["enrollment"] = enrollment;
+                }
+                Ok(item)
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(json!({

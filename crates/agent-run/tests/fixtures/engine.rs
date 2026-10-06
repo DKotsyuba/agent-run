@@ -135,6 +135,67 @@ fn pool_script(args: &[String], lead: bool) {
         .expect("bounded pool member fixture");
     });
 }
+
+/// Keeps an independent fixture active across mixed admission, reads its new
+/// live membership through the already running private MCP, and posts the exact
+/// broker challenge with a useful summary. The native work/session is unchanged.
+/// All I/O and the owned MCP child lifetime are finite; only test markers persist.
+fn pool_enroll(args: &[String]) {
+    let config: Value = serde_json::from_str(
+        &std::fs::read_to_string(argument(args, "--mcp-config").expect("worker config path"))
+            .unwrap(),
+    )
+    .unwrap();
+    let server = &config["mcpServers"]["agent_run_worker"];
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        use agent_run::transport::{frame,socket};
+        use std::process::Stdio;
+        let mut child=tokio::process::Command::new(server["command"].as_str().unwrap())
+            .args(server["args"].as_array().unwrap().iter().map(|a|a.as_str().unwrap()))
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
+        let mut input=child.stdin.take().unwrap();
+        let mut output=tokio::io::BufReader::new(child.stdout.take().unwrap());
+        let result=tokio::time::timeout(Duration::from_secs(20),async {
+            frame::write(&mut input,&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"enrollment-fixture","version":"1"}}}),socket::MAX_FRAME).await.unwrap();
+            frame::read(&mut output,socket::MAX_FRAME).await.unwrap().unwrap();
+            frame::write(&mut input,&json!({"jsonrpc":"2.0","method":"notifications/initialized"}),socket::MAX_FRAME).await.unwrap();
+            frame::write(&mut input,&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),socket::MAX_FRAME).await.unwrap();
+            let listed:Value=serde_json::from_slice(&frame::read(&mut output,socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
+            assert_eq!(listed["result"]["tools"].as_array().unwrap().len(),5);
+            std::fs::write("enrollment-worker-ready","five-tool MCP initialized").unwrap();
+            let mut id=2;
+            loop {
+                id+=1;
+                frame::write(&mut input,&json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"pool_read","arguments":{"after_seq":0,"limit":50}}}),socket::MAX_FRAME).await.unwrap();
+                let reply:Value=serde_json::from_slice(&frame::read(&mut output,socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
+                let text=reply["result"]["content"][0]["text"].as_str().unwrap_or_default();
+                // This is an offline model emulator interpreting its private
+                // tool result, never a production broker control parser.
+                let key=text.split("request_id=").nth(1).map(|s|s.split_whitespace().next().unwrap());
+                if let Some(key)=key {
+                    id+=1;
+                    frame::write(&mut input,&json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"pool_post","arguments":{"request_id":key,"message":"I read the pool context and continue the original independent review."}}}),socket::MAX_FRAME).await.unwrap();
+                    let ack:Value=serde_json::from_slice(&frame::read(&mut output,socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
+                    assert_ne!(ack["result"]["isError"],true,"{ack}");
+                    assert!(ack.get("error").is_none(),"{ack}");
+                    std::fs::write("enrollment-acked","current attempt acknowledged").unwrap();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+            while !std::path::Path::new("enrollment-release").exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await;
+        drop(input);
+        if result.is_err() { let _=child.kill().await; }
+        if tokio::time::timeout(Duration::from_secs(2),child.wait()).await.is_err() {
+            child.kill().await.unwrap();child.wait().await.unwrap();
+        }
+        result.expect("bounded active enrollment fixture");
+    });
+}
+
 /// Blocks until the marker file exists in the current workdir, bounded to
 /// twenty seconds so a lost test driver still ends this child finitely.
 fn wait_marker(name: &str) {
@@ -305,6 +366,9 @@ fn main() {
     }
     if task == "fixture:slow" {
         std::thread::sleep(Duration::from_secs(3));
+    }
+    if task == "fixture:pool-enroll" {
+        pool_enroll(&args);
     }
     if task.contains("fixture:pool-script") {
         pool_script(&args, task.contains("fixture:pool-script lead"));

@@ -6,8 +6,9 @@ three expose the same operator tool surface through one shared dispatcher
 (`crates/agent-run-core/src/dispatch.rs`), so a tool that exists in MCP exists here
 under the same name with the same parameters.
 
-Workers use a [separate MCP surface](worker-mcp.md) containing only
-`notify_orchestrator`. Its private `worker/notify` broker route is not in operator
+Workers use a [separate fixed five-tool MCP surface](worker-mcp.md):
+`notify_orchestrator`, `pool_post`, `pool_read`, `pool_propose` and `pool_vote`.
+Pool actions require live authenticated membership. Private worker broker routes are not in operator
 discovery and requires the current run/attempt capability on every call.
 
 Audience: an integrating agent or developer who has never seen this repo.
@@ -127,8 +128,9 @@ Discover the authoritative surface at runtime:
 - `ping` (no params) — `{"ok": true}`; liveness probe.
 
 Cooperative pools use five strict methods from the same table: `start_pool`
-(two to five ordinary start requests sharing one goal and acceptance criteria,
-admitted atomically; returns the stable `pool_id` and each member's `agent_id`,
+(two to five members sharing one goal and acceptance criteria, admitted
+atomically; each member supplies exactly one `start` or `existing_agent_id` plus
+`role`; returns the stable `pool_id` and each member's `agent_id`,
 name, role and status), `pool_post` (an operator message stamped as the
 orchestrator), `pool_replace` (replace a terminal, fully cleaned member; same
 `request_id` returns the same new member) and `pool` (status plus a cursor-paged
@@ -138,6 +140,15 @@ with the pool code leading the message (`member_busy`, `pool_completed`,
 `pool_not_found`, ...). A pool completes only by formal verification (every
 member voted ready on one proposal, ended successfully, cleanup verified) and
 delivers exactly one common notice; that is not proof the result is correct.
+
+An attached existing member keeps its current owned RUNNING execution, task,
+account, grants, native session, reservation and original deadline. Its admission
+member row adds `existing: true` and an `enrollment` view (`state`, remaining
+seconds, optional failure reason); ordinary new-only member shapes stay unchanged.
+The worker-only `pool_read` adds its own attempt-pinned ACK challenge. Only an
+exact `pool_post` summary using that challenge changes `pending` to `joined`;
+unjoined members cannot vote or settle. `needs_action` reports failed awareness
+without restarting or cancelling old work. See [worker enrollment](worker-mcp.md).
 
 Over MCP, every tool result renders as one compact plain-text page (see
 `assets/mcp/*.txt.j2`) instead of the structured JSON below; `start`/`resume`

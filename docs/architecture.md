@@ -104,7 +104,7 @@ require existing canonical directories.
 
 SQLite is the source of truth for agents, events, messages, answers, native
 session lineage, deliveries, cleanup evidence, capacity, and statistics. The
-current schema is version 25. Numbered migrations live in `sql/migrations/`
+current schema is version 26. Numbered migrations live in `sql/migrations/`
 and apply transactionally after a pre-version backup. The step to 17 is paired
 with the schema-2 config: ordinary commands and the broker refuse an older
 database with `migration_required` until `agent-run config migrate` runs. A
@@ -113,11 +113,27 @@ binary refuses a database newer than its supported schema.
 Schema 25 lays the foundation for cooperative pools (a small roster of
 ordinary executions sharing one goal) with `pools`, `pool_members` and
 `pool_entries`. The schema, the validated domain types, the compact entry renderer and
-atomic batch admission exist so far: the store admits every member agent, its
-reservations and the pool roster in one transaction (or none), and the core
+atomic batch admission share one immediate transaction: new executions,
+reservations and the roster commit together (or none), and the core
 composes each member's task with the common goal, its own seat and every peer's
 stable identity before any member is launched. Replay is keyed by the original
-client request, never by the composed text. Pool members carry a fixed private
+client request, never by the composed text. Schema 26 adds attempt-pinned
+`pool_enrollments`, observed worker catalog proof, and a permanent per-root
+membership marker. A mixed batch can attach supported independent RUNNING
+workers without another execution or reservation; the transaction rechecks the
+exact attempt, original deadline, immutable launch facts and compatible binding.
+The membership marker also covers new seats and replacements and survives pool
+history collection; historical independence remains unknown conservatively.
+Existing seats receive durable context and remain pending until an authenticated
+`pool_post` summary matches their opaque challenge. Replays authenticate the
+pinned attempt before idempotent lookup; native transport receipts never imply
+awareness. Unjoined seats cannot vote or settle. Their overlay is retained with
+active pool history and removed before eligible entry/member GC. Failure queues
+one broker-authored attention through the existing outbox, suppressed by an
+already queued individual error. Codex attention requires v5 support and defers
+before a send attempt on older peers without blocking ordinary v4 notices.
+
+All current workers carry a fixed private
 worker catalog — `notify_orchestrator`, `pool_post`, `pool_read`,
 `pool_propose` and `pool_vote` — served over one private broker route that
 authenticates the hidden per-attempt capability and stamps the author (kind,

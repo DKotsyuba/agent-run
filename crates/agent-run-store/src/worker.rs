@@ -131,6 +131,48 @@ impl Store {
         Ok(())
     }
 
+    /// Registers proof from the real native worker MCP, including legitimate
+    /// owned STARTING attempts. Unknown/old catalogs remain unsupported; no
+    /// token value is persisted. Repeated identical proof is an idempotent read.
+    pub fn register_worker_catalog(
+        &mut self,
+        proof: &agent_run_domain::worker::WorkerCatalogProof,
+        at: f64,
+    ) -> Result<()> {
+        if proof.version != agent_run_domain::worker::POOL_CATALOG_VERSION
+            || proof.digest != agent_run_domain::worker::pool_catalog_digest()
+        {
+            return Err(Error::Unsupported(
+                "worker pool catalog is not supported".into(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if authenticate_attempt(&tx, &proof.run_id, &proof.attempt_id, &proof.token, at)?.is_none()
+        {
+            return Err(Error::Validation("invalid worker capability".into()));
+        }
+        let existing:(Option<u32>,Option<String>)=tx.query_row(
+            "SELECT pool_catalog_version,pool_catalog_digest FROM worker_capabilities WHERE attempt_id=?",
+            [&proof.attempt_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        if existing.0.is_some() || existing.1.is_some() {
+            if existing.0 != Some(proof.version)
+                || existing.1.as_deref() != Some(proof.digest.as_str())
+            {
+                return Err(Error::Conflict);
+            }
+            tx.commit()?;
+            return Ok(());
+        }
+        tx.execute(
+            "UPDATE worker_capabilities SET pool_catalog_version=?,pool_catalog_digest=?,pool_catalog_observed_at=? WHERE attempt_id=?",
+            params![proof.version, proof.digest, at, proof.attempt_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Authenticates the exact running attempt and atomically queues one report.
     /// Idempotent replays bypass volume limits but never bypass authentication.
     pub fn notify_orchestrator(

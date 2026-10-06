@@ -12,6 +12,8 @@ pub mod journal;
 pub mod lineage;
 pub mod migrations;
 pub mod pool_admission;
+/// Exact-attempt enrollment of active independent workers into one pool.
+pub mod pool_enrollment;
 /// Authenticated pool writes, the durable shared log, and derived status.
 pub mod pool_log;
 pub mod pool_replace;
@@ -1365,9 +1367,12 @@ impl Store {
             json!({"agent_id":id,"messages":messages,"cursor":cursor,"limit":limit,"next_cursor":next,"complete":!more}),
         )
     }
+    /// Projects one execution's individual completion notice and safe attempt
+    /// evidence. Worker reports, common-pool completion and join attention are
+    /// excluded; no row yields `not_created`, without implying task completion.
     pub fn delivery_status(&self, id: &AgentId) -> Result<Value> {
         let row = self.get(id)?;
-        let d=self.conn.query_row("SELECT id,state,attempts,ambiguous_result,last_error FROM deliveries WHERE agent_id=? AND id NOT IN (SELECT delivery_id FROM worker_notifications) AND id NOT IN (SELECT completion_delivery_id FROM pools WHERE completion_delivery_id IS NOT NULL) ORDER BY terminal_event_seq DESC LIMIT 1",[id.as_str()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u32>(2)?,r.get::<_,bool>(3)?,r.get::<_,Option<String>>(4)?))).optional()?;
+        let d=self.conn.query_row("SELECT id,state,attempts,ambiguous_result,last_error FROM deliveries WHERE agent_id=? AND id NOT IN (SELECT delivery_id FROM worker_notifications) AND id NOT IN (SELECT completion_delivery_id FROM pools WHERE completion_delivery_id IS NOT NULL) AND terminal_event_seq NOT IN (SELECT seq FROM events WHERE kind='pool_join_needs_action') ORDER BY terminal_event_seq DESC LIMIT 1",[id.as_str()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u32>(2)?,r.get::<_,bool>(3)?,r.get::<_,Option<String>>(4)?))).optional()?;
         let (notification_id, state, attempts, ambiguous, last_error, last_attempt) = if let Some(
             (did, state, attempts, ambiguous, last_error),
         ) = d

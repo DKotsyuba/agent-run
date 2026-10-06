@@ -14,9 +14,15 @@ Current proposal #{{ status.current_proposal.seq }} unchanged (read with after_s
 {% else %}
 No proposal yet.
 {% endif %}
+{% if enrollment %}
+Enrollment: {{ enrollment.state }}; original execution time remaining {{ enrollment.remaining_seconds }}s{% if enrollment.reason %}, {{ enrollment.reason }}{% endif %}.
+{% if enrollment.state != "joined" and enrollment.request_id %}
+After reading the goal/criteria/roster, ACK through pool_post with exact request_id={{ enrollment.request_id }} and a brief current-work summary. This does not restart or extend your work.
+{% endif %}
+{% endif %}
 Members:
 {% for member in status.members %}
-- {{ member.name }} ({{ member.role }}, {{ member.agent_id }}): {{ member.tip_status }}, vote {{ member.why }}{% if member.vote and member.vote.decision %} [{{ member.vote.decision }}]{% endif %}{{ "" }}
+- {{ member.name }} ({{ member.role }}, {{ member.agent_id }}): {{ member.tip_status }}{% if member.enrollment %}, enrollment {{ member.enrollment.state }}{% endif %}, vote {{ member.why }}{% if member.vote and member.vote.decision %} [{{ member.vote.decision }}]{% endif %}{{ "" }}
 {% endfor %}
 {{ status.note }}
 Common notice delivery: {{ delivery.state }}{% if delivery.state == "not_created" %} (not created yet){% elif delivery.state == "waiting_binding" %} (waiting for pool binding){% elif delivery.bound %} (bound){% else %} (unbound){% endif %}{% if delivery.attempts > 0 %}, attempts {{ delivery.attempts }}{% endif %}{% if delivery.ambiguous %}, ambiguous{% endif %}{% if delivery.last_classification %}, last {{ delivery.last_classification }}{% endif %}

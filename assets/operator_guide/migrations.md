@@ -3,7 +3,9 @@
 state.db's schema version is tracked in SQLite's own `PRAGMA user_version`.
 Each schema change beyond the initial schema is a numbered SQL delta file
 under `sql/migrations/` (`NNN_slug.sql`), applied in order, each in its own
-`BEGIN IMMEDIATE` transaction. The current schema is version 25.
+`BEGIN IMMEDIATE` transaction. The current schema is version 26. Migration 26 adds attempt-pinned active-pool
+enrollment and current worker catalog proof. Historical independence is unknown,
+so attaching an older root is refused rather than assuming no pool history.
 
 ## Older stores refuse ordinary commands
 

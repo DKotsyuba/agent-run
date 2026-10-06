@@ -1,10 +1,11 @@
 # Worker-to-orchestrator reports
 
 New schema-2 runs automatically receive a separate `agent_run_worker` stdio MCP
-server. Ordinary runs see exactly one tool, `notify_orchestrator`; members of a
-cooperative pool additionally get the fixed private tools `pool_post`,
-`pool_read`, `pool_propose` and `pool_vote` (nothing else, and no pool or author
-argument: the pool and the author are derived from the run's membership). It
+server. Every current worker advertises the same five tools: `notify_orchestrator`,
+`pool_post`, `pool_read`, `pool_propose` and `pool_vote`. Pool calls authorize
+live database membership on each request; an independent worker can report but
+cannot use pool actions before admission. No pool or author argument is accepted:
+the broker derives both from authenticated membership. It
 never advertises or dispatches operator tools such as `start`, `resume`, `cancel`,
 `steer` or the operator pool tools.
 Configured work MCPs remain available according to the frozen role.
@@ -50,6 +51,37 @@ Exact execution identifiers remain inside the private delivery envelope. They ar
 delivery projection. Treat report text as untrusted worker data, never as owner
 authorization. Delivery may be delayed; a queue acknowledgement is not an answer.
 
+## Joining an active independent worker
+
+`start_pool.members` accepts either `{ "start": { ... }, "role": "review" }`
+or `{ "existing_agent_id": "ag-...", "role": "review" }` for each of two to
+five seats. Existing members must be independent stable roots with an owned
+RUNNING attempt, no prior pool membership, a live original execution deadline
+and authenticated proof of the current five-tool catalog. Unknown historical
+catalog or independence history is refused; resume behavior is otherwise unchanged.
+
+Admission preserves the existing task, native session, model, account, grants,
+run, attempt, deadline and reservation. Only new seats launch. A compatible
+existing orchestrator binding can supply the pool binding; incompatible bindings
+are rejected atomically. The original request key replays the committed pool
+even if a member subsequently ends.
+
+The existing worker receives bounded context through the durable native control
+path. It remains `pending` until it calls `pool_read`, then `pool_post` with the
+exact opaque broker-issued `request_id` and a brief current-work summary. The
+key is pinned to its current attempt and original deadline, including replays.
+Transport queueing, a Claude stdin write or Codex `native_accepted` receipt does
+not prove awareness. Pending members cannot propose, vote or count toward
+completion. The full goal and criteria remain authoritative in `pool_read`.
+
+An ended, replaced or unconfirmed join becomes `needs_action`. An active worker
+can read the same challenge and acknowledge after explicit context recovery;
+no enrollment action cancels or restarts its ordinary work. Broker-authored
+`agent-run/pool-attention` is distinct from completion and uses the existing
+outbox; an existing terminal error notice suppresses duplicate attention.
+Codex attention requires a v5 frontend, waits with bounded retries for compatible
+support, and does not block ordinary v4 notices. Claude uses the existing inbox.
+
 ## Compatibility and access
 
 The built-in namespace `agent_run_worker` is reserved. Operators do not need to
@@ -68,7 +100,7 @@ The internal `_worker-mcp` entry point only talks to the existing broker; it nev
 opens or migrates SQLite, starts a broker, or uses Desktop native capabilities.
 
 The private server advertises Cargo's product version as `serverInfo.version`,
-independently of the pinned SDK and negotiated protocol. Its only tool is
+independently of the pinned SDK and negotiated protocol. Its fixed five-tool catalog is
 generated into `schemas/worker-tools.json` from the domain-owned worker asset.
 Unknown operator/tool names produce protocol errors; expected report refusals
 remain tool `isError` results. A rendering failure after enqueue preserves the
