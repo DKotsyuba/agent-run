@@ -254,10 +254,15 @@ acknowledgement or its evidence.
 ## Capacity and diagnostics
 
 Capacity collectors store timestamped provider observations and explicit
-physical quota topology. `limits` reports freshness and projections without
-calling providers; `capacity order` returns an advisory compatible-route order
-and never launches work. Missing or stale evidence becomes unknown rather than
-an invented zero.
+physical quota topology. With schema 2, `delegation_guide` provides compact routing guidance
+with exact provider/model/profile filters. Optional `limits` diagnostics retain
+quota percentages, resets and freshness and add numerical provider/model
+standing from the same committed snapshot and advice clock, without calling
+providers. `models` and `capacity_order` remain call-only compatibility views
+with their original CLI/socket responses; they are absent from discovery.
+Schema 1 retains its historical limits windows and compatibility views; the
+guide is Unsupported there. Missing or stale evidence becomes unknown rather
+than an invented zero.
 
 `agent-run doctor` checks configuration, binaries, role assets, state,
 schema-2 provider bindings against a read-only account-registry snapshot,

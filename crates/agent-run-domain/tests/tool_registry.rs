@@ -49,7 +49,8 @@ fn registry_matches_python_golden_field_by_field() {
     {
         assert_eq!(actual["name"], expected["name"]);
         // The schema-2 catalog reads extend the baseline: their descriptions
-        // keep the Python text as a prefix, and they add only the exact
+        // retain the Python opening after explicit compatibility guidance,
+        // and add only the exact
         // optional nullable string filters pinned here.
         let filters: &[&str] = match definition.name.as_str() {
             "models" => &["model", "profile", "provider"],
@@ -65,12 +66,21 @@ fn registry_matches_python_golden_field_by_field() {
                 .find(". ")
                 .map(|end| text[..end + 1].to_owned())
                 .unwrap_or(text);
-            assert!(
-                actual["description"]
-                    .as_str()
-                    .unwrap()
-                    .starts_with(base.as_str())
-            );
+            let prefix = match definition.name.as_str() {
+                "models" => {
+                    "Call-only compatibility method; not advertised. Use delegation_guide for provider/model/profile guidance. Existing responses and handlers are unchanged. "
+                }
+                "capacity_order" => {
+                    "Call-only compatibility method; not advertised. Use limits for quota windows and ranked provider/model diagnosis. Existing responses and handlers are unchanged. "
+                }
+                _ => unreachable!(),
+            };
+            let historical = actual["description"]
+                .as_str()
+                .unwrap()
+                .strip_prefix(prefix)
+                .expect("exact compatibility guidance prefix");
+            assert!(historical.starts_with(base.as_str()));
             expected["description"] = actual["description"].clone();
             for name in filters {
                 expected["inputSchema"]["properties"][name] =

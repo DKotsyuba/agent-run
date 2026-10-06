@@ -158,7 +158,8 @@ release platform, and agent-run does not generate systemd units.
 
 ```bash
 agent-run delegation-guide             # read before choosing a delegation route
-agent-run models                       # providers, explicit models, roles, standing
+agent-run delegation-guide --provider codex --profile review  # exact optional filters
+agent-run limits                       # optional quota/reset/priority diagnosis
 agent-run start --provider codex --model gpt-6.1-sol --profile review \
   --task "Review this repository." --workdir "$PWD"
 
@@ -186,8 +187,10 @@ the Claude runtime journals assistant fragments and the completion tail of one
 message under its native message id (or one producer-owned fallback per
 message boundary when the engine omits ids), so each message renders as one
 continuous row and distinct messages stay distinct. Other commands
-include `steer`, `cancel`, `models`, `limits`, `capacity order`,
-`delivery status`, and `doc`.
+include `steer`, `cancel`, `delivery status`, and `doc`. The legacy
+`models` and `capacity order` CLI commands remain compatibility reads with
+their original structured responses; ordinary routing uses `delegation-guide`
+and optional `limits` diagnostics.
 
 ## Use the MCP server
 

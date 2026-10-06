@@ -222,11 +222,13 @@ mod tests {
     use super::render;
     use serde_json::json;
 
-    /// The guide stays honest for an empty and for a control-laden catalog.
+    /// Empty/control-laden catalogs stay honest, and the single optional
+    /// diagnostics direction names limits without requiring compatibility reads.
     #[test]
     fn render_states_an_empty_catalog_and_normalizes_prose() {
         let empty = render(&json!({"providers": []})).unwrap();
         assert!(empty.contains("No providers are currently configured."));
+        assert_eq!(empty.matches("For optional quota percentages, reset times and numeric priority details, use limits.").count(), 1);
         let messy = render(&json!({
             "ranked_at": 1000.0,
             "providers": [{
