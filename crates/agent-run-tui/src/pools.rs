@@ -31,8 +31,8 @@ pub struct Page {
     pub entries: Vec<PoolEntryView>,
     /// Exclusive reverse cursor, absent for forward reads.
     pub before_seq: Option<u64>,
-    /// Last durable sequence, independent of page direction.
-    pub last_seq: u64,
+    /// Last durable sequence, independent of page direction; null for an empty log.
+    pub last_seq: Option<u64>,
     /// No further entries in the requested direction.
     pub complete: bool,
     /// Current or frozen status, supplied even by empty polls.
@@ -130,8 +130,8 @@ pub struct Buffer {
     pub entries: Vec<PoolEntryView>,
     /// Latest sequence actually loaded, never the server's unseen last_seq.
     pub after: u64,
-    /// Durable tail known from the last status page; retained window may end earlier.
-    pub last_seq: u64,
+    /// Durable tail known from status; absent for an empty log, never invented as zero.
+    pub last_seq: Option<u64>,
     /// Whether all older history is loaded.
     pub history_complete: bool,
     /// In-flight reverse cursor; cleared on response or target switch.
@@ -165,7 +165,7 @@ impl Buffer {
             status: None,
             entries: vec![],
             after: 0,
-            last_seq: 0,
+            last_seq: None,
             history_complete: false,
             older: None,
             follow: true,
@@ -238,7 +238,10 @@ impl Buffer {
         }
         // Initial tail reads establish a forward cursor; later reverse pages never rewind it.
         if self.after == 0 {
-            self.after = self.entries.last().map_or(page.last_seq, |e| e.seq);
+            self.after = self
+                .entries
+                .last()
+                .map_or(page.last_seq.unwrap_or(0), |e| e.seq);
         }
         if self.entries.len() > ENTRY_CAP {
             if backward {
@@ -410,7 +413,7 @@ impl Pools {
             completed: b
                 .and_then(|b| b.status.as_ref())
                 .is_some_and(|s| s.state == PoolState::Completed)
-                && b.is_some_and(|b| b.after >= b.last_seq),
+                && b.is_some_and(|b| b.last_seq.is_none_or(|last| b.after >= last)),
             candidates: candidates(sessions, self.selected.as_ref()),
         }
     }
@@ -576,7 +579,7 @@ pub async fn worker(
                         goal: s.goal.chars().take(128).collect(),
                         goal_truncated: s.goal.chars().count() > 128,
                         created_at: 0.0,
-                        last_seq: page.last_seq,
+                        last_seq: page.last_seq.unwrap_or(0),
                         completed_at: None,
                         roster_revision: s.roster_revision,
                         members_count: s.members.len(),

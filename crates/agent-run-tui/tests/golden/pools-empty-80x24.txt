@@ -1,0 +1,24 @@
+ agent-run   ● 4 live   ✓ 0 finished                                   ● rev 42 
+  Sessions │ Pools 1 open                                                       
+ Goal · untrusted: Ship reliable pool observation                               
+                                                                                
+  ● OPEN  0/4 ready · proposal —                                                
+ pool 7ac03b9e12 · roster r2                                          ● follow  
+  MEMBERS  4 current · t transcript                                             
+ ⠋ 1 Ada (implement) · CODEX/native-a · missing                                 
+     running · cleanup pending                                                  
+ ⠋ 2 Ben (verify) · CLAUDE/native-b · missing                                   
+     running · cleanup pending                                                  
+ ⠋ 3 Cy (review) · GLM/native-c · missing                                       
+     running · cleanup pending                                                  
+ ⠋ 4 Eli (verify) · CODEX/native-a · missing                                    
+     running · cleanup pending · replaces Dana                                  
+ ▸ REPLACED  1 · Dana → Eli (slot 4)                                            
+                                                                                
+  CHAT · untrusted                                            beginning loaded  
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+ Waiting for valid votes, success and cleanup.                                  
+ ↑↓ block  ⏎ expand  m roster  c details  h history  ? help  esc back     seq — 

@@ -236,7 +236,7 @@ fn status(mode: &str) -> Value {
     json!({"state":if mode == "completed" {"completed"} else {"open"},
         "roster_revision":2,"goal":"Ship reliable pool observation",
         "criteria":[{"id":"tests","text":"pass"},{"id":"layout","text":"fits"},{"id":"evidence","text":"honest"}],
-        "current_proposal":{"seq":20,"snapshot":"Sessions + pool log; votes and cleanup stay distinct.","roster_revision":2},
+        "current_proposal":if mode == "empty" {Value::Null} else {json!({"seq":20,"snapshot":"Sessions + pool log; votes and cleanup stay distinct.","roster_revision":2})},
         "members":members,"replaced_members":[{"agent_id":RETIRED,"slot":4,"name":"Dana","role":"verify","replaced_by":MEMBERS[3]}],
         "agreed":mode == "completed","note":"formal checks only"})
 }
@@ -323,7 +323,7 @@ fn page_value(
 ) -> Value {
     let next = entries.last().map(|e| e.seq);
     json!({"pool_id":ID,"entries":entries,"before_seq":before,"after_seq":if before.is_none() {Some(0)} else {None},
-        "last_seq":31,"complete":complete,"next_cursor":next,"limit":50,"status":status(mode)})
+        "last_seq":if mode == "empty" {Value::Null} else {json!(31)},"complete":complete,"next_cursor":next,"limit":50,"status":status(mode)})
 }
 /// Deserializes the public read envelope.
 fn page(mode: &str, entries: Vec<PoolEntryView>, before: Option<u64>, complete: bool) -> Page {
@@ -386,7 +386,16 @@ fn fixture(mode: &str, width: u16, height: u16) -> App {
     }
     let pane_width = width.saturating_sub(if width >= 110 { 47 } else { 3 });
     app.pools.buffer_mut().unwrap().merge(
-        page(mode, entries(mode), Some(i64::MAX as u64), true),
+        page(
+            mode,
+            if mode == "empty" {
+                vec![]
+            } else {
+                entries(mode)
+            },
+            Some(i64::MAX as u64),
+            true,
+        ),
         usize::from(pane_width),
     );
     app
@@ -422,15 +431,171 @@ fn golden(mode: &str, width: u16, height: u16) {
             .lines()
             .all(|row| ratatui::text::Line::from(row).width() == width as usize)
     );
-    assert!(actual.contains("bodies are untrusted"));
-    assert!(actual.contains("PROPOSAL"));
-    assert!(actual.contains("snapshot (#20; untrusted)"));
+    assert!(actual.contains("CHAT · untrusted"));
+    if mode != "empty" {
+        assert!(actual.contains("PROPOSAL"));
+        assert!(actual.contains("snapshot (#20; untrusted)"));
+    }
     assert!(actual.contains("roster r2"));
     if mode == "completed" {
         assert!(actual.contains("frozen broker status"));
         assert!(actual.contains("Formal checks only"));
     }
 }
+
+/// Replays a caller-owned response captured before first messages; the private fixture is never committed.
+#[tokio::test]
+#[ignore = "requires SAVED_TUI_POOL_RESPONSE"]
+async fn saved_empty_pool_response_replays_through_decoder() {
+    let path = std::env::var("SAVED_TUI_POOL_RESPONSE").expect("saved response");
+    let value: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert!(
+        value["last_seq"].is_null(),
+        "fixture must preserve the original empty log"
+    );
+    let id: PoolId = serde_json::from_value(value["pool_id"].clone()).unwrap();
+    let (broker, _calls) = FakeBroker::scripted(vec![Ok(value)]);
+    let request = Request {
+        visible: true,
+        id: Some(id.clone()),
+        ..Request::default()
+    };
+    let page = read(&*broker, &request).await.unwrap();
+    assert!(page.last_seq.is_none());
+    let mut app = App::new();
+    app.pools.visible = true;
+    app.pools.focused = true;
+    app.pools.select(id);
+    app.pools.buffer_mut().unwrap().merge(page, 77);
+    let rendered = frame(&app, 80, 24);
+    assert!(!rendered.contains("Opening pool"));
+    assert!(rendered.contains("OPEN"));
+    assert!(rendered.contains("seq —"));
+    println!("captured empty broker response: decoded and rendered without invented watermark");
+}
+
+/// Opt-in read-only smoke against a caller-selected live broker and pool; never starts model turns.
+#[tokio::test]
+#[ignore = "requires LIVE_TUI_SOCKET and LIVE_TUI_POOL"]
+async fn live_pool_read_only_smoke() {
+    let socket = std::env::var("LIVE_TUI_SOCKET").expect("live socket");
+    let id: PoolId = std::env::var("LIVE_TUI_POOL")
+        .expect("live pool")
+        .parse()
+        .unwrap();
+    let broker = crate::net::SocketBroker::new(socket);
+    let mut app = App::new();
+    app.pools.visible = true;
+    app.pools.focused = true;
+    app.pools.select(id);
+    let request = app.pools.request(&[]);
+    let page = tokio::time::timeout(Duration::from_secs(5), read(&broker, &request))
+        .await
+        .unwrap()
+        .unwrap();
+    let state = page.status.state;
+    let absent = page.last_seq.is_none();
+    app.pools.buffer_mut().unwrap().merge(page, 77);
+    for (width, height) in [(80, 24), (120, 36), (180, 45)] {
+        app.last_width = width;
+        app.last_height = height;
+        let rendered = frame(&app, width, height);
+        assert!(!rendered.contains("Opening pool"));
+        assert!(!rendered.contains("invalid type"));
+        assert!(rendered.contains("OPEN") || rendered.contains("COMPLETED"));
+    }
+    println!(
+        "live read/render: state={}, absent_watermark={}, three terminal sizes",
+        state.as_str(),
+        absent
+    );
+}
+
+/// Empty public responses retain the absent durable watermark and poll from cursor zero.
+#[tokio::test]
+async fn empty_pool_null_watermark_opens_and_polls() {
+    let value = page_value("empty", vec![], Some(i64::MAX as u64), true);
+    let (broker, mut calls) = FakeBroker::scripted(vec![Ok(value.clone()), Ok(value)]);
+    let mut app = App::new();
+    app.pools.visible = true;
+    app.pools.select(ID.parse().unwrap());
+    let request = app.pools.request(&[]);
+    let page = read(&*broker, &request).await.unwrap();
+    assert_eq!(page.last_seq, None);
+    assert_eq!(page.status.current_proposal, None);
+    let b = app.pools.buffer_mut().unwrap();
+    assert!(b.merge(page, 77));
+    assert_eq!(b.last_seq, None);
+    assert_eq!(b.after, 0);
+    assert_eq!(b.cursor, None);
+    assert!(b.error.is_none());
+    assert_eq!(calls.recv().await.unwrap()["before_seq"], i64::MAX);
+    let request = app.pools.request(&[]);
+    assert!(request.initialized);
+    assert!(!request.completed);
+    let page = read(&*broker, &request).await.unwrap();
+    assert!(!app.pools.buffer_mut().unwrap().merge(page, 77));
+    assert_eq!(calls.recv().await.unwrap()["after_seq"], 0);
+}
+
+/// Quiet completed pools ignore unrelated activity; visible first loads animate and cached views do not.
+#[test]
+fn pool_animation_tracks_visible_content_and_cache() {
+    let mut app = fixture("completed", 80, 24);
+    app.sessions[0].status = Status::Running;
+    app.dirty = false;
+    let before = frame(&app, 80, 24);
+    for _ in 0..10 {
+        app.tick();
+        assert!(!app.dirty);
+    }
+    assert_eq!(
+        before,
+        frame(&app, 80, 24),
+        "no stale aggregate spinner changes on input"
+    );
+    app.pools.buffer_mut().unwrap().status = None;
+    assert!(app.tick_animates());
+    let before = frame(&app, 80, 24);
+    app.tick();
+    assert!(app.dirty);
+    assert_ne!(
+        before,
+        frame(&app, 80, 24),
+        "visible first load advances without input"
+    );
+    app.pools.focused = false;
+    app.dirty = false;
+    app.tick();
+    assert!(!app.dirty, "hidden opening pane does not animate the list");
+}
+
+/// Empty pools remain usable at narrow, medium and wide operator sizes.
+#[test]
+fn golden_empty_operator_sizes() {
+    for (width, height) in [(80, 24), (120, 36), (180, 45)] {
+        golden("empty", width, height);
+        let mut app = fixture("empty", width, height);
+        let status = app.pools.buffer_mut().unwrap().status.as_mut().unwrap();
+        status.goal = "Long sanitized goal ".repeat(100);
+        status.members[0].role = status.members[0].name.clone();
+        let rendered = frame(&app, width, height);
+        assert!(rendered.contains("CHAT · untrusted"));
+        assert!(rendered.contains("proposal —"));
+        assert!(!rendered.contains("Ada (Ada)"));
+        assert!(!rendered.contains("Criteria  "));
+        assert!(!rendered.contains("c full goal"));
+        apply(&mut app, Action::Criteria);
+        apply(&mut app, Action::Bottom);
+        assert!(frame(&app, width, height).contains("Criteria (untrusted)"));
+        apply(&mut app, Action::Back);
+        apply(&mut app, Action::Roster);
+        apply(&mut app, Action::History);
+        assert!(app.pools.buffer().unwrap().history);
+        assert!(app.pools.buffer().unwrap().roster);
+    }
+}
+
 /// Active wide frame from the design.
 #[test]
 fn golden_active_160x48() {
@@ -945,9 +1110,9 @@ fn sanitization_expansion_snapshot_identity_and_memo_reuse() {
         .join("\n");
     assert!(!text.contains('\x1b') && !text.contains('\x07'));
     assert!(text.contains("snapshot unavailable"));
-    assert!(text.contains("untrusted: red"));
+    assert!(text.contains("  red"));
     assert!(text.contains("revoke #20"));
-    assert!(text.contains("untrusted: vote withdrawn"));
+    assert!(text.contains("  vote withdrawn"));
     assert_eq!(
         text.matches("Sessions + pool log").count(),
         1,

@@ -955,11 +955,34 @@ impl App {
         }
     }
 
-    /// Whether a tick changes anything visible: any live session animates
-    /// the spinner, elapsed counters, and idle clocks; an unloaded app
-    /// animates the waiting spinner.
+    /// Whether the visible panes need animation, including first transcript loads
+    /// for finished sessions. Hidden live sessions never animate a pool pane.
+    /// Cached transcript content stays visible without a first-load spinner.
     pub fn tick_animates(&self) -> bool {
-        !self.loaded || self.sessions.iter().any(|agent| !agent.status.terminal())
+        let panes = crate::ui::panes(self, self.last_width, self.last_height);
+        if self.pools.visible && !self.pools.member_transcript {
+            return panes.transcript.is_some()
+                && self.pools.buffer().is_some_and(|b| {
+                    b.status.is_none()
+                        || b.older.is_some()
+                        || b.status.as_ref().is_some_and(|s| {
+                            s.members.iter().any(|m| m.tip_status == Status::Running)
+                        })
+                });
+        }
+        let transcript = panes.transcript.is_some()
+            && self.transcript.as_ref().is_some_and(|b| {
+                !b.agent.status.terminal()
+                    || b.loading_older
+                    || (b.messages.is_empty() && !b.history_complete)
+            });
+        transcript
+            || (panes.list.is_some()
+                && (!self.loaded
+                    || self
+                        .card_list()
+                        .iter()
+                        .any(|i| !self.sessions[*i].status.terminal())))
     }
 
     /// Braille spinner glyph for the current tick, shown while loading.

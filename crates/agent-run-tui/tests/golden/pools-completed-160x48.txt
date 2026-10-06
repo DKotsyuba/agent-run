@@ -1,47 +1,47 @@
- agent-run   ⠋ 0 live   ✓ 4 finished                                                                                               ● broker rev 42   sessions 4 
+ agent-run   ● 0 live   ✓ 4 finished                                                                                               ● broker rev 42   sessions 4 
   Sessions │ Pools 0 open                                                                                                                                       
-  OPEN  0                                     Ship reliable pool observation                                                                                    
-                                               ✓ COMPLETED  4/4 ready · proposal #20                                                                            
-   no pools on this page                      pool 7ac03b9e12 · roster r2                                                                              ● follow 
-                                              Criteria  tests: pass · layout: fits · evidence: honest                                                           
-  COMPLETED  1                                c full goal + criteria · m roster · h replaced history                                                            
+  OPEN  0                                     Goal · untrusted: Ship reliable pool observation                                                                  
                                                                                                                                                                 
- ▌  ✓ Ship reliable pool observation           MEMBERS  4 current · t transcript · frozen status                                                                
- ▌    4/4 ready · #20 · 7ac03b9e12            ✓ 1 Ada (implement) · CODEX/native-a (latest) · ready                                                             
+   no pools on this page                       ✓ COMPLETED  4/4 ready · proposal #20                                                                            
+                                              pool 7ac03b9e12 · roster r2                                                                              ● follow 
+  COMPLETED  1                                 MEMBERS  4 current · t transcript · frozen status                                                                
+                                              ✓ 1 Ada (implement) · CODEX/native-a (latest) · ready                                                             
+ ▌  ✓ Ship reliable pool observation              succeeded · cleaned                                                                                           
+ ▌    4/4 ready · #20 · 7ac03b9e12            ✓ 2 Ben (verify) · CLAUDE/native-b (latest) · ready                                                               
                                                   succeeded · cleaned                                                                                           
-  [ ] pages · offset 0 · 50/state             ✓ 2 Ben (verify) · CLAUDE/native-b (latest) · ready                                                               
-                                                  succeeded · cleaned                                                                                           
-                                              ✓ 3 Cy (review) · GLM/native-c (latest) · ready                                                                   
+  [ ] pages · offset 0 · 50/state             ✓ 3 Cy (review) · GLM/native-c (latest) · ready                                                                   
                                                   succeeded · cleaned                                                                                           
                                               ✓ 4 Eli (verify) · CODEX/native-a (latest) · ready                                                                
                                                   succeeded · cleaned · replaces Dana                                                                           
                                               ▸ REPLACED  1 · Dana → Eli (slot 4)                                                                               
                                                                                                                                                                 
-                                               CHAT · #seq rN · bodies are untrusted                                                           beginning loaded 
-                                                                                                                                                               │
-                                              #18 r2 · OPERATOR → team · message                                                                               ┃
-                                                untrusted: Keep the observer read-only.                                                                        │
-                                                                                                                                                               │
-                                              #19 r2 · Ada (implement) → team · message                                                                        │
-                                                untrusted: The pool pane now follows the log.                                                                  │
-                                                                                                                                                               │
-                                              ╭─ #20 r2 · Ada → team · PROPOSAL──────────────────────────────────────────────╮                                 │
-                                              │   untrusted: Ship the pool observer.                                         │                                 │
-                                              │ snapshot (#20; untrusted):                                                   │                                 │
-                                              │   untrusted: Sessions + pool log; votes and cleanup stay distinct.           │                                 │
-                                              ╰──────────────────────────────────────────────────────────────────────────────╯                                 │
-                                                                                                                                                               │
-                                              #21 r2 · Ada (implement) → team · ready #20                                                                      │
-                                                                                                                                                               │
-                                              #22 r2 · Ben (verify) → orchestrator (team copy) · report: risk                                                  │
-                                                untrusted: Frame golden tests still need narrow coverage.                                                      │
-                                                                                                                                                               │
-                                              #25 r2 · Ben (verify) → team · ready #20                                                                         │
-                                                                                                                                                               │
-                                              #30 r2 · Cy (review) → team · ready #20                                                                          │
-                                                                                                                                                               │
-                                              #31 r2 · Eli (verify) → team · ready #20                                                                         │
-                                                                                                                                                               │
+                                               CHAT · untrusted                                                                                beginning loaded 
+                                              #10 r2 · BROKER → team · roster                                                                                   
+                                                slot 4 Dana replaced by Eli.                                                                                    
+                                                                                                                                                                
+                                              #18 r2 · OPERATOR → team · message                                                                                
+                                                Keep the observer read-only.                                                                                    
+                                                                                                                                                                
+                                              #19 r2 · Ada (implement) → team · message                                                                         
+                                                The pool pane now follows the log.                                                                              
+                                                                                                                                                                
+                                              ╭─ #20 r2 · Ada → team · PROPOSAL──────────────────────────────────────────────╮                                  
+                                              │   Ship the pool observer.                                                    │                                  
+                                              │ snapshot (#20; untrusted):                                                   │                                  
+                                              │   Sessions + pool log; votes and cleanup stay distinct.                      │                                  
+                                              ╰──────────────────────────────────────────────────────────────────────────────╯                                  
+                                                                                                                                                                
+                                              #21 r2 · Ada (implement) → team · ready #20                                                                       
+                                                                                                                                                                
+                                              #22 r2 · Ben (verify) → orchestrator (team copy) · report: risk                                                   
+                                                Frame golden tests still need narrow coverage.                                                                  
+                                                                                                                                                                
+                                              #25 r2 · Ben (verify) → team · ready #20                                                                          
+                                                                                                                                                                
+                                              #30 r2 · Cy (review) → team · ready #20                                                                           
+                                                                                                                                                                
+                                              #31 r2 · Eli (verify) → team · ready #20                                                                          
+                                                                                                                                                                
                                               ✓ Pool completed · frozen broker status                                                                           
                                               Accepted #20 · 4 ready · 4 succeeded · 4 cleaned                                                                  
                                               Formal checks only; not a judgment of the result.                                                                 

@@ -142,8 +142,9 @@ the public `pool` read and labels this discovery as session-derived; older
 pools whose members are all finished may be unavailable until `list_pools`
 is supported.
 
-The detail header shows the goal excerpt, state badge, valid readiness,
-proposal and roster revision. `c` opens the full sanitized goal and criteria
+The detail header shows at most two goal rows, state badge, valid readiness,
+proposal and short identity. An empty log preserves the absent sequence
+watermark and displays `seq —`. `c` opens the full sanitized goal and criteria
 in a scrollable overlay (↑/↓, PgUp/PgDn, Home/End; Esc closes). The MEMBERS
 shelf shows broker execution status, verified cleanup, raw vote and its
 validity reason. Readiness counts only `counts: true`; a raw ready vote with
@@ -157,8 +158,8 @@ The CHAT pane shows member messages, operator posts, broker roster events,
 reports with severity and `orchestrator (team copy)` addressing, framed
 proposals, votes and revokes. Headers use historical stamped author names
 and `#seq rN`, with no invented timestamps. Every body and snapshot is
-sanitized and explicitly marked **untrusted**. Long bodies preview four
-wrapped lines with an omitted-line count; Enter/click expands them. Votes
+sanitized; the CHAT section labels all its content **untrusted**. Long bodies
+preview four wrapped lines with an omitted-line count; Enter/click expands them. Votes
 and revokes use compact headers and expand to their bodies. Proposal
 snapshots are attached only to their exact sequence; historical snapshots
 not observed in a status read say `snapshot unavailable`.
@@ -350,8 +351,10 @@ background so highlights stay visible.
   rebuilds rows, and only the visible viewport rows are assembled each frame.
 - Event intake is decoupled from drawing. Every broker page and input event
   applies to the state as it arrives through cheap reducers (JSON parsing
-  stays in the worker tasks); drawing is capped at one frame per 33 ms
-  (`FRAME_INTERVAL`, ~30 fps). When nothing was drawn for longer than the
+  stays in the worker tasks); drawing is capped at one frame per 33,333,334 ns
+  (`FRAME_INTERVAL`, at most 30 fps). Resize dimensions update the state
+  before frame preparation, so the first draw uses the current layout.
+  When nothing was drawn for longer than the
   interval, the next change draws immediately (leading edge); further
   changes within the interval wait for its end and draw together (trailing
   edge), so any number of events between two frames costs one draw of the
@@ -359,7 +362,11 @@ background so highlights stay visible.
   after each page rather than draining a large page batch before drawing.
   Nothing draws while the state is clean,
   and a tick marks it dirty only while something animated is visible
-  (spinners, elapsed and idle clocks).
+  (spinners, elapsed and idle clocks). Needed first-load spinners advance
+  every 100 ms without keyboard input, including loads for finished sessions.
+  Cached content remains visible during refresh; aggregate live counts and
+  loaded empty lists use static indicators. Hidden live sessions do not
+  animate a quiet pool view.
 - Input bursts coalesce. Consecutive wheel, arrow, and page steps of one
   kind and direction merge into one net selection, cursor, or scroll delta
   applied once per frame (a direction change, or any other key or click,
@@ -378,8 +385,8 @@ background so highlights stay visible.
 - Terminal output is diffed cell by cell (ratatui); the observer never
   clears or resets the screen between frames, so an unchanged redraw writes
   only the backend's fixed style-reset and cursor-hide sequences (25 bytes).
-- `cargo test --release --locked -p agent-run-tui -- --ignored --nocapture`
-  runs the timing probes, including an end-to-end storm of 2000 events per
+- `cargo test --release --locked -p agent-run-tui end_to_end_event_storm_probe -- --ignored --nocapture`
+  runs an end-to-end timing storm of 2000 events per
   second for 5 s over a live 4000-message (~8 MB) transcript that reports
   draws, reducer and frame time, the longest frame, and bytes written.
 

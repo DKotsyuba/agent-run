@@ -197,7 +197,7 @@ fn render_app_bar(f: &mut Frame, app: &App, area: Rect) {
             ));
         }
     } else {
-        left.push(Span::styled(app.spinner(), Style::new().fg(p.yellow)));
+        left.push(Span::styled("●", Style::new().fg(p.yellow)));
         left.push(Span::styled(format!(" {live} live   "), white));
         left.push(Span::styled("✓", Style::new().fg(p.green)));
         left.push(Span::styled(
@@ -273,6 +273,9 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                         ("↑↓", "member"),
                         ("t", "transcript"),
                         ("m", "chat"),
+                        ("c", "details"),
+                        ("h", "history"),
+                        ("?", "help"),
                         ("esc", "back"),
                     ]
                 } else {
@@ -280,7 +283,9 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                         ("↑↓", "block"),
                         ("⏎", "expand"),
                         ("m", "roster"),
-                        ("f", "follow"),
+                        ("c", "details"),
+                        ("h", "history"),
+                        ("?", "help"),
                         ("esc", "back"),
                     ]
                 };
@@ -355,7 +360,11 @@ fn key_bar_right(app: &App, panes: Panes) -> Vec<Span<'static>> {
     }
     if app.pools.visible && !app.pools.member_transcript {
         return app.pools.buffer().map_or_else(Vec::new, |b| {
-            vec![Span::styled(format!("seq #{} ", b.after), theme::dim())]
+            vec![Span::styled(
+                b.last_seq
+                    .map_or("seq — ".into(), |_| format!("seq #{} ", b.after)),
+                theme::dim(),
+            )]
         });
     }
     let (Some(pane), Some(buffer)) = (panes.transcript, app.transcript.as_ref()) else {
@@ -423,10 +432,7 @@ mod tests {
         let screen = render_to_string(&app, 120, 20);
         assert!(screen.contains("agent-run"), "brand: {screen}");
         assert!(screen.contains("LIVE"), "section header: {screen}");
-        assert!(
-            screen.contains("⠋ 1 live"),
-            "spinner and live count: {screen}"
-        );
+        assert!(screen.contains("● 1 live"), "stable live count: {screen}");
         assert!(screen.contains("✓ 1 finished"), "finished count: {screen}");
         // Finished sessions stay behind the collapsed header.
         assert!(screen.contains("▸ FINISHED"), "collapsed section: {screen}");

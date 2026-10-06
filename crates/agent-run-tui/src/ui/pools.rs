@@ -63,10 +63,10 @@ fn sanitize(value: &str) -> String {
     text::Sanitizer::default().push(value)
 }
 
-/// Creates sanitized wrapped body rows with an explicit untrusted marker.
+/// Creates sanitized wrapped body rows under the chat section's untrusted label.
 /// Bodies preview four rows; expansion restores all rows with no hidden truncation.
 fn body(value: &str, width: usize, expanded: bool) -> Vec<String> {
-    let mut rows = text::wrap(&format!("  untrusted: {}", sanitize(value)), width.max(1));
+    let mut rows = text::wrap(&format!("  {}", sanitize(value)), width.max(1));
     if !expanded && rows.len() > 5 {
         let omitted = rows.len() - 4;
         rows.truncate(4);
@@ -74,6 +74,18 @@ fn body(value: &str, width: usize, expanded: bool) -> Vec<String> {
     }
     rows
 }
+/// Sanitizes a member identity and omits its role only when it repeats the name exactly.
+/// Distinct roles remain visible; this changes presentation, never broker semantics.
+fn member_label(name: &str, role: &str) -> String {
+    let name = sanitize(name);
+    let role = sanitize(role);
+    if name == role {
+        name
+    } else {
+        format!("{name} ({role})")
+    }
+}
+
 /// Palette style of report severity and raw vote outcome.
 fn entry_color(entry: &PoolEntryView) -> Color {
     let p = theme::palette();
@@ -102,10 +114,9 @@ fn entry_color(entry: &PoolEntryView) -> Color {
 fn block(entry: &PoolEntryView, width: usize, expanded: bool, snapshot: Option<&str>) -> Vec<Row> {
     let p = theme::palette();
     let author = match entry.author_kind {
-        AuthorKind::Member => format!(
-            "{} ({})",
-            sanitize(entry.author_name.as_deref().unwrap_or("member")),
-            sanitize(entry.author_role.as_deref().unwrap_or("role unavailable"))
+        AuthorKind::Member => member_label(
+            entry.author_name.as_deref().unwrap_or("member"),
+            entry.author_role.as_deref().unwrap_or("role unavailable"),
         ),
         AuthorKind::Operator => "OPERATOR".into(),
         AuthorKind::Broker => "BROKER".into(),
@@ -257,13 +268,13 @@ fn header_height(buffer: &Buffer) -> usize {
     } else {
         0
     };
-    10 + members * 2 + retired
+    8 + members * 2 + retired + usize::from(buffer.error.is_some())
 }
 /// Available scrolling chat rows in the current terminal.
 pub fn viewport(app: &App) -> usize {
     app.pools.buffer().map_or(1, |b| {
         usize::from(app.last_height.saturating_sub(3))
-            .saturating_sub(header_height(b) + 3)
+            .saturating_sub(header_height(b) + b.status.as_ref().map_or(0, |s| summary(s).len()))
             .max(1)
     })
 }
@@ -444,17 +455,7 @@ fn summary(status: &PoolStatus) -> Vec<String> {
     if ready == n && n > 0 {
         return vec!["Agreement; waiting for success/cleanup.".into()];
     }
-    let missing = status
-        .members
-        .iter()
-        .filter(|m| !m.counts)
-        .map(|m| sanitize(&m.name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    vec![
-        format!("{ready}/{n} valid-ready · pool remains open."),
-        format!("Waiting for {missing}; success + cleanup still required."),
-    ]
+    vec!["Waiting for valid votes, success and cleanup.".into()]
 }
 /// Renders header, frozen/current roster and scrolling chat on the existing detail pane.
 pub fn render_detail(f: &mut Frame, app: &App, pane: Rect) {
@@ -479,7 +480,8 @@ pub fn render_detail(f: &mut Frame, app: &App, pane: Rect) {
             area,
             0,
             plain(format!(
-                "Opening pool {}…",
+                "{} Opening pool {}…",
+                app.spinner(),
                 app::id_hash(buffer.id.as_str(), 10)
             )),
             theme::dim(),
@@ -489,13 +491,33 @@ pub fn render_detail(f: &mut Frame, app: &App, pane: Rect) {
         }
         return;
     };
-    put(
-        f,
-        area,
-        0,
-        plain(&status.goal),
-        Style::new().fg(p.bwhite).add_modifier(Modifier::BOLD),
+    let goal = text::wrap(
+        &format!("Goal · untrusted: {}", sanitize(&status.goal)),
+        usize::from(area.width).max(1),
     );
+    for (row, value) in goal.iter().take(2).enumerate() {
+        let value = if row == 1 && goal.len() > 2 {
+            format!(
+                "{}…",
+                Line::from(text::fit(
+                    vec![Span::raw(value.clone())],
+                    usize::from(area.width).saturating_sub(1),
+                    Style::new()
+                ))
+                .to_string()
+                .trim_end()
+            )
+        } else {
+            value.clone()
+        };
+        put(
+            f,
+            area,
+            row,
+            plain(value),
+            Style::new().fg(p.bwhite).add_modifier(Modifier::BOLD),
+        );
+    }
     let completed = status.state == PoolState::Completed;
     let badge = if completed {
         " ✓ COMPLETED "
@@ -505,7 +527,7 @@ pub fn render_detail(f: &mut Frame, app: &App, pane: Rect) {
     put(
         f,
         area,
-        1,
+        2,
         Line::from(vec![
             Span::styled(
                 badge,
@@ -537,7 +559,7 @@ pub fn render_detail(f: &mut Frame, app: &App, pane: Rect) {
     put(
         f,
         area,
-        2,
+        3,
         Line::from(text::lr(
             vec![Span::styled(
                 format!(
@@ -553,39 +575,21 @@ pub fn render_detail(f: &mut Frame, app: &App, pane: Rect) {
         )),
         Style::new(),
     );
-    let criteria = status
-        .criteria
-        .iter()
-        .map(|c| format!("{}: {}", c.id, c.text))
-        .collect::<Vec<_>>()
-        .join(" · ");
-    put(
-        f,
-        area,
-        3,
-        plain(format!("Criteria  {criteria}")),
-        Style::new().fg(p.white),
-    );
-    put(
-        f,
-        area,
-        4,
-        plain("c full goal + criteria · m roster · h replaced history"),
-        theme::dim(),
-    );
+    let mut row = 4;
     if let Some(error) = &buffer.error {
         put(
             f,
             area,
-            5,
+            row,
             plain(format!("broker error, retrying · {error}")),
             theme::failure(),
         );
+        row += 1;
     }
     put(
         f,
         area,
-        6,
+        row,
         plain(format!(
             " MEMBERS  {} current · t transcript{}",
             status.members.len(),
@@ -593,7 +597,7 @@ pub fn render_detail(f: &mut Frame, app: &App, pane: Rect) {
         )),
         theme::dim(),
     );
-    let mut row = 7;
+    row += 1;
     for (at, member) in status.members.iter().enumerate() {
         let selected = buffer.roster && buffer.member == at && app.pools.focused;
         let style = if selected {
@@ -634,7 +638,10 @@ pub fn render_detail(f: &mut Frame, app: &App, pane: Rect) {
                     Style::new().fg(theme::status_color(member.tip_status)),
                 ),
                 Span::styled(
-                    sanitize(&format!("{} ({}) · {native} · ", member.name, member.role)),
+                    sanitize(&format!(
+                        "{} · {native} · ",
+                        member_label(&member.name, &member.role)
+                    )),
                     Style::new().fg(p.white),
                 ),
                 Span::styled(vote(member), Style::new().fg(color)),
@@ -742,17 +749,14 @@ pub fn render_detail(f: &mut Frame, app: &App, pane: Rect) {
         area,
         row,
         Line::from(text::lr(
-            vec![Span::styled(
-                " CHAT · #seq rN · bodies are untrusted",
-                theme::dim(),
-            )],
+            vec![Span::styled(" CHAT · untrusted", theme::dim())],
             vec![Span::styled(
                 if buffer.older.is_some() {
-                    "loading older history…"
+                    format!("{} loading older history…", app.spinner())
                 } else if buffer.history_complete {
-                    "beginning loaded"
+                    "beginning loaded".into()
                 } else {
-                    "↑ older history"
+                    "↑ older history".into()
                 },
                 theme::dim(),
             )],
@@ -762,7 +766,8 @@ pub fn render_detail(f: &mut Frame, app: &App, pane: Rect) {
         Style::new(),
     );
     row += 1;
-    let viewport = usize::from(area.height).saturating_sub(row + 3);
+    let summary = summary(status);
+    let viewport = usize::from(area.height).saturating_sub(row + summary.len());
     let rows = rows(buffer, usize::from(area.width));
     let offset = if buffer.follow {
         rows.len().saturating_sub(viewport)
@@ -785,11 +790,12 @@ pub fn render_detail(f: &mut Frame, app: &App, pane: Rect) {
             Target::Entry(buffer.id.clone(), entry.seq),
         ));
     }
-    for (at, value) in summary(status).into_iter().enumerate() {
+    let summary_start = usize::from(area.height).saturating_sub(summary.len());
+    for (at, value) in summary.into_iter().enumerate() {
         put(
             f,
             area,
-            usize::from(area.height).saturating_sub(3) + at,
+            summary_start + at,
             plain(value),
             if completed {
                 Style::new().fg(p.green)
