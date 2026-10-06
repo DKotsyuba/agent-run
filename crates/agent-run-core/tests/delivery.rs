@@ -614,7 +614,7 @@ async fn host_exchange(request: Value, mode: &str) -> (Value, Option<Value>) {
                     path.file_name()
                         .unwrap()
                         .to_string_lossy()
-                        .starts_with("ar-cdx-v4-")
+                        .starts_with("ar-cdx-v5-")
                 })
             {
                 break path;
@@ -3153,4 +3153,122 @@ async fn malformed_config_before_claim_leaves_delivery_pending() {
         )
         .unwrap();
     assert_eq!((state.as_str(), attempts), ("pending", 0));
+}
+
+/// Capability support waits do not spend attempts or block ordinary v4 notices;
+/// the same durable attention delivers after a v5 frontend becomes available.
+#[tokio::test]
+async fn enrollment_attention_waits_for_v5_without_losing_outbox() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let home = common::Home::new();
+    delivery(&home.path, "ntf_attention", "codex_queue", "pending");
+    let conn = Connection::open(home.path.join("state.db")).unwrap();
+    conn.execute("INSERT INTO events(agent_id,at,kind,data_json) VALUES('ag-20260825-120000-0123456789',?,'pool_join_needs_action',?)",
+        params![now(),json!({"pool_id":"pool-20261003-120000-0123456789","notice":"Existing enrollment needs action."}).to_string()]).unwrap();
+    let seq = conn.last_insert_rowid();
+    conn.execute(
+        "UPDATE deliveries SET terminal_event_seq=? WHERE id='ntf_attention'",
+        [seq],
+    )
+    .unwrap();
+    let old = tokio::net::UnixListener::bind(home.path.join("ar-cdx-v4-attention.sock")).unwrap();
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 0);
+    let (state, attempts, next): (String, i64, f64) = conn
+        .query_row(
+            "SELECT state,attempts,next_attempt_at FROM deliveries WHERE id='ntf_attention'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((state.as_str(), attempts), ("retry_wait", 0));
+    assert!(next > now());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), old.accept())
+            .await
+            .is_err(),
+        "old v4 must receive no attention frame"
+    );
+    conn.execute("INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,next_attempt_at) VALUES('ntf_ordinary','ag-20260825-120000-0123456789','sess','pending',?)",[now()-1.0]).unwrap();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = old.accept().await.unwrap();
+        let size = stream.read_u32_le().await.unwrap() as usize;
+        assert!(size <= 8192);
+        let mut bytes = vec![0; size];
+        stream.read_exact(&mut bytes).await.unwrap();
+        let request: Value = serde_json::from_slice(&bytes).unwrap();
+        let reply = br#"{"outcome":"accepted"}"#;
+        stream.write_u32_le(reply.len() as u32).await.unwrap();
+        stream.write_all(reply).await.unwrap();
+        request
+    });
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+    let request = tokio::time::timeout(Duration::from_secs(2), peer)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(request["op"], "completion");
+    let new = tokio::net::UnixListener::bind(home.path.join("ar-cdx-v5-attention.sock")).unwrap();
+    make_due(&home.path, "ntf_attention");
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = new.accept().await.unwrap();
+        let size = stream.read_u32_le().await.unwrap() as usize;
+        assert!(size <= 8192);
+        let mut bytes = vec![0; size];
+        stream.read_exact(&mut bytes).await.unwrap();
+        let reply = br#"{"outcome":"accepted"}"#;
+        stream.write_u32_le(reply.len() as u32).await.unwrap();
+        stream.write_all(reply).await.unwrap();
+        serde_json::from_slice::<Value>(&bytes).unwrap()
+    });
+    assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
+    let request = tokio::time::timeout(Duration::from_secs(2), peer)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(request["version"], 5);
+    assert_eq!(request["op"], "pool_attention");
+    assert!(request.get("agent_id").is_none() && request.get("run_id").is_none());
+    assert_eq!(
+        conn.query_row(
+            "SELECT state FROM deliveries WHERE id='ntf_attention'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "delivered"
+    );
+}
+
+/// Claude attention uses distinct broker framing and existing correlated inbox
+/// receipts; it never labels a running member or pool as completed.
+#[tokio::test]
+async fn enrollment_attention_uses_distinct_claude_inbox_framing() {
+    let temp = tempfile::tempdir().unwrap();
+    let registry = temp.path().join("sessions");
+    std::fs::create_dir(&registry).unwrap();
+    let socket = temp.path().join("inbox.sock");
+    claude_descriptor(&registry, "session-1", &socket);
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let inbox = socket.clone();
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        native_inbox_connection(&mut stream, &inbox, Some(("ntf_attention", "held"))).await
+    });
+    let notice = agent_run_domain::pool::PoolNotice {
+        notification_id: "ntf_attention".into(),
+        pool_id: "pool-20261003-120000-0123456789".parse().unwrap(),
+        message: "Existing enrollment needs action.".into(),
+    };
+    let evidence = claude::send_pool_attention(&registry, "session-1", &notice).await;
+    let frame = tokio::time::timeout(Duration::from_secs(2), peer)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        frame["message"]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("agent-run/pool-attention\n")
+    );
+    assert_eq!(evidence.classifier, "uds_receipt_held");
 }

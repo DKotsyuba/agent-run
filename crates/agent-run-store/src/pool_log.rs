@@ -303,6 +303,14 @@ impl Store {
             Ok(member) => member,
             Err(denial) => return Ok(Err(denial)),
         };
+        crate::pool_enrollment::validate_ack_replay(
+            &tx,
+            &member.seat_agent_id.parse()?,
+            run_id,
+            attempt_id,
+            write.request_id(),
+            matches!(write, PoolWrite::Message(_)),
+        )?;
         // Idempotency: the sender execution scope plus the request key. The
         // same content replays; different content under the key conflicts.
         // This precedes the closed-pool guard so a retry of a write that
@@ -330,16 +338,56 @@ impl Store {
             return Ok(Err(PoolDenial::PoolCompleted));
         }
         write.validate()?;
-        let seq = match &write {
-            PoolWrite::Message(input) => append_message(&tx, &member, run_id, attempt_id, input),
-            PoolWrite::Proposal(input) => append_proposal(&tx, &member, run_id, attempt_id, input),
-            PoolWrite::Vote(input) => append_vote(&tx, &member, run_id, attempt_id, input),
+        let ack = crate::pool_enrollment::ack_allowed(
+            &tx,
+            &member.seat_agent_id.parse()?,
+            run_id,
+            attempt_id,
+            if let PoolWrite::Message(input) = &write {
+                Some(input.request_id.as_str())
+            } else {
+                None
+            },
+        )?;
+        let seq = if ack {
+            let PoolWrite::Message(input) = &write else {
+                unreachable!("ACK is a message");
+            };
+            // One reserved bounded summary per attached seat cannot be starved
+            // by ordinary chat volume; replay returns before this append.
+            Ok(Ok(append_entry(
+                &tx,
+                &member,
+                run_id,
+                attempt_id,
+                EntryKind::Message,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &input.message,
+                &input.request_id,
+            )?))
+        } else {
+            match &write {
+                PoolWrite::Message(input) => {
+                    append_message(&tx, &member, run_id, attempt_id, input)
+                }
+                PoolWrite::Proposal(input) => {
+                    append_proposal(&tx, &member, run_id, attempt_id, input)
+                }
+                PoolWrite::Vote(input) => append_vote(&tx, &member, run_id, attempt_id, input),
+            }
         };
         let seq = match seq {
             Ok(Ok(seq)) => seq,
             Ok(Err(reason)) => return Ok(Err(reason)),
             Err(error) => return Err(error),
         };
+        if ack {
+            crate::pool_enrollment::acknowledge(&tx, &member.seat_agent_id.parse()?, seq)?;
+        }
         // The durable event lands on the authenticated execution so followers
         // of the event revision also see pool progress.
         tx_event(
@@ -387,7 +435,14 @@ impl Store {
             Ok(member) => member,
             Err(_) => return Ok(Err(PoolDenial::NotPoolMemberRead)),
         };
-        read_page(&self.conn, &member.pool_id, after_seq, before_seq, limit).map(Ok)
+        let mut page = read_page(&self.conn, &member.pool_id, after_seq, before_seq, limit)?;
+        let challenge:Option<(String,String,f64)> = self.conn.query_row(
+            "SELECT challenge,state,deadline FROM pool_enrollments WHERE agent_id=? AND run_id=? AND attempt_id=?",
+            params![member.seat_agent_id,run_id.as_str(),attempt_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        if let Some((request, state, deadline)) = challenge {
+            page["enrollment"] = json!({"state":state,"request_id":request,"deadline":deadline,"remaining_seconds":(deadline-now()).max(0.0)});
+        }
+        Ok(Ok(page))
     }
 
     /// Lists validated compact pool summaries from one deferred read snapshot.
@@ -1210,17 +1265,25 @@ fn pool_status(conn: &Connection, pool_id: &str) -> Result<Value> {
                 vote_validity(latest, roster_revision, *proposal_roster, &tip, &tip_status)
             }
         };
+        let enrollment = crate::pool_enrollment::view(conn, &seat, now())?;
+        let why = if enrollment.as_ref().is_some_and(|e| e["state"] != "joined") {
+            "join_pending".to_owned()
+        } else {
+            why
+        };
         if why != "valid" {
             agreed = false;
         }
-        members.push(json!({
+        let mut item = json!({
             "name": name, "role": role, "agent_id": seat_id, "slot": slot,
             "tip_status": tip_status,
             "cleanup_complete": lineage_cleanup_complete(conn, &seat)?,
-            "vote": vote,
-            "counts": why == "valid",
-            "why": why,
-        }));
+            "vote": vote, "counts": why == "valid", "why": why,
+        });
+        if let Some(enrollment) = enrollment {
+            item["enrollment"] = enrollment;
+        }
+        members.push(item);
     }
     let mut retired = conn.prepare(
         "SELECT m.agent_id,m.slot,m.name,m.role,m.replaced_by FROM pool_members m \
@@ -1269,6 +1332,13 @@ fn pool_status(conn: &Connection, pool_id: &str) -> Result<Value> {
 ///
 /// A pool with no current member is `needs_action`.
 fn pool_activity(status: &Value) -> &'static str {
+    if status["members"].as_array().is_some_and(|members| {
+        members
+            .iter()
+            .any(|m| m["enrollment"]["state"] == "needs_action")
+    }) {
+        return "needs_action";
+    }
     if status["state"] == json!("completed") {
         return "completed";
     }

@@ -6,8 +6,9 @@ three expose the same operator tool surface through one shared dispatcher
 (`crates/agent-run-core/src/dispatch.rs`), so a tool that exists in MCP exists here
 under the same name with the same parameters.
 
-Workers use a [separate MCP surface](worker-mcp.md) containing only
-`notify_orchestrator`. Its private `worker/notify` broker route is not in operator
+Workers use a [separate fixed five-tool MCP surface](worker-mcp.md):
+`notify_orchestrator`, `pool_post`, `pool_read`, `pool_propose` and `pool_vote`.
+Pool actions require live authenticated membership. Private worker broker routes are not in operator
 discovery and requires the current run/attempt capability on every call.
 
 Audience: an integrating agent or developer who has never seen this repo.
@@ -127,8 +128,9 @@ Discover the authoritative surface at runtime:
 - `ping` (no params) — `{"ok": true}`; liveness probe.
 
 Cooperative pools use five strict methods from the same table: `start_pool`
-(two to five ordinary start requests sharing one goal and acceptance criteria,
-admitted atomically; returns the stable `pool_id` and each member's `agent_id`,
+(two to five members sharing one goal and acceptance criteria, admitted
+atomically; each member supplies exactly one `start` or `existing_agent_id` plus
+`role`; returns the stable `pool_id` and each member's `agent_id`,
 name, role and status), `pool_post` (an operator message stamped as the
 orchestrator), `pool_replace` (replace a terminal, fully cleaned member; same
 `request_id` returns the same new member) and `pool` (status plus a cursor-paged
@@ -138,6 +140,15 @@ with the pool code leading the message (`member_busy`, `pool_completed`,
 `pool_not_found`, ...). A pool completes only by formal verification (every
 member voted ready on one proposal, ended successfully, cleanup verified) and
 delivers exactly one common notice; that is not proof the result is correct.
+
+An attached existing member keeps its current owned RUNNING execution, task,
+account, grants, native session, reservation and original deadline. Its admission
+member row adds `existing: true` and an `enrollment` view (`state`, remaining
+seconds, optional failure reason); ordinary new-only member shapes stay unchanged.
+The worker-only `pool_read` adds its own attempt-pinned ACK challenge. Only an
+exact `pool_post` summary using that challenge changes `pending` to `joined`;
+unjoined members cannot vote or settle. `needs_action` reports failed awareness
+without restarting or cancelling old work. See [worker enrollment](worker-mcp.md).
 
 Over MCP, every tool result renders as one compact plain-text page (see
 `assets/mcp/*.txt.j2`) instead of the structured JSON below; `start`/`resume`
@@ -154,10 +165,12 @@ channels, and status-preserving presentation fallback are documented in
 `schemas/mcp-registration.json` describes commands and environment names
 without registering anything with a host.
 
-The tool set (same names as the MCP server) is exactly `start`, `resume`,
-`cancel`, `steer`, `list_agents`, `answer`, `transcript`, `capacity_order`,
-`doc`, `models`, `delegation_guide`, `limits`, `start_pool`, `pool_post`,
-`pool_replace`, `pool`, and `list_pools`.
+Shared MCP/socket discovery advertises 15 tools: `start`, `resume`, `cancel`,
+`steer`, `list_agents`, `answer`, `transcript`, `doc`, `delegation_guide`,
+`limits`, `start_pool`, `pool_post`, `pool_replace`, `pool`, and `list_pools`.
+`models` and `capacity_order` remain call-only compatibility methods in the
+same registry/dispatcher; their original structured CLI/socket responses and
+schema-1 behavior remain available, including direct MCP calls by known name.
 
 `list_pools` accepts a strict object with optional `state` (`"open"` or
 `"completed"`; omitted/null means all), `limit` (integer 1..200, default 50)
@@ -316,7 +329,8 @@ aliases. An unknown model is a `ValidationError`. The view reads one committed
 snapshot without collecting quota, reserving capacity or starting work.
 
 The CLI equivalent is `agent-run capacity order [--model MODEL]`. Select a
-compatible model and canonical role using `delegation_guide` and `models`.
+compatible model and canonical role using `delegation_guide`; `models` is a
+structured compatibility read for existing clients.
 Schema 1 retains its historical physical-route output and rejects a model
 filter with `Unsupported`.
 
@@ -368,15 +382,24 @@ Notes for the loop:
   daemon is reported as `BrokerUnavailable` instead of falling back locally.
 - CLI `start --wait` repeatedly uses the private socket `wait` method and emits
   its terminal answer; interrupting that client leaves the durable run active.
-- Use `capacity_order` for provider capacity order, optionally for one model.
-- Use `models` for the configured provider catalog, admissible roles and cached
-  quota standing; `limits` returns the latest stored samples without provider calls.
-- `delegation_guide` (no params, schema 2 only) returns one compact plain-text
+- Use `limits` for stored quota windows, percentages, reset times and freshness.
+  With schema 2 it adds `ranking`: provider/model standing, numerical scores and
+  provider multipliers from the same committed snapshot, config revision and
+  advice clock as `items`/`observed_at`. All governing windows and exhaustion
+  facts participate; a healthy short window does not override a weekly zero.
+  Schema 1 keeps its historical window response. MCP text omits account/pool
+  identities and stays within the existing whole-response byte/row bounds.
+- `models` and `capacity_order` retain their structured compatibility responses
+  for existing CLI/socket clients, without joining the advertised MCP catalog.
+- `delegation_guide` (optional exact `provider`, `model`, `profile` filters;
+  schema 2 only) returns one compact plain-text
   routing guide — providers in capacity order with each exact model id, cached
   quota standing, admissible profiles, params, restrictions, and configured
   guidance prose — instead of reading the full `models` JSON just to pick a
   route. Its result is a JSON string here and real MCP text content on the MCP
-  transport; the CLI equivalent is `agent-run delegation-guide`.
+  transport; the CLI equivalent is `agent-run delegation-guide` with optional
+  `--provider`, `--model`, and `--profile` filters.
+  Unknown filters are `ValidationError`; omitted filters keep default guidance.
   Before delegating a task, the orchestrator must call it and read the result
   before choosing provider, model, effort or profile. Routing advice belongs in
   provider/model `recommendations`, not a separately maintained delegation skill.

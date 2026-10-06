@@ -1,19 +1,18 @@
 # migrations
 
-state.db's schema version is tracked in SQLite's own `PRAGMA user_version`.
-Each schema change beyond the initial schema is a numbered SQL delta file
-under `sql/migrations/` (`NNN_slug.sql`), applied in order, each in its own
-`BEGIN IMMEDIATE` transaction. The current schema is version 25.
+state.db tracks its schema in SQLite's `PRAGMA user_version`. Numbered
+`sql/migrations/NNN_slug.sql` deltas apply in order, each in a separate
+`BEGIN IMMEDIATE` transaction. Current schema 26 adds attempt-pinned pool
+enrollment and worker catalog proof. Historical independence is unknown:
+attaching an older root is refused, not assumed safe from missing pool history.
 
 ## Older stores refuse ordinary commands
 
-While a home's database is older than the running binary's schema, every
-command except `config` and `doc` refuses with `migration_required` instead
-of opening it, and the broker refuses to start: schema upgrades belong to
-the paired config migration below. Public `agent-run doctor` hits this
-`migration_required` preflight before its internal diagnostic can report
-`state_migration_pending`. A newer store than the binary supports is
-refused clearly rather than opened partially; see `releases`.
+For an older database, commands except `config` and `doc` refuse with
+`migration_required`, and the broker will not start; use paired migration
+below. This preflight also stops public `agent-run doctor` before its internal
+`state_migration_pending` diagnostic. A database newer than the binary supports
+is refused, never partially opened; see `releases`.
 
 ## Upgrading an existing schema-2 home
 
@@ -44,12 +43,11 @@ spill; migration does not build a whole-database string in Rust memory.
 
 This migration pairs schema-2 configuration with the current database schema.
 
-Write one mapping file. It names the two harnesses, declares every global
-account by nonsecret reference (no credential value is read), and maps each v1
-runtime to its provider id, harness, connection, auth family, v2 limits source
-(and executable collector for `exec`), an explicit native model for every historical
-model, the account for requests that omitted an account (`global_account`), an
-account for every v1 label, and optional recommendation prose:
+One mapping file names both harnesses and every global account by nonsecret
+reference; no credential value is read. Map each v1 runtime to provider,
+harness, connection, auth family, v2 limits source (with collector for `exec`),
+every historical model's native id, `global_account` for unlabelled requests,
+each v1 label's account, and optional recommendations:
 
 ```toml
 [harnesses.codex]
@@ -139,14 +137,11 @@ edited by someone else meanwhile is kept as is. If the process is killed, the
 journal stays, every ordinary command refuses with `migration_incomplete`,
 and `config rollback --snapshot <dir>` recovers from it.
 
-Rollback restores the original configuration and database with their exact
-rows (schema 16 for a v1 source, schema 17 for a 0.13.x v2 source). It needs this snapshot's
-applied record or its own journal, a live config equal to the snapshot's v1
-or v2 bytes, every database row equal to the recorded source or target
-digest, no active agent, and the recorded release still sealed with its
-recorded digests. A matching config alone never authorizes replacing the
-database: any post-migration write (an agent, an event, an account change, a
-quota sample) makes rollback refuse and leaves config, database and journal
-untouched. Rollback is itself journalled, so an interrupted rollback is
-finished by rerunning it. It returns the release to reinstall; it does not
-switch the installed pointer. The snapshot is never modified.
+Rollback restores exact original config and rows (schema 16 for v1, schema
+17 for 0.13.x v2). It requires this snapshot's applied record or its own journal,
+live config matching its v1/v2 bytes, all rows matching the recorded source or
+target digest, no active agent, and the recorded release's seal and digests.
+Matching config alone is insufficient: any later database write (agent, event,
+account or quota sample) refuses rollback without changing config, database or
+journal. Rerun an interrupted rollback to finish its journal. It returns the
+release to reinstall, never switches the installed pointer or alters the snapshot.

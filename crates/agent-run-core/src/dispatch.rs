@@ -110,6 +110,17 @@ struct Wait {
 /// socket, MCP, and CLI transports can independently render their protocols.
 pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
     match name {
+        agent_run_domain::worker::CATALOG_METHOD => {
+            let proof: agent_run_domain::worker::WorkerCatalogProof = args(raw)?;
+            let home = service.home.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::state::Store::open(&home)?
+                    .register_worker_catalog(&proof, crate::domain::now())?;
+                Ok(json!({"registered":true}))
+            })
+            .await
+            .map_err(|_| crate::Error::Runtime("worker catalog proof failed".into()))?
+        }
         agent_run_domain::worker::METHOD => {
             let call: agent_run_domain::worker::WorkerCall = args(raw)?;
             let home = service.home.clone();
@@ -217,11 +228,8 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
             service.limits()
         }
         "capacity_order" => service.capacity_order(args(raw)?),
-        "delegation_guide" => {
-            let _: Empty = args(raw)?;
-            service.delegation_guide()
-        }
-        // Socket-only control/discovery methods; not part of the twelve MCP tools.
+        "delegation_guide" => service.delegation_guide_filtered(args(raw)?),
+        // Socket-only control/discovery methods; absent from public tool discovery.
         "tools" => {
             let _: Empty = args(raw)?;
             // The private socket discovery method predates MCP and returns the

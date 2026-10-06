@@ -123,14 +123,69 @@ impl AcceptanceCriterion {
     }
 }
 
-/// One requested member: an ordinary start request plus a descriptive role.
+/// One requested seat, either a new provider start or an active independent
+/// stable agent. The two wire shapes are exclusive, retain new-only JSON, and
+/// never grant permissions through the descriptive role label.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PoolMemberSpec {
-    /// Ordinary provider start; its `display_name` becomes the member name.
-    pub start: ProviderStartRequest,
-    /// Descriptive role label; it never changes the profile's permissions.
-    pub role: String,
+#[serde(untagged, deny_unknown_fields)]
+pub enum PoolMemberSpec {
+    /// Admits a new ordinary execution, retaining the historical request shape.
+    New {
+        /// Provider start whose display name becomes the member name.
+        start: Box<ProviderStartRequest>,
+        /// Descriptive pool role, not an execution permission.
+        role: String,
+    },
+    /// Attaches an existing RUNNING independent lineage without restarting it.
+    Existing {
+        /// Exact stable root identity; historical executions are refused.
+        existing_agent_id: AgentId,
+        /// Descriptive pool role, not an execution permission.
+        role: String,
+    },
+}
+
+impl PoolMemberSpec {
+    /// Returns the role label common to both member sources.
+    pub fn role(&self) -> &str {
+        match self {
+            Self::New { role, .. } | Self::Existing { role, .. } => role,
+        }
+    }
+
+    /// Returns the stable existing identity, absent for a newly admitted member.
+    pub fn existing_agent_id(&self) -> Option<&AgentId> {
+        match self {
+            Self::Existing {
+                existing_agent_id, ..
+            } => Some(existing_agent_id),
+            _ => None,
+        }
+    }
+
+    /// Returns the new start mutably for validation/fixture preparation, never
+    /// exposing an attached worker's immutable stored execution request.
+    pub fn start_mut(&mut self) -> Option<&mut ProviderStartRequest> {
+        match self {
+            Self::New { start, .. } => Some(start),
+            _ => None,
+        }
+    }
+
+    /// Returns the descriptive role label for normalization or fixture setup.
+    pub fn role_mut(&mut self) -> &mut String {
+        match self {
+            Self::New { role, .. } | Self::Existing { role, .. } => role,
+        }
+    }
+
+    /// Returns a new member's ordinary start request, absent for an attachment.
+    pub fn start(&self) -> Option<&ProviderStartRequest> {
+        match self {
+            Self::New { start, .. } => Some(start),
+            _ => None,
+        }
+    }
 }
 
 /// Public request that starts a pool, validated before any admission.
@@ -190,43 +245,67 @@ impl PoolStartRequest {
             return Err(invalid("a pool needs 2 to 5 members"));
         }
         let mut names = BTreeSet::new();
+        let mut existing = BTreeSet::new();
         let mut seats = Vec::new();
         for (index, member) in self.members.iter_mut().enumerate() {
             let slot = index as u8 + 1;
-            if member.start.request_id.is_some() || member.start.orchestrator.is_some() {
-                return Err(invalid(
-                    "member start must not set request_id or orchestrator",
-                ));
-            }
-            member.role = display_name(&member.role)?;
-            if member.role.chars().count() > MAX_ROLE_CHARS {
+            let role = match member {
+                PoolMemberSpec::New { role, .. } | PoolMemberSpec::Existing { role, .. } => role,
+            };
+            *role = display_name(role)?;
+            if role.chars().count() > MAX_ROLE_CHARS {
                 return Err(invalid("role exceeds 48 characters"));
             }
-            if member.start.display_name.is_none() {
-                member.start.display_name = Some(format!("{} {slot}", member.role));
+            match member {
+                PoolMemberSpec::New { start, role } => {
+                    if start.request_id.is_some() || start.orchestrator.is_some() {
+                        return Err(invalid(
+                            "member start must not set request_id or orchestrator",
+                        ));
+                    }
+                    if start.display_name.is_none() {
+                        start.display_name = Some(format!("{role} {slot}"));
+                    }
+                    start.validate()?;
+                    let name = start.display_name.clone().unwrap_or_default();
+                    if !names.insert(name.to_lowercase()) {
+                        return Err(invalid("member names must be unique"));
+                    }
+                    seats.push(PoolSeat {
+                        slot,
+                        name,
+                        role: role.clone(),
+                        agent_id: AgentId::new(),
+                    });
+                }
+                PoolMemberSpec::Existing {
+                    existing_agent_id,
+                    role,
+                } => {
+                    if !existing.insert(existing_agent_id.as_str().to_owned()) {
+                        return Err(invalid("duplicate existing pool member"));
+                    }
+                    seats.push(PoolSeat {
+                        slot,
+                        name: format!("{role} {slot}"),
+                        role: role.clone(),
+                        agent_id: existing_agent_id.clone(),
+                    });
+                }
             }
-            member.start.validate()?;
-            let name = member.start.display_name.clone().unwrap_or_default();
-            if !names.insert(name.to_lowercase()) {
-                return Err(invalid("member names must be unique"));
-            }
-            seats.push(PoolSeat {
-                slot,
-                name,
-                role: member.role.clone(),
-                agent_id: AgentId::new(),
-            });
         }
         let pool_id = PoolId::new();
         for (member, seat) in self.members.iter().zip(&seats) {
-            compose_member_task(
-                &pool_id,
-                &self.goal,
-                &self.acceptance,
-                &seats,
-                seat,
-                &member.start.task,
-            )?;
+            if let Some(start) = member.start() {
+                compose_member_task(
+                    &pool_id,
+                    &self.goal,
+                    &self.acceptance,
+                    &seats,
+                    seat,
+                    &start.task,
+                )?;
+            }
         }
         Ok(())
     }
@@ -434,13 +513,25 @@ impl PoolNotice {
             .find(|candidate| candidate.validate().is_ok() && fits(candidate))
     }
 
-    /// Renders trusted framing from the embedded template around the frozen text.
+    /// Renders a broker-authored attention notice, explicitly distinct from
+    /// pool completion or worker reports, through the same bounded notice type.
+    pub fn render_attention(&self) -> Result<String> {
+        self.render_template("pool_attention_template")
+    }
+
+    /// Renders trusted common-completion framing around the frozen text.
     pub fn render(&self) -> Result<String> {
+        self.render_template("pool_template")
+    }
+
+    /// Selects only a first-party trusted template; body/identities are validated
+    /// before rendering and cannot supply framing or lifecycle authority.
+    fn render_template(&self, key: &str) -> Result<String> {
         self.validate()?;
         let contract: serde_json::Value =
             serde_json::from_str(include_str!("../../../assets/completion_notice.json"))?;
         let template = contract
-            .get("pool_template")
+            .get(key)
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| crate::Error::Runtime("pool template missing".into()))?;
         Ok(template
@@ -1209,6 +1300,32 @@ mod tests {
         }
     }
 
+    /// Mixed member JSON is exclusive and preserves historical new-only shape;
+    /// duplicate existing IDs or both sources cannot pass structural validation.
+    #[test]
+    fn mixed_sources_are_exclusive_and_existing_ids_are_unique() {
+        let original = request(2);
+        let mut value = serde_json::to_value(&original).unwrap();
+        let id = crate::domain::AgentId::new();
+        value["members"][0] = json!({"existing_agent_id":id,"role":"reviewer"});
+        let mut mixed: PoolStartRequest = serde_json::from_value(value.clone()).unwrap();
+        mixed.validate().unwrap();
+        assert_eq!(mixed.members[0].existing_agent_id(), Some(&id));
+        let old = serde_json::to_value(&original).unwrap();
+        assert!(old["members"][0].get("existing_agent_id").is_none());
+        value["members"][0]["start"] = old["members"][0]["start"].clone();
+        assert!(serde_json::from_value::<PoolStartRequest>(value).is_err());
+        let mut duplicate = serde_json::to_value(&original).unwrap();
+        duplicate["members"] =
+            json!([{"existing_agent_id":id,"role":"a"},{"existing_agent_id":id,"role":"b"}]);
+        assert!(
+            serde_json::from_value::<PoolStartRequest>(duplicate)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+    }
+
     /// Defaults fill in one criterion and role/slot names; replay shape is deterministic.
     #[test]
     fn defaults_fill_criterion_and_member_names() {
@@ -1217,7 +1334,7 @@ mod tests {
         assert_eq!(pool.acceptance.len(), 1);
         assert_eq!(pool.acceptance[0].id, "goal");
         assert_eq!(
-            pool.members[1].start.display_name.as_deref(),
+            pool.members[1].start().unwrap().display_name.as_deref(),
             Some("reviewer1 2")
         );
     }
@@ -1261,11 +1378,11 @@ mod tests {
         bad.goal = "x".repeat(MAX_GOAL_BYTES + 1);
         assert!(bad.validate().is_err());
         let mut bad = request(2);
-        bad.members[0].role = "r".repeat(MAX_ROLE_CHARS + 1);
+        *bad.members[0].role_mut() = "r".repeat(MAX_ROLE_CHARS + 1);
         assert!(bad.validate().is_err());
         let mut bad = request(2);
-        bad.members[0].start.display_name = Some("Twin".into());
-        bad.members[1].start.display_name = Some("twin".into());
+        bad.members[0].start_mut().unwrap().display_name = Some("Twin".into());
+        bad.members[1].start_mut().unwrap().display_name = Some("twin".into());
         assert!(bad.validate().is_err());
         let mut bad = request(2);
         let c = |id: &str| AcceptanceCriterion {
@@ -1278,7 +1395,7 @@ mod tests {
         bad.acceptance = (0..=MAX_CRITERIA).map(|i| c(&format!("c{i}"))).collect();
         assert!(bad.validate().is_err());
         let mut bad = request(2);
-        bad.members[0].start.request_id = Some("own".into());
+        bad.members[0].start_mut().unwrap().request_id = Some("own".into());
         assert!(bad.validate().is_err());
     }
 
@@ -1286,7 +1403,7 @@ mod tests {
     #[test]
     fn composed_task_exceeding_the_native_bound_is_rejected() {
         let mut pool = request(2);
-        pool.members[0].start.task = "t".repeat(crate::domain::MAX_TASK_BYTES);
+        pool.members[0].start_mut().unwrap().task = "t".repeat(crate::domain::MAX_TASK_BYTES);
         assert!(pool.validate().is_err());
     }
 

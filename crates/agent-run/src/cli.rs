@@ -123,8 +123,9 @@ pub trait CliService: Send + Sync {
     fn limits(&self) -> Result<Value>;
     /// Return the ordered capacity view, optionally for one exact model.
     fn capacity_order(&self, query: agent_run_domain::CapacityOrderQuery) -> Result<Value>;
-    /// Return the plain-text delegation guide as a JSON string value.
-    fn delegation_guide(&self) -> Result<Value>;
+    /// Returns account-free guide text for the exact catalog filters; omitted
+    /// filters retain default guidance, and invalid names preserve typed errors.
+    fn delegation_guide(&self, query: agent_run_domain::ModelsQuery) -> Result<Value>;
     /// Return delivery status for one exact execution.
     fn delivery_status(&self, id: &AgentId) -> Result<Value>;
     /// Cancel one completion-delivery attempt.
@@ -189,8 +190,9 @@ impl CliService for Service {
     fn capacity_order(&self, query: agent_run_domain::CapacityOrderQuery) -> Result<Value> {
         Service::capacity_order(self, query)
     }
-    fn delegation_guide(&self) -> Result<Value> {
-        Service::delegation_guide(self)
+    /// Forwards the CLI's exact optional filters to the shared guide service.
+    fn delegation_guide(&self, query: agent_run_domain::ModelsQuery) -> Result<Value> {
+        Service::delegation_guide_filtered(self, query)
     }
     fn delivery_status(&self, id: &AgentId) -> Result<Value> {
         Service::delivery_status(self, id)
@@ -393,8 +395,18 @@ pub enum Command {
         model: Option<String>,
     },
     Limits,
-    /// Print the compact plain-text routing guide for orchestrators.
-    DelegationGuide,
+    /// Prints compact routing guidance, with the same exact filters as models.
+    DelegationGuide {
+        /// Exact configured provider id.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Exact canonical role/profile name.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Exact provider-visible model id.
+        #[arg(long)]
+        model: Option<String>,
+    },
     Doc {
         topic: Option<String>,
     },
@@ -1909,9 +1921,19 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 .await?,
         )?,
         Command::Limits => (dependencies.output)(&dependencies.service.limits()?)?,
-        Command::DelegationGuide => {
+        Command::DelegationGuide {
+            provider,
+            profile,
+            model,
+        } => {
             // The guide is text, not JSON: print it with a normal newline.
-            let value = dependencies.service.delegation_guide()?;
+            let value = dependencies
+                .service
+                .delegation_guide(agent_run_domain::ModelsQuery {
+                    provider,
+                    profile,
+                    model,
+                })?;
             let text = value
                 .as_str()
                 .ok_or_else(|| invalid("delegation guide must be text"))?;

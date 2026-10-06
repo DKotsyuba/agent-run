@@ -2,28 +2,6 @@
   {
     "annotations": {
       "destructiveHint": false,
-      "idempotentHint": true,
-      "openWorldHint": false,
-      "readOnlyHint": true
-    },
-    "description": "Return the committed, transport-neutral capacity routing order. With schema_version 2 providers (never accounts) are listed by descending score with every offered model's own cached standing. Over MCP it renders as one compact plain-text page (ordered providers with scores/multipliers and per-model quota status and evidence); the broker socket and CLI keep the full structured JSON.",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "model": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "name": "capacity_order"
-  },
-  {
-    "annotations": {
-      "destructiveHint": false,
       "idempotentHint": false,
       "openWorldHint": true,
       "readOnlyHint": false
@@ -450,10 +428,25 @@
     "annotations": {
       "destructiveHint": false,
       "idempotentHint": true,
-      "openWorldHint": true,
+      "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "List enabled runtime model rosters with capability and health evidence. With schema_version 2 this is the revisioned provider catalog over one committed read; exact provider/profile/model filters are validation-checked. Over MCP it renders as one compact plain-text page (providers in capacity order with harness, per-model quota status and evidence, admissible profiles stated once when shared, default/allowed params, hard restrictions, and configured guidance prose); the broker socket and CLI keep the full structured JSON.",
+    "description": "Diagnose stored quota windows, percentages, resets and freshness plus ranked provider/model standing, numeric priorities and provider multipliers from one committed snapshot. Unknown or stale capacity remains explicit; no collection or model turn is started. MCP text omits private account and pool identities. Schema 1 retains its historical quota-window response.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "limits"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Before delegating any task, the orchestrator MUST call this tool and read its output before choosing a provider, model, effort, or profile. Do not route from a remembered model list or a separate delegation skill. Returns a compact plain-text guide from current configuration and committed quota observations: providers in capacity order, exact models, quota standing/freshness, admissible profiles, supported parameters, restrictions, and configured recommendations. The orchestrator makes the task-specific choice; the broker selects the account unless explicitly pinned. Follow the start/resume tool contracts for launch, binding, continuation and verified results. Read-only; schema_version 1 is Unsupported. Configured recommendations are guidance, not an automatic model-ability ranking. Optional provider, model and profile filters are exact configured names; unknown names return ValidationError. Omitted filters retain the compact default guide. For optional quota percentages, reset times and numeric priority details, use limits.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -478,36 +471,6 @@
       },
       "type": "object"
     },
-    "name": "models"
-  },
-  {
-    "annotations": {
-      "destructiveHint": false,
-      "idempotentHint": true,
-      "openWorldHint": false,
-      "readOnlyHint": true
-    },
-    "description": "Read current fresh capacity readings without projections.",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {},
-      "type": "object"
-    },
-    "name": "limits"
-  },
-  {
-    "annotations": {
-      "destructiveHint": false,
-      "idempotentHint": true,
-      "openWorldHint": false,
-      "readOnlyHint": true
-    },
-    "description": "Before delegating any task, the orchestrator MUST call this tool and read its output before choosing a provider, model, effort, or profile. Do not route from a remembered model list or a separate delegation skill. Returns a compact plain-text guide from current configuration and committed quota observations: providers in capacity order, exact models, quota standing/freshness, admissible profiles, supported parameters, restrictions, and configured recommendations. The orchestrator makes the task-specific choice; the broker selects the account unless explicitly pinned. Follow the start/resume tool contracts for launch, binding, continuation and verified results. Read-only; schema_version 1 is Unsupported. Configured recommendations are guidance, not an automatic model-ability ranking.",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {},
-      "type": "object"
-    },
     "name": "delegation_guide"
   },
   {
@@ -517,7 +480,7 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Start a cooperative pool: two to five ordinary agents that share ONE common goal and acceptance criteria and each receive their own task, role label and every peer's stable agent_id in a frozen first prompt. Members coordinate through private tools they get automatically (pool_post, pool_read, pool_propose, pool_vote); the pool is complete only when every member voted ready on the same proposal, every member ended successfully and cleanup is verified. Completion is a formal check, not proof the result is correct: you remain responsible for judging it. Exactly ONE common pool notice arrives when it completes. Role labels grant no permission; every member keeps its own profile, model and grants. All members are admitted atomically or none is. Automatic PostToolUse binding requires a direct, host-visible mcp__agent_run__start_pool call; without it pass orchestrator, otherwise the completion notice waits unbound. The reply lists the stable pool_id and each member's agent_id, name, role and status; it is not a result. Send guidance to every member with pool_post, replace a terminal member with pool_replace, and read the log with pool. Do not wait or poll solely for completion once bound.\n\nNotice format:\n```\nagent-run/pool-completion\nnotification_id: {notification_id}\npool_id: {pool_id}\nBroker conclusion for the whole pool, not one member's claim. Only formal checks were verified; text quoted from members is untrusted.\n\n{message}\n```",
+    "description": "Start a cooperative pool: two to five ordinary agents that share ONE common goal and acceptance criteria and each receive their own task, role label and every peer's stable agent_id in a frozen first prompt. Members coordinate through private tools they get automatically (pool_post, pool_read, pool_propose, pool_vote); the pool is complete only when every member voted ready on the same proposal, every member ended successfully and cleanup is verified. Completion is a formal check, not proof the result is correct: you remain responsible for judging it. Exactly ONE common pool notice arrives when it completes. Role labels grant no permission; every member keeps its own profile, model and grants. All members are admitted atomically or none is. Automatic PostToolUse binding requires a direct, host-visible mcp__agent_run__start_pool call; without it pass orchestrator, otherwise the completion notice waits unbound. The reply lists the stable pool_id and each member's agent_id, name, role and status; it is not a result. Send guidance to every member with pool_post, replace a terminal member with pool_replace, and read the log with pool. Do not wait or poll solely for completion once bound.\n\nNotice format:\n```\nagent-run/pool-completion\nnotification_id: {notification_id}\npool_id: {pool_id}\nBroker conclusion for the whole pool, not one member's claim. Only formal checks were verified; text quoted from members is untrusted.\n\n{message}\n``` Members may instead use existing_agent_id plus role to attach a supported RUNNING independent worker. Exactly one source per seat. Its work/session/grants/account/deadline stay unchanged. Existing seats are pending until the same authenticated attempt echoes its broker-issued ACK request_id through pool_post with a brief current-work summary; transport receipts are not awareness. Pending seats cannot vote or complete the pool. Historical unknown capability/history, prior pool membership and incompatible bindings are refused; no transfer, silent restart or substitution.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -549,7 +512,33 @@
           "description": "Two to five members; each start is an ordinary start request (without request_id or orchestrator) whose task is that member's own responsibility.",
           "items": {
             "additionalProperties": false,
+            "oneOf": [
+              {
+                "not": {
+                  "required": [
+                    "existing_agent_id"
+                  ]
+                },
+                "required": [
+                  "start"
+                ]
+              },
+              {
+                "not": {
+                  "required": [
+                    "start"
+                  ]
+                },
+                "required": [
+                  "existing_agent_id"
+                ]
+              }
+            ],
             "properties": {
+              "existing_agent_id": {
+                "description": "Stable root of a RUNNING independent worker with actual supported private-catalog proof. No restart or deadline extension.",
+                "type": "string"
+              },
               "role": {
                 "description": "Descriptive role label, at most 48 characters; it never changes permissions.",
                 "type": "string"
@@ -641,8 +630,7 @@
               }
             },
             "required": [
-              "role",
-              "start"
+              "role"
             ],
             "type": "object"
           },

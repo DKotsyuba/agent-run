@@ -14,9 +14,15 @@ Current proposal #{{ status.current_proposal.seq }} unchanged (read with after_s
 {% else %}
 No proposal yet.
 {% endif %}
+{% if enrollment %}
+Enrollment: {{ enrollment.state }}; original execution time remaining {{ enrollment.remaining_seconds }}s{% if enrollment.reason %}, {{ enrollment.reason }}{% endif %}.
+{% if enrollment.state != "joined" and enrollment.request_id %}
+After reading the goal/criteria/roster, ACK through pool_post with exact request_id={{ enrollment.request_id }} and a brief current-work summary. This does not restart or extend your work.
+{% endif %}
+{% endif %}
 Members:
 {% for member in status.members %}
-- {{ member.name }} ({{ member.role }}, {{ member.agent_id }}): {{ member.tip_status }}{% if member.cleanup_complete %}, cleaned up{% endif %}, vote {{ member.why }}{% if member.vote and member.vote.decision %} [{{ member.vote.decision }}]{% endif %}{{ "" }}
+- {{ member.name }} ({{ member.role }}, {{ member.agent_id }}): {{ member.tip_status }}{% if member.cleanup_complete %}, cleaned up{% endif %}{% if member.enrollment %}, enrollment {{ member.enrollment.state }}{% endif %}, vote {{ member.why }}{% if member.vote and member.vote.decision %} [{{ member.vote.decision }}]{% endif %}{{ "" }}
 {% endfor %}
 {% for retired in status.replaced_members %}
 - replaced: {{ retired.name }} ({{ retired.role }}, {{ retired.agent_id }}) by {{ retired.replaced_by }}

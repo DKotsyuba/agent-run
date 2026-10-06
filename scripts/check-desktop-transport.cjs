@@ -37,7 +37,7 @@ function receive(socket){return new Promise((resolve,reject)=>{/** @type {Buffer
  * @returns {Promise<string>} Absolute relay path after it appears.
  * @throws {Error} When no endpoint appears within the bounded polling window.
  */
-async function relayPath(directory){for(let i=0;i<200;i++){const name=fs.readdirSync(directory).find(v=>v.startsWith('ar-cdx-v4-')&&v.endsWith('.sock'));if(name)return path.join(directory,name);await new Promise(resolve=>setTimeout(resolve,10));}throw Error('relay did not start');}
+async function relayPath(directory){for(let i=0;i<200;i++){const name=fs.readdirSync(directory).find(v=>v.startsWith('ar-cdx-v5-')&&v.endsWith('.sock'));if(name)return path.join(directory,name);await new Promise(resolve=>setTimeout(resolve,10));}throw Error('relay did not start');}
 
 /**
  * Connect after the listening callback, tolerating the socket-file visibility race.
@@ -107,3 +107,14 @@ test('v4 pool completion is a broker conclusion through the fixed host tool',asy
 test('pool completion rejects malformed payloads before host contact',async()=>{for(const request of [{...pool,method:'tools/call'},{...pool,message:'x'.repeat(4097)},{...pool,message:'bad\0body'},{...pool,pool_id:'agent-1'},{...pool,run_id:'ag-20260925-000000-0000000002'}]){const{result,calls}=await scenario('accepted',request);assert.equal(result.outcome,'rejected');assert.equal(calls.length,0);}});
 /** Unknown fields, oversized prose, and controls cannot reach the native host. */
 test('worker report rejects malformed payloads before host contact',async()=>{for(const request of [{...worker,method:'tools/call'},{...worker,message:'x'.repeat(2049)},{...worker,message:'bad\0body'},{...worker,kind:'approval'}]){const{result,calls}=await scenario('accepted',request);assert.equal(result.outcome,'rejected');assert.equal(calls.length,0);}});
+
+/** New broker attention requires advertised v5; old wire4 is known rejected. */
+test('v5 pool attention is distinct and v4 attention rejects before host contact',async()=>{
+  const attention={...pool,version:5,op:'pool_attention',message:'Enrollment needs_action; work continues.'};
+  const accepted=await scenario('accepted',attention);
+  assert.equal(accepted.result.outcome,'accepted');
+  assert.ok(accepted.calls[1].params.arguments.prompt.startsWith('agent-run/pool-attention\n'));
+  assert.ok(accepted.calls[1].params.arguments.prompt.includes('not completion'));
+  const old=await scenario('accepted',{...attention,version:4});
+  assert.equal(old.result.outcome,'rejected');assert.equal(old.calls.length,0);
+});

@@ -515,9 +515,17 @@ pub fn rank(
         reset_credit_multiplier: credit_weight,
     })
 }
+/// Returns the historical latest quota-window diagnostics for `home`, without
+/// collection or provider launches. Expired percentages stay absent, while
+/// reset/observation/expiry timestamps and distinct physical identities remain.
 pub fn limits(home: &Path) -> Result<Value> {
-    let store = Store::open(home)?;
-    let at = now();
+    limits_from_store(&Store::open(home)?, now())
+}
+
+/// Projects at most 1000 latest quota identities from the caller's Store/read
+/// snapshot at one Unix-seconds advice clock. It does not start a transaction
+/// or collect data; diagnostics can share its snapshot with provider ranking.
+pub(crate) fn limits_from_store(store: &Store, at: f64) -> Result<Value> {
     // Select the latest per identity BEFORE applying a diagnostic result bound.
     let mut q=store.conn.prepare("SELECT * FROM (SELECT *,ROW_NUMBER() OVER(PARTITION BY runtime,lane,window,target,source,account_id,quota_key ORDER BY observed_at DESC,id DESC) AS position FROM capacity_samples) WHERE position=1 ORDER BY runtime,lane,window,target,source,account_id,quota_key LIMIT 1000")?;
     // Account-bound (schema-2) rows keep their account and physical pool so

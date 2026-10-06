@@ -519,7 +519,7 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut statement = tx.prepare(
-            "SELECT d.id FROM deliveries d JOIN agents a ON a.id=d.agent_id JOIN events e ON e.seq=d.terminal_event_seq WHERE d.state='waiting_binding' AND e.kind NOT IN ('worker_notification','pool_completed') AND a.status IN ('succeeded','failed','timed_out','cancelled','lost') AND e.at<=? ORDER BY e.at,d.id",
+            "SELECT d.id FROM deliveries d JOIN agents a ON a.id=d.agent_id JOIN events e ON e.seq=d.terminal_event_seq WHERE d.state='waiting_binding' AND (e.kind='pool_join_needs_action' OR (e.kind NOT IN ('worker_notification','pool_completed') AND a.status IN ('succeeded','failed','timed_out','cancelled','lost'))) AND e.at<=? ORDER BY e.at,d.id",
         )?;
         let ids = statement
             .query_map([at - BINDING_WINDOW_SECONDS], |row| row.get::<_, String>(0))?

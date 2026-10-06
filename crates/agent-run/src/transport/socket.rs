@@ -559,6 +559,7 @@ pub async fn respond(service: &Service, v: Value) -> Option<Value> {
             "wait",
             agent_run_domain::worker::METHOD,
             agent_run_domain::worker::TOOL_METHOD,
+            agent_run_domain::worker::CATALOG_METHOD,
         ]
         .contains(&method);
     let response = if !known {

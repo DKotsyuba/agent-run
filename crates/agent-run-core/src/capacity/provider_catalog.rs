@@ -321,6 +321,12 @@ pub fn order(
         },
         crate::domain::now(),
     )?;
+    Ok(order_value(&order, revision))
+}
+
+/// Serializes existing provider ranking without changing its compatibility
+/// shape, numerical priorities or account-free provider/model identities.
+fn order_value(order: &provider_ranking::ProviderCapacityOrder, revision: &str) -> Value {
     let providers: Vec<Value> = order
         .providers
         .iter()
@@ -337,11 +343,55 @@ pub fn order(
             })
         })
         .collect();
-    Ok(json!({
+    json!({
         "schema_version": 2,
         "config_revision": revision,
         "capacity_revision": order.capacity_revision,
         "ranked_at": order.observed_at,
         "providers": providers,
-    }))
+    })
+}
+
+/// Returns quota windows plus provider/model ranking from one committed read,
+/// active configuration revision and advice clock. It reuses the admission
+/// ranker, including all windows/latches; no collectors or engines are started.
+pub fn diagnostics(home: &Path, config: &ProviderConfig, revision: &str) -> Result<Value> {
+    diagnostics_between(home, config, revision, &mut || {})
+}
+
+/// Fixture seam proving a concurrent quota commit cannot split diagnostic
+/// windows and ranking. The callback runs after registry snapshot acquisition.
+#[cfg(feature = "test-fixtures")]
+pub fn diagnostics_observed(
+    home: &Path,
+    config: &ProviderConfig,
+    revision: &str,
+    between_reads: &mut dyn FnMut(),
+) -> Result<Value> {
+    diagnostics_between(home, config, revision, between_reads)
+}
+
+/// Owns the shared read transaction and invokes the optional fixture seam
+/// before projecting quota windows and scores at the exact same advice clock.
+fn diagnostics_between(
+    home: &Path,
+    config: &ProviderConfig,
+    revision: &str,
+    between_reads: &mut dyn FnMut(),
+) -> Result<Value> {
+    let store = Store::open(home)?;
+    let _read = store.conn.unchecked_transaction()?;
+    let catalog = resolve(config, &store)?;
+    between_reads();
+    let at = crate::domain::now();
+    let order = provider_ranking::provider_order_filtered_at(
+        &store,
+        &catalog,
+        &BTreeSet::new(),
+        &|_, _| true,
+        at,
+    )?;
+    let mut value = crate::capacity::limits_from_store(&store, at)?;
+    value["ranking"] = order_value(&order, revision);
+    Ok(value)
 }

@@ -2,7 +2,7 @@
 
 The operator `agent-run` and private `agent-run-worker` servers advertise the
 Cargo product version. It is independent of rmcp 3.4.0, the negotiated MCP
-protocol, state schema 25, and family response profile `rust-minijinja-v1/0.1.0`.
+protocol, state schema 26, and family response profile `rust-minijinja-v1/0.1.0`.
 Tool names, resident execution, stable agent IDs and worker capabilities keep
 their existing contracts. The worker registration namespace remains
 `agent_run_worker`; only the supervisor supplies its attempt context.
@@ -72,10 +72,11 @@ reversible JSON quoting; excerpts retain their bytes, including literal Jinja.
 | pool, pool_read | 614400 | 50 entries, every entry displayed or the page refused | 563200 |
 | list_pools | 524288 | 200 | 524288 |
 | cancel, steer, notify_orchestrator, routine errors | 2048 | 8 | none |
-| list_agents, limits | 8192 | 20 | none |
+| list_agents | 8192 | 20 | none |
+| limits | 8192 | 20 windows; ranking retains 100 providers and 100 models total | none |
 | transcript | 16384 | 100 | 14336 |
 | answer, doc, delegation_guide | 16384 | none | 14336 |
-| models, capacity_order | 16384 | 100 providers and 100 models in total | none |
+| models, capacity_order (call-only compatibility methods) | 16384 | 100 providers and 100 models in total | none |
 
 Admission replies reserve the original request key, whose existing contract
 allows 512 characters; reversible quoting can expand it beyond 2 KiB. These
@@ -90,7 +91,8 @@ No tokenizer savings are claimed.
 Pages are budgeted before projection, then rendered into a bounded private
 writer. Every page row is displayed in source order or the entire page is
 refused. No partial buffer, shortened critical value or upstream continuation
-for undisplayed rows is published. Narrow models with the existing filters;
+for undisplayed rows is published. Narrow delegation guidance with exact
+provider/model/profile filters (also retained by the call-only models method);
 request smaller list/transcript limits; use CLI/socket for full documents or
 answer artifacts. No new detail-reference service is invented.
 

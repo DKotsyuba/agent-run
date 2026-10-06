@@ -27,7 +27,15 @@ pub struct PoolMemberAdmission<'a> {
     pub personal_task: String,
     /// Trusted inputs whose request, effective task and identity already carry
     /// the composed task.
-    pub inputs: AdmissionInputs<'a>,
+    pub source: PoolAdmissionSource<'a>,
+}
+
+/// Either new reservation inputs or an exact existing-worker preflight pin.
+pub enum PoolAdmissionSource<'a> {
+    /// Ordinary admission; only this branch reserves capacity and creates a run.
+    New(AdmissionInputs<'a>),
+    /// Existing independent RUNNING worker; all facts are atomically rechecked.
+    Existing(crate::pool_enrollment::ExistingMember),
 }
 
 /// Everything one pool admission writes, decided outside the transaction.
@@ -48,6 +56,8 @@ pub struct PoolAdmissionInput<'a> {
     pub catalog: &'a ProviderCatalog,
     /// Members in slot order.
     pub members: Vec<PoolMemberAdmission<'a>>,
+    /// Effective shared binding, inferred from existing workers when outer input omitted it.
+    pub orchestrator: Option<&'a agent_run_domain::domain::OrchestratorRef>,
 }
 
 /// A member as recorded, without any internal run or attempt detail.
@@ -138,28 +148,51 @@ impl Store {
             tx.commit()?;
             return Ok(found);
         }
-        let binding = input
-            .members
-            .first()
-            .map(|m| &m.inputs.effective.orchestrator);
-        if input.members.is_empty()
-            || input
-                .members
-                .iter()
-                .any(|m| Some(&m.inputs.effective.orchestrator) != binding)
-        {
+        if input.members.is_empty() {
             return Err(invalid("pool members must share one orchestrator binding"));
         }
-        let mut first_agent = None;
+        let mut names = std::collections::BTreeSet::new();
         for member in &input.members {
-            admit_in_tx(&tx, input.catalog, member.id.clone(), &member.inputs, None)?;
-            first_agent.get_or_insert(member.id.as_str());
+            if !names.insert(member.name.to_lowercase()) {
+                return Err(invalid("member names must be unique"));
+            }
+            match &member.source {
+                PoolAdmissionSource::New(inputs) => {
+                    if inputs.effective.orchestrator.as_ref() != input.orchestrator {
+                        return Err(invalid("pool members must share one orchestrator binding"));
+                    }
+                    admit_in_tx(&tx, input.catalog, member.id.clone(), inputs, None)?;
+                }
+                PoolAdmissionSource::Existing(pin) => {
+                    let actual = crate::pool_enrollment::existing_member(&tx, &member.id, now())?;
+                    if actual.run_id != pin.run_id
+                        || actual.attempt_id != pin.attempt_id
+                        || actual.fingerprint != pin.fingerprint
+                        || actual.deadline != pin.deadline
+                        || !crate::pool_enrollment::same_binding(
+                            actual.orchestrator.as_ref(),
+                            pin.orchestrator.as_ref(),
+                        )?
+                    {
+                        return Err(invalid("existing worker changed during pool admission"));
+                    }
+                    if actual.orchestrator.is_some()
+                        && !crate::pool_enrollment::same_binding(
+                            actual.orchestrator.as_ref(),
+                            input.orchestrator,
+                        )?
+                    {
+                        return Err(invalid(
+                            "existing worker is bound to a different orchestrator",
+                        ));
+                    }
+                }
+            }
         }
-        let session: Option<String> = tx.query_row(
-            "SELECT orchestrator_session_id FROM agents WHERE id=?",
-            [first_agent],
-            |row| row.get(0),
-        )?;
+        let session = input
+            .orchestrator
+            .map(|reference| crate::session_for_reference(&tx, reference, now()))
+            .transpose()?;
         tx.execute(
             "INSERT INTO pools(id,request_namespace,request_id,request_sha256,orchestrator_session_id,goal,acceptance_json,state,roster_revision,created_at) \
              VALUES(?,?,?,?,?,?,?,'open',1,?)",
@@ -188,7 +221,41 @@ impl Store {
                 ],
             )?;
         }
-        Store::advance_quota_capacity_revision(&tx)?;
+        for member in &input.members {
+            if let PoolAdmissionSource::Existing(pin) = &member.source {
+                if let Some(session) = session.as_ref() {
+                    tx.execute("UPDATE agents SET orchestrator_session_id=? WHERE id=? AND orchestrator_session_id IS NULL",params![session,pin.run_id.as_str()])?;
+                }
+                let challenge = format!("pool-join-v1-{}", uuid::Uuid::new_v4().simple());
+                tx.execute("INSERT INTO pool_enrollments(agent_id,run_id,attempt_id,challenge,deadline,created_at) VALUES(?,?,?,?,?,?)",
+                    params![member.id.as_str(),pin.run_id.as_str(),pin.attempt_id,challenge,pin.deadline,now()])?;
+                let goal_brief = input.goal.chars().take(96).collect::<String>();
+                let roster = input
+                    .members
+                    .iter()
+                    .map(|m| format!("{} ({}, {})", m.name, m.role, m.id))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let intro = format!(
+                    "Pool {} enrollment pending. Seat: {} ({}). Goal brief: {}. Roster: {}. Your current work, permissions, session and original deadline remain unchanged. Read pool_read for the authoritative full goal and acceptance criteria; then acknowledge awareness with pool_post request_id={} and a brief current-work summary. Transport receipt is not acknowledgement.",
+                    input.pool_id, member.name, member.role, goal_brief, roster, challenge
+                );
+                if intro.len() > 4096 {
+                    return Err(invalid(
+                        "pool enrollment introduction exceeds bounded message size",
+                    ));
+                }
+                tx.execute("INSERT INTO commands(agent_id,kind,payload_json,state,created_at) VALUES(?,'steer',?,'pending',?)",
+                    params![pin.run_id.as_str(),serde_json::to_string(&serde_json::json!({"text":intro,"pool_enrollment":member.id}))?,now()])?;
+            }
+        }
+        if input
+            .members
+            .iter()
+            .any(|m| matches!(m.source, PoolAdmissionSource::New(_)))
+        {
+            Store::advance_quota_capacity_revision(&tx)?;
+        }
         let members = members_of(&tx, input.pool_id.as_str())?;
         tx.commit()?;
         Ok(PoolAdmission {

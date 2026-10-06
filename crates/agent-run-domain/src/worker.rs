@@ -7,6 +7,36 @@ use std::fmt;
 
 /// Private worker MCP server identity exposed only to launched subagents.
 pub const SERVER_NAME: &str = "agent_run_worker";
+
+/// Private native handshake; it is not an advertised operator or worker tool.
+pub const CATALOG_METHOD: &str = "worker/catalog";
+
+/// The reviewed version of the five-tool private pool-capable server contract.
+pub const POOL_CATALOG_VERSION: u32 = 1;
+
+/// Fingerprints the actual embedded private catalog served by this binary.
+/// The digest includes schemas/effect hints, not runtime capability material.
+pub fn pool_catalog_digest() -> String {
+    crate::canonical::sha256_hex(&serde_json::json!(crate::tools::worker_tools_json()), true)
+}
+
+/// Hidden attempt-bound catalog proof sent only by the native worker server.
+/// No Debug representation is provided because the token is ephemeral secret.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerCatalogProof {
+    /// Exact execution whose launcher supplied the capability.
+    pub run_id: AgentId,
+    /// Exact owned attempt, not a moving lineage alias.
+    pub attempt_id: String,
+    /// Hidden transient worker capability; persisted only as a hash.
+    pub token: String,
+    /// Reviewed catalog contract version.
+    pub version: u32,
+    /// SHA-256 of the actual five-tool embedded catalog.
+    pub digest: String,
+}
+
 /// Private broker method accepted only from an authenticated worker capability.
 pub const METHOD: &str = "worker/notify";
 /// Launch-time inherited names carrying home, exact run, attempt, and secret.

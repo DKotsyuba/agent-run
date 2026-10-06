@@ -11,7 +11,7 @@ topic for this index.
 | skills | revisioned-profile `skills = [...]`, plugin ownership, snapshots |
 | mcp-servers | `[mcp.<name>]` declarations and revisioned-profile selection |
 | plugins | `harnesses.<id>.plugins`, harness load mechanics, canonical role skill declarations |
-| models | provider/model catalog, cached quota standing, delegation guide, historical schema-1 rosters |
+| models | routing guide and quota diagnostics, compatibility catalogs, historical schema-1 rosters |
 | releases | sealed release build/switch/retention under standalone/releases |
 | migrations | PRAGMA user_version, numbered SQL deltas, pre-backup, refusal cases |
 | storage | shared managed assets, `storage status`/`compact`/`recover`, collection rules |

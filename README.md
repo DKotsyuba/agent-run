@@ -158,7 +158,8 @@ release platform, and agent-run does not generate systemd units.
 
 ```bash
 agent-run delegation-guide             # read before choosing a delegation route
-agent-run models                       # providers, explicit models, roles, standing
+agent-run delegation-guide --provider codex --profile review  # exact optional filters
+agent-run limits                       # optional quota/reset/priority diagnosis
 agent-run start --provider codex --model gpt-6.1-sol --profile review \
   --task "Review this repository." --workdir "$PWD"
 
@@ -186,8 +187,10 @@ the Claude runtime journals assistant fragments and the completion tail of one
 message under its native message id (or one producer-owned fallback per
 message boundary when the engine omits ids), so each message renders as one
 continuous row and distinct messages stay distinct. Other commands
-include `steer`, `cancel`, `models`, `limits`, `capacity order`,
-`delivery status`, and `doc`.
+include `steer`, `cancel`, `delivery status`, and `doc`. The legacy
+`models` and `capacity order` CLI commands remain compatibility reads with
+their original structured responses; ordinary routing uses `delegation-guide`
+and optional `limits` diagnostics.
 
 ## Use the MCP server
 
@@ -197,12 +200,18 @@ The MCP process is a thin stdio proxy over the resident broker:
 {"command":"agent-run","args":["--home","/absolute/path/to/agent-run-home","mcp"]}
 ```
 
-It exposes `start`, `resume`, `cancel`, `steer`, `list_agents`, `answer`,
-`transcript`, `capacity_order`, `doc`, `models`, `delegation_guide`, and `limits`.
+It advertises 15 tools: `start`, `resume`, `cancel`, `steer`, `list_agents`,
+`answer`, `transcript`, `doc`, `delegation_guide`, `limits`, `start_pool`,
+`pool_post`, `pool_replace`, `pool`, and `list_pools`. Use `delegation_guide`
+with optional exact `provider`, `model`, and `profile` filters for routing;
+use `limits` for quota windows plus numerical provider/model standing.
+`models` and `capacity_order` remain callable compatibility methods with their
+original CLI/socket JSON shapes, but do not appear in MCP discovery.
 
-New schema-2 workers receive a separate built-in MCP with only
-`notify_orchestrator`: a durable report to their bound orchestrator without
-ending the run. Ordinary work MCPs remain profile-controlled.
+New schema-2 workers receive a separate built-in MCP with five fixed tools:
+`notify_orchestrator` plus four pool tools authorized by live membership.
+`start_pool` can mix new members with supported independent RUNNING workers;
+attached workers keep their work and must acknowledge enrollment before voting. Ordinary work MCPs remain profile-controlled.
 See [worker reports](docs/worker-mcp.md) for bounds, replies and upgrade behavior.
 
 ## Use the socket API

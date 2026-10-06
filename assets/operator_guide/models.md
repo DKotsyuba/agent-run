@@ -2,10 +2,9 @@
 
 ## Historical schema 1: claude, codex, and glm
 
-Static rosters: whatever model ids are listed in each runtime's `models =
-[...]` in config.toml. There is nothing else to sync: the broker loads a valid
-changed config automatically, and new starts materialize the updated roster.
-Existing sessions retain their admitted model identity.
+Static rosters come from each runtime's `models = [...]` in config.toml.
+The broker reloads valid changes automatically; new starts use the new roster
+and existing sessions retain their admitted model identity.
 
 ### Verifying
 
@@ -16,12 +15,12 @@ admitting work with that model.
 
 ## Schema 2: the provider catalog
 
-With `schema_version = 2`, `models` is the public provider catalog and
-`capacity_order` the provider-only capacity order. Both are read-only views of
-the current valid config, the canonical role files, and committed quota
-observations: they never collect quota, probe a harness, reserve capacity or
-start work. The caller alone picks provider, model, effort and profile; the
-catalog reports facts and never recommends by itself.
+MCP discovery exposes two routing reads: `delegation_guide` and `limits`.
+Schema 2 keeps `models` and `capacity_order` as call-only compatibility views.
+They read valid config, canonical role files and committed quota observations;
+they never collect quota, probe a harness, reserve capacity or start work.
+The caller picks provider, model, effort and profile; configured guidance is
+prose, not an automatic model-suitability decision.
 
 Filters are exact identifiers; an unknown value is a `ValidationError`:
 
@@ -30,8 +29,8 @@ agent-run models --provider codex --profile review --model gpt-main
 agent-run capacity order --model gpt-main
 ```
 
-The same filters are the `models` / `capacity_order` tool arguments over MCP
-and the broker socket (`{"provider":..,"profile":..,"model":..}`,
+The same filters remain accepted by direct compatibility calls to `models` /
+`capacity_order` over MCP and the broker socket (`{"provider":..,"profile":..,"model":..}`,
 `{"model":..}`). Each result carries `config_revision` (SHA-256 of the exact
 `config.toml` bytes), `capacity_revision` (the committed quota/registry
 snapshot it was read from) and `ranked_at` (the clock the standing was
@@ -63,34 +62,22 @@ offerings that role can use. No account id, label or credential reference
 appears; per-account facts stay in `limits` (each account-bound row names
 its `account` and physical `pool`) and `accounts list`.
 
-Recommendations are plain configured prose. Editing them in `config.toml`
-changes the next `models` result (and its `config_revision`); no skill needs
-model or account constants:
+Edit provider/model `recommendations` in `config.toml`; valid reload changes
+the next guide/catalog result and its `config_revision`. Skills need no model
+or account constants. Configuration excerpt:
 
 ```toml
 [providers.codex]
-harness = "codex"
-connection = { kind = "native" }
-auth_family = "openai"
-limits_source = "exec"
-collector = { command = "/bin/bash", args = ["/opt/agent-run/collectors/codex.sh"], source = "codex-appserver" }
-recommendations = ["native subscription; strongest for long refactors"]
+recommendations = ["native subscription; long refactors"]
 [[providers.codex.models]]
 id = "gpt-main"
-native_model = "gpt-native"
 allowed_params = { effort = ["medium", "high"] }
 params = { effort = "medium" }
 recommendations = ["broad coding"]
-[[providers.codex.models]]
-id = "gpt-review"
-restrictions = ["web_tools_disabled"]
-[[providers.codex.bindings]]
-label = "personal"
-account = "acct-codex"
 ```
 
-`params.effort` is the effective default when a start omits effort. Other
-parameter keys are rejected until a launch adapter can execute them.
+Omitted effort uses `params.effort`. Other parameter keys are rejected until a
+launch adapter can execute them. See `agent-run doc config` for full config.
 
 A schema-1 file keeps its historical runtime roster and route order; the
 filters are `Unsupported` there.
@@ -111,28 +98,36 @@ ranking; only use values admitted by the configured `allowed_params`.
 
 ## MCP compact presentation
 
-Over MCP, `models` renders providers in order with their harness, per-model
-quota status and freshness evidence, admissible profiles (stated once when
-identical across models), params, restrictions and configured guidance.
-`capacity_order` renders provider scores/multipliers and each model's quota
-status and evidence. Both omit skills/MCP arrays, hashes, accounts and
-endpoints; the broker socket and CLI keep the full structured JSON above.
+Use `delegation_guide` for compact provider/model guidance and `limits` for
+diagnosis. Limits retain quota windows, percentages, reset times and freshness
+and add schema-2 provider/model standing, scores and provider multipliers in
+`ranking`. Windows and ranking share one committed snapshot, config revision
+and advice clock (`observed_at` equals `ranking.ranked_at`); the existing ranker
+considers every governing window and exhaustion fact. Unknown/stale capacity
+is never presented as healthy. MCP text omits account/pool identities and
+retains whole-response size/row bounds; CLI/socket diagnostic JSON keeps those
+original physical-window identities. Call-only `models` and `capacity_order`
+retain their original compact MCP layouts and structured CLI/socket shapes.
 
 ## Delegation guide
 
-`agent-run delegation-guide` (or the no-argument `delegation_guide` tool over
-MCP and the broker socket) renders the same committed snapshot as one compact
-plain-text page for an orchestrator choosing a route: a compact operating header,
-then each provider in capacity order with its harness, configured provider
-guidance, and one short line per exact selectable model id — cached quota
-status and evidence (with sample age and reset horizon derived from
-`ranked_at`, never raw timestamps), the admissible canonical profiles
-(`profiles: none` marks a model no role may use), nonempty default and allowed
-params, hard restrictions, and configured model guidance. Schema 1 is
-`Unsupported`; an explicitly empty catalog says so. The text omits skills, MCP
-arrays, hashes, accounts, credentials, and endpoints, and normalizes whitespace
-and control characters in configured recommendation prose — it adds no
-model-ability ranking and no facts beyond the `models` snapshot it renders.
+`agent-run delegation-guide` and the `delegation_guide` MCP/socket read accept
+the same exact optional `provider`, `model`, and `profile` filters, with typed
+`ValidationError` for unknown names. For example:
+
+```sh
+agent-run delegation-guide --provider codex --model gpt-main --profile review
+```
+
+Omitted filters retain the default guide. One committed snapshot renders a
+compact operating header, providers in capacity order with harness/guidance,
+and each exact selectable model: cached quota status/evidence, sample age and
+reset horizon derived from `ranked_at`, admissible canonical profiles
+(`profiles: none` means no role may use it), nonempty default/allowed params,
+restrictions and configured guidance. Schema 1 is `Unsupported`; an empty
+catalog is explicit. Text omits skills, MCP arrays, hashes, accounts,
+credentials and endpoints, normalizes recommendation whitespace/control
+characters, and adds no model-ability ranking or facts beyond its snapshot.
 
 Before delegating a task, the orchestrator must call this tool and read its
 output before choosing provider, model, effort or profile. Keep task-suitability

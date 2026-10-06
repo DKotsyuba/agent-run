@@ -482,6 +482,20 @@ struct ReportTextView {
     duplicate: bool,
 }
 
+/// Public enrollment overlay; private ACK key is present only for the
+/// authenticated recipient's pool_read. No attempt/token/native-session data.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PoolEnrollmentTextView {
+    /// Pending, joined or needs_action; validated before rendering.
+    state: String,
+    /// Original execution deadline remaining, never an extension.
+    remaining_seconds: f64,
+    /// Optional exact opaque broker-issued request key for the recipient ACK.
+    request_id: Option<String>,
+    /// Fixed safe failure reason, absent while healthy/pending.
+    reason: Option<String>,
+}
+
 /// Pool admission roster, without provider, account, attempt or capability fields.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PoolAdmissionMemberTextView {
@@ -493,6 +507,8 @@ struct PoolAdmissionMemberTextView {
     role: String,
     /// Current lifecycle; null means an original member was replaced or pruned.
     status: Option<crate::domain::Status>,
+    /// Existing worker enrollment, absent for backward-compatible new-only seats.
+    enrollment: Option<PoolEnrollmentTextView>,
 }
 
 /// Public admission and binding facts of a committed cooperative pool.
@@ -646,6 +662,8 @@ struct PoolStatusMemberTextView {
     vote: Option<PoolVoteTextView>,
     /// Display-safe validity reason.
     why: String,
+    /// Optional enrollment overlay, absent on legacy/new-only status rows.
+    enrollment: Option<PoolEnrollmentTextView>,
 }
 
 /// Retired public roster labels; no replacement launch details are exposed.
@@ -726,6 +744,8 @@ struct PoolPageTextView {
     show_goal: bool,
     /// Whether the proposal snapshot is new or explicitly requested.
     show_proposal: bool,
+    /// Recipient-only structured challenge; never present on operator reads.
+    enrollment: Option<PoolEnrollmentTextView>,
 }
 
 /// Routine expected error carries only public sanitized diagnostics.
@@ -1052,6 +1072,8 @@ struct ModelTextView {
     status: String,
     /// Explicit observation evidence classification.
     evidence: String,
+    /// Existing best model priority, including zero; unknown stays absent.
+    priority: Option<f64>,
     /// Exact admissible profile list, optionally hoisted to the provider.
     profiles: Option<String>,
     /// Faithful configured parameter choices.
@@ -1148,6 +1170,8 @@ struct LimitTextView {
 struct LimitsTextView {
     /// Every source diagnostic in order.
     items: Vec<LimitTextView>,
+    /// Optional account-free schema-2 standing from the same diagnostic snapshot.
+    ranking: Option<CatalogTextView>,
 }
 
 /// Converts the existing dynamic catalog projection to its allowlisted typed view.
@@ -1211,6 +1235,32 @@ fn validate_agent(value: &Value) -> Result<()> {
     for key in ["warned"] {
         if !value[key].is_null() {
             required_bool(value, key)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validates a bounded enrollment overlay before any ACK key can be printed.
+/// State/remaining time remain exact, and an opaque challenge is never shortened.
+fn validate_enrollment(value: &Value) -> Result<()> {
+    if !matches!(
+        value["state"].as_str(),
+        Some("pending" | "joined" | "needs_action")
+    ) || value["remaining_seconds"]
+        .as_f64()
+        .is_none_or(|v| !v.is_finite() || v < 0.0)
+    {
+        return Err(shape_error());
+    }
+    if let Some(key) = value.get("request_id") {
+        let key = key.as_str().ok_or_else(shape_error)?;
+        if key.is_empty()
+            || key.len() > 128
+            || !key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        {
+            return Err(shape_error());
         }
     }
     Ok(())
@@ -1503,6 +1553,12 @@ fn validate_result(tool: &str, value: &Value) -> Result<()> {
             required_rows(value, "unavailable_runtimes", policy.rows)?;
         }
         "limits" => {
+            if let Some(ranking) = value.get("ranking") {
+                if ranking["schema_version"] != 2 || ranking["ranked_at"] != value["observed_at"] {
+                    return Err(shape_error());
+                }
+                validate_result("capacity_order", ranking)?;
+            }
             for item in required_rows(value, "items", policy.rows)? {
                 let known = required_bool(item, "known")?;
                 for key in ["runtime", "lane", "window"] {
@@ -1528,6 +1584,9 @@ fn positive_counter(value: &Value, key: &str) -> Result<u64> {
 
 /// Validates pool roster labels and stable identity before they become framing.
 fn validate_pool_member(value: &Value) -> Result<()> {
+    if let Some(enrollment) = value.get("enrollment") {
+        validate_enrollment(enrollment)?;
+    }
     required_reference(value, "agent_id")?;
     for key in ["name", "role"] {
         let text = required_reference(value, key)?;
@@ -1568,6 +1627,9 @@ fn pool_entry(value: &Value) -> Result<agent_run_domain::pool::PoolEntryView> {
 /// Validates every pool log row, direction-specific continuation and context
 /// before rendering. Oversize or malformed pages publish no partial entries.
 fn validate_pool_page(value: &Value) -> Result<()> {
+    if let Some(enrollment) = value.get("enrollment") {
+        validate_enrollment(enrollment)?;
+    }
     let policy = budget("pool");
     required_reference(value, "pool_id")?;
     let after = value["after_seq"]
@@ -2074,6 +2136,7 @@ fn order_context(value: &Value) -> Value {
                         json!({
                             "id": model["model"].as_str().map(exact_display), "status": model["quota"]["status"],
                             "evidence": model["quota"]["evidence"],
+                            "priority": model["quota"]["best_priority"].as_f64(),
                         })
                     }).collect::<Vec<_>>(),
                 })
@@ -2103,6 +2166,7 @@ fn order_context(value: &Value) -> Value {
 fn limits_context(value: &Value) -> Value {
     let observed_at = value["observed_at"].as_f64();
     json!({
+        "ranking": value.get("ranking").map(order_context),
         "items": value["items"].as_array().into_iter().flatten().map(|item| {
             let key = &item["key"];
             json!({
@@ -3329,5 +3393,41 @@ mod tests {
                 "{legacy}"
             );
         }
+    }
+
+    /// Diagnostic text preserves zero scores and explicit multipliers while
+    /// private physical identities, invalid standing/clock and oversized rows fail closed.
+    #[test]
+    fn limits_ranking_preserves_numbers_privacy_and_existing_bounds() {
+        let value = json!({
+            "observed_at":100.0,
+            "items":[{"key":{"runtime":"glm","lane":"m","window":"5h"},
+                "known":true,"remaining_percent":100.0,"reset_at":200.0,
+                "account":"PRIVATE_ACCOUNT","pool":"PRIVATE_POOL"}],
+            "ranking":{"schema_version":2,"capacity_revision":5,"ranked_at":100.0,
+                "config_revision":"PRIVATE_REVISION",
+                "providers":[{"provider":"glm","score":0.0,"priority_multiplier":2.5,
+                    "models":[{"model":"m","quota":{"status":"exhausted","evidence":"fresh","best_priority":0.0}}]}]}
+        });
+        let rendered = text("limits", &value);
+        assert!(rendered.contains("100.0% remaining"), "{rendered}");
+        assert!(rendered.contains("score 0"), "{rendered}");
+        assert!(rendered.contains("multiplier 2.5"), "{rendered}");
+        assert!(rendered.contains("exhausted") && rendered.contains("priority 0"));
+        for private in ["PRIVATE_ACCOUNT", "PRIVATE_POOL", "PRIVATE_REVISION"] {
+            assert!(!rendered.contains(private));
+        }
+        let mut wrong = value.clone();
+        wrong["ranking"]["ranked_at"] = json!(99.0);
+        assert_eq!(success_result("limits", &wrong).is_error, Some(true));
+        wrong = value.clone();
+        wrong["ranking"]["providers"][0]["models"][0]["quota"]["status"] = json!("made_up");
+        assert_eq!(success_result("limits", &wrong).is_error, Some(true));
+        wrong = value.clone();
+        wrong["items"] = json!(vec![value["items"][0].clone(); 21]);
+        assert_eq!(success_result("limits", &wrong).is_error, Some(true));
+        wrong = value.clone();
+        wrong["ranking"]["providers"] = json!(vec![value["ranking"]["providers"][0].clone(); 101]);
+        assert_eq!(success_result("limits", &wrong).is_error, Some(true));
     }
 }

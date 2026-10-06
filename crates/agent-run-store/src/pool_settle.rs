@@ -173,6 +173,9 @@ fn evaluate(tx: &Connection, pool_id: &PoolId) -> Result<Evaluation> {
     let mut roster = Vec::new();
     for (seat, slot, name, role) in &seats {
         let root: AgentId = seat.parse()?;
+        if crate::pool_enrollment::view(tx, &root, now())?.is_some_and(|e| e["state"] != "joined") {
+            return Ok(Evaluation::NotReady);
+        }
         let tip = tip_of(tx, &root)?;
         let tip_status: String = tx.query_row(
             "SELECT status FROM agents WHERE id=?",
@@ -309,9 +312,12 @@ fn settle_in_tx(tx: &Transaction<'_>, pool_id: &PoolId) -> Result<Option<PoolCom
 
 impl Store {
     /// Completes `pool_id` when every condition holds, in one immediate
-    /// transaction. Repeats and concurrent callers record at most one event
-    /// and one delivery; `None` means the pool is not (yet) complete.
+    /// transaction after read-only preflight. Pending enrollment acquires a
+    /// writer only for changed join state/attention; ordinary unchanged pools
+    /// never reserve it. Repeats record at most one completion event/delivery;
+    /// `None` means the pool is not (yet) complete.
     pub fn settle_pool(&mut self, pool_id: &PoolId) -> Result<Option<PoolCompletion>> {
+        self.reconcile_pool_enrollments(pool_id)?;
         // Read-only preflight: pools that are running, unproven or unvoted
         // never take the writer lock. The deciding read repeats inside the
         // immediate transaction, so a race can only skip, never mis-complete.
@@ -355,8 +361,7 @@ impl Store {
     // ponytail: one count plus one windowed page per tick; an indexed
     // "possibly settleable" marker would avoid it if open pools reach thousands.
     pub fn settle_open_pools(&mut self, limit: usize, seed: usize) -> Result<usize> {
-        const OPEN: &str = "state='open' AND EXISTS(SELECT 1 FROM pool_entries e \
-                            WHERE e.pool_id=p.id AND e.kind='proposal')";
+        const OPEN: &str = "state='open' AND (EXISTS(SELECT 1 FROM pool_entries e WHERE e.pool_id=p.id AND e.kind='proposal') OR EXISTS(SELECT 1 FROM pool_enrollments j JOIN pool_members m ON m.agent_id=j.agent_id WHERE m.pool_id=p.id AND j.state<>'joined' AND m.replaced_by IS NULL))";
         let total: i64 = self.conn.query_row(
             &format!("SELECT COUNT(*) FROM pools p WHERE {OPEN}"),
             [],
