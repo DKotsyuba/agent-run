@@ -45,4 +45,4 @@
                                               ✓ Pool completed · frozen broker status                                                                           
                                               Accepted #20 · 4 ready · 4 succeeded · 4 cleaned                                                                  
                                               Formal checks only; not a judgment of the result.                                                                 
- ↑↓ block  ⏎ expand/open  m roster  c criteria  h history  f follow  t transcript  esc list  ? help                                                     seq #31 
+ y copy  ↑↓ block  ⏎ expand/open  m roster  c criteria  h history  f follow  t transcript  esc list  ? help                                             seq #31 

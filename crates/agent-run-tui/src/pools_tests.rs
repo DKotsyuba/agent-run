@@ -538,6 +538,227 @@ async fn empty_pool_null_watermark_opens_and_polls() {
     assert_eq!(calls.recv().await.unwrap()["after_seq"], 0);
 }
 
+/// Two pool read lanes with independently gated first calls and recorded method/target receipts.
+struct PoolLanes {
+    /// Delay the first discovery request until explicitly released.
+    list_delay: std::sync::atomic::AtomicBool,
+    /// Delay detail reads of the original pool, allowing a new selection to proceed immediately.
+    detail_delay: bool,
+    /// Admission receipts for discovery and detail reads respectively.
+    entered: [tokio::sync::Notify; 2],
+    /// Release gates for discovery and detail reads respectively.
+    release: [tokio::sync::Notify; 2],
+    /// Exact admitted read methods and pool identities; no payload content is recorded.
+    calls: Mutex<Vec<(String, Option<String>)>>,
+}
+impl PoolLanes {
+    /// Builds a synthetic broker with optional delay on each independent read lane.
+    fn new(list: bool, detail: bool) -> Arc<Self> {
+        Arc::new(Self {
+            list_delay: std::sync::atomic::AtomicBool::new(list),
+            detail_delay: detail,
+            entered: std::array::from_fn(|_| tokio::sync::Notify::new()),
+            release: std::array::from_fn(|_| tokio::sync::Notify::new()),
+            calls: Mutex::new(vec![]),
+        })
+    }
+}
+impl crate::net::Broker for PoolLanes {
+    /// Records actual calls and serves two selectable pool summaries plus empty public detail pages.
+    fn call<'a>(&'a self, method: &'a str, params: Value) -> crate::net::BrokerFuture<'a> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((method.into(), params["pool_id"].as_str().map(str::to_owned)));
+            if method == "list_pools" {
+                self.entered[0].notify_one();
+                if self.list_delay.swap(false, Ordering::Relaxed) {
+                    self.release[0].notified().await;
+                }
+                if params["state"] == "completed" {
+                    return Ok(serde_json::to_value(empty_list(0)).unwrap());
+                }
+                let mut page = list("active", 0, 2);
+                let mut second = page.items[0].clone();
+                second.pool_id = "pool-20261006-000000-aaaaaaaaaa".parse().unwrap();
+                page.items.push(second);
+                return Ok(serde_json::to_value(page).unwrap());
+            }
+            self.entered[1].notify_one();
+            if self.detail_delay && params["pool_id"] == ID {
+                self.release[1].notified().await;
+            }
+            let mut page = page_value("empty", vec![], Some(i64::MAX as u64), true);
+            page["pool_id"] = params["pool_id"].clone();
+            Ok(page)
+        })
+    }
+}
+
+/// Pool tab's first listing auto-selects and loads detail, arrows retarget it, and refresh preserves the cache.
+#[tokio::test]
+async fn tab_default_arrow_and_refresh_load_without_click() {
+    let broker = PoolLanes::new(false, false);
+    let mut app = App::new();
+    events::apply_action(&mut app, Global::Tab(true));
+    let (requests, rx) = watch::channel(app.pools.request(&[]));
+    let (tx, mut events_rx) = mpsc::channel(8);
+    let task = tokio::spawn(worker(broker.clone(), rx, tx));
+    let mut pipeline = Pipeline::new(events::FRAME_INTERVAL);
+    let listing = tokio::time::timeout(Duration::from_millis(300), events_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(listing, BrokerEvent::Pools { .. }));
+    pipeline.broker_event(&mut app, listing);
+    assert!(app.pools.selected.is_some());
+    requests.send(app.pools.request(&[])).unwrap();
+    let detail = tokio::time::timeout(Duration::from_millis(300), events_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(detail, BrokerEvent::Pool { .. }));
+    pipeline.broker_event(&mut app, detail);
+    assert!(app.pools.buffer().unwrap().status.is_some());
+    pipeline.ui_event(
+        &mut app,
+        UiEvent::Terminal(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))),
+    );
+    let selected = app.pools.selected.clone().unwrap();
+    assert_ne!(selected.as_str(), ID);
+    requests.send(app.pools.request(&[])).unwrap();
+    let detail = tokio::time::timeout(Duration::from_millis(300), events_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(&detail,BrokerEvent::Pool {id,..} if id == &selected));
+    pipeline.broker_event(&mut app, detail);
+    let cached = app.pools.buffer().unwrap().status.clone();
+    let old_refresh = app.pools.refresh;
+    pipeline.ui_event(
+        &mut app,
+        UiEvent::Terminal(Event::Key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::NONE,
+        ))),
+    );
+    assert_eq!(app.pools.refresh, old_refresh + 1);
+    assert_eq!(app.pools.buffer().unwrap().status, cached);
+    requests.send(app.pools.request(&[])).unwrap();
+    for _ in 0..2 {
+        pipeline.broker_event(
+            &mut app,
+            tokio::time::timeout(Duration::from_millis(300), events_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    let calls = broker.calls.lock().unwrap().len();
+    for _ in 0..20 {
+        pipeline.prepare_frame(&mut app);
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        broker.calls.lock().unwrap().len(),
+        calls,
+        "unchanged frames do not dispatch new fetches"
+    );
+    drop(requests);
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+/// A delayed discovery never blocks selected detail, and a delayed old detail never starves discovery/new selection.
+#[tokio::test]
+async fn discovery_and_detail_progress_independently_and_latest_selection_wins() {
+    for (delay_list, delay_detail) in [(true, false), (false, true)] {
+        let broker = PoolLanes::new(delay_list, delay_detail);
+        let mut request = Request {
+            visible: true,
+            id: Some(ID.parse().unwrap()),
+            ..Request::default()
+        };
+        let (requests, rx) = watch::channel(request.clone());
+        let (tx, mut events_rx) = mpsc::channel(8);
+        let task = tokio::spawn(worker(broker.clone(), rx, tx));
+        tokio::time::timeout(
+            Duration::from_millis(300),
+            broker.entered[usize::from(delay_detail)].notified(),
+        )
+        .await
+        .unwrap();
+        let event = tokio::time::timeout(Duration::from_millis(300), events_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(if delay_list {
+            matches!(event, BrokerEvent::Pool { .. })
+        } else {
+            matches!(event, BrokerEvent::Pools { .. })
+        });
+        if delay_detail {
+            request.id = Some("pool-20261006-000000-aaaaaaaaaa".parse().unwrap());
+            requests.send(request.clone()).unwrap();
+            let event = tokio::time::timeout(Duration::from_millis(300), events_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(&event,BrokerEvent::Pool {id,..} if Some(id) == request.id.as_ref()));
+        } else {
+            broker.release[0].notify_one();
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_millis(300), events_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                BrokerEvent::Pools { .. }
+            ));
+        }
+        drop(requests);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+/// Hovering a different pool selects and requests it without any click or Enter.
+#[test]
+fn pool_hover_selects_without_click() {
+    let mut app = fixture("active", 120, 36);
+    app.pools.focused = false;
+    let other: PoolId = "pool-20261006-000000-aaaaaaaaaa".parse().unwrap();
+    let mut item = app.pools.items[0].clone();
+    item.pool_id = other.clone();
+    app.pools.items.push(item);
+    frame(&app, 120, 36);
+    let hit = app
+        .pools
+        .hits
+        .borrow()
+        .iter()
+        .find_map(|(r, target)| matches!(target,Target::Pool(id) if id == &other).then_some(*r))
+        .unwrap();
+    let mut pipeline = crate::events::Pipeline::new(crate::events::FRAME_INTERVAL);
+    pipeline.ui_event(
+        &mut app,
+        crate::events::UiEvent::Terminal(ratatui::crossterm::event::Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: hit.x,
+            row: hit.y,
+            modifiers: KeyModifiers::NONE,
+        })),
+    );
+    pipeline.prepare_frame(&mut app);
+    assert_eq!(app.pools.selected, Some(other.clone()));
+    assert_eq!(app.pools.request(&app.sessions).id, Some(other));
+    assert!(!app.pools.focused);
+}
+
 /// Quiet completed pools ignore unrelated activity; visible first loads animate and cached views do not.
 #[test]
 fn pool_animation_tracks_visible_content_and_cache() {

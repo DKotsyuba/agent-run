@@ -247,7 +247,13 @@ fn render_app_bar(f: &mut Frame, app: &App, area: Rect) {
 fn render_key_bar(f: &mut Frame, app: &App, area: Rect, panes: Panes) {
     let p = theme::palette();
     let mut left = vec![Span::raw(" ")];
-    for (key, description) in key_hints(app) {
+    let mut hints = key_hints(app);
+    if app.copy_request.is_some() {
+        hints = vec![("esc", "cancel copy"), ("q", "quit")];
+    } else if app.answer.is_none() && !app.help && !app.project_picker && !app.pools.criteria {
+        hints.insert(0, ("y", "copy"));
+    }
+    for (key, description) in hints {
         left.push(Span::styled(key, theme::accent()));
         left.push(Span::styled(format!(" {description}  "), theme::dim()));
     }
@@ -355,6 +361,18 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
 
 /// The right-aligned readout of the key bar: `<last visible>/<total> lines`.
 fn key_bar_right(app: &App, panes: Panes) -> Vec<Span<'static>> {
+    if let Some(request) = &app.copy_request {
+        return vec![Span::styled(
+            format!("{} Copying {} ", app.spinner(), request.target.label()),
+            theme::accent(),
+        )];
+    }
+    if let Some(feedback) = &app.copy_feedback {
+        return vec![Span::styled(
+            text::Sanitizer::default().push(feedback),
+            theme::dim(),
+        )];
+    }
     if app.answer.is_some() || app.help || app.project_picker {
         return Vec::new();
     }

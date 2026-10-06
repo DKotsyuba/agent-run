@@ -154,6 +154,12 @@ completed state receives the completed badge; its proof stays frozen even
 if a member resumes. Joined runtime/model labels are marked `latest` on a
 completed pool and never replace frozen execution or cleanup facts.
 
+Entering Pools loads discovery and its default selected detail automatically.
+Arrows and pointer hover load the newly selected pool without clicking; `r`
+refreshes discovery and selected detail while retaining cached content.
+Discovery and detail reads progress independently, so a delayed listing does
+not block selection and switching details does not starve discovery.
+
 The CHAT pane shows member messages, operator posts, broker roster events,
 reports with severity and `orchestrator (team copy)` addressing, framed
 proposals, votes and revokes. Headers use historical stamped author names
@@ -173,6 +179,17 @@ mode. `f` toggles follow, `g`/Home requests older history, and `G`/End follows
 the tail. Incoming entries preserve the scrolled entry/row anchor.
 
 The tab is read-only: it never posts, replaces members or binds a pool.
+
+`y` copies the entire selected agent transcript or pool chat to the local macOS
+clipboard. It fetches all pages in the background through a frozen watermark;
+navigation does not change the captured target. Streamed fragments concatenate
+into readable logical messages without wrapping, trimming or ellipses. Native
+tool error evidence and pool author names, roles and stable identities remain.
+Esc cancels; repeated `y` presses coalesce. The footer shows progress and result.
+Copy reads are bounded to 30 seconds, 10,000 pages and 32 MiB of exported text.
+Missing, spooled, incomplete or unknown-coverage history refuses the operation
+before writing the clipboard. Cancellation after a native clipboard commit
+does not undo it; a raced native write reports copied or an unknown outcome.
 
 ## Running
 
@@ -257,7 +274,8 @@ background so highlights stay visible.
 
 ## How it updates
 
-- Sessions, transcript pages, one-shot answer/member-status requests and pools use four separate
+- Sessions, transcript pages, one-shot answer/member-status requests, pool detail,
+  pool discovery and complete-chat copies use six separate
   persistent broker connections. The sessions long-poll cannot hold up opening
   a transcript or fetching an answer. Switching selection cancels the previous
   transcript fetch and retires its socket; watcher commands keep only the latest

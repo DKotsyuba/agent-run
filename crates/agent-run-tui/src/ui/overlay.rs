@@ -47,7 +47,7 @@ pub fn render_help(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let p = theme::palette();
-    let inner = begin(f, area, "keys", 64, 24);
+    let inner = begin(f, area, "keys", 64, 25);
     let key = |k: &str, d: &str| {
         Line::from(vec![
             Span::styled(format!("{k:<10}"), theme::accent()),
@@ -64,6 +64,7 @@ pub fn render_help(f: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         heading("tabs"),
         key("1 2 ⇧tab", "Sessions · Pools · switch tabs"),
+        key("y / esc", "copy whole selected chat / cancel copy"),
         heading("agents"),
         key("↑↓ j k", "select agent · move between blocks"),
         key("⏎", "open transcript · expand tool"),

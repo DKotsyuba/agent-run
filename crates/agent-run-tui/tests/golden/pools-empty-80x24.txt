@@ -21,4 +21,4 @@
                                                                                 
                                                                                 
  Waiting for valid votes, success and cleanup.                                  
- ↑↓ block  ⏎ expand  m roster  c details  h history  ? help  esc back     seq — 
+ y copy  ↑↓ block  ⏎ expand  m roster  c details  h history  ? help  esc …seq — 

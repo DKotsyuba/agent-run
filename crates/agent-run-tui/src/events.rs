@@ -101,6 +101,15 @@ pub enum BrokerEvent {
     },
     /// Public status read for a selected roster member.
     PoolMember(Result<Box<agent_run_domain::AgentView>, String>),
+    /// One clipboard job's actual outcome; generation rejects completions superseded by a newer job.
+    Copied {
+        /// Frozen local job generation.
+        generation: u64,
+        /// Frozen target whose native write actually completed or was cancelled.
+        target: crate::clipboard::Target,
+        /// Copied UTF-8 bytes; read failures leave clipboard unchanged, native write races report unknown outcome.
+        result: Result<usize, String>,
+    },
 }
 
 /// Commands addressed to the transcript watcher.
@@ -427,6 +436,10 @@ pub enum Action {
     Tab(bool),
     /// Pure read-only pool navigation.
     Pool(crate::pools::Action),
+    /// Copy the entire frozen selected chat in the background.
+    Copy,
+    /// Cancel the pending copy and wait for owned worker cleanup.
+    CancelCopy,
 }
 
 /// Maps one key press to an action given the current screen and popup state.
@@ -463,6 +476,12 @@ pub fn key_action(app: &App, key: KeyEvent) -> Action {
         KeyCode::Char('2') => return Action::Tab(true),
         KeyCode::BackTab => return Action::Tab(!app.pools.visible),
         _ => {}
+    }
+    if key.code == KeyCode::Char('y') && !app.pools.criteria {
+        return Action::Copy;
+    }
+    if key.code == KeyCode::Esc && app.copy_request.is_some() {
+        return Action::CancelCopy;
     }
     if app.pools.visible && !app.pools.member_transcript {
         return crate::pools::key(app, key.code);
@@ -526,12 +545,59 @@ pub fn apply_action(app: &mut App, action: Action) -> Dispatched {
             if app.pools.visible != pools {
                 app.close_transcript();
                 app.pools.visible = pools;
+                if pools {
+                    app.pools.focused = false;
+                    app.pools.refresh = app.pools.refresh.wrapping_add(1);
+                }
                 app.pools.member_transcript = false;
                 app.pools.member_watch = false;
                 app.pools.pending_member = None;
                 app.dirty = true;
                 return Dispatched::Clear;
             }
+            Dispatched::None
+        }
+        Action::Copy => {
+            if app.copy_request.is_some() {
+                return Dispatched::None;
+            }
+            let target = if app.pools.visible && !app.pools.member_transcript {
+                app.pools
+                    .selected
+                    .clone()
+                    .map(crate::clipboard::Target::Pool)
+            } else if app.screen == crate::app::Screen::Transcript || app.pools.member_transcript {
+                app.transcript
+                    .as_ref()
+                    .map(|b| crate::clipboard::Target::Agent {
+                        agent: b.agent.agent_id.clone(),
+                        run: b.agent.run_id.clone(),
+                    })
+            } else {
+                app.selected_agent_id()
+                    .map(|agent| crate::clipboard::Target::Agent {
+                        agent,
+                        run: app.selected_run_id(),
+                    })
+            };
+            if let Some(target) = target {
+                app.copy_generation = app.copy_generation.wrapping_add(1);
+                app.copy_request = Some(crate::clipboard::Request {
+                    generation: app.copy_generation,
+                    target,
+                });
+                app.copy_feedback = None;
+                app.dirty = true;
+            } else {
+                app.copy_feedback = Some("Select an agent or pool to copy".into());
+                app.dirty = true;
+            }
+            Dispatched::None
+        }
+        Action::CancelCopy => {
+            app.copy_request = None;
+            app.copy_feedback = Some("Stopping copy…".into());
+            app.dirty = true;
             Dispatched::None
         }
         Action::Pool(action) => crate::pools::apply(app, action),
@@ -610,6 +676,11 @@ pub fn apply_action(app: &mut App, action: Action) -> Dispatched {
             Dispatched::None
         }
         Action::Refresh => {
+            if app.pools.visible && !app.pools.member_transcript {
+                app.pools.refresh = app.pools.refresh.wrapping_add(1);
+                app.dirty = true;
+                return Dispatched::None;
+            }
             app.loaded = false;
             Dispatched::Scope
         }
@@ -1094,6 +1165,21 @@ impl Pipeline {
             BrokerEvent::PoolMember(Ok(agent)) => {
                 let _ = crate::pools::open_member(app, *agent);
             }
+            BrokerEvent::Copied {
+                generation,
+                target,
+                result,
+            } => {
+                if app.copy_generation == generation {
+                    let label = target.label();
+                    app.copy_feedback = Some(match result {
+                        Ok(bytes) => format!("Copied {label} · {bytes} bytes"),
+                        Err(error) => format!("Copy failed for {label}: {error}"),
+                    });
+                    app.copy_request = None;
+                    app.dirty = true;
+                }
+            }
             BrokerEvent::PoolMember(Err(error)) => {
                 app.pools.error = Some(error);
                 app.dirty = true;
@@ -1129,6 +1215,7 @@ impl Pipeline {
             if !app.pools.member_transcript {
                 if let Some(position) = self.input.hover.take() {
                     self.pointer = Some(position);
+                    app.dirty |= crate::pools::hover(app, position.0, position.1);
                 }
                 crate::pools::older(app);
                 return Dispatched::None;
@@ -1321,6 +1408,14 @@ pub async fn run(
         broker_tx.clone(),
     ));
 
+    let (copy_tx, copy_rx) = watch::channel(app.copy_request.clone());
+    let copy_worker = tokio::spawn(crate::clipboard::worker(
+        broker.clone(),
+        Arc::new(crate::clipboard::NativeClipboard),
+        copy_rx,
+        broker_tx.clone(),
+    ));
+
     let loop_ctx = Loop {
         watch_tx,
         scope_tx,
@@ -1334,6 +1429,14 @@ pub async fn run(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
+        copy_tx.send_if_modified(|current| {
+            if *current == app.copy_request {
+                false
+            } else {
+                *current = app.copy_request.clone();
+                true
+            }
+        });
         pool_tx.send_if_modified(|current| {
             let next = app.pools.request(&app.sessions);
             if *current == next {
@@ -1380,6 +1483,8 @@ pub async fn run(
             }
         }
         if app.quit {
+            drop(copy_tx);
+            let _ = copy_worker.await;
             return Ok(());
         }
         let now = Instant::now();

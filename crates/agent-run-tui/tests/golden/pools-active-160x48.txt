@@ -45,4 +45,4 @@
                                                                                                                                                                 
                                                                                                                                                                 
                                               Waiting for valid votes, success and cleanup.                                                                     
- ↑↓ block  ⏎ expand/open  m roster  c criteria  h history  f follow  t transcript  esc list  ? help                                                     seq #24 
+ y copy  ↑↓ block  ⏎ expand/open  m roster  c criteria  h history  f follow  t transcript  esc list  ? help                                             seq #24 

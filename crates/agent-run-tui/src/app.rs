@@ -458,6 +458,12 @@ pub struct App {
     pub home_prefix: Option<String>,
     /// Monotonic tick counter driving the spinner and local clocks.
     pub ticks: u64,
+    /// Frozen pending copy; repeated presses coalesce until completion or cancellation.
+    pub copy_request: Option<crate::clipboard::Request>,
+    /// Monotonic local copy generation used to reject late worker completions.
+    pub copy_generation: u64,
+    /// Transient explicit copy result; contains no copied body content.
+    pub copy_feedback: Option<String>,
     /// Whether anything visible changed since the last draw; the event loop
     /// draws only while this is set and clears it after.
     pub dirty: bool,
@@ -495,6 +501,9 @@ impl App {
             hits: std::cell::RefCell::default(),
             home_prefix: None,
             ticks: 0,
+            copy_request: None,
+            copy_generation: 0,
+            copy_feedback: None,
             dirty: true,
             quit: false,
         }
@@ -959,6 +968,9 @@ impl App {
     /// for finished sessions. Hidden live sessions never animate a pool pane.
     /// Cached transcript content stays visible without a first-load spinner.
     pub fn tick_animates(&self) -> bool {
+        if self.copy_request.is_some() {
+            return true;
+        }
         let panes = crate::ui::panes(self, self.last_width, self.last_height);
         if self.pools.visible && !self.pools.member_transcript {
             return panes.transcript.is_some()

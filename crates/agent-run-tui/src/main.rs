@@ -1,10 +1,12 @@
 //! `agent-run-tui` — interactive terminal observer for the agent-run broker.
 //!
 //! The observer is a pure broker client: it starts nothing, owns no store,
-//! and mutates nothing. Sessions and transcripts are read through the same
+//! and never mutates broker state. Explicit copy writes only the local clipboard.
+//! Sessions and transcripts are read through the same
 //! public JSON-RPC surface the CLI and MCP transports use.
 
 mod app;
+mod clipboard;
 mod events;
 mod net;
 mod pools;
