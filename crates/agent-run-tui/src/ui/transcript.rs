@@ -30,6 +30,8 @@ pub const HEADER_ROWS: u16 = 4;
 const FRAME_COLS: u16 = 3;
 /// Wrapped lines a user prompt shows before collapsing.
 const USER_COLLAPSE_LINES: usize = 4;
+/// Maximum collapsed tool label cells; short labels shrink so previews have only a two-cell gap.
+const TOOL_LABEL_COLS: usize = 32;
 
 /// A coalesced run of same-identity streaming text, one tool call with its
 /// paired results, or an orphan tool result.
@@ -287,12 +289,12 @@ struct Row {
     block: Option<usize>,
     /// Left-aligned content (the pane prepends the selection gutter).
     left: Vec<Span<'static>>,
-    /// Right-aligned content pinned to the pane's right edge.
+    /// Deferred annotations: tool status/result assemble inline, elapsed time and text stamps at the right edge.
     right: Vec<Span<'static>>,
     /// Row background kept even on selection (expanded payload rows).
     keep: Option<ratatui::style::Color>,
-    /// Start time of a pending tool call: the row's right side renders as
-    /// `running` with the live elapsed, or `no result` once the session
+    /// Start time of a pending tool call: inline status renders as
+    /// `running` with right-aligned elapsed, or `no result` once the session
     /// ended, decided at assembly time.
     running_at: Option<f64>,
     /// Whether the first left span is the animated spinner slot.
@@ -1105,6 +1107,7 @@ fn user_more_row(hidden: usize) -> Row {
 /// update the bounded summary in journal order. Evidence and truncation
 /// annotations take precedence over long summary text within the row width.
 /// Expansion joins the full payload once; duration comes from the last chunk.
+/// Collapsed labels are cell-capped so inline evidence and elapsed time survive long tool names.
 fn tool_rows(
     buffer: &TranscriptBuffer,
     block: &StreamBlock,
@@ -1124,26 +1127,35 @@ fn tool_rows(
     let error = memo.error == Some(true);
     let name_color = if error { p.red } else { p.accent };
     let marker = if expanded { "▾ " } else { "▸ " };
-    let (right, running_at) = tool_summary_right(
-        head,
-        is_call,
-        memo,
-        width.saturating_sub(Span::raw(&name).width() + 4),
-    );
-
+    let label = vec![
+        Span::styled(marker, theme::dim()),
+        Span::styled(
+            name,
+            Style::new().fg(name_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {brief}"),
+            Style::new().fg(if !is_call && error { p.red } else { p.white }),
+        ),
+    ];
+    let critical = if memo.consumed > 0 {
+        if memo.error.is_none() { 10 } else { 8 }
+    } else {
+        12
+    } + usize::from(memo.truncated) * 20
+        + usize::from(is_call) * 7;
+    let label_width = label
+        .iter()
+        .map(Span::width)
+        .sum::<usize>()
+        .min(TOOL_LABEL_COLS)
+        .min(width / 2)
+        .min(width.saturating_sub(critical + 2));
+    let (right, running_at) =
+        tool_summary_right(head, is_call, memo, width.saturating_sub(label_width + 2));
     let mut rows = vec![Row {
         block: None,
-        left: vec![
-            Span::styled(marker, theme::dim()),
-            Span::styled(
-                name,
-                Style::new().fg(name_color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  {brief}"),
-                Style::new().fg(if !is_call && error { p.red } else { p.white }),
-            ),
-        ],
+        left: text::fit(label, label_width, Style::new()),
         right,
         running_at,
         keep: if expanded { Some(p.code) } else { None },
@@ -1278,6 +1290,7 @@ fn concat_results(results: &[&MessageView]) -> String {
 /// Builds a tool row's right side within `width` terminal cells. Native
 /// evidence and truncation/duration suffixes survive long payload summaries.
 /// Pending calls retain a truncation annotation and defer clocks to assembly.
+/// Completed calls always end with one duration span; orphan results have no duration span.
 fn tool_summary_right(
     head: &MessageView,
     is_call: bool,
@@ -1571,8 +1584,8 @@ pub fn render(f: &mut Frame, app: &App, area: Rect, split: bool) {
     }
 }
 
-/// Fills one body row: selection gutter, fitted content, row background, and
-/// the frame-animated parts (spinner slot and pending-call right side).
+/// Fills one body row: selection gutter, fitted content, row background, inline tool preview
+/// with a two-cell label gap, right-aligned elapsed time, and the frame-animated parts (spinner slot and pending-call right side).
 ///
 /// Expanded payload rows keep their code background even under the cursor;
 /// every other block row carries the selection or hover background.
@@ -1634,6 +1647,23 @@ fn assemble_row(
         Some(_) => right.push(Span::styled("no result", theme::dim())),
         None => (),
     };
+    let role = row
+        .block
+        .and_then(|index| cache.grouping.blocks.get(index))
+        .map(|block| buffer.messages[block.start].role.as_str());
+    if matches!(role, Some("tool_call" | "tool_result")) && !right.is_empty() {
+        // Completed calls end with tool_summary_right's duration span; live pending
+        // calls append their elapsed span above. Ended pending calls and orphan
+        // results have no duration to detach.
+        let duration = if role == Some("tool_call") && (row.running_at.is_none() || ctx.live) {
+            right.pop().into_iter().collect()
+        } else {
+            Vec::new()
+        };
+        left.push(Span::raw("  "));
+        left.extend(right);
+        right = duration;
+    }
     Line::from(text::lr(left, right, width + 2, base))
 }
 
@@ -1951,6 +1981,164 @@ mod tests {
         ));
         assert!(truncated.truncated);
         assert_eq!(truncated.error, None);
+    }
+
+    /// Collapsed result evidence follows the compact label rather than drifting with terminal width.
+    /// Duration stays at the right edge; selected rows keep the same cell-safe geometry.
+    #[test]
+    fn collapsed_tool_preview_stays_next_to_label() {
+        let mut buffer = buffer();
+        buffer.messages[1].content = "compact-preview".into();
+        buffer.messages[1].error = Some(false);
+        buffer.messages[1].at = 130.0;
+        let mut evidence_cells = Vec::new();
+        for width in [80, 160, 240] {
+            let guard = cache(&buffer, width - 2);
+            let row = &guard.blocks[0].rows[0];
+            let ctx = Ctx {
+                live: true,
+                spinner: "⠋",
+                now: 131.0,
+            };
+            let rendered = assemble_row(&buffer, &guard, row, usize::from(width - 2), true, &ctx);
+            let text = rendered.to_string();
+            println!("tool spacing snapshot {width}: {text:?}");
+            let mut original_left = row.left.clone();
+            original_left.insert(0, Span::raw("▌ "));
+            let original = Line::from(text::lr(
+                original_left,
+                row.right.clone(),
+                usize::from(width),
+                theme::selection(),
+            ))
+            .to_string();
+            println!("tool spacing baseline snapshot {width}: {original:?}");
+            let evidence = text.find("[ok]").unwrap();
+            let cell = Line::from(&text[..evidence]).width();
+            println!(
+                "tool spacing {width}: preview evidence at cell {cell}, duration at {}",
+                Line::from(&text[..text.find("30s").unwrap()]).width()
+            );
+            evidence_cells.push(cell);
+            assert!(text.trim_end().ends_with("30s"));
+            assert_eq!(rendered.width(), usize::from(width));
+        }
+        assert!(
+            evidence_cells.iter().all(|cell| *cell <= 40),
+            "tool preview drifts right: {evidence_cells:?}"
+        );
+    }
+
+    /// Long Unicode labels cannot displace native evidence or elapsed time; pending/ended status is inline.
+    /// Expanded argument/payload rows retain their nested indent and full cell bounds.
+    #[test]
+    fn compact_tool_rows_preserve_unicode_status_and_expansion_geometry() {
+        for width in [80, 160, 240] {
+            for pending in [false, true] {
+                let mut buffer = buffer();
+                let name = "界🔧".repeat(40);
+                buffer.messages[0].name = Some(name.clone());
+                if pending {
+                    buffer.messages.pop();
+                } else {
+                    buffer.messages[1].name = Some(name);
+                    buffer.messages[1].error = Some(true);
+                    buffer.messages[1].at = 130.0;
+                }
+                let guard = cache(&buffer, width - 2);
+                for live in [false, true] {
+                    let ctx = Ctx {
+                        live,
+                        spinner: "⠋",
+                        now: 130.0,
+                    };
+                    let row = assemble_row(
+                        &buffer,
+                        &guard,
+                        &guard.blocks[0].rows[0],
+                        usize::from(width - 2),
+                        true,
+                        &ctx,
+                    );
+                    let text = row.to_string();
+                    let marker = if pending {
+                        if live { "running" } else { "no result" }
+                    } else {
+                        "[error]"
+                    };
+                    let at = Line::from(&text[..text.find(marker).unwrap()]).width();
+                    assert!(at <= 40, "wide tool name displaced {marker}: {at}");
+                    assert_eq!(row.width(), usize::from(width));
+                    if !pending || live {
+                        assert!(text.trim_end().ends_with("30s"));
+                    }
+                }
+                drop(guard);
+                buffer.toggle_expanded(1);
+                let guard = cache(&buffer, width - 2);
+                let ctx = Ctx {
+                    live: true,
+                    spinner: "⠋",
+                    now: 130.0,
+                };
+                assert!(guard.blocks[0].rows.len() > 1);
+                for row in &guard.blocks[0].rows {
+                    let assembled =
+                        assemble_row(&buffer, &guard, row, usize::from(width - 2), true, &ctx);
+                    assert_eq!(assembled.width(), usize::from(width));
+                }
+            }
+        }
+    }
+
+    /// Native success/error/unknown and truncation survive long labels and wide bodies at every target width.
+    /// Orphan results keep all annotations inline without accidentally treating one as elapsed time.
+    #[test]
+    fn compact_tool_rows_preserve_critical_metadata_and_orphan_results() {
+        for width in [80, 160, 240] {
+            for (error, marker) in [
+                (Some(true), "[error]"),
+                (Some(false), "[ok]"),
+                (None, "[unknown]"),
+            ] {
+                for orphan in [false, true] {
+                    let mut buffer = buffer();
+                    let name = "界🔧".repeat(40);
+                    buffer.messages[0].name = Some(name.clone());
+                    buffer.messages[1].name = Some(name);
+                    buffer.messages[1].error = error;
+                    buffer.messages[1].content_complete = Some(false);
+                    buffer.messages[1].content = "界".repeat(500);
+                    buffer.messages[1].at = 130.0;
+                    if orphan {
+                        buffer.messages.remove(0);
+                    }
+                    let guard = cache(&buffer, width - 2);
+                    let ctx = Ctx {
+                        live: true,
+                        spinner: "⠋",
+                        now: 130.0,
+                    };
+                    let row = assemble_row(
+                        &buffer,
+                        &guard,
+                        &guard.blocks[0].rows[0],
+                        usize::from(width - 2),
+                        true,
+                        &ctx,
+                    );
+                    let text = row.to_string();
+                    assert!(text.contains(marker), "{width}: {text}");
+                    assert!(text.contains("… content truncated"), "{width}: {text}");
+                    assert_eq!(row.width(), usize::from(width));
+                    if orphan {
+                        assert!(!text.contains("30s"));
+                    } else {
+                        assert!(text.trim_end().ends_with("30s"));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
