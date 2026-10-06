@@ -85,7 +85,7 @@ impl CliService for CapacityServiceFake {
     }
 
     /// Returns empty guide text for commands outside this fixture's scope.
-    fn delegation_guide(&self) -> agent_run::Result<Value> {
+    fn delegation_guide(&self, _query: agent_run_domain::ModelsQuery) -> agent_run::Result<Value> {
         Ok(Value::String(String::new()))
     }
 

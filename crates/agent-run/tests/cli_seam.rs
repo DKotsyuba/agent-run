@@ -95,7 +95,8 @@ impl CliService for FakeService {
     ) -> agent_run::Result<Value> {
         Ok(json!({}))
     }
-    fn delegation_guide(&self) -> agent_run::Result<Value> {
+    /// Returns empty text for this fixture's guide query without catalog I/O.
+    fn delegation_guide(&self, _query: agent_run_domain::ModelsQuery) -> agent_run::Result<Value> {
         Ok(Value::String(String::new()))
     }
     fn delivery_status(&self, _id: &AgentId) -> agent_run::Result<Value> {
@@ -1447,7 +1448,8 @@ impl CliService for PausingService {
     ) -> agent_run::Result<Value> {
         Ok(json!({}))
     }
-    fn delegation_guide(&self) -> agent_run::Result<Value> {
+    /// Returns empty text for this fixture's guide query without catalog I/O.
+    fn delegation_guide(&self, _query: agent_run_domain::ModelsQuery) -> agent_run::Result<Value> {
         Ok(Value::String(String::new()))
     }
     fn delivery_status(&self, _id: &AgentId) -> agent_run::Result<Value> {
@@ -1722,7 +1724,8 @@ impl CliService for FollowService {
     ) -> agent_run::Result<Value> {
         Ok(json!({}))
     }
-    fn delegation_guide(&self) -> agent_run::Result<Value> {
+    /// Returns empty text for this fixture's guide query without catalog I/O.
+    fn delegation_guide(&self, _query: agent_run_domain::ModelsQuery) -> agent_run::Result<Value> {
         Ok(Value::String(String::new()))
     }
     fn delivery_status(&self, _id: &AgentId) -> agent_run::Result<Value> {

@@ -196,11 +196,12 @@ fn cli(home: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
-/// Execute one real MCP tool call with bounded I/O and guaranteed child cleanup.
+/// Executes one real MCP tool call using the historical 2025-06-18 protocol,
+/// bounded I/O and exact child cleanup; modern tests opt in explicitly.
 async fn mcp_tool(home: &Path, name: &str, arguments: Value) -> Value {
     mcp_request(
         home,
-        "2026-07-28",
+        "2025-06-18",
         "tools/call",
         json!({"name":name,"arguments":arguments}),
     )
@@ -599,37 +600,69 @@ async fn consolidated_routing_discovery_and_legacy_aliases_work_live() {
     }
     let socket_tools = client.call("tools", Some(json!({}))).await.unwrap();
     assert_eq!(socket_tools.as_array().unwrap().len(), 15);
-    let guide = mcp_tool(
+    let filtered_cli = cli(
         &broker.home,
-        "delegation_guide",
-        json!({"provider":"glm-user","model":"fixture","profile":"review"}),
-    )
-    .await;
-    assert_eq!(guide["result"]["isError"], false, "{guide}");
-    let text = guide["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("fixture") && text.contains("review"));
-    for key in ["provider", "model", "profile"] {
-        let bad = mcp_tool(&broker.home, "delegation_guide", json!({key:"missing"})).await;
-        assert_eq!(bad["result"]["isError"], true, "{bad}");
-        assert!(
-            bad["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("ValidationError")
-        );
-    }
-    let limits = mcp_tool(&broker.home, "limits", json!({})).await;
-    assert_eq!(limits["result"]["isError"], false, "{limits}");
-    let text = limits["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("60.0% remaining") && text.contains("resets in"));
-    assert!(text.contains("score") && text.contains("multiplier") && text.contains("priority"));
-    for private in [
-        "acct-work",
-        "synthetic-token",
-        "gateway.example",
-        "FAKE_TOKEN",
-    ] {
-        assert!(!text.contains(private), "{private}: {text}");
+        &[
+            "delegation-guide",
+            "--provider",
+            "glm-user",
+            "--model",
+            "fixture",
+            "--profile",
+            "review",
+        ],
+    );
+    assert!(filtered_cli.status.success(), "{filtered_cli:?}");
+    let guide = String::from_utf8(filtered_cli.stdout).unwrap();
+    assert!(guide.contains("fixture") && guide.contains("review"));
+    let unknown_cli = cli(&broker.home, &["delegation-guide", "--model", "missing"]);
+    assert!(!unknown_cli.status.success());
+    let error: Value = serde_json::from_slice(&unknown_cli.stderr).unwrap();
+    assert_eq!(error["error"]["type"], "ValidationError", "{error}");
+    for protocol in ["2025-06-18", "2026-07-28"] {
+        let call = |name: &str, arguments: Value| {
+            mcp_request(
+                &broker.home,
+                protocol,
+                "tools/call",
+                json!({"name":name,"arguments":arguments}),
+            )
+        };
+        let guide = call(
+            "delegation_guide",
+            json!({"provider":"glm-user","model":"fixture","profile":"review"}),
+        )
+        .await;
+        assert_eq!(guide["result"]["isError"], false, "{protocol}: {guide}");
+        let text = guide["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("fixture") && text.contains("review"));
+        for key in ["provider", "model", "profile"] {
+            let bad = call("delegation_guide", json!({key:"missing"})).await;
+            assert_eq!(bad["result"]["isError"], true, "{protocol}: {bad}");
+            assert!(
+                bad["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("ValidationError")
+            );
+        }
+        let limits = call("limits", json!({})).await;
+        assert_eq!(limits["result"]["isError"], false, "{protocol}: {limits}");
+        let text = limits["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("60.0% remaining") && text.contains("resets in"));
+        assert!(text.contains("score") && text.contains("multiplier") && text.contains("priority"));
+        for private in [
+            "acct-work",
+            "synthetic-token",
+            "gateway.example",
+            "FAKE_TOKEN",
+        ] {
+            assert!(!text.contains(private), "{private}: {text}");
+        }
+        for method in ["models", "capacity_order"] {
+            let alias = call(method, json!({})).await;
+            assert_eq!(alias["result"]["isError"], false, "{protocol}: {alias}");
+        }
     }
     for (method, command) in [
         ("models", &["models"][..]),
@@ -649,8 +682,6 @@ async fn consolidated_routing_discovery_and_legacy_aliases_work_live() {
             value.as_object().unwrap().keys().collect::<Vec<_>>(),
             legacy.as_object().unwrap().keys().collect::<Vec<_>>()
         );
-        let alias = mcp_tool(&broker.home, method, json!({})).await;
-        assert_eq!(alias["result"]["isError"], false, "{alias}");
     }
     let agents: i64 = store
         .conn

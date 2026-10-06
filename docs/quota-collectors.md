@@ -97,8 +97,9 @@ the latest safe failure code through skipped rounds and clears
 it after a successful collection. Existing two-field ledger entries load without
 a failure code. Scripts control HTTP retries within their execution deadline;
 Rust does not interpret HTTP status
-codes or provider-specific retry headers. Reads such as models, limits and
-capacity_order use persisted observations and never execute collectors.
+codes or provider-specific retry headers. Canonical reads `delegation_guide`
+and `limits`, plus compatibility `models` and `capacity_order`, use persisted
+observations and never execute collectors.
 
 The native release includes the external files under collectors/. The source
 repository keeps them under scripts/collectors/:

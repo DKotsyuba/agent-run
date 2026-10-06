@@ -318,7 +318,8 @@ aliases. An unknown model is a `ValidationError`. The view reads one committed
 snapshot without collecting quota, reserving capacity or starting work.
 
 The CLI equivalent is `agent-run capacity order [--model MODEL]`. Select a
-compatible model and canonical role using `delegation_guide` and `models`.
+compatible model and canonical role using `delegation_guide`; `models` is a
+structured compatibility read for existing clients.
 Schema 1 retains its historical physical-route output and rejects a model
 filter with `Unsupported`.
 
@@ -385,7 +386,8 @@ Notes for the loop:
   quota standing, admissible profiles, params, restrictions, and configured
   guidance prose — instead of reading the full `models` JSON just to pick a
   route. Its result is a JSON string here and real MCP text content on the MCP
-  transport; the default CLI equivalent is `agent-run delegation-guide`.
+  transport; the CLI equivalent is `agent-run delegation-guide` with optional
+  `--provider`, `--model`, and `--profile` filters.
   Unknown filters are `ValidationError`; omitted filters keep default guidance.
   Before delegating a task, the orchestrator must call it and read the result
   before choosing provider, model, effort or profile. Routing advice belongs in

@@ -125,9 +125,16 @@ retain their original compact MCP layouts and structured CLI/socket shapes.
 
 ## Delegation guide
 
-`agent-run delegation-guide` renders the default guide. The `delegation_guide`
-read over MCP/socket also accepts exact optional `provider`, `model`, and
-`profile` filters, with typed `ValidationError` for unknown names. It renders the same committed snapshot as one compact
+`agent-run delegation-guide` and the `delegation_guide` MCP/socket read accept
+the same exact optional `provider`, `model`, and `profile` filters, with typed
+`ValidationError` for unknown names. For example:
+
+```sh
+agent-run delegation-guide --provider codex --model gpt-main --profile review
+```
+
+Omitted filters retain the default guide. It renders the same committed snapshot
+as one compact
 plain-text page for an orchestrator choosing a route: a compact operating header,
 then each provider in capacity order with its harness, configured provider
 guidance, and one short line per exact selectable model id — cached quota

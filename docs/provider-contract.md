@@ -352,18 +352,29 @@ Executable boundary coverage lives beside the contracts:
 
 ## C6 Public catalog reads
 
-`models` and `capacity_order` (shared registry `assets/tools.json`, one
-dispatch for CLI, broker socket and MCP) are read-only over one validated
+`delegation_guide` and `limits` are the advertised routing reads in the shared
+`assets/tools.json` registry and CLI/socket/MCP dispatcher. `models` and
+`capacity_order` retain their original call-only compatibility views. These
+reads are read-only over one validated
 config revision from the service's exact-byte last-valid cache, the canonical
 role files, and one committed quota read. They never collect quota, call a
 harness, reserve, consume reset credits, write samples or start agents.
 
-* `capacity_order` returns providers, never provider/account pairs, ranked
+* `delegation_guide` renders compact account-free routing text, optionally
+  filtered by exact provider/model/profile names on CLI, socket and MCP. It
+  reuses catalog admission rules, efforts, restrictions and recommendations;
+  unknown names are typed validation errors and omitted filters retain defaults.
+* `limits` keeps quota windows, percentages, resets and freshness and adds
+  schema-2 provider/model ranking from the same committed transaction, config
+  revision and advice clock (`observed_at` equals `ranking.ranked_at`). It uses
+  all governing windows and exhaustion facts; a healthy short window does not
+  override a weekly zero. Schema 1 keeps its historical window response.
+* Compatibility `capacity_order` returns providers, never provider/account pairs, ranked
   by `capacity::provider_ranking` (known before unknown; exhausted, disabled
   and ineligible accounts excluded). Each offered model keeps its own
   `status` and `best_priority`; the optional exact `model` filter ranks
   providers by that model alone.
-* `models` adds the explicit offerings (`native_model`, `params`,
+* Compatibility `models` adds the explicit offerings (`native_model`, `params`,
   `allowed_params`, `restrictions`, `recommendations`), provider
   recommendations, harness and connection kind, canonical role grants, and
   for each offering the roles admission would accept: the role loads as a
@@ -375,9 +386,11 @@ harness, reserve, consume reset credits, write samples or start agents.
   advice clock, not sample age), and (`models`) `roles_sha256`. Registry
   status, samples, latches and the advertised capacity revision come from
   one committed read transaction; config and roles are frozen inputs.
-  Reuse a result only while all three revisions match. Operator `limits`
-  keeps account-bound rows distinct by `account` and physical `pool`. No account id, label or secret reference is
-  emitted. The orchestrator chooses provider, model, effort and profile;
+  Reuse a catalog result only while all three revisions match. Raw CLI/socket
+  `limits` keeps account-bound rows distinct by `account` and physical `pool`;
+  MCP diagnostic text omits those identities and retains existing byte/row
+  bounds. Guide and provider/model ranking emit no account id, label or secret
+  reference. The orchestrator chooses provider, model, effort and profile;
   there is no automatic model choice or ability score.
 
 ### Next attempt on one logical agent (store primitive)
