@@ -15,16 +15,18 @@ use std::{
 
 /// Mirrors `test_state_db.py::test_fresh_init_and_reopen_apply_schema_pragmas_and_private_modes`.
 ///
-/// Initialization and a second connection retain the durable schema and WAL safety settings.
+/// Initialization/reopen retain the current inventory, including schema26
+/// enrollment evidence, plus the durable WAL and private-mode safety settings.
 #[test]
 fn schema_initialization_and_reopen() {
     let h = common::Home::new();
     let a = h.store().health().unwrap();
     assert_eq!(a["ok"], true);
     assert_eq!(a["schema_version"], agent_run_store::VERSION);
-    assert_eq!(a["tables"], 32);
+    assert_eq!(a["tables"], 33);
     assert_eq!(h.store().health().unwrap()["integrity"], "ok");
     let store = h.store();
+    assert!(store.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pool_enrollments')",[],|row|row.get::<_,bool>(0)).unwrap());
     assert_eq!(
         store
             .conn
