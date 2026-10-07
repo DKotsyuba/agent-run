@@ -4,6 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- fix(codex): use explicit native permission profiles for shared-store preflight
+  on Codex CLI 0.160.1; preserve managed requirements and all storage boundaries
+
 ## 0.22.3
 
 - feat(codex): add a global harness fast_mode switch for starts, pool members

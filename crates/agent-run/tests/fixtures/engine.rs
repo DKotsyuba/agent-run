@@ -455,7 +455,8 @@ fn main() {
 /// Stands in for the native `codex sandbox` the shared-store qualification
 /// probes invoke: runs the command after `--` under a Seatbelt profile that
 /// denies every write except `/dev/null`, plus writes below the `-C` workdir
-/// when the flags request `workspace-write`, mirroring the native boundary
+/// when the flags request legacy `workspace-write` or the built-in `:workspace`
+/// permission profile, mirroring the native boundary
 /// the probes exercise. Exits with the command's status; never returns.
 fn sandbox(args: &[String]) -> ! {
     let split = args
@@ -467,7 +468,9 @@ fn sandbox(args: &[String]) -> ! {
     let mut profile =
         "(version 1)(allow default)(deny file-write*)(allow file-write* (literal \"/dev/null\"))"
             .to_owned();
-    if flags.iter().any(|flag| flag.contains("workspace-write")) {
+    if flags.iter().any(|flag| flag.contains("workspace-write"))
+        || argument(flags, "-P").as_deref() == Some(":workspace")
+    {
         profile.push_str("(allow file-write* (subpath (param \"CWD\")))");
     }
     let status = std::process::Command::new("/usr/bin/sandbox-exec")
