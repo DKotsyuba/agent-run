@@ -689,9 +689,11 @@ fn release_prepare_updates_source_registration_mirror() {
     );
 }
 
-/// Stalled download/source leaves must start within the normal setup budget and
-/// finish before their thirty-second stubs can exit naturally. Their result stays
-/// deadline expiry; TERM during extraction stays cancelled, not integrity failure.
+/// Stalled download/source leaves must start within the normal setup budget, and
+/// the CLI must return before their thirty-second stubs can finish naturally
+/// (this bounds CLI responsiveness only; the leaf's pipes are private to the CLI,
+/// so it does not prove the leaf process died). Their result stays deadline
+/// expiry; TERM during extraction stays cancelled, not integrity failure.
 #[test]
 fn stalled_leaves_and_cancelled_verification_keep_terminal_kind() {
     for stage in ["download", "source"] {
@@ -726,7 +728,7 @@ fn stalled_leaves_and_cancelled_verification_keep_terminal_kind() {
         let output = fixture.output(command);
         assert!(
             started.elapsed() < Duration::from_secs(25),
-            "stalled leaf must be stopped before its natural exit"
+            "CLI must return before the stalled leaf exits naturally"
         );
         assert!(
             fixture.temp.path().join("leaf-started").exists(),
