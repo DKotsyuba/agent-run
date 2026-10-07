@@ -205,7 +205,26 @@ fn wait_marker(name: &str) {
     }
 }
 
-/// Runs one offline native-protocol scenario selected only by fixture task text.
+/// Reads one subsequent stream input with a five-second fixture ceiling.
+/// The reader thread owns stdin only until it reads one line; timeout panics
+/// this fixture process, so a missing test driver cannot leave a harness alive.
+fn control_input() -> Value {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let read = io::stdin().lock().read_line(&mut line);
+        let _ = sender.send((read, line));
+    });
+    let (read, line) = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("fixture control deadline");
+    read.expect("fixture control input");
+    serde_json::from_str(&line).expect("fixture control JSON")
+}
+
+/// Runs one offline protocol scenario selected by fixture task text. Claude
+/// inputs echo their UUIDs and replay batches; control readers have finite
+/// deadlines. Existing subprocess scenarios retain their ownership contracts.
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // A detached helper mode used only by `fixture:descendant`: sleep past the
@@ -227,8 +246,8 @@ fn main() {
     let session = argument(&args, "--resume")
         .or_else(|| argument(&args, "--session-id"))
         .unwrap_or_else(|| "fixture-session".into());
-    let task = if let Some(task) = argument(&args, "-p") {
-        task
+    let (task, input) = if let Some(task) = argument(&args, "-p") {
+        (task, None)
     } else {
         let mut line = String::new();
         io::stdin()
@@ -236,12 +255,18 @@ fn main() {
             .read_line(&mut line)
             .expect("fixture input");
         let value: Value = serde_json::from_str(&line).expect("fixture JSON");
-        value
+        let task = value
             .pointer("/message/content/0/text")
             .and_then(Value::as_str)
             .unwrap_or("")
-            .to_owned()
+            .to_owned();
+        (task, Some(value))
     };
+    let mut result_input = input
+        .as_ref()
+        .and_then(|input| input.get("uuid"))
+        .cloned()
+        .unwrap_or(Value::Null);
     // Pool fixtures record the exact first-turn text this child received, as
     // proof that every peer identity was already committed when it started.
     if task.contains("fixture:pool-observe") {
@@ -258,6 +283,48 @@ fn main() {
         }
     }
     emit(json!({"type":"system","subtype":"init","session_id":session}));
+    if task == "fixture:context-then-result" {
+        let context = control_input();
+        let id = context.get("uuid").cloned().unwrap_or(Value::Null);
+        let mut replay = context;
+        replay["isReplay"] = json!(true);
+        emit(replay);
+        emit(json!({"type":"result","subtype":"success","is_error":false,
+            "session_id":session,"user_message_uuid":id,
+            "result":"","num_turns":0,"duration_ms":0}));
+    }
+    if let Some(mut replay) = input
+        && task != "fixture:legacy-after-steer"
+    {
+        replay["isReplay"] = json!(true);
+        emit(replay);
+    }
+    if task == "fixture:legacy-after-steer" {
+        let _ = control_input();
+        result_input = Value::Null;
+    }
+    if task == "fixture:steer-grouped"
+        || task == "fixture:context-grouped"
+        || task == "fixture:steer-two-results"
+        || task == "fixture:empty-task-then-context"
+    {
+        let mut replay = control_input();
+        if task == "fixture:steer-two-results" || task == "fixture:empty-task-then-context" {
+            emit(json!({"type":"result","subtype":"success","is_error":false,
+                "session_id":session,"user_message_uuid":result_input,
+                "result":"","num_turns":0,"duration_ms":0}));
+        }
+        result_input = replay.get("uuid").cloned().unwrap_or(Value::Null);
+        replay["isReplay"] = json!(true);
+        emit(replay);
+    }
+    if task == "fixture:empty-then-result" || task == "fixture:ambiguous-then-error" {
+        // Synthetic evidence only: this does not establish a production frame sequence.
+        emit(
+            json!({"type":"result","subtype":"success","is_error":false,"session_id":session,
+            "result":"","num_turns":0,"duration_ms":0,"usage":{"input_tokens":0,"output_tokens":0}}),
+        );
+    }
     emit(
         json!({"type":"assistant","session_id":session,"message":{"content":[{"type":"text","text":"fixture partial\n"}]}}),
     );
@@ -424,12 +491,31 @@ fn main() {
         );
     }
     let failed = task == "fixture:error"
+        || task == "fixture:ambiguous-then-error"
         || task == "fixture:quota"
         || task == "fixture:quota-opus"
         || task.starts_with("fixture:quota-then-");
+    let answer = if failed {
+        "fixture failure"
+    } else if task == "fixture:empty-result" {
+        ""
+    } else {
+        "fixture final answer\n"
+    };
     emit(
-        json!({"type":"result","subtype":if failed{"error_during_execution"}else{"success"},"is_error":failed,"session_id":session,"result":if failed{"fixture failure"}else{"fixture final answer\n"},"usage":{"input_tokens":2,"output_tokens":3},"num_turns":1}),
+        json!({"type":"result","subtype":if failed{"error_during_execution"}else{"success"},"is_error":failed,"session_id":session,
+            "user_message_uuid":if task == "fixture:unknown-result" {json!("foreign-input")} else {result_input.clone()},
+            "result":answer,"usage":{"input_tokens":2,"output_tokens":3},"num_turns":1}),
     );
+    if task == "fixture:duplicate-result" || task == "fixture:result-then-error" {
+        let error = task == "fixture:result-then-error";
+        emit(
+            json!({"type":"result","subtype":if error {"error_during_execution"} else {"success"},
+            "is_error":error,"session_id":session,"user_message_uuid":result_input,
+            "result":if error {"fixture late failure"} else {"fixture duplicate answer"},
+            "num_turns":1,"duration_ms":0}),
+        );
+    }
     if task == "fixture:result-then-hang" {
         // A complete, valid success result followed by a root process that keeps
         // its stdout open and never exits on its own accord: only the run

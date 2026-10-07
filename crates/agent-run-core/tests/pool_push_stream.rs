@@ -63,16 +63,20 @@ async fn push_through(script: &str, initial: Option<&str>) -> Value {
     serde_json::from_str(&raw).unwrap()
 }
 
-/// The engine reads the line holding the initial text and the pushed frame; the write is
-/// recorded as `written`, carries the stamped render, and claims nothing more.
+/// The engine reads the initial JSON task and pool frame, and identifies its
+/// terminal as the task result. The pool write is still only `written`, carries
+/// the stamped render, and claims no delivery or consumption.
 #[tokio::test]
 async fn successful_stdin_write_is_written_not_accepted() {
     let seen = std::env::temp_dir().join(format!("pool-push-{}", std::process::id()));
     let script = format!(
-        "read line; printf '%s' \"$line\" > {path}; echo '{RESULT}'",
+        r#"read initial; read line; printf '%s' "$line" > {path}; id=$(printf '%s' "$initial" | sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p'); printf '%s\n' '{RESULT}' | sed "s/\"session_id\"/\"user_message_uuid\":\"$id\",\"session_id\"/""#,
         path = seen.display()
     );
-    let result = push_through(&script, Some("hello")).await;
+    let initial =
+        json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":"hello"}]}})
+            .to_string();
+    let result = push_through(&script, Some(&initial)).await;
     assert_eq!(result["push"], "written");
     assert_eq!(result["reason"], "stdin_write");
     assert!(result.get("delivered").is_none() && result.get("accepted").is_none());

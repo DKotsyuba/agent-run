@@ -882,6 +882,143 @@ fn candidates(revision: i64) -> QuotaCandidateSet {
     }
 }
 
+/// Exercises correlated, empty, ambiguous and failed Claude results through the
+/// real admitted provider/supervisor. All homes and inputs are disposable; every
+/// control reader is bounded. Progress is never substituted for an answer.
+#[tokio::test]
+async fn claude_result_selection_requires_correlated_task_completion() {
+    for (task, failure, count, selected) in [
+        ("fixture:answer", None, 1, 1),
+        ("fixture:empty-result", Some("empty_result"), 1, 1),
+        ("fixture:empty-then-result", Some("ambiguous_result"), 2, 1),
+        ("fixture:context-then-result", None, 2, 2),
+        ("fixture:context-grouped", None, 1, 1),
+        ("fixture:steer-grouped", None, 1, 1),
+        ("fixture:steer-two-results", None, 2, 2),
+        ("fixture:legacy-after-steer", Some("ambiguous_result"), 1, 1),
+        (
+            "fixture:empty-task-then-context",
+            Some("empty_result"),
+            2,
+            1,
+        ),
+        ("fixture:error", Some("runtime_failed"), 1, 1),
+        ("fixture:result-then-error", Some("runtime_failed"), 2, 2),
+        ("fixture:ambiguous-then-error", Some("runtime_failed"), 2, 2),
+        ("fixture:nonzero-after-result", Some("nonzero_exit"), 1, 1),
+        ("fixture:duplicate-result", Some("ambiguous_result"), 2, 2),
+        ("fixture:unknown-result", Some("ambiguous_result"), 1, 1),
+    ] {
+        let (_temp, home) = home();
+        let service = Service::new(home.clone());
+        let mut requested = request(&home);
+        requested.task = task.into();
+        let admitted = service
+            .admit_provider_trusted(requested, candidates(committed(&home)))
+            .unwrap();
+        let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+        let mut store = Store::open(&home).unwrap();
+        if matches!(
+            task,
+            "fixture:steer-grouped" | "fixture:steer-two-results" | "fixture:legacy-after-steer"
+        ) {
+            store
+                .enqueue(
+                    &id,
+                    "steer",
+                    &serde_json::json!({"text":"finish revised task"}),
+                )
+                .unwrap();
+        }
+        if matches!(
+            task,
+            "fixture:context-then-result"
+                | "fixture:context-grouped"
+                | "fixture:empty-task-then-context"
+        ) {
+            for sql in [
+                "INSERT INTO pools(id,request_namespace,request_id,request_sha256,goal,acceptance_json,state,roster_revision,created_at) VALUES('pool-20260101-000000-0123456789','ns','r',lower(hex(zeroblob(32))),'goal','[]','open',1,1.0)",
+                "INSERT INTO pool_entries(pool_id,author_kind,direction,kind,roster_revision,body,idem_scope,request_id,created_at) VALUES('pool-20260101-000000-0123456789','operator','team','message',1,'context only','op','k',1.0)",
+            ] {
+                store.conn.execute(sql, []).unwrap();
+            }
+            store.conn.execute(
+                "INSERT INTO pool_members(agent_id,pool_id,slot,name,role,personal_task,joined_roster_revision) VALUES(?,'pool-20260101-000000-0123456789',1,'Ada','reviewer','t',1)",
+                [id.as_str()],
+            ).unwrap();
+            store
+                .enqueue(&id, "pool", &serde_json::json!({"seq":1}))
+                .unwrap();
+        }
+        drop(store);
+        run_to_end(&home, &id).await;
+        let store = Store::open(&home).unwrap();
+        let row = store.get(&id).unwrap();
+        assert_eq!(
+            row.status,
+            if failure.is_some() {
+                Status::Failed
+            } else {
+                Status::Succeeded
+            },
+            "{task}"
+        );
+        assert_eq!(row.failure_kind.as_deref(), failure, "{task}");
+        assert_eq!(
+            row.exit_code,
+            Some(if task == "fixture:nonzero-after-result" {
+                3
+            } else {
+                0
+            }),
+            "{task}"
+        );
+        if failure.is_none() {
+            assert!(row.answer_path.is_some(), "{task}");
+        } else if matches!(failure, Some("empty_result" | "ambiguous_result")) {
+            assert!(row.answer_path.is_none(), "{task}");
+        }
+        let mut query = store.conn.prepare("SELECT data_json FROM events WHERE agent_id=? AND kind='native_result_frame_v1' ORDER BY seq").unwrap();
+        let frames: Vec<serde_json::Value> = query
+            .query_map([id.as_str()], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+            .collect();
+        assert_eq!(frames.len(), count, "{task}");
+        assert_eq!(frames[0]["index"], 1);
+        if task == "fixture:context-then-result" {
+            assert_eq!(frames[0]["result_bytes"], 0);
+            assert_eq!(frames[0]["ignored"], true);
+            assert_eq!(frames[0]["correlation"], "context");
+            assert_eq!(frames[1]["correlation"], "task");
+        }
+        let exit: String = store.conn.query_row("SELECT data_json FROM events WHERE agent_id=? AND kind='native_result_exit_v1' ORDER BY seq DESC LIMIT 1", [id.as_str()], |row| row.get(0)).unwrap();
+        let exit: serde_json::Value = serde_json::from_str(&exit).unwrap();
+        assert_eq!(exit["exit_code"], row.exit_code.unwrap());
+        assert_eq!(exit["selected_index"], selected, "{task}");
+        assert_eq!(exit["frames"], frames.len());
+        let cleanup: String = store.conn.query_row("SELECT cleanup_proof_json FROM attempts WHERE agent_id=? ORDER BY number DESC LIMIT 1", [id.as_str()], |row| row.get(0)).unwrap();
+        let cleanup: serde_json::Value = serde_json::from_str(&cleanup).unwrap();
+        assert_eq!(cleanup["confirmed"], true);
+        assert_eq!(cleanup["group_gone"], true);
+        assert_eq!(cleanup["descendants_gone"], true);
+        let diagnostics = serde_json::to_string(&frames).unwrap();
+        for forbidden in [
+            "fixture partial",
+            "fixture final answer",
+            "synthetic-token",
+            "foreign-input",
+            "user_message_uuid",
+            "session_id",
+        ] {
+            assert!(
+                !diagnostics.contains(forbidden),
+                "{task}: leaked {forbidden}"
+            );
+        }
+    }
+}
+
 /// The real supervisor keeps the chosen attempt through transcript, process
 /// proof, sealed answer, terminal cleanup and exactly one delivery notice.
 #[tokio::test]
