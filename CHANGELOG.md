@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- feat(codex): add a global harness fast_mode switch for starts, pool members
+  and resumes, retaining effective policy across retries without changing
+  original request hashes or existing native session grants
+
 ## 0.22.2
 
 - fix(tui): place tool result previews beside compact labels while keeping
