@@ -269,7 +269,9 @@ fn owned_environment_names(launch: &Value) -> BTreeSet<String> {
         .collect()
 }
 
-/// Compares launch arguments, adapter state, and every adapter-owned environment field.
+/// Compares launch arguments, adapter state, and every adapter-owned environment
+/// field against immutable Python capture data. The Rust stream adds the one
+/// required replay flag explicitly to the expected argv; no arguments are ignored.
 fn compare_launch(
     expected: &Value,
     adapter: Adapter,
@@ -284,7 +286,7 @@ fn compare_launch(
             actual_argv[index + 1] = "${SESSION_ID}".into();
         }
     }
-    let expected_argv = expected["argv"]
+    let mut expected_argv = expected["argv"]
         .as_array()
         .expect("golden argv")
         .iter()
@@ -293,6 +295,13 @@ fn compare_launch(
             value => value.into(),
         })
         .collect::<Vec<String>>();
+    if matches!(adapter, Adapter::Claude | Adapter::Glm) {
+        let partial = expected_argv
+            .iter()
+            .position(|arg| arg == "--include-partial-messages")
+            .expect("Claude-family golden partial stream flag");
+        expected_argv.insert(partial + 1, "--replay-user-messages".into());
+    }
     assert_eq!(
         actual_argv
             .iter()

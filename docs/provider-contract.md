@@ -272,6 +272,40 @@ redaction preserves nonsecret whitespace, Codex flushes pending text when a
 turn ends without an item completion, and failure text is redacted before its
 published length limit is applied.
 
+### Claude-family task completion
+
+Claude's persistent input stream can produce several native results, including
+one result for a coalesced input batch. The shared runner assigns a fresh UUID
+to each initial task, steering input and pool message, and requests
+`--replay-user-messages`. A result's `user_message_uuid` must match a known
+input and, when acknowledgements are present, the last input in that replay
+batch. A batch completes the current task only if it includes the latest
+initial/steering input. Pool-only successful results do not finish the task.
+These UUIDs are native framing, not public agent identifiers, and are omitted
+from diagnostic metadata.
+
+Every observed result is validated, including later or context-only frames.
+Native errors remain failures; successful frames cannot erase a failure.
+Unknown or duplicate correlations and multiple uncorrelated legacy results
+produce `ambiguous_result`. A single legacy result remains compatible only
+when no additional task or context inputs were written; even one uncorrelated
+result after multiple inputs is ambiguous.
+A genuine empty task result stays `empty_result` even when assistant progress
+or a later pool-only answer is nonblank. A possibly partial control write
+cannot certify success. EOF, exit zero, durable answer and verified process
+cleanup remain required; transcript text is never an answer fallback.
+
+`native_result_frame_v1` records the frame index, fixed subtype/category,
+nullable error/counter values, JSON types and byte counts, selection/correlation
+labels. `native_result_exit_v1` records observed frame count, selected index
+and actual exit code (unknown stays null). These diagnostics contain no
+prompts, answers, session/input IDs, arguments, environment values or secrets.
+
+Queued/coalesced input correlation is verified against Claude CLI 2.1.287.
+This contract and its finite fixtures do not establish the exact native frame
+sequence of earlier production `empty_result` incidents; their original
+terminal frames were not captured.
+
 ## C4 Historical schema-v17 introduction: attempts and ownership
 
 * One logical agent id keeps its existing attempts/events/messages tables.

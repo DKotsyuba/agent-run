@@ -609,8 +609,10 @@ pub fn plan_selected_with(
     })
 }
 
-/// Builds Claude's partial-message stream with the sealed model, role grants,
-/// MCP/plugin assets, and exact resume id, without model-name special cases.
+/// Builds Claude's partial-message stream with input replay acknowledgements,
+/// the sealed model, role grants, MCP/plugin assets and exact resume id.
+/// Replay frames let the shared runner correlate coalesced input batches without
+/// changing permissions, model selection or the public agent identity.
 fn claude_args(
     sealed: &SealedProvider,
     role: &ResolvedRolePlan,
@@ -653,6 +655,7 @@ fn claude_args(
         "--output-format".into(),
         "stream-json".into(),
         "--include-partial-messages".into(),
+        "--replay-user-messages".into(),
         "--input-format".into(),
         "stream-json".into(),
         "--verbose".into(),

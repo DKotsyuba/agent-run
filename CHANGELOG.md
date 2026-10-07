@@ -4,6 +4,15 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.22.6
+
+- fix(claude): correlate terminal results with native task input UUIDs and
+  replayed/coalesced input batches; pool-only replies no longer finish a task
+- fix(claude): validate later terminal frames and preserve errors, genuine
+  empty answers, ambiguous legacy multi-input runs and uncertain stdin writes
+- feat(diagnostics): record content-free metadata for every observed Claude
+  result frame and process exit, including frames excluded from answer selection
+
 ## 0.22.5
 
 - refactor(storage): remove Agent Run's own Seatbelt (`sandbox-exec`) launch

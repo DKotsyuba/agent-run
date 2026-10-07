@@ -1,3 +1,6 @@
+//! Claude-family launch planning and native stream completion. Input correlation
+//! separates task results from context acknowledgements; the supervisor retains
+//! process ownership, durable answer sealing and final cleanup authority.
 use crate::{
     Result,
     config::{Adapter, Config, Runtime},
@@ -140,6 +143,7 @@ pub fn plan_with_environment(
             // transcript producer journals; the official CLI requires this
             // flag together with --print and stream-json above.
             "--include-partial-messages".into(),
+            "--replay-user-messages".into(),
             "--model".into(),
             model,
             "--permission-mode".into(),
@@ -205,6 +209,164 @@ pub fn plan_with_environment(
         initial_input: input,
     })
 }
+/// Associates native terminal frames with inputs issued during this attempt.
+/// IDs stay in memory; a replay batch can contain several coalesced inputs.
+#[derive(Default)]
+struct ResultInputs {
+    /// IDs written by this runner; unknown native correlations fail closed.
+    sent: std::collections::BTreeSet<String>,
+    /// Most recent initial task or written steering input; pool notes do not replace it.
+    task: Option<String>,
+    /// Native replay acknowledgements since the preceding terminal frame, in order.
+    replayed: Vec<String>,
+    /// Correlations already completed; repeated terminal frames are ambiguous.
+    completed: std::collections::BTreeSet<String>,
+    /// Historical raw initial text has no UUID; subsequent inputs make it ambiguous.
+    unframed_initial: bool,
+    /// A failed write with open stdin may have partially sent a new task.
+    uncertain_write: bool,
+}
+
+/// Selection evidence for one terminal frame, independent of answer contents.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResultScope {
+    /// The frame covers the current task directly or in a native replay batch.
+    Task,
+    /// The frame covers a known input without completing the current task.
+    Context,
+    /// An older engine omitted correlation; only a single terminal is compatible.
+    Legacy,
+    /// Unknown, duplicate or inconsistent native correlation cannot certify success.
+    Ambiguous,
+}
+
+impl ResultScope {
+    /// Returns a fixed diagnostic label without exposing input identifiers.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Task => "task",
+            Self::Context => "context",
+            Self::Legacy => "legacy",
+            Self::Ambiguous => "ambiguous",
+        }
+    }
+}
+
+impl ResultInputs {
+    /// Records one successfully written UUID; authoritative inputs replace the task.
+    fn sent(&mut self, id: String, authoritative: bool) {
+        if authoritative {
+            self.task = Some(id.clone());
+        }
+        self.sent.insert(id);
+    }
+
+    /// Accepts only CLI replay acknowledgements of this runner's known inputs.
+    /// Other user frames, including tool results, do not establish task completion.
+    fn replay(&mut self, frame: &Value) -> Result<()> {
+        if frame.get("isReplay").and_then(Value::as_bool) != Some(true) {
+            return Ok(());
+        }
+        let id = frame
+            .get("uuid")
+            .and_then(Value::as_str)
+            .filter(|id| self.sent.contains(*id))
+            .ok_or_else(|| invalid("native user replay has unknown input correlation"))?;
+        if self.replayed.iter().any(|seen| seen == id) {
+            return Err(invalid("native user replay duplicated an input"));
+        }
+        self.replayed.push(id.to_owned());
+        Ok(())
+    }
+
+    /// Resolves the terminal's native user-message UUID, never its position or text.
+    /// A coalesced batch must end with that UUID; its current task may occur earlier.
+    /// Missing correlations retain only the historical single-result compatibility.
+    fn scope(&mut self, frame: &Value) -> ResultScope {
+        let replayed = std::mem::take(&mut self.replayed);
+        let Some(id) = frame.get("user_message_uuid").and_then(Value::as_str) else {
+            let single_input = self.sent.is_empty()
+                || (self.sent.len() == 1 && self.task.is_some() && !self.unframed_initial);
+            return if replayed.is_empty()
+                && single_input
+                && frame.get("user_message_uuid").is_none_or(Value::is_null)
+            {
+                ResultScope::Legacy
+            } else {
+                ResultScope::Ambiguous
+            };
+        };
+        if !self.sent.contains(id)
+            || self.completed.contains(id)
+            || replayed.iter().any(|id| self.completed.contains(id))
+            || replayed.last().is_some_and(|last| last != id)
+        {
+            return ResultScope::Ambiguous;
+        }
+        self.completed.insert(id.to_owned());
+        self.completed.extend(replayed.iter().cloned());
+        if self.task.as_deref() == Some(id)
+            || self
+                .task
+                .as_ref()
+                .is_some_and(|task| replayed.contains(task))
+        {
+            ResultScope::Task
+        } else {
+            ResultScope::Context
+        }
+    }
+}
+
+/// Builds content-free metadata for one native result, including ignored frames.
+///
+/// `index` is one-based within the execution; `ignored` describes the current
+/// selection policy. Known protocol subtype labels, JSON types, byte counts
+/// and numeric counters are retained; unknown labels and all content are omitted.
+/// Input JSON is already bounded by the transport. Missing counters stay null.
+fn native_result_metadata(index: u64, result: &Value, ignored: bool) -> Value {
+    let kind = |value: Option<&Value>| match value {
+        None => "missing",
+        Some(Value::Null) => "null",
+        Some(Value::Bool(_)) => "boolean",
+        Some(Value::Number(_)) => "number",
+        Some(Value::String(_)) => "string",
+        Some(Value::Array(_)) => "array",
+        Some(Value::Object(_)) => "object",
+    };
+    let bytes = |value: Option<&Value>| match value {
+        None | Some(Value::Null) => 0,
+        Some(Value::String(text)) => text.len(),
+        Some(value) => value.to_string().len(),
+    };
+    let subtype = match result.get("subtype").and_then(Value::as_str) {
+        Some(
+            value @ ("success"
+            | "error_during_execution"
+            | "error_max_turns"
+            | "error_max_budget_usd"
+            | "error_max_structured_output_retries"),
+        ) => value,
+        None => "missing_or_invalid",
+        Some(_) => "unrecognized",
+    };
+    json!({
+        "version": 1, "index": index, "subtype": subtype,
+        "is_error": result.get("is_error").and_then(Value::as_bool),
+        "result_type": kind(result.get("result")),
+        "result_bytes": bytes(result.get("result")),
+        "structured_output_type": kind(result.get("structured_output")),
+        "structured_output_bytes": bytes(result.get("structured_output")),
+        "num_turns": result.get("num_turns").and_then(Value::as_u64),
+        "duration_ms": result.get("duration_ms").and_then(Value::as_f64)
+            .filter(|value| value.is_finite() && *value >= 0.0),
+        "ignored": ignored,
+    })
+}
+
+/// Reads the native result string/object, or its non-null structured output when
+/// no supported result value exists. Empty strings remain empty: transcript
+/// text is never substituted for a terminal answer.
 fn result_text(v: &Value) -> Option<String> {
     match v.get("result") {
         Some(Value::String(s)) => Some(s.clone()),
@@ -251,6 +413,11 @@ fn result_failure_kind(subtype: &str, text: Option<&str>) -> &'static str {
 /// instead reject any identifier other than their requested session. The
 /// function journals recognized events, services bounded control commands, and
 /// returns malformed stream data or persistence failures as domain errors.
+/// Native input UUIDs and replay batches correlate results to the latest task or
+/// steering input; pool-only results cannot complete it. Every result is observed
+/// and validated, errors stay fatal, and uncorrelated multiple results fail closed.
+/// A single legacy result remains compatible. Success requires a nonblank native
+/// answer, EOF, exit zero, and no uncertain input write.
 /// Assistant text deltas and the completion tail of one message are journaled
 /// under one durable `raw_ref`: the native message id from `message_start` or
 /// the full event, or one producer-owned bounded fallback per message boundary
@@ -261,8 +428,20 @@ pub async fn run(
     record: &Record,
     initial_input: Option<&str>,
 ) -> Result<EngineResult> {
+    let mut inputs = ResultInputs::default();
     if let Some(input) = initial_input {
-        process.text(input).await?;
+        if let Ok(mut frame) = serde_json::from_str::<Value>(input)
+            && frame.get("type").and_then(Value::as_str) == Some("user")
+        {
+            let id = uuid::Uuid::new_v4().to_string();
+            frame["uuid"] = json!(id);
+            process.text(&format!("{frame}\n")).await?;
+            inputs.sent(id, true);
+        } else {
+            // Historical text fixtures remain one-shot; they provide no correlation.
+            inputs.unframed_initial = true;
+            process.text(input).await?;
+        }
     } else {
         process.input.take();
     }
@@ -273,6 +452,9 @@ pub async fn run(
     )?;
     let mut session = None;
     let mut final_result: Option<EngineResult> = None;
+    let mut result_frame_index = 0_u64;
+    let mut legacy_result_seen = false;
+    let mut selected_result_index = None;
     let mut tool_names: BTreeMap<String, String> = BTreeMap::new();
     // The attempt's current authoritative native state (rate-limit events
     // and assistant error controls, in protocol order).
@@ -322,7 +504,14 @@ pub async fn run(
                 }
                 if command == "steer" {
                     if let Some(text) = commands::steer_text(&payload) {
-                        let accepted = send_user_text(process, text, deadline).await;
+                        let id = uuid::Uuid::new_v4().to_string();
+                        let open = process.input.is_some();
+                        let accepted = send_user_text(process, text, &id, deadline).await;
+                        if accepted {
+                            inputs.sent(id, true);
+                        } else if open {
+                            inputs.uncertain_write = true;
+                        }
                         store.complete_command(&record.id, cid, &json!({"accepted":accepted}))?;
                         if accepted {
                             journal(store, &record.id, "user", &process.redact(text), None, None)?;
@@ -341,10 +530,17 @@ pub async fn run(
                     // so it is `unknown`, not "not delivered". The durable log
                     // keeps the entry either way.
                     let result = match commands::pool_push_text(store, &record.id, &payload) {
-                        Ok(text) => match send_user_text(process, &text, deadline).await {
-                            true => commands::pool_result("written", "stdin_write"),
-                            false => commands::pool_result("unknown", "stdin_write_failed"),
-                        },
+                        Ok(text) => {
+                            let id = uuid::Uuid::new_v4().to_string();
+                            let open = process.input.is_some();
+                            if send_user_text(process, &text, &id, deadline).await {
+                                inputs.sent(id, false);
+                                commands::pool_result("written", "stdin_write")
+                            } else {
+                                inputs.uncertain_write |= open;
+                                commands::pool_result("unknown", "stdin_write_failed")
+                            }
+                        }
                         Err(refusal) => refusal,
                     };
                     store.complete_command(&record.id, cid, &result)?;
@@ -369,12 +565,26 @@ pub async fn run(
                     message_id.as_deref(),
                 )?;
                 let code = process.reap().await;
+                store.event(
+                    &record.id,
+                    "native_result_exit_v1",
+                    &json!({
+                        "version": 1, "frames": result_frame_index,
+                        "selected_index": selected_result_index, "exit_code": code,
+                    }),
+                )?;
                 if let Some(mut result) = final_result {
                     result.outcome.exit_code = code;
                     if code != Some(0) && result.outcome.status == Status::Succeeded {
                         result.outcome.status = Status::Failed;
                         result.outcome.failure_kind = Some("nonzero_exit".into());
                         result.outcome.failure_text = process.diagnostic_tail();
+                    }
+                    if result.outcome.status == Status::Succeeded && inputs.uncertain_write {
+                        result.outcome = Outcome::failure("uncertain_input");
+                        result.outcome.exit_code = code;
+                        result.outcome.runtime_session_id = session.clone();
+                        result.answer = None;
                     }
                     if code == Some(0)
                         && result.outcome.status == Status::Succeeded
@@ -386,7 +596,9 @@ pub async fn run(
                     return Ok(result);
                 }
                 let diagnostic = process.diagnostic_tail();
-                let kind = if saw_answer {
+                let kind = if result_frame_index > 0 {
+                    "uncorrelated_result"
+                } else if saw_answer {
                     "cut_off"
                 } else if diagnostic
                     .as_deref()
@@ -417,6 +629,12 @@ pub async fn run(
                     message_id.as_deref(),
                 )?;
                 let code = process.reap().await;
+                store.event(
+                    &record.id,
+                    "native_result_exit_v1",
+                    &json!({"version":1,"frames":result_frame_index,
+                        "selected_index":selected_result_index,"exit_code":code}),
+                )?;
                 let mut outcome = Outcome::failure(e);
                 outcome.exit_code = code;
                 outcome.failure_text = process.diagnostic_tail();
@@ -427,6 +645,29 @@ pub async fn run(
                     usage: None,
                 });
             }
+        };
+        // Capture every observed result before identity/shape validation can reject it.
+        let result_scope = if v.get("type").and_then(Value::as_str) == Some("result") {
+            result_frame_index += 1;
+            let scope = inputs.scope(&v);
+            let failed = v.get("is_error").and_then(Value::as_bool) == Some(true)
+                || v.get("subtype").and_then(Value::as_str) != Some("success")
+                || result_text(&v)
+                    .as_deref()
+                    .and_then(verify::error_only)
+                    .is_some();
+            let prior_failed = final_result.as_ref().is_some_and(|result| {
+                result.outcome.status == Status::Failed
+                    && (result.outcome.failure_kind.as_deref() != Some("ambiguous_result")
+                        || !failed)
+            });
+            let ignored = prior_failed || (scope == ResultScope::Context && !failed);
+            let mut metadata = native_result_metadata(result_frame_index, &v, ignored);
+            metadata["correlation"] = json!(scope.label());
+            store.event(&record.id, "native_result_frame_v1", &metadata)?;
+            Some(scope)
+        } else {
+            None
         };
         if let Some(s) = v
             .get("session_id")
@@ -626,6 +867,7 @@ pub async fn run(
                 }
             }
             Some("user") => {
+                inputs.replay(&v)?;
                 if let Some(content) = v.pointer("/message/content").and_then(Value::as_array) {
                     for block in content {
                         if block.get("type").and_then(Value::as_str) == Some("tool_result") {
@@ -659,9 +901,8 @@ pub async fn run(
                 }
             }
             Some("result") => {
-                if final_result.is_some() {
-                    continue;
-                }
+                let scope = result_scope.expect("result metadata was captured");
+                legacy_result_seen |= scope == ResultScope::Legacy;
                 let mut text = result_text(&v);
                 let is_error = match v.get("is_error") {
                     None => false,
@@ -695,16 +936,39 @@ pub async fn run(
                         "runtime did not confirm the resumed native session",
                     ));
                 }
+                // Errors are authoritative even in context or otherwise ambiguous frames.
+                // No success replaces a failure; a native error can clarify prior ambiguity.
+                let prior_failed = final_result.as_ref().is_some_and(|result| {
+                    result.outcome.status == Status::Failed
+                        && (result.outcome.failure_kind.as_deref() != Some("ambiguous_result")
+                            || outcome.status == Status::Succeeded)
+                });
+                if prior_failed {
+                    continue;
+                }
+                if outcome.status == Status::Succeeded {
+                    if scope == ResultScope::Ambiguous
+                        || (legacy_result_seen && result_frame_index != 1)
+                    {
+                        outcome = Outcome::failure("ambiguous_result");
+                        outcome.runtime_session_id = session.clone();
+                        text = None;
+                    } else if scope == ResultScope::Context {
+                        continue;
+                    }
+                }
                 let failed = outcome.status == Status::Failed;
+                selected_result_index = Some(result_frame_index);
                 final_result = Some(EngineResult {
                     native_failure: signals.terminal().filter(|_| failed),
                     outcome,
                     answer: text
-                        .filter(|s| !s.is_empty())
+                        .filter(|s| !s.trim().is_empty())
                         .map(|value| process.redact(&value)),
                     usage: Some(usage),
                 });
-                // The one-shot stream must close after its result; EOF plus exit status remains required.
+                // Close only after task completion or failure; context acknowledgements
+                // cannot end the task. Still drain queued frames and require EOF + exit.
                 process.input.take();
             }
             _ => {}
@@ -720,17 +984,19 @@ fn runtime_result_usage(result: &Value) -> Value {
     json!({"duration_ms":result["duration_ms"],"duration_api_ms":result["duration_api_ms"],"num_turns":result["num_turns"],"ttft_ms":result["ttft_ms"],"total_cost_usd":result["total_cost_usd"],"usage":result["usage"]})
 }
 
-/// Writes one user text message to the engine's stdin before `deadline`;
-/// shared by operator steering and pool delivery. `false` after a possible
-/// partial write is not proof that nothing was sent.
+/// Writes one user text message with the caller's fresh correlation `id` before
+/// `deadline`; shared by operator steering and pool delivery. The ID is native
+/// framing only, not a public agent identity or a delivery/consumption proof.
+/// `false` after a possible partial write is not proof that nothing was sent.
 async fn send_user_text(
     process: &mut agent_run_adapters::io::Process,
     text: &str,
+    id: &str,
     deadline: tokio::time::Instant,
 ) -> bool {
     process
         .send_before(
-            &json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":text}]}}),
+            &json!({"type":"user","uuid":id,"message":{"role":"user","content":[{"type":"text","text":text}]}}),
             deadline,
         )
         .await
@@ -739,8 +1005,100 @@ async fn send_user_text(
 
 #[cfg(test)]
 mod tests {
-    use super::{result_failure_kind, result_text, runtime_result_usage};
+    use super::{native_result_metadata, result_failure_kind, result_text, runtime_result_usage};
     use serde_json::json;
+
+    /// Native correlations cover coalesced replay batches, not write counts or text.
+    #[test]
+    fn result_inputs_correlate_tasks_context_and_coalesced_steering() {
+        use super::{ResultInputs, ResultScope};
+        let mut inputs = ResultInputs::default();
+        inputs.sent("task".into(), true);
+        inputs.sent("context".into(), false);
+        inputs
+            .replay(&json!({"isReplay":true,"uuid":"context"}))
+            .unwrap();
+        assert!(inputs.scope(&json!({"user_message_uuid":"context"})) == ResultScope::Context);
+        inputs
+            .replay(&json!({"isReplay":true,"uuid":"task"}))
+            .unwrap();
+        assert!(inputs.scope(&json!({"user_message_uuid":"task"})) == ResultScope::Task);
+        assert!(inputs.scope(&json!({"user_message_uuid":"task"})) == ResultScope::Ambiguous);
+
+        let mut inputs = ResultInputs::default();
+        inputs.sent("task".into(), true);
+        inputs.sent("note".into(), false);
+        for id in ["task", "note"] {
+            inputs.replay(&json!({"isReplay":true,"uuid":id})).unwrap();
+        }
+        assert!(inputs.scope(&json!({"user_message_uuid":"note"})) == ResultScope::Task);
+        assert!(inputs.scope(&json!({"user_message_uuid":"task"})) == ResultScope::Ambiguous);
+
+        let mut inputs = ResultInputs::default();
+        inputs.sent("old".into(), true);
+        inputs.sent("steer".into(), true);
+        inputs
+            .replay(&json!({"isReplay":true,"uuid":"old"}))
+            .unwrap();
+        assert!(inputs.scope(&json!({"user_message_uuid":"old"})) == ResultScope::Context);
+        inputs
+            .replay(&json!({"isReplay":true,"uuid":"steer"}))
+            .unwrap();
+        assert!(inputs.scope(&json!({"user_message_uuid":"steer"})) == ResultScope::Task);
+        assert!(inputs.scope(&json!({"user_message_uuid":"unknown"})) == ResultScope::Ambiguous);
+        assert!(inputs.scope(&json!({})) == ResultScope::Ambiguous);
+        assert!(ResultInputs::default().scope(&json!({})) == ResultScope::Legacy);
+        let mut single = ResultInputs::default();
+        single.sent("only".into(), true);
+        assert!(single.scope(&json!({})) == ResultScope::Legacy);
+        single.sent("note".into(), false);
+        assert!(single.scope(&json!({})) == ResultScope::Ambiguous);
+        inputs
+            .replay(&json!({"isReplay":true,"uuid":"steer"}))
+            .unwrap();
+        assert!(inputs.scope(&json!({})) == ResultScope::Ambiguous);
+        assert!(
+            inputs
+                .replay(&json!({"isReplay":true,"uuid":"unknown"}))
+                .is_err()
+        );
+    }
+
+    /// Result diagnostics retain types/counts but omit every supplied content field.
+    #[test]
+    fn result_metadata_is_content_free_and_preserves_zero_counters() {
+        let frame = json!({"subtype":"success","is_error":false,"result":"é秘密",
+            "structured_output":{"secret":"OUTPUT_SECRET"},"num_turns":0,"duration_ms":0,
+            "session_id":"SESSION_SECRET","prompt":"PROMPT_SECRET","environment":{"x":"ENV_SECRET"}});
+        let metadata = native_result_metadata(2, &frame, true);
+        assert_eq!(metadata["index"], 2);
+        assert_eq!(metadata["result_type"], "string");
+        assert_eq!(metadata["result_bytes"], "é秘密".len());
+        assert_eq!(metadata["structured_output_type"], "object");
+        assert_eq!(metadata["num_turns"], 0);
+        assert_eq!(metadata["duration_ms"], 0.0);
+        assert_eq!(metadata["ignored"], true);
+        let encoded = metadata.to_string();
+        for forbidden in [
+            "é秘密",
+            "OUTPUT_SECRET",
+            "SESSION_SECRET",
+            "PROMPT_SECRET",
+            "ENV_SECRET",
+        ] {
+            assert!(!encoded.contains(forbidden));
+        }
+        assert!(encoded.len() < 4096);
+        let malformed = native_result_metadata(
+            1,
+            &json!({"subtype":"UNKNOWN_SECRET","is_error":"ERROR_SECRET"}),
+            false,
+        );
+        assert_eq!(malformed["subtype"], "unrecognized");
+        assert_eq!(malformed["result_type"], "missing");
+        assert!(malformed["is_error"].is_null() && malformed["num_turns"].is_null());
+        assert!(!malformed.to_string().contains("SECRET"));
+    }
 
     /// Mirrors `tests/test_claude_stream.py::StreamDecoderTests::test_result_with_error_subtype_is_terminal_and_marked_as_error`.
     #[test]
@@ -799,10 +1157,9 @@ mod tests {
     /// Mirrors `tests/test_claude_stream.py::StreamDecoderTests::test_assistant_text_and_tool_use_become_messages`.
     /// Mirrors `tests/test_claude_stream.py::StreamDecoderTests::test_tool_result_becomes_message`.
     /// Mirrors `tests/test_claude_stream.py::StreamDecoderTests::test_system_event_redacts_secret_looking_fields`.
-    /// Mirrors `tests/test_claude_stream.py::StreamDecoderTests::test_terminal_line_captures_metadata_and_rejects_duplicates`.
-    /// Mirrors `tests/test_claude_stream.py::StreamDecoderTests::test_replays_the_captured_double_init_result_cycle_and_settles_on_the_first`.
+    /// Native terminal helpers preserve legacy single-result text semantics.
     #[test]
-    fn terminal_helpers_preserve_first_terminal_contract() {
+    fn terminal_helpers_preserve_single_terminal_contract() {
         assert_eq!(
             result_text(&json!({"result": "answer"})),
             Some("answer".into())
