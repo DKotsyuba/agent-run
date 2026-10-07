@@ -6,8 +6,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## 0.22.4
 
-- fix(codex): use explicit native permission profiles for shared-store preflight
-  on Codex CLI 0.160.1; preserve managed requirements and all storage boundaries
+- fix(codex): select explicit native permission profiles for shared-store
+  preflight and non-network thread start/resume on Codex CLI 0.160.1; preserve
+  managed requirements, grant verification and existing network override paths
 
 ## 0.22.3
 
