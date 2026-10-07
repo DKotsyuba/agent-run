@@ -111,6 +111,14 @@ remain in `[mcp.<name>]`. Missing role assets fail before admission. A canonical
 role selects its skills and MCP servers; legacy per-runtime lists belong only
 to historical schema-1 compatibility profiles.
 
+A catalog entry such as `<skills-directory>/code-reading` may be an absolute or
+relative symlink to a skill directory outside the catalog. Agent Run resolves
+that declared directory and seals its regular files into the run snapshot; the
+runtime does not keep a live link to the source. Editing, retargeting or removing
+the catalog link does not change an existing run or its resume snapshot. Broken,
+cyclic and non-directory targets fail explicitly. Links and special files inside
+a skill remain rejected; runtime destination link protections are unchanged.
+
 ## Accounts
 
 Omitting `account` requests automatic allocation among the provider's eligible

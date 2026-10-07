@@ -517,6 +517,29 @@ pub fn materialize_provider(
     )
 }
 
+/// Resolves one operator-selected catalog directory, including an external directory alias.
+/// Catalog must be absolute and the skill path must contain only normal relative components;
+/// broken, cyclic, missing or non-directory sources are rejected without exposing target paths.
+/// Only the declared source root is resolved: snapshot traversal still rejects links or special
+/// files inside the skill, and the original catalog/target grants are never added to the agent.
+fn catalog_skill_source(catalog: &Path, skill: &str) -> Result<PathBuf> {
+    let relative = Path::new(skill);
+    if !catalog.is_absolute()
+        || relative.as_os_str().is_empty()
+        || !relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(invalid("declared skill must have a relative catalog path"));
+    }
+    let source = std::fs::canonicalize(catalog.join(relative))
+        .map_err(|_| invalid("declared skill directory is unavailable"))?;
+    if !source.is_dir() {
+        return Err(invalid("declared skill source must be a directory"));
+    }
+    Ok(source)
+}
+
 /// Publishes a new v1/v2 home with frozen local assets and private native state.
 ///
 /// Codex homes disable remote catalog discovery and forward resolved Rust roots
@@ -554,7 +577,10 @@ fn materialize_with_provider(
         if matches!(kind, Adapter::Claude | Adapter::Glm) && plugin_source.is_some() {
             continue;
         }
-        let source = plugin_source.unwrap_or_else(|| skill_catalog.join(skill));
+        let source = match plugin_source {
+            Some(source) => source,
+            None => catalog_skill_source(&skill_catalog, skill)?,
+        };
         if !source.join("SKILL.md").is_file() {
             return Err(invalid("declared skill is unavailable"));
         }

@@ -125,6 +125,33 @@ Review the assigned change.\n";
     assert_eq!(again.config_revision, plan.config_revision);
 }
 
+/// A declared catalog directory alias hashes the same frozen contents as a regular skill directory.
+#[test]
+fn canonical_skill_directory_alias_has_content_revision() {
+    let home = common::Home::new();
+    let catalog = home.path.join("skills");
+    let shared = home.path.join("shared");
+    fs::create_dir_all(&catalog).unwrap();
+    fs::create_dir_all(&shared).unwrap();
+    fs::write(shared.join("SKILL.md"), "Shared skill.\n").unwrap();
+    let alias = catalog.join("linked");
+    std::os::unix::fs::symlink(&shared, &alias).unwrap();
+    let profile = profiles::parse(
+        "+++\nrevision=\"fixture\"\nwrite=false\nnetwork=false\nallow_external_read_roots=false\nskills=[\"linked\"]\nmcp=[]\nrequired_constraints=[]\n+++\nRead the task.\n",
+        &home.request(),
+    ).unwrap();
+    let linked = resolve_role_plan(&profile, &catalog, &BTreeMap::new(), "global", None).unwrap();
+    fs::remove_file(&alias).unwrap();
+    fs::create_dir_all(&alias).unwrap();
+    fs::write(alias.join("SKILL.md"), "Shared skill.\n").unwrap();
+    let regular = resolve_role_plan(&profile, &catalog, &BTreeMap::new(), "global", None).unwrap();
+    assert_eq!(linked.skills, regular.skills);
+    assert_eq!(linked.config_revision, regular.config_revision);
+    fs::write(alias.join("SKILL.md"), "Changed skill.\n").unwrap();
+    let changed = resolve_role_plan(&profile, &catalog, &BTreeMap::new(), "global", None).unwrap();
+    assert_ne!(linked.skills[0].revision, changed.skills[0].revision);
+}
+
 /// Mirrors `test_from_payload_rejects_malformed_or_tampered_documents`.
 #[test]
 fn from_payload_rejects_malformed_or_tampered_documents() {

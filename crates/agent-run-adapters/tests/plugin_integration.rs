@@ -107,6 +107,117 @@ fn config(runtime: &Runtime, mcp: BTreeMap<String, Mcp>) -> Config {
     }
 }
 
+/// Catalog directory aliases resolve for every harness and freeze regular runtime snapshots.
+#[test]
+fn catalog_skill_directory_symlinks_are_frozen_for_all_harnesses() {
+    for adapter in ["codex", "claude", "glm"] {
+        for canonical in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let external = root.path().join("external-skill");
+            std::fs::create_dir_all(external.join("scripts")).unwrap();
+            std::fs::write(external.join("SKILL.md"), "Shared skill version one.\n").unwrap();
+            std::fs::write(external.join("scripts/helper.sh"), "#!/bin/sh\necho one\n").unwrap();
+            let catalog = root.path().join("skills").join(adapter);
+            std::fs::create_dir_all(&catalog).unwrap();
+            let target = if canonical {
+                external.as_path()
+            } else {
+                Path::new("../../external-skill")
+            };
+            std::os::unix::fs::symlink(target, catalog.join("linked")).unwrap();
+            let home = root.path().join("runtime-home");
+            let mut runtime = runtime(adapter, &home, vec![], vec![], vec![], vec![]);
+            if adapter == "glm" {
+                runtime.auth = Some(agent_run_config::config::Auth::Environment { names: vec![] });
+            }
+            let mut config = config(&runtime, BTreeMap::new());
+            config.skills = serde_json::from_value(json!({"directory": &catalog})).unwrap();
+            let (request, mut profile) =
+                request_profile(adapter, root.path(), vec!["linked".into()], vec![]);
+            profile.canonical = canonical;
+            let (_, digest) =
+                materialize::materialize(&config, &runtime, &request, &profile, &home, root.path())
+                    .expect("directory alias materializes");
+            let relative = if adapter == "codex" {
+                "skills/linked"
+            } else {
+                "plugins/linked/skills/linked"
+            };
+            let frozen = home.join(relative);
+            assert!(
+                !std::fs::symlink_metadata(&frozen)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(
+                std::fs::read_to_string(frozen.join("SKILL.md")).unwrap(),
+                "Shared skill version one.\n"
+            );
+            assert!(frozen.join("scripts/helper.sh").is_file());
+            std::fs::write(external.join("SKILL.md"), "Changed live source.\n").unwrap();
+            std::fs::remove_file(catalog.join("linked")).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(frozen.join("SKILL.md")).unwrap(),
+                "Shared skill version one.\n"
+            );
+            materialize::verify(&home, &digest)
+                .expect("source updates do not change frozen history");
+        }
+    }
+}
+
+/// Catalog aliases reject broken/cyclic/non-directory targets, path traversal and inner links.
+#[test]
+fn catalog_skill_aliases_preserve_snapshot_boundaries() {
+    for case in ["dangling", "cycle", "file", "inner-link", "traversal"] {
+        let root = tempfile::tempdir().unwrap();
+        let external = root.path().join("external-skill");
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("SKILL.md"), "Fixture skill.\n").unwrap();
+        let catalog = root.path().join("skills/codex");
+        std::fs::create_dir_all(&catalog).unwrap();
+        let alias = catalog.join("linked");
+        let selected = if case == "traversal" {
+            "../outside"
+        } else {
+            "linked"
+        };
+        match case {
+            "dangling" => std::os::unix::fs::symlink(root.path().join("missing"), &alias).unwrap(),
+            "cycle" => std::os::unix::fs::symlink("linked", &alias).unwrap(),
+            "file" => std::os::unix::fs::symlink(external.join("SKILL.md"), &alias).unwrap(),
+            "traversal" => {
+                std::fs::create_dir_all(catalog.parent().unwrap().join("outside")).unwrap();
+                std::fs::write(
+                    catalog.parent().unwrap().join("outside/SKILL.md"),
+                    "outside",
+                )
+                .unwrap();
+            }
+            _ => {
+                let private = root.path().join("private.txt");
+                std::fs::write(&private, "not skill content").unwrap();
+                std::os::unix::fs::symlink(&private, external.join("escape")).unwrap();
+                std::os::unix::fs::symlink(&external, &alias).unwrap();
+            }
+        }
+        let home = root.path().join("runtime-home");
+        let runtime = runtime("codex", &home, vec![], vec![], vec![], vec![]);
+        let config = config(&runtime, BTreeMap::new());
+        let (request, profile) =
+            request_profile("codex", root.path(), vec![selected.into()], vec![]);
+        let error =
+            materialize::materialize(&config, &runtime, &request, &profile, &home, root.path())
+                .expect_err(case);
+        assert!(
+            matches!(error, agent_run_domain::Error::Validation(_)),
+            "{case}: {error}"
+        );
+        assert!(!home.join("skills/linked/escape").exists());
+    }
+}
+
 /// Returns a stdio MCP definition with the requested arguments.
 fn mcp(args: &[&str]) -> Mcp {
     Mcp {
