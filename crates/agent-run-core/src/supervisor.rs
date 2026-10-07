@@ -569,10 +569,11 @@ pub enum Relocation {
 /// agent's attempt was actually admitted with, and the Codex grant derived
 /// from them — and only then hands the home to the registry coordinator. It
 /// never rewrites the frozen identity or configuration to make a check pass,
-/// never guesses the current provider, and never launches a model. An
-/// invalid store root, a vanished workdir or binary, or an unverifiable
-/// grant surfaces as [`Relocation::Skipped`] with the reason and the bytes
-/// still held privately; the home itself is untouched.
+/// never guesses the current provider, and never launches a model. It no
+/// longer spawns the harness binary, so a vanished binary is not detected
+/// here. An unreadable identity, an unplannable launch, an invalid store root,
+/// or an unverifiable Codex grant surfaces as [`Relocation::Skipped`] with
+/// the reason and the bytes still held privately; the home itself is untouched.
 pub fn relocate_retained_home(
     store: &mut Store,
     app_home: &Path,

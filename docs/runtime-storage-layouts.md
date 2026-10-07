@@ -239,8 +239,8 @@ paired config migration holds, refuses while any agent is active, relocates
 each eligible home once, and then runs one collection pass. Each
 relocation replays the supervisor's own preflight from the recorded
 identity, frozen configuration and recorded account — never the current
-provider, never a rewritten configuration — and a home whose workdir, binary,
-grants or store root cannot be verified is skipped with its reason and
+provider, never a rewritten configuration — and a home whose identity, frozen
+configuration, account, Codex grant or store root cannot be verified is skipped with its reason and
 preserved byte count. `storage recover` runs under the same offline locks and
 finishes prepared rows forward; it starts no model and supports no rollback.
 
