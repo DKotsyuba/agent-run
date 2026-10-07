@@ -264,14 +264,14 @@ case "$1" in
    */releases/tags/*) if [ -f "$TEST_FIXTURE/release.json" ]; then cat "$TEST_FIXTURE/release.json"; else echo 'HTTP 404' >&2; exit 1; fi ;;
    */releases\?*) if [ -f "$TEST_FIXTURE/releases.json" ]; then cat "$TEST_FIXTURE/releases.json"; elif [ -f "$TEST_FIXTURE/release.json" ]; then printf '[';cat "$TEST_FIXTURE/release.json";printf ']';else printf '[]';fi ;;
    */releases/29) if [ -f "$TEST_FIXTURE/release-id.json" ]; then cat "$TEST_FIXTURE/release-id.json";else cat "$TEST_FIXTURE/release.json";fi ;;
-   */contents/*) if [ "${TEST_STALL_STAGE:-}" = source ]; then touch "$TEST_FIXTURE/leaf-started"; sleep 6; exit 1; fi; name=${endpoint##*/};name=${name%%\?*};cat "$TEST_FIXTURE/source/$name" ;;
+   */contents/*) if [ "${TEST_STALL_STAGE:-}" = source ]; then touch "$TEST_FIXTURE/leaf-started"; sleep 30; exit 1; fi; name=${endpoint##*/};name=${name%%\?*};cat "$TEST_FIXTURE/source/$name" ;;
    *) exit 9 ;;
   esac ;;
  release)
   operation=$2; shift 2
   case "$operation" in
    download)
-    if [ "${TEST_STALL_STAGE:-}" = download ]; then touch "$TEST_FIXTURE/leaf-started"; sleep 6; exit 1; fi
+    if [ "${TEST_STALL_STAGE:-}" = download ]; then touch "$TEST_FIXTURE/leaf-started"; sleep 30; exit 1; fi
     patterns=
     while [ "$#" -gt 0 ]; do case "$1" in --dir) directory=$2;shift ;; --pattern) patterns="$patterns $2";shift ;; esac;shift;done
     for name in $patterns; do [ ! -e "$directory/$name" ] || exit 9;cp "$TEST_FIXTURE/assets/$name" "$directory/$name";done ;;
@@ -527,7 +527,7 @@ fn access_lightweight_and_ambiguous_discovery_fail_closed() {
             "--commit",
             &fixture.manifest.commit,
             "--timeout",
-            "2",
+            "10",
             "--result-file",
         ])
         .arg(fixture.temp.path().join("ambiguous.json"));
@@ -602,7 +602,9 @@ exit {exit}
             exit = if status == 200 { 0 } else { 1 }
         );
         executable(&fixture.tools.join("gh"), &script);
-        let output = fixture.wait_for(&fixture.temp.path().join("result.json"), None, "1");
+        // Only Retry-After tests the one-second deadline; other cases test refusal kinds.
+        let timeout = if status == 429 { "1" } else { "10" };
+        let output = fixture.wait_for(&fixture.temp.path().join("result.json"), None, timeout);
         assert_eq!(
             output.status.code(),
             Some(expected),
@@ -687,8 +689,9 @@ fn release_prepare_updates_source_registration_mirror() {
     );
 }
 
-/// Stalled download/source leaves retain the shared deadline exit; a TERM while
-/// the verified archive is being extracted produces cancelled, not integrity failure.
+/// Stalled download/source leaves must start within the normal setup budget and
+/// finish before their thirty-second stubs can exit naturally. Their result stays
+/// deadline expiry; TERM during extraction stays cancelled, not integrity failure.
 #[test]
 fn stalled_leaves_and_cancelled_verification_keep_terminal_kind() {
     for stage in ["download", "source"] {
@@ -715,11 +718,16 @@ fn stalled_leaves_and_cancelled_verification_keep_terminal_kind() {
                 "--attempt",
                 "1",
                 "--timeout",
-                "3",
+                "10",
                 "--result-file",
             ])
             .arg(fixture.temp.path().join("timeout.json"));
+        let started = Instant::now();
         let output = fixture.output(command);
+        assert!(
+            started.elapsed() < Duration::from_secs(25),
+            "stalled leaf must be stopped before its natural exit"
+        );
         assert!(
             fixture.temp.path().join("leaf-started").exists(),
             "actual {stage} leaf must run"
