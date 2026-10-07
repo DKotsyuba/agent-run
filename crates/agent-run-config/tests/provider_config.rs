@@ -66,6 +66,43 @@ account = "acct-glm"
     )
 }
 
+/// The global Fast flag is Codex-only and omission preserves historical normalized snapshots.
+#[test]
+fn harness_fast_mode_defaults_and_validation() {
+    let home = tempfile::tempdir().unwrap();
+    let text = document(home.path());
+    let legacy = ProviderConfig::parse(&text, home.path()).unwrap();
+    let encoded = serde_json::to_value(&legacy).unwrap();
+    assert!(encoded["harnesses"]["codex"].get("fast_mode").is_none());
+    let enabled = text.replace("[harnesses.codex]", "[harnesses.codex]\nfast_mode = true");
+    let config = ProviderConfig::parse(&enabled, home.path()).expect("global Codex Fast flag");
+    assert_eq!(
+        serde_json::to_value(&config).unwrap()["harnesses"]["codex"]["fast_mode"],
+        true
+    );
+    assert_ne!(legacy.snapshot().unwrap(), config.snapshot().unwrap());
+    let restored: ProviderConfig = serde_json::from_value(encoded).unwrap();
+    assert_eq!(legacy.snapshot().unwrap(), restored.snapshot().unwrap());
+    let disabled = text.replace("[harnesses.codex]", "[harnesses.codex]\nfast_mode = false");
+    assert_eq!(
+        legacy.snapshot().unwrap(),
+        ProviderConfig::parse(&disabled, home.path())
+            .unwrap()
+            .snapshot()
+            .unwrap()
+    );
+    let wrong = text.replace(
+        "[harnesses.claude-code]",
+        "[harnesses.claude-code]\nfast_mode = true",
+    );
+    assert!(ProviderConfig::parse(&wrong, home.path()).is_err());
+    let malformed = text.replace(
+        "[harnesses.codex]",
+        "[harnesses.codex]\nfast_mode = \"yes\"",
+    );
+    assert!(ProviderConfig::parse(&malformed, home.path()).is_err());
+}
+
 /// Returns fake global account records without credential bytes.
 fn accounts() -> Vec<AccountRecord> {
     [

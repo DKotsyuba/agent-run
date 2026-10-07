@@ -2683,6 +2683,200 @@ async fn codex_run(home: &Path, request_id: &str, account: Option<&str>) -> Agen
     id
 }
 
+/// Global Codex Fast reaches native argv and resume without altering raw intent, grants or replay.
+#[tokio::test]
+async fn codex_global_fast_mode_start_and_resume_policy() {
+    let (_temp, home) = codex_home_with(&["healthy"]);
+    let path = home.join("config.toml");
+    let mut text = fs::read_to_string(&path).unwrap();
+    let parsed = agent_run_config::provider_config::ProviderConfig::load(&home)
+        .unwrap()
+        .0;
+    let original = &parsed.harnesses[&agent_run_domain::HarnessId::Codex].binary;
+    let wrapper = home.join("capture-fast-codex");
+    let script = format!(
+        "#!/bin/sh\ncase \" $* \" in *\" app-server \"*) printf '%s\\n' \"$@\" >> \"$CODEX_HOME/fast-test-args.log\";; esac\n# The fixture does not parse Codex global config overrides; capture them before forwarding.\nwhile [ \"${{1-}}\" = \"-c\" ]; do shift 2; done\nexec {} \"$@\"\n",
+        agent_run_adapters::materialize::shell_quote(&original.to_string_lossy())
+    );
+    fs::write(&wrapper, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    text = text.replace(
+        &format!("binary = \"{}\"", original.display()),
+        &format!("binary = \"{}\"", wrapper.display()),
+    );
+    fs::write(&path, &text).unwrap();
+    let service = Service::new(home.clone());
+    let raw = request_for(&home, "codex-user", "global-fast-parent", Some("a"));
+    assert!(!raw.fast);
+    let admitted = service.admit_provider(raw.clone()).unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    run_to_end(&home, &id).await;
+    let parent = Store::open(&home).unwrap().get(&id).unwrap();
+    assert_eq!(
+        parent.status,
+        Status::Succeeded,
+        "{:?}",
+        parent.failure_text
+    );
+    assert!(!parent.request.fast);
+    let runtime_home = std::path::PathBuf::from(
+        parent.identity.as_ref().unwrap()["runtime_home"]
+            .as_str()
+            .unwrap(),
+    );
+    let log = runtime_home.join("fast-test-args.log");
+    assert!(
+        !fs::read_to_string(&log)
+            .unwrap()
+            .contains("service_tier=fast")
+    );
+    let enabled = text.replace("[harnesses.codex]", "[harnesses.codex]\nfast_mode = true");
+    fs::write(&path, &enabled).unwrap();
+    let child = service
+        .admit_provider_resume(
+            &parent,
+            "fixture:usage".into(),
+            None,
+            Some("global-fast-child".into()),
+            None,
+            None,
+        )
+        .unwrap();
+    let child_id: AgentId = serde_json::from_value(child["agent_id"].clone()).unwrap();
+    let row = Store::open(&home).unwrap().get(&child_id).unwrap();
+    assert!(row.request.fast);
+    assert_eq!(
+        row.identity.as_ref().unwrap()["provider_request"]["fast"],
+        false
+    );
+    for key in [
+        "runtime_home",
+        "snapshot_sha256",
+        "provider_config",
+        "authority",
+    ] {
+        assert_eq!(
+            parent.identity.as_ref().unwrap()[key],
+            row.identity.as_ref().unwrap()[key],
+            "{key}"
+        );
+    }
+    assert_eq!(
+        service
+            .admit_provider_resume(
+                &parent,
+                "fixture:usage".into(),
+                None,
+                Some("global-fast-child".into()),
+                None,
+                None
+            )
+            .unwrap()["created"],
+        false
+    );
+    run_to_end(&home, &child_id).await;
+    let child_row = Store::open(&home).unwrap().get(&child_id).unwrap();
+    assert_eq!(
+        child_row.status,
+        Status::Succeeded,
+        "{:?}",
+        child_row.failure_text
+    );
+    let args = fs::read_to_string(&log).unwrap();
+    assert!(
+        args.contains("service_tier=fast") && args.contains("features.fast_mode=true"),
+        "{args}"
+    );
+    let new_raw = request_for(&home, "codex-user", "global-fast-new", Some("a"));
+    let new = service.admit_provider(new_raw.clone()).unwrap();
+    let new_id: AgentId = serde_json::from_value(new["agent_id"].clone()).unwrap();
+    let new_row = Store::open(&home).unwrap().get(&new_id).unwrap();
+    assert!(new_row.request.fast);
+    assert_eq!(
+        new_row.identity.as_ref().unwrap()["provider_request"]["fast"],
+        false
+    );
+    assert_eq!(service.admit_provider(new_raw).unwrap()["created"], false);
+    run_to_end(&home, &new_id).await;
+    fs::write(&path, &text).unwrap();
+    let standard = service
+        .admit_provider_resume(
+            &child_row,
+            "fixture:usage".into(),
+            None,
+            Some("global-fast-disabled".into()),
+            None,
+            None,
+        )
+        .unwrap();
+    let standard_id: AgentId = serde_json::from_value(standard["agent_id"].clone()).unwrap();
+    assert!(
+        !Store::open(&home)
+            .unwrap()
+            .get(&standard_id)
+            .unwrap()
+            .request
+            .fast
+    );
+    run_to_end(&home, &standard_id).await;
+    let mut explicit = request_for(&home, "codex-user", "explicit-fast-still-works", Some("a"));
+    explicit.fast = true;
+    let admitted = service.admit_provider(explicit).unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    assert!(Store::open(&home).unwrap().get(&id).unwrap().request.fast);
+    run_to_end(&home, &id).await;
+}
+
+/// Pool admission applies one Codex harness Fast policy across provider/model aliases and accounts.
+#[test]
+fn codex_global_fast_mode_pool_members_and_aliases() {
+    let (_temp, home) = codex_home_with(&["healthy", "healthy"]);
+    let path = home.join("config.toml");
+    let text = fs::read_to_string(&path)
+        .unwrap()
+        .replace("[harnesses.codex]", "[harnesses.codex]\nfast_mode = true");
+    fs::write(&path, format!("{text}\n[providers.codex-other]\nharness='codex'\nconnection={{kind='native'}}\nauth_family='openai'\nlimits_source='none'\n[[providers.codex-other.models]]\nid='other-model'\n[[providers.codex-other.bindings]]\nlabel='b'\naccount='acct-cx-b'\n")).unwrap();
+    let mut first = request_for(&home, "codex-user", "pool-fast-first", Some("a"));
+    first.request_id = None;
+    first.orchestrator = None;
+    let mut second = request_for(&home, "codex-other", "pool-fast-second", Some("b"));
+    second.model = "other-model".into();
+    second.request_id = None;
+    second.orchestrator = None;
+    let request: agent_run_domain::pool::PoolStartRequest =
+        serde_json::from_value(serde_json::json!({
+            "request_id":"global-fast-pool","goal":"Read-only fixture",
+            "members":[{"role":"first","start":first},{"role":"second","start":second}],
+        }))
+        .unwrap();
+    let service = Service::new(home.clone());
+    let admitted = service.admit_pool(request.clone()).unwrap();
+    assert_eq!(service.admit_pool(request).unwrap()["created"], false);
+    let store = Store::open(&home).unwrap();
+    for member in admitted["members"].as_array().unwrap() {
+        let id: AgentId = serde_json::from_value(member["agent_id"].clone()).unwrap();
+        let row = store.get(&id).unwrap();
+        assert!(row.request.fast);
+        assert_eq!(
+            row.identity.as_ref().unwrap()["provider_request"]["fast"],
+            false
+        );
+        agent_run_core::service::ProviderLaunchIdentity::read(&row).unwrap();
+    }
+    drop(store);
+    let claude = service
+        .admit_provider(request_for(
+            &home,
+            "glm-user",
+            "fast-does-not-affect-claude",
+            Some("work"),
+        ))
+        .unwrap();
+    let id: AgentId = serde_json::from_value(claude["agent_id"].clone()).unwrap();
+    assert!(!Store::open(&home).unwrap().get(&id).unwrap().request.fast);
+}
+
 /// Offline Codex start/resume runs prove normalized names and replay conflicts,
 /// launch-time native usage baselines, exact deltas, complete lineage sums and
 /// public stable identity without leaking internal execution IDs in usage.

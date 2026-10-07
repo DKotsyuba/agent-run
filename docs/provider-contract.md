@@ -156,7 +156,11 @@ served by `Service::start_provider` inside the
 resident broker: the CLI never admits in its own one-shot process. A legacy
 `runtime` field (CLI `--runtime`) is an unknown argument and a
 `ValidationError`; there is no runtime alias. A repeated `request_id` returns
-the original admission (`created=false`). `fast` is carried to the codex
+the original admission (`created=false`). `[harnesses.codex].fast_mode = true`
+forces the effective Fast option for all Codex starts/pool members. Resume reads
+the current override; each admitted execution and its retries retain that value.
+Raw requests, replay digests and parent native configuration remain unchanged.
+`fast` is carried to the codex
 harness as its fast service tier and `output_schema` to the claude-code
 harness as the answer-schema instruction, through the same launch
 mechanisms as before; setting either on the other harness is a

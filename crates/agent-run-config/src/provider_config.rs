@@ -35,6 +35,10 @@ pub struct HarnessConfig {
     /// Optional harness-wide active process cap.
     #[serde(default)]
     pub max_active_agents: Option<usize>,
+    /// Forces Fast for new Codex executions across all models/providers and resumed executions.
+    /// Omitted/false keeps per-request behavior; omitted serialization preserves old snapshot digests.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fast_mode: bool,
     /// Unowned native settings subject to existing reserved-key checks.
     #[serde(default)]
     pub native_settings: BTreeMap<String, toml::Value>,
@@ -286,6 +290,9 @@ impl ProviderConfig {
             harness.home = fs::expand(&harness.home)?;
             if !harness.binary.is_absolute() || !harness.home.is_absolute() {
                 return Err(invalid("harness binary and home must be absolute"));
+            }
+            if harness.fast_mode && *id != HarnessId::Codex {
+                return Err(invalid("harness fast_mode is supported only by codex"));
             }
             if harness.max_active_agents == Some(0) {
                 return Err(invalid("harness max_active_agents must be positive"));

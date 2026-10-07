@@ -110,7 +110,9 @@ impl ProviderLaunchIdentity {
     /// Reads only an explicit v2 identity and verifies its raw provider
     /// request against the staged projection and replay digest. An omitted
     /// effort may resolve to the frozen model default in newer admissions;
-    /// older rows whose effective effort stayed absent remain readable.
+    /// older rows whose effective effort stayed absent remain readable. The stored
+    /// request's Fast value is effective launch policy; the raw request remains
+    /// unchanged for replay, independently of the captured global Fast override.
     pub fn read(row: &Record) -> Result<Self> {
         let identity: Self = serde_json::from_value(
             row.identity
@@ -1500,8 +1502,8 @@ impl Service {
     ///
     /// The child keeps the parent's provider, harness, explicit model,
     /// workdir, role grants, sealed assets, frozen configuration, runtime
-    /// home and native session; only the task text, timeout, orchestrator and
-    /// the per-attempt account lease change. A request-id replay is answered
+    /// home and native session; task text, timeout, orchestrator, current global
+    /// Codex Fast policy and the per-attempt account lease may change. A request-id replay is answered
     /// before any configuration or quota read. The parent's selection intent
     /// is kept: a pinned run never switches; an automatic run keeps its
     /// previous account while that account is still a valid candidate and
@@ -1691,6 +1693,13 @@ impl Service {
             None => parent.request.timeout_seconds,
         };
         effective.orchestrator = request.orchestrator.clone();
+        // Preserve raw replay intent while each resume captures current global Fast policy.
+        effective.fast = request.fast
+            || (authority.harness == agent_run_domain::HarnessId::Codex
+                && current
+                    .harnesses
+                    .get(&authority.harness)
+                    .is_some_and(|harness| harness.fast_mode));
         let identity = serde_json::to_value(ProviderLaunchIdentity {
             provider_identity_version: 2,
             replay_request_sha256: agent_run_domain::canonical::sha256_hex(
@@ -2312,7 +2321,8 @@ pub(crate) struct Prepared {
 /// Resolves role, authority, effective request and frozen identity for one
 /// provider request from an already loaded configuration and catalog, with no
 /// database access. Shared by single starts and pool admission so both freeze
-/// exactly the same facts.
+/// exactly the same facts. The effective storage request captures the Codex
+/// harness Fast flag without changing original request/replay hashes.
 pub(crate) fn prepare_provider(
     config: &ProviderConfig,
     revision: &str,
@@ -2370,6 +2380,11 @@ pub(crate) fn prepare_provider(
         request.account.as_ref().map(|label| label.as_str()),
     )?;
     let mut effective = request.storage_projection();
+    effective.fast |= provider.harness == agent_run_domain::HarnessId::Codex
+        && config
+            .harnesses
+            .get(&provider.harness)
+            .is_some_and(|harness| harness.fast_mode);
     effective.effort = effective_effort.clone();
     effective.write = profile.write;
     effective.read_roots = profile.read_roots.clone();
