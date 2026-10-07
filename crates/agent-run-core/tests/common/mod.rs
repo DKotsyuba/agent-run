@@ -30,45 +30,6 @@ pub fn role_payload() -> serde_json::Value {
     payload
 }
 
-/// One minimal frozen launch plan whose only qualification inputs are the
-/// harness binary and its environment, for driving the real guard
-/// qualification body with an isolated fixture harness.
-pub fn launch_plan(binary: &Path) -> agent_run_adapters::provider::ProviderLaunchPlan {
-    let role = agent_run_config::role_plan::ResolvedRolePlan::from_payload(&role_payload())
-        .expect("role payload");
-    agent_run_adapters::provider::ProviderLaunchPlan {
-        launch: agent_run_adapters::LaunchPlan {
-            binary: binary.to_path_buf(),
-            args: vec!["app-server".into()],
-            cwd: std::env::temp_dir(),
-            environment: Default::default(),
-            initial_input: None,
-        },
-        native_model: "fixture".into(),
-        role,
-        runtime: serde_json::from_value(json!({
-            "enabled": true, "adapter": "codex", "binary": "/usr/bin/true",
-            "home": "/tmp/agent-run-fixture-runtime",
-            "models": ["fixture"],
-        }))
-        .expect("runtime"),
-        profile: agent_run_config::profiles::Profile {
-            name: "review".into(),
-            body: "Review the fixture.".into(),
-            write: false,
-            network: false,
-            revision: "fixture".into(),
-            canonical: false,
-            allow_external_read_roots: true,
-            read_roots: vec![],
-            skills: vec![],
-            mcp: vec![],
-            mcp_tools: Default::default(),
-            required_constraints: Default::default(),
-        },
-    }
-}
-
 pub struct Home {
     pub temp: TempDir,
     pub path: PathBuf,

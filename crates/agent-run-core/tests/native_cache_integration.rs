@@ -171,15 +171,9 @@ fn fixture(account: &str, payload: &[u8]) -> Fixture {
     }
 }
 
-/// Obtains the qualified store root through the real guard qualification
-/// body, with an isolated fixture harness standing in for the native one.
+/// Obtains the validated store root through the real publication-root body.
 fn witness(app_home: &Path) -> PathBuf {
-    agent_run_core::supervisor::qualify_shared_root(
-        app_home,
-        &common::launch_plan(Path::new("/usr/bin/true")),
-        None,
-    )
-    .expect("qualified")
+    agent_run_core::supervisor::shared_publication_root(app_home, None).expect("validated")
 }
 
 /// Restores owner write below one fixture tree so the temporary dir can drop.
@@ -462,7 +456,7 @@ fn two_homes_share_assets_but_keep_private_state_and_domains_isolate() {
 
 /// Before native work, frozen remote plugin parents thaw while the generated
 /// skills tree keeps its link, and a cache-only home still reports shared
-/// links so the launch path keeps it behind the shared-store guard.
+/// links so the launch path keeps it bound to the shared store.
 #[test]
 fn prepare_native_thaws_remote_parents_and_detects_shared_links() {
     let fixture = fixture("acct-one", b"thaw-payload\n");
@@ -571,8 +565,7 @@ fn refresh_privatizes_and_repacks_and_journals_recover() {
 
 /// A private or cache-only home verifies through the shared bridge with an
 /// empty map exactly as strictly as a private home, which binding every
-/// launch to the store requires. The launch-time denial itself is witnessed
-/// through the real supervisor in the `agent-run` crate's provider tests.
+/// launch to the store requires.
 #[test]
 fn private_home_launches_bound_to_the_shared_store() {
     let fixture = fixture("acct-one", b"bound-launch\n");

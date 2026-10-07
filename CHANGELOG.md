@@ -4,6 +4,17 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.22.5
+
+- refactor(storage): remove Agent Run's own Seatbelt (`sandbox-exec`) launch
+  wrappers, guard profile generation and sentinel qualification of the shared
+  runtime asset store. Harnesses and their MCP children now start without an
+  extra wrapper; native Codex sandbox/approvals/network and Claude permission
+  modes are unchanged. Shared-store integrity keeps hashes, no-follow
+  validation, atomic publication, locks and reference-aware collection, but
+  same-user write prevention is no longer claimed; tampering is detected at the
+  next verification
+
 ## 0.22.4
 
 - fix(codex): select explicit native permission profiles for shared-store

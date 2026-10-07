@@ -65,7 +65,7 @@ pub enum StorageFault {
 /// symlinked components (checked through no-follow descriptors and by
 /// canonical form), so an aliased or foreign entry is refused instead of
 /// adopted. A missing namespace is derived, not created: the launch path may
-/// create the empty trusted root before guard validation, and [`install`]
+/// create the empty trusted root before root validation, and [`install`]
 /// creates it before its first import.
 pub fn store_root(app_home: &Path) -> Result<PathBuf> {
     if !app_home.is_absolute() {

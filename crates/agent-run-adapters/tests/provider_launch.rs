@@ -493,6 +493,41 @@ fn native_provider_keeps_login_and_model_alias() {
     )
     .unwrap();
     assert_eq!(plan.native_model, "claude-sonnet");
+    // A shared-layout launch runs the sealed native binary directly: agent-run
+    // adds no sandbox-exec wrapper, so program and leading argv are unchanged.
+    let store = root.join("shared-store");
+    fs::create_dir_all(&store).unwrap();
+    let shared = agent_run_adapters::provider::plan_selected_with(
+        &config,
+        &catalog,
+        &authority,
+        &account,
+        &run_home,
+        root,
+        &BTreeMap::from([("HOME".into(), root.to_string_lossy().into_owned())]),
+        &FakeReader,
+        "task",
+        None,
+        agent_run_adapters::provider::LaunchOptions::default(),
+        Some(&agent_run_adapters::provider::SharedLaunchAssets {
+            store_root: store.canonicalize().unwrap(),
+            roots: BTreeMap::new(),
+        }),
+    )
+    .unwrap();
+    assert_eq!(shared.launch.binary, plan.launch.binary);
+    assert_eq!(shared.launch.binary, Path::new(&fake_engine(root)));
+    assert_eq!(
+        shared.launch.args.first().map(String::as_str),
+        Some("--print")
+    );
+    assert!(
+        !shared
+            .launch
+            .args
+            .iter()
+            .any(|arg| arg == "-p" || arg.contains("(deny file-write"))
+    );
     assert!(plan.launch.args.iter().any(|arg| arg == "--mcp-config"));
     assert!(
         plan.launch

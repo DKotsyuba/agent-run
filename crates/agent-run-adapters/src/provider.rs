@@ -16,7 +16,7 @@ use agent_run_config::{
     role_plan::{ResolvedRolePlan, role_from_authority},
 };
 use agent_run_domain::{
-    CredentialRef, Error, Result, Sha256Digest,
+    CredentialRef, Result, Sha256Digest,
     catalog::{
         AccountId, AttemptCredentials, HarnessId, ProviderCatalog, ProviderConnection, ProviderId,
         ResolvedLaunchAuthority,
@@ -25,7 +25,6 @@ use agent_run_domain::{
     error::invalid,
 };
 use agent_run_platform::fs;
-use agent_run_platform::{shared_asset_guard::SharedAssetGuard, shared_assets::SharedStoreLock};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -416,7 +415,10 @@ pub fn plan_selected(
 /// credentials only into the child environment. `shared` names the
 /// committed shared-store placement of the home's managed trees, when the
 /// registry recorded one; without it the sealed home verifies strictly as a
-/// private tree.
+/// private tree. The returned plan always launches the sealed native binary
+/// directly: agent-run adds no launch wrapper, so the shared store is guarded
+/// by owner-only modes and by digest verification before each launch, never by
+/// an OS-level write denial on the child or its descendants.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_selected_with(
     config: &ProviderConfig,
@@ -567,7 +569,7 @@ pub fn plan_selected_with(
                 .into_owned(),
         );
     }
-    let mut args = if sealed.harness == HarnessId::Codex {
+    let args = if sealed.harness == HarnessId::Codex {
         // The same fast-tier overrides the historical codex launch uses.
         let mut args: Vec<String> = Vec::new();
         if options.fast {
@@ -590,66 +592,9 @@ pub fn plan_selected_with(
             options.output_schema,
         )?
     };
-    // A shared layout launches only behind a proven guard, and the guard is
-    // proven here, before any child exists. The whole Codex app-server cannot
-    // be wrapped (its nested executor sandbox would fail), so Codex keeps its
-    // original managed profile and instead guards every harness-owned stdio
-    // MCP server through launch-time overrides compiled from the same frozen
-    // definitions the sealed native config carries. Claude and GLM children
-    // are wrapped whole, which constrains their descendants too.
-    let binary = match shared_assets {
-        Some(assets) => {
-            let guard = SharedAssetGuard::new(&assets.store_root)
-                .map_err(|error| Error::Unsupported(error.to_string()))?;
-            if sealed.harness == HarnessId::Codex {
-                let mut servers = BTreeMap::new();
-                let server_config = shared(config, role.worker_mcp)?;
-                let declared = role.mcp.iter().map(|server| server.id.clone()).chain(
-                    role.worker_mcp
-                        .then(|| agent_run_domain::worker::SERVER_NAME.to_owned()),
-                );
-                for name in declared {
-                    let server = server_config.mcp.get(&name).ok_or_else(|| {
-                        invalid(format!("frozen MCP server {name:?} is unavailable"))
-                    })?;
-                    servers.insert(
-                        name,
-                        crate::codex::SealedMcpServer {
-                            command: server.command.to_string_lossy().into_owned(),
-                            args: server.args.iter().map(|arg| arg.to_string()).collect(),
-                        },
-                    );
-                }
-                args.extend(crate::codex::shared_guard_mcp_overrides(
-                    &assets.store_root,
-                    &servers,
-                )?);
-                sealed.binary.clone()
-            } else {
-                // The wrapper itself always spawns, so an absent harness is
-                // refused here, before any child exists, exactly as the
-                // unwrapped spawn would refuse it.
-                if !std::fs::metadata(&sealed.binary)?.is_file() {
-                    return Err(invalid("sealed harness binary is not a file"));
-                }
-                // Import and GC use the same lock; the whole-child wrapper
-                // scans one stable store state.
-                let _publish_lock = SharedStoreLock::acquire(&assets.store_root)?;
-                let argv = guard
-                    .wrap(&sealed.binary, &args)
-                    .map_err(|error| Error::Unsupported(error.to_string()))?;
-                args = argv[1..]
-                    .iter()
-                    .map(|value| value.to_string_lossy().into_owned())
-                    .collect();
-                PathBuf::from(&argv[0])
-            }
-        }
-        None => sealed.binary.clone(),
-    };
     Ok(ProviderLaunchPlan {
         launch: LaunchPlan {
-            binary,
+            binary: sealed.binary.clone(),
             args,
             cwd: authority.workdir.clone(),
             environment,

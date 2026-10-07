@@ -1737,7 +1737,7 @@ fn concurrent_curated_freezes_and_thaws_stay_independent() {
 /// shape: 5380 files totalling ~53.6 MB in 2352 directories (depth 10) plus
 /// the 24,205,581-byte pack. Prints unique-inode bytes before, idle after
 /// both freezes, peak with one home thawed, and idle again after refreeze,
-/// plus first/second freeze, thaw, guard-scan and refreeze wall times.
+/// plus first/second freeze, thaw and refreeze wall times.
 /// Run with `cargo test --release ... -- --ignored --nocapture`.
 #[test]
 #[ignore = "measurement; run in release with --ignored --nocapture"]
@@ -1779,10 +1779,6 @@ fn measure_curated_increment() {
         }
     });
     let peak = bytes(&all);
-    let guard = agent_run_platform::shared_asset_guard::SharedAssetGuard::new(&store_root).unwrap();
-    let scan = timed("guard hardlink scan", &mut || {
-        guard.verify_no_hardlink_aliases().unwrap()
-    });
     timed("refreeze home 1 unchanged", &mut || {
         for root_key in [MIRROR, PACKS] {
             frozen(native_tree_cache::freeze(&store_root, &homes[0], root_key, &scope()).unwrap());
@@ -1792,6 +1788,6 @@ fn measure_curated_increment() {
     eprintln!(
         "measure unique-inode bytes: before={before} idle={idle} peak(one thawed)={peak} idle-after={after}"
     );
-    eprintln!("measure thaw+guard: {:.3}s", (thaw + scan).as_secs_f64());
+    eprintln!("measure thaw: {:.3}s", thaw.as_secs_f64());
     cleanup_store(&store_root);
 }

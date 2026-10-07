@@ -130,8 +130,7 @@ on reuse or collected as orphans.
 Shared-tree bounds (the platform store and this unit agree): 16384 manifest
 entries, 32 MiB per payload, a 4 MiB manifest read bound
 (`shared_assets::MAX_TREE_MANIFEST_BYTES`) for shared-tree manifests only,
-256 MiB aggregate per store tree; the launch guard scans at most 400 000
-store paths. Runtime indexes, `op.json`, markers, plugin views and managed
+256 MiB aggregate per store tree. Runtime indexes, `op.json`, markers, plugin views and managed
 snapshots keep their 64 KiB bounds; manifest bytes and digests are
 unchanged.
 

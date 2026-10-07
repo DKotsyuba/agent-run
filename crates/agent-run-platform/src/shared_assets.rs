@@ -178,7 +178,7 @@ impl SharedStoreLock {
     ///
     /// Returns `Ok(None)` when another cooperating process holds it, so a
     /// maintenance caller can skip this pass instead of stalling the broker
-    /// behind an import or a native guard preflight, and — with `create`
+    /// behind an import, and — with `create`
     /// unset — when the lock file does not exist yet, so a read-only caller
     /// never creates store state just to look at it. Any failure to open or
     /// lock the file other than those is an error, never a silent pass.
@@ -213,7 +213,7 @@ impl Drop for SharedStoreLock {
 /// descriptor opens and store-target derivation. Shared by this module's
 /// import/verify entry points and `snapshot_tree`'s explicit shared-bridge
 /// verifier, which derives each expected home symlink target from it.
-pub(crate) fn validated_root(store_root: &Path) -> Result<PathBuf> {
+pub fn validated_root(store_root: &Path) -> Result<PathBuf> {
     if !store_root.is_absolute() {
         return Err(invalid("shared store root must be absolute"));
     }
@@ -256,8 +256,9 @@ fn blob_name(sha256: &str, logical: u32) -> PathBuf {
 /// Returns the physical store mode for one normalized logical mode: readonly
 /// `0o400` for data, readonly-executable `0o500` for executables. The
 /// manifest's logical modes stay `0o600`/`0o700`; only the stored files are
-/// restricted, and restoring owner write later requires the verified native
-/// launch guard.
+/// restricted. The readonly bits stop accidental writes only; they are not a
+/// boundary against another process of the same user, and integrity rests on
+/// digest verification.
 fn physical_mode(logical: u32) -> u32 {
     if logical & 0o111 != 0 { 0o500 } else { 0o400 }
 }

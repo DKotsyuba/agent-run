@@ -271,6 +271,10 @@ fn plugin_parents(runtime_home: &Path) -> Result<Vec<String>> {
 /// Every step is reported and skipped on failure: an optional cache never
 /// turns a valid answer into a failure, and a failed preparation with a
 /// journal stays recoverable by the next entry or the operator.
+///
+/// `witness` must equal the app home's store root as returned by
+/// [`crate::supervisor::shared_publication_root`]; any other root is refused
+/// before the store is touched.
 pub fn consolidate(
     store: &mut Store,
     id: &AgentId,
@@ -278,7 +282,7 @@ pub fn consolidate(
     account: &AccountId,
     app_home: &Path,
     runtime_home: &Path,
-    qualified: &Path,
+    witness: &Path,
 ) -> Result<CacheConsolidation> {
     let mut report = CacheConsolidation::default();
     if identity.authority.harness != HarnessId::Codex {
@@ -286,9 +290,9 @@ pub fn consolidate(
         return Ok(report);
     }
     let root = crate::runtime_storage::store_root(app_home)?;
-    if root != qualified {
+    if root != witness {
         return Err(invalid(
-            "native cache publication requires the qualified shared store root",
+            "native cache publication requires the validated shared store root",
         ));
     }
     crate::native_tree_cache::recover(&root, runtime_home)?;
@@ -346,10 +350,10 @@ pub fn consolidate(
 
 /// Returns whether one home still holds any shared native or managed link.
 ///
-/// The launch path uses this to decide whether a home whose managed map is
-/// empty still launches behind the shared-store guard: a cache-only home
-/// reads through its native links, so the store must stay provably outside
-/// every root the child can write even when no managed root is mapped.
+/// Tells whether a home whose managed map is empty still reads through the
+/// store: a cache-only home reads through its native links, so a Codex grant
+/// must keep the store outside every root the child can write even when no
+/// managed root is mapped.
 pub fn holds_shared_links(app_home: &Path, runtime_home: &Path) -> Result<bool> {
     if !crate::runtime_storage::store_root(app_home)
         .map(|root| root.is_dir())
