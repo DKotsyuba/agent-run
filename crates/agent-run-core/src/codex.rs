@@ -280,7 +280,10 @@ impl Grant {
     /// read-only roles never write. Generated `Projects` grants validate the
     /// managed system policy or compose every configured root with the
     /// runtime cache locations, and network roles require an explicit
-    /// `workspace_network` opt-in.
+    /// `workspace_network` opt-in. Non-network grants always select the exact
+    /// built-in profile, so a managed default cannot replace legacy sandbox
+    /// fields during thread admission. Existing network override paths remain
+    /// unchanged and still require their effective grants to verify.
     pub fn new(
         runtime: &Runtime,
         request: &StartRequest,
@@ -311,7 +314,7 @@ impl Grant {
         let managed = system.is_some();
         let profile;
         if !role.write {
-            profile = managed.then(|| ":read-only".into());
+            profile = (managed || !role.network).then(|| ":read-only".into());
         } else if !runtime.workspace_roots.is_empty() && (managed || !role.network) {
             if role.network && !runtime.workspace_network {
                 return Err(invalid("network role requires workspace_network"));
@@ -338,7 +341,7 @@ impl Grant {
             if managed && role.network {
                 return Err(invalid("network role requires managed workspace_roots"));
             }
-            profile = managed.then(|| ":workspace".into());
+            profile = (managed || !role.network).then(|| ":workspace".into());
         }
         let network_access = if profile.as_deref() == Some("Projects") {
             runtime.workspace_network
@@ -362,6 +365,10 @@ impl Grant {
             permission_profile: profile,
         })
     }
+    /// Builds thread-start/resume fields from the already admitted grant.
+    /// Named and built-in profiles replace legacy sandbox fields; only the
+    /// existing unnamed network path retains its native network override.
+    /// No credentials are included and no state or filesystem data is changed.
     pub fn request(&self) -> Value {
         let mut v =
             json!({"cwd":self.cwd,"model":self.model,"approvalPolicy":self.approval_policy});

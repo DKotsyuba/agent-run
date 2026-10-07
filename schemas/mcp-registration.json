@@ -14,7 +14,7 @@
     "tool_timeout_seconds": null,
     "transport": "stdio"
   },
-  "product_version": "0.22.3",
+  "product_version": "0.22.4",
   "protocol_versions": [
     "2024-11-05",
     "2025-03-26",

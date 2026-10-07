@@ -13,6 +13,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   same-user write prevention is no longer claimed; tampering is detected at the
   next verification
 
+## 0.22.4
+
+- fix(codex): select explicit native permission profiles for shared-store
+  preflight and non-network thread start/resume on Codex CLI 0.160.1; preserve
+  managed requirements, grant verification and existing network override paths
+
 ## 0.22.3
 
 - feat(codex): add a global harness fast_mode switch for starts, pool members

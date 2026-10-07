@@ -504,6 +504,50 @@ fn python_test_codex_adapter_grant_keeps_read_and_write_authority_separate() {
     assert_eq!(grant.sandbox, "workspace-write");
 }
 
+/// New non-network grants select their exact native profile for both first
+/// starts and resumes; a managed default or missing profile echo is refused.
+#[test]
+fn non_network_grants_select_and_verify_builtin_profiles() {
+    for write in [false, true] {
+        let mut profile = read_only_profile(vec![]);
+        profile.write = write;
+        let grant = Grant::new(
+            &grant_runtime(&[]),
+            &grant_request("/private/tmp/work", write),
+            &profile,
+            std::path::Path::new("/private/tmp/home"),
+        )
+        .expect("matching grant");
+        let expected = if write { ":workspace" } else { ":read-only" };
+        let params = grant.request();
+        assert_eq!(params["permissions"], expected);
+        assert!(params.get("sandbox").is_none());
+        assert!(params.get("config").is_none());
+        assert_eq!(params["runtimeWorkspaceRoots"], json!(grant.roots));
+        let mut actual = json!({
+            "model": grant.model,
+            "cwd": grant.cwd,
+            "runtimeWorkspaceRoots": grant.roots,
+            "sandbox": {
+                "type": if write { "workspaceWrite" } else { "readOnly" },
+                "writableRoots": [],
+                "networkAccess": false
+            },
+            "approvalPolicy": grant.approval_policy,
+            "approvalsReviewer": grant.reviewer,
+            "activePermissionProfile": {"id": expected}
+        });
+        grant.verify(&actual).expect("exact explicit profile echo");
+        actual["activePermissionProfile"]["id"] = json!(":danger-full-access");
+        assert!(grant.verify(&actual).is_err());
+        actual
+            .as_object_mut()
+            .unwrap()
+            .remove("activePermissionProfile");
+        assert!(grant.verify(&actual).is_err());
+    }
+}
+
 /// Mirrors `test_codex_adapter.py::test_prepare_refuses_external_read_roots_with_write`.
 /// Mirrors `test_codex_adapter.py::test_prepare_rejects_write_workdir_outside_configured_project_root`.
 #[test]

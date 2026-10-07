@@ -481,7 +481,9 @@ fn native_history(session: &str, task: &str) {
 ///
 /// Answers `initialize`, `model/list` (model `fixture`), `thread/start` or
 /// `thread/resume` (echoing the requested grant and keeping the resumed
-/// thread id) and `turn/start`. It keeps a Codex-shaped rollout in
+/// thread id) and `turn/start`. Built-in workspace profiles and legacy write
+/// modes echo the matching filesystem mode without widening read-only grants.
+/// It keeps a Codex-shaped rollout in
 /// `$CODEX_HOME/sessions/.../rollout-fixture-<thread>.jsonl` with the turn
 /// input as the installed Codex records it: a user `message` whose
 /// `input_text` is the exact wire input, tagged with the turn id in
@@ -534,6 +536,16 @@ fn app_server() {
                     "runtimeWorkspaceRoots":params.get("runtimeWorkspaceRoots").cloned().unwrap_or_else(|| json!([params["cwd"]])),
                     "thread":{"id":thread,"status":{"type":"idle"}},"threadId":thread,
                 });
+                if params["permissions"].as_str() == Some(":workspace")
+                    || params["sandbox"].as_str() == Some("workspace-write")
+                {
+                    echo["sandbox"] = json!({
+                        "type": "workspaceWrite",
+                        "writableRoots": [],
+                        "networkAccess": params.pointer("/config/sandbox_workspace_write/network_access")
+                            .and_then(Value::as_bool).unwrap_or(false)
+                    });
+                }
                 if let Some(profile) = params["permissions"].as_str() {
                     echo["activePermissionProfile"] = json!({"id":profile});
                 }
