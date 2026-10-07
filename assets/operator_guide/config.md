@@ -16,6 +16,7 @@ remain within 30 days. This setting does not change collector or service timeout
 ```toml
 schema_version = 2
 [harnesses.codex]
+fast_mode = false # set true to force Fast across this harness
 binary = "/absolute/path/to/codex"
 home = "/absolute/path/to/agent-run/codex"
 [harnesses.claude-code]
@@ -64,6 +65,12 @@ narrow the catalog cap. See [MCP controls](../../docs/provider-config-v2.md#mcp-
 for native harness limits. Harnesses
 own native settings, hooks, plugins and workspace roots. Provider models carry
 explicit native aliases, effort settings, recommendations and restrictions.
+
+`harnesses.codex.fast_mode = true` forces Fast for every Codex provider/model
+and pool member, without a per-call flag. Default false keeps explicit `fast`.
+Resume reads the current flag; retries keep the admitted effective mode. Running
+processes do not change. Other harnesses reject true; reasoning effort is separate.
+Fast uses subscription limits/credits at higher rates.
 
 Tune an existing harness without overriding managed permissions:
 

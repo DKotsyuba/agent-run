@@ -717,7 +717,7 @@ pub fn qualify_for_native(
         identity.provider_request.task.as_str(),
         None,
         adapters::provider::LaunchOptions {
-            fast: identity.provider_request.fast,
+            fast: request.fast,
             output_schema: identity.provider_request.output_schema.as_ref(),
         },
         shared.as_ref(),
@@ -827,7 +827,7 @@ pub fn relocate_retained_home(
         identity.provider_request.task.as_str(),
         row.resume_of_runtime_session_id.as_deref(),
         adapters::provider::LaunchOptions {
-            fast: identity.provider_request.fast,
+            fast: row.request.fast,
             output_schema: identity.provider_request.output_schema.as_ref(),
         },
         None,
@@ -1134,7 +1134,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 identity.provider_request.task.as_str(),
                 row.resume_of_runtime_session_id.as_deref(),
                 adapters::provider::LaunchOptions {
-                    fast: identity.provider_request.fast,
+                    fast: row.request.fast,
                     output_schema: identity.provider_request.output_schema.as_ref(),
                 },
                 None,
@@ -1208,7 +1208,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             task,
             resume_session,
             adapters::provider::LaunchOptions {
-                fast: identity.provider_request.fast,
+                fast: row.request.fast,
                 output_schema: identity.provider_request.output_schema.as_ref(),
             },
             Some(&shared_assets),
