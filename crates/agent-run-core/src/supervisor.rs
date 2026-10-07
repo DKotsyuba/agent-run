@@ -481,6 +481,36 @@ fn probe_shared_guard(
     result
 }
 
+/// Builds the `codex sandbox` arguments (after the executable) that run
+/// `/bin/sh -c <script> -- <target>` under the grant's native boundary.
+///
+/// A named permission profile is selected with `--include-managed-config -P
+/// <profile> -C <cwd>`; the native CLI accepts `-C` only together with `-P`,
+/// so a grant without a profile passes `-c sandbox_mode="<mode>"` and no
+/// `-C`, and the caller must start the command in `grant.cwd` instead. Pure.
+fn codex_sandbox_args(grant: &crate::codex::Grant, script: &str, target: &Path) -> Vec<String> {
+    let mut args = vec!["sandbox".to_owned()];
+    match &grant.permission_profile {
+        Some(profile) => args.extend([
+            "--include-managed-config".to_owned(),
+            "-P".to_owned(),
+            profile.clone(),
+            "-C".to_owned(),
+            grant.cwd.clone(),
+        ]),
+        None => args.extend(["-c".to_owned(), format!("sandbox_mode={:?}", grant.sandbox)]),
+    }
+    args.extend([
+        "--".to_owned(),
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        script.to_owned(),
+        "--".to_owned(),
+        target.to_string_lossy().into_owned(),
+    ]);
+    args
+}
+
 /// Proves the selected native sandbox can read a shared sentinel, can neither
 /// change its bytes nor its mode, and can still write the admitted workspace
 /// when the role may. The mode check refuses sandboxes that only restrict
@@ -514,25 +544,7 @@ fn probe_codex_shared_root(
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&shared)?.permissions().mode();
         let run = |script: &str, target: &Path| -> Result<bool> {
-            let mut args = vec!["sandbox".to_owned()];
-            match &grant.permission_profile {
-                Some(profile) => args.extend([
-                    "--include-managed-config".to_owned(),
-                    "-P".to_owned(),
-                    profile.clone(),
-                ]),
-                None => args.extend(["-c".to_owned(), format!("sandbox_mode={:?}", grant.sandbox)]),
-            }
-            args.extend([
-                "-C".to_owned(),
-                grant.cwd.clone(),
-                "--".to_owned(),
-                "/bin/sh".to_owned(),
-                "-c".to_owned(),
-                script.to_owned(),
-                "--".to_owned(),
-                target.to_string_lossy().into_owned(),
-            ]);
+            let args = codex_sandbox_args(grant, script, target);
             let argv = if cfg!(target_os = "linux") {
                 guard
                     .wrap(binary, &args)
@@ -543,7 +555,11 @@ fn probe_codex_shared_root(
                     .collect()
             };
             let mut command = std::process::Command::new(&argv[0]);
-            command.args(&argv[1..]).env_clear().envs(environment);
+            command
+                .args(&argv[1..])
+                .current_dir(&grant.cwd)
+                .env_clear()
+                .envs(environment);
             probe_status(&mut command)
         };
         if !run("cat \"$1\" >/dev/null", &shared)? {
@@ -1205,10 +1221,11 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             Some(&shared_assets),
         )?;
         // Codex keeps its original managed profile and its own nested
-        // sandbox, so the app-server is never wrapped: the shared store must
-        // instead stay provably outside every root that profile can write and
-        // outside the temporary directories the native sandbox grants. The
-        // live app-server grant echo is still verified in the runner.
+        // sandbox. On macOS the app-server is never wrapped, and on Linux it
+        // runs whole under the shared-asset guard; on both the shared store
+        // must also stay provably outside every root that profile can write
+        // and outside the temporary directories the native sandbox grants.
+        // The live app-server grant echo is still verified in the runner.
         if identity.authority.harness == HarnessId::Codex {
             crate::codex::Grant::new(&planned.runtime, &row.request, &planned.profile, home)?
                 .admits_shared_root(&shared_assets.store_root)?;
@@ -2141,6 +2158,42 @@ mod tests {
         ]);
         let guard = agent_run_platform::shared_asset_guard::SharedAssetGuard::new(&root).unwrap();
         super::probe_codex_shared_root(&grant, &guard, &binary, &environment).unwrap();
+    }
+
+    /// The native CLI accepts `-C` only with a named profile: a profile grant
+    /// selects it with `-C`, a profile-less grant passes its sandbox mode and
+    /// no `-C`, and both keep the probe command after `--` unchanged.
+    #[test]
+    fn codex_sandbox_args_pass_cwd_only_with_a_named_profile() {
+        let mut grant = crate::codex::Grant {
+            model: "fixture".into(),
+            cwd: "/work".into(),
+            roots: vec!["/work".into()],
+            writable_roots: vec!["/work".into()],
+            sandbox: "workspace-write".into(),
+            approval_policy: "on-request".into(),
+            reviewer: None,
+            network_access: false,
+            permission_profile: Some("Projects".into()),
+        };
+        let tail = ["--", "/bin/sh", "-c", "true", "--", "/store/probe"];
+        let target = std::path::Path::new("/store/probe");
+        let named = super::codex_sandbox_args(&grant, "true", target);
+        let mut expected = vec![
+            "sandbox",
+            "--include-managed-config",
+            "-P",
+            "Projects",
+            "-C",
+            "/work",
+        ];
+        expected.extend(tail);
+        assert_eq!(named, expected);
+        grant.permission_profile = None;
+        let legacy = super::codex_sandbox_args(&grant, "true", target);
+        let mut expected = vec!["sandbox", "-c", "sandbox_mode=\"workspace-write\""];
+        expected.extend(tail);
+        assert_eq!(legacy, expected);
     }
 
     /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_blank_startup_error_uses_exception_type_in_ready_failure`.

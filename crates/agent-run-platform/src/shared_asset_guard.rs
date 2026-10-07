@@ -535,18 +535,22 @@ fn escape_seatbelt_regex(text: &str) -> String {
 /// [`SharedAssetGuard::verify_no_mount_aliases`].
 ///
 /// `table` is the raw mountinfo text, `mount_id` the id of the mount that
-/// path lookup of `root` reaches, and `root` the canonical shared root.
-/// Every mount of the same device (`major:minor`, shared by bind mounts and
-/// subvolumes of one filesystem) is compared through its filesystem subtree
-/// field. A mount whose subtree contains the root's subtree is an alias
-/// unless it maps the root back onto `root` itself (the root's own mount and
-/// ancestor binds stacked beneath it). A mount whose subtree lies inside the
-/// root's subtree is an alias unless it is mounted at the matching position
-/// beneath `root`, where the recursive read-only bind covers it. Returns
-/// `None` when no line carries `mount_id` or `root` does not lie beneath
-/// that mount's point, `Some(Err(mount point))` for the first alias, and
-/// `Some(Ok(()))` otherwise. Malformed lines are skipped and fields are
-/// decoded from mountinfo's octal escapes. Pure: no filesystem access.
+/// path lookup of `root` reaches, and `root` the canonical shared root. The
+/// store is made of pieces: the root's own mount, exposing its filesystem
+/// subtree at `root`, and every mount whose point lies strictly beneath
+/// `root` (of any device), exposing its subtree at that point. For each
+/// piece every mount of the same device (`major:minor`, shared by bind
+/// mounts and subvolumes of one filesystem) is compared through its
+/// filesystem subtree field. A mount whose subtree contains the piece's
+/// subtree is an alias unless it maps the piece back onto the piece's own
+/// path (the piece itself, and ancestor binds stacked beneath it). A mount
+/// whose subtree lies inside the piece's subtree is an alias unless it is
+/// mounted at the matching position beneath that path, where the recursive
+/// read-only bind covers it. Returns `None` when no line carries `mount_id`
+/// or `root` does not lie beneath that mount's point,
+/// `Some(Err(mount point))` for the first alias, and `Some(Ok(()))`
+/// otherwise. Malformed lines are skipped and fields are decoded from
+/// mountinfo's octal escapes. Pure: no filesystem access.
 #[cfg(any(target_os = "linux", test))]
 fn mount_alias(table: &str, mount_id: u64, root: &Path) -> Option<Result<(), PathBuf>> {
     let mounts: Vec<(u64, &str, PathBuf, PathBuf)> = table
@@ -561,20 +565,32 @@ fn mount_alias(table: &str, mount_id: u64, root: &Path) -> Option<Result<(), Pat
         })
         .collect();
     let (_, device, tree, point) = mounts.iter().find(|mount| mount.0 == mount_id)?;
-    let inner = tree.join(root.strip_prefix(point).ok()?);
-    for (_, other_device, other_tree, other_point) in &mounts {
-        if other_device != device {
-            continue;
-        }
-        let aliased = if let Ok(rest) = inner.strip_prefix(other_tree) {
-            other_point.join(rest) != root
-        } else if let Ok(rest) = other_tree.strip_prefix(&inner) {
-            *other_point != root.join(rest)
-        } else {
-            false
-        };
-        if aliased {
-            return Some(Err(other_point.clone()));
+    let mut pieces = vec![(
+        *device,
+        tree.join(root.strip_prefix(point).ok()?),
+        root.to_path_buf(),
+    )];
+    pieces.extend(
+        mounts
+            .iter()
+            .filter(|(_, _, _, point)| point != root && point.starts_with(root))
+            .map(|(_, device, tree, point)| (*device, tree.clone(), point.clone())),
+    );
+    for (device, inner, at) in &pieces {
+        for (_, other_device, other_tree, other_point) in &mounts {
+            if other_device != device {
+                continue;
+            }
+            let aliased = if let Ok(rest) = inner.strip_prefix(other_tree) {
+                other_point.join(rest) != *at
+            } else if let Ok(rest) = other_tree.strip_prefix(inner) {
+                *other_point != at.join(rest)
+            } else {
+                false
+            };
+            if aliased {
+                return Some(Err(other_point.clone()));
+            }
         }
     }
     Some(Ok(()))
@@ -734,8 +750,9 @@ mod tests {
     }
 
     /// Accepts the root's own mount, stacked ancestor binds and covered
-    /// submounts, and refuses bind or subvolume views exposing the root
-    /// elsewhere, including escaped mount point names.
+    /// submounts, and refuses bind or subvolume views exposing the root or
+    /// any submount beneath it (also of another device) elsewhere, including
+    /// escaped mount point names.
     #[test]
     fn mount_alias_classifies_same_filesystem_views() {
         let root = Path::new("/home/u/.agent-run/shared-assets/v1");
@@ -765,6 +782,23 @@ mod tests {
             mount_alias(&inner, 30, root),
             Some(Err(PathBuf::from("/srv/trees")))
         );
+        let submount = format!(
+            "{own}60 30 0:50 / /home/u/.agent-run/shared-assets/v1/trees rw - tmpfs none rw\n\
+             61 60 0:50 /sub /home/u/.agent-run/shared-assets/v1/trees/sub rw - tmpfs none rw\n"
+        );
+        assert_eq!(mount_alias(&submount, 30, root), Some(Ok(())));
+        for (alias, point) in [
+            ("70 1 0:50 / /srv/alias rw - tmpfs none rw\n", "/srv/alias"),
+            (
+                "71 1 0:50 /sub/deep /srv/deep rw - tmpfs none rw\n",
+                "/srv/deep",
+            ),
+        ] {
+            assert_eq!(
+                mount_alias(&format!("{submount}{alias}"), 30, root),
+                Some(Err(PathBuf::from(point)))
+            );
+        }
         assert_eq!(
             unescape_mountinfo("/a\\011b\\134c\\9"),
             PathBuf::from("/a\tb\\c\\9")
@@ -788,6 +822,51 @@ mod tests {
                 assert!(!Path::new(LINUX_BWRAP).exists(), "{why}");
             }
             Err(other) => panic!("{other}"),
+        }
+    }
+
+    /// Live mount-table check of a different-device submount beneath the
+    /// root, built without host privileges inside a fresh user and mount
+    /// namespace: a tmpfs at `<root>/trees` alone passes, and the same tmpfs
+    /// also bound at `<work>/alias` is refused as an alias. The test re-runs
+    /// its own binary inside each namespace; `GUARD_ALIAS_ROOT` and
+    /// `GUARD_ALIAS_EXPECT` (`clean` or `aliased`) select that child role.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires unshare, mount and unprivileged user and mount namespaces"]
+    fn live_submount_alias_is_refused() {
+        if let Some(root) = std::env::var_os("GUARD_ALIAS_ROOT") {
+            let guard = SharedAssetGuard::new(Path::new(&root)).unwrap();
+            match std::env::var("GUARD_ALIAS_EXPECT").unwrap().as_str() {
+                "clean" => guard.verify_no_mount_aliases().unwrap(),
+                _ => assert!(matches!(
+                    guard.verify_no_mount_aliases(),
+                    Err(SharedAssetGuardError::AliasedMount(point)) if point.ends_with("alias")
+                )),
+            }
+            return;
+        }
+        let (_temp, root, work) = fixture();
+        std::fs::create_dir(root.join("trees")).unwrap();
+        std::fs::create_dir(work.join("alias")).unwrap();
+        let test = std::env::current_exe().unwrap();
+        for (expect, alias) in [
+            ("clean", ""),
+            ("aliased", " && mount --bind \"$1/trees\" \"$2/alias\""),
+        ] {
+            let script = format!(
+                "mount -t tmpfs none \"$1/trees\"{alias} && exec \"$3\" --exact \
+                 shared_asset_guard::tests::live_submount_alias_is_refused \
+                 --include-ignored --test-threads 1"
+            );
+            let status = std::process::Command::new("unshare")
+                .args(["-Urm", "sh", "-c", &script, "sh"])
+                .args([&root, &work, &test])
+                .env("GUARD_ALIAS_ROOT", &root)
+                .env("GUARD_ALIAS_EXPECT", expect)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{expect}");
         }
     }
 

@@ -416,7 +416,20 @@ pub fn plan_selected(
 /// credentials only into the child environment. `shared` names the
 /// committed shared-store placement of the home's managed trees, when the
 /// registry recorded one; without it the sealed home verifies strictly as a
-/// private tree.
+/// private tree and the launch is the sealed binary unwrapped.
+///
+/// With `shared`, the launch is guarded by the shared-asset guard of
+/// `shared.store_root`. Claude and GLM, and Codex on Linux, are wrapped
+/// whole: `launch.binary` becomes the guard helper (`sandbox-exec` or
+/// `bwrap`) with the sealed binary and its arguments after `--`, under the
+/// store's publish lock while the guard's alias scans run. Codex on macOS
+/// keeps its sealed binary and instead gains `-c` overrides wrapping every
+/// harness-owned stdio MCP server. `runtime.binary` always names the frozen
+/// native executable, which callers use for native probes. A missing guard
+/// helper, an invalid root, an alias or an unnamable MCP server is an
+/// `Unsupported` or invalid error before any child exists. Planning only
+/// validates and builds argv: whether the kernel admits the guard's
+/// namespaces is proven by the supervisor's qualification probes, not here.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_selected_with(
     config: &ProviderConfig,
