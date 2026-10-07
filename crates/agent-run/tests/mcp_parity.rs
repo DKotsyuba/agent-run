@@ -739,6 +739,8 @@ fn resume_missing_broker_and_lost_response_keep_reconciliation_identity() {
 }
 /// The real binary must reject a nearly-one-MiB string ID before routing even
 /// a read-only doc call. A normal opaque ID still echoes in one complete frame.
+/// Empty startup connections are not dispatches; partial frames and unexpected
+/// read failures remain fixture errors, and actual calls are counted unchanged.
 #[test]
 fn long_rpc_ids_are_rejected_before_tool_dispatch() {
     use std::sync::{
@@ -764,9 +766,22 @@ fn long_rpc_ids_are_rejected_before_tool_dispatch() {
                         .set_write_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
                     let mut line = String::new();
-                    BufReader::new(stream.try_clone().unwrap())
-                        .read_line(&mut line)
-                        .unwrap();
+                    match BufReader::new(stream.try_clone().unwrap()).read_line(&mut line) {
+                        Ok(0) => continue,
+                        Err(error)
+                            if line.is_empty()
+                                && matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock
+                                        | std::io::ErrorKind::TimedOut
+                                        | std::io::ErrorKind::ConnectionReset
+                                ) =>
+                        {
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(error) => panic!("fixture broker read: {error}"),
+                    }
                     let call: Value = serde_json::from_str(&line).unwrap();
                     assert_eq!(call["method"], "doc");
                     seen.fetch_add(1, Ordering::SeqCst);
