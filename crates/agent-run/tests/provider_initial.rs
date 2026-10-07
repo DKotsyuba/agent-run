@@ -4708,16 +4708,14 @@ async fn narrow_window_exhaustion_is_not_carried_into_other_models() {
     assert!(candidate_accounts(&home, "fixture").contains(&"acct-work".to_owned()));
 }
 
-/// Every Claude/GLM launch is bound to the shared store even before anything
-/// was ever published: the supervisor creates the empty trusted store before
-/// the child exists, so an object another run publishes while this private
-/// run is already live stays read-only to it. The object is owner-writable,
-/// so the denial is the launch guard, never a file mode. With the store then
-/// present, a second independent start prepares its still-absent fresh home
-/// and a resume prepares its retained one.
+/// Every Claude/GLM launch names the shared store even before anything was
+/// ever published: the supervisor creates the empty trusted store before the
+/// child exists, and runs the native binary directly with no launch wrapper, so
+/// the fixture child's own writes are governed by its native permissions only.
+/// With the store then present, a second independent start prepares its
+/// still-absent fresh home and a resume prepares its retained one.
 #[tokio::test]
-async fn private_launch_is_guarded_before_the_first_publication() {
-    use std::{io::Write, os::unix::fs::PermissionsExt};
+async fn private_launch_creates_the_store_before_the_first_publication() {
     let (_temp, home) = home();
     let store_root = home.join("shared-assets/v1");
     assert!(
@@ -4725,56 +4723,20 @@ async fn private_launch_is_guarded_before_the_first_publication() {
         "nothing is shared before the first launch"
     );
     let service = Service::new(home.clone());
-    let mut first = request(&home);
-    first.task = "fixture:shared-write".into();
+    let first = request(&home);
     let admitted = service
         .admit_provider_trusted(first, candidates(committed(&home)))
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
-    let mut child = supervisor(&home, &id);
-    // The launch itself creates the store; publish only after that, while the
-    // already-running child waits for the object.
-    tokio::time::timeout(Duration::from_secs(20), async {
-        while !store_root.is_dir() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the launch creates the trusted store before its child");
-    let object = store_root.join("fixture-published");
-    fs::write(&object, b"original").unwrap();
-    fs::set_permissions(&object, fs::Permissions::from_mode(0o600)).unwrap();
-    let exit = tokio::time::timeout(Duration::from_secs(20), child.wait())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(exit.success(), "supervisor exit: {exit}");
+    run_to_end(&home, &id).await;
     assert_eq!(
         Store::open(&home).unwrap().get(&id).unwrap().status,
         Status::Succeeded
     );
-    let report: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(home.join("shared-write.json")).unwrap()).unwrap();
-    assert_eq!(
-        report,
-        serde_json::json!({
-            "present": true, "write_denied": true, "chmod_denied": true, "create_denied": true,
-        }),
-        "the live private child cannot change a later publication"
+    assert!(
+        store_root.is_dir(),
+        "the launch creates the trusted store before its child"
     );
-    assert_eq!(fs::read(&object).unwrap(), b"original");
-    assert_eq!(
-        fs::metadata(&object).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    assert!(!store_root.join("fixture-injected").exists());
-    // Outside the guard the same object is writable: the denial was the guard.
-    fs::OpenOptions::new()
-        .append(true)
-        .open(&object)
-        .unwrap()
-        .write_all(b"!")
-        .unwrap();
 
     // A second independent start with the store present: its fresh home is
     // absent until sealed and prepares instead of failing native recovery.
@@ -4811,9 +4773,9 @@ async fn private_launch_is_guarded_before_the_first_publication() {
 }
 
 /// A Codex run whose role carries a managed skill is materialized, relocated
-/// into the shared store behind the real qualification, launched through its
+/// into the shared store after store validation, launched through its
 /// committed registry mapping, and after cleanup still consolidates its native
-/// caches: the post-cleanup qualification plans through that same verified
+/// caches: the post-cleanup publication plans through that same verified
 /// mapping instead of the strict private verifier, which rejects the managed
 /// link and would silently skip every managed-role home.
 #[tokio::test]
@@ -4850,11 +4812,11 @@ async fn managed_codex_home_consolidates_through_its_registry_mapping() {
     assert_eq!(events("native_cache_consolidated"), 1);
 }
 
-/// Claude/GLM qualification probes the original harness even after its
-/// managed layout makes the launch plan a sandbox-exec wrapper. Offline
-/// compaction must still qualify the sealed native executable.
+/// A managed Claude home relocates into the shared store and launches its
+/// sealed native executable directly. Offline compaction must still consolidate
+/// it.
 #[tokio::test]
-async fn managed_claude_home_qualifies_the_native_binary() {
+async fn managed_claude_home_launches_the_native_binary_directly() {
     let (_temp, home) = home();
     let profile = home.join("profiles/review.md");
     fs::write(
@@ -4902,7 +4864,7 @@ async fn managed_claude_home_qualifies_the_native_binary() {
 /// Repeated offline compaction reaches a home that is already shared: after
 /// a managed-role Codex run committed its layout, a remote plugin parent the
 /// home accumulated later is frozen by `storage compact --apply` through the
-/// real qualification, and the committed home is not relocated again.
+/// validated store root, and the committed home is not relocated again.
 #[tokio::test]
 async fn repeat_compact_consolidates_caches_of_an_already_shared_home() {
     let (_temp, home) = codex_home_with(&["ok"]);

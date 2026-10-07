@@ -30,39 +30,51 @@ payload byte is copied. Ordinary skill and other roots keep the plain
 whole-root link; the original index bytes and index SHA-256 never change.
 Owner-only writable directory modes let the broker publish and collect on
 macOS versions that refuse renaming write-disabled directories. Payload files
-remain readonly; the qualified native shared-root guard prevents agent writes,
-entry replacement and permission changes throughout the store.
+remain readonly. Agent Run adds no OS-level write denial for the store (see
+"Enforcement" below): payload immutability is a mode and digest-verification
+property, not a sandbox guarantee.
 Collection must drain obsolete `plugin-views` containers **before** the
 trees and blobs beneath them, and treat every view still referenced by a
 registered layout row as live (`agent-run-platform::plugin_views::{plugin_mount,
 view_root, verify_view}` derive and check the exact names).
 
-The supervisor validates the real native guard before moving a fresh home.
-It creates a unique owned sentinel in the shared root, then runs a finite
-`sandbox-exec` child that must read it and fail to write it. For Codex it also
-compares the root with every effective writable grant and native temporary
-root, then runs the selected Codex binary's `sandbox` command with the same
-private config and permission profile. That command must read the sentinel,
-fail to alter it, and write an owned workspace sentinel when the admitted
-role allows writes. Claude and GLM instead run guarded `--version` metadata
-startup. Each probe has a five-second process bound and removes only its own
-sentinels. A failed or unsupported native check refuses conversion and launch.
-The preflight holds the store's publish/GC lock while its sentinel files exist
-and while guard scans run; install releases and reacquires that lock at its own
-prepare and import steps. Launch wrapper scans use the same lock.
+## Enforcement
 
-Codex keeps its original app-server and nested sandbox. The launch adds
-native `-c` overrides that wrap each harness-owned stdio MCP child with
-`sandbox-exec`, leaving the sealed config bytes, account environment, tool
-filters and approvals unchanged. Server names that the native override key
-cannot address unambiguously are refused. Claude and GLM launch their whole
-child process under the guard. An already-running external MCP server or
-daemon is outside the child guard; it is not treated as a protected child.
+Agent Run does not wrap any harness or MCP child in a launch sandbox, and it
+runs no write probes against the store. Before moving a fresh home the
+supervisor only validates the store root: it is created owner-only when
+absent and must be an existing absolute real directory whose canonical form
+equals its path, so no symlinked component aliases it. For Codex the
+effective grant must also keep the store outside every writable root and
+native temporary root; otherwise the conversion is refused and the home stays
+private. Claude and GLM launch their sealed native executable directly with
+their own tool and permission modes, and Codex keeps its original app-server,
+native sandbox, approvals and network policy unchanged. Harness-owned stdio
+MCP servers start exactly as the sealed config declares them.
 
-The guard's path and hardlink scan runs at launch time. It cannot control an
-unrelated same-UID process that later creates a new alias, or retroactively
-constrain another process. Shared conversion currently covers the roots in
-the frozen runtime index. Native unindexed caches remain separate work.
+What this does and does not guarantee:
+
+- Hashes, manifests, no-follow descriptor opens, atomic import/switch,
+  recovery journals, the store publish/GC lock and reference-aware collection
+  are unchanged. Launch and resume still verify the original index and the
+  shared tree content, so a modified payload, a replaced link or a foreign
+  target is refused at the next verification.
+- Nothing prevents a process running as the same user — including a harness
+  child that its own native permissions allow to write there, an MCP server,
+  or an unrelated process — from modifying, replacing or chmod-ing the store
+  between verifications. Detection happens at the next launch or verification;
+  prevention is not claimed, and `0o500`/`0o700` modes are not a security
+  boundary against the same UID. Codex's own native sandbox still applies
+  whatever Seatbelt or equivalent restrictions the selected Codex profile
+  enforces; Agent Run neither adds to nor removes them.
+- The pre-launch external-hardlink alias scan is gone with the path-deny
+  rules it protected. An alias that survives outside the store is therefore
+  not refused up front; the content digest check remains the detector.
+- An already-running external MCP server or daemon is outside any Agent Run
+  control, as before.
+
+Shared conversion currently covers the roots in the frozen runtime index.
+Native unindexed caches remain separate work.
 
 Operator migration of retained homes and shared-store collection are wired:
 `agent-run storage status | compact | recover` surveys, relocates and

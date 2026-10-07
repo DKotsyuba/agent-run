@@ -13,12 +13,9 @@ use crate::{
 };
 use agent_run_config::role_plan::ResolvedRolePlan;
 use agent_run_domain::catalog::{AccountId, HarnessId};
-use agent_run_platform::{shared_asset_guard::SharedAssetGuard, shared_assets::SharedStoreLock};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::os::unix::process::CommandExt;
 use std::{
     ffi::OsStr,
     path::{Path, PathBuf},
@@ -439,167 +436,13 @@ pub fn managed_scope() -> String {
     fs::sha256(format!("agent-run/managed-assets/v1:{uid}").as_bytes())
 }
 
-/// Runs one metadata-only native probe with a five-second bound and an owned
-/// process group, so a stuck sandbox helper cannot outlive this preflight.
-fn probe_status(command: &mut std::process::Command) -> Result<bool> {
-    command
-        .process_group(0)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let mut child = command.spawn()?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status.success());
-        }
-        if std::time::Instant::now() >= deadline {
-            // SAFETY: this child was started in its own group and is still
-            // observed alive above, so the negative PID names only that group.
-            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-            let _ = child.kill();
-            child.wait()?;
-            return Err(Error::Unsupported(
-                "native shared-asset preflight timed out".into(),
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-}
-
-/// Applies the actual Seatbelt wrapper to an owned shared sentinel and proves
-/// that a child can read it but cannot write it. The sentinel is removed even
-/// when the native probe fails or times out.
-fn probe_shared_guard(
-    guard: &SharedAssetGuard,
-    environment: &BTreeMap<String, String>,
-) -> Result<()> {
-    let sentinel = guard.root().join(format!(
-        ".agent-run-probe-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&sentinel)?;
-    if let Err(error) = file.write_all(b"original") {
-        let _ = std::fs::remove_file(&sentinel);
-        return Err(error.into());
-    }
-    drop(file);
-    let result = (|| -> Result<()> {
-        let args = vec![
-            "-c".to_owned(),
-            "cat \"$1\" >/dev/null && ! printf changed > \"$1\"".to_owned(),
-            "--".to_owned(),
-            sentinel.to_string_lossy().into_owned(),
-        ];
-        let argv = guard
-            .wrap(Path::new("/bin/sh"), &args)
-            .map_err(|error| Error::Unsupported(error.to_string()))?;
-        let mut command = std::process::Command::new(&argv[0]);
-        command.args(&argv[1..]).env_clear().envs(environment);
-        if !probe_status(&mut command)? || std::fs::read(&sentinel)? != b"original" {
-            return Err(Error::Unsupported(
-                "native shared-asset guard did not deny writes".into(),
-            ));
-        }
-        Ok(())
-    })();
-    std::fs::remove_file(&sentinel)?;
-    result
-}
-
-/// Proves the selected native sandbox can read a shared sentinel, cannot
-/// change it, and can still write the admitted workspace when the role may.
-/// Probe files are created exclusively and removed on every outcome.
-fn probe_codex_shared_root(
-    grant: &crate::codex::Grant,
-    binary: &Path,
-    environment: &BTreeMap<String, String>,
-    root: &Path,
-) -> Result<()> {
-    let name = format!(".agent-run-probe-{}", uuid::Uuid::new_v4().simple());
-    let shared = root.join(&name);
-    let workspace = Path::new(&grant.cwd).join(&name);
-    let mut shared_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&shared)?;
-    if let Err(error) = shared_file.write_all(b"original") {
-        let _ = std::fs::remove_file(&shared);
-        return Err(error.into());
-    }
-    drop(shared_file);
-    let mut workspace_created = false;
-    let result = (|| -> Result<()> {
-        let run = |script: &str, target: &Path| -> Result<bool> {
-            let mut command = std::process::Command::new(binary);
-            command.arg("sandbox");
-            if let Some(profile) = &grant.permission_profile {
-                command
-                    .arg("--include-managed-config")
-                    .arg("-P")
-                    .arg(profile);
-            } else {
-                command
-                    .arg("-c")
-                    .arg(format!("sandbox_mode={:?}", grant.sandbox));
-            }
-            command
-                .arg("-C")
-                .arg(&grant.cwd)
-                .arg("--")
-                .arg("/bin/sh")
-                .arg("-c")
-                .arg(script)
-                .arg("--")
-                .arg(target)
-                .env_clear()
-                .envs(environment);
-            probe_status(&mut command)
-        };
-        if !run("cat \"$1\" >/dev/null", &shared)? {
-            return Err(Error::Unsupported(
-                "native Codex sandbox cannot read shared assets".into(),
-            ));
-        }
-        if run("printf changed > \"$1\"", &shared)? || std::fs::read(&shared)? != b"original" {
-            return Err(Error::Unsupported(
-                "native Codex sandbox can change shared assets".into(),
-            ));
-        }
-        if grant.sandbox == "workspace-write" {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&workspace)?;
-            workspace_created = true;
-            if !run("printf ok > \"$1\"", &workspace)? || std::fs::read(&workspace)? != b"ok" {
-                return Err(Error::Unsupported(
-                    "native Codex sandbox cannot write its admitted workspace".into(),
-                ));
-            }
-        }
-        Ok(())
-    })();
-    let shared_cleanup = std::fs::remove_file(&shared);
-    let workspace_cleanup = if workspace_created {
-        std::fs::remove_file(&workspace)
-    } else {
-        Ok(())
-    };
-    shared_cleanup?;
-    workspace_cleanup?;
-    result
-}
-
 /// Installs the shared layout for one freshly sealed provider home.
 ///
 /// Planning is read-only; a home whose index maps no managed roots, or one
 /// already committed to the same digest, needs no work. Before anything is
-/// pinned or moved, a real guard for the canonical shared store is proven on
-/// this host and the Codex grant, when present, must exclude it. An unsupported
-/// guard is a refusal, never a silent private fallback. The install itself is the registry-backed coordinator, which
+/// pinned or moved, the canonical shared store is validated and the Codex
+/// grant, when present, must exclude it from every writable and temporary
+/// root. A refusal never falls back to a silent private copy. The install itself is the registry-backed coordinator, which
 /// pins its references before importing, switches roots behind a token-bound
 /// in-home backup, proves the unchanged original index, commits, and removes
 /// only backups proven to still hold the replaced assets.
@@ -609,7 +452,6 @@ fn install_shared_assets(
     runtime_home: &Path,
     expected: &str,
     owner: &AgentId,
-    preliminary: &adapters::provider::ProviderLaunchPlan,
     codex_grant: Option<&crate::codex::Grant>,
 ) -> Result<()> {
     let scope = managed_scope();
@@ -618,71 +460,44 @@ fn install_shared_assets(
     else {
         return Ok(());
     };
-    qualify_shared_root(app_home, preliminary, codex_grant)?;
+    shared_publication_root(app_home, codex_grant)?;
     crate::runtime_storage::install(store, app_home, &layout, Some(owner))
 }
 
-/// Proves this host's real sandbox boundary keeps the shared store read-only
-/// for one frozen launch, and returns the qualified store root as the witness
+/// Validates the shared store and returns its canonical root as the witness
 /// every publication path must hold.
 ///
-/// This is the one qualification body: a Seatbelt sentinel under the
-/// store-wide publish lock that a child can read but not write, plus the
-/// harness's own boundary — for Codex, the grant must keep the store outside
-/// every admitted writable and temporary root and the native sandbox must
-/// prove read-only against a real sentinel; for every other harness the
-/// guarded metadata probe of the frozen native executable, even when the
-/// supplied launch plan already wraps it. The returned path is the only root a caller may
-/// publish into: `consolidate` refuses any other, so an unqualified
-/// publication cannot masquerade as a qualified one.
-pub fn qualify_shared_root(
+/// The store directory is created owner-only when absent and must be an
+/// existing absolute real directory whose canonical form equals its path, so no
+/// symlinked component can alias it. For Codex the grant must also keep the
+/// store outside every admitted writable and temporary root. There is no
+/// OS-level write denial for the launched harness: the store's immutability
+/// rests on owner-only modes plus digest verification before each launch, and a
+/// same-UID process can still alter it between verifications. The returned path
+/// is the only root a caller may publish into: `consolidate` refuses any
+/// other, so an unvalidated publication cannot masquerade as a validated one.
+pub fn shared_publication_root(
     app_home: &Path,
-    preliminary: &adapters::provider::ProviderLaunchPlan,
     codex_grant: Option<&crate::codex::Grant>,
 ) -> Result<PathBuf> {
     let root = crate::runtime_storage::store_root(app_home)?;
     fs::private_dir(&root)?;
-    // The publisher/GC lock excludes inode changes while sentinels exist and
-    // wrap scans run. Drop it before any later step acquires it internally.
-    let publish_lock = SharedStoreLock::acquire(&root)?;
-    let guard =
-        SharedAssetGuard::new(&root).map_err(|error| Error::Unsupported(error.to_string()))?;
-    probe_shared_guard(&guard, &preliminary.launch.environment)?;
+    let root = agent_run_platform::shared_assets::validated_root(&root)?;
     if let Some(grant) = codex_grant {
         grant.admits_shared_root(&root)?;
-        probe_codex_shared_root(
-            grant,
-            &preliminary.launch.binary,
-            &preliminary.launch.environment,
-            &root,
-        )?;
-    } else {
-        let version = vec!["--version".to_owned()];
-        let argv = guard
-            .wrap(&preliminary.runtime.binary, &version)
-            .map_err(|error| Error::Unsupported(error.to_string()))?;
-        let mut command = std::process::Command::new(&argv[0]);
-        command
-            .args(&argv[1..])
-            .env_clear()
-            .envs(&preliminary.launch.environment);
-        if !probe_status(&mut command)? {
-            return Err(Error::Unsupported(
-                "guarded harness version probe failed".into(),
-            ));
-        }
     }
-    drop(publish_lock);
     Ok(root)
 }
 
-/// Qualifies the shared store for one frozen execution's native publication.
+/// Validates the shared store for one frozen execution's native publication.
 ///
 /// Builds the exact launch plan the sealed home would launch with — frozen
-/// configuration and authority, recorded account, host environment — and runs
-/// the real guard qualification against it. A failure means the home stays
-/// private: no anchor, no shared link, nothing published.
-pub fn qualify_for_native(
+/// configuration and authority, recorded account, host environment — so a
+/// home that cannot launch is refused, and derives the Codex grant from it.
+/// [`shared_publication_root`] then validates the store against that grant. A
+/// failure means the home stays private: no anchor, no shared link, nothing
+/// published.
+pub fn native_publication_root(
     store: &Store,
     home: &Path,
     identity: &ProviderLaunchIdentity,
@@ -690,9 +505,8 @@ pub fn qualify_for_native(
     runtime_home: &Path,
     request: &domain::StartRequest,
 ) -> Result<PathBuf> {
-    // Native preparation precedes the qualification probes themselves: a
-    // frozen remote plugin parent must be private again before any child —
-    // including a probe child — could write to it.
+    // Native preparation precedes planning and publication: a frozen remote
+    // plugin parent must be private again before any child could write to it.
     crate::runtime_cache::prepare_native(home, runtime_home, true)?;
     let config = &identity.provider_config;
     let catalog = config.resolve_catalog(store.list_accounts()?)?;
@@ -732,7 +546,7 @@ pub fn qualify_for_native(
     } else {
         None
     };
-    qualify_shared_root(home, &preliminary, codex_grant.as_ref())
+    shared_publication_root(home, codex_grant.as_ref())
 }
 
 /// The result of one operator-driven relocation of a retained sealed home.
@@ -747,17 +561,16 @@ pub enum Relocation {
     Skipped { reason: String, private_bytes: u64 },
 }
 
-/// Relocates one already-sealed retained home behind the real guard preflight.
+/// Relocates one already-sealed retained home after the launch preflight.
 ///
 /// This is the narrow trusted seam for operator compaction: it replays the
-/// supervisor's own qualification exactly — the recorded launch identity (and
+/// supervisor's own preflight exactly — the recorded launch identity (and
 /// the frozen configuration and authority it carries), the account the
-/// agent's attempt was actually admitted with, and the same native
-/// sandbox/permission probes — and only then hands the home to the registry
-/// coordinator. It never rewrites the frozen identity or configuration to
-/// make a check pass, never guesses the current provider, and never launches
-/// a model: the probes are the metadata-only ones the launch preflight uses.
-/// An unsupported guard, a vanished workdir or binary, or an unverifiable
+/// agent's attempt was actually admitted with, and the Codex grant derived
+/// from them — and only then hands the home to the registry coordinator. It
+/// never rewrites the frozen identity or configuration to make a check pass,
+/// never guesses the current provider, and never launches a model. An
+/// invalid store root, a vanished workdir or binary, or an unverifiable
 /// grant surfaces as [`Relocation::Skipped`] with the reason and the bytes
 /// still held privately; the home itself is untouched.
 pub fn relocate_retained_home(
@@ -854,7 +667,6 @@ pub fn relocate_retained_home(
         &runtime_home,
         identity.authority.assets_sha256.as_str(),
         agent,
-        &preliminary,
         codex_grant.as_ref(),
     ) {
         Ok(()) => Ok(Relocation::Installed),
@@ -883,9 +695,9 @@ pub fn consolidate_retained_native(
     let account = store
         .recorded_account(agent)
         .map_err(|error| error.to_string())?;
-    // Native caches publish only behind the same real qualification as a
-    // managed relocation, replayed from the recorded frozen authority.
-    let qualified = qualify_for_native(
+    // Native caches publish only into the root validated exactly as a managed
+    // relocation validates it, replayed from the recorded frozen authority.
+    let witness = native_publication_root(
         store,
         app_home,
         &identity,
@@ -901,7 +713,7 @@ pub fn consolidate_retained_native(
         &account,
         app_home,
         &runtime_home,
-        &qualified,
+        &witness,
     )
     .map_err(|error| error.to_string())?;
     serde_json::to_value(&report).map_err(|error| error.to_string())
@@ -958,13 +770,12 @@ fn private_managed_bytes(home: &Path) -> u64 {
 
 /// Returns the shared placement every harness launch is bound to.
 ///
-/// The trusted store namespace is created empty when absent, so protection
-/// exists before the first publication and creation order cannot leave a
-/// private run unguarded while another later shares objects. The roots are
+/// The trusted store namespace is created empty when absent, so every launch
+/// names the same canonical root whatever the creation order. The roots are
 /// the home's verified committed registry mapping when one exists — a
 /// still-prepared row is an explicit refusal — and an empty map otherwise:
-/// the launch still verifies through the shared bridge and the store stays
-/// outside every writable root the child is granted.
+/// the launch still verifies through the shared bridge and a Codex grant must
+/// keep the store outside every writable root.
 pub fn launch_shared_assets(
     store: &Store,
     app_home: &Path,
@@ -1089,9 +900,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         let agent_dir = home.join("agents").join(id.as_str());
         fs::private_dir(&agent_dir)?;
         store.event(id, "phase", &json!({"phase":"preparing"}))?;
-        // Native caches precede every probe and child of this attempt —
-        // including the qualification probes the seal branch runs below:
-        // recover this home's own interrupted native operations, then thaw
+        // Native caches precede every child of this attempt: recover this home's own interrupted native operations, then thaw
         // every frozen remote plugin parent, because the native store
         // rewrites those in place and a frozen parent must be private again
         // before anything can write to it.
@@ -1118,8 +927,8 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 &format!("snapshot:v2:{}", digest.as_str()),
             )?;
             // The sealed home, identity and index digest are durable; only
-            // now may its managed trees move into the shared store, behind a
-            // proven guard, so the next attempt and any resume verify the
+            // now may its managed trees move into the shared store, after the
+            // store root and Codex grant are validated, so the next attempt and any resume verify the
             // same original index through the registry.
             let host: BTreeMap<String, String> = std::env::vars().collect();
             let preliminary = adapters::provider::plan_selected_with(
@@ -1155,7 +964,6 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 &runtime_home,
                 digest.as_str(),
                 id,
-                &preliminary,
                 codex_grant.as_ref(),
             )?;
         } else {
@@ -1166,13 +974,10 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 identity.authority.assets_sha256.as_str(),
             )?;
         }
-        // The guard is global and creation-order safe, not per-home: the
-        // trusted store namespace is ensured before every harness launch and
-        // every launch is bound to it — Claude and GLM children are wrapped
-        // whole and a Codex grant must keep the store outside its writable
-        // roots — so a private run started before anything was published
-        // cannot write objects a later run shares, even though it maps none
-        // itself. A committed shared layout joins the plan through its
+        // The trusted store namespace is ensured before every harness launch
+        // and a Codex grant must keep it outside its writable roots. There is
+        // no launch wrapper: a Claude or GLM child runs with its own native
+        // permissions. A committed shared layout joins the plan through its
         // verified registry mapping; anything still pending was recovered or
         // refused above.
         let shared_assets = launch_shared_assets(store, home, &runtime_home)?;
@@ -1213,11 +1018,11 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             },
             Some(&shared_assets),
         )?;
-        // Codex keeps its original managed profile and its own nested
-        // sandbox, so the app-server is never wrapped: the shared store must
-        // instead stay provably outside every root that profile can write and
-        // outside the temporary directories the native sandbox grants. The
-        // live app-server grant echo is still verified in the runner.
+        // Codex keeps its original managed profile and its own native
+        // sandbox: the shared store must stay provably outside every root that
+        // profile can write and outside the temporary directories the native
+        // sandbox grants. The live app-server grant echo is still verified in
+        // the runner.
         if identity.authority.harness == HarnessId::Codex {
             crate::codex::Grant::new(&planned.runtime, &row.request, &planned.profile, home)?
                 .admits_shared_root(&shared_assets.store_root)?;
@@ -1558,8 +1363,8 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             domain::now(),
             verify::DEFAULT_SILENCE_THRESHOLD_SECONDS,
         )?;
-        // Only the Codex harness has native caches; qualifying any other
-        // harness would only probe for a no-op publication.
+        // Only the Codex harness has native caches; validating any other
+        // harness would only prepare a no-op publication.
         if cleanup.confirmed && identity.authority.harness == HarnessId::Codex {
             // The destination is still exclusively owned: resume admission
             // cannot observe it as terminal until the following store.finish.
@@ -1567,10 +1372,10 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             // run, and never changes the model's completion verdict: a
             // failed optional cache step is reported and skipped, never
             // allowed to fail a valid answer or erase valid source data.
-            // Publication happens only behind this host's real guard
-            // qualification, replayed from the frozen plan and account: an
-            // unqualified root leaves the private home exactly as it was.
-            let qualified = qualify_for_native(
+            // Publication happens only into the root validated against the
+            // frozen plan and account: a refused root leaves the private home
+            // exactly as it was.
+            let witness = native_publication_root(
                 store,
                 home,
                 &identity,
@@ -1578,7 +1383,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 &runtime_home,
                 &row.request,
             );
-            match qualified.and_then(|root| {
+            match witness.and_then(|root| {
                 crate::runtime_cache::consolidate(
                     store,
                     id,
@@ -2061,71 +1866,6 @@ fn cancelled_before_spawn(id: &AgentId, store: &mut Store) -> Result<()> {
 mod tests {
     use super::error_text;
     use crate::Error;
-
-    /// Applies the production preflight against a disposable native root;
-    /// sandbox application can be unavailable inside nested CI sandboxes.
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "requires native sandbox-exec application on the host"]
-    fn native_shared_guard_preflight_denies_writes() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let guard = agent_run_platform::shared_asset_guard::SharedAssetGuard::new(&root).unwrap();
-        let environment = std::env::vars().collect();
-        super::probe_shared_guard(&guard, &environment).unwrap();
-    }
-
-    /// Exercises the production Codex preflight with an owned profile and
-    /// workspace outside native temporary grants; no model turn is started.
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "requires CODEX_BIN and NATIVE_GUARD_HOME on a native macOS host"]
-    fn native_codex_shared_preflight_uses_selected_profile() {
-        let binary = std::path::PathBuf::from(std::env::var("CODEX_BIN").unwrap());
-        let parent = std::path::PathBuf::from(std::env::var("NATIVE_GUARD_HOME").unwrap());
-        let temp = tempfile::Builder::new()
-            .prefix("agent-run-codex-preflight-")
-            .tempdir_in(parent)
-            .unwrap();
-        let base = temp.path().canonicalize().unwrap();
-        let root = base.join("shared");
-        let work = base.join("work");
-        let codex_home = base.join("codex-home");
-        for path in [&root, &work, &codex_home] {
-            std::fs::create_dir_all(path).unwrap();
-        }
-        let config = format!(
-            "[permissions.shared_probe]\nextends = \":workspace\"\n\
-             [permissions.shared_probe.workspace_roots]\n{} = true\n\
-             [permissions.shared_probe.filesystem]\n{} = \"read\"\n",
-            serde_json::to_string(&work.to_string_lossy()).unwrap(),
-            serde_json::to_string(&root.to_string_lossy()).unwrap(),
-        );
-        std::fs::write(codex_home.join("config.toml"), config).unwrap();
-        let grant = crate::codex::Grant {
-            model: "fixture".into(),
-            cwd: work.to_string_lossy().into_owned(),
-            roots: vec![work.to_string_lossy().into_owned()],
-            writable_roots: vec![work.to_string_lossy().into_owned()],
-            sandbox: "workspace-write".into(),
-            approval_policy: "on-request".into(),
-            reviewer: None,
-            network_access: false,
-            permission_profile: Some("shared_probe".into()),
-        };
-        let environment = std::collections::BTreeMap::from([
-            ("HOME".into(), base.to_string_lossy().into_owned()),
-            (
-                "CODEX_HOME".into(),
-                codex_home.to_string_lossy().into_owned(),
-            ),
-            (
-                "PATH".into(),
-                format!("{}:/usr/bin:/bin", binary.parent().unwrap().display()),
-            ),
-        ]);
-        super::probe_codex_shared_root(&grant, &binary, &environment, &root).unwrap();
-    }
 
     /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_blank_startup_error_uses_exception_type_in_ready_failure`.
     #[test]

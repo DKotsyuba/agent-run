@@ -119,8 +119,8 @@ a new child to that home.
 ## Filesystem coordinator (`agent-run-core::runtime_storage`)
 
 The coordinator owns the physical switch itself, above the registry and the
-platform store. The supervisor calls it after the actual harness guard is
-validated, never through a request-supplied path.
+platform store. The supervisor calls it after the shared store root and any
+Codex grant are validated, never through a request-supplied path.
 
 `anchor(store, app_home, runtime_home, expected, owner)` registers one
 strictly verified sealed home that maps no managed roots. A cache-only home
@@ -133,33 +133,37 @@ row binding the same digest and refuses a `prepared` row the same way
 `install` does. `plan` still returns `None` for a home with no managed roots,
 so sealing one imposes no needless preflight.
 
-`qualify_shared_root(app_home, preliminary, codex_grant)` is the one guard
-qualification body every publication path holds: the real sentinel probes
-under the store-wide publish lock plus the harness's own boundary (a Codex
-grant keeping the store outside every writable and temporary root, with the
-native sandbox proving read-only, or a guarded metadata probe otherwise). It
-returns the qualified store root, and `runtime_cache::consolidate` publishes
-only into exactly that root — an unqualified publication cannot masquerade as
-a qualified one, and a failed qualification leaves the private home untouched
-with no anchor. Native preparation (journal recovery and remote-parent thaw)
-precedes the probes themselves. An already-shared managed home is planned for
-qualification through its verified committed registry mapping, exactly as it
-launches, never through the strict private verifier that rejects its links.
+`shared_publication_root(app_home, codex_grant)` is the one validation body
+every publication path holds: it creates the owner-only store root when
+absent, requires it to be an existing absolute real directory equal to its
+canonical form (`shared_assets::validated_root`), and for Codex requires the
+grant to keep the store outside every writable and temporary root. It returns
+the validated store root, and `runtime_cache::consolidate` publishes only into
+exactly that root — an unvalidated publication cannot masquerade as a validated
+one, and a refused root leaves the private home untouched with no anchor. It
+runs no sentinel or sandbox probe and takes no lock: Agent Run launches
+harnesses without a Seatbelt wrapper, so the store's immutability against the
+same UID rests on modes and digest verification, never on an OS write denial
+(see `docs/shared-runtime-assets.md`). Native preparation (journal recovery
+and remote-parent thaw) precedes planning and publication. An already-shared
+managed home is planned through its verified committed registry mapping,
+exactly as it launches, never through the strict private verifier that rejects
+its links.
 
 Every harness launch — first attempt, account switch and resume, private or
-shared — is bound to the store: `launch_shared_assets` creates the empty
-trusted root when absent and plans with the home's committed mapping or an
-empty map, so Claude and GLM children are wrapped whole and a Codex grant must
-keep the store outside its writable and temporary roots. A run started before
-the first publication is therefore already guarded when another run later
-publishes. Native preparation distinguishes a fresh execution's not-yet-sealed
+shared — names the store: `launch_shared_assets` creates the empty trusted root
+when absent and plans with the home's committed mapping or an empty map, so a
+Codex grant must keep the store outside its writable and temporary roots and
+every launch verifies its home through the shared bridge. Claude and GLM
+children run the sealed native binary directly. Native preparation
+distinguishes a fresh execution's not-yet-sealed
 home (nothing to recover) from a recorded home that is missing (a refusal);
 only a plain `NotFound` store root, home or plugin cache means empty, and an
 ordinary private plugin-cache entry that never froze is left alone.
 
 `store_root(app_home)` derives `<canonical app home>/shared-assets/v1`
 read-only. A missing namespace is derived, not created (the launch path may
-create the empty trusted root before guard validation); an existing namespace
+create the empty trusted root before root validation); an existing namespace
 must be a real directory reached without symlinked components, checked
 through no-follow descriptors and canonical form.
 
@@ -233,10 +237,10 @@ hardlinks move the two numbers independently.
 `compact --apply` holds the same broker and service-manager startup locks a
 paired config migration holds, refuses while any agent is active, relocates
 each eligible home once, and then runs one collection pass. Each
-relocation replays the supervisor's own guard preflight from the recorded
+relocation replays the supervisor's own preflight from the recorded
 identity, frozen configuration and recorded account — never the current
 provider, never a rewritten configuration — and a home whose workdir, binary,
-grants or sandbox boundary cannot be verified is skipped with its reason and
+grants or store root cannot be verified is skipped with its reason and
 preserved byte count. `storage recover` runs under the same offline locks and
 finishes prepared rows forward; it starts no model and supports no rollback.
 

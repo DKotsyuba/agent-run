@@ -3,7 +3,7 @@
 //! Collection runs inside the existing bounded housekeeping and socket
 //! maintenance cycles, never as a daemon of its own. One pass takes the same
 //! store-wide publish/GC lock publication uses — nonblocking, so a broker is
-//! never stalled behind an import or a native guard preflight — and while it
+//! never stalled behind an import — and while it
 //! holds that lock it re-derives every reference from durable evidence before
 //! deleting anything: every registered layout row (a `prepared` row always
 //! pins what it names; a `committed` row pins while its physical home

@@ -1,13 +1,12 @@
-//! Guard qualification for native cache publication and global launches.
+//! Shared-store root validation for native cache publication and global
+//! launches.
 //!
-//! Every test here drives the real qualification body — a Seatbelt sentinel
-//! under the store-wide publish lock plus the harness's own boundary — with
-//! no mock guard. Isolated fixture binaries stand in for the harness only
-//! where a native selector would run the real one; the sentinel probes
-//! themselves are real.
+//! Every test drives the real [`supervisor::shared_publication_root`] body: the
+//! canonical store-root validation plus the Codex grant overlap check. No
+//! OS-level write denial exists for the launched harness, so these tests assert
+//! only what agent-run itself enforces.
 #![cfg(feature = "test-fixtures")]
 
-use agent_run_adapters::{LaunchPlan, provider::ProviderLaunchPlan};
 use agent_run_config::{config::Runtime, profiles::Profile};
 use agent_run_core::supervisor;
 use agent_run_domain::{
@@ -15,7 +14,7 @@ use agent_run_domain::{
     domain::{AgentId, StartRequest},
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs as stdfs,
     path::{Path, PathBuf},
 };
@@ -80,28 +79,6 @@ fn role_payload() -> serde_json::Value {
     payload
 }
 
-/// One minimal frozen launch plan whose only qualification inputs are the
-/// harness binary and its environment.
-fn plan(binary: &Path) -> ProviderLaunchPlan {
-    let role =
-        agent_run_config::role_plan::ResolvedRolePlan::from_payload(&role_payload()).unwrap();
-    let mut runtime = runtime(Path::new("/tmp"));
-    runtime.binary = binary.to_path_buf();
-    ProviderLaunchPlan {
-        launch: LaunchPlan {
-            binary: binary.to_path_buf(),
-            args: vec!["app-server".into()],
-            cwd: std::env::temp_dir(),
-            environment: BTreeMap::new(),
-            initial_input: None,
-        },
-        native_model: "gpt-5.6-sol".into(),
-        role,
-        runtime,
-        profile: profile_writing(false),
-    }
-}
-
 /// Creates the empty shared store root below one app home.
 fn store_root(app_home: &Path) -> PathBuf {
     let root = app_home.join("shared-assets").join("v1");
@@ -145,48 +122,47 @@ fn codex_grant_refuses_a_store_inside_its_writable_root() {
     );
 }
 
-/// Qualification runs the real sentinel probes: a harness whose guarded
-/// metadata probe fails disqualifies the root, and a working one returns the
-/// witness root that publication requires.
+/// Validation creates the owner-only store, returns exactly the canonical
+/// root as the publication witness, and writes no probe object into it. A
+/// store root reached through a symlinked component is refused rather than
+/// followed.
 #[test]
-fn qualification_proves_the_boundary_and_returns_the_witness() {
+fn publication_root_validates_the_store_and_returns_the_witness() {
     let temporary = tempfile::tempdir().unwrap();
     let app_home = temporary.path().canonicalize().unwrap();
     let root = store_root(&app_home);
 
-    // A harness that cannot even start under the guard disqualifies the root.
-    let error =
-        supervisor::qualify_shared_root(&app_home, &plan(Path::new("/usr/bin/false")), None)
-            .unwrap_err();
-    assert!(
-        error.to_string().contains("guarded harness version probe"),
-        "{error}"
-    );
-
-    // A working harness qualifies and returns exactly the store root.
-    let witness =
-        supervisor::qualify_shared_root(&app_home, &plan(Path::new("/usr/bin/true")), None)
-            .expect("qualified");
+    let witness = supervisor::shared_publication_root(&app_home, None).expect("validated");
     assert_eq!(witness, root);
-    // The sentinel probes left nothing behind in the store.
-    let leftovers: Vec<_> = stdfs::read_dir(&root)
+    let entries: Vec<_> = stdfs::read_dir(&root)
         .unwrap()
         .flatten()
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".agent-run-probe")
-        })
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != ".publish.lock")
         .collect();
-    assert!(leftovers.is_empty(), "probes clean up: {leftovers:?}");
+    assert!(
+        entries.is_empty(),
+        "validation publishes nothing: {entries:?}"
+    );
+
+    // A store namespace swapped for a symlink is never followed.
+    let aliased = temporary.path().canonicalize().unwrap().join("aliased");
+    let real = aliased.join("real");
+    stdfs::create_dir_all(real.join("v1")).unwrap();
+    let linked_home = aliased.join("home");
+    stdfs::create_dir_all(&linked_home).unwrap();
+    std::os::unix::fs::symlink(&real, linked_home.join("shared-assets")).unwrap();
+    assert!(
+        supervisor::shared_publication_root(&linked_home, None).is_err(),
+        "a symlinked store namespace is refused"
+    );
 }
 
-/// Qualification with a Codex grant keeps the grant check: a store inside
+/// Validation with a Codex grant keeps the grant check: a store inside
 /// the admitted workspace is refused before any publication, and a refused
-/// qualification leaves no shared objects behind.
+/// validation leaves no shared objects behind.
 #[test]
-fn codex_qualification_refuses_overlapping_store_before_publication() {
+fn codex_publication_refuses_overlapping_store_before_publication() {
     let temporary = tempfile::tempdir().unwrap();
     let workdir = temporary.path().join("work");
     stdfs::create_dir_all(&workdir).unwrap();
@@ -200,15 +176,13 @@ fn codex_qualification_refuses_overlapping_store_before_publication() {
         temporary.path(),
     )
     .unwrap();
-    let error =
-        supervisor::qualify_shared_root(&app_home, &plan(Path::new("/usr/bin/true")), Some(&grant))
-            .unwrap_err();
+    let error = supervisor::shared_publication_root(&app_home, Some(&grant)).unwrap_err();
     assert!(
         error.to_string().contains("writable"),
         "the grant overlap is the refusal: {error}"
     );
     // Nothing was published into the refused store: apart from the lock file
-    // the qualification itself created, no object exists.
+    // a prior publisher may have created, no object exists.
     let published: Vec<_> = stdfs::read_dir(app_home.join("shared-assets").join("v1"))
         .unwrap()
         .flatten()
@@ -221,9 +195,9 @@ fn codex_qualification_refuses_overlapping_store_before_publication() {
     );
 }
 
-/// Publication requires the qualified witness root: any other root is
-/// refused without touching the store, so an unqualified caller cannot
-/// masquerade as a qualified one.
+/// Publication requires the validated witness root: any other root is
+/// refused without touching the store, so an unvalidated caller cannot
+/// masquerade as a validated one.
 #[test]
 fn consolidation_requires_the_qualified_witness_root() {
     let temporary = tempfile::tempdir().unwrap();
@@ -241,11 +215,9 @@ fn consolidation_requires_the_qualified_witness_root() {
         &mut store, &id, &identity, &account, &app_home, &home, &foreign,
     )
     .unwrap_err();
-    assert!(error.to_string().contains("qualified"), "{error}");
+    assert!(error.to_string().contains("validated"), "{error}");
     // The real witness root is accepted as the publication target.
-    let witness =
-        supervisor::qualify_shared_root(&app_home, &plan(Path::new("/usr/bin/true")), None)
-            .expect("qualified");
+    let witness = supervisor::shared_publication_root(&app_home, None).expect("validated");
     assert_eq!(witness, root);
     let report = agent_run_core::runtime_cache::consolidate(
         &mut store, &id, &identity, &account, &app_home, &home, &witness,
