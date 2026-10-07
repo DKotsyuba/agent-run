@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.22.5
+
 - refactor(storage): remove Agent Run's own Seatbelt (`sandbox-exec`) launch
   wrappers, guard profile generation and sentinel qualification of the shared
   runtime asset store. Harnesses and their MCP children now start without an
