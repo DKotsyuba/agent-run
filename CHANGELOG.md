@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.22.6
+
 - fix(claude): correlate terminal results with native task input UUIDs and
   replayed/coalesced input batches; pool-only replies no longer finish a task
 - fix(claude): validate later terminal frames and preserve errors, genuine
