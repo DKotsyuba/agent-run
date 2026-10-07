@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.22.2
+
 - fix(tui): place tool result previews beside compact labels while keeping
   elapsed time aligned at the right edge
 - fix(skills): resolve declared catalog directory symlinks into immutable run
