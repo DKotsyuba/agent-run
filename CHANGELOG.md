@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.22.4
+
 - fix(codex): use explicit native permission profiles for shared-store preflight
   on Codex CLI 0.160.1; preserve managed requirements and all storage boundaries
 
