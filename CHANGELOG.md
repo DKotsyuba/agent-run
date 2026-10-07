@@ -4,6 +4,11 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- fix(tui): place tool result previews beside compact labels while keeping
+  elapsed time aligned at the right edge
+- fix(skills): resolve declared catalog directory symlinks into immutable run
+  snapshots; preserve internal-link rejection and unchanged resume history
+
 ## 0.22.1
 
 - fix(tui): accept empty pool responses with nullable proposals and simplify the
