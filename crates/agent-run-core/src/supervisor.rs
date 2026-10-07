@@ -512,6 +512,9 @@ fn probe_shared_guard(
 /// Proves the selected native sandbox can read a shared sentinel, cannot
 /// change it, and can still write the admitted workspace when the role may.
 /// Probe files are created exclusively and removed on every outcome.
+/// Named profiles are forwarded unchanged; legacy read-only and workspace-write
+/// grants select their matching built-in profiles. Every probe still includes
+/// managed requirements and never falls back to unsandboxed execution.
 fn probe_codex_shared_root(
     grant: &crate::codex::Grant,
     binary: &Path,
@@ -532,19 +535,17 @@ fn probe_codex_shared_root(
     drop(shared_file);
     let mut workspace_created = false;
     let result = (|| -> Result<()> {
+        let profile = match grant.permission_profile.as_deref() {
+            Some(profile) => profile,
+            None => match grant.sandbox.as_str() {
+                "read-only" => ":read-only",
+                "workspace-write" => ":workspace",
+                _ => return Err(Error::Unsupported("unsupported Codex sandbox grant".into())),
+            },
+        };
         let run = |script: &str, target: &Path| -> Result<bool> {
             let mut command = std::process::Command::new(binary);
-            command.arg("sandbox");
-            if let Some(profile) = &grant.permission_profile {
-                command
-                    .arg("--include-managed-config")
-                    .arg("-P")
-                    .arg(profile);
-            } else {
-                command
-                    .arg("-c")
-                    .arg(format!("sandbox_mode={:?}", grant.sandbox));
-            }
+            command.args(["sandbox", "--include-managed-config", "-P", profile]);
             command
                 .arg("-C")
                 .arg(&grant.cwd)
@@ -2125,6 +2126,90 @@ mod tests {
             ),
         ]);
         super::probe_codex_shared_root(&grant, &binary, &environment, &root).unwrap();
+    }
+
+    /// Matches the modern CLI's mandatory profile arguments for legacy read-only,
+    /// legacy workspace-write and explicitly named grants. The finite fixture
+    /// denies shared writes, allows workspace writes and leaves no sentinel.
+    /// An unknown legacy grant is refused before invoking the fixture.
+    #[test]
+    fn codex_shared_preflight_requires_explicit_permission_profiles() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let root = base.join("shared");
+        let work = base.join("work");
+        let binary = base.join("codex-fixture");
+        for path in [&root, &work] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(
+            &binary,
+            r#"#!/bin/sh
+    set -eu
+    [ "$1" = sandbox ]
+    [ "$2" = --include-managed-config ]
+    [ "$3" = -P ]
+    [ "$4" = "$EXPECTED_PROFILE" ]
+    shift 4
+    [ "$1" = -C ]
+    shift 2
+    [ "$1" = -- ]
+    [ "$2" = /bin/sh ]
+    [ "$3" = -c ]
+    script="$4"
+    [ "$5" = -- ]
+    target="$6"
+    case "$script" in
+      'cat "$1" >/dev/null') cat "$target" >/dev/null ;;
+      'printf changed > "$1"') exit 1 ;;
+      'printf ok > "$1"') printf ok > "$target" ;;
+      *) exit 97 ;;
+    esac
+    "#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for (sandbox, named, expected) in [
+            ("read-only", None, ":read-only"),
+            ("workspace-write", None, ":workspace"),
+            ("workspace-write", Some("managed_probe"), "managed_probe"),
+            ("danger-full-access", None, ""),
+        ] {
+            let grant = crate::codex::Grant {
+                model: "fixture".into(),
+                cwd: work.to_string_lossy().into_owned(),
+                roots: vec![work.to_string_lossy().into_owned()],
+                writable_roots: if sandbox == "workspace-write" {
+                    vec![work.to_string_lossy().into_owned()]
+                } else {
+                    vec![]
+                },
+                sandbox: sandbox.into(),
+                approval_policy: "never".into(),
+                reviewer: None,
+                network_access: false,
+                permission_profile: named.map(str::to_owned),
+            };
+            let environment = std::collections::BTreeMap::from([
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                ("EXPECTED_PROFILE".into(), expected.into()),
+            ]);
+            let result = super::probe_codex_shared_root(&grant, &binary, &environment, &root);
+            if sandbox == "danger-full-access" {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("unsupported Codex sandbox grant")
+                );
+            } else {
+                result.unwrap_or_else(|error| panic!("{sandbox}/{expected}: {error}"));
+            }
+            assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+            assert!(std::fs::read_dir(&work).unwrap().next().is_none());
+        }
     }
 
     /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_blank_startup_error_uses_exception_type_in_ready_failure`.
