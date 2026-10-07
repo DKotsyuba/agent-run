@@ -493,7 +493,9 @@ pub fn shared_publication_root(
 ///
 /// Builds the exact launch plan the sealed home would launch with — frozen
 /// configuration and authority, recorded account, host environment — so a
-/// home that cannot launch is refused, and derives the Codex grant from it.
+/// home whose sealed record, configuration, role or credentials no longer
+/// plan is refused, and derives the Codex grant from it. The harness binary and
+/// workdir are not stat'ed or executed here; their absence surfaces at launch.
 /// [`shared_publication_root`] then validates the store against that grant. A
 /// failure means the home stays private: no anchor, no shared link, nothing
 /// published.
@@ -569,10 +571,11 @@ pub enum Relocation {
 /// agent's attempt was actually admitted with, and the Codex grant derived
 /// from them — and only then hands the home to the registry coordinator. It
 /// never rewrites the frozen identity or configuration to make a check pass,
-/// never guesses the current provider, and never launches a model. It no
-/// longer spawns the harness binary, so a vanished binary is not detected
-/// here. An unreadable identity, an unplannable launch, an invalid store root,
-/// or an unverifiable Codex grant surfaces as [`Relocation::Skipped`] with
+/// never guesses the current provider, and never launches a model. It neither
+/// spawns nor stats the harness binary or workdir, so their absence is not
+/// detected here; it surfaces when the home next launches. An unreadable
+/// identity, a launch that no longer plans, an invalid store root, or an
+/// unverifiable Codex grant surfaces as [`Relocation::Skipped`] with
 /// the reason and the bytes still held privately; the home itself is untouched.
 pub fn relocate_retained_home(
     store: &mut Store,
