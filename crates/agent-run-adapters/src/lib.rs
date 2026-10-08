@@ -30,12 +30,19 @@ pub struct LaunchPlan {
     pub environment: BTreeMap<String, String>,
     pub initial_input: Option<String>,
 }
-/// Validates one request against the selected adapter's closed capability set.
+/// Validates one legacy request against the selected adapter's closed capability set.
+/// Restricted research requires the schema-2 attempt-bound worker channel;
+/// legacy launches are rejected rather than receiving weaker native tools.
 ///
 /// The runtime model, profile grants, authentication shape, and executable
 /// path are checked without spawning a child or consulting provider state.
 pub fn validate(request: &StartRequest, runtime: &Runtime, profile: &Profile) -> Result<()> {
     let kind = runtime.kind()?;
+    if profile.research_tools_only() {
+        return Err(invalid(
+            "restricted research requires a schema-2 provider launch",
+        ));
+    }
     claude::validate_runtime(runtime, kind)?;
     agent_run_config::config::native_settings(kind, &runtime.native_settings)?;
     if !runtime.models.contains(&request.model) {
@@ -47,11 +54,7 @@ pub fn validate(request: &StartRequest, runtime: &Runtime, profile: &Profile) ->
     if request.output_schema.is_some() && !matches!(kind, Adapter::Claude | Adapter::Glm) {
         return Err(invalid("adapter does not advertise output_schema"));
     }
-    if kind == Adapter::Codex && profile.network && !profile.write {
-        return Err(invalid(
-            "codex read-only sandbox cannot grant network access",
-        ));
-    }
+    validate_role(runtime, profile)?;
     if request.model == "gpt-6-astra"
         && kind == Adapter::Codex
         && (profile.write || !["architect", "review"].contains(&profile.name.as_str()))
@@ -69,6 +72,25 @@ pub fn validate(request: &StartRequest, runtime: &Runtime, profile: &Profile) ->
         return Err(invalid("unsupported Claude effort"));
     }
     validate_executable(runtime)
+}
+
+/// Checks static native role compatibility for catalog, admission and launch.
+/// Restricted Codex research uses hosted web with raw environment access
+/// disabled; generated native controls are verified again before any turn.
+/// Other read-only Codex network roles retain the established rejection.
+/// No child, credential or mutable state is opened by this check.
+pub fn validate_role(runtime: &Runtime, profile: &Profile) -> Result<()> {
+    profile.validate_research()?;
+    if runtime.kind()? == Adapter::Codex
+        && profile.network
+        && !profile.write
+        && !profile.research_tools_only()
+    {
+        return Err(invalid(
+            "codex read-only sandbox cannot grant network access",
+        ));
+    }
+    Ok(())
 }
 
 /// Checks the configured native binary's file type and executable mode without

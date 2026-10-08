@@ -168,6 +168,13 @@ fn canonical_payload(plan: &ResolvedRolePlan) -> Value {
 }
 
 impl ResolvedRolePlan {
+    /// Whether this immutable role requires the command-free web/reports
+    /// contract. Historical payloads without the constraint remain unchanged.
+    pub fn research_tools_only(&self) -> bool {
+        self.required_constraints
+            .contains(&Constraint::ResearchToolsOnly)
+    }
+
     /// Return the canonical JSON-safe role document without live secrets.
     pub fn to_payload(&self) -> Value {
         let mut payload = canonical_payload(self);
@@ -459,6 +466,19 @@ impl ResolvedRolePlan {
             auth_reference,
             config_revision,
         };
+        if plan.research_tools_only()
+            && (plan.write
+                || !plan.network
+                || plan.allow_external_read_roots
+                || !plan.read_roots.is_empty()
+                || !plan.mcp.is_empty()
+                || !plan.worker_mcp
+                || plan.skills.iter().any(|skill| skill.id != "role-research"))
+        {
+            return Err(invalid(
+                "resolved research role widens its restricted tool contract",
+            ));
+        }
         if plan.to_payload() != *payload {
             return Err(invalid("resolved role payload is not canonical"));
         }
@@ -494,6 +514,8 @@ pub fn role_from_authority(
 /// hashes the full credential-free payload, so identical inputs produce
 /// identical role plans for every runtime. Profile selections join global
 /// catalog servers once; profile tool filters intersect the catalog cap.
+/// Restricted research excludes every user/global MCP server so none can
+/// restore execution capabilities; its first-party worker channel remains.
 /// The shared worker instructions precede the profile body and are hashed with
 /// it, so continuation restores exactly the admitted behavior without reinjection.
 /// New plans enable the built-in worker MCP; its namespace is reserved and
@@ -536,6 +558,7 @@ pub fn resolve_role_plan(
         ));
     }
 
+    profile.validate_research()?;
     let mut skills = Vec::with_capacity(profile.skills.len());
     for name in &profile.skills {
         if !config_id(name) {
@@ -586,7 +609,7 @@ pub fn resolve_role_plan(
     // already named become `Both` instead of a second entry, and unselected
     // ones follow in catalog order after the profile's declaration order.
     for (name, definition) in mcp_catalog.iter() {
-        if !definition.global {
+        if !definition.global || profile.research_tools_only() {
             continue;
         }
         match servers.iter_mut().find(|server| server.id == *name) {

@@ -16,6 +16,74 @@ use std::{
 /// The native profile name that binds an admitted workspace and cache grants.
 pub const PROJECTS_PROFILE: &str = "Projects";
 
+/// Native feature switches disabled for research, including command, plugin,
+/// environment-REPL and permission-expansion paths. Composition runs separately
+/// in the native V8 isolate; these names never grant OS access.
+pub const RESEARCH_DISABLED_FEATURES: &[&str] = &[
+    "shell_tool",
+    "unified_exec",
+    "multi_agent",
+    "multi_agent_v2",
+    "apps",
+    "plugins",
+    "remote_plugin",
+    "browser_use",
+    "computer_use",
+    "skill_search",
+    "skill_mcp_dependency_install",
+    "hooks",
+    "js_repl",
+    "request_permissions_tool",
+    "memories",
+    "tool_suggest",
+];
+
+/// Returns the native research controls shared by rendering and live verification.
+/// The fresh object enables isolated composition and hosted web, disables agent
+/// creation and local tool integrations, and contains no paths or credentials.
+/// Environment access is independently disabled on thread start/resume.
+pub fn research_settings() -> Value {
+    let mut settings = json!({
+        "web_search": "live",
+        "agents": {"enabled": false},
+        "tools": {"view_image": false},
+        "features": {
+            "code_mode": {"enabled": true, "excluded_tool_namespaces": ["collaboration"]},
+            "code_mode_host": true,
+            "standalone_web_search": true
+        }
+    });
+    for feature in RESEARCH_DISABLED_FEATURES {
+        settings["features"][*feature] = json!(false);
+    }
+    settings
+}
+
+/// Rejects a native config/read response missing or widening research controls.
+/// Only named capability settings are inspected; diagnostics never include native
+/// config contents, prompts, environment values or credentials. Unknown/missing
+/// controls fail before a turn, so older or managed overrides cannot weaken them.
+pub fn verify_research_config(response: &Value) -> Result<()> {
+    let expected = research_settings();
+    for feature in expected["features"]
+        .as_object()
+        .expect("static feature object")
+        .keys()
+    {
+        if response.pointer(&format!("/config/features/{feature}"))
+            != expected["features"].get(feature)
+        {
+            return Err(invalid("native research feature controls did not verify"));
+        }
+    }
+    if response.pointer("/config/agents/enabled") != Some(&json!(false))
+        || response.pointer("/config/web_search") != Some(&json!("live"))
+    {
+        return Err(invalid("native research agent/web controls did not verify"));
+    }
+    Ok(())
+}
+
 /// Renders one validated native setting as a TOML inline value.
 ///
 /// Tables remain inline so later agent-run-owned sections cannot be captured by
@@ -345,6 +413,39 @@ fn resolve_command(command: &str, path: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Native controls round-trip through TOML and fail closed for every widened
+    /// feature, missing agents control and disabled web; no real harness is started.
+    #[test]
+    fn research_controls_reject_missing_or_widened_native_settings() {
+        let settings = research_settings();
+        let table: toml::Table = serde_json::from_value(settings.clone()).unwrap();
+        let serialized = toml::to_string(&table).unwrap();
+        let parsed: toml::Value = toml::from_str(&serialized).unwrap();
+        let response = json!({"config": parsed});
+        verify_research_config(&response).unwrap();
+        for feature in RESEARCH_DISABLED_FEATURES {
+            let mut widened = response.clone();
+            widened["config"]["features"][*feature] = json!(true);
+            assert!(verify_research_config(&widened).is_err(), "{feature}");
+        }
+        for (pointer, replacement) in [
+            ("/config/agents/enabled", json!(true)),
+            ("/config/web_search", json!("disabled")),
+            ("/config/features/code_mode_host", json!(false)),
+            ("/config/features/code_mode/enabled", json!(false)),
+            (
+                "/config/features/code_mode/excluded_tool_namespaces",
+                json!([]),
+            ),
+            ("/config/features/standalone_web_search", json!(false)),
+        ] {
+            let mut changed = response.clone();
+            *changed.pointer_mut(pointer).unwrap() = replacement;
+            assert!(verify_research_config(&changed).is_err(), "{pointer}");
+        }
+        assert!(verify_research_config(&json!({})).is_err());
+    }
 
     /// Mirrors `test_codex_adapter.py::test_managed_projects_uses_one_definition_and_verifies_all_write_roots` refusal behavior.
     ///

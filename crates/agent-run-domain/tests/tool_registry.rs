@@ -138,6 +138,14 @@ fn registry_matches_python_golden_field_by_field() {
                 "Diagnose stored quota windows, percentages, resets and freshness plus ranked provider/model standing, numeric priorities and provider multipliers from one committed snapshot. Unknown or stale capacity remains explicit; no collection or model turn is started. MCP text omits private account and pool identities. Schema 1 retains its historical quota-window response."
             );
         }
+        // Preserve the historical schema; research adds exactly one reviewed
+        // constraint value to its existing request-side enum.
+        if let Some(values) = expected
+            .pointer_mut("/inputSchema/properties/required_constraints/items/enum")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            values.push(serde_json::json!("research_tools_only"));
+        }
         if definition.name != "start" {
             assert_eq!(actual["description"], expected["description"]);
         }

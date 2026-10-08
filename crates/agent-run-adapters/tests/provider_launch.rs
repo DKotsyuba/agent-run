@@ -152,6 +152,144 @@ fn role(root: &Path, network: bool) -> ResolvedRolePlan {
     resolve_role_plan(&profile, root, &BTreeMap::new(), "account", Some("work")).unwrap()
 }
 
+/// Restricted research excludes global command-capable MCP declarations,
+/// materializes no plugin execution path and exposes native web plus reports.
+/// Ordinary role materialization remains covered by the existing golden cases.
+#[test]
+fn research_native_plans_remove_command_and_inherited_tools() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mut config = config(&root, &fake_engine(&root));
+    for harness in config.harnesses.values_mut() {
+        harness.hooks.push(agent_run_config::config::Hook {
+            event: "SessionStart".into(),
+            command: vec!["/usr/bin/false".into()],
+            matcher: None,
+        });
+    }
+    config.mcp.insert(
+        "execution".into(),
+        serde_json::from_value(serde_json::json!({
+            "transport":"stdio","command":"/usr/bin/true","args":[],"env_from":[],"approval_mode":"auto","global":true
+        }))
+        .unwrap(),
+    );
+    let account_home = agent_run_adapters::materialize::account_home(
+        &root,
+        agent_run_config::config::Adapter::Codex,
+        "work",
+    );
+    fs::create_dir_all(&account_home).unwrap();
+    fs::write(account_home.join("auth.json"), "{}\n").unwrap();
+    fs::set_permissions(
+        account_home.join("auth.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let catalog = catalog(&config);
+    let profile = Profile {
+        name: "research".into(),
+        body: "Search, retrieve primary sources and save_report.".into(),
+        write: false,
+        network: true,
+        revision: "research-reports-v1".into(),
+        canonical: true,
+        allow_external_read_roots: false,
+        read_roots: vec![],
+        skills: vec![],
+        mcp: vec![],
+        mcp_tools: Default::default(),
+        required_constraints: BTreeSet::from([Constraint::ResearchToolsOnly]),
+    };
+    let legacy: agent_run_domain::domain::StartRequest = serde_json::from_value(serde_json::json!({
+        "runtime":"legacy","model":"sonnet","profile":"research","task":"Research","workdir":root
+    })).unwrap();
+    let legacy_runtime = agent_run_adapters::provider::runtime(
+        &config,
+        agent_run_domain::HarnessId::ClaudeCode,
+        "sonnet",
+    )
+    .unwrap();
+    assert!(
+        agent_run_adapters::validate(&legacy, &legacy_runtime, &profile)
+            .unwrap_err()
+            .to_string()
+            .contains("schema-2 provider launch")
+    );
+    let role = resolve_role_plan(&profile, &root, &config.mcp, "global", None).unwrap();
+    assert!(role.mcp.is_empty());
+    for (provider, model, account) in [
+        ("codex-plus", "gpt", "acct-native"),
+        ("claude-main", "sonnet", "acct-claude"),
+    ] {
+        let home = root.join(provider);
+        let provider: ProviderId = provider.parse().unwrap();
+        let account_id = account.parse().unwrap();
+        let materialized = materialize_selected(
+            &config,
+            &catalog,
+            &provider,
+            model,
+            &account_id,
+            &role,
+            &root,
+            &home,
+            &root,
+        );
+        let (_, digest) = materialized.unwrap();
+        let authority = make_authority(&catalog, &provider, model, &role, &root, digest, account);
+        let plan = plan_selected(
+            &config,
+            &catalog,
+            &authority,
+            &account_id,
+            &home,
+            &root,
+            &BTreeMap::from([("HOME".into(), root.display().to_string())]),
+            &FakeReader,
+            "bounded research",
+            None,
+        )
+        .unwrap();
+        assert!(plan.launch.args.iter().all(|arg| arg != "--plugin-dir"));
+        if provider.as_str() == "codex-plus" {
+            let native: toml::Value =
+                toml::from_str(&fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
+            let native = serde_json::to_value(native).unwrap();
+            agent_run_adapters::codex::verify_research_config(
+                &serde_json::json!({"config":native}),
+            )
+            .unwrap();
+            assert_eq!(native["tools"]["view_image"], false);
+            assert_eq!(native["mcp_servers"].as_object().unwrap().len(), 1);
+            let worker = &native["mcp_servers"]["agent_run_worker"];
+            assert_eq!(worker["required"], true);
+            assert!(
+                worker["env_vars"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!(agent_run_domain::worker::RESEARCH_ENV))
+            );
+            assert!(native.get("hooks").is_none());
+            assert_eq!(plan.launch.args, ["app-server"]);
+            continue;
+        }
+        let value = |flag: &str| {
+            plan.launch.args[plan.launch.args.iter().position(|arg| arg == flag).unwrap() + 1]
+                .clone()
+        };
+        assert_eq!(value("--tools"), "WebFetch,WebSearch");
+        assert!(value("--disallowedTools").contains("Bash"));
+        assert!(plan.launch.args.iter().any(|arg| arg == "--restricted"));
+        assert!(
+            plan.launch
+                .args
+                .iter()
+                .any(|arg| arg == "--disable-slash-commands")
+        );
+    }
+}
+
 /// Historical role payloads do not acquire a worker MCP when materialized by
 /// a newer executable; both native harness config formats keep that boundary.
 #[test]

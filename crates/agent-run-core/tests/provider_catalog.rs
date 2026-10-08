@@ -179,6 +179,48 @@ async fn catalog_is_revisioned_ordered_and_account_free() {
     assert_eq!(footprint(root), before, "reads never write");
 }
 
+/// Catalog and actual admission share the same native role compatibility:
+/// ordinary read-only/network roles remain unsupported, while the explicit
+/// research constraint permits one admitted run with native controlled tools.
+#[tokio::test]
+async fn research_catalog_matches_actual_static_admission() {
+    let temp = home();
+    let root = temp.path().canonicalize().unwrap();
+    let service = Service::new(root.clone());
+    let body = |constraints: &str| {
+        format!(
+            "+++\nrevision=\"research-test\"\nwrite=false\nnetwork=true\nallow_external_read_roots=false\nskills=[]\nmcp=[]\nrequired_constraints={constraints}\n+++\nSearch and save reports.\n"
+        )
+    };
+    fs::write(root.join("profiles/research.md"), body("[]")).unwrap();
+    let query = ModelsQuery {
+        provider: Some("codex".into()),
+        model: Some("gpt-main".into()),
+        profile: Some("research".into()),
+    };
+    let old = service.models(query.clone()).await.unwrap();
+    assert!(old["providers"].as_array().unwrap().is_empty());
+    let request = || {
+        serde_json::from_value(json!({"provider":"codex","model":"gpt-main","profile":"research","task":"Search with sources","workdir":root})).unwrap()
+    };
+    assert!(service.admit_provider(request()).is_err());
+    fs::write(
+        root.join("profiles/research.md"),
+        body("[\"research_tools_only\"]"),
+    )
+    .unwrap();
+    let current = service.models(query).await.unwrap();
+    assert_eq!(current["providers"].as_array().unwrap().len(), 1);
+    // The catalog fixture's inert executable must exist for actual admission.
+    let config = fs::read_to_string(root.join("config.toml"))
+        .unwrap()
+        .replace("/bin/true", "/usr/bin/true");
+    fs::write(root.join("config.toml"), config).unwrap();
+    let before = footprint(&root);
+    service.admit_provider(request()).unwrap();
+    assert_eq!(footprint(&root)[0], before[0] + 1, "research is admitted");
+}
+
 /// Exact filters narrow the same snapshot; unknown values and fields are
 /// typed validation errors on every transport entry.
 #[tokio::test]

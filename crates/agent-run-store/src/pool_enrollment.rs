@@ -113,8 +113,12 @@ pub fn existing_member(conn: &Connection, root: &AgentId, at: f64) -> Result<Exi
         [row.id.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     let (attempt_id, version, digest) =
         attempt.ok_or_else(|| invalid("existing worker attempt is not owned and RUNNING"))?;
-    if version != Some(i64::from(agent_run_domain::worker::POOL_CATALOG_VERSION))
-        || digest.as_deref() != Some(agent_run_domain::worker::pool_catalog_digest().as_str())
+    if !version
+        .zip(digest.as_deref())
+        .is_some_and(|(version, digest)| {
+            u32::try_from(version)
+                .is_ok_and(|version| agent_run_domain::worker::known_pool_catalog(version, digest))
+        })
     {
         return Err(Error::Unsupported(
             "existing worker pool catalog is unknown or unsupported".into(),

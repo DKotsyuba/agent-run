@@ -115,7 +115,8 @@
               "mcp_ipc_isolation",
               "filesystem_write_isolation",
               "filesystem_read_isolation",
-              "plugin_immutability"
+              "plugin_immutability",
+              "research_tools_only"
             ],
             "type": "string"
           },
@@ -684,7 +685,8 @@
                         "mcp_ipc_isolation",
                         "filesystem_write_isolation",
                         "filesystem_read_isolation",
-                        "plugin_immutability"
+                        "plugin_immutability",
+                        "research_tools_only"
                       ],
                       "type": "string"
                     },
@@ -874,7 +876,8 @@
                       "mcp_ipc_isolation",
                       "filesystem_write_isolation",
                       "filesystem_read_isolation",
-                      "plugin_immutability"
+                      "plugin_immutability",
+                      "research_tools_only"
                     ],
                     "type": "string"
                   },

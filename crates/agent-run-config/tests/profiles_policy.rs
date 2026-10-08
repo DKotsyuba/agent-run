@@ -237,6 +237,42 @@ fn network_boundaries_are_independent_and_legacy_admission_stays_open() {
     assert!(policy::admission_decision(&policy).allowed);
 }
 
+/// Known harnesses declare research controls; an unknown adapter fails closed.
+/// Malformed research grants are rejected during parsing before any runtime
+/// state or filesystem write. This static claim is not live qualification.
+#[test]
+fn research_policy_is_harness_specific_and_rejects_widened_grants() {
+    let home = common::Home::new();
+    let text = "+++\nrevision=\"research-v1\"\nwrite=false\nnetwork=true\nallow_external_read_roots=false\nskills=[]\nmcp=[]\nrequired_constraints=[\"research_tools_only\"]\n+++\nResearch.";
+    let profile = profiles::parse(text, &home.request()).unwrap();
+    for (adapter, supported) in [
+        ("codex", true),
+        ("claude", true),
+        ("glm", true),
+        ("unknown", false),
+    ] {
+        let runtime = serde_json::from_value(serde_json::json!({
+            "enabled":true,"adapter":adapter,"binary":"/usr/bin/true","home":"/tmp","models":["fixture"]
+        })).unwrap();
+        let effective = policy::evaluate(adapter, &runtime, &profile);
+        let evidence = effective
+            .constraints
+            .iter()
+            .find(|evidence| evidence.constraint == Constraint::ResearchToolsOnly)
+            .unwrap();
+        assert_eq!(evidence.supported, supported);
+        assert_eq!(effective.admit().is_ok(), supported);
+    }
+    for widened in [
+        text.replace("write=false", "write=true"),
+        text.replace("network=true", "network=false"),
+        text.replace("skills=[]", "skills=[\"role-implement\"]"),
+        text.replace("mcp=[]", "mcp=[\"execution\"]"),
+    ] {
+        assert!(profiles::parse(&widened, &home.request()).is_err());
+    }
+}
+
 /// Mirrors `tests/test_effective_policy.py::test_platform_scopes_are_applied_without_upgrading_configuration`
 #[test]
 fn platform_scopes_are_applied_without_upgrading_configuration() {
