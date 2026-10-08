@@ -4,6 +4,17 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- feat(research): enable native web search and page retrieval with a frozen
+  research-only tool contract, preserving ordinary role capabilities
+- feat(research): save bounded, cited reports only in the assigned workdir
+  through authenticated, atomic create-only publication; reject traversal,
+  symlinks, overwrites and stopped-attempt writes
+- fix(codex): keep native isolated tool composition available while disabling
+  environment access, OS commands, agent creation, hooks and inherited tools;
+  verify effective controls and the private worker catalog before a turn
+- fix(runtime): validate frozen role and executable compatibility before
+  admission and preserve bounded failure causes for refused launches
+
 ## 0.22.6
 
 - fix(claude): correlate terminal results with native task input UUIDs and
