@@ -125,7 +125,8 @@ impl Broker {
 
     /// Asserts the exact public class of a refused start on all three
     /// transports: CLI `error.type`, MCP tool `error.code`, and the socket
-    /// client's rendered `PublicError.kind` plus retained broker code.
+    /// client's rendered `PublicError.kind`; ordinary validation decodes to
+    /// `Error::Validation`, while domain refusals retain their broker code.
     async fn assert_refused(&self, code: &str) {
         let output = cli(
             &self.home,
@@ -170,10 +171,14 @@ impl Broker {
             .start(&self.request("fixture:answer", &format!("refused-{code}")))
             .await
             .unwrap_err();
-        assert!(
-            matches!(&error, Error::Broker { broker_error_code: Some(found), .. } if found == code),
-            "socket: {error:?}"
-        );
+        if code == "ValidationError" {
+            assert!(matches!(&error, Error::Validation(_)), "socket: {error:?}");
+        } else {
+            assert!(
+                matches!(&error, Error::Broker { broker_error_code: Some(found), .. } if found == code),
+                "socket: {error:?}"
+            );
+        }
         assert_eq!(error.public().kind, code, "socket render");
     }
 }
@@ -606,6 +611,32 @@ async fn admission_codes_survive_every_public_transport() {
             .success()
     );
     broker.assert_refused("no_eligible_account").await;
+}
+
+/// A static credential/connection mismatch returns a typed refusal through
+/// real CLI, MCP and socket starts before any agent or attempt row exists.
+#[tokio::test]
+async fn static_launch_preflight_refuses_every_public_transport_without_admission() {
+    let broker = Broker::start();
+    let path = broker.home.join("config.toml");
+    let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    config["providers"]["glm-user"]["connection"] = toml::Value::Table(
+        [("kind".into(), toml::Value::String("native".into()))]
+            .into_iter()
+            .collect(),
+    );
+    std::fs::write(path, toml::to_string(&config).unwrap()).unwrap();
+    broker.assert_refused("ValidationError").await;
+    let store = agent_run::state::Store::open(&broker.home).unwrap();
+    for table in ["agents", "attempts"] {
+        let count: i64 = store
+            .conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
 }
 
 /// A real broker whose committed capacity revision moves between every

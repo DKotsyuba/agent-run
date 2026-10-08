@@ -272,6 +272,38 @@ redaction preserves nonsecret whitespace, Codex flushes pending text when a
 turn ends without an item completion, and failure text is redacted before its
 published length limit is applied.
 
+### Synchronous static launch admission
+
+Before creating a durable agent/attempt or reserving account capacity, provider
+admission resolves the frozen canonical role and checks the executable, shared
+role policy, credential-reference connection shape and Codex grant compiler
+used by real launch. Single starts, new
+pool members and replacements share prepare_provider; historical start uses
+the same native grant compiler. Replays still return their original admission
+before consulting mutable state. Unsupported writable Codex external read roots
+are typed errors in the start call, with no partial admission.
+
+This preflight does not start a harness/model or read credential values. It
+checks known static contracts, not a promise of successful future execution:
+file changes, credential expiry, native model availability, MCP readiness and
+resource races remain runtime checks. The real provider materializer/planner
+rechecks the shared executable and credential-reference checks. Auto admission
+validates enabled model-bound candidates; pinned admission validates the selected
+account, without reading its credentials. Historical snapshots, account scope
+and permanent agent IDs remain unchanged.
+
+### Safe execution failure provenance
+
+Both supervisor routes retain execution_failure_v1 before converting an
+execution error to its terminal outcome. Fixed stage/class labels and nullable
+I/O kind, errno, SQLite code/extended code or JSON category distinguish storage,
+protocol and transport failures without persisting original error messages,
+SQL, paths, prompts, responses, arguments or credentials. A bounded log is
+attempted before best-effort event persistence; an unavailable database cannot
+replace the original failed outcome with success or a secondary diagnostic
+error. SQLite and JSON errors have explicit runtime_storage_failed and
+runtime_protocol_failed categories; actual cleanup ownership is unchanged.
+
 ### Claude-family task completion
 
 Claude's persistent input stream can produce several native results, including

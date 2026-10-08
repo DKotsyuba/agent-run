@@ -142,7 +142,7 @@ fn shared(config: &ProviderConfig, worker_mcp: bool) -> Result<Config> {
 /// Reconstructs role grants from a validated canonical plan rather than a
 /// mutable profile file; the materializer still verifies skill/MCP assets.
 /// Includes the built-in worker namespace only when frozen in the role.
-fn profile(role: &ResolvedRolePlan) -> Profile {
+pub fn profile(role: &ResolvedRolePlan) -> Profile {
     let mut profile = Profile {
         name: role.role_name.clone(),
         body: role.prompt.clone(),
@@ -174,6 +174,47 @@ fn profile(role: &ResolvedRolePlan) -> Profile {
     profile
 }
 
+/// Validates an enabled model-bound account's reference against the actual
+/// native/custom launch contract without opening credentials or spawning.
+/// Returns its parsed nonsecret reference; rejects mismatched harnesses,
+/// connection types and unsupported Codex authorization headers. Admission,
+/// materialization and execution call this same check; live auth is read later.
+pub fn credential_reference(
+    catalog: &ProviderCatalog,
+    provider: &ProviderId,
+    model: &str,
+    account: &AccountId,
+) -> Result<CredentialRef> {
+    let definition = catalog
+        .provider(provider)
+        .ok_or_else(|| invalid("unknown provider"))?;
+    let lease = AttemptCredentials::from_selected(catalog, provider, model, account)?;
+    let reference = CredentialRef::from_str(lease.secret().reference())?;
+    match (&definition.connection, &reference) {
+        (ProviderConnection::Native, CredentialRef::Native(harness))
+        | (ProviderConnection::Native, CredentialRef::Named { harness, .. })
+            if *harness == definition.harness => {}
+        (
+            ProviderConnection::Custom { auth_header, .. },
+            CredentialRef::Environment(_) | CredentialRef::File(_) | CredentialRef::Keychain { .. },
+        ) => {
+            if definition.harness == HarnessId::Codex
+                && *auth_header != agent_run_domain::CredentialHeader::Bearer
+            {
+                return Err(invalid(
+                    "Codex custom gateway requires bearer authorization",
+                ));
+            }
+        }
+        _ => {
+            return Err(invalid(
+                "credential reference is incompatible with provider connection",
+            ));
+        }
+    }
+    Ok(reference)
+}
+
 /// Seals one provider's native settings, tools, grants, and model alias once.
 ///
 /// `role` must be the admitted canonical role, `workdir` an existing absolute
@@ -201,22 +242,8 @@ pub fn materialize_selected(
         .iter()
         .find(|offering| offering.id == model)
         .ok_or_else(|| invalid("provider model is unavailable"))?;
-    let lease = AttemptCredentials::from_selected(catalog, provider, model, account)?;
-    let reference = CredentialRef::from_str(lease.secret().reference())?;
+    let reference = credential_reference(catalog, provider, model, account)?;
     let native = matches!(definition.connection, ProviderConnection::Native);
-    match (&reference, native) {
-        (CredentialRef::Native(harness), true) if *harness == definition.harness => {}
-        (CredentialRef::Named { harness, .. }, true) if *harness == definition.harness => {}
-        (
-            CredentialRef::Environment(_) | CredentialRef::File(_) | CredentialRef::Keychain { .. },
-            false,
-        ) => {}
-        _ => {
-            return Err(invalid(
-                "credential reference is incompatible with provider connection",
-            ));
-        }
-    }
     let role = ResolvedRolePlan::from_payload(&role.to_payload())?;
     if !offering
         .restrictions
@@ -230,6 +257,7 @@ pub fn materialize_selected(
     }
     let role_profile = profile(&role);
     let mut runtime = runtime(config, definition.harness, model)?;
+    crate::validate_executable(&runtime)?;
     if definition.harness == HarnessId::ClaudeCode {
         runtime.skills = role_profile.skills.clone();
     }
@@ -451,8 +479,7 @@ pub fn plan_selected_with(
     if definition.harness != authority.harness || definition.connection != authority.connection {
         return Err(invalid("provider connection changed since admission"));
     }
-    let lease =
-        AttemptCredentials::from_selected(catalog, &authority.provider, &authority.model, account)?;
+    let reference = credential_reference(catalog, &authority.provider, &authority.model, account)?;
     if !sealed
         .restrictions
         .iter()
@@ -460,8 +487,8 @@ pub fn plan_selected_with(
     {
         return Err(invalid("sealed model restriction is absent from role"));
     }
-    let reference = CredentialRef::from_str(lease.secret().reference())?;
     let runtime = runtime(config, sealed.harness, &authority.model)?;
+    crate::validate_executable(&runtime)?;
     policy::evaluate(authority.provider.as_str(), &runtime, &profile(&role)).admit()?;
     let selected_label = match &reference {
         CredentialRef::Named { label, .. } => Some(label.as_str()),
@@ -507,19 +534,10 @@ pub fn plan_selected_with(
         | (ProviderConnection::Native, CredentialRef::Named { harness, .. }, _)
             if *harness == sealed.harness => {}
         (
-            ProviderConnection::Custom {
-                endpoint,
-                auth_header,
-                ..
-            },
+            ProviderConnection::Custom { endpoint, .. },
             CredentialRef::Environment(_) | CredentialRef::File(_) | CredentialRef::Keychain { .. },
             HarnessId::Codex,
         ) => {
-            if *auth_header != agent_run_domain::CredentialHeader::Bearer {
-                return Err(invalid(
-                    "Codex custom gateway requires bearer authorization",
-                ));
-            }
             environment.insert("AGENT_RUN_PROVIDER_TOKEN".into(), reader.read(&reference)?);
             // The sealed Codex config names this env key and excludes it from tool shells.
             let _ = endpoint;
