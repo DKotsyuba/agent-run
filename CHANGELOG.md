@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.22.7
+
 - feat(research): enable native web search and page retrieval with a frozen
   research-only tool contract, preserving ordinary role capabilities
 - feat(research): save bounded, cited reports only in the assigned workdir
