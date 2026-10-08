@@ -283,7 +283,11 @@ impl Grant {
     /// `workspace_network` opt-in. Non-network grants always select the exact
     /// built-in profile, so a managed default cannot replace legacy sandbox
     /// fields during thread admission. Existing network override paths remain
-    /// unchanged and still require their effective grants to verify.
+    /// unchanged and still require their effective grants to verify. Restricted
+    /// research has no runtime workspace roots and uses the built-in read-only
+    /// grant: disabling environment access removes those roots from the native
+    /// echo, while the broker separately owns report-directory authorization.
+    /// Hosted web does not require raw command network access.
     pub fn new(
         runtime: &Runtime,
         request: &StartRequest,
@@ -314,7 +318,8 @@ impl Grant {
         let managed = system.is_some();
         let profile;
         if !role.write {
-            profile = (managed || !role.network).then(|| ":read-only".into());
+            profile = (managed || !role.network || role.research_tools_only())
+                .then(|| ":read-only".into());
         } else if !runtime.workspace_roots.is_empty() && (managed || !role.network) {
             if role.network && !runtime.workspace_network {
                 return Err(invalid("network role requires workspace_network"));
@@ -343,7 +348,12 @@ impl Grant {
             }
             profile = (managed || !role.network).then(|| ":workspace".into());
         }
-        let network_access = if profile.as_deref() == Some("Projects") {
+        if role.research_tools_only() {
+            roots.clear();
+        }
+        let network_access = if role.research_tools_only() {
+            false
+        } else if profile.as_deref() == Some("Projects") {
             runtime.workspace_network
         } else {
             role.network
@@ -654,10 +664,13 @@ pub async fn models(process: &mut Process) -> Result<Vec<Value>> {
     }
     Err(invalid("model roster exceeds page bound"))
 }
+
 /// Runs one admitted Codex turn through its owned app-server process.
 ///
-/// The runner verifies the live model roster and the echoed grant before it
-/// starts a turn, journals recognized transcript data, and persists valid
+/// The runner validates the role, live model roster and echoed grant before
+/// starting a turn. Research additionally verifies effective native controls
+/// and the exact private MCP catalog, with environment access disabled. It
+/// journals recognized transcript data and persists valid
 /// unconsumed app-server notifications as durable events. It returns a
 /// terminal engine outcome, or fails closed on malformed protocol data,
 /// grant drift, unavailable models, and nonterminal completion statuses.
@@ -671,7 +684,18 @@ pub async fn run(
     role: &Profile,
     home: &Path,
 ) -> Result<EngineResult> {
+    agent_run_adapters::validate_role(runtime, role)?;
     initialize(process).await?;
+    if role.research_tools_only() {
+        let config = process
+            .rpc(
+                "config/read",
+                json!({"cwd": record.request.workdir}),
+                Duration::from_secs(30),
+            )
+            .await?;
+        agent_run_adapters::codex::verify_research_config(&config)?;
+    }
     let mut session = Session::new(record.resume_of_runtime_session_id.is_some());
     session.initialized()?;
     agent_run_adapters::codex::models::validate_cached_selection(
@@ -695,6 +719,11 @@ pub async fn run(
     }
     let grant = Grant::new(runtime, &record.request, role, home)?;
     let mut params = grant.request();
+    if role.research_tools_only() {
+        // Empty sticky environments remove shell, patch and filesystem tools.
+        // Hosted web and the attempt-bound worker MCP remain available.
+        params["environments"] = json!([]);
+    }
     let method = if let Some(s) = &record.resume_of_runtime_session_id {
         params["threadId"] = json!(s);
         "thread/resume"
@@ -719,6 +748,48 @@ pub async fn run(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| invalid("thread start did not return an id"))?
         .to_owned();
+    if role.research_tools_only() {
+        let status = process
+            .rpc(
+                "mcpServerStatus/list",
+                json!({"threadId": tid, "limit": 1000}),
+                Duration::from_secs(30),
+            )
+            .await?;
+        let servers = status
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid("native research MCP inventory is missing"))?;
+        let expected = agent_run_domain::worker::research_tools_json();
+        let expected: BTreeSet<&str> = expected
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        let tools = servers
+            .first()
+            .and_then(|server| server["tools"].as_object());
+        if status
+            .get("nextCursor")
+            .is_some_and(|cursor| !cursor.is_null())
+            || servers.len() != 1
+            || servers[0]["name"] != agent_run_domain::worker::SERVER_NAME
+            || servers[0]["runtimeStatus"] != "connected"
+            || tools.map(|tools| tools.keys().map(String::as_str).collect::<BTreeSet<_>>())
+                != Some(expected.clone())
+        {
+            return Err(invalid("native research MCP inventory did not verify"));
+        }
+        store.event(
+            &record.id,
+            "research_runtime_tools_v1",
+            &json!({
+                "disabled_features": agent_run_adapters::codex::RESEARCH_DISABLED_FEATURES,
+                "agents_enabled": false, "environment_access": false,
+                "raw_command_network": false, "composition": "native_isolate",
+                "worker_tools": expected,
+            }),
+        )?;
+    }
     session.thread_started(&tid)?;
     if record
         .resume_of_runtime_session_id

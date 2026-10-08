@@ -1096,6 +1096,15 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 attempt_id.clone(),
                 token,
             ];
+            planned.launch.environment.insert(
+                agent_run_domain::worker::RESEARCH_ENV.into(),
+                if planned.role.research_tools_only() {
+                    "1"
+                } else {
+                    "0"
+                }
+                .into(),
+            );
             for (name, value) in agent_run_domain::worker::ENV_NAMES.into_iter().zip(values) {
                 planned.launch.environment.insert(name.into(), value);
             }

@@ -554,6 +554,15 @@ fn materialize_with_provider(
     app_home: &Path,
     provider: Option<(&agent_run_domain::ProviderDefinition, &str, &str)>,
 ) -> Result<(Snapshot, String)> {
+    crate::validate_role(runtime, profile)?;
+    let research = profile.research_tools_only();
+    let mut restricted = runtime.clone();
+    if research {
+        // Plugin assets/hooks cannot reintroduce command or MCP capabilities.
+        restricted.plugins.clear();
+        restricted.hooks.clear();
+    }
+    let runtime = &restricted;
     let kind = runtime.kind()?;
     agent_run_config::config::native_settings(kind, &runtime.native_settings)?;
     super::claude::validate_runtime(runtime, kind)?;
@@ -584,13 +593,13 @@ fn materialize_with_provider(
         if !source.join("SKILL.md").is_file() {
             return Err(invalid("declared skill is unavailable"));
         }
-        let relative = if matches!(kind, Adapter::Claude | Adapter::Glm) {
+        let relative = if !research && matches!(kind, Adapter::Claude | Adapter::Glm) {
             format!("plugins/{skill}/skills/{skill}")
         } else {
             format!("skills/{skill}")
         };
         p.tree(&source, &relative, None)?;
-        if matches!(kind, Adapter::Claude | Adapter::Glm) {
+        if !research && matches!(kind, Adapter::Claude | Adapter::Glm) {
             p.json(
                 &format!("plugins/{skill}/.claude-plugin/plugin.json"),
                 &json!({"name":skill,"version":"1.0.0"}),
@@ -615,7 +624,7 @@ fn materialize_with_provider(
         mcp.insert(name.clone(), entry);
     }
     let mut hooks = super::plugins::hook_groups(runtime, &plugins.roots)?;
-    if kind == Adapter::Codex {
+    if kind == Adapter::Codex && !research {
         let trusted = profile
             .mcp
             .iter()
@@ -689,6 +698,12 @@ fn materialize_with_provider(
                     toml::Value::Array(s.args.iter().cloned().map(toml::Value::String).collect()),
                 );
                 let mut forwarded = s.env_from.clone();
+                if research && name == agent_run_domain::worker::SERVER_NAME {
+                    // Select the six-tool catalog inside Codex's separately
+                    // filtered MCP child; broker authority remains independent.
+                    forwarded.push(agent_run_domain::worker::RESEARCH_ENV.into());
+                    t.insert("required".into(), toml::Value::Boolean(true));
+                }
                 // Codex's stdio MCP environment is separately filtered. Forward
                 // the already resolved toolchain roots, never raw host values.
                 // The worker channel only needs its attempt-bound capability.
@@ -783,6 +798,12 @@ fn materialize_with_provider(
                     )]),
                 );
                 doc.insert("shell_environment_policy".into(), toml::Value::Table(shell));
+            }
+            if research {
+                // Native controls override only this frozen research snapshot.
+                let controls: toml::Table =
+                    serde_json::from_value(super::codex::research_settings())?;
+                doc.extend(controls);
             }
             let text = toml::to_string_pretty(&doc)
                 .map_err(|_| invalid("native config could not be serialized"))?;

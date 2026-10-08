@@ -100,6 +100,9 @@ pub fn current_platform() -> &'static str {
 // Conservative reasons used until a backend supplies narrower verified evidence.
 fn unsupported_reason(constraint: Constraint) -> &'static str {
     match constraint {
+        Constraint::ResearchToolsOnly => {
+            "the runtime did not supply the restricted research tool contract"
+        }
         Constraint::WebToolsDisabled => "the effective profile authorizes built-in web tools",
         Constraint::ExternalNetworkIsolation => {
             "tool filtering does not prevent shell or child-process external sockets"
@@ -147,6 +150,9 @@ pub fn effective_policy(
 ) -> EffectivePolicy {
     let constraints = Constraint::ALL
         .into_iter()
+        .filter(|constraint| {
+            *constraint != Constraint::ResearchToolsOnly || required.contains(constraint)
+        })
         .map(|constraint| {
             let is_required = required.contains(&constraint);
             if let Some(capability) = capabilities.get(&constraint) {
@@ -226,10 +232,33 @@ pub fn admission_decision(policy: &EffectivePolicy) -> AdmissionDecision {
 /// [`effective_policy`]. `runtime.required_constraints` is not read here;
 /// callers pass the already-tightened `profile.required_constraints`
 /// (the effective requirement is the union of role and request; see
-/// `docs/api.md`).
+/// `docs/api.md`). Research claims depend on native launch controls; Codex
+/// verifies their effective configuration and private MCP inventory before a turn.
 pub fn evaluate(runtime_name: &str, runtime: &Runtime, profile: &Profile) -> EffectivePolicy {
     let platform = current_platform();
     let mut capabilities = BTreeMap::new();
+    if profile.research_tools_only()
+        && profile.validate_research().is_ok()
+        && matches!(
+            runtime.kind(),
+            Ok(crate::config::Adapter::Codex
+                | crate::config::Adapter::Claude
+                | crate::config::Adapter::Glm)
+        )
+    {
+        capabilities.insert(
+            Constraint::ResearchToolsOnly,
+            DeclaredCapability {
+                enforcement: Enforcement::RuntimeEnforced,
+                scope: "hosted web and broker-confined reports; no command or user MCP tools"
+                    .into(),
+                reason:
+                    "research native tool controls and authenticated workdir-only report writer"
+                        .into(),
+                platforms: BTreeSet::new(),
+            },
+        );
+    }
     if runtime.plugins.is_empty() {
         capabilities.insert(
             Constraint::PluginImmutability,

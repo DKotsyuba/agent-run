@@ -15,10 +15,13 @@ pub enum Constraint {
     FilesystemWriteIsolation,
     FilesystemReadIsolation,
     PluginImmutability,
+    /// Hosted web research with no command, plugin or user-MCP tools; report
+    /// writes are confined by the authenticated broker to the assigned workdir.
+    ResearchToolsOnly,
 }
 impl Constraint {
     /// Lists every recognized constraint in stable declaration order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::WebToolsDisabled,
         Self::ExternalNetworkIsolation,
         Self::LoopbackTcpIsolation,
@@ -27,6 +30,7 @@ impl Constraint {
         Self::FilesystemWriteIsolation,
         Self::FilesystemReadIsolation,
         Self::PluginImmutability,
+        Self::ResearchToolsOnly,
     ];
 }
 

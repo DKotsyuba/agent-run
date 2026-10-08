@@ -1,14 +1,14 @@
 # Worker-to-orchestrator reports
 
 New schema-2 runs automatically receive a separate `agent_run_worker` stdio MCP
-server. Every current worker advertises the same five tools: `notify_orchestrator`,
+server. Ordinary workers advertise five tools: `notify_orchestrator`,
 `pool_post`, `pool_read`, `pool_propose` and `pool_vote`. Pool calls authorize
 live database membership on each request; an independent worker can report but
 cannot use pool actions before admission. No pool or author argument is accepted:
 the broker derives both from authenticated membership. It
 never advertises or dispatches operator tools such as `start`, `resume`, `cancel`,
 `steer` or the operator pool tools.
-Configured work MCPs remain available according to the frozen role.
+Configured work MCPs remain available according to the frozen role. Restricted research excludes configured work MCPs and adds only `save_report`; see [research permissions](research-permissions.md).
 
 The worker uses the tool for material findings, risks, questions or blockers:
 
@@ -57,7 +57,7 @@ authorization. Delivery may be delayed; a queue acknowledgement is not an answer
 or `{ "existing_agent_id": "ag-...", "role": "review" }` for each of two to
 five seats. Existing members must be independent stable roots with an owned
 RUNNING attempt, no prior pool membership, a live original execution deadline
-and authenticated proof of the current five-tool catalog. Unknown historical
+and authenticated proof of the ordinary five-tool or restricted research six-tool catalog. Unknown historical
 catalog or independence history is refused; resume behavior is otherwise unchanged.
 
 Admission preserves the existing task, native session, model, account, grants,
@@ -100,9 +100,14 @@ The internal `_worker-mcp` entry point only talks to the existing broker; it nev
 opens or migrates SQLite, starts a broker, or uses Desktop native capabilities.
 
 The private server advertises Cargo's product version as `serverInfo.version`,
-independently of the pinned SDK and negotiated protocol. Its fixed five-tool catalog is
+independently of the pinned SDK and negotiated protocol. Its ordinary five-tool catalog is
 generated into `schemas/worker-tools.json` from the domain-owned worker asset.
 Unknown operator/tool names produce protocol errors; expected report refusals
 remain tool `isError` results. A rendering failure after enqueue preserves the
 notification identity and original request key with no-replay advice; uncertainty
 stays unknown. See [MCP presentation](mcp-presentation.md).
+
+Restricted research derives a six-tool surface by adding `save_report`. A
+supervisor-selected nonsecret marker selects discovery; the broker independently
+authenticates the attempt and checks its frozen report-directory contract.
+Ordinary and historical workers keep their existing catalog.

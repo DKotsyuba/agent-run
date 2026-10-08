@@ -297,6 +297,18 @@ async fn worker_tool_call(
         Ok(json!({"error": {"code": denial.code(), "message": denial.message()}}))
     };
     match tool {
+        WorkerTool::SaveReport => {
+            let input: agent_run_domain::worker::SaveReportRequest =
+                serde_json::from_value(call.input.clone())
+                    .map_err(|_| invalid("invalid save_report arguments"))?;
+            let home = service.home.clone();
+            let receipt = tokio::task::spawn_blocking(move || {
+                crate::research_reports::save(&crate::state::Store::open(&home)?, &call, &input)
+            })
+            .await
+            .map_err(|_| crate::Error::Runtime("research report write failed".into()))??;
+            Ok(serde_json::to_value(receipt)?)
+        }
         WorkerTool::Notify => {
             let input: agent_run_domain::worker::NotifyRequest = serde_json::from_value(call.input)
                 .map_err(|_| invalid("unknown, missing, or incorrectly typed report argument"))?;

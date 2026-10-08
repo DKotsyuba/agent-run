@@ -258,6 +258,7 @@ pub fn materialize_selected(
     let role_profile = profile(&role);
     let mut runtime = runtime(config, definition.harness, model)?;
     crate::validate_executable(&runtime)?;
+    crate::validate_role(&runtime, &role_profile)?;
     if definition.harness == HarnessId::ClaudeCode {
         runtime.skills = role_profile.skills.clone();
     }
@@ -489,6 +490,7 @@ pub fn plan_selected_with(
     }
     let runtime = runtime(config, sealed.harness, &authority.model)?;
     crate::validate_executable(&runtime)?;
+    crate::validate_role(&runtime, &profile(&role))?;
     policy::evaluate(authority.provider.as_str(), &runtime, &profile(&role)).admit()?;
     let selected_label = match &reference {
         CredentialRef::Named { label, .. } => Some(label.as_str()),
@@ -639,8 +641,13 @@ fn claude_args(
     resume_session: Option<&str>,
     output_schema: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Vec<String>> {
-    let mut tools = vec!["Read", "Grep", "Glob"];
-    if !role.skills.is_empty() {
+    let research = role.research_tools_only();
+    let mut tools = if research {
+        vec![]
+    } else {
+        vec!["Read", "Grep", "Glob"]
+    };
+    if !research && !role.skills.is_empty() {
         tools.push("Skill");
     }
     if role.write {
@@ -663,7 +670,9 @@ fn claude_args(
     if role.worker_mcp {
         allowed.push(format!("mcp__{}", agent_run_domain::worker::SERVER_NAME));
     }
-    let denied = if role.network {
+    let denied = if research {
+        "Bash,Agent,Task,Skill,Read,Grep,Glob,Edit,Write,NotebookEdit".into()
+    } else if role.network {
         String::new()
     } else {
         "WebFetch,WebSearch".into()
@@ -706,7 +715,14 @@ fn claude_args(
                 .into_owned(),
         ]);
     }
-    for plugin in &sealed.plugin_paths {
+    if research {
+        args.extend([
+            "--restricted".into(),
+            "--disable-slash-commands".into(),
+            "--no-chrome".into(),
+        ]);
+    }
+    for plugin in sealed.plugin_paths.iter().filter(|_| !research) {
         args.extend(["--plugin-dir".into(), plugin.to_string_lossy().into_owned()]);
     }
     if let Some(effort) = effort {

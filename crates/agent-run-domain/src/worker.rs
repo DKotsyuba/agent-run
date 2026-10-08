@@ -20,6 +20,83 @@ pub fn pool_catalog_digest() -> String {
     crate::canonical::sha256_hex(&serde_json::json!(crate::tools::worker_tools_json()), true)
 }
 
+/// Nonsecret launch marker selecting the report-capable research worker surface.
+/// Only the supervisor sets it from frozen authority; the broker independently
+/// checks authority before writing, so the marker itself grants no access.
+pub const RESEARCH_ENV: &str = "AGENT_RUN_WORKER_RESEARCH";
+
+/// The research surface retains safe completion/pool messages and adds only a
+/// confined filesystem tool. The ordinary five-tool surface stays unchanged.
+pub fn research_tools_json() -> Vec<Value> {
+    let mut tools = crate::tools::worker_tools_json();
+    tools.push(serde_json::json!({
+        "name":"save_report",
+        "description":"Save a UTF-8 research report in the assigned report directory (workdir). Accepts one .md, .txt or .json filename, no directory/path, traversal, symlink target, command or overwrite. Identical existing content is a duplicate. Returns filename, bytes and SHA-256; not proof of task completion.",
+        "annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},
+        "inputSchema":{"type":"object","additionalProperties":false,"required":["filename","content"],"properties":{
+            "filename":{"type":"string","maxLength":128},
+            "content":{"type":"string","minLength":1,"maxLength":65536}
+        }}
+    }));
+    tools
+}
+
+/// Fingerprints the exact research worker schemas without capability secrets.
+pub fn research_catalog_digest() -> String {
+    crate::canonical::sha256_hex(&serde_json::json!(research_tools_json()), true)
+}
+
+/// Accepts only reviewed pool-capable catalogs. The research catalog includes
+/// every ordinary pool tool; an unknown catalog never satisfies enrollment.
+pub fn known_pool_catalog(version: u32, digest: &str) -> bool {
+    version == POOL_CATALOG_VERSION
+        && (digest == pool_catalog_digest() || digest == research_catalog_digest())
+}
+
+/// A bounded report request. Its directory comes from frozen authority; a
+/// model cannot supply a directory, execution or overwrite option.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SaveReportRequest {
+    /// Single non-hidden report filename, at most 128 UTF-8 bytes.
+    pub filename: String,
+    /// Nonblank UTF-8 report text, at most 64 KiB; never diagnostic contents.
+    pub content: String,
+}
+impl SaveReportRequest {
+    /// Rejects absolute/traversing paths, both separators, hidden/control names
+    /// and non-report extensions. Checks content bytes before filesystem effects.
+    pub fn validate(&self) -> Result<()> {
+        let name = &self.filename;
+        if name.is_empty()
+            || name.len() > 128
+            || name.starts_with('.')
+            || name.contains('/')
+            || name.as_bytes().contains(&92)
+            || name.chars().any(char::is_control)
+            || ![".md", ".txt", ".json"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix))
+        {
+            return Err(Error::Validation("report filename must be a single non-hidden .md, .txt or .json name inside the assigned directory".into()));
+        }
+        bounded_text("report content", &self.content, 65536)
+    }
+}
+
+/// Content-free receipt for atomic report publication or an identical replay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaveReportReceipt {
+    /// Validated basename; no caller-selected directory.
+    pub filename: String,
+    /// Exact published UTF-8 byte count.
+    pub bytes: u64,
+    /// Saved file SHA-256, for verification without repeating contents.
+    pub sha256: String,
+    /// True only when an existing regular file held identical bytes.
+    pub duplicate: bool,
+}
+
 /// Hidden attempt-bound catalog proof sent only by the native worker server.
 /// No Debug representation is provided because the token is ephemeral secret.
 #[derive(Clone, Serialize, Deserialize)]
@@ -156,6 +233,8 @@ pub const TOOL_METHOD: &str = "worker/call";
 pub enum WorkerTool {
     /// Report a material finding to this run's orchestrator.
     Notify,
+    /// Atomically save a report within frozen research workdir authority.
+    SaveReport,
     /// Ordinary informational chat to the pool.
     PoolPost,
     /// Bounded read of the pool log and derived status.
@@ -171,6 +250,7 @@ impl WorkerTool {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Notify => "notify_orchestrator",
+            Self::SaveReport => "save_report",
             Self::PoolPost => "pool_post",
             Self::PoolRead => "pool_read",
             Self::PoolPropose => "pool_propose",
@@ -182,6 +262,7 @@ impl WorkerTool {
     pub fn parse(name: &str) -> Option<Self> {
         [
             (Self::Notify.as_str(), Self::Notify),
+            (Self::SaveReport.as_str(), Self::SaveReport),
             (Self::PoolPost.as_str(), Self::PoolPost),
             (Self::PoolRead.as_str(), Self::PoolRead),
             (Self::PoolPropose.as_str(), Self::PoolPropose),

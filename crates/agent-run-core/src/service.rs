@@ -2405,6 +2405,7 @@ pub(crate) fn prepare_provider(
     let runtime = adapters::provider::runtime(config, provider.harness, &request.model)?;
     let launch_profile = adapters::provider::profile(&role);
     adapters::validate_executable(&runtime)?;
+    adapters::validate_role(&runtime, &launch_profile)?;
     policy::evaluate(request.provider.as_str(), &runtime, &launch_profile).admit()?;
     if provider.harness == agent_run_domain::HarnessId::Codex {
         crate::codex::Grant::new(&runtime, &effective, &launch_profile, &runtime.home)?;

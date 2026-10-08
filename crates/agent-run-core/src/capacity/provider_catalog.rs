@@ -53,9 +53,10 @@ fn admissible(
     role_plan::resolve_role_plan(&profile, config.skills_dir(), &config.mcp, "global", None).is_ok()
         && agent_run_adapters::provider::runtime(config, provider.harness, native).is_ok_and(
             |runtime| {
-                policy::evaluate(provider.id.as_str(), &runtime, &profile)
-                    .admit()
-                    .is_ok()
+                agent_run_adapters::validate_role(&runtime, &profile).is_ok()
+                    && policy::evaluate(provider.id.as_str(), &runtime, &profile)
+                        .admit()
+                        .is_ok()
             },
         )
 }

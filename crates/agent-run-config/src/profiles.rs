@@ -179,6 +179,38 @@ pub fn profile_path(directory: &std::path::Path, name: &str) -> Result<PathBuf> 
     }
     Ok(resolved)
 }
+
+impl Profile {
+    /// Whether this frozen profile requires the restricted research runtime:
+    /// hosted web, no command/user-MCP tools and broker-confined report writes.
+    pub fn research_tools_only(&self) -> bool {
+        self.required_constraints
+            .contains(&Constraint::ResearchToolsOnly)
+    }
+
+    /// Rejects a restricted research role that grants native writes, disables
+    /// web, widens read roots or exposes user MCP/delegation skill capabilities.
+    /// Other profiles are unchanged; this performs no I/O or model invocation.
+    pub fn validate_research(&self) -> Result<()> {
+        if self.research_tools_only()
+            && (self.write
+                || !self.network
+                || self.allow_external_read_roots
+                || !self.read_roots.is_empty()
+                || self
+                    .mcp
+                    .iter()
+                    .any(|name| name != agent_run_domain::worker::SERVER_NAME)
+                || self.skills.iter().any(|skill| skill != "role-research"))
+        {
+            return Err(invalid(
+                "research requires hosted web, read-only native grants, no external roots and no user MCP/delegation skills",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Parses Markdown and strict TOML front matter without loading catalog assets.
 /// Canonical roles own grants; legacy grants can only narrow the request.
 /// MCP entries accept unique catalog names or named exact tool caps. Invalid
@@ -256,7 +288,7 @@ pub fn parse(text: &str, request: &StartRequest) -> Result<Profile> {
     }
     let revision = meta.revision.unwrap_or_else(|| "legacy".into());
     domain::nonblank("profile revision", &revision)?;
-    Ok(Profile {
+    let profile = Profile {
         name: request.profile.clone(),
         body: body.trim().into(),
         write: meta.write.unwrap_or(false) && (canonical || request.write),
@@ -269,7 +301,9 @@ pub fn parse(text: &str, request: &StartRequest) -> Result<Profile> {
         mcp,
         mcp_tools,
         required_constraints,
-    })
+    };
+    profile.validate_research()?;
+    Ok(profile)
 }
 /// Loads one historical schema-1 profile inside its configured directory and
 /// validates catalog references. Profile-side MCP tool caps are schema-2-only

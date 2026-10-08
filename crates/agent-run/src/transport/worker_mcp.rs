@@ -39,6 +39,8 @@ pub struct WorkerProxy {
     token: String,
     /// Durable proof success for this attempt, shared by server clones only.
     catalog_registered: Arc<AtomicBool>,
+    /// Frozen supervisor-selected report surface; broker authorization remains authoritative.
+    research: bool,
 }
 
 /// Converts every domain-owned worker definition through the pinned SDK.
@@ -54,6 +56,22 @@ fn tools() -> std::result::Result<Vec<Tool>, ErrorData> {
 }
 
 impl WorkerProxy {
+    /// Returns the role-bound embedded surface. Research adds only the report
+    /// writer; ordinary workers retain their original exact five-tool inventory.
+    fn tools(&self) -> std::result::Result<Vec<Tool>, ErrorData> {
+        if !self.research {
+            return tools();
+        }
+        agent_run_domain::worker::research_tools_json()
+            .into_iter()
+            .map(|tool| {
+                serde_json::from_value(tool).map_err(|_| {
+                    ErrorData::internal_error("invalid research worker registry", None)
+                })
+            })
+            .collect()
+    }
+
     /// Registers this actual native catalog once per exact immutable attempt.
     /// Only an explicit successful broker receipt is memoized across clones;
     /// errors, unknown replies and timeouts remain retryable on legitimate
@@ -67,7 +85,11 @@ impl WorkerProxy {
             attempt_id: self.attempt_id.clone(),
             token: self.token.clone(),
             version: agent_run_domain::worker::POOL_CATALOG_VERSION,
-            digest: agent_run_domain::worker::pool_catalog_digest(),
+            digest: if self.research {
+                agent_run_domain::worker::research_catalog_digest()
+            } else {
+                agent_run_domain::worker::pool_catalog_digest()
+            },
         };
         if let Ok(value) = serde_json::to_value(proof)
             && let Ok(Ok(receipt)) = tokio::time::timeout(
@@ -101,6 +123,11 @@ impl WorkerProxy {
         use agent_run_domain::worker::WorkerTool;
         let validated = match tool {
             WorkerTool::Notify => validated_input(arguments, name, NotifyRequest::validate),
+            WorkerTool::SaveReport => validated_input(
+                arguments,
+                name,
+                agent_run_domain::worker::SaveReportRequest::validate,
+            ),
             WorkerTool::PoolRead => validated_input(arguments, name, PoolReadRequest::validate),
             WorkerTool::PoolPost => validated_input(arguments, name, PoolMessage::validate),
             WorkerTool::PoolPropose => validated_input(arguments, name, PoolPropose::validate),
@@ -155,6 +182,27 @@ impl WorkerProxy {
         value: Value,
         request_id: Option<&str>,
     ) -> rmcp::model::CallToolResult {
+        if tool == agent_run_domain::worker::WorkerTool::SaveReport {
+            return match serde_json::from_value::<agent_run_domain::worker::SaveReportReceipt>(
+                value,
+            ) {
+                Ok(receipt) => {
+                    rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                        format!(
+                            "Report saved: {} ({} bytes, sha256={}, duplicate={}). Verify it with the final answer; this receipt is not task completion.",
+                            serde_json::to_string(&receipt.filename).unwrap_or_default(),
+                            receipt.bytes,
+                            receipt.sha256,
+                            receipt.duplicate
+                        ),
+                    )])
+                }
+                Err(_) => super::mcp_text::error_result(
+                    "invalid_report_receipt",
+                    "Report outcome is uncertain; reconcile the same filename and content.",
+                ),
+            };
+        }
         if let Some(error) = value.get("error") {
             return match pool_denial(error) {
                 Ok((denial, message)) => super::mcp_text::error_result(denial.code(), &message),
@@ -243,7 +291,14 @@ impl ServerHandler for WorkerProxy {
         info.capabilities = serde_json::from_value(json!({"tools":{"listChanged":false}}))
             .expect("static capabilities");
         info.server_info = Implementation::new("agent-run-worker", env!("CARGO_PKG_VERSION"));
-        info.instructions = Some("This private surface exposes the fixed five-tool catalog for the supervisor-bound attempt. Receipts confirm durable recording, never delivery, reading, approval or completion. Reconcile uncertainty with the same request_id and content; never send credentials.".into());
+        let catalog = if self.research {
+            "fixed six-tool research catalog"
+        } else {
+            "fixed five-tool catalog"
+        };
+        info.instructions = Some(format!(
+            "This private surface exposes the {catalog} for the supervisor-bound attempt. Receipts confirm durable recording, never delivery, reading, approval or completion. Reconcile uncertainty with the same request_id and content; never send credentials."
+        ));
         info
     }
 
@@ -255,12 +310,15 @@ impl ServerHandler for WorkerProxy {
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, ErrorData> {
         self.register_catalog().await;
-        Ok(super::mcp_cache::tools_list_result(&context, tools()?))
+        Ok(super::mcp_cache::tools_list_result(&context, self.tools()?))
     }
 
     /// Resolve only an embedded worker tool, never the operator tool table.
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        tools().ok()?.into_iter().find(|tool| tool.name == name)
+        self.tools()
+            .ok()?
+            .into_iter()
+            .find(|tool| tool.name == name)
     }
 
     /// Execute one validated report and return compact text with no secret context.
@@ -316,6 +374,8 @@ pub async fn serve_from_env() -> Result<()> {
         attempt_id,
         token,
         catalog_registered: Arc::new(AtomicBool::new(false)),
+        research: std::env::var(agent_run_domain::worker::RESEARCH_ENV)
+            .is_ok_and(|value| value == "1"),
     };
     proxy.register_catalog().await;
     let service = proxy
@@ -334,6 +394,36 @@ pub async fn serve_from_env() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Research adds only its confined report writer; neither surface exposes
+    /// operator launches, shell tools or generic filesystem writes.
+    #[test]
+    fn research_inventory_adds_only_report_writer() {
+        let mut proxy = WorkerProxy {
+            broker: Arc::new(Broker::default()),
+            run_id: "ag-20260928-000000-0000000001".parse().unwrap(),
+            attempt_id: "attempt".into(),
+            token: "a".repeat(64),
+            catalog_registered: Arc::new(AtomicBool::new(false)),
+            research: false,
+        };
+        let ordinary = proxy.tools().unwrap();
+        assert_eq!(ordinary.len(), 5);
+        assert!(proxy.get_tool("save_report").is_none());
+        proxy.research = true;
+        let research = proxy.tools().unwrap();
+        assert_eq!(research.len(), 6);
+        assert!(
+            ordinary
+                .iter()
+                .all(|tool| research.iter().any(|item| item.name == tool.name))
+        );
+        assert!(proxy.get_tool("save_report").is_some());
+        for name in ["start", "resume", "Bash", "exec_command", "write_file"] {
+            assert!(proxy.get_tool(name).is_none(), "{name}");
+        }
+    }
+
     /// Every private pool write keeps its own strict input and durable receipt.
     /// Invalid destination injection is rejected before broker contact; unknown
     /// transport replies never advise creating a replacement mutation.
@@ -346,6 +436,7 @@ mod tests {
             attempt_id: "attempt".into(),
             token: "a".repeat(64),
             catalog_registered: Arc::new(AtomicBool::new(false)),
+            research: false,
         };
         for (tool, input) in [
             (
@@ -450,6 +541,7 @@ mod tests {
             attempt_id: "attempt".into(),
             token: "a".repeat(64),
             catalog_registered: Arc::new(AtomicBool::new(false)),
+            research: false,
         };
         for _ in 0..3 {
             proxy.register_catalog().await;
@@ -473,6 +565,7 @@ mod tests {
             attempt_id: "attempt".into(),
             token: "a".repeat(64),
             catalog_registered: Arc::new(AtomicBool::new(false)),
+            research: false,
         };
         let names: Vec<_> = tools()
             .unwrap()
@@ -539,6 +632,7 @@ mod tests {
             attempt_id: "attempt".into(),
             token: "a".repeat(64),
             catalog_registered: Arc::new(AtomicBool::new(false)),
+            research: false,
         };
         let (mut input_writer, input_reader) = tokio::io::duplex(64 * 1024);
         let (output_writer, output_reader) = tokio::io::duplex(64 * 1024);

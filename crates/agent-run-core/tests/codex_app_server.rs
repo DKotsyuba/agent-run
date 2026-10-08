@@ -79,6 +79,133 @@ fn fake_plan() -> LaunchPlan {
     }
 }
 
+/// A native server missing research controls fails before a thread or turn.
+/// The ordinary fixture deliberately returns a roster instead of config/read;
+/// absence is rejected, and the owned fixture process is closed and reaped.
+#[tokio::test]
+async fn research_is_rejected_when_native_controls_are_missing() {
+    let fixture = common::Home::new();
+    let mut request = fixture.request();
+    request.workdir = PathBuf::from(scratch());
+    let (id, _) = fixture
+        .store()
+        .admit(&request, &fixture.config, &json!({}), None)
+        .unwrap();
+    let mut store = fixture.store();
+    let record = store.get(&id).unwrap();
+    let app_home = fixture.path.join("codex-home");
+    fs::private_dir(&app_home).unwrap();
+    let mut role = profile();
+    role.network = true;
+    role.allow_external_read_roots = false;
+    role.required_constraints
+        .insert(agent_run_domain::domain::Constraint::ResearchToolsOnly);
+    let mut process = Process::spawn(&fake_plan()).unwrap();
+    let result = codex::run(
+        &mut process,
+        &mut store,
+        &record,
+        &runtime(fixture.path.join("runtime")),
+        &role,
+        &app_home,
+    )
+    .await;
+    assert!(
+        result
+            .err()
+            .expect("unverified research controls are rejected")
+            .to_string()
+            .contains("research feature controls did not verify")
+    );
+    assert!(store.get(&id).unwrap().runtime_session_id.is_none());
+    assert!(!app_home.join("cache/models.json").exists());
+    drop(process.input.take());
+    process.reap().await;
+}
+
+/// Valid research reaches a turn only with empty environments and the exact
+/// private worker catalog. An inherited MCP prevents the turn/session binding;
+/// both owned fake servers exit through EOF without host command execution.
+#[tokio::test]
+async fn research_verifies_controls_and_private_catalog_before_turn() {
+    for extra_mcp in [false, true] {
+        let fixture = common::Home::new();
+        let mut request = fixture.request();
+        request.workdir = PathBuf::from(scratch());
+        let (id, _) = fixture
+            .store()
+            .admit(&request, &fixture.config, &json!({}), None)
+            .unwrap();
+        let mut store = fixture.store();
+        let record = store.get(&id).unwrap();
+        let app_home = fixture.path.join("codex-home");
+        fs::private_dir(&app_home).unwrap();
+        let mut role = profile();
+        role.network = true;
+        role.allow_external_read_roots = false;
+        role.required_constraints
+            .insert(agent_run_domain::domain::Constraint::ResearchToolsOnly);
+        let controls =
+            json!({"id":2,"result":{"config":agent_run_adapters::codex::research_settings()}});
+        let tools: serde_json::Map<String, serde_json::Value> =
+            agent_run_domain::worker::research_tools_json()
+                .into_iter()
+                .map(|tool| (tool["name"].as_str().unwrap().to_owned(), json!({})))
+                .collect();
+        let mut servers =
+            vec![json!({"name":"agent_run_worker","tools":tools,"runtimeStatus":"connected"})];
+        if extra_mcp {
+            servers.push(json!({"name":"execution","tools":{},"runtimeStatus":"connected"}));
+        }
+        let inventory = json!({"id":5,"result":{"data":servers,"nextCursor":null}});
+        let script = format!(
+            r#"n=0; while IFS= read -r line; do n=$((n+1)); case "$n" in
+1) printf '%s\n' '{{"id":1,"result":{{}}}}' ;;
+3) printf '%s\n' '{controls}' ;;
+4) printf '%s\n' '{{"id":3,"result":{{"data":[{{"id":"fixture"}}]}}}}' ;;
+5) case "$line" in *'"environments":[]'*) printf '%s\n' '{{"id":4,"result":{{"model":"fixture","cwd":"{cwd}","runtimeWorkspaceRoots":[],"sandbox":{{"type":"readOnly","networkAccess":false}},"approvalPolicy":"never","activePermissionProfile":{{"id":":read-only"}},"threadId":"thread"}}}}' ;; *) printf '%s\n' '{{"id":4,"error":{{"code":-32602,"message":"missing empty environments"}}}}' ;; esac ;;
+6) printf '%s\n' '{inventory}' ;;
+7) printf '%s\n' '{{"id":6,"result":{{"turn":{{"id":"turn"}}}}}}';
+printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"thread","turn":{{"id":"turn","status":"completed","items":[{{"type":"agentMessage","id":"answer","text":"research fixture complete"}}]}}}}}}' ;;
+esac; done"#,
+            cwd = scratch()
+        );
+        let mut plan = fake_plan();
+        plan.args = vec!["-c".into(), script];
+        let mut process = Process::spawn(&plan).unwrap();
+        let result = codex::run(
+            &mut process,
+            &mut store,
+            &record,
+            &runtime(fixture.path.join("runtime")),
+            &role,
+            &app_home,
+        )
+        .await;
+        if extra_mcp {
+            assert!(
+                result
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("MCP inventory did not verify")
+            );
+            assert!(store.get(&id).unwrap().runtime_session_id.is_none());
+        } else {
+            assert_eq!(
+                result.unwrap().answer.as_deref(),
+                Some("research fixture complete")
+            );
+            assert_eq!(
+                store.get(&id).unwrap().runtime_session_id.as_deref(),
+                Some("thread")
+            );
+        }
+        drop(process.input.take());
+        process.reap().await;
+    }
+}
+
 /// Builds a delayed fake app-server stream with repeated deltas and whitespace.
 fn streaming_plan() -> LaunchPlan {
     LaunchPlan {

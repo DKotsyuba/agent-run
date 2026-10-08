@@ -20,6 +20,8 @@ pub mod managed_services;
 pub mod native_cache;
 /// Freeze/thaw lifecycle for native Codex directory caches in retained homes.
 pub mod native_tree_cache;
+/// Authenticated workdir-confined report writes for restricted research.
+mod research_reports;
 /// Native cache lifecycle glue shared by the supervisor and operator surfaces.
 pub mod runtime_cache;
 /// Filesystem relocation of sealed managed trees into the shared store.
