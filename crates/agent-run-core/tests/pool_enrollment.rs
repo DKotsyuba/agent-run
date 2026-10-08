@@ -40,13 +40,13 @@ impl Fixture {
         Store::initialize(&root).unwrap();
         fs::create_dir_all(root.join("profiles")).unwrap();
         fs::write(root.join("profiles/review.md"),"+++\nrevision=\"1\"\nwrite=false\nnetwork=false\nallow_external_read_roots=false\nskills=[]\nmcp=[]\nrequired_constraints=[]\n+++\nReview.\n").unwrap();
-        fs::write(root.join("config.toml"),format!("schema_version=2\n[core]\nmax_active_agents={cap}\n[harnesses.codex]\nbinary=\"/bin/true\"\nhome=\"{}\"\n[harnesses.claude-code]\nbinary=\"/bin/true\"\nhome=\"{}\"\n[providers.codex]\nharness=\"codex\"\nconnection={{kind=\"native\"}}\nauth_family=\"openai\"\nlimits_source=\"none\"\n[[providers.codex.models]]\nid=\"m\"\n[[providers.codex.bindings]]\nlabel=\"test\"\naccount=\"acct\"\n",root.join("codex").display(),root.join("claude").display())).unwrap();
+        fs::write(root.join("config.toml"),format!("schema_version=2\n[core]\nmax_active_agents={cap}\n[harnesses.codex]\nbinary=\"/usr/bin/true\"\nhome=\"{}\"\n[harnesses.claude-code]\nbinary=\"/usr/bin/true\"\nhome=\"{}\"\n[providers.codex]\nharness=\"codex\"\nconnection={{kind=\"native\"}}\nauth_family=\"openai\"\nlimits_source=\"none\"\n[[providers.codex.models]]\nid=\"m\"\n[[providers.codex.bindings]]\nlabel=\"test\"\naccount=\"acct\"\n",root.join("codex").display(),root.join("claude").display())).unwrap();
         let mut store = Store::open(&root).unwrap();
         store
             .register_account(&AccountRecord {
                 account_id: "acct".parse().unwrap(),
                 auth_family: "openai".parse().unwrap(),
-                secret_ref: "env:FIXTURE_KEY".parse().unwrap(),
+                secret_ref: "native:codex".parse().unwrap(),
                 status: AccountStatus::Enabled,
             })
             .unwrap();

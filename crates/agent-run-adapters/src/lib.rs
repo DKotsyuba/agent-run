@@ -68,6 +68,14 @@ pub fn validate(request: &StartRequest, runtime: &Runtime, profile: &Profile) ->
     {
         return Err(invalid("unsupported Claude effort"));
     }
+    validate_executable(runtime)
+}
+
+/// Checks the configured native binary's file type and executable mode without
+/// spawning it or reading credentials. Shared by legacy and provider admission
+/// and real launch validation; missing files and non-executable paths are typed
+/// input errors. Mutable file state must still be rechecked at actual spawn.
+pub fn validate_executable(runtime: &Runtime) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     if !std::fs::metadata(&runtime.binary)
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)

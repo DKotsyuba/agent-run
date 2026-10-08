@@ -1249,6 +1249,9 @@ impl Service {
             .map(|plan| plan.config_revision.as_str())
             .unwrap_or("pending:materialization");
         adapters::validate(&request, runtime, &profile)?;
+        if runtime.kind()? == crate::config::Adapter::Codex {
+            crate::codex::Grant::new(runtime, &request, &profile, &self.home)?;
+        }
         let policy = policy::evaluate(&request.runtime, runtime, &profile);
         policy.admit()?;
         let identity = LaunchIdentity {
@@ -2321,7 +2324,10 @@ pub(crate) struct Prepared {
 /// Resolves role, authority, effective request and frozen identity for one
 /// provider request from an already loaded configuration and catalog, with no
 /// database access. Shared by single starts and pool admission so both freeze
-/// exactly the same facts. The effective storage request captures the Codex
+/// exactly the same facts. Static executable, credential-reference, role-policy and Codex permission
+/// checks reuse the launch implementations before durable admission; no harness
+/// or credential is opened. Mutable external state is still verified at spawn.
+/// The effective storage request captures the Codex
 /// harness Fast flag without changing original request/replay hashes.
 pub(crate) fn prepare_provider(
     config: &ProviderConfig,
@@ -2394,6 +2400,15 @@ pub(crate) fn prepare_provider(
             .core
             .effective_timeout_seconds(effective.timeout_seconds)?,
     );
+    // Compile the same frozen role and native grant used by materialization
+    // and the supervisor before any durable row or account reservation exists.
+    let runtime = adapters::provider::runtime(config, provider.harness, &request.model)?;
+    let launch_profile = adapters::provider::profile(&role);
+    adapters::validate_executable(&runtime)?;
+    policy::evaluate(request.provider.as_str(), &runtime, &launch_profile).admit()?;
+    if provider.harness == agent_run_domain::HarnessId::Codex {
+        crate::codex::Grant::new(&runtime, &effective, &launch_profile, &runtime.home)?;
+    }
     let eligible_accounts = provider
         .bindings
         .iter()
@@ -2411,7 +2426,17 @@ pub(crate) fn prepare_provider(
         .map(|binding| binding.account.clone())
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
-        .collect();
+        .collect::<Vec<_>>();
+    for account in &eligible_accounts {
+        if pinned.as_ref().is_none_or(|pinned| pinned == account) {
+            adapters::provider::credential_reference(
+                catalog,
+                &request.provider,
+                &request.model,
+                account,
+            )?;
+        }
+    }
     let authority = ResolvedLaunchAuthority {
         provider: request.provider.clone(),
         harness: provider.harness,

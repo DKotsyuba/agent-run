@@ -155,6 +155,64 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
     }
 }
 
+/// Returns closed, content-free categories for an execution error. Original
+/// messages, SQL text, paths, JSON contents and credential/environment values
+/// never enter diagnostics. Native numeric errno/SQLite codes remain nullable.
+fn execution_error_metadata(error: &Error) -> serde_json::Value {
+    let mut data = json!({"version":1,"stage":"engine_execution","class":error.public().kind});
+    match error {
+        Error::Io(source) => {
+            data["io_kind"] = json!(format!("{:?}", source.kind()));
+            data["os_code"] = json!(source.raw_os_error());
+        }
+        Error::Sql(rusqlite::Error::SqliteFailure(source, _)) => {
+            data["sqlite_code"] = json!(format!("{:?}", source.code));
+            data["sqlite_extended_code"] = json!(source.extended_code);
+        }
+        Error::Json(source) => {
+            data["json_category"] = json!(format!("{:?}", source.classify()));
+        }
+        _ => {}
+    }
+    data
+}
+
+/// Preserves a failed execution's safe cause across both supervisor routes.
+/// Logging precedes best-effort event persistence; either sink may be unavailable.
+/// Diagnostic failure never replaces the original failure. The returned failure
+/// has no answer; existing identity/cleanup verification still applies.
+fn failed_execution(store: &Store, id: &AgentId, error: &Error) -> adapters::EngineResult {
+    let metadata = execution_error_metadata(error);
+    if let Some(logger) = crate::logging::configured() {
+        logger.log(
+            crate::logging::Level::Error,
+            &format!("execution_failure {metadata}"),
+        );
+    }
+    if store.event(id, "execution_failure_v1", &metadata).is_err()
+        && let Some(logger) = crate::logging::configured()
+    {
+        logger.log(
+            crate::logging::Level::Error,
+            "execution_failure_diagnostic_not_persisted",
+        );
+    }
+    let mut outcome = Outcome::failure(match error {
+        Error::Integrity(_) | Error::AnswerIntegrity(_) => "runtime_integrity_failed",
+        Error::Validation(_) => "runtime_contract_rejected",
+        Error::Sql(_) => "runtime_storage_failed",
+        Error::Json(_) => "runtime_protocol_failed",
+        _ => "runtime_transport_failed",
+    });
+    outcome.failure_text = Some(format!("execution failed; diagnostic={metadata}"));
+    adapters::EngineResult {
+        native_failure: None,
+        outcome,
+        answer: None,
+        usage: None,
+    }
+}
+
 /// Returns a nonblank startup diagnostic even when an error carries no text.
 fn error_text(error: &Error) -> String {
     let message = error.to_string();
@@ -379,16 +437,7 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
     }
     let mut result = match execution {
         Ok(result) => result,
-        Err(error) => adapters::EngineResult {
-            native_failure: None,
-            outcome: Outcome::failure(match error {
-                Error::Integrity(_) => "runtime_integrity_failed",
-                Error::Validation(_) => "runtime_contract_rejected",
-                _ => "runtime_transport_failed",
-            }),
-            answer: None,
-            usage: None,
-        },
+        Err(error) => failed_execution(store, id, &error),
     };
     // Codex reports its semantic turn outcome before app-server shutdown. Its
     // deliberate post-result SIGTERM does not turn a verified completed turn
@@ -1267,16 +1316,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         let cancelled = store.cancel_pending(id)?;
         let mut result = match execution {
             Ok(result) => result,
-            Err(error) => adapters::EngineResult {
-                native_failure: None,
-                outcome: Outcome::failure(match error {
-                    Error::Integrity(_) => "runtime_integrity_failed",
-                    Error::Validation(_) => "runtime_contract_rejected",
-                    _ => "runtime_transport_failed",
-                }),
-                answer: None,
-                usage: None,
-            },
+            Err(error) => failed_execution(store, id, &error),
         };
         #[cfg(feature = "test-fixtures")]
         inject_native_failure(&mut result, &attempt_id, store, id)?;
@@ -1868,6 +1908,52 @@ fn cancelled_before_spawn(id: &AgentId, store: &mut Store) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::{AgentId, Status, Store, execution_error_metadata, failed_execution};
+
+    /// Safe execution causes contain only closed labels and numeric codes.
+    /// A failed diagnostic insertion cannot erase the original failed outcome.
+    #[test]
+    fn execution_failure_metadata_keeps_categories_without_source_contents() {
+        let errors = [
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "SOURCE_SECRET",
+            )),
+            Error::Sql(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(5),
+                Some("SOURCE_SECRET".into()),
+            )),
+            Error::Validation("SOURCE_SECRET".into()),
+            Error::Runtime("SOURCE_SECRET".into()),
+            Error::Json(serde_json::from_str::<serde_json::Value>("{SOURCE_SECRET").unwrap_err()),
+        ];
+        let home = tempfile::tempdir().unwrap();
+        Store::initialize(home.path()).unwrap();
+        let store = Store::open(home.path()).unwrap();
+        let id: AgentId = "ag-20260101-000000-0123456789".parse().unwrap();
+        for error in &errors {
+            let data = execution_error_metadata(error);
+            assert!(data.to_string().len() < 4096);
+            assert!(!data.to_string().contains("SOURCE_SECRET"));
+            let result = failed_execution(&store, &id, error);
+            assert_eq!(result.outcome.status, Status::Failed);
+            assert!(result.answer.is_none());
+            assert!(
+                !result
+                    .outcome
+                    .failure_text
+                    .unwrap()
+                    .contains("SOURCE_SECRET")
+            );
+        }
+        let data = execution_error_metadata(&errors[1]);
+        assert_eq!(data["sqlite_code"], "DatabaseBusy");
+        assert_eq!(data["sqlite_extended_code"], 5);
+        assert_eq!(
+            execution_error_metadata(&errors[0])["io_kind"],
+            "PermissionDenied"
+        );
+    }
     use super::error_text;
     use crate::Error;
 

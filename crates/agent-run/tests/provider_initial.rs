@@ -1319,14 +1319,16 @@ async fn provider_supervisor_refuses_tampered_config_snapshot() {
     assert_eq!((active, process), (0, None));
 }
 
-/// An OS refusal to spawn the configured engine proves no child existed and
-/// releases the first attempt without pretending that a process was cleaned.
+/// A binary disappearing after valid admission is rechecked before launch.
+/// The owned attempt proves no child existed and is released without pretending
+/// that a process was cleaned; preflight cannot eliminate mutable file races.
 #[tokio::test]
-async fn provider_spawn_error_closes_owned_attempt_without_process() {
+async fn provider_binary_disappearing_after_admission_never_spawns() {
     let (_temp, home) = home();
     let path = home.join("config.toml");
     let config = fs::read_to_string(&path).unwrap();
-    let missing = home.join("missing-engine");
+    let missing = home.join("disappearing-engine");
+    fs::copy(env!("CARGO_BIN_EXE_agent-run-fixture"), &missing).unwrap();
     fs::write(
         &path,
         config.replace(
@@ -1340,6 +1342,7 @@ async fn provider_spawn_error_closes_owned_attempt_without_process() {
         .admit_provider_trusted(request(&home), candidates(committed(&home)))
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    fs::remove_file(&missing).unwrap();
     let mut child = supervisor(&home, &id);
     let _ = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
@@ -2800,6 +2803,189 @@ fn codex_home_with(auth: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
             .unwrap();
     }
     (temp, home)
+}
+
+/// Start/pool admission and real Codex launch use the same grant compiler:
+/// unsupported external read roots are rejected before rows/reservations exist.
+#[test]
+fn provider_preflight_reuses_native_grant_before_durable_admission() {
+    let (_temp, home) = codex_home_with(&["healthy"]);
+    let external = tempfile::tempdir().unwrap();
+    fs::write(home.join("profiles/implement.md"),
+        "+++\nrevision = \"1\"\nwrite = true\nnetwork = false\nallow_external_read_roots = true\nskills = []\nmcp = []\nrequired_constraints = []\n+++\nImplement safely.\n").unwrap();
+    let bad: ProviderStartRequest = serde_json::from_value(serde_json::json!({
+        "provider":"codex-user","model":"fixture","profile":"implement","account":"a",
+        "task":"fixture:answer","workdir":home,"read_roots":[external.path()],
+        "request_id":"preflight-bad",
+    }))
+    .unwrap();
+    let service = Service::new(home.clone());
+    let error = service.admit_provider(bad.clone()).unwrap_err();
+    assert!(matches!(error, agent_run_domain::Error::Validation(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("Codex workspace-write cannot grant external read roots")
+    );
+    assert_eq!(rows(&home), (0, 0));
+
+    let (config, _) = agent_run_config::provider_config::ProviderConfig::load(&home).unwrap();
+    let runtime = agent_run_adapters::provider::runtime(
+        &config,
+        agent_run_domain::HarnessId::Codex,
+        "fixture",
+    )
+    .unwrap();
+    let profile = agent_run_config::profiles::load_provider(&config, &bad).unwrap();
+    let mut effective = bad.storage_projection();
+    effective.write = profile.write;
+    effective.read_roots = profile.read_roots.clone();
+    let launch_error =
+        agent_run_core::codex::Grant::new(&runtime, &effective, &profile, &runtime.home)
+            .unwrap_err();
+    assert_eq!(error.to_string(), launch_error.to_string());
+
+    let mut pool = serde_json::to_value(pool_request(
+        &home,
+        "preflight-pool",
+        false,
+        &[
+            ("lead", "fixture:answer", None),
+            ("reviewer", "fixture:answer", None),
+        ],
+    ))
+    .unwrap();
+    pool["members"][0]["start"] = serde_json::to_value(&bad).unwrap();
+    pool["members"][0]["start"]
+        .as_object_mut()
+        .unwrap()
+        .remove("request_id");
+    let error = service
+        .admit_pool(serde_json::from_value(pool).unwrap())
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Codex workspace-write cannot grant external read roots")
+    );
+    assert_eq!(rows(&home), (0, 0));
+    assert_eq!(table_rows(&home, "pools"), 0);
+
+    let mut good = bad;
+    good.read_roots.clear();
+    good.request_id = Some("preflight-good".into());
+    assert!(service.admit_provider(good).is_ok());
+    assert_eq!(rows(&home), (1, 1));
+}
+
+/// A configured non-executable native binary is refused in the same call;
+/// no harness/model is spawned and no durable agent or attempt is admitted.
+#[test]
+fn provider_preflight_refuses_nonexecutable_binary_without_rows() {
+    let (_temp, home) = home();
+    let binary = home.join("non-executable");
+    fs::write(&binary, "fixture").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o600)).unwrap();
+    edit_config(&home, |config| {
+        config["harnesses"]["claude-code"]["binary"] =
+            toml::Value::String(binary.display().to_string())
+    });
+    let error = Service::new(home.clone())
+        .admit_provider_trusted(request(&home), candidates(committed(&home)))
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("runtime binary is not executable")
+    );
+    assert_eq!(rows(&home), (0, 0));
+}
+
+/// Auto and pinned starts reject incompatible credential-reference shape
+/// before durable admission, through the same check actual launches consume.
+#[test]
+fn provider_preflight_reuses_launch_credential_contract_without_reading_secrets() {
+    let (_temp, home) = home();
+    edit_config(&home, |config| {
+        config["providers"]["glm-user"]["connection"] = toml::Value::Table(
+            [("kind".into(), toml::Value::String("native".into()))]
+                .into_iter()
+                .collect(),
+        );
+    });
+    let (config, _) = agent_run_config::provider_config::ProviderConfig::load(&home).unwrap();
+    let store = Store::open(&home).unwrap();
+    let catalog = config
+        .resolve_catalog(store.list_accounts().unwrap())
+        .unwrap();
+    let actual = agent_run_adapters::provider::credential_reference(
+        &catalog,
+        &"glm-user".parse().unwrap(),
+        "fixture",
+        &"acct-work".parse().unwrap(),
+    )
+    .unwrap_err();
+    for pinned in [true, false] {
+        let mut request = request(&home);
+        if !pinned {
+            request.account = None;
+        }
+        let error = Service::new(home.clone())
+            .admit_provider(request)
+            .unwrap_err();
+        assert_eq!(error.to_string(), actual.to_string());
+        assert_eq!(error.public().kind, "ValidationError");
+        assert_eq!(rows(&home), (0, 0));
+    }
+}
+
+/// Real supervision retains a safe execution cause after a malformed native
+/// frame, alongside confirmed cleanup; no prompt/result/source string leaks.
+#[tokio::test]
+async fn provider_execution_error_persists_content_free_cause() {
+    let (_temp, home) = home();
+    let service = Service::new(home.clone());
+    let mut requested = request(&home);
+    requested.task = "fixture:invalid-result-error-type".into();
+    let admitted = service
+        .admit_provider_trusted(requested, candidates(committed(&home)))
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    run_to_end(&home, &id).await;
+    let store = Store::open(&home).unwrap();
+    let row = store.get(&id).unwrap();
+    assert_eq!(row.status, Status::Failed);
+    assert_eq!(
+        row.failure_kind.as_deref(),
+        Some("runtime_contract_rejected")
+    );
+    assert!(row.answer_path.is_none());
+    let diagnostic: String = store
+        .conn
+        .query_row(
+            "SELECT data_json FROM events WHERE agent_id=? AND kind='execution_failure_v1'",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(diagnostic.len() < 4096 && !diagnostic.contains("SOURCE_SECRET"));
+    let diagnostic: serde_json::Value = serde_json::from_str(&diagnostic).unwrap();
+    assert_eq!(diagnostic["stage"], "engine_execution");
+    assert_eq!(diagnostic["class"], "ValidationError");
+    assert!(!row.failure_text.unwrap().contains("SOURCE_SECRET"));
+    let cleanup: String = store
+        .conn
+        .query_row(
+            "SELECT cleanup_proof_json FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&cleanup).unwrap()["confirmed"],
+        true
+    );
 }
 
 /// Admits one ranked `codex-user` run (optionally pinned) and runs its

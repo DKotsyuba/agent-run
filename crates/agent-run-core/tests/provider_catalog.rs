@@ -921,7 +921,7 @@ async fn source_switch_with_carried_latch_stays_scoped_through_admission() {
     fs::write(
         root.join("config.toml"),
         format!(
-            "schema_version = 2\n[harnesses.codex]\nbinary = \"/bin/true\"\nhome = \"{r}/codex\"\n[harnesses.claude-code]\nbinary = \"/bin/true\"\nhome = \"{r}/claude\"\n[providers.g]\nharness = \"claude-code\"\nconnection = {{ kind = \"custom\", endpoint = \"https://g.example.com/api\", protocol = \"messages\" }}\nauth_family = \"anthropic\"\nlimits_source = \"none\"\n[[providers.g.models]]\nid = \"m-a\"\n[[providers.g.models]]\nid = \"m-b\"\n[[providers.g.bindings]]\nlabel = \"main\"\naccount = \"acct-a\"\n",
+            "schema_version = 2\n[harnesses.codex]\nbinary = \"/usr/bin/true\"\nhome = \"{r}/codex\"\n[harnesses.claude-code]\nbinary = \"/usr/bin/true\"\nhome = \"{r}/claude\"\n[providers.g]\nharness = \"claude-code\"\nconnection = {{ kind = \"custom\", endpoint = \"https://g.example.com/api\", protocol = \"messages\" }}\nauth_family = \"anthropic\"\nlimits_source = \"none\"\n[[providers.g.models]]\nid = \"m-a\"\n[[providers.g.models]]\nid = \"m-b\"\n[[providers.g.bindings]]\nlabel = \"main\"\naccount = \"acct-a\"\n",
             r = root.display()
         ),
     )
@@ -986,7 +986,7 @@ async fn cross_source_latch_survives_small_retention_and_releases_only_on_covera
         fs::write(
             root.join("config.toml"),
             format!(
-                "schema_version = 2\n[harnesses.codex]\nbinary = \"/bin/true\"\nhome = \"{r}/codex\"\n[harnesses.claude-code]\nbinary = \"/bin/true\"\nhome = \"{r}/claude\"\n[providers.g]\nharness = \"claude-code\"\nconnection = {{ kind = \"custom\", endpoint = \"https://g.example.com/api\", protocol = \"messages\" }}\nauth_family = \"anthropic\"\nlimits_source = \"none\"\n[[providers.g.models]]\nid = \"m-a\"\n[[providers.g.models]]\nid = \"m-b\"\n[[providers.g.bindings]]\nlabel = \"main\"\naccount = \"acct-a\"\n",
+                "schema_version = 2\n[harnesses.codex]\nbinary = \"/usr/bin/true\"\nhome = \"{r}/codex\"\n[harnesses.claude-code]\nbinary = \"/usr/bin/true\"\nhome = \"{r}/claude\"\n[providers.g]\nharness = \"claude-code\"\nconnection = {{ kind = \"custom\", endpoint = \"https://g.example.com/api\", protocol = \"messages\" }}\nauth_family = \"anthropic\"\nlimits_source = \"none\"\n[[providers.g.models]]\nid = \"m-a\"\n[[providers.g.models]]\nid = \"m-b\"\n[[providers.g.bindings]]\nlabel = \"main\"\naccount = \"acct-a\"\n",
                 r = root.display()
             ),
         )

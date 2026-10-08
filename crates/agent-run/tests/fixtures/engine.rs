@@ -490,6 +490,14 @@ fn main() {
             json!({"type":"assistant","session_id":session,"message":{"content":[{"type":"text","text":quota_frame.to_string()}]}}),
         );
     }
+    if task == "fixture:invalid-result-error-type" {
+        emit(
+            json!({"type":"result","subtype":"success","is_error":"SOURCE_SECRET",
+            "session_id":session,"user_message_uuid":result_input,
+            "result":"SOURCE_SECRET"}),
+        );
+        return;
+    }
     let failed = task == "fixture:error"
         || task == "fixture:ambiguous-then-error"
         || task == "fixture:quota"

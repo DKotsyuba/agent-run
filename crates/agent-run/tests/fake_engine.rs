@@ -514,7 +514,7 @@ async fn session_wait_failure_reaches_cleanup_and_durable_failure() {
 /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_running_transition_exception_reaches_cleanup_and_failure`
 /// The SQLite trigger is a test-only durable commit seam: production still uses
 /// the concrete Store, while the real supervisor must clean up after `running`
-/// is rejected and persist the resulting failure.
+/// is rejected and persist the resulting storage failure and content-free cause.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn running_transition_failure_reaches_cleanup_and_durable_failure() {
     let (_tmp, home) = home();
@@ -536,11 +536,15 @@ async fn running_transition_failure_reaches_cleanup_and_durable_failure() {
     let store = Store::open(&home).unwrap();
     let row = store.get(&id).unwrap();
     assert_eq!(row.status, Status::Failed);
-    assert_eq!(
-        row.failure_kind.as_deref(),
-        Some("runtime_transport_failed")
-    );
+    assert_eq!(row.failure_kind.as_deref(), Some("runtime_storage_failed"));
     assert!(store.last_event(&id, "process_cleanup").unwrap().is_some());
+    let cause = store
+        .last_event(&id, "execution_failure_v1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(cause["class"], json!("StorageError"));
+    assert_eq!(cause["sqlite_code"], json!("ConstraintViolation"));
+    assert!(!cause.to_string().contains("running rejected"));
 }
 
 /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_commit_rejection_is_not_swallowed_while_agent_is_active`
