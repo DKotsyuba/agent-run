@@ -4,6 +4,17 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.24.0
+
+- feat(runtime)!: remove agent execution deadlines, the global time margin and
+  age-based worker/enrollment expiry; runs end through native completion,
+  failure or explicit cancellation and can continue through repeated resumes
+- feat(storage)!: migrate to schema 28, preserving retired policy as historical
+  events and verifying original frozen digests before compatibility projection
+- docs(migration): require a reviewed configuration/database upgrade removing
+  the four obsolete core timing keys; retain native-history, authority,
+  process-identity and rollback protections
+
 - fix(runtime): defer optional native cache publication to explicit offline
   compaction so verified answers are not delayed by filesystem work
 - fix(ownership): retain typed initial/stream/final checkpoint and observation
