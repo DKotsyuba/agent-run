@@ -197,13 +197,12 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
 /// and retries SQLITE_BUSY/LOCKED at most twice. Required initial persistence
 /// splits the connection's existing busy allowance (normally five seconds)
 /// across those attempts, before any native task is released. Later checkpoints
-/// keep the 250 ms control allowance. Both are capped by the original run
-/// deadline. Permanent errors are returned unchanged for typed phase wrapping;
+/// keep the 250 ms control allowance. These operation bounds never limit an
+/// execution's lifetime. Permanent errors retain their typed phase/cause;
 /// successful callbacks never leave a transaction or statement across an await.
 fn ownership_writer(
     home: &Path,
     attempt: String,
-    deadline: f64,
 ) -> Result<
     impl FnMut(&agent_run_platform::process::OwnershipSnapshot) -> Result<()> + Send + 'static,
 > {
@@ -229,16 +228,12 @@ fn ownership_writer(
             let until = std::time::Instant::now() + budget;
             for retry in 0..2 {
                 let left = until.saturating_duration_since(std::time::Instant::now());
-                let run_left = Duration::try_from_secs_f64((deadline - domain::now()).max(0.0))
-                    .unwrap_or(Duration::MAX);
-                if left.is_zero() || run_left.is_zero() {
+                if left.is_zero() {
                     return Err(Error::Runtime(
-                        "run deadline expired before ownership persistence".into(),
+                        "ownership persistence operation allowance exhausted".into(),
                     ));
                 }
-                writer
-                    .conn
-                    .busy_timeout(left.min(run_left).min(lock_wait))?;
+                writer.conn.busy_timeout(left.min(lock_wait))?;
                 match writer.remember_processes("attempt", &attempt, snapshot) {
                     Ok(()) => {
                         initial = false;
@@ -246,11 +241,7 @@ fn ownership_writer(
                     }
                     Err(error) => {
                         let transient = matches!(&error, Error::Sql(source) if matches!(source.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)));
-                        if retry == 1
-                            || !transient
-                            || std::time::Instant::now() >= until
-                            || domain::now() >= deadline
-                        {
+                        if retry == 1 || !transient || std::time::Instant::now() >= until {
                             return Err(error);
                         }
                     }
@@ -480,19 +471,10 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
             &snapshot,
         )?,
     };
-    // The same one run deadline as a provider run: admission time plus the
-    // stored (already multiplier-scaled) timeout, which preparation consumes.
-    // An expired run never spawns an engine.
-    let deadline = run_deadline(store, id)?;
-    if domain::now() >= deadline {
-        return timed_out_before_spawn(id, store);
-    }
     store.event(id, "phase", &json!({"phase":"spawning"}))?;
     let mut process = Process::spawn(&plan)?;
     // From this point EVERY path must clean up before returning, including a
     // database failure immediately after spawning the engine.
-    let remaining =
-        Duration::try_from_secs_f64((deadline - domain::now()).max(0.0)).unwrap_or(Duration::MAX);
     let execution = async {
         store.running(id, process.owner.pid)?;
         let attempt = format!("{id}:1");
@@ -506,7 +488,7 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
             rusqlite::params![leader.token, leader.birth, attempt],
         )?;
         let ownership_home = home.to_owned();
-        process.observe_ownership(ownership_writer(&ownership_home, attempt, deadline)?)?;
+        process.observe_ownership(ownership_writer(&ownership_home, attempt)?)?;
         crate::journal(store, id, "user", &row.request.task, None, None)?;
         match runtime.kind()? {
             Adapter::Codex => {
@@ -523,13 +505,7 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
             _ => crate::stream::run(&mut process, store, &row, plan.initial_input.as_deref()).await,
         }
     };
-    // On expiry the pending runner, and with it any result already received
-    // but not yet concluded by EOF and exit, is dropped; the group is then
-    // cleaned exactly as for any other end.
-    let (execution, expired) = match tokio::time::timeout(remaining, execution).await {
-        Ok(execution) => (execution, false),
-        Err(_) => (Err(Error::Runtime("run deadline expired".into())), true),
-    };
+    let execution = execution.await;
     let cleanup = process.owner.cleanup(Duration::from_secs(2)).await;
     let exit = process.reap().await;
     if let Err(error) = process.checkpoint_ownership_at(agent_run_domain::OwnershipStage::Final) {
@@ -555,12 +531,6 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
         }
     }
     let cancelled = store.cancel_pending(id)?;
-    // Same predicate as a provider run: the timer firing, or the stored
-    // deadline having passed by the time cleanup finished. Cancellation wins.
-    let expired = expired || domain::now() >= run_deadline(store, id)?;
-    if expired && !cancelled {
-        store.event(id, "run_deadline_expired", &json!({"deadline":deadline}))?;
-    }
     let mut result = match execution {
         Ok(result) => result,
         Err(error) => failed_execution(store, id, &error),
@@ -584,11 +554,7 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
     let last_progress_at = store.last_progress(id)?;
     let outcome = verify::verify_completion(
         Some(result.outcome),
-        if cancelled {
-            Some(verify::StopReason::Cancel)
-        } else {
-            expired.then_some(verify::StopReason::Timeout)
-        },
+        cancelled.then_some(verify::StopReason::Cancel),
         Some(&evidence),
         cleanup.confirmed,
         last_progress_at,
@@ -1295,23 +1261,11 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             store.event(id, "phase", &json!({"phase":"warming_services"}))?;
         }
         let service_gate = crate::managed_services::wait_for_gate(home, id).await;
-        // The run's one overall deadline (admission time + its timeout) is
-        // re-read from durable state before every spawn; an expired run never
-        // spawns another attempt.
-        let deadline = run_deadline(store, id)?;
-        if domain::now() >= deadline && !store.cancel_pending(id)? {
-            if !store.provider_never_spawned(id)? {
-                return Err(invalid("provider attempt was already spawning"));
-            }
-            return timed_out_before_spawn(id, store);
-        }
         service_gate?;
         if identity.authority.harness == HarnessId::ClaudeCode && !store.cancel_pending(id)? {
             let ownership_home = home.to_owned();
             let ownership_agent = id.clone();
             let ownership_attempt = attempt_id.clone();
-            let remaining = Duration::try_from_secs_f64((deadline - domain::now()).max(0.0))
-                .unwrap_or(Duration::MAX);
             let discovery =
                 adapters::mcp_catalog::apply_claude_tool_filters(&mut planned, move |snapshot| {
                     let mut store = Store::open(&ownership_home)?;
@@ -1322,16 +1276,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                         &serde_json::to_value(snapshot)?,
                     )
                 });
-            let discovered = tokio::time::timeout(remaining, discovery).await;
-            if discovered.is_err() {
-                if !crate::lifecycle::reconcile::cleanup_mcp_discovery(store, &attempt_id)?
-                    || !store.provider_never_spawned(id)?
-                {
-                    return Err(invalid("MCP discovery cleanup is unconfirmed"));
-                }
-                return timed_out_before_spawn(id, store);
-            }
-            discovered.expect("checked discovery deadline")?;
+            discovery.await?;
         }
         // The spawn claim itself refuses while a cancel is pending, so an
         // accepted cancel can never race past this boundary.
@@ -1353,11 +1298,6 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             Err(error) => return Err(error),
         };
         let switched = continuing.is_some();
-        // Admission bounds new timeouts, but an older stored row may not be:
-        // the conversion is checked and saturates (tokio clamps an
-        // unrepresentable timeout) instead of panicking after the spawn.
-        let remaining = std::time::Duration::try_from_secs_f64((deadline - domain::now()).max(0.0))
-            .unwrap_or(Duration::MAX);
         let execution = async {
             let leader = process
                 .owner
@@ -1367,14 +1307,10 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             store.provider_process(id, &attempt_id, leader)?;
             let ownership_home = home.to_owned();
             let ownership_attempt = attempt_id.clone();
-            process.observe_ownership(ownership_writer(
-                &ownership_home,
-                ownership_attempt,
-                deadline,
-            )?)?;
+            process.observe_ownership(ownership_writer(&ownership_home, ownership_attempt)?)?;
             if switched {
-                // The logical run is already running; its start time (and
-                // so any deadline) is kept. No user entry is journaled.
+                // The logical run is already running; its original start
+                // time is kept. No user entry is journaled.
                 store.provider_rerunning(id, &attempt_id, process.owner.pid)?;
                 store.event(
                     id,
@@ -1416,12 +1352,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 .await
             }
         };
-        // Only the remainder of the run's deadline is available to this
-        // attempt; on expiry the runner is dropped and the group cleaned.
-        let (execution, expired) = match tokio::time::timeout(remaining, execution).await {
-            Ok(execution) => (execution, false),
-            Err(_) => (Err(Error::Runtime("run deadline expired".into())), true),
-        };
+        let execution = execution.await;
         let cleanup = process.owner.cleanup(Duration::from_secs(2)).await;
         let cleanup_ended = std::time::Instant::now();
         let checkpoint = process.checkpoint_ownership_at(agent_run_domain::OwnershipStage::Final);
@@ -1510,12 +1441,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         }
         store.provider_history(id, &attempt_id, &state)?;
         let history_recorded = std::time::Instant::now();
-        // Cancellation wins over expiry; an expired run takes no next attempt.
-        let expired = expired || domain::now() >= run_deadline(store, id)?;
-        if expired && !cancelled {
-            store.event(id, "run_deadline_expired", &json!({"deadline":deadline}))?;
-        }
-        if quota && !cancelled && !expired && result.outcome.status == Status::Failed {
+        if quota && !cancelled && result.outcome.status == Status::Failed {
             match failover(home, id, store, &identity) {
                 Ok(next) => {
                     store.event(id, "account_switched", &next)?;
@@ -1547,11 +1473,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         };
         let outcome = verify::verify_completion(
             Some(result.outcome),
-            if cancelled {
-                Some(verify::StopReason::Cancel)
-            } else {
-                expired.then_some(verify::StopReason::Timeout)
-            },
+            cancelled.then_some(verify::StopReason::Cancel),
             Some(&evidence),
             cleanup.group_gone,
             store.last_progress(id)?,
@@ -2000,25 +1922,6 @@ fn injected_cleanup_error(
     }
     Ok(cleanup)
 }
-
-/// The provider run's one overall deadline: its durable admission time plus
-/// its stored timeout. It spans every attempt and preparation; a switch never
-/// restarts it.
-fn run_deadline(store: &Store, id: &AgentId) -> Result<f64> {
-    Ok(store.conn.query_row(
-        "SELECT created_at + timeout_seconds FROM agents WHERE id=?",
-        [id.as_str()],
-        |row| row.get(0),
-    )?)
-}
-/// Ends a run whose deadline expired before its next attempt spawned; the
-/// caller has already closed that attempt with never-spawned evidence.
-fn timed_out_before_spawn(id: &AgentId, store: &mut Store) -> Result<()> {
-    let mut outcome = Outcome::failure("timed_out");
-    outcome.status = Status::TimedOut;
-    store.finish(id, &outcome, None, None)?;
-    commands::complete_terminal(store, id)
-}
 fn cancelled_before_spawn(id: &AgentId, store: &mut Store) -> Result<()> {
     let mut outcome = Outcome::failure("cancelled_before_spawn");
     outcome.status = Status::Cancelled;
@@ -2163,12 +2066,10 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let lock = Store::initialize(home.path()).unwrap();
         let id = "ag-20260101-000000-0000000098";
-        lock.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision) VALUES (?,'mock','fixture','review','t','t','/tmp','{}','starting',1,30,'cfg')",[id]).unwrap();
+        lock.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision) VALUES (?,'mock','fixture','review','t','t','/tmp','{}','starting',1,'cfg')",[id]).unwrap();
         let attempt = format!("{id}:1");
         lock.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES (?,?,1,'starting','{}',1,1)",rusqlite::params![attempt,id]).unwrap();
-        let mut write =
-            super::ownership_writer(home.path(), attempt, agent_run_domain::domain::now() + 30.0)
-                .unwrap();
+        let mut write = super::ownership_writer(home.path(), attempt).unwrap();
         let root = agent_run_platform::process::Identity {
             pid: 10,
             ppid: 2,
@@ -2194,12 +2095,7 @@ mod tests {
             matches!(error, Error::Sql(ref source) if source.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy))
         );
         lock.conn.execute_batch("ROLLBACK").unwrap();
-        let mut missing = super::ownership_writer(
-            home.path(),
-            "missing-attempt".into(),
-            agent_run_domain::domain::now() + 30.0,
-        )
-        .unwrap();
+        let mut missing = super::ownership_writer(home.path(), "missing-attempt".into()).unwrap();
         assert!(matches!(missing(&snapshot), Err(Error::Validation(_))));
     }
 
@@ -2211,15 +2107,10 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = Store::initialize(home.path()).unwrap();
         let id = "ag-20260101-000000-0000000099";
-        store.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision) VALUES (?,'mock','fixture','review','t','t','/tmp','{}','starting',1,30,'cfg')",[id]).unwrap();
+        store.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision) VALUES (?,'mock','fixture','review','t','t','/tmp','{}','starting',1,'cfg')",[id]).unwrap();
         let attempt = format!("{id}:1");
         store.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES (?,?,1,'starting','{}',1,1)",rusqlite::params![attempt,id]).unwrap();
-        let mut write = super::ownership_writer(
-            home.path(),
-            attempt.clone(),
-            agent_run_domain::domain::now() + 30.0,
-        )
-        .unwrap();
+        let mut write = super::ownership_writer(home.path(), attempt.clone()).unwrap();
         let (ready, waiting) = std::sync::mpsc::sync_channel(0);
         let path = home.path().to_path_buf();
         let held = std::thread::spawn(move || {

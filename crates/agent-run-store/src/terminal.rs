@@ -71,7 +71,7 @@ pub fn finish(
     } else {
         None
     };
-    let pending_cancel = if matches!(outcome.status, Status::Succeeded | Status::TimedOut) {
+    let pending_cancel = if outcome.status == Status::Succeeded {
         tx.query_row(
             "SELECT id FROM commands WHERE agent_id=? AND kind='cancel' AND state='pending' ORDER BY id LIMIT 1",
             [id.as_str()],

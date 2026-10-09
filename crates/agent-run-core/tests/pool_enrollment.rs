@@ -30,11 +30,6 @@ impl Fixture {
     /// Admits one independent execution, then models verified local ownership
     /// and an actual-catalog registration for storage-level boundary tests.
     fn new(binding: Option<OrchestratorRef>, cap: usize) -> Self {
-        Self::with_timeout(binding, cap, 600.0)
-    }
-
-    /// Builds a fixture with a deliberately finite original execution deadline.
-    fn with_timeout(binding: Option<OrchestratorRef>, cap: usize, timeout: f64) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         Store::initialize(&root).unwrap();
@@ -52,7 +47,7 @@ impl Fixture {
             .unwrap();
         agent_run_config::provider_config::ProviderConfig::load(&root).unwrap();
         let service = Service::new(root.clone());
-        let request=serde_json::from_value(json!({"provider":"codex","model":"m","profile":"review","task":"Keep current independent work.","workdir":root,"timeout_seconds":timeout,"display_name":"existing","orchestrator":binding})).unwrap();
+        let request=serde_json::from_value(json!({"provider":"codex","model":"m","profile":"review","task":"Keep current independent work.","workdir":root,"display_name":"existing","orchestrator":binding})).unwrap();
         let admitted = service.admit_provider(request).unwrap();
         let agent: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
         let attempt: String = store
@@ -135,20 +130,11 @@ impl Fixture {
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
-        let deadline: f64 = store
-            .conn
-            .query_row(
-                "SELECT created_at+timeout_seconds FROM agents WHERE id=?",
-                [self.agent.as_str()],
-                |r| r.get(0),
-            )
-            .unwrap();
         json!([
             row.request,
             row.identity,
             row.runtime_session_id,
             row.created_at,
-            deadline,
             account,
             keys
         ])
@@ -439,57 +425,48 @@ fn unsupported_terminal_and_prior_pool_are_refused() {
     );
 }
 
-/// The original deadline bounds ACK even if the worker is otherwise alive;
-/// fixture time advances past it rather than renewing enrollment.
+/// An arbitrarily old still-owned worker can join and acknowledge. Authentication
+/// remains pinned to its exact attempt/token/challenge; no lifetime is renewed.
 #[test]
-fn ack_original_deadline_expires_without_extension() {
-    let f = Fixture::with_timeout(None, 8, 2.0);
-    f.service
-        .admit_pool(f.request("deadline", 1, None))
-        .unwrap();
+fn old_active_worker_can_join_and_ack_without_expiry() {
+    let f = Fixture::new(None, 8);
     let mut store = Store::open(&f.root).unwrap();
-    let deadline: f64 = store
-        .conn
-        .query_row(
-            "SELECT deadline FROM pool_enrollments WHERE agent_id=?",
-            [f.agent.as_str()],
-            |r| r.get(0),
-        )
-        .unwrap();
-    while agent_run_core::domain::now() <= deadline {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    let ack = PoolWrite::Message(PoolMessage {
-        request_id: f.challenge(),
-        message: "Late summary".into(),
-    });
-    assert!(
-        store
-            .pool_write(&f.agent, &f.attempt, &f.token, ack)
-            .is_err()
-    );
-    let pool: String = store
-        .conn
-        .query_row(
-            "SELECT pool_id FROM pool_members WHERE agent_id=?",
-            [f.agent.as_str()],
-            |r| r.get(0),
-        )
-        .unwrap();
     store
-        .reconcile_pool_enrollments(&pool.parse().unwrap())
+        .conn
+        .execute(
+            "UPDATE agents SET created_at=created_at-7776000 WHERE id=?",
+            [f.agent.as_str()],
+        )
         .unwrap();
-    assert_eq!(
-        store
-            .conn
-            .query_row(
-                "SELECT state FROM pool_enrollments WHERE agent_id=?",
-                [f.agent.as_str()],
-                |r| r.get::<_, String>(0)
-            )
-            .unwrap(),
-        "needs_action"
-    );
+    let before = f.snapshot();
+    let pool = f.service.admit_pool(f.request("aged", 1, None)).unwrap();
+    assert_eq!(f.snapshot(), before);
+    let id = serde_json::from_value(pool["pool_id"].clone()).unwrap();
+    store.reconcile_pool_enrollments(&id).unwrap();
+    let private = store
+        .pool_read(&f.agent, &f.attempt, &f.token, 0, None, 50)
+        .unwrap()
+        .unwrap();
+    assert_eq!(private["enrollment"]["request_id"], f.challenge());
+    assert_eq!(private["enrollment"]["state"], "pending");
+    assert!(private["enrollment"].get("deadline").is_none());
+    assert!(private["enrollment"].get("remaining_seconds").is_none());
+    let input = PoolWrite::Message(PoolMessage {
+        request_id: f.challenge(),
+        message: "Current work continues.".into(),
+    });
+    let receipt = store
+        .pool_write(&f.agent, &f.attempt, &f.token, input)
+        .unwrap()
+        .unwrap();
+    assert!(!receipt.duplicate);
+    let overlay = agent_run_store::pool_enrollment::view(&store.conn, &f.agent)
+        .unwrap()
+        .unwrap();
+    assert_eq!(overlay["state"], "joined");
+    assert!(overlay.get("deadline").is_none());
+    assert!(overlay.get("remaining_seconds").is_none());
+    assert_eq!(f.snapshot(), before);
 }
 
 /// A replacement attempt on the same execution cannot use the old enrollment
@@ -596,7 +573,7 @@ fn atomic_existing_exit_race_leaves_every_worker_independent() {
         PoolAdmissionInput, PoolAdmissionSource, PoolMemberAdmission,
     };
     let f = Fixture::new(None, 8);
-    let request=serde_json::from_value(json!({"provider":"codex","model":"m","profile":"review","task":"other independent","workdir":f.root,"timeout_seconds":600.0,"display_name":"other"})).unwrap();
+    let request=serde_json::from_value(json!({"provider":"codex","model":"m","profile":"review","task":"other independent","workdir":f.root,"display_name":"other"})).unwrap();
     let admitted = f.service.admit_provider(request).unwrap();
     let other: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     let mut store = Store::open(&f.root).unwrap();
@@ -909,7 +886,7 @@ fn joined_ack_cannot_replay_from_new_attempt_or_resumed_run() {
         )
         .unwrap();
     let resumed = AgentId::new();
-    store.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id,parent_agent_id,sequence) SELECT ?,runtime,model,profile,task,task_summary,workdir,request_json,'running',?,timeout_seconds,config_revision,root_agent_id,id,2 FROM agents WHERE id=?",params![resumed.as_str(),at,f.agent.as_str()]).unwrap();
+    store.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id,parent_agent_id,sequence) SELECT ?,runtime,model,profile,task,task_summary,workdir,request_json,'running',?,config_revision,root_agent_id,id,2 FROM agents WHERE id=?",params![resumed.as_str(),at,f.agent.as_str()]).unwrap();
     let attempt = "att_joined_resume";
     store.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES(?,?,1,'running','{}',?,1)",params![attempt,resumed.as_str(),at]).unwrap();
     let token = "c".repeat(64);

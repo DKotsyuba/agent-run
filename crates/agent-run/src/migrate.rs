@@ -312,8 +312,13 @@ fn plan(
     mapping: &[u8],
 ) -> Result<(String, Value, Vec<String>, MigrationMapping)> {
     let text = std::str::from_utf8(config).map_err(|_| invalid("config must be UTF-8"))?;
-    let old: Config = toml::from_str(text)
-        .map_err(|_| invalid("config migrate expects a valid schema_version 1 config"))?;
+    let original: toml::Value =
+        toml::from_str(text).map_err(|_| invalid("config migrate expects valid TOML"))?;
+    // Migration alone projects retired lifetime policy; source bytes stay in the paired backup.
+    let old: Config = serde_json::from_value(agent_run_config::config::historical_config(
+        serde_json::to_value(original)?,
+    ))
+    .map_err(|_| invalid("config migrate expects a valid schema_version 1 config"))?;
     if old.schema_version != 1 {
         return Err(invalid("config migrate expects a schema_version 1 home"));
     }

@@ -68,7 +68,7 @@ before manually retrying or treating delivery as complete.
 Each member supplies exactly one `start` or `existing_agent_id`, plus a descriptive
 `role`. Only new members launch and get every stable peer ID in their first prompt.
 An attached independent RUNNING worker retains its task, native session, grants,
-account, reservation and original deadline. It must have no prior pool membership
+account and reservation. It must have no prior pool membership
 and authenticated proof of the current worker catalog; unknown historical proof
 is refused. The batch commits atomically, including compatible binding inference.
 
@@ -76,8 +76,7 @@ Existing seats are `pending` until the pinned worker uses `pool_read`, then post
 its current-work summary with the exact broker-issued ACK `request_id`. Queueing,
 Claude writes and Codex transport acceptance do not prove awareness. Pending seats
 cannot vote or complete the pool. Ended or unconfirmed joins show `needs_action`;
-recover an active worker using existing context/steer and the same challenge before
-its unchanged deadline. A distinct broker attention uses the existing outbox;
+recover an active worker using existing context/steer and the same challenge. Executions have no lifetime limit. A distinct broker attention uses the existing outbox;
 Codex requires v5 support, while ordinary v4 notices continue. No join action
 restarts or cancels the original work. Members talk through private
 pool tools they receive automatically; you can `pool_post` guidance (stamped as

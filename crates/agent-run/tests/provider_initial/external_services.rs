@@ -265,7 +265,6 @@ async fn managed_services_external_survives_broker_pid_change() {
         broker_ready(&home, &mut broker).await;
         let mut request = request(&home);
         request.request_id = Some(format!("restart-{turn}"));
-        request.timeout_seconds = Some(10.0);
         let admitted = socket::client(&home, "start", serde_json::to_value(request).unwrap())
             .await
             .unwrap();

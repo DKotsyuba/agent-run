@@ -63,9 +63,9 @@ fn retained(store: &Store, id: &str, runtime_home: &Path, digest: &str, status: 
         .conn
         .execute(
             r#"INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,
-         status,created_at,timeout_seconds,config_revision,root_agent_id,identity_json)
+         status,created_at,config_revision,root_agent_id,identity_json)
          VALUES(?1,'glm-user','fixture','review','task','task','/tmp','{"read_roots":[]}',
-         ?4,1,100,'fixture',?1,json_object('runtime_home',?2,'snapshot_sha256',?3))"#,
+         ?4,1,'fixture',?1,json_object('runtime_home',?2,'snapshot_sha256',?3))"#,
             params![id, runtime_home.to_string_lossy(), digest, status],
         )
         .expect("agent row");
@@ -434,10 +434,10 @@ fn retained_at(
         .conn
         .execute(
             r#"INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,
-         status,created_at,timeout_seconds,config_revision,root_agent_id,finished_at,identity_json)
+         status,created_at,config_revision,root_agent_id,finished_at,identity_json)
          VALUES(?1,'glm-user','fixture','review','task','task','/tmp',
          '{"runtime":"glm-user","model":"fixture","profile":"review","task":"task","workdir":"/tmp","timeout_seconds":100,"read_roots":[]}',
-         ?4,1,100,'fixture',?1,?5,json_object('runtime_home',?2,'snapshot_sha256',?3))"#,
+         ?4,1,'fixture',?1,?5,json_object('runtime_home',?2,'snapshot_sha256',?3))"#,
             params![
                 id,
                 runtime_home.to_string_lossy(),

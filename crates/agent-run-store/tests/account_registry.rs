@@ -59,8 +59,8 @@ fn registry_keeps_global_identity_and_reference_metadata() {
     assert_eq!(store.list_accounts().unwrap().len(), 5);
     let id: AccountId = "acct-one".parse().unwrap();
     store.conn.execute(
-        "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision) \
-         VALUES ('ag-20260825-010203-0123456789','codex','gpt','role','task','task','/tmp','{}','running',1.0,10.0,'cfg')",
+        "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision) \
+         VALUES ('ag-20260825-010203-0123456789','codex','gpt','role','task','task','/tmp','{}','running',1.0,'cfg')",
         [],
     ).unwrap();
     store.conn.execute(

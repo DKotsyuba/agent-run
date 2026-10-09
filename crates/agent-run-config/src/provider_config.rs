@@ -404,17 +404,32 @@ impl ProviderConfig {
         )
     }
 
-    /// Returns a metadata-only snapshot digest and stable configured ids.
-    ///
-    /// It hashes complete validated settings but never emits environment
-    /// values, native arguments, account secret references, or credentials.
+    /// Returns a metadata-only digest and stable configured ids for this validated
+    /// configuration. Environment, arguments, references and credentials are hashed
+    /// but never emitted; historical verification uses the same raw-document rule.
     pub fn snapshot(&self) -> Result<Value> {
-        let document = serde_json::to_value(self)?;
+        Self::snapshot_document(&serde_json::to_value(self)?)
+    }
+
+    /// Summarizes a complete serialized configuration without decoding retired
+    /// execution controls. `document` must have object-valued harness/provider maps;
+    /// malformed shape returns ValidationError. Its original canonical bytes define
+    /// the digest, preserving historical verification before in-memory projection.
+    /// Emits only schema, digest and sorted ids, never stored settings or secrets.
+    pub fn snapshot_document(document: &Value) -> Result<Value> {
+        let harnesses = document
+            .get("harnesses")
+            .and_then(Value::as_object)
+            .ok_or_else(|| invalid("serialized harness configuration is malformed"))?;
+        let providers = document
+            .get("providers")
+            .and_then(Value::as_object)
+            .ok_or_else(|| invalid("serialized provider configuration is malformed"))?;
         Ok(json!({
-            "schema_version": 2,
-            "sha256": canonical::sha256_hex(&document, true),
-            "harnesses": self.harnesses.keys().map(|id| id.as_str()).collect::<Vec<_>>(),
-            "providers": self.providers.keys().map(ProviderId::as_str).collect::<Vec<_>>(),
+            "schema_version":2,
+            "sha256":canonical::sha256_hex(document,true),
+            "harnesses":harnesses.keys().collect::<Vec<_>>(),
+            "providers":providers.keys().collect::<Vec<_>>(),
         }))
     }
 

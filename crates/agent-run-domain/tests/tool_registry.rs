@@ -104,6 +104,16 @@ fn registry_matches_python_golden_field_by_field() {
                 description.into();
         }
         if matches!(definition.name.as_str(), "start" | "resume") {
+            expected["inputSchema"]["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove("timeout_seconds");
+            if definition.name == "resume" {
+                expected["description"] = Value::from(format!(
+                    "{} Executions have no wall-clock limit; completion, failure or explicit cancellation ends a run. Native continuations may be resumed repeatedly.",
+                    expected["description"].as_str().unwrap()
+                ));
+            }
             let description = if definition.name == "start" {
                 "Optional human display label for the agent, shown in list views and inherited by resumes that omit it. At most 64 Unicode characters, no control or bidi formatting; null or omission means unnamed."
             } else {
@@ -222,7 +232,7 @@ fn start_description_extends_the_python_baseline_exactly() {
     assert_eq!(
         description,
         &(expected
-            + " Replays are idempotent only with the same nonempty request_id and identical arguments; without a key each call may admit new work.")
+            + " Replays are idempotent only with the same nonempty request_id and identical arguments; without a key each call may admit new work. Executions have no wall-clock limit; completion, failure or explicit cancellation ends a run. Native continuations may be resumed repeatedly.")
     );
 }
 
@@ -234,7 +244,8 @@ fn resume_description_discloses_optional_key_replay_exactly() {
     let base = "Continue the latest terminal execution of a stable agent in the same native context. agent_id stays constant. Concurrent continuations cannot create parallel active runs. Reuse request_id for an identical retry, including after later resumes. Identity, permissions, native-history and cleanup checks remain mandatory.";
     let replay = " Replays are idempotent only with the same nonempty request_id and identical arguments; without a key each call may admit new work.";
     let resume = tool("resume").unwrap();
-    assert_eq!(resume.description, format!("{base}{replay}"));
+    let lifecycle = " Executions have no wall-clock limit; completion, failure or explicit cancellation ends a run. Native continuations may be resumed repeatedly.";
+    assert_eq!(resume.description, format!("{base}{replay}{lifecycle}"));
     assert_eq!(resume.description.matches(replay).count(), 1);
     let key = resume
         .arguments()

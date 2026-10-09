@@ -145,10 +145,7 @@ fn config_to_value(cfg: &Config) -> Value {
     json!({
         "schema_version": cfg.schema_version,
         "core": {
-            "default_timeout_seconds": cfg.core.default_timeout_seconds,
             "max_active_agents": cfg.core.max_active_agents,
-            "warning_fraction": cfg.core.warning_fraction,
-            "stalled_after_seconds": cfg.core.stalled_after_seconds,
         },
         "capacity": capacity_summary(&cfg.capacity),
         "delivery": {
@@ -255,11 +252,14 @@ fn normalize_expected_config_paths(expected: &mut Value, home: &std::path::Path)
 ///
 /// Placeholders at any depth resolve against this case's real fixture root.
 /// The returned value is then normalized only for paths whose production
-/// loader semantics vary with the host filesystem.
+/// loader semantics vary with the host filesystem, and projects the four retired
+/// execution-policy keys without relaxing any other golden value.
 fn expected_config_value(raw: &Value, tmp_home: &std::path::Path) -> Value {
     let text = serde_json::to_string(raw).unwrap();
     let text = text.replace("${TMP_HOME}", &tmp_home.to_string_lossy());
-    let mut expected = serde_json::from_str(&text).unwrap();
+    // Preserve the frozen oracle; only the explicitly retired core policy is projected.
+    let mut expected =
+        agent_run_config::config::historical_config(serde_json::from_str(&text).unwrap());
     normalize_expected_config_paths(&mut expected, tmp_home);
     expected
 }
@@ -279,10 +279,30 @@ fn run_config_case(case: &Case) -> (Result<Value, Error>, Option<Value>) {
     run_config_case_at(case, &home)
 }
 
-/// Runs one config case against an already-created canonical fixture `home`.
+/// Runs an immutable config oracle under a canonical fixture home. Formerly
+/// accepted retired policy must first fail strict live loading, then its explicit
+/// in-memory migration projection is compared against every remaining golden field.
 fn run_config_case_at(case: &Case, home: &Path) -> (Result<Value, Error>, Option<Value>) {
     let text = case.toml.replace("${TMP_HOME}", &home.to_string_lossy());
-    std::fs::write(home.join("config.toml"), text).unwrap();
+    std::fs::write(home.join("config.toml"), &text).unwrap();
+    if case.outcome == "ok" {
+        let raw: toml::Value = toml::from_str(&text).unwrap();
+        let original = serde_json::to_value(&raw).unwrap();
+        let projected = agent_run_config::config::historical_config(original.clone());
+        if projected != original {
+            assert!(
+                matches!(Config::load(home), Err(Error::Validation(_))),
+                "retired live policy must fail closed: {}",
+                case.id
+            );
+            let migrated: toml::Value = serde_json::from_value(projected).unwrap();
+            std::fs::write(
+                home.join("config.toml"),
+                toml::to_string(&migrated).unwrap(),
+            )
+            .unwrap();
+        }
+    }
     let result = Config::load(home).map(|cfg| config_to_value(&cfg));
     let expected = case
         .normalized_result_summary

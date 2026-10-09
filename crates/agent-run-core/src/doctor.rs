@@ -1091,7 +1091,6 @@ fn roles(config: &Config, home: &Path, findings: &mut Vec<Finding>) -> bool {
             fast: false,
             effort: None,
             display_name: None,
-            timeout_seconds: None,
             read_roots: Vec::new(),
             output_schema: None,
             orchestrator: None,
@@ -2063,7 +2062,7 @@ mod tests {
             ),
         ] {
             store.conn.execute(
-                "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,parent_agent_id,root_agent_id) VALUES(?, 'fixture','model','','private-task-sentinel','', '/tmp','{}',?,1,60,'',?,?)",
+                "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,parent_agent_id,root_agent_id) VALUES(?, 'fixture','model','','private-task-sentinel','', '/tmp','{}',?,1,'',?,?)",
                 rusqlite::params![id, status, parent, root],
             ).unwrap();
         }

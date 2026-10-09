@@ -74,70 +74,44 @@ pub struct Config {
     #[serde(default)]
     pub runtimes: BTreeMap<String, Runtime>,
 }
+
+/// Projects an immutable serialized configuration to current concurrency policy.
+/// Only retired execution-allowance/warning keys in its `core` object are
+/// discarded. The caller verifies the original snapshot before projection;
+/// unknown fields remain available for strict decoding to reject. No bytes,
+/// paths, grants or credentials are rewritten, and no live config is accepted
+/// through this compatibility projection without explicit migration.
+pub fn historical_config(mut document: serde_json::Value) -> serde_json::Value {
+    if let Some(core) = document
+        .get_mut("core")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for key in [
+            "default_timeout_seconds",
+            "timeout_multiplier",
+            "warning_fraction",
+            "stalled_after_seconds",
+        ] {
+            core.remove(key);
+        }
+    }
+    document
+}
+
+/// Supervisor concurrency controls. Executions have no wall-clock allowance,
+/// expiry margin or near-deadline warning policy; cancellation and verified
+/// native completion own their lifecycle. The validated active cap is 1..4096.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Core {
-    pub default_timeout_seconds: f64,
-    /// Margin applied once to every newly admitted run's whole-run timeout:
-    /// the explicit `timeout_seconds` a caller requests, or
-    /// `default_timeout_seconds` when the request omits one. Finite and at
-    /// least `1.0`; `1.0` disables the margin. Existing runs, frozen
-    /// snapshots and inherited resume timeouts are never re-scaled.
-    ///
-    /// The default `1.2` is omitted from serialization: pre-field snapshots
-    /// and identities never carried the key, so skipping the default keeps
-    /// their normalized documents and digests byte-identical, while every
-    /// other value is emitted and sealed into the config digest.
-    #[serde(skip_serializing_if = "is_default_timeout_multiplier")]
-    pub timeout_multiplier: f64,
+    /// Maximum concurrent admitted executions; defaults to six.
     pub max_active_agents: usize,
-    pub warning_fraction: f64,
-    pub stalled_after_seconds: f64,
 }
 impl Default for Core {
     fn default() -> Self {
         Self {
-            default_timeout_seconds: 480.,
-            timeout_multiplier: 1.2,
             max_active_agents: 6,
-            warning_fraction: 0.9,
-            stalled_after_seconds: 900.,
         }
-    }
-}
-impl Core {
-    /// Returns the effective whole-run timeout one new admission persists.
-    ///
-    /// `requested` is the caller's explicit timeout in seconds, or `None` to
-    /// take [`Core::default_timeout_seconds`]. The configured
-    /// [`Core::timeout_multiplier`] is applied exactly once to that base, and
-    /// the product must satisfy the shared run-timeout contract (positive,
-    /// finite and at most 2592000 seconds); anything else is a validation
-    /// error and nothing is admitted or persisted.
-    ///
-    /// Resume callers pass `Some` only for a newly requested timeout; an
-    /// inherited timeout is the parent's already-effective value and is
-    /// reused as-is so the margin never compounds.
-    pub fn effective_timeout_seconds(&self, requested: Option<f64>) -> Result<f64> {
-        let effective = requested.unwrap_or(self.default_timeout_seconds) * self.timeout_multiplier;
-        domain::timeout_seconds(effective).map_err(|_| {
-            invalid(
-                "effective timeout_seconds (the requested value or core.default_timeout_seconds \
-                 times core.timeout_multiplier) must be positive, finite and at most 2592000",
-            )
-        })
-    }
-
-    /// Returns the effective default allowance for an admission that omitted a
-    /// timeout, without a validation round-trip.
-    ///
-    /// This is the infallible fallback for store writers that must persist a
-    /// concrete column value for a request carrying no timeout; a validated
-    /// configuration already proves the product is positive, finite and at
-    /// most 2592000 seconds, so the plain product can never overflow the
-    /// run-timeout contract here.
-    pub fn effective_default_timeout_seconds(&self) -> f64 {
-        self.default_timeout_seconds * self.timeout_multiplier
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,12 +192,6 @@ pub struct Mcp {
 /// Returns whether a boolean is `false`, for skipping default serialization.
 fn is_false(value: &bool) -> bool {
     !*value
-}
-/// Returns whether `multiplier` equals the documented default margin, so the
-/// default serializes exactly like a pre-field document and historical
-/// snapshots keep their frozen digest; any other value is emitted.
-fn is_default_timeout_multiplier(multiplier: &f64) -> bool {
-    *multiplier == 1.2
 }
 fn auto() -> String {
     "auto".into()
@@ -521,27 +489,8 @@ impl Config {
         if self.schema_version != 1 {
             return Err(invalid("unsupported config schema_version"));
         }
-        agent_run_domain::domain::timeout_seconds(self.core.default_timeout_seconds).map_err(
-            |_| {
-                invalid("core.default_timeout_seconds must be positive, finite and at most 2592000")
-            },
-        )?;
-        if !self.core.timeout_multiplier.is_finite() || self.core.timeout_multiplier < 1.0 {
-            return Err(invalid(
-                "core.timeout_multiplier must be finite and at least 1",
-            ));
-        }
-        self.core
-            .effective_timeout_seconds(None)
-            .map_err(|_| invalid("core.default_timeout_seconds times core.timeout_multiplier must be positive, finite and at most 2592000"))?;
         if self.core.max_active_agents == 0 || self.core.max_active_agents > 4096 {
             return Err(invalid("max_active_agents must be 1..4096"));
-        }
-        if !(0.0..1.0).contains(&self.core.warning_fraction) || self.core.warning_fraction == 0.0 {
-            return Err(invalid("warning_fraction must be between zero and one"));
-        }
-        if !self.core.stalled_after_seconds.is_finite() || self.core.stalled_after_seconds < 0.0 {
-            return Err(invalid("stalled_after_seconds must be nonnegative"));
         }
         if self.capacity.collect_interval_seconds == 0
             || self.capacity.sample_retention == 0

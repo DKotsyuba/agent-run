@@ -67,9 +67,6 @@ struct Resume {
     /// Nonblank next instruction for the retained native conversation.
     task: String,
     #[serde(default)]
-    /// Whole-run deadline override in seconds; omission inherits the parent.
-    timeout_seconds: Option<f64>,
-    #[serde(default)]
     /// Idempotency key in the caller's namespace, reused for transport retries.
     request_id: Option<String>,
     #[serde(default)]
@@ -101,7 +98,7 @@ struct Wait {
     #[serde(default)]
     sequence: Option<u32>,
     #[serde(default)]
-    /// Optional observer deadline in seconds, distinct from the run deadline.
+    /// Optional observer wait in seconds; expiry never stops or limits the execution.
     timeout_seconds: Option<f64>,
 }
 /// Decodes and dispatches one named tool against the caller-owned service.
@@ -158,7 +155,6 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
                     &a.agent_id,
                     a.run_id.as_ref(),
                     a.task,
-                    a.timeout_seconds,
                     a.request_id,
                     a.display_name,
                     a.orchestrator,

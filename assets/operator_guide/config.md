@@ -4,14 +4,12 @@ Schema 2 separates native harnesses, named providers and global accounts.
 Configuration contains nonsecret references, never token values. Register each
 account before using its id in a provider binding.
 
-`core.timeout_multiplier` adds a global margin to new agent timeouts. It defaults
-to `1.2` (+20%); set it to `1.0` to disable the margin. An explicit 600-second
-request becomes 720 seconds. When omitted, `core.default_timeout_seconds`
-(480 by default) becomes 576 seconds. The effective allowance is persisted once;
-resume inherits that allowance without multiplying it again, while an explicit
-resume timeout is scaled once. Existing runs keep their admitted deadline.
-The multiplier must be finite and at least 1.0, and the resulting timeout must
-remain within 30 days. This setting does not change collector or service timeouts.
+Agent executions have no wall-clock limit. Start and resume accept no lifetime
+parameter; continuations may be resumed repeatedly. Cancellation, native completion
+and failure retain their usual lifecycle and cleanup proof requirements. The four
+retired core lifetime/warning keys are rejected in live configuration. Historical
+requests and snapshots remain readable after the schema-28 upgrade. Collector,
+service and transport operation timeouts remain separate.
 
 ```toml
 schema_version = 2

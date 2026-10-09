@@ -1239,13 +1239,16 @@ mod tests {
         let at = 2_000_000_000.0;
         for index in 0..100 {
             let id = format!("ag-20330518-040000-{index:010x}");
-            store.conn.execute(
-                "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,
-                 request_json,status,created_at,finished_at,timeout_seconds,config_revision,root_agent_id)
+            store
+                .conn
+                .execute(
+                    "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,
+                 request_json,status,created_at,finished_at,config_revision,root_agent_id)
                  VALUES(?1,'mock','fixture','review','fixture','fixture','/tmp','{}',
-                        'succeeded',?2,?2,1,'fixture',?1)",
-                rusqlite::params![id, at + 1_000.0 + index as f64],
-            ).unwrap();
+                        'succeeded',?2,?2,'fixture',?1)",
+                    rusqlite::params![id, at + 1_000.0 + index as f64],
+                )
+                .unwrap();
         }
         let stale = store.storage_protection_snapshot().unwrap();
         assert_eq!(stale.count_boundary(), Some(at + 1_000.0));
@@ -1256,9 +1259,9 @@ mod tests {
             .conn
             .execute(
                 "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,
-             request_json,status,created_at,timeout_seconds,config_revision,root_agent_id)
+             request_json,status,created_at,config_revision,root_agent_id)
              VALUES(?1,'mock','fixture','review','fixture','fixture','/tmp','{}',
-                    'running',?2,1,'fixture',?1)",
+                    'running',?2,'fixture',?1)",
                 rusqlite::params![id, at + 0.8],
             )
             .unwrap();

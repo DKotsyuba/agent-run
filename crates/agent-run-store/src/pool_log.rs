@@ -436,11 +436,11 @@ impl Store {
             Err(_) => return Ok(Err(PoolDenial::NotPoolMemberRead)),
         };
         let mut page = read_page(&self.conn, &member.pool_id, after_seq, before_seq, limit)?;
-        let challenge:Option<(String,String,f64)> = self.conn.query_row(
-            "SELECT challenge,state,deadline FROM pool_enrollments WHERE agent_id=? AND run_id=? AND attempt_id=?",
-            params![member.seat_agent_id,run_id.as_str(),attempt_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-        if let Some((request, state, deadline)) = challenge {
-            page["enrollment"] = json!({"state":state,"request_id":request,"deadline":deadline,"remaining_seconds":(deadline-now()).max(0.0)});
+        let challenge:Option<(String,String)> = self.conn.query_row(
+            "SELECT challenge,state FROM pool_enrollments WHERE agent_id=? AND run_id=? AND attempt_id=?",
+            params![member.seat_agent_id,run_id.as_str(),attempt_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        if let Some((request, state)) = challenge {
+            page["enrollment"] = json!({"state":state,"request_id":request});
         }
         Ok(Ok(page))
     }
@@ -1265,7 +1265,7 @@ fn pool_status(conn: &Connection, pool_id: &str) -> Result<Value> {
                 vote_validity(latest, roster_revision, *proposal_roster, &tip, &tip_status)
             }
         };
-        let enrollment = crate::pool_enrollment::view(conn, &seat, now())?;
+        let enrollment = crate::pool_enrollment::view(conn, &seat)?;
         let why = if enrollment.as_ref().is_some_and(|e| e["state"] != "joined") {
             "join_pending".to_owned()
         } else {

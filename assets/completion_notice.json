@@ -10,7 +10,7 @@
   "status_guidance": {
     "timed_out": {
       "reason": "The agent exceeded its execution deadline.",
-      "advice": "Inspect progress and transcript; increase the timeout only when the run was making useful progress, then retry with a fresh ID."
+      "advice": "Inspect progress and transcript; resume explicitly after the native-history, authority and cleanup checks pass. Executions have no time limit."
     },
     "lost": {
       "reason": "The supervisor could no longer prove ownership of the running agent.",

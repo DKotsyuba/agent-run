@@ -36,7 +36,7 @@ pub struct AttemptAuth {
 /// Authenticates the exact live attempt behind a worker capability.
 ///
 /// The token hash must match `worker_capabilities`, the attempt must be
-/// ownership-active and unfinished, its agent live within its deadline, and
+/// ownership-active and unfinished, its agent live without lifetime expiry, and
 /// the optional orchestrator session is joined without requiring it. `None`
 /// means the credentials or liveness failed; callers add only their own
 /// predicates on top.
@@ -57,8 +57,8 @@ pub fn authenticate_attempt(
              JOIN attempts t ON t.id=c.attempt_id JOIN agents a ON a.id=t.agent_id \
              LEFT JOIN orchestrator_sessions s ON s.id=a.orchestrator_session_id \
              WHERE t.id=? AND t.agent_id=? AND t.ownership_active=1 AND t.finished_at IS NULL \
-               AND a.finished_at IS NULL AND a.created_at+a.timeout_seconds>?",
-            rusqlite::params![attempt_id, run_id.as_str(), at],
+               AND a.finished_at IS NULL",
+            rusqlite::params![attempt_id, run_id.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;

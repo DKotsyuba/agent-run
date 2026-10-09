@@ -107,19 +107,49 @@ pub struct ProviderLaunchIdentity {
 }
 
 impl ProviderLaunchIdentity {
-    /// Reads only an explicit v2 identity and verifies its raw provider
+    /// Reads an explicit v2 identity, verifies its original immutable raw
+    /// configuration/replay proofs, then projects retired clocks out in memory.
+    /// Remaining grants and normalized settings remain exact; historical bytes
+    /// are never rewritten. Verifies the provider
     /// request against the staged projection and replay digest. An omitted
     /// effort may resolve to the frozen model default in newer admissions;
     /// older rows whose effective effort stayed absent remain readable. The stored
     /// request's Fast value is effective launch policy; the raw request remains
     /// unchanged for replay, independently of the captured global Fast override.
     pub fn read(row: &Record) -> Result<Self> {
-        let identity: Self = serde_json::from_value(
-            row.identity
-                .clone()
-                .ok_or_else(|| invalid("provider launch identity is missing"))?,
-        )
-        .map_err(|_| invalid("provider launch identity is malformed"))?;
+        let mut document = row
+            .identity
+            .clone()
+            .ok_or_else(|| invalid("provider launch identity is missing"))?;
+        let original_request = document["provider_request"].clone();
+        let original_config = document["provider_config"].clone();
+        let original_snapshot = document["provider_config_snapshot"].clone();
+        if document["replay_request_sha256"].as_str()
+            != Some(agent_run_domain::canonical::sha256_hex(&original_request, true).as_str())
+            || ProviderConfig::snapshot_document(&original_config)? != original_snapshot
+        {
+            return Err(Error::Integrity(
+                "stored provider snapshot or replay proof changed".into(),
+            ));
+        }
+        let projected_request = ProviderStartRequest::from_history(original_request)?;
+        let projected_config = crate::config::historical_config(original_config);
+        document["provider_request"] = serde_json::to_value(&projected_request)?;
+        document["provider_config"] = projected_config.clone();
+        let mut identity: Self = serde_json::from_value(document)
+            .map_err(|_| invalid("provider launch identity is malformed"))?;
+        // All nonretired fields must still have the exact normalized form that
+        // the original snapshot sealed; removing clocks cannot normalize grants.
+        if serde_json::to_value(&identity.provider_config)? != projected_config {
+            return Err(Error::Integrity(
+                "stored provider configuration is not normalized".into(),
+            ));
+        }
+        identity.provider_config_snapshot = identity.provider_config.snapshot()?;
+        identity.replay_request_sha256 = agent_run_domain::canonical::sha256_hex(
+            &serde_json::to_value(&identity.provider_request)?,
+            true,
+        );
         let configured_default = identity
             .provider_config
             .providers
@@ -155,12 +185,6 @@ impl ProviderLaunchIdentity {
             || identity.authority.profile != identity.provider_request.profile
             || identity.authority.workdir != identity.provider_request.workdir
             || identity.provider_config.schema_version != 2
-            || identity.provider_config.snapshot()? != identity.provider_config_snapshot
-            || identity.replay_request_sha256
-                != agent_run_domain::canonical::sha256_hex(
-                    &serde_json::to_value(&identity.provider_request)?,
-                    true,
-                )
         {
             return Err(Error::Integrity(
                 "stored provider authority contradicts request".into(),
@@ -170,11 +194,15 @@ impl ProviderLaunchIdentity {
     }
 }
 impl LaunchIdentity {
+    /// Reads immutable historical grants and projects only retired execution
+    /// controls out of the embedded configuration. Runtime snapshot bytes and
+    /// their digests remain untouched; malformed identities stay unsupported.
     pub fn read(row: &Record) -> Result<Self> {
-        let value = row
+        let mut value = row
             .identity
             .clone()
             .ok_or_else(|| invalid("native resume requires a recorded launch identity"))?;
+        value["config"] = crate::config::historical_config(value["config"].clone());
         let result:Self=serde_json::from_value(value).map_err(|_|Error::Unsupported("resuming Python-created runs is not yet supported; their history and answers remain readable".into()))?;
         if result.rust_identity_version != 1 {
             return Err(invalid("unsupported launch identity version"));
@@ -1168,11 +1196,9 @@ impl Service {
                     "agent_id":member.agent_id,"name":member.name,"role":member.role,
                     "status":run.map(|row|row.status.as_str()),
                 });
-                if let Some(enrollment) = agent_run_store::pool_enrollment::view(
-                    &store.conn,
-                    &member.agent_id,
-                    crate::domain::now(),
-                )? {
+                if let Some(enrollment) =
+                    agent_run_store::pool_enrollment::view(&store.conn, &member.agent_id)?
+                {
                     item["existing"] = json!(true);
                     item["enrollment"] = enrollment;
                 }
@@ -1219,11 +1245,6 @@ impl Service {
         let config = self.current_config()?;
         let runtime = config.runtime(&request.runtime)?;
         request.account = runtime.selected_account(request.account.as_deref())?;
-        request.timeout_seconds = Some(
-            config
-                .core
-                .effective_timeout_seconds(request.timeout_seconds)?,
-        );
         let profile = profiles::load(&config, runtime, &request)?;
         request.write = profile.write;
         request.read_roots = profile.read_roots.clone();
@@ -1326,13 +1347,12 @@ impl Service {
     /// continues through [`Self::admit_provider_resume`]. `display_name` inherits
     /// when absent and otherwise replaces the label after normalization; it
     /// participates in request-id replay. The supplied task becomes the next
-    /// native turn; timeout and orchestrator overrides keep existing bounds.
+    /// native turn without a lifetime limit; binding overrides stay validated.
     /// Admission is durable before supervisor handoff; replay launches nothing.
     pub async fn resume(
         &self,
         id: &AgentId,
         task: String,
-        timeout: Option<f64>,
         request_id: Option<String>,
         display_name: Option<String>,
         orchestrator: Option<OrchestratorRef>,
@@ -1351,39 +1371,28 @@ impl Service {
             .as_ref()
             .is_some_and(|identity| identity["provider_identity_version"] == 2);
         if provider_row {
-            let mut result = self.admit_provider_resume(
-                &parent,
-                task,
-                timeout,
-                request_id,
-                display_name,
-                orchestrator,
-            )?;
+            let mut result =
+                self.admit_provider_resume(&parent, task, request_id, display_name, orchestrator)?;
             self.hand_off_provider(&mut result).await?;
             return Ok(result);
         }
         // Replay of the original resume intent precedes every mutable read, as
         // for a provider run: an old parent's retry finds its one child even
         // after later continuations, a changed configuration or a moved home.
-        // Hash the raw override before scaling. An inherited timeout is already
-        // effective; exact retries never consult the current margin or filesystem.
+        // Exact retries compare task/binding intent without mutable policy or
+        // filesystem reads. Execution has no inherited lifetime allowance.
         let mut replay = parent.request.clone();
         replay.task = task.clone();
         replay.request_id = request_id.clone();
         if display_name.is_some() {
             replay.display_name = display_name.clone();
         }
-        if let Some(explicit) = timeout {
-            replay.timeout_seconds = Some(explicit);
-        }
         if orchestrator.is_some() {
             replay.orchestrator = orchestrator.clone();
         }
         replay.validate_intent()?;
-        let intent_hash = agent_run_domain::canonical::sha256_hex(
-            &json!({"request": replay, "explicit_timeout": timeout}),
-            true,
-        );
+        let intent_hash =
+            agent_run_domain::canonical::sha256_hex(&json!({"request": replay}), true);
         {
             let store = Store::open(&self.home)?;
             if let Some(child) = store.replay_request(&replay)? {
@@ -1396,21 +1405,19 @@ impl Service {
                     .and_then(|value| value.get("replay_request_sha256"))
                     .and_then(Value::as_str);
                 match frozen_hash {
-                    Some(hash) if hash != intent_hash => return Err(Error::Conflict),
-                    Some(_) => {}
-                    None => {
-                        // Historical resumes did not record the raw intent. Compare every
-                        // field using the child's frozen policy, never today's multiplier.
-                        let mut historical = replay.clone();
-                        if let Some(explicit) = timeout {
-                            historical.timeout_seconds = Some(
-                                LaunchIdentity::read(&child)?
-                                    .config
-                                    .core
-                                    .effective_timeout_seconds(Some(explicit))?,
-                            );
-                        }
-                        if store.replay_resume_child(&historical, &parent)?.is_none() {
+                    Some(hash)
+                        if hash != intent_hash
+                            && !store
+                                .last_event(&child.id, "historical_execution_policy")?
+                                .is_some_and(|policy| policy["version"] == 1) =>
+                    {
+                        return Err(Error::Conflict);
+                    }
+                    Some(hash) if hash == intent_hash => {}
+                    _ => {
+                        // Retired allowances no longer distinguish intent;
+                        // every remaining frozen child field still must match.
+                        if store.replay_resume_child(&replay, &parent)?.is_none() {
                             return Err(Error::Conflict);
                         }
                     }
@@ -1457,13 +1464,6 @@ impl Service {
         if display_name.is_some() {
             request.display_name = display_name;
         }
-        // A newly requested timeout is scaled once; an inherited one is the
-        // parent's already-effective allowance and is reused unscaled, so the
-        // configured margin never compounds across a lineage.
-        request.timeout_seconds = match timeout {
-            Some(explicit) => Some(current.core.effective_timeout_seconds(Some(explicit))?),
-            None => parent.request.timeout_seconds,
-        };
         if orchestrator.is_some() {
             request.orchestrator = orchestrator;
         }
@@ -1521,14 +1521,13 @@ impl Service {
     /// proves the parent terminal, quiescent and cleaned up, and admits at
     /// most one child per parent. `display_name` inherits the frozen label when
     /// absent, or supplies a normalized replacement; a changed label with the
-    /// same request id is `Conflict`. Task, timeout and orchestrator overrides
+    /// same request id is `Conflict`. Task and orchestrator overrides
     /// remain subject to their normal validation. Returns a durable admission
     /// snapshot; this method does not launch the supervisor.
     pub fn admit_provider_resume(
         &self,
         parent: &Record,
         task: String,
-        timeout: Option<f64>,
         request_id: Option<String>,
         display_name: Option<String>,
         orchestrator: Option<OrchestratorRef>,
@@ -1542,7 +1541,6 @@ impl Service {
         if display_name.is_some() {
             request.display_name = display_name;
         }
-        request.timeout_seconds = timeout.or(frozen.provider_request.timeout_seconds);
         if orchestrator.is_some() {
             request.orchestrator = orchestrator;
         } else if let Some(shared) =
@@ -1687,14 +1685,6 @@ impl Service {
         effective.task = request.task.clone();
         effective.request_id = request.request_id.clone();
         effective.display_name = request.display_name.clone();
-        // A resume's newly requested timeout is scaled once by the current
-        // configuration; an inherited one keeps the parent's already-effective
-        // allowance (never the frozen pre-margin base), so the margin is
-        // applied exactly once per base value across a lineage.
-        effective.timeout_seconds = match timeout {
-            Some(explicit) => Some(current.core.effective_timeout_seconds(Some(explicit))?),
-            None => parent.request.timeout_seconds,
-        };
         effective.orchestrator = request.orchestrator.clone();
         // Preserve raw replay intent while each resume captures current global Fast policy.
         effective.fast = request.fast
@@ -1968,7 +1958,7 @@ impl Service {
             .as_ref()
             .and_then(|i| i.get("effective_policy"));
         let mut view = json!({"agent_id":row.id,"name":row.display_name,"runtime":row.request.runtime,"model":row.request.model,"profile":row.request.profile,"task_summary":row.request.task.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect::<String>(),"status":row.status,
-            "created_at":row.created_at,"started_at":row.started_at,"finished_at":row.finished_at,"elapsed_seconds":(row.finished_at.unwrap_or(observed)-row.started_at.unwrap_or(row.created_at)).max(0.0),"last_progress_at":progress,"silence_seconds":if row.status.terminal(){None}else{Some((observed-progress.or(row.started_at).unwrap_or(row.created_at)).max(0.0))},"warned":false,"failure_kind":row.failure_kind,"failure_text":row.failure_text,"answer_available":row.answer_path.is_some(),"answer_bytes":row.answer_bytes,"answer_sha256":row.answer_sha256,"effort":row.request.effort,
+            "created_at":row.created_at,"started_at":row.started_at,"finished_at":row.finished_at,"elapsed_seconds":(row.finished_at.unwrap_or(observed)-row.started_at.unwrap_or(row.created_at)).max(0.0),"last_progress_at":progress,"silence_seconds":if row.status.terminal(){None}else{Some((observed-progress.or(row.started_at).unwrap_or(row.created_at)).max(0.0))},"failure_kind":row.failure_kind,"failure_text":row.failure_text,"answer_available":row.answer_path.is_some(),"answer_bytes":row.answer_bytes,"answer_sha256":row.answer_sha256,"effort":row.request.effort,
             "delivery":store.delivery_status(&row.id)?,"parent_agent_id":row.parent_agent_id,"root_agent_id":row.root_agent_id,"sequence":row.sequence,"cleanup":store.last_event(&row.id,"process_cleanup")?,"policy":policy,"phase":phase,"phase_started_at":row.finished_at.or(row.started_at).unwrap_or(row.created_at),"process_state":process::observe(row.supervisor_pid,row.supervisor_identity.as_deref(),row.supervisor_birth_time),"observed_at":observed,"runtime_outcome":if row.status.terminal(){Some(row.status.as_str())}else{None},"acceptance":"pending","workdir":row.request.workdir.display().to_string(),
             "usage":store.usage_view(&row.id)?,"usage_cumulative":store.usage_cumulative(&row.root_agent_id)?,"tool_counts":store.tool_counts(&row.id)?});
         let mcp = agent_run_store::projections::selected_mcp(row.identity.as_ref());
@@ -2395,11 +2385,6 @@ pub(crate) fn prepare_provider(
     effective.write = profile.write;
     effective.read_roots = profile.read_roots.clone();
     effective.required_constraints = profile.required_constraints.clone();
-    effective.timeout_seconds = Some(
-        config
-            .core
-            .effective_timeout_seconds(effective.timeout_seconds)?,
-    );
     // Compile the same frozen role and native grant used by materialization
     // and the supervisor before any durable row or account reservation exists.
     let runtime = adapters::provider::runtime(config, provider.harness, &request.model)?;

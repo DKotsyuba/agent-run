@@ -164,7 +164,15 @@ impl Record {
         })?;
         Ok(Self {
             id: agent_id.clone(),
-            request: parse(row.get("request_json")?)?,
+            request: StartRequest::from_history(parse(row.get("request_json")?)?).map_err(
+                |error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                },
+            )?,
             status,
             created_at: row.get("created_at")?,
             started_at: row.get("started_at")?,

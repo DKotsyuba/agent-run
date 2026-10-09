@@ -47,7 +47,9 @@ pub fn replay(store: &Store, request: &ProviderStartRequest) -> Result<Option<Pr
         .transpose()
 }
 
-/// Verifies one row's explicit v2 request and returns its immutable selection.
+/// Verifies the original immutable v2 replay proof, then compares current
+/// intent after projecting retired run controls. Known legacy transport aliases
+/// remain supported; no historical JSON or selection is rewritten.
 fn replayed(
     conn: &rusqlite::Connection,
     record: &Record,
@@ -66,14 +68,28 @@ fn replayed(
         fingerprints.push(canonical::sha256_hex(&legacy, true));
     }
     let identity = record.identity.as_ref().ok_or(Error::Conflict)?;
+    let raw = identity["provider_request"].clone();
+    let mut original_digests = vec![canonical::sha256_hex(&raw, true)];
+    let historical = ProviderStartRequest::from_history(raw.clone())?;
+    if let Some(reference) = &historical.orchestrator {
+        let canonical = reference.canonical_transport()?;
+        let legacy = match canonical {
+            "codex_queue" => "codex",
+            "claude_uds" => "claude",
+            _ => unreachable!(),
+        };
+        for transport in [canonical, legacy] {
+            let mut spelling = raw.clone();
+            spelling["orchestrator"]["transport"] = json!(transport);
+            original_digests.push(canonical::sha256_hex(&spelling, true));
+        }
+    }
+    let projected_digest = canonical::sha256_hex(&serde_json::to_value(historical)?, true);
     if identity["provider_identity_version"] != 2
         || !identity["replay_request_sha256"]
             .as_str()
-            .is_some_and(|previous| {
-                fingerprints
-                    .iter()
-                    .any(|fingerprint| fingerprint == previous)
-            })
+            .is_some_and(|previous| original_digests.iter().any(|digest| digest == previous))
+        || !fingerprints.iter().any(|value| value == &projected_digest)
     {
         return Err(Error::Conflict);
     }
@@ -561,12 +577,12 @@ pub(crate) fn admit_in_tx(
         None => (id.clone(), 1, None),
     };
     let inserted = tx.execute(
-            "INSERT INTO agents(id,request_id,orchestrator_session_id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,parent_agent_id,root_agent_id,sequence,resume_of_runtime_session_id,identity_json,selection_intent,requested_account_id,display_name) \
-             VALUES(?,?,?,?,?,?,?,?,?,?,'starting',?,?,'pending:provider-v2',?,?,?,?,?,?,?,?)",
+            "INSERT INTO agents(id,request_id,orchestrator_session_id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,parent_agent_id,root_agent_id,sequence,resume_of_runtime_session_id,identity_json,selection_intent,requested_account_id,display_name) \
+             VALUES(?,?,?,?,?,?,?,?,?,?,'starting',?,'pending:provider-v2',?,?,?,?,?,?,?,?)",
             params![id.as_str(), request.request_id, session, request.provider.as_str(),
                 request.model, request.profile, request.task, summary,
                 effective.workdir.to_string_lossy(), serde_json::to_string(effective)?,
-                at, effective.timeout_seconds.unwrap_or(480.0),
+                at,
                 resume.map(|resume| resume.parent.as_str()), root.as_str(), sequence, resumed,
                 serde_json::to_string(identity)?,
                 if pinned.is_some() { "pinned" } else { "auto" },

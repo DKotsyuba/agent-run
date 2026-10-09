@@ -156,15 +156,15 @@ fn python_cli_spec_command_surface_is_present() {
         // Deliberate schema-2 divergences from the Python capture: start names a
         // provider instead of a runtime, catalog reads take exact filters,
         // stable agent operations can pin an exact historical execution,
-        // admissions accept an optional display label, and transcript pages
+        // admissions accept an optional display label but no lifetime limit, and transcript pages
         // offer the bounded block view. Doctor now accepts an explicit JSON
         // selector while retaining JSON as its default; the oracle stays frozen.
         let (removed, added): (&[&str], &[&str]) = match path {
             "doctor" => (&[], &["--json"]),
-            "start" => (&["--runtime"], &["--provider", "--name"]),
+            "start" => (&["--runtime", "--timeout"], &["--provider", "--name"]),
             "models" => (&[], &["--provider", "--profile", "--model"]),
             "capacity order" => (&[], &["--model"]),
-            "resume" => (&[], &["--run-id", "--name"]),
+            "resume" => (&["--timeout"], &["--run-id", "--name"]),
             "transcript" => (
                 &[],
                 &["--run-id", "--view", "--tail-blocks", "--before-cursor"],

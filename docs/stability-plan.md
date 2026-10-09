@@ -159,7 +159,8 @@ failed; neither observation proves the process died.
    short connection busy timeout and one monotonic budget. Required initial
    persistence splits the existing store allowance (five seconds) across two
    attempts before releasing native task input. Recurring checkpoints retain
-   two attempts within 250 ms. Both remain capped by the original run deadline.
+   two attempts within 250 ms. The later unlimited-execution change removes that job-clock cap; operation-local
+   persistence bounds and process ownership fences remain.
    A one-second startup allowance reproduced SQLITE_BUSY under fifteen starts;
    the real 1.1-second held-writer regression requires the original store bound.
    Permanent constraint, identity and I/O errors are not retried. The hot
@@ -294,7 +295,8 @@ failed/unqualified case, not a passing zero-survivor claim.
 Only after fixtures pass, perform finite native start/resume and mixed-pool receipt
 checks on approved available routes. Use confirmed completion binding and passive
 delivery, inspect actual answer/report/cleanup proofs after notification, and verify
-the *effective* stored deadline after the configured timeout multiplier. Unavailable
+the execution lifecycle with a bounded observer; the later unlimited-execution
+change removes the former run deadline and multiplier. Unavailable
 capacity leaves that native route explicitly unqualified.
 
 ### R1 — research evidence and skill source
@@ -346,7 +348,7 @@ cargo build --locked --release --package agent-run --bin agent-run
 node --test scripts/check-desktop-transport.cjs scripts/check-codegraph-probe.cjs
 ```
 
-Record exact source/artifact hashes, observed effective deadlines, native IDs and
+Record exact source/artifact hashes, observed completion/cancellation, native IDs and
 completion/receipt facts. Known doctor false positives and historical ownership
 warnings require an accurate before/after comparison; never delete or rename their
 evidence to claim a clean doctor. Add no unmeasured family/host qualification.
@@ -390,10 +392,45 @@ cleanup. A mixed installed-0.22.7 Claude/Codex pool recovered its failed Claude
 member through the same stable identity, kept its successful peer, completed one
 frozen proposal and delivered one common notice with an actual relay receipt.
 GLM remains unqualified: fresh live evidence still reports exhausted quota.
-The full candidate gate, comparable baseline and final exact-binary native proof
-are required before acceptance; focused checks are not a release claim.
+The full candidate gate, signed commit and source archive completed for the
+0.23.0 checkpoint. Exact optimized-binary native start and resume qualified its
+answer, eight-tool inventory, report hashes, write denials and cleanup. These
+local checks do not imply publication or installation.
 
 After this stabilization checkpoint, the owner explicitly requested removal of
 all agent wall-clock execution limits, timeout margins/parameters and inherited
 resume allowances. That separate implementation follows the current changes;
 publication or installation of a new candidate is not implied.
+
+## Unlimited execution checkpoint — local 0.24.0 / schema 28
+
+Execution allowances, their multiplier and warning policy are removed from
+requests, configuration, supervisor preparation/attempts, worker authority,
+pool enrollment, CLI, MCP schemas and presentation. Current execution stops
+through native completion/failure or explicit cancellation; elapsed age does
+not terminate work, revoke an owned worker or prevent a quota-driven switch.
+Operational safety bounds and all ownership/cleanup assertions remain intact.
+Historical data and digests retain their original bytes through the explicit
+schema-28 compatibility and paired migration described in
+[continuations.md](continuations.md#unlimited-execution-migration-0240--schema-28).
+
+The complete required gate passed without failures or compiler/doc warnings.
+Its 377 runner summaries sum to 3,988 passing executions across feature sets and
+nested fixture processes; this is not a count of unique test functions. Fixtures
+prove backdated live jobs, native result followed by a still-live engine,
+explicit cancellation, aged worker read/ACK, quota switching, tamper refusal and
+32 actual native-fixture continuations with stable lineage and exact replay.
+Both 26-to-28 and 27-to-28 paired upgrades and rollback passed.
+
+One exact optimized GLM 5.3 Flash start and its same-conversation resume completed
+naturally through an isolated resident broker. Both captured a complete eight-tool
+research inventory and sealed answers with verified group/descendant cleanup.
+Together they produced actual WebSearch/WebFetch results, report receipts and
+hashes, plus path/overwrite denials.
+A fresh API/MCP process exposed start/resume schemas without lifetime parameters,
+rejected retired inputs without an execution, and read the native lineage.
+The optimized TUI displayed its live resume and exited cleanly. Private doctor
+reported only informational checks. Installed production remains 0.22.7/schema26;
+its two known config false positives and three historical ownership warnings
+remain, and the latest observation additionally reports stale capacity.
+No new release, installation, global policy or credential change is implied.

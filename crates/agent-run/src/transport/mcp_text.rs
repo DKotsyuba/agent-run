@@ -328,8 +328,6 @@ struct AgentTextView {
     delivery_error: String,
     /// Whether delivery acknowledgement is ambiguous.
     ambiguous: bool,
-    /// Whether a watchdog warning is recorded.
-    warned: bool,
     /// Whether stored cleanup remains unconfirmed.
     cleanup_unconfirmed: bool,
     /// Optional process evidence classification.
@@ -488,8 +486,6 @@ struct ReportTextView {
 struct PoolEnrollmentTextView {
     /// Pending, joined or needs_action; validated before rendering.
     state: String,
-    /// Original execution deadline remaining, never an extension.
-    remaining_seconds: f64,
     /// Optional exact opaque broker-issued request key for the recipient ACK.
     request_id: Option<String>,
     /// Fixed safe failure reason, absent while healthy/pending.
@@ -1232,24 +1228,16 @@ fn validate_agent(value: &Value) -> Result<()> {
     if !value["delivery"].is_null() && !value["delivery"].is_object() {
         return Err(shape_error());
     }
-    for key in ["warned"] {
-        if !value[key].is_null() {
-            required_bool(value, key)?;
-        }
-    }
     Ok(())
 }
 
 /// Validates a bounded enrollment overlay before any ACK key can be printed.
-/// State/remaining time remain exact, and an opaque challenge is never shortened.
+/// State remains exact, and an opaque challenge is never shortened.
 fn validate_enrollment(value: &Value) -> Result<()> {
     if !matches!(
         value["state"].as_str(),
         Some("pending" | "joined" | "needs_action")
-    ) || value["remaining_seconds"]
-        .as_f64()
-        .is_none_or(|v| !v.is_finite() || v < 0.0)
-    {
+    ) {
         return Err(shape_error());
     }
     if let Some(key) = value.get("request_id") {
@@ -1897,7 +1885,6 @@ fn agent_fields(view: &Value) -> Value {
             .as_str()
             .filter(|s| !s.is_empty()).map(label).unwrap_or_default(),
         "ambiguous": view["delivery"]["ambiguous"].as_bool().unwrap_or(false),
-        "warned": view["warned"].as_bool().unwrap_or(false),
         "cleanup_unconfirmed": view["cleanup"]
             .as_object()
             .is_some_and(|cleanup| !cleanup["confirmed"].as_bool().unwrap_or(false)),

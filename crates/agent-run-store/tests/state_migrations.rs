@@ -319,10 +319,15 @@ fn existing_rows_survive_migration_from_v1() {
     let conn = open_ro(&db_path);
     assert_eq!(agent_count(&conn), V1_AGENTS.len() as i64);
     assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get::<_, i64>(0))
-            .unwrap(),
+        conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE kind='created'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
         V1_AGENTS.len() as i64
     );
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM events WHERE kind='historical_execution_policy' AND json_extract(data_json,'$.timeout_seconds')=10.0", [], |r| r.get::<_, i64>(0)).unwrap(), V1_AGENTS.len() as i64);
     for id in V1_AGENTS {
         let status: String = conn
             .query_row("SELECT status FROM agents WHERE id=?1", params![id], |r| {

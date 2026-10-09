@@ -767,13 +767,10 @@ fn context_budget_is_never_exceeded_with_many_active_agents() {
     assert!(active_block.contains("do not start replacements for existing ids"));
 }
 
-/// Mirrors `tests/test_context_hook.py::ContextHookTests::test_warning_and_silence_use_events_and_latest_message_time`
-///
-/// Deadline warnings come from durable events and silence from the latest
-/// transcript message, so each is re-injected when it appears and silence clears
-/// as soon as the agent speaks again.
+/// Historical deadline events no longer change active hints; observed silence
+/// still clears immediately when a fresh transcript message arrives.
 #[test]
-fn context_warning_and_silence_use_events_and_latest_message_time() {
+fn context_ignores_deadline_warnings_and_tracks_latest_message_time() {
     let home = common::Home::new();
     let agent_id = active_agent_row(&home, "summary task", "req-silence");
     let mut store = home.store();
@@ -787,9 +784,9 @@ fn context_warning_and_silence_use_events_and_latest_message_time() {
         .event(&agent_id, "deadline_warning", &json!({}))
         .unwrap();
     let warned = context::build(&home.path, &reference(), Some(started + 2.0)).expect("warned");
-    assert!(warned.injected);
-    assert_ne!(warned.context_key, first.context_key);
-    assert!(warned.text.contains(" warn"));
+    assert!(!warned.injected);
+    assert_eq!(warned.context_key, first.context_key);
+    assert!(!warned.text.contains(" warn"));
 
     let silent = context::build(&home.path, &reference(), Some(started + 120.0)).expect("silent");
     assert!(silent.injected);

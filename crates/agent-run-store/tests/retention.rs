@@ -1176,9 +1176,9 @@ fn count_retirement_is_proved_by_a_fresh_row_not_id_timestamps() {
         .conn
         .execute(
             "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,
-             status,created_at,finished_at,timeout_seconds,config_revision,root_agent_id)
+             status,created_at,finished_at,config_revision,root_agent_id)
              VALUES(?,'mock','fixture','review','task','task','/tmp','{}',
-             'succeeded',?,?,100,'fixture',?)",
+             'succeeded',?,?,'fixture',?)",
             params![racer, NOW, NOW - 1.0, racer],
         )
         .unwrap();
@@ -1194,9 +1194,9 @@ fn count_retirement_is_proved_by_a_fresh_row_not_id_timestamps() {
             .conn
             .execute(
                 "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,
-                 status,created_at,finished_at,timeout_seconds,config_revision,root_agent_id)
+                 status,created_at,finished_at,config_revision,root_agent_id)
                  VALUES(?,'mock','fixture','review','task','task','/tmp','{}',
-                 'succeeded',?,?,100,'fixture',?)",
+                 'succeeded',?,?,'fixture',?)",
                 params![
                     format!("ag-20260101-000000-{:010x}", index),
                     NOW + 1_000.0 + index as f64,

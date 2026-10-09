@@ -513,17 +513,13 @@ fn python_test_service_start_is_visible_with_acceptance_events() {
     assert!(store.last_event(&id, "start_accepted").unwrap().is_some());
 }
 
-/// Mirrors `tests/test_service.py::AgentServiceTests::test_default_timeout_is_resolved_once_and_explicit_value_is_preserved`.
+/// Current admissions persist no execution lifetime field in their durable request.
 #[test]
-fn python_test_service_timeout_is_frozen_at_admission() {
+fn service_admission_has_no_execution_lifetime() {
     let home = common::Home::new();
-    let mut request = home.request();
-    request.timeout_seconds = Some(7.5);
-    let id = admit(&home, request, json!({}));
-    assert_eq!(
-        home.store().get(&id).unwrap().request.timeout_seconds,
-        Some(7.5)
-    );
+    let id = admit(&home, home.request(), json!({}));
+    let request = serde_json::to_value(home.store().get(&id).unwrap().request).unwrap();
+    assert!(request.get("timeout_seconds").is_none());
 }
 
 /// Mirrors `tests/test_service.py::AgentServiceTests::test_service_passes_caps_and_refusal_never_launches_or_creates_artifacts`.

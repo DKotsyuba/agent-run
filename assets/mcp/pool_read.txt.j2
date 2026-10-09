@@ -15,7 +15,7 @@ Current proposal #{{ status.current_proposal.seq }} unchanged (read with after_s
 No proposal yet.
 {% endif %}
 {% if enrollment %}
-Enrollment: {{ enrollment.state }}; original execution time remaining {{ enrollment.remaining_seconds }}s{% if enrollment.reason %}, {{ enrollment.reason }}{% endif %}.
+Enrollment: {{ enrollment.state }}{% if enrollment.reason %}, {{ enrollment.reason }}{% endif %}.
 {% if enrollment.state != "joined" and enrollment.request_id %}
 After reading the goal/criteria/roster, ACK through pool_post with exact request_id={{ enrollment.request_id }} and a brief current-work summary. This does not restart or extend your work.
 {% endif %}

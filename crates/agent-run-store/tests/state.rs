@@ -426,8 +426,7 @@ async fn start_replay_is_independent_of_later_configuration_edits() {
     original.request_id = Some("stable-replay".into());
     let fingerprint =
         fs::sha256(&fs::canonical_json(&serde_json::to_value(&original).unwrap()).unwrap());
-    let mut effective = original.clone();
-    effective.timeout_seconds = Some(480.0);
+    let effective = original.clone();
     let (id, _) = h
         .store()
         .admit(

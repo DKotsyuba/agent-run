@@ -175,7 +175,7 @@ fn crash_worker_dies_between_admission_writes() {
     connection.execute_batch("BEGIN IMMEDIATE").unwrap();
     connection
         .execute(
-            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id,sequence) VALUES('ag-20260101-000000-0000000000','mock','fixture','review','crash','crash','/tmp','{}','starting',1,480,'pending:materialization','ag-20260101-000000-0000000000',1)",
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id,sequence) VALUES('ag-20260101-000000-0000000000','mock','fixture','review','crash','crash','/tmp','{}','starting',1,'pending:materialization','ag-20260101-000000-0000000000',1)",
             [],
         )
         .unwrap();

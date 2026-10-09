@@ -79,11 +79,6 @@ impl Store {
             [id.as_str()],
             |row| row.get(0),
         )?;
-        let warned: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM events WHERE agent_id=? AND kind='deadline_warning')",
-            [id.as_str()],
-            |row| row.get(0),
-        )?;
         let cleanup_json = self.conn.query_row("SELECT data_json FROM events WHERE agent_id=? AND kind='process_cleanup' ORDER BY seq DESC LIMIT 1", [id.as_str()], |row| row.get::<_, String>(0)).optional()?;
         let phase_row = self.conn.query_row("SELECT at,data_json FROM events WHERE agent_id=? AND kind='phase' ORDER BY seq DESC LIMIT 1", [id.as_str()], |row| Ok((row.get::<_, f64>(0)?, row.get::<_, String>(1)?))).optional()?;
         let delivery = self.delivery_view(&record)?;
@@ -153,7 +148,6 @@ impl Store {
             elapsed_seconds: (end - record.started_at.unwrap_or(record.created_at)).max(0.0),
             last_progress_at: progress,
             silence_seconds,
-            warned,
             failure_kind: record.failure_kind,
             failure_text: record.failure_text,
             answer_available: record.answer_path.is_some(),

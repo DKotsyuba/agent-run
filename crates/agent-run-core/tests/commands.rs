@@ -97,7 +97,7 @@ fn pool_entry_text_validates_membership_and_renders() {
     store
         .conn
         .execute(
-            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision)              VALUES(?,?,?,?,?,?,?,?, 'succeeded', 2.0, 10.0, 'fixture')",
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision)              VALUES(?,?,?,?,?,?,?,?, 'succeeded', 2.0, 'fixture')",
             rusqlite::params![
                 replacement.as_str(), "mock", "fixture", "review", "task", "summary",
                 home.path.display().to_string(), "{}"
@@ -162,7 +162,7 @@ fn pool_entry_text_validates_membership_and_renders() {
     store
         .conn
         .execute(
-            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id,sequence)              VALUES('ag-20260101-000000-0000000010','mock','fixture','review','task','summary',?,'{}','running',3.0,10.0,'fixture',?,2)",
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id,sequence)              VALUES('ag-20260101-000000-0000000010','mock','fixture','review','task','summary',?,'{}','running',3.0,'fixture',?,2)",
             rusqlite::params![home.path.display().to_string(), replacement.as_str()],
         )
         .unwrap();

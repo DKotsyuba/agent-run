@@ -91,8 +91,8 @@ fn delivery(home: &Path, id: &str, transport: &str, state: &str) {
         .unwrap();
     connection
         .execute(
-            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            params!["ag-20260825-120000-0123456789", "mock", "fixture", "review", "private task", "summary", home.to_string_lossy(), "{}", "succeeded", now(), 1.0, "fixture", "ag-20260825-120000-0123456789"],
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            params!["ag-20260825-120000-0123456789", "mock", "fixture", "review", "private task", "summary", home.to_string_lossy(), "{}", "succeeded", now(), "fixture", "ag-20260825-120000-0123456789"],
         )
         .unwrap();
     connection
@@ -159,7 +159,8 @@ fn notice_from_case(input: &Value) -> Notice {
 /// Mirrors `tests/test_delivery_base.py::test_configured_identifier_punctuation_renders_verbatim`.
 /// Mirrors `tests/test_delivery_base.py::test_metadata_can_never_add_list_lines_or_commands`.
 /// Mirrors `tests/test_delivery_base.py::test_missing_metadata_renders_unknown_and_unspecified`.
-/// Replays every frozen Python rendering capture (`tests/fixtures/baseline/notices/cases.json`).
+/// Replays every frozen Python capture, with only the retired timeout recovery advice
+/// projected to the current explicit-resume contract.
 #[test]
 fn notice_rendering_matches_python_golden_cases() {
     let cases: Vec<Value> = serde_json::from_slice(
@@ -169,7 +170,11 @@ fn notice_rendering_matches_python_golden_cases() {
     for case in cases {
         let input = case.get("input").unwrap();
         let notice = notice_from_case(input);
-        assert_eq!(notice.render().unwrap(), case["rendered"], "{}", case["id"]);
+        let expected = case["rendered"].as_str().unwrap().replace(
+            "Inspect progress and transcript; increase the timeout only when the run was making useful progress, then retry with a fresh ID.",
+            "Inspect progress and transcript; resume explicitly after the native-history, authority and cleanup checks pass. Executions have no time limit.",
+        );
+        assert_eq!(notice.render().unwrap(), expected, "{}", case["id"]);
     }
 }
 
@@ -229,7 +234,7 @@ async fn stability_invalid_payload_isolated_from_next_notice() {
     let db = Connection::open(home.path.join("state.db")).unwrap();
     db.execute("UPDATE agents SET root_agent_id='invalid'", [])
         .unwrap();
-    db.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) VALUES('ag-20261004-000000-0000000002','mock','fixture','review','t','t','/tmp','{}','succeeded',1,1,'fixture','ag-20261004-000000-0000000002')", []).unwrap();
+    db.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) VALUES('ag-20261004-000000-0000000002','mock','fixture','review','t','t','/tmp','{}','succeeded',1,'fixture','ag-20261004-000000-0000000002')", []).unwrap();
     db.execute("INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,next_attempt_at) VALUES('ntf_next','ag-20261004-000000-0000000002','sess','pending',?)", [now()-0.5]).unwrap();
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 0);
     let bad: (String, String) = db
@@ -352,7 +357,7 @@ async fn unbound_terminal_delivery_expires_before_claiming() {
     let home = common::Home::new();
     let connection = Connection::open(home.path.join("state.db")).unwrap();
     let agent = "ag-20260825-120000-0123456789";
-    connection.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", params![agent,"mock","fixture","review","private task","summary",home.path.to_string_lossy(),"{}","succeeded",now()-7200.0,1.0,"fixture",agent]).unwrap();
+    connection.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", params![agent,"mock","fixture","review","private task","summary",home.path.to_string_lossy(),"{}","succeeded",now()-7200.0,"fixture",agent]).unwrap();
     connection
         .execute(
             "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?,?,?,?)",
@@ -1093,7 +1098,7 @@ async fn claude_uds_reset_after_write_body(home: &Path) {
         .unwrap();
     connection
         .execute(
-            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary',?1,'{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',?2,1.0,'fixture','ag-20260825-120000-0123456789')",
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary',?1,'{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',?2,'fixture','ag-20260825-120000-0123456789')",
             params![home.to_string_lossy(), now()],
         )
         .unwrap();
@@ -1163,7 +1168,7 @@ async fn claude_uds_unconfirmed_write_body(home: &Path) {
         .unwrap();
     connection
         .execute(
-            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary',?1,'{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',?2,1.0,'fixture','ag-20260825-120000-0123456789')",
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary',?1,'{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',?2,'fixture','ag-20260825-120000-0123456789')",
             params![home.to_string_lossy(), now()],
         )
         .unwrap();
@@ -1232,7 +1237,7 @@ async fn claude_uds_known_unsent_attempt_body(home: &Path) {
     let connection = Connection::open(home.join("state.db")).unwrap();
     for sql in [
         "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) VALUES('sess','claude_uds','session-gone',1.0,1.0)",
-        "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary','/tmp','{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',1.0,1.0,'fixture','ag-20260825-120000-0123456789')",
+        "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary','/tmp','{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',1.0,'fixture','ag-20260825-120000-0123456789')",
         "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,next_attempt_at) VALUES('ntf_gone','ag-20260825-120000-0123456789','sess','pending',0)",
     ] {
         connection.execute(sql, []).unwrap();
@@ -1293,7 +1298,7 @@ async fn legacy_possibly_sent_claude_retry_body(home: &Path) {
     let connection = Connection::open(home.join("state.db")).unwrap();
     for sql in [
         "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) VALUES('sess','claude_uds','session-1',1.0,1.0)",
-        "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary','/tmp','{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',1.0,1.0,'fixture','ag-20260825-120000-0123456789')",
+        "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary','/tmp','{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',1.0,'fixture','ag-20260825-120000-0123456789')",
         "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,attempts,next_attempt_at) VALUES('ntf_a_legacy_unconfirmed','ag-20260825-120000-0123456789','sess','retry_wait',1,0)",
         "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,attempts,next_attempt_at) VALUES('ntf_b_legacy_ambiguous','ag-20260825-120000-0123456789','sess','retry_wait',2,0)",
         "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,attempts,lease_owner,lease_until) VALUES('ntf_a2_crash_no_evidence','ag-20260825-120000-0123456789','sess','sending',1,'dead-dispatcher',1.0)",
@@ -1377,7 +1382,7 @@ async fn claude_uds_hold_receipt_body(home: &Path) {
         .unwrap();
     connection
         .execute(
-            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary',?1,'{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',?2,1.0,'fixture','ag-20260825-120000-0123456789')",
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary',?1,'{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',?2,'fixture','ag-20260825-120000-0123456789')",
             params![home.to_string_lossy(), now()],
         )
         .unwrap();
@@ -2617,7 +2622,7 @@ async fn running_unbound_delivery_never_expires() {
     let home = common::Home::new();
     let connection = Connection::open(home.path.join("state.db")).unwrap();
     let agent = "ag-20260825-120000-0123456789";
-    connection.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", params![agent,"mock","fixture","review","task","summary",home.path.to_string_lossy(),"{}","running",now()-7200.0,1.0,"fixture",agent]).unwrap();
+    connection.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", params![agent,"mock","fixture","review","task","summary",home.path.to_string_lossy(),"{}","running",now()-7200.0,"fixture",agent]).unwrap();
     connection
         .execute(
             "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?,?,?,?)",
@@ -2645,7 +2650,7 @@ async fn recent_unbound_terminal_delivery_waits_for_binding() {
     let home = common::Home::new();
     let connection = Connection::open(home.path.join("state.db")).unwrap();
     let agent = "ag-20260825-120000-0123456789";
-    connection.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", params![agent,"mock","fixture","review","task","summary",home.path.to_string_lossy(),"{}","succeeded",now()-3599.0,1.0,"fixture",agent]).unwrap();
+    connection.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", params![agent,"mock","fixture","review","task","summary",home.path.to_string_lossy(),"{}","succeeded",now()-3599.0,"fixture",agent]).unwrap();
     connection
         .execute(
             "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?,?,?,?)",

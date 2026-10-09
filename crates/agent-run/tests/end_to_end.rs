@@ -184,7 +184,7 @@ async fn worker_mcp_queues_a_report_without_ending_the_run() {
         "start",
         json!({
             "provider":"mock","model":"fixture","profile":"review",
-            "task":"fixture:worker-notify","workdir":h.home,"timeout_seconds":20,
+            "task":"fixture:worker-notify","workdir":h.home,
             "orchestrator":{"transport":"codex_queue","external_session_id":"fixture-worker-thread"}
         }),
     )
@@ -513,7 +513,7 @@ async fn scripted_pool_completes_with_one_correlated_common_notice() {
     let member = |role: &str, task: &str| {
         json!({"role": role, "start": {
             "provider":"mock","model":"fixture","profile":"review","task":task,
-            "workdir":h.home,"timeout_seconds":40}})
+            "workdir":h.home}})
     };
     let pool_start = json!({
         "request_id": "scripted-pool", "goal": "ship the fixture result",

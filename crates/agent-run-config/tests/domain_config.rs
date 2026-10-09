@@ -52,7 +52,6 @@ fn transition_matrix_matches_contract() {
         (Status::Starting, Status::Lost),
         (Status::Running, Status::Succeeded),
         (Status::Running, Status::Failed),
-        (Status::Running, Status::TimedOut),
         (Status::Running, Status::Cancelling),
         (Status::Running, Status::Lost),
         (Status::Cancelling, Status::Cancelled),
@@ -85,12 +84,12 @@ fn request_scalars_are_not_coerced() {
     }
 }
 #[test]
-fn request_rejects_bad_timeout_and_duplicate_roots() {
+fn request_rejects_retired_lifetime_and_duplicate_roots() {
     let h = common::Home::new();
-    for timeout in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-        let mut r = h.request();
-        r.timeout_seconds = Some(timeout);
-        assert!(r.validate().is_err());
+    for value in [json!(60), json!(0), json!(null)] {
+        let mut raw = serde_json::to_value(h.request()).unwrap();
+        raw["timeout_seconds"] = value;
+        assert!(serde_json::from_value::<agent_run_domain::domain::StartRequest>(raw).is_err());
     }
     let mut r = h.request();
     r.read_roots = vec![h.path.clone(), h.path.clone()];

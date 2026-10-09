@@ -337,8 +337,7 @@ async fn mcp_request(home: &Path, protocol: &str, method: &str, params: Value) -
 async fn mixed_pool_attaches_active_worker_over_live_mcp_without_restart() {
     let broker = Broker::start();
     let client = BrokerClient::new(broker.home.join("api.sock"));
-    let mut request = broker.request("fixture:pool-enroll", "independent-join");
-    request.timeout_seconds = Some(30.0);
+    let request = broker.request("fixture:pool-enroll", "independent-join");
     let started = client.start(&request).await.unwrap();
     let agent: agent_run_domain::domain::AgentId = started.agent_id.parse().unwrap();
     let until = Instant::now() + Duration::from_secs(10);
@@ -358,7 +357,7 @@ async fn mixed_pool_attaches_active_worker_over_live_mcp_without_restart() {
         .unwrap()
         .get(&agent)
         .unwrap();
-    let response=mcp_tool(&broker.home,"start_pool",json!({"request_id":"live-mixed","goal":"Verify mixed pool enrollment","acceptance":[{"id":"goal","text":"Existing work remains intact"}],"members":[{"existing_agent_id":agent,"role":"review"},{"start":{"provider":"glm-user","model":"fixture","profile":"review","task":"fixture:pool-observe","workdir":broker.home,"timeout_seconds":30.0,"display_name":"new helper"},"role":"helper"}]})).await;
+    let response=mcp_tool(&broker.home,"start_pool",json!({"request_id":"live-mixed","goal":"Verify mixed pool enrollment","acceptance":[{"id":"goal","text":"Existing work remains intact"}],"members":[{"existing_agent_id":agent,"role":"review"},{"start":{"provider":"glm-user","model":"fixture","profile":"review","task":"fixture:pool-observe","workdir":broker.home,"display_name":"new helper"},"role":"helper"}]})).await;
     assert_ne!(response["result"]["isError"], true, "{response}");
     assert!(response.get("error").is_none(), "{response}");
     let until = Instant::now() + Duration::from_secs(10);
@@ -889,7 +888,6 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
     let broker = Broker::start();
     let client = BrokerClient::new(broker.home.join("api.sock"));
     let mut request = broker.request("fixture:answer", "stable-start");
-    request.timeout_seconds = Some(10.0);
     request.display_name = Some("  Мария / review  ".into());
     let started = client
         .call("start", Some(serde_json::to_value(request).unwrap()))
@@ -917,7 +915,7 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
     );
     for number in 1..=2 {
         let mut arguments = json!({
-            "agent_id":agent, "task":"fixture:answer", "timeout_seconds":10.0,
+            "agent_id":agent, "task":"fixture:answer",
             "request_id":format!("stable-resume-{number}")
         });
         if number == 2 {
@@ -999,7 +997,7 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
         .call(
             "resume",
             Some(json!({
-                "agent_id":agent,"task":"fixture:answer","timeout_seconds":10.0,
+                "agent_id":agent,"task":"fixture:answer",
                 "request_id":"stable-resume-1"
             })),
         )
@@ -1013,7 +1011,7 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
         .call(
             "resume",
             Some(json!({
-                "agent_id":agent,"task":"different intent","timeout_seconds":10.0,
+                "agent_id":agent,"task":"different intent",
                 "request_id":"stable-resume-1"
             })),
         )
@@ -1023,7 +1021,7 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
         .call(
             "resume",
             Some(json!({
-                "agent_id":agent, "task":"fixture:answer", "timeout_seconds":10.0,
+                "agent_id":agent, "task":"fixture:answer",
                 "request_id":"stable-resume-1", "display_name":"changed"
             })),
         )
@@ -1048,8 +1046,8 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
 
     // A bounded hanging fixture keeps the winner active until explicitly cancelled.
     let other = BrokerClient::new(broker.home.join("api.sock"));
-    let first = json!({"agent_id":agent,"task":"fixture:hang","timeout_seconds":10.0,"request_id":"stable-race-a"});
-    let second = json!({"agent_id":agent,"task":"fixture:hang","timeout_seconds":10.0,"request_id":"stable-race-b"});
+    let first = json!({"agent_id":agent,"task":"fixture:hang","request_id":"stable-race-a"});
+    let second = json!({"agent_id":agent,"task":"fixture:hang","request_id":"stable-race-b"});
     let (left, right) = tokio::join!(
         client.call("resume", Some(first)),
         other.call("resume", Some(second))

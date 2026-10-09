@@ -9,7 +9,7 @@ and `sequence` for that lineage.
 
 ```sh
 agent-run resume <agent-id> --task "Address these review findings" --request-id review-2
-agent-run resume <agent-id> --task-file review.txt --timeout 900
+agent-run resume <agent-id> --task-file review.txt
 ```
 
 `--task` and `--task-file` are mutually exclusive. A task file is UTF-8 and its
@@ -18,7 +18,7 @@ the resident broker, so closing the CLI cannot orphan a preparation worker.
 The usual `--session-transport`, `--session-id` and `--session-turn-id` options
 bind the **new** run's notification to its caller.
 
-MCP and the socket API expose `resume(agent_id, task, timeout_seconds?,
+MCP and the socket API expose `resume(agent_id, task,
 request_id?, orchestrator?)`, returning the same stable `agent_id`. The broker
 continues the latest terminal execution. Old execution identifiers remain
 accepted as aliases; internal rows are never renumbered. `answer` reads the
@@ -27,12 +27,10 @@ latest result, `transcript` spans retained conversation history, and
 
 The original provider, harness, model, reasoning effort, generated home, working
 directory, write/network/read-root grants, output schema and fast setting are
-inherited. The task changes; timeout and caller binding may be overridden.
-Omitted `timeout_seconds` and `orchestrator` inherit the previous request's
-values; an inherited timeout keeps the previous run's already-effective
-allowance (`core.timeout_multiplier` is never applied twice), while a newly
-requested timeout is scaled once by the current multiplier. The new run has its own deadline from admission, and preparation and
-all its attempts share that budget. Missing identity or incompatible current
+inherited. The task and caller binding may change. Executions have no wall-clock limit,
+expiry margin or inherited allowance. Repeated native continuations are not
+limited by a time budget or an independent resume-count cap. Omitting
+`orchestrator` keeps the previous binding. Missing identity or incompatible current
 permissions fail explicitly, including a changed profile.
 
 Account selection intent is inherited too. An explicit account remains pinned.
@@ -43,7 +41,7 @@ must retain the same account because its native history is account-specific.
 The selected predecessor must be terminal and have no child. The database
 permits one child per predecessor, so concurrent requests cannot branch the
 conversation. A matching `request_id` returns the accepted run even if its
-directory or current configuration has since changed; a different parent, task, timeout or caller
+directory or current configuration has since changed; a different parent, task or caller
 with that key is a conflict. A failed preparation remains a separate record;
 it can be resumed only if that run has its own recorded `runtime_session_id`
 and passes the normal history and cleanup checks. An inherited
@@ -86,3 +84,38 @@ broker before upgrading, retain the automatic pre-migration backup, and restart
 compatible clients afterward.
 Older clients refuse a newer database; never point an older binary at it as a
 rollback. Restore a verified backup with the matching release instead.
+
+## Unlimited execution migration (0.24.0 / schema 28)
+
+Start and resume no longer accept `--timeout` or `timeout_seconds`. A removed
+parameter is a typed validation failure; omitting it creates an execution with
+no lifetime clock. Operational observer, transport, collector, service and
+cleanup bounds remain in force. Historical `timed_out` outcomes stay readable,
+but current active transitions cannot create that status.
+
+For an existing schema-2 home, prepare a reviewed target configuration that
+removes `core.default_timeout_seconds`, `core.timeout_multiplier`,
+`core.warning_fraction` and `core.stalled_after_seconds`. Keep
+`core.max_active_agents`, provider/account references, all role grants and every
+unrelated setting. Stop admission and wait for all executions and ownership to
+finish before stopping services; never cancel unrelated work to upgrade.
+
+Use the candidate's existing paired migration procedure:
+
+```sh
+agent-run --home HOME config migrate --target-config TARGET --dry-run
+agent-run --home HOME config migrate --target-config TARGET --apply --from-release OLD_RELEASE
+```
+
+`OLD_RELEASE` must be the verified sealed release matching the source database.
+The procedure preserves the source config/database pair in its immutable
+snapshot and refuses live writers. Schema 28 retires live clock columns while
+preserving their numeric policy in historical events; original request,
+identity, transcript and answer bytes remain unchanged. Frozen provider digests
+are checked before the in-memory compatibility projection. One-child,
+native-history, account, authority and process-cleanup checks still gate resume.
+
+Rollback uses `config rollback --snapshot SNAPSHOT` under the same quiescence
+and divergence protections, then restores the matching old executable. An older
+binary must never open the upgraded database. Tests cover both source schemas
+26 and 27, exact application values and original configuration bytes on rollback.

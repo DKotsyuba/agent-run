@@ -30,7 +30,6 @@ CREATE TABLE agents (
   created_at REAL NOT NULL,
   started_at REAL,
   finished_at REAL,
-  timeout_seconds REAL NOT NULL,
   supervisor_pid INTEGER,
   supervisor_identity TEXT,
   process_group_id INTEGER,
@@ -40,8 +39,6 @@ CREATE TABLE agents (
   exit_code INTEGER,
   failure_kind TEXT,
   failure_text TEXT,
-  warned INTEGER NOT NULL DEFAULT 0 CHECK (warned IN (0, 1)),
-  silent_seconds REAL,
   answer_path TEXT,
   answer_bytes INTEGER,
   answer_sha256 TEXT,
@@ -589,14 +586,13 @@ CREATE INDEX idx_incident_ledger_time ON incident_ledger(occurred_at, execution_
 CREATE TRIGGER incident_ledger_immutable BEFORE UPDATE ON incident_ledger
 BEGIN SELECT RAISE(ABORT,'incident ledger observations are immutable'); END;
 
-PRAGMA user_version = 27;
+PRAGMA user_version = 28;
 
 CREATE TABLE pool_enrollments (
   agent_id TEXT PRIMARY KEY REFERENCES pool_members(agent_id) ON DELETE CASCADE,
   run_id TEXT NOT NULL REFERENCES agents(id),
   attempt_id TEXT NOT NULL REFERENCES attempts(id),
   challenge TEXT NOT NULL UNIQUE CHECK(length(challenge) BETWEEN 1 AND 128),
-  deadline REAL NOT NULL,
   state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','joined','needs_action')),
   created_at REAL NOT NULL,
   ack_seq INTEGER REFERENCES pool_entries(seq),
@@ -606,11 +602,11 @@ CREATE TABLE pool_enrollments (
   attention_issued INTEGER NOT NULL DEFAULT 0 CHECK(attention_issued IN (0,1)),
   CHECK (state<>'joined' OR (ack_seq IS NOT NULL AND ack_at IS NOT NULL))
 );
-CREATE INDEX idx_pool_enrollments_pending ON pool_enrollments(state,deadline);
+CREATE INDEX idx_pool_enrollments_pending ON pool_enrollments(state);
 CREATE TRIGGER pool_enrollment_identity_immutable BEFORE UPDATE ON pool_enrollments
 WHEN NEW.agent_id IS NOT OLD.agent_id OR NEW.run_id IS NOT OLD.run_id
   OR NEW.attempt_id IS NOT OLD.attempt_id OR NEW.challenge IS NOT OLD.challenge
-  OR NEW.deadline IS NOT OLD.deadline OR NEW.created_at IS NOT OLD.created_at
+  OR NEW.created_at IS NOT OLD.created_at
   OR (OLD.state='joined' AND NEW.state<>'joined')
   OR (OLD.attention_issued=1 AND NEW.attention_issued<>1)
 BEGIN SELECT RAISE(ABORT,'pool enrollment identity is immutable'); END;

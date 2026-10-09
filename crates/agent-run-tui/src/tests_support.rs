@@ -27,7 +27,6 @@ pub fn agent_view(stable_id: &str, run_id: &str, status: &str) -> AgentView {
         "elapsed_seconds": 42.0,
         "last_progress_at": None::<f64>,
         "silence_seconds": Some(3.0),
-        "warned": false,
         "failure_kind": None::<String>,
         "failure_text": None::<String>,
         "answer_available": false,

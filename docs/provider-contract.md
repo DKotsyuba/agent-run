@@ -144,7 +144,7 @@ public CLI/MCP/JSON-RPC quota-candidate endpoint.
 The public `start` tool (CLI `agent-run start`, broker socket, MCP) takes a
 `ProviderStartRequest`: required `provider`, `model`, `profile`, `task`,
 `workdir`, plus optional `account` (a provider-local label pin), `effort`,
-`write`, `read_roots`, `timeout_seconds`, `request_id`, `orchestrator` and
+`write`, `read_roots`, `request_id`, `orchestrator` and
 `required_constraints`. When the offering configures
 `allowed_params.effort`, a chosen `effort` outside that list is a
 `ValidationError`. `params.effort` supplies the effective value when the caller
@@ -175,9 +175,8 @@ the latest terminal execution. Storage still records a physical child:
 
 - The child keeps the parent's provider, harness, explicit model, workdir,
   role grants, sealed assets, frozen configuration, runtime home and native
-  session id. Only the task text, timeout, orchestrator and the per-attempt
-  account lease change. Omitted timeout and orchestrator inherit the previous
-  request's values.
+  session id. Only the task text, orchestrator and the per-attempt
+  account lease change. An omitted orchestrator inherits the previous binding.
 - A repeated `request_id` returns the original child and account before any
   configuration or quota read; one parent admits at most one child, and a
   different request id for the same parent is refused.
@@ -527,25 +526,15 @@ tries to continue the same logical run on another account:
   for that run without inventing a shared pool. Ranking consumes the stored
   per-window model membership.
 
-### One run deadline, handoff serialization and recovery
+### Unlimited executions, handoff serialization and recovery
 
-- A provider run has one deadline: its admission time (`created_at`) plus
-  its stored `timeout_seconds`, re-read before every spawn. A requested or
-  resume-override timeout, and `core.default_timeout_seconds`, must be
-  positive, finite and at most 2592000 seconds (30 days); anything else is
-  refused before a row is written. `core.timeout_multiplier` (finite, at
-  least 1.0, default 1.2) is applied exactly once to that base — the explicit
-  request or the default when omitted — before the effective timeout is
-  persisted, and the product must itself stay within the 2592000-second
-  ceiling. An explicit 1.0 disables the margin. A resume's newly requested
-  timeout is scaled once; an inherited timeout reuses the parent's
-  already-effective allowance, so the margin never compounds
-  (600 -> 720 -> 720, never 864). Configuration changes reach new admissions
-  only: an admitted row, a running agent and a frozen snapshot keep the
-  allowance they were admitted with. Each attempt runs
-  only for the remainder; on expiry the runner is dropped, the process group
-  cleaned, and the run ends `timed_out` once. An expired run allocates or
-  spawns no further attempt; a pending cancel wins over expiry.
+- A provider run has no execution lifetime, deadline or margin. Its preparation
+  and quota-driven account switches share one durable identity without a time
+  budget. Repeated native continuations remain available after each terminal
+  execution, subject to the unchanged native-history, authority and cleanup
+  checks. Explicit cancellation prevents subsequent spawn. Schema 28 preserves
+  retired policy in historical events while removing all live clock columns;
+  original request, identity and transcript bytes remain unchanged.
 - The spawn claim refuses in the same statement while a cancel is pending or
   claimed. A switched attempt re-checks at that boundary that its account is
   still enabled, still bound to the provider for the model, and the current

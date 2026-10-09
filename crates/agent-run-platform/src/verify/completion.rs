@@ -40,14 +40,12 @@ pub const GROUP_SURVIVED: &str = "engine_group_survived";
 /// `verify_completion` default (`verify.py:569`); no caller overrides it.
 pub const DEFAULT_SILENCE_THRESHOLD_SECONDS: f64 = 60.0;
 
-/// Why supervision stopped waiting for the engine. Python represents this as
-/// a `stop_reason: str | None` validated against two literals
-/// (`verify.py:578-579`); the string-facing wrapper below preserves the
-/// validation error for callers crossing the transport boundary.
+/// Explicit owner cancellation, the only reason to stop a live execution.
+/// No execution lifetime or silence threshold signals the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
+    /// Cancellation requested through an authenticated control.
     Cancel,
-    Timeout,
 }
 
 /// What is on disk for an agent's answer, and whether it terminated.
@@ -235,7 +233,7 @@ fn silence_note(last_progress_at: Option<f64>, now: f64, threshold: f64) -> Resu
 
 /// Decide the terminal outcome from process facts plus answer evidence.
 ///
-/// Mirrors `verify_completion` (`verify.py:561-637`) branch-for-branch. The
+/// Retains the historical answer and process proof requirements. The
 /// engine's own exit status is never trusted on its own: a success without a
 /// complete answer is a failure, and no terminal state is issued while the
 /// engine process group is still alive.
@@ -267,7 +265,6 @@ pub fn verify_completion(
     if let Some(reason) = stop_reason {
         let status = match reason {
             StopReason::Cancel => Status::Cancelled,
-            StopReason::Timeout => Status::TimedOut,
         };
         return Ok(Outcome {
             status,
@@ -301,9 +298,9 @@ pub fn verify_completion(
     Ok(outcome)
 }
 
-/// Validates Python's string stop-reason boundary before applying completion policy.
+/// Validates the string cancellation boundary before applying completion policy.
 ///
-/// `stop_reason` accepts only `None`, `"cancel"`, or `"timeout"`; unknown
+/// `stop_reason` accepts only `None` or `"cancel"`; other
 /// strings are rejected before process or answer facts are evaluated. The
 /// remaining arguments and returned terminal outcome have the same semantics
 /// as [`verify_completion`].
@@ -319,8 +316,7 @@ pub fn verify_completion_with_stop_reason(
     let parsed = match stop_reason {
         None => None,
         Some("cancel") => Some(StopReason::Cancel),
-        Some("timeout") => Some(StopReason::Timeout),
-        Some(_) => return Err(invalid("stop_reason must be cancel, timeout, or None")),
+        Some(_) => return Err(invalid("stop_reason must be cancel or None")),
     };
     verify_completion(
         session_outcome,

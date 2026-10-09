@@ -308,67 +308,74 @@ fn application_rows(home: &Path) -> Vec<(String, Vec<Vec<String>>)> {
         .collect()
 }
 
-/// The accepted schema-26/v2 pair upgrades explicitly to 27 with unchanged
-/// configuration/account/history bytes and a recoverable snapshot. Journal-aware
-/// rollback restores the exact old pair before any old binary could reopen it.
+/// Both supported source pairs upgrade through the explicit publication lease.
+/// Schema-27's retired live policy is removed only in the reviewed target config;
+/// exact source config, historical bytes and every table value survive rollback.
 #[test]
-fn v2_schema_26_to_27_preserves_the_pair_and_rolls_back() {
-    let home = Home::v2();
-    fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/baseline/db/current-v26.sqlite"),
-        home.root.join("state.db"),
-    )
-    .unwrap();
-    let conn = rusqlite::Connection::open(home.root.join("state.db")).unwrap();
-    conn.execute_batch("UPDATE agents SET status='succeeded'; INSERT INTO provider_accounts(account_id,auth_family,secret_ref,status,created_at,updated_at) VALUES ('acct-existing','anthropic','env:EXISTING_KEY','enabled',0,0);")
+fn v2_schema_26_and_27_upgrade_to_unlimited_and_roll_back() {
+    for source in [26_u32, 27_u32] {
+        let home = Home::v2();
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+                "../../tests/fixtures/baseline/db/current-v{source}.sqlite"
+            )),
+            home.root.join("state.db"),
+        )
         .unwrap();
-    drop(conn);
-    let original = fs::read_to_string(home.root.join("target.toml")).unwrap();
-    fs::write(home.root.join("config.toml"), &original).unwrap();
-    seal(&home.root.join("old-release"), 26);
-    let before = application_rows(&home.root);
-    let before_history = history(&home.root);
-    let target = home.path("target.toml");
-    let old = home.path("old-release");
-    let (ok, result) = run(
-        &home.root,
-        &[
-            "config",
-            "migrate",
-            "--target-config",
-            &target,
-            "--apply",
-            "--from-release",
-            &old,
-        ],
-        false,
-    );
-    assert!(ok, "{result}");
-    assert_eq!(version(&home.root), 27);
-    assert_eq!(history(&home.root), before_history);
-    assert_eq!(
-        fs::read_to_string(home.root.join("config.toml")).unwrap(),
-        original
-    );
-    let snapshot = result["snapshot"].as_str().unwrap();
-    let (ok, result) = run(
-        &home.root,
-        &["config", "rollback", "--snapshot", snapshot],
-        false,
-    );
-    assert!(ok, "{result}");
-    assert_eq!(version(&home.root), 26);
-    assert_eq!(
-        application_rows(&home.root),
-        before,
-        "every application-table value survives rollback"
-    );
-    assert_eq!(history(&home.root), before_history);
-    assert_eq!(
-        fs::read_to_string(home.root.join("config.toml")).unwrap(),
-        original
-    );
+        let conn = rusqlite::Connection::open(home.root.join("state.db")).unwrap();
+        conn.execute_batch("UPDATE agents SET status='succeeded'; INSERT INTO provider_accounts(account_id,auth_family,secret_ref,status,created_at,updated_at) VALUES ('acct-existing','anthropic','env:EXISTING_KEY','enabled',0,0);").unwrap();
+        drop(conn);
+        let target_bytes = fs::read_to_string(home.root.join("target.toml")).unwrap();
+        let original = if source == 27 {
+            format!(
+                "{target_bytes}\n[core]\nmax_active_agents=6\ndefault_timeout_seconds=480\ntimeout_multiplier=1.2\nwarning_fraction=0.9\nstalled_after_seconds=900\n"
+            )
+        } else {
+            target_bytes.clone()
+        };
+        fs::write(home.root.join("config.toml"), &original).unwrap();
+        seal(&home.root.join("old-release"), source);
+        let before = application_rows(&home.root);
+        let before_history = history(&home.root);
+        let (ok, result) = run(
+            &home.root,
+            &[
+                "config",
+                "migrate",
+                "--target-config",
+                &home.path("target.toml"),
+                "--apply",
+                "--from-release",
+                &home.path("old-release"),
+            ],
+            false,
+        );
+        assert!(ok, "source {source}: {result}");
+        assert_eq!(version(&home.root), agent_run_store::VERSION as u32);
+        assert_eq!(history(&home.root), before_history);
+        assert_eq!(
+            fs::read_to_string(home.root.join("config.toml")).unwrap(),
+            target_bytes
+        );
+        let snapshot = result["snapshot"].as_str().unwrap();
+        let (ok, result) = run(
+            &home.root,
+            &["config", "rollback", "--snapshot", snapshot],
+            false,
+        );
+        assert!(ok, "source {source}: {result}");
+        assert_eq!(version(&home.root), source);
+        assert_eq!(
+            application_rows(&home.root),
+            before,
+            "every application-table value survives rollback"
+        );
+        assert_eq!(history(&home.root), before_history);
+        assert_eq!(
+            fs::read_to_string(home.root.join("config.toml")).unwrap(),
+            original
+        );
+    }
 }
 
 /// Missing account references and a live service-manager lock refuse before changing the source pair.

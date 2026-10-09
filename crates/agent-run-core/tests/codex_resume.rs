@@ -111,7 +111,7 @@ async fn python_test_python_created_codex_run_is_explicitly_refused() {
         Err(Error::Unsupported(_))
     ));
     let error = Service::new(home.path.clone())
-        .resume(&id, "continue".into(), None, None, None, None)
+        .resume(&id, "continue".into(), None, None, None)
         .await
         .unwrap_err();
     assert!(matches!(error, Error::Unsupported(message) if message.contains("Python-created")));
@@ -133,7 +133,7 @@ async fn python_test_resume_without_native_session_is_refused() {
         .unwrap();
 
     let error = Service::new(home.path.clone())
-        .resume(&id, "continue".into(), None, None, None, None)
+        .resume(&id, "continue".into(), None, None, None)
         .await
         .unwrap_err();
     assert!(matches!(error, Error::Validation(message) if message.contains("native session ID")));
@@ -191,19 +191,20 @@ fn python_test_resume_explicit_account_ignores_changed_default() {
     );
 }
 
-/// Mirrors `tests/test_resume.py::ResumeTests::test_explicit_timeout_overrides_and_omitted_one_inherits`.
+/// Continuations have no inherited lifetime policy or deadline parameters.
 #[test]
-fn python_test_resume_timeout_override_and_inheritance_are_durable() {
+fn resume_does_not_inherit_execution_lifetime() {
     let home = common::Home::new();
-    let mut initial = home.request();
-    initial.timeout_seconds = Some(7.5);
+    let initial = home.request();
     let id = parent(&home, initial.clone(), "session");
     let (child_id, _) = child(&home, &id, "continue");
     let child_row = home.store().get(&child_id).unwrap();
-    assert_eq!(child_row.request.timeout_seconds, None);
-    let mut overridden = request(&home, "continue");
-    overridden.timeout_seconds = Some(9.0);
-    assert_eq!(overridden.timeout_seconds, Some(9.0));
+    assert!(
+        serde_json::to_value(child_row.request)
+            .unwrap()
+            .get("timeout_seconds")
+            .is_none()
+    );
 }
 
 /// Mirrors `tests/test_resume.py::ResumeTests::test_failed_child_stays_latest_and_lends_its_source_session`.
@@ -502,10 +503,10 @@ fn finish_with_session(home: &common::Home, id: &agent_run_domain::domain::Agent
         .unwrap();
 }
 
-/// A frozen raw timeout intent replays without current config or live paths;
-/// changing the timeout remains a conflict.
+/// A frozen continuation intent replays without current config or live paths;
+/// changing its task remains a conflict.
 #[tokio::test]
-async fn stability_resume_replays_raw_timeout_without_current_policy() {
+async fn stability_resume_replays_without_current_policy() {
     let home = common::Home::new();
     let mut initial = home.request();
     let workspace = home.path.join("workspace");
@@ -516,14 +517,9 @@ async fn stability_resume_replays_raw_timeout_without_current_policy() {
     let mut raw = parent_row.request.clone();
     raw.task = "continue".into();
     raw.request_id = Some("retry-margin".into());
-    raw.timeout_seconds = Some(120.0);
     raw.validate_intent().unwrap();
-    let hash = agent_run_domain::canonical::sha256_hex(
-        &json!({"request":raw,"explicit_timeout":Some(120.0)}),
-        true,
-    );
-    let mut effective = raw.clone();
-    effective.timeout_seconds = Some(144.0);
+    let hash = agent_run_domain::canonical::sha256_hex(&json!({"request":raw}), true);
+    let effective = raw.clone();
     let (child, _) = home
         .store()
         .admit(
@@ -540,7 +536,6 @@ async fn stability_resume_replays_raw_timeout_without_current_policy() {
         .resume(
             &root,
             "continue".into(),
-            Some(120.0),
             Some("retry-margin".into()),
             None,
             None,
@@ -549,12 +544,69 @@ async fn stability_resume_replays_raw_timeout_without_current_policy() {
         .unwrap();
     assert_eq!(retry["created"], false);
     assert_eq!(retry["agent_id"], json!(child));
+    let mut old_raw = serde_json::to_value(&raw).unwrap();
+    old_raw["timeout_seconds"] = json!(120.0);
+    let old_hash = agent_run_domain::canonical::sha256_hex(
+        &json!({"request":old_raw,"explicit_timeout":120.0}),
+        true,
+    );
+    let store = home.store();
+    let mut historical_request = serde_json::to_value(&effective).unwrap();
+    historical_request["timeout_seconds"] = json!(144.0);
+    let frozen_request = historical_request.to_string();
+    let frozen_identity = json!({"replay_request_sha256":old_hash}).to_string();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET request_json=?,identity_json=? WHERE id=?",
+            (&frozen_request, &frozen_identity, child.as_str()),
+        )
+        .unwrap();
     assert!(matches!(
         service
             .resume(
                 &root,
                 "continue".into(),
-                Some(121.0),
+                Some("retry-margin".into()),
+                None,
+                None
+            )
+            .await,
+        Err(Error::Conflict)
+    ));
+    store
+        .event(
+            &child,
+            "historical_execution_policy",
+            &json!({"version":1,"timeout_seconds":144.0}),
+        )
+        .unwrap();
+    let historical = service
+        .resume(
+            &root,
+            "continue".into(),
+            Some("retry-margin".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(historical["agent_id"], json!(child));
+    assert_eq!(historical["created"], false);
+    let after: (String, String) = store
+        .conn
+        .query_row(
+            "SELECT request_json,identity_json FROM agents WHERE id=?",
+            [child.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(after, (frozen_request, frozen_identity));
+    assert!(matches!(
+        service
+            .resume(
+                &root,
+                "changed task".into(),
                 Some("retry-margin".into()),
                 None,
                 None
@@ -613,7 +665,6 @@ async fn old_parent_resume_retry_replays_through_later_continuations() {
             .resume(
                 &root,
                 "continue".into(),
-                None,
                 Some("retry-1".into()),
                 None,
                 orchestrator,
@@ -633,7 +684,6 @@ async fn old_parent_resume_retry_replays_through_later_continuations() {
                 .resume(
                     &root,
                     task.into(),
-                    None,
                     Some("retry-1".into()),
                     None,
                     orchestrator,
