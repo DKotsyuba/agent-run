@@ -26,6 +26,9 @@ std::thread_local! {
     /// One synchronous SQLite busy sequence on this supervisor thread. A zero
     /// callback count starts a new sequence; no transaction crosses an await.
     static JOURNAL_BUSY_STARTED: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    /// Per-statement ownership deadline on this synchronous thread; absent for
+    /// ordinary journal writes and cleared before returning from a checkpoint.
+    static OWNERSHIP_BUSY_UNTIL: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
 }
 
 /// Uses short two-millisecond busy sleeps for a supervisor's hot native journal.
@@ -34,20 +37,26 @@ std::thread_local! {
 /// then refuses with the original SQLite error; never retries permanent errors.
 /// Short sleeps let final writes compete with dense frame writers instead of
 /// missing many free slots during SQLite's escalating hundred-millisecond sleeps.
+/// Ownership statements reuse this handler with their already-bounded absolute
+/// deadline, avoiding SQLite's coarse escalating sleeps under runner contention.
 /// The connection remains thread-affine; no state or transaction crosses await.
 fn journal_busy(prior_calls: i32) -> bool {
     JOURNAL_BUSY_STARTED.with(|started| {
         if prior_calls == 0 {
             started.set(Some(std::time::Instant::now()));
         }
-        if started
-            .get()
-            .is_none_or(|at| at.elapsed() >= agent_run_store::BUSY_TIMEOUT)
-        {
+        let deadline = OWNERSHIP_BUSY_UNTIL
+            .with(std::cell::Cell::get)
+            .or_else(|| started.get().map(|at| at + agent_run_store::BUSY_TIMEOUT));
+        let Some(deadline) = deadline else {
+            return false;
+        };
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
             return false;
         }
-        std::thread::sleep(Duration::from_millis(2));
-        true
+        std::thread::sleep(left.min(Duration::from_millis(2)));
+        std::time::Instant::now() < deadline
     })
 }
 
@@ -217,6 +226,7 @@ fn ownership_writer(
                 Error::ownership_checkpoint(agent_run_domain::OwnershipStage::Initial, error.into())
             })?,
     );
+    writer.conn.busy_handler(Some(journal_busy))?;
     let mut initial = true;
     Ok(
         move |snapshot: &agent_run_platform::process::OwnershipSnapshot| {
@@ -233,8 +243,12 @@ fn ownership_writer(
                         "ownership persistence operation allowance exhausted".into(),
                     ));
                 }
-                writer.conn.busy_timeout(left.min(lock_wait))?;
-                match writer.remember_processes("attempt", &attempt, snapshot) {
+                let statement_until = std::time::Instant::now() + left.min(lock_wait);
+                OWNERSHIP_BUSY_UNTIL
+                    .with(|deadline| deadline.set(Some(statement_until.min(until))));
+                let persisted = writer.remember_processes("attempt", &attempt, snapshot);
+                OWNERSHIP_BUSY_UNTIL.with(|deadline| deadline.set(None));
+                match persisted {
                     Ok(()) => {
                         initial = false;
                         return Ok(());
@@ -2097,6 +2111,21 @@ mod tests {
         lock.conn.execute_batch("ROLLBACK").unwrap();
         let mut missing = super::ownership_writer(home.path(), "missing-attempt".into()).unwrap();
         assert!(matches!(missing(&snapshot), Err(Error::Validation(_))));
+    }
+
+    /// An already-expired ownership statement stops immediately; clearing its
+    /// synchronous override restores the ordinary journal allowance on this thread.
+    #[test]
+    fn ownership_busy_deadline_does_not_leak_into_journal() {
+        super::OWNERSHIP_BUSY_UNTIL.with(|deadline| {
+            deadline.set(Some(
+                std::time::Instant::now() - std::time::Duration::from_millis(1),
+            ));
+        });
+        assert!(!super::journal_busy(0));
+        super::OWNERSHIP_BUSY_UNTIL.with(|deadline| deadline.set(None));
+        assert!(super::journal_busy(0));
+        super::JOURNAL_BUSY_STARTED.with(|started| started.set(None));
     }
 
     /// Initial required ownership may wait beyond one control tick before any
