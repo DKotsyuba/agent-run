@@ -2,8 +2,9 @@
 
 state.db tracks its schema in SQLite's `PRAGMA user_version`. Numbered
 `sql/migrations/NNN_slug.sql` deltas apply in order, each in a separate
-`BEGIN IMMEDIATE` transaction. Current schema 26 adds attempt-pinned pool
-enrollment and worker catalog proof. Historical independence is unknown:
+`BEGIN IMMEDIATE` transaction. Current schema 27 adds a bounded, content-free incident ledger independent of
+ordinary history retirement. Schema 26 added attempt-pinned pool enrollment
+and worker catalog proof. Historical independence is unknown:
 attaching an older root is refused, not assumed safe from missing pool history.
 
 ## Older stores refuse ordinary commands

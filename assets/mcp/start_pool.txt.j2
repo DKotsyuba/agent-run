@@ -5,6 +5,6 @@ agent-run start_pool accepted (asynchronous cooperative pool)
 - Notice binding: {{ "bound" if bound else "not bound; the one common pool notice waits until the pool is bound" }}
 Members:
 {% for member in members %}
-- {{ member.name }} ({{ member.role }}, {{ member.agent_id }}): {{ member.status }}{% if member.enrollment %}; existing enrollment {{ member.enrollment.state }}, original time remaining {{ member.enrollment.remaining_seconds }}s{% endif %}
+- {{ member.name }} ({{ member.role }}, {{ member.agent_id }}): {{ member.status }}{% if member.enrollment %}; existing enrollment {{ member.enrollment.state }}{% endif %}
 {% endfor %}
 Completion needs every member to vote ready on one proposal, end successfully and be cleaned up; that is a formal check, not proof the result is right. Use pool to read, pool_post to guide, pool_replace for a terminal member.

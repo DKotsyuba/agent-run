@@ -23,6 +23,13 @@ symlink in the home, without changing any native behavior:
   reads, extracts or rewrites auth material, config, account bindings,
   history, plugins, data, or any managed index.
 
+
+Optional packing/freezing is deferred to explicit offline `storage compact
+--apply`, under its existing startup locks and all-terminal ownership checks.
+Live completion retains private native caches and does not perform this work
+before notifying the owner or schedule it after terminal state. Nonblocking
+publication-lock skips and cooperative budgets do not preempt filesystem I/O.
+
 ## Layout and scope
 
 Objects live in one fixed namespace inside the caller-owned shared store,

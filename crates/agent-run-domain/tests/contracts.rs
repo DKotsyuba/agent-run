@@ -141,7 +141,6 @@ fn python_view_dtos_keep_field_order_and_nulls() {
         elapsed_seconds: 0.0,
         last_progress_at: None,
         silence_seconds: None,
-        warned: false,
         failure_kind: None,
         failure_text: None,
         answer_available: false,

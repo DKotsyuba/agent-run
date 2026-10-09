@@ -914,8 +914,8 @@ mod tests {
         let child = "ag-20260925-000000-0000000002";
         for id in [root, child] {
             store.conn.execute(
-                "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id) \
-                 VALUES(?1,'mock','fixture','review','task','task','/tmp','{}','succeeded',?2,1,'fixture',?3)",
+                "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) \
+                 VALUES(?1,'mock','fixture','review','task','task','/tmp','{}','succeeded',?2,'fixture',?3)",
                 params![id, now(), root],
             ).unwrap();
         }

@@ -23,9 +23,9 @@ fn retained(store: &agent_run_store::Store, id: &str, identity: &str) {
         .conn
         .execute(
             r#"INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,
-         status,created_at,timeout_seconds,config_revision,root_agent_id,identity_json)
+         status,created_at,config_revision,root_agent_id,identity_json)
          VALUES(?,'mock','fixture','review','task','task','/tmp','{"read_roots":[]}',
-         'running',1,100,'fixture',?,?)"#,
+         'running',1,'fixture',?,?)"#,
             params![id, id, identity],
         )
         .unwrap();
@@ -39,9 +39,9 @@ fn session_row(store: &agent_run_store::Store, id: &str, created: f64) {
         .conn
         .execute(
             r#"INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,
-         status,created_at,finished_at,timeout_seconds,config_revision,root_agent_id,identity_json)
+         status,created_at,finished_at,config_revision,root_agent_id,identity_json)
          VALUES(?,'mock','fixture','review','task','task','/tmp','{"read_roots":[]}',
-         'succeeded',?,?,100,'fixture',?,'{}')"#,
+         'succeeded',?,?,'fixture',?,'{}')"#,
             params![id, created, created + 1.0, id],
         )
         .unwrap();

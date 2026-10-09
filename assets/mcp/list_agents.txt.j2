@@ -17,8 +17,8 @@ agent-run agents: {{ returned }} of {{ total }} matching (offset {{ offset }})
 {% if agent.failure_kind %}
   failure: {{ agent.failure_kind }}{% if agent.failure_text %}: {{ agent.failure_text }}{% endif %}{{ "" }}
 {% endif %}
-{% if agent.warned or agent.ambiguous or agent.delivery_error %}
-  diagnostics: {% if agent.warned %}warned; {% endif %}{% if agent.ambiguous %}delivery ambiguous; {% endif %}{{ agent.delivery_error }}{{ "" }}
+{% if agent.ambiguous or agent.delivery_error %}
+  diagnostics: {% if agent.ambiguous %}delivery ambiguous; {% endif %}{{ agent.delivery_error }}{{ "" }}
 {% endif %}
 {% if agent.cleanup_unconfirmed %}
   cleanup unconfirmed{% if agent.process_state %} (process {{ agent.process_state }}){% endif %}{{ "" }}

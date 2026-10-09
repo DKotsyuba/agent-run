@@ -18,8 +18,6 @@ pub struct ExistingMember {
     pub run_id: AgentId,
     /// Exact owned attempt whose actual private catalog has been observed.
     pub attempt_id: String,
-    /// Original created-at plus timeout, never renewed by enrollment.
-    pub deadline: f64,
     /// Existing display name, or a safe seat-local fallback.
     pub name: Option<String>,
     /// Existing execution task copied into pool history without editing the agent.
@@ -47,9 +45,9 @@ pub fn same_binding(
 }
 
 /// Resolves a stable independent root to its supported exact live execution.
-/// Historical aliases, prior membership, expired/non-RUNNING/unowned attempts
+/// Historical aliases, prior membership, non-RUNNING/unowned attempts
 /// and unobserved catalogs fail closed; no state, reservation or binding changes.
-pub fn existing_member(conn: &Connection, root: &AgentId, at: f64) -> Result<ExistingMember> {
+pub fn existing_member(conn: &Connection, root: &AgentId) -> Result<ExistingMember> {
     let original = conn
         .query_row(
             "SELECT * FROM agents WHERE id=?",
@@ -86,14 +84,9 @@ pub fn existing_member(conn: &Connection, root: &AgentId, at: f64) -> Result<Exi
     let row = conn.query_row(
         "SELECT * FROM agents WHERE root_agent_id=? OR id=? ORDER BY sequence DESC,created_at DESC,id DESC LIMIT 1",
         params![root.as_str(),root.as_str()], Record::read)?;
-    let deadline: f64 = conn.query_row(
-        "SELECT created_at+timeout_seconds FROM agents WHERE id=?",
-        [row.id.as_str()],
-        |r| r.get(0),
-    )?;
-    if row.status != Status::Running || row.finished_at.is_some() || deadline <= at {
+    if row.status != Status::Running || row.finished_at.is_some() {
         return Err(invalid(
-            "existing pool member must be RUNNING within its original deadline",
+            "existing pool member must be RUNNING with an unfinished execution",
         ));
     }
     if agent_run_platform::process::observe(
@@ -139,7 +132,6 @@ pub fn existing_member(conn: &Connection, root: &AgentId, at: f64) -> Result<Exi
             row.identity,
             row.runtime_session_id,
             row.created_at,
-            deadline,
             account
         ]),
         true,
@@ -148,7 +140,6 @@ pub fn existing_member(conn: &Connection, root: &AgentId, at: f64) -> Result<Exi
         agent_id: root.clone(),
         run_id: row.id,
         attempt_id,
-        deadline,
         name: row.display_name,
         task: row.request.task,
         orchestrator,
@@ -159,17 +150,13 @@ pub fn existing_member(conn: &Connection, root: &AgentId, at: f64) -> Result<Exi
 /// Reads one seat's enrollment overlay. New-only seats are already joined.
 /// Public data never exposes run/attempt/token identities; the challenge is
 /// provided only in the recipient's private pool_read response and durable intro.
-pub fn view(conn: &Connection, root: &AgentId, at: f64) -> Result<Option<Value>> {
+pub fn view(conn: &Connection, root: &AgentId) -> Result<Option<Value>> {
     conn.query_row(
-        "SELECT state,deadline,failure_reason FROM pool_enrollments WHERE agent_id=?",
+        "SELECT state,failure_reason FROM pool_enrollments WHERE agent_id=?",
         [root.as_str()],
         |r| {
             let state: String = r.get(0)?;
-            let deadline: f64 = r.get(1)?;
-            Ok(
-                json!({"state":state,"deadline":deadline,"remaining_seconds":(deadline-at).max(0.0),
-                "reason":r.get::<_,Option<String>>(2)?}),
-            )
+            Ok(json!({"state":state,"reason":r.get::<_,Option<String>>(1)?}))
         },
     )
     .optional()
@@ -186,22 +173,21 @@ pub(crate) fn validate_ack_replay(
     key: &str,
     is_message: bool,
 ) -> Result<()> {
-    let issued: Option<(String, String, String, f64)> = conn
+    let issued: Option<(String, String, String)> = conn
         .query_row(
-            "SELECT agent_id,run_id,attempt_id,deadline FROM pool_enrollments WHERE challenge=?",
+            "SELECT agent_id,run_id,attempt_id FROM pool_enrollments WHERE challenge=?",
             [key],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    if let Some((member, pinned_run, pinned_attempt, deadline)) = issued
+    if let Some((member, pinned_run, pinned_attempt)) = issued
         && (!is_message
             || member != root.as_str()
             || pinned_run != run.as_str()
-            || pinned_attempt != attempt
-            || deadline <= now())
+            || pinned_attempt != attempt)
     {
         return Err(invalid(
-            "enrollment ACK key is pinned to a different or expired worker attempt",
+            "enrollment ACK key is pinned to a different worker attempt",
         ));
     }
     Ok(())
@@ -217,17 +203,21 @@ pub(crate) fn ack_allowed(
     attempt: &str,
     request: Option<&str>,
 ) -> Result<bool> {
-    let row: Option<(String,String,String,String,f64)> = conn.query_row(
-        "SELECT state,run_id,attempt_id,challenge,deadline FROM pool_enrollments WHERE agent_id=?",
-        [root.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
-    let Some((state, pinned_run, pinned_attempt, challenge, deadline)) = row else {
+    let row: Option<(String, String, String, String)> = conn
+        .query_row(
+            "SELECT state,run_id,attempt_id,challenge FROM pool_enrollments WHERE agent_id=?",
+            [root.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((state, pinned_run, pinned_attempt, challenge)) = row else {
         return Ok(false);
     };
     if state == "joined" {
         return Ok(false);
     }
-    if pinned_run != run.as_str() || pinned_attempt != attempt || deadline <= now() {
-        return Err(invalid("pool enrollment attempt ended, changed or expired"));
+    if pinned_run != run.as_str() || pinned_attempt != attempt {
+        return Err(invalid("pool enrollment attempt ended or changed"));
     }
     if request != Some(challenge.as_str()) {
         return Err(invalid(
@@ -256,12 +246,7 @@ fn failure_reason(
     root: &str,
     run: &str,
     attempt: &str,
-    deadline: f64,
-    at: f64,
 ) -> Result<Option<&'static str>> {
-    if deadline <= at {
-        return Ok(Some("deadline_expired"));
-    }
     let state: Option<String> = conn
         .query_row("SELECT status FROM agents WHERE id=?", [run], |r| r.get(0))
         .optional()?;
@@ -285,31 +270,28 @@ fn failure_reason(
 fn enrollment_changes(
     conn: &Connection,
     pool: &agent_run_domain::pool::PoolId,
-    at: f64,
 ) -> Result<Vec<(String, &'static str)>> {
-    let mut q=conn.prepare("SELECT j.agent_id,j.run_id,j.attempt_id,j.deadline FROM pool_enrollments j JOIN pool_members m ON m.agent_id=j.agent_id WHERE m.pool_id=? AND m.replaced_by IS NULL AND j.state<>'joined'")?;
+    let mut q=conn.prepare("SELECT j.agent_id,j.run_id,j.attempt_id FROM pool_enrollments j JOIN pool_members m ON m.agent_id=j.agent_id WHERE m.pool_id=? AND m.replaced_by IS NULL AND j.state<>'joined'")?;
     let rows = q
         .query_map([pool.as_str()], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, f64>(3)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(q);
     let mut changed = Vec::new();
-    for (root, run, attempt, deadline) in rows {
+    for (root, run, attempt) in rows {
         let delivery_failed:bool=conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM commands WHERE agent_id=? AND kind='steer' AND json_extract(payload_json,'$.pool_enrollment')=? AND state='completed' AND COALESCE(json_extract(result_json,'$.accepted'),0)=0)",
             params![run,root],|r|r.get(0))?;
-        let reason =
-            failure_reason(conn, &root, &run, &attempt, deadline, at)?.or(if delivery_failed {
-                Some("delivery_unconfirmed")
-            } else {
-                None
-            });
+        let reason = failure_reason(conn, &root, &run, &attempt)?.or(if delivery_failed {
+            Some("delivery_unconfirmed")
+        } else {
+            None
+        });
         let Some(reason) = reason else {
             continue;
         };
@@ -337,13 +319,13 @@ impl Store {
         &mut self,
         pool: &agent_run_domain::pool::PoolId,
     ) -> Result<()> {
-        if enrollment_changes(&self.conn, pool, now())?.is_empty() {
+        if enrollment_changes(&self.conn, pool)?.is_empty() {
             return Ok(());
         }
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        for (root, reason) in enrollment_changes(&tx, pool, now())? {
+        for (root, reason) in enrollment_changes(&tx, pool)? {
             let (run, attempt): (String, String) = tx.query_row(
                 "SELECT run_id,attempt_id FROM pool_enrollments WHERE agent_id=?",
                 [&root],
@@ -389,6 +371,6 @@ impl Store {
 
     /// Read-only preflight for the operator's stable existing-member identity.
     pub fn existing_pool_member(&self, id: &AgentId) -> Result<ExistingMember> {
-        existing_member(&self.conn, id, now())
+        existing_member(&self.conn, id)
     }
 }

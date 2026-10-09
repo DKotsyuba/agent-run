@@ -569,12 +569,6 @@ pub struct Start {
     pub fast: bool,
     #[arg(long)]
     pub effort: Option<String>,
-    #[arg(
-        long = "timeout",
-        id = "timeout",
-        help = "Whole-run deadline in seconds, at most 2592000; defaults to core.default_timeout_seconds; either base is scaled once by core.timeout_multiplier"
-    )]
-    pub timeout_seconds: Option<f64>,
     #[arg(long = "read-root", id = "read_root")]
     pub read_roots: Vec<PathBuf>,
     #[arg(long)]
@@ -605,12 +599,6 @@ pub struct Resume {
     pub task: Option<String>,
     #[arg(long)]
     pub task_file: Option<PathBuf>,
-    #[arg(
-        long = "timeout",
-        id = "timeout",
-        help = "Whole-run deadline in seconds, at most 2592000; a new value is scaled once by core.timeout_multiplier, omission inherits the previous run's effective deadline"
-    )]
-    pub timeout_seconds: Option<f64>,
     #[arg(long)]
     pub request_id: Option<String>,
     /// Optional replacement display label; omission inherits the previous
@@ -717,7 +705,6 @@ fn follow_signature(agent: &Value) -> Option<String> {
         "answer_sha256",
         "effort",
         "last_progress_at",
-        "warned",
         "usage",
         "usage_cumulative",
         "tool_counts",
@@ -1546,7 +1533,6 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                     "write": a.write,
                     "fast": a.fast,
                     "effort": a.effort,
-                    "timeout_seconds": a.timeout_seconds,
                     "read_roots": read_roots,
                     "output_schema": schema,
                     "orchestrator": a.session.resolve()?,
@@ -1584,7 +1570,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 (None, Some(path)) => read_input(&path, 1024 * 1024)?,
                 _ => return Err(invalid("provide exactly one resume task source")),
             };
-            let mut arguments = json!({"agent_id":a.agent_id,"task":task,"timeout_seconds":a.timeout_seconds,"request_id":a.request_id,"orchestrator":a.session.resolve()?});
+            let mut arguments = json!({"agent_id":a.agent_id,"task":task,"request_id":a.request_id,"orchestrator":a.session.resolve()?});
             if let Some(run_id) = a.run_id {
                 arguments["run_id"] = json!(run_id);
             }

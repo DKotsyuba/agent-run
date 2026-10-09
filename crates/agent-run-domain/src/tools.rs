@@ -285,7 +285,7 @@ fn argument_default(tool: &str, argument: &str) -> Option<ArgumentDefault> {
         }
         ("start", "read_roots" | "required_constraints") => Some(ArgumentDefault::EmptyArray),
         ("start", "effort" | "output_schema" | "orchestrator" | "request_id" | "account")
-        | ("resume", "timeout_seconds" | "request_id" | "orchestrator")
+        | ("resume", "request_id" | "orchestrator")
         | ("list_agents", "orchestrator" | "after_revision")
         | ("doc", "topic")
         | ("models" | "delegation_guide", "provider" | "profile" | "model")

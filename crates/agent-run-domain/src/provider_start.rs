@@ -50,11 +50,6 @@ pub struct ProviderStartRequest {
     /// Existing output schema for supporting harnesses.
     #[serde(default)]
     pub output_schema: Option<serde_json::Map<String, serde_json::Value>>,
-    /// Whole-run deadline in seconds from admission, bounded by
-    /// [`crate::domain::MAX_TIMEOUT_SECONDS`]; absence takes the configured
-    /// default. Every attempt runs only for the remainder.
-    #[serde(default)]
-    pub timeout_seconds: Option<f64>,
     /// Scoped idempotency key.
     #[serde(default)]
     pub request_id: Option<String>,
@@ -79,7 +74,7 @@ fn unique_constraints<'de, D: serde::Deserializer<'de>>(
 }
 
 impl ProviderStartRequest {
-    /// Validates paths, task, effort, timeout, namespace, orchestrator transport
+    /// Validates paths, task, effort, namespace, orchestrator transport
     /// and the optional human label; stores canonical paths, labels and transport
     /// in place. Invalid values return `ValidationError` before admission.
     /// Historical runtime selectors remain excluded from public v2 input.
@@ -88,7 +83,6 @@ impl ProviderStartRequest {
         projection.validate()?;
         self.workdir = projection.workdir;
         self.read_roots = projection.read_roots;
-        self.timeout_seconds = projection.timeout_seconds;
         self.display_name = projection.display_name;
         self.orchestrator = projection.orchestrator;
         Ok(())
@@ -102,6 +96,18 @@ impl ProviderStartRequest {
         self.display_name = projection.display_name;
         self.orchestrator = projection.orchestrator;
         Ok(())
+    }
+
+    /// Projects persisted provider intent without its obsolete run allowance.
+    /// Callers verify the original raw replay digest before this projection;
+    /// original JSON is never rewritten. Remaining fields decode strictly and
+    /// malformed/unknown fields return typed JSON errors. Public input uses the
+    /// ordinary strict decoder, which rejects the removed allowance parameter.
+    pub fn from_history(mut document: serde_json::Value) -> Result<Self> {
+        if let Some(object) = document.as_object_mut() {
+            object.remove("timeout_seconds");
+        }
+        Ok(serde_json::from_value(document)?)
     }
 
     /// Produces the existing read-model projection for staged store readers.
@@ -120,7 +126,6 @@ impl ProviderStartRequest {
             fast: self.fast,
             effort: self.effort.clone(),
             display_name: self.display_name.clone(),
-            timeout_seconds: self.timeout_seconds,
             read_roots: self.read_roots.clone(),
             output_schema: self.output_schema.clone(),
             orchestrator: self.orchestrator.clone(),

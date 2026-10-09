@@ -545,6 +545,34 @@ pub fn import_shared_tree(
     source_home: &Path,
     relative_root: &Path,
 ) -> Result<SharedTreeRef> {
+    import_shared_tree_with_contention(store_root, scope, source_home, relative_root, false)?
+        .ok_or_else(|| invalid("shared tree publication lock unavailable"))
+}
+
+/// Imports a verified snapshot only when the publish lock is immediately free.
+/// Returns `Ok(None)` on contention without publishing or changing the source.
+/// All topology, ownership, digest and durability checks are identical to
+/// `import_shared_tree`; ordinary validation/I/O failures remain errors.
+/// This bounds lock waiting, not filesystem system-call latency.
+pub fn try_import_shared_tree(
+    store_root: &Path,
+    scope: &str,
+    source_home: &Path,
+    relative_root: &Path,
+) -> Result<Option<SharedTreeRef>> {
+    import_shared_tree_with_contention(store_root, scope, source_home, relative_root, true)
+}
+
+/// Shared publisher for required and optional imports; `nonblocking` selects
+/// only lock acquisition policy. Contention may return no reference only for
+/// optional imports, before any store mutation; the source is never changed.
+fn import_shared_tree_with_contention(
+    store_root: &Path,
+    scope: &str,
+    source_home: &Path,
+    relative_root: &Path,
+    nonblocking: bool,
+) -> Result<Option<SharedTreeRef>> {
     if !is_scope(scope) {
         return Err(invalid(
             "shared store scope must be 64 lowercase hexadecimal digits",
@@ -566,7 +594,14 @@ pub fn import_shared_tree(
     validate_entries(&entries)?;
     verify_topology(&source_dir, &entries, TreeShape::Source, "managed snapshot")?;
     let root = validated_root(store_root)?;
-    let _guard = SharedStoreLock::acquire(&root)?;
+    let _guard = if nonblocking {
+        let Some(guard) = SharedStoreLock::try_acquire(&root, true)? else {
+            return Ok(None);
+        };
+        guard
+    } else {
+        SharedStoreLock::acquire(&root)?
+    };
     let store = Dir::open(&root)?;
     require_owner(store.entry(None)?.uid, "root")?;
     store.directory(&blobs_scope(scope))?;
@@ -575,7 +610,7 @@ pub fn import_shared_tree(
     match store.entry_type(&destination) {
         Ok(EntryType::Directory) => {
             verify_shared_tree(&root, &reference)?;
-            return Ok(reference);
+            return Ok(Some(reference));
         }
         Ok(_) => {
             return Err(invalid(
@@ -605,13 +640,13 @@ pub fn import_shared_tree(
         .and_then(|()| store.sync())
         .and_then(|()| store.rename_entry_no_replace(&staging, &destination));
     match published {
-        Ok(true) => Ok(reference),
+        Ok(true) => Ok(Some(reference)),
         Ok(false) => {
             // An object already occupies the content-addressed destination —
             // most often a concurrent publisher of the identical tree.
             discard_staging(&store, &staging);
             verify_shared_tree(&root, &reference)?;
-            Ok(reference)
+            Ok(Some(reference))
         }
         Err(error) => {
             discard_staging(&store, &staging);
@@ -1093,6 +1128,37 @@ mod tests {
         let store = tempfile::tempdir().unwrap();
         let root = store.path().canonicalize().unwrap();
         (store, root)
+    }
+
+    /// Optional publication skips a held lock without changing the sealed source
+    /// or publishing a tree, then performs the same verified import after release.
+    #[test]
+    fn optional_import_skips_busy_lock_and_retries_without_source_changes() {
+        let (_source, home) = sealed(&[("file.txt", b"fixture", false)]);
+        let (_store, root) = store_root();
+        let scope = "a".repeat(64);
+        let before = inspect_managed_snapshot(home.path(), Path::new("assets/runtime")).unwrap();
+        let held = SharedStoreLock::acquire(&root).unwrap();
+        assert!(
+            try_import_shared_tree(&root, &scope, home.path(), Path::new("assets/runtime"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(!root.join("trees").exists());
+        assert_eq!(
+            inspect_managed_snapshot(home.path(), Path::new("assets/runtime")).unwrap(),
+            before
+        );
+        drop(held);
+        let reference =
+            try_import_shared_tree(&root, &scope, home.path(), Path::new("assets/runtime"))
+                .unwrap()
+                .unwrap();
+        verify_shared_tree(&root, &reference).unwrap();
+        assert_eq!(
+            inspect_managed_snapshot(home.path(), Path::new("assets/runtime")).unwrap(),
+            before
+        );
     }
 
     /// Returns one path's inode number for hardlink identity assertions.

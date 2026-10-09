@@ -127,19 +127,15 @@ impl Store {
         if limit == 0 || limit > 1000 {
             return Err(invalid("limit must be 1..1000"));
         }
-        let mut stmt = self.conn.prepare(&format!("SELECT a.*,EXISTS(SELECT 1 FROM events e WHERE e.agent_id=a.id AND e.kind='deadline_warning') AS activity_warned,MAX(0.0,?-COALESCE((SELECT MAX(m.at) FROM messages m WHERE m.agent_id=a.id),a.started_at,a.created_at)) AS activity_silence FROM agents a WHERE a.orchestrator_session_id=? AND a.status IN {ACTIVE_SQL} ORDER BY a.created_at DESC,a.id DESC LIMIT ?"))?;
+        let mut stmt = self.conn.prepare(&format!("SELECT a.*,MAX(0.0,?-COALESCE((SELECT MAX(m.at) FROM messages m WHERE m.agent_id=a.id),a.started_at,a.created_at)) AS activity_silence FROM agents a WHERE a.orchestrator_session_id=? AND a.status IN {ACTIVE_SQL} ORDER BY a.created_at DESC,a.id DESC LIMIT ?"))?;
         let rows = stmt
             .query_map(
                 (observed_at, orchestrator_session_id, limit as i64),
                 |row| {
                     // Named, not positional: later migrations append agents columns.
-                    let warned: bool =
-                        row.get::<_, bool>("warned")? || row.get::<_, bool>("activity_warned")?;
                     let silence_seconds: f64 = row.get("activity_silence")?;
                     let mut object = row_object(row)?.as_object().cloned().expect("row object");
-                    object.remove("activity_warned");
                     object.remove("activity_silence");
-                    object.insert("warned".to_owned(), Value::Bool(warned));
                     object.insert("silent_seconds".to_owned(), json!(silence_seconds));
                     Ok(Value::Object(object))
                 },

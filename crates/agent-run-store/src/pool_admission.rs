@@ -164,11 +164,10 @@ impl Store {
                     admit_in_tx(&tx, input.catalog, member.id.clone(), inputs, None)?;
                 }
                 PoolAdmissionSource::Existing(pin) => {
-                    let actual = crate::pool_enrollment::existing_member(&tx, &member.id, now())?;
+                    let actual = crate::pool_enrollment::existing_member(&tx, &member.id)?;
                     if actual.run_id != pin.run_id
                         || actual.attempt_id != pin.attempt_id
                         || actual.fingerprint != pin.fingerprint
-                        || actual.deadline != pin.deadline
                         || !crate::pool_enrollment::same_binding(
                             actual.orchestrator.as_ref(),
                             pin.orchestrator.as_ref(),
@@ -227,8 +226,8 @@ impl Store {
                     tx.execute("UPDATE agents SET orchestrator_session_id=? WHERE id=? AND orchestrator_session_id IS NULL",params![session,pin.run_id.as_str()])?;
                 }
                 let challenge = format!("pool-join-v1-{}", uuid::Uuid::new_v4().simple());
-                tx.execute("INSERT INTO pool_enrollments(agent_id,run_id,attempt_id,challenge,deadline,created_at) VALUES(?,?,?,?,?,?)",
-                    params![member.id.as_str(),pin.run_id.as_str(),pin.attempt_id,challenge,pin.deadline,now()])?;
+                tx.execute("INSERT INTO pool_enrollments(agent_id,run_id,attempt_id,challenge,created_at) VALUES(?,?,?,?,?)",
+                    params![member.id.as_str(),pin.run_id.as_str(),pin.attempt_id,challenge,now()])?;
                 let goal_brief = input.goal.chars().take(96).collect::<String>();
                 let roster = input
                     .members

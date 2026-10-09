@@ -229,6 +229,64 @@ fn consolidation_requires_the_qualified_witness_root() {
     );
 }
 
+/// A competing publisher cannot hold completion behind its lock: optional
+/// consolidation reports a bounded skip, preserves the private tree and index,
+/// and retries successfully after release. No native process/model is launched.
+#[test]
+fn consolidation_skips_contended_publication_without_changing_private_home() {
+    let temporary = tempfile::tempdir().unwrap();
+    let app_home = temporary.path().canonicalize().unwrap();
+    let root = store_root(&app_home);
+    let home = app_home.join("runs/test");
+    stdfs::create_dir_all(home.join("skills/.system")).unwrap();
+    let payload = home.join("skills/.system/SKILL.md");
+    stdfs::write(&payload, "immutable fixture").unwrap();
+    let mut store = agent_run_core::state::Store::initialize(&app_home).unwrap();
+    let id: AgentId = "ag-20260101-000000-0000000001".parse().unwrap();
+    let identity = fixture_identity(&app_home, &home);
+    let account = "acct-work".parse().unwrap();
+    let held = agent_run_platform::shared_assets::SharedStoreLock::acquire(&root).unwrap();
+    let report = agent_run_core::runtime_cache::consolidate(
+        &mut store, &id, &identity, &account, &app_home, &home, &root,
+    )
+    .unwrap();
+    assert!(report.bounded);
+    assert_eq!(report.frozen, 0);
+    assert!(
+        !stdfs::symlink_metadata(home.join("skills/.system"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        stdfs::read_to_string(&payload).unwrap(),
+        "immutable fixture"
+    );
+    assert!(!stdfs::read_dir(&home).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".agent-run-native-")
+    }));
+    drop(held);
+    let report = agent_run_core::runtime_cache::consolidate(
+        &mut store, &id, &identity, &account, &app_home, &home, &root,
+    )
+    .unwrap();
+    assert_eq!(report.frozen, 1);
+    assert!(
+        stdfs::symlink_metadata(home.join("skills/.system"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        stdfs::read_to_string(&payload).unwrap(),
+        "immutable fixture"
+    );
+}
+
 /// One frozen Codex identity for a cache-only home with no managed roots.
 fn fixture_identity(
     app_home: &Path,

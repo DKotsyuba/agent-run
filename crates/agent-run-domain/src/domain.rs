@@ -95,6 +95,7 @@ impl<'de> Deserialize<'de> for AgentId {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Durable execution state; terminal history is immutable and active transitions never expire by age.
 pub enum Status {
     Created,
     Starting,
@@ -102,6 +103,7 @@ pub enum Status {
     Cancelling,
     Succeeded,
     Failed,
+    /// Historical terminal status, readable for old records but unreachable from active executions.
     TimedOut,
     Cancelled,
     Lost,
@@ -137,6 +139,7 @@ impl Status {
             Self::Lost => "lost",
         }
     }
+    /// Validates an active lifecycle change; terminal records cannot change and elapsed time grants no transition.
     pub fn transition(self, to: Self) -> Result<()> {
         let ok = match self {
             Self::Created => matches!(
@@ -149,7 +152,7 @@ impl Status {
             ),
             Self::Running => matches!(
                 to,
-                Self::Succeeded | Self::Failed | Self::TimedOut | Self::Cancelling | Self::Lost
+                Self::Succeeded | Self::Failed | Self::Cancelling | Self::Lost
             ),
             Self::Cancelling => matches!(to, Self::Cancelled | Self::Lost),
             _ => false,
@@ -305,10 +308,6 @@ pub struct StartRequest {
     /// [`display_name`] during validation so equal labels replay identically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
-    /// The run's whole-run deadline in seconds from admission, at most
-    /// [`MAX_TIMEOUT_SECONDS`]; absence takes the configured default.
-    #[serde(default)]
-    pub timeout_seconds: Option<f64>,
     #[serde(default)]
     pub read_roots: Vec<PathBuf>,
     #[serde(default)]
@@ -373,9 +372,6 @@ impl StartRequest {
         if let Some(label) = &self.display_name {
             self.display_name = Some(display_name(label)?);
         }
-        if let Some(v) = self.timeout_seconds {
-            timeout_seconds(v)?;
-        }
         if !self.workdir.is_absolute() || self.read_roots.iter().any(|path| !path.is_absolute()) {
             return Err(invalid("paths must be absolute"));
         }
@@ -391,6 +387,18 @@ impl StartRequest {
         }
         Ok(())
     }
+
+    /// Decodes an immutable historical request as current execution intent.
+    /// The obsolete whole-run allowance is discarded only in this in-memory
+    /// projection; original JSON/fingerprints stay untouched. Public input still
+    /// uses strict deserialization and rejects removed or otherwise unknown fields.
+    /// Returns a typed JSON error for every remaining malformed/unknown field.
+    pub fn from_history(mut document: serde_json::Value) -> Result<Self> {
+        if let Some(object) = document.as_object_mut() {
+            object.remove("timeout_seconds");
+        }
+        Ok(serde_json::from_value(document)?)
+    }
 }
 /// The largest accepted task text, in UTF-8 bytes.
 pub const MAX_TASK_BYTES: usize = 512 * 1024;
@@ -402,23 +410,6 @@ pub fn task_text(task: &str) -> Result<()> {
         return Err(invalid("task exceeds 512 KiB"));
     }
     Ok(())
-}
-
-/// The largest accepted run timeout: 30 days in seconds.
-///
-/// The bound keeps `created_at + timeout` and every remaining-time duration
-/// representable, so an accepted timeout can never overflow a runtime clock.
-pub const MAX_TIMEOUT_SECONDS: f64 = 30.0 * 24.0 * 3600.0;
-
-/// Accepts a run timeout in seconds that is finite, positive and at most
-/// [`MAX_TIMEOUT_SECONDS`]; anything else is a validation error.
-pub fn timeout_seconds(value: f64) -> Result<f64> {
-    if !value.is_finite() || value <= 0.0 || value > MAX_TIMEOUT_SECONDS {
-        return Err(invalid(
-            "timeout_seconds must be positive, finite and at most 2592000",
-        ));
-    }
-    Ok(value)
 }
 pub fn existing_dir(path: &std::path::Path) -> Result<PathBuf> {
     if !path.is_absolute() {

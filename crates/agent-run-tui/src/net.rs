@@ -338,7 +338,6 @@ mod tests {
                 "elapsed_seconds": 5.0,
                 "last_progress_at": None::<serde_json::Value>,
                 "silence_seconds": Some(1.0),
-                "warned": false,
                 "failure_kind": None::<serde_json::Value>,
                 "failure_text": None::<serde_json::Value>,
                 "answer_available": false,

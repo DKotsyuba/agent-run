@@ -186,7 +186,6 @@ impl crate::service::Service {
         agent_id: &AgentId,
         run_id: Option<&AgentId>,
         task: String,
-        timeout: Option<f64>,
         request_id: Option<String>,
         display_name: Option<String>,
         orchestrator: Option<crate::domain::OrchestratorRef>,
@@ -213,15 +212,8 @@ impl crate::service::Service {
             }
         };
         admission(
-            self.resume(
-                &parent.id,
-                task,
-                timeout,
-                request_id,
-                display_name,
-                orchestrator,
-            )
-            .await?,
+            self.resume(&parent.id, task, request_id, display_name, orchestrator)
+                .await?,
         )
     }
 }

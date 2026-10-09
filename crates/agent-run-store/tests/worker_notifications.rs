@@ -22,10 +22,10 @@ fn running() -> (tempfile::TempDir, Store, AgentId, String) {
     ).unwrap();
     store.conn.execute(
         r#"INSERT INTO agents(id,orchestrator_session_id,runtime,model,profile,task,task_summary,workdir,
-          request_json,status,created_at,started_at,timeout_seconds,config_revision,root_agent_id)
+          request_json,status,created_at,started_at,config_revision,root_agent_id)
          VALUES(?,'session','codex','fixture','review','task','task','/tmp',
          '{"runtime":"codex","model":"fixture","profile":"review","task":"task","workdir":"/tmp"}',
-         'running',100,190,120,'fixture',?)"#,
+         'running',100,190,'fixture',?)"#,
         params![run.as_str(), run.as_str()],
     ).unwrap();
     let attempt = "att-worker-1".to_owned();
@@ -65,9 +65,9 @@ fn stability_legacy_transport_alias_reports() {
     }
 }
 
-/// A delayed start still expires at admission time; accepted reports are durable and idempotent.
+/// Live attempts retain report authority regardless of age; replay and per-report spacing remain exact.
 #[test]
-fn active_report_replay_and_deadline() {
+fn active_report_replay_has_no_lifetime_expiry() {
     let (_home, mut store, run, attempt) = running();
     store
         .issue_worker_capability(&run, &attempt, TOKEN, 100.0)
@@ -138,6 +138,10 @@ fn active_report_replay_and_deadline() {
             .notify_orchestrator(&run, &attempt, TOKEN, &report("two"), 220.0)
             .is_err()
     );
+    let later = store
+        .notify_orchestrator(&run, &attempt, TOKEN, &report("two"), 7_776_000.0)
+        .unwrap();
+    assert!(!later.duplicate);
     let (event_kind, event_data): (String, String) = store.conn.query_row(
         "SELECT e.kind,e.data_json FROM events e JOIN deliveries d ON d.terminal_event_seq=e.seq WHERE d.id=?",
         [&first.notification_id], |r| Ok((r.get(0)?,r.get(1)?)),
@@ -233,13 +237,6 @@ fn forged_and_inactive_reports_are_rejected() {
 #[test]
 fn volume_limit_is_per_run() {
     let (_home, mut store, run, attempt) = running();
-    store
-        .conn
-        .execute(
-            "UPDATE agents SET timeout_seconds=1000 WHERE id=?",
-            [run.as_str()],
-        )
-        .unwrap();
     store
         .issue_worker_capability(&run, &attempt, TOKEN, 100.0)
         .unwrap();

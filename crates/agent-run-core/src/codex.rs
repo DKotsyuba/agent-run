@@ -1003,6 +1003,18 @@ pub async fn run(
         };
         let v = match event {
             Event::Json(v) => v,
+            Event::OwnershipFailure(error) => {
+                // Transcript flushing cannot erase the first checkpoint cause.
+                let _ = flush_pending_assistant(
+                    process,
+                    store,
+                    &record.id,
+                    &streamed,
+                    &completed,
+                    &mut redactors,
+                );
+                return Err(error);
+            }
             Event::Eof => {
                 flush_pending_assistant(
                     process,

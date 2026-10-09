@@ -6,6 +6,8 @@ pub mod admission;
 pub mod delivery;
 /// Read-only diagnostic and active-context snapshots.
 pub mod diagnostics;
+/// Bounded, content-free incident phases independent of expirable history.
+pub mod incidents;
 /// Durable append-only journal operations and bounded transcript spooling.
 pub mod journal;
 /// Resume-parent proof and one-child lineage admission helpers.
@@ -64,7 +66,7 @@ pub const ACTIVE_SQL: &str = "('created','starting','running','cancelling')";
 /// deliberately short: a normal caller blocked this long is reporting real
 /// contention, and hiding that behind a longer wait would trade a fast, visible
 /// failure for an unbounded stall.
-pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the schema-migration connection waits out a competing writer.
 ///
 /// Mirrors `PRAGMA busy_timeout=30000` in `src/agent_run/state/migrations.py`,
@@ -162,7 +164,15 @@ impl Record {
         })?;
         Ok(Self {
             id: agent_id.clone(),
-            request: parse(row.get("request_json")?)?,
+            request: StartRequest::from_history(parse(row.get("request_json")?)?).map_err(
+                |error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                },
+            )?,
             status,
             created_at: row.get("created_at")?,
             started_at: row.get("started_at")?,

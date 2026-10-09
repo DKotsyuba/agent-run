@@ -249,16 +249,11 @@ fn active_block(agents: &[Value], at: f64) -> (String, String) {
                 .or_else(|| number(agent, "created_at"))
                 .unwrap_or(at);
             let elapsed = ((at - started).max(0.0) / 60.0).floor() as u64;
-            let warned = agent
-                .get("warned")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
             let silent = number(agent, "silent_seconds")
                 .is_some_and(|seconds| seconds >= SILENCE_THRESHOLD_SECONDS);
-            key.push(format!("{id}:{status}:{warned}:{silent}"));
+            key.push(format!("{id}:{status}:{silent}"));
             format!(
-                "{id} {runtime}/{model} {profile} {summary} {status} {elapsed}m{}{}",
-                if warned { " warn" } else { "" },
+                "{id} {runtime}/{model} {profile} {summary} {status} {elapsed}m{}",
                 if silent { " silent" } else { "" }
             )
         })

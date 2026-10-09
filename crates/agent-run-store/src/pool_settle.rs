@@ -173,7 +173,7 @@ fn evaluate(tx: &Connection, pool_id: &PoolId) -> Result<Evaluation> {
     let mut roster = Vec::new();
     for (seat, slot, name, role) in &seats {
         let root: AgentId = seat.parse()?;
-        if crate::pool_enrollment::view(tx, &root, now())?.is_some_and(|e| e["state"] != "joined") {
+        if crate::pool_enrollment::view(tx, &root)?.is_some_and(|e| e["state"] != "joined") {
             return Ok(Evaluation::NotReady);
         }
         let tip = tip_of(tx, &root)?;

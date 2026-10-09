@@ -510,8 +510,8 @@ fn holders_block_install_and_prepared_rows_refuse_replacement() {
         .conn
         .execute(
             "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,\
-             status,created_at,timeout_seconds,config_revision,identity_json) \
-             VALUES('ag_blocker','codex','m','p','t','t','/tmp','{}','starting',?1,1,'x',?2)",
+             status,created_at,config_revision,identity_json) \
+             VALUES('ag_blocker','codex','m','p','t','t','/tmp','{}','starting',?1,'x',?2)",
             rusqlite::params![
                 1.0,
                 serde_json::json!({"runtime_home": canonical.to_string_lossy()}).to_string()

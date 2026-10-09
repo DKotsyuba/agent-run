@@ -56,12 +56,11 @@ authorization. Delivery may be delayed; a queue acknowledgement is not an answer
 `start_pool.members` accepts either `{ "start": { ... }, "role": "review" }`
 or `{ "existing_agent_id": "ag-...", "role": "review" }` for each of two to
 five seats. Existing members must be independent stable roots with an owned
-RUNNING attempt, no prior pool membership, a live original execution deadline
-and authenticated proof of the ordinary five-tool or restricted research six-tool catalog. Unknown historical
+RUNNING attempt, no prior pool membership, authenticated proof of the ordinary five-tool or restricted research six-tool catalog. Unknown historical
 catalog or independence history is refused; resume behavior is otherwise unchanged.
 
 Admission preserves the existing task, native session, model, account, grants,
-run, attempt, deadline and reservation. Only new seats launch. A compatible
+run, attempt and reservation. Only new seats launch. A compatible
 existing orchestrator binding can supply the pool binding; incompatible bindings
 are rejected atomically. The original request key replays the committed pool
 even if a member subsequently ends.
@@ -69,7 +68,8 @@ even if a member subsequently ends.
 The existing worker receives bounded context through the durable native control
 path. It remains `pending` until it calls `pool_read`, then `pool_post` with the
 exact opaque broker-issued `request_id` and a brief current-work summary. The
-key is pinned to its current attempt and original deadline, including replays.
+key is pinned to its current live attempt, including replays; it has no execution
+lifetime expiry.
 Transport queueing, a Claude stdin write or Codex `native_accepted` receipt does
 not prove awareness. Pending members cannot propose, vote or count toward
 completion. The full goal and criteria remain authoritative in `pool_read`.

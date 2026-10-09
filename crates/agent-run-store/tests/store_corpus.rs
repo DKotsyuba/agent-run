@@ -115,7 +115,6 @@ fn every_semantic_request_field_conflicts_on_replay() {
         ("workdir", json!(other)),
         ("write", json!(true)),
         ("effort", json!("high")),
-        ("timeout_seconds", json!(481.0)),
         ("read_roots", json!([other])),
         ("output_schema", json!({"type":"object"})),
         ("fast", json!(true)),
@@ -244,21 +243,21 @@ fn request_json_round_trips_all_fields_and_legacy_defaults() {
     ));
 }
 
-/// Mirrors `tests/test_state_store.py::StateStoreTests::test_unresolved_timeout_is_never_persisted`.
+/// Fresh requests persist no lifetime field; historical request projection is explicit.
 #[test]
-fn admitted_requests_always_persist_a_resolved_timeout() {
+fn admitted_requests_have_no_lifetime_field() {
     let home = common::Home::new();
-    let request = home.request();
-    let (store, id) = admitted(&home, &request);
-    let timeout: f64 = store
+    let (store, id) = admitted(&home, &home.request());
+    let raw: String = store
         .conn
         .query_row(
-            "SELECT timeout_seconds FROM agents WHERE id=?",
+            "SELECT request_json FROM agents WHERE id=?",
             [id.as_str()],
-            |row| row.get(0),
+            |r| r.get(0),
         )
         .unwrap();
-    assert!(timeout.is_finite() && timeout > 0.0);
+    let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert!(request.get("timeout_seconds").is_none());
 }
 
 /// Mirrors `tests/test_state_store.py::StateStoreTests::test_session_lookup_and_agent_filter_are_read_only_and_composable`.

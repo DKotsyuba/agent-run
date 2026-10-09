@@ -208,8 +208,6 @@ async fn test_start_decodes_the_full_request_and_returns_immediately() {
         "--fast",
         "--effort",
         "high",
-        "--timeout",
-        "42",
         "--read-root",
         read_root.to_str().unwrap(),
         "--output-schema",
@@ -239,7 +237,7 @@ async fn test_start_decodes_the_full_request_and_returns_immediately() {
     assert_eq!(request["display_name"], "工程師 / review");
     assert_eq!(request["fast"], true);
     assert_eq!(request["effort"], "high");
-    assert_eq!(request["timeout_seconds"], 42.0);
+    assert!(request.get("timeout_seconds").is_none());
     assert_eq!(request["account"], Value::Null);
     assert_eq!(request["orchestrator"]["external_turn_id"], "turn-1");
     assert_eq!(
@@ -354,46 +352,13 @@ async fn test_start_fast_flag_reaches_the_request() {
     assert_eq!(broker.calls.lock().unwrap()[0].1["fast"], true);
 }
 
-/// Mirrors `tests/test_cli.py::test_start_preserves_omitted_and_explicit_timeout`.
-#[tokio::test]
-async fn test_start_preserves_omitted_and_explicit_timeout() {
-    for (timeout, expected) in [(None, Value::Null), (Some("480"), json!(480.0))] {
-        let temp = tempdir().unwrap();
-        let broker = Arc::new(FakeBroker::new(vec![
-            json!({"agent_id":AGENT_ID,"created":true}),
-        ]));
-        let mut args = vec![
-            "--home",
-            temp.path().to_str().unwrap(),
-            "start",
-            "--provider",
-            "fake",
-            "--model",
-            "model",
-            "--profile",
-            "p",
-            "--task",
-            "t",
-            "--workdir",
-            temp.path().to_str().unwrap(),
-        ];
-        if let Some(timeout) = timeout {
-            args.extend(["--timeout", timeout]);
-        }
-        agent_run::cli::run_with(
-            parse(&args),
-            dependencies(
-                Arc::new(FakeService::new(Vec::new(), false)),
-                broker.clone(),
-                Arc::new(Mutex::new(Vec::new())),
-            ),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            broker.calls.lock().unwrap()[0].1["timeout_seconds"],
-            expected
-        );
+/// Start and resume reject the removed lifetime option instead of silently
+/// accepting or substituting a default. Their current help contains no such option.
+#[test]
+fn start_and_resume_reject_execution_timeout_option() {
+    for command in ["start", "resume"] {
+        let result = Cli::try_parse_from(["agent-run", command, "--timeout", "480"]);
+        assert!(result.is_err(), "{command}");
     }
 }
 
@@ -414,8 +379,6 @@ async fn test_resume_task_file_preserves_whitespace_and_session_binding() {
             AGENT_ID,
             "--task-file",
             task.to_str().unwrap(),
-            "--timeout",
-            "32",
             "--request-id",
             "retry",
             "--session-transport",
@@ -1548,7 +1511,6 @@ async fn test_transcript_text_pipe_receives_fragments_before_the_agent_finishes(
         fast: false,
         effort: None,
         display_name: None,
-        timeout_seconds: None,
         read_roots: vec![],
         output_schema: None,
         orchestrator: None,

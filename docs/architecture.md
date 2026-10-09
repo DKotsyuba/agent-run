@@ -69,13 +69,12 @@ alone. Recovery uses an attempt-matching snapshot even if a crash occurred befor
 the agent group field was updated, and persists newly captured members before
 recording an unresolved cleanup. PID/token/birth fences still guard every signal.
 
-A run (schema-1 and provider alike) has one execution deadline: admission
-time plus its stored, already-scaled `timeout_seconds`. Preparation and every
-account-switch attempt consume that same budget. Before each spawn the
-supervisor checks the remaining time; it bounds execution by that remainder,
-cleans up on expiry, and records `timed_out`. There is no independent silence watchdog. Success requires a
-verified answer plus completion and cleanup evidence; exit code alone is never
-enough.
+Provider and legacy executions have no wall-clock limit. Preparation and account
+switches do not consume an overall time budget. Native completion, failure or
+explicit cancellation ends execution; silence only provides diagnostic evidence.
+Success requires a verified answer plus completion and cleanup evidence; exit
+code alone is never enough. Operational bounds remain on startup ownership,
+transport I/O, collector commands, service probes and cleanup.
 
 Native process identity and signalling are described in
 [process-identity.md](process-identity.md).
@@ -121,7 +120,7 @@ client request, never by the composed text. Schema 26 adds attempt-pinned
 `pool_enrollments`, observed worker catalog proof, and a permanent per-root
 membership marker. A mixed batch can attach supported independent RUNNING
 workers without another execution or reservation; the transaction rechecks the
-exact attempt, original deadline, immutable launch facts and compatible binding.
+exact attempt, immutable launch facts and compatible binding.
 The membership marker also covers new seats and replacements and survives pool
 history collection; historical independence remains unknown conservatively.
 Existing seats receive durable context and remain pending until an authenticated

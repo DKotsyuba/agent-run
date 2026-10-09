@@ -166,8 +166,6 @@ pub struct AgentView {
     pub last_progress_at: Option<f64>,
     /// Active-run silence duration, or `null` for terminal rows.
     pub silence_seconds: Option<f64>,
-    /// Whether the stall watchdog emitted a warning.
-    pub warned: bool,
     /// Stable failure category, when terminal failure evidence exists.
     pub failure_kind: Option<String>,
     /// Bounded explanatory failure text, when any.

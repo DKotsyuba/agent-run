@@ -158,7 +158,7 @@ pub fn admit_with_config_revision(
     let resume_session = lineage
         .as_ref()
         .map(|lineage| lineage.runtime_session_id.as_str());
-    let inserted = tx.execute("INSERT INTO agents(id,request_id,orchestrator_session_id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,parent_agent_id,root_agent_id,sequence,resume_of_runtime_session_id,identity_json,display_name) VALUES(?,?,?,?,?,?,?,?,?,?,'starting',?,?,?,?,?,?,?,?,?)", params![id.as_str(), checked.request_id, session, checked.runtime, checked.model, checked.profile, checked.task, summary, checked.workdir.to_string_lossy(), serde_json::to_string(&checked)?, accepted_at, checked.timeout_seconds.unwrap_or_else(|| config.core.effective_default_timeout_seconds()), config_revision, parent.map(|record| record.id.as_str()), root, sequence, resume_session, serde_json::to_string(&identity)?, checked.display_name]);
+    let inserted = tx.execute("INSERT INTO agents(id,request_id,orchestrator_session_id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,parent_agent_id,root_agent_id,sequence,resume_of_runtime_session_id,identity_json,display_name) VALUES(?,?,?,?,?,?,?,?,?,?,'starting',?,?,?,?,?,?,?,?)", params![id.as_str(), checked.request_id, session, checked.runtime, checked.model, checked.profile, checked.task, summary, checked.workdir.to_string_lossy(), serde_json::to_string(&checked)?, accepted_at, config_revision, parent.map(|record| record.id.as_str()), root, sequence, resume_session, serde_json::to_string(&identity)?, checked.display_name]);
     if let Err(error) = inserted {
         let latest: Option<String> = tx
             .query_row(

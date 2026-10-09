@@ -318,6 +318,58 @@ impl ResultInputs {
     }
 }
 
+/// Projects only reviewed static tool names from a Claude initialization frame.
+/// Missing, oversized, malformed or unrecognized entries keep inventory proof
+/// incomplete. Unknown names, session IDs, paths, arguments, environment and
+/// plugin/server configuration are never persisted in this diagnostic.
+fn native_init_inventory(frame: &Value) -> Value {
+    /// Static diagnostic spellings include allowed and forbidden capabilities;
+    /// membership here records observation and never grants tool execution.
+    const KNOWN: &[&str] = &[
+        "WebFetch",
+        "WebSearch",
+        "Bash",
+        "Read",
+        "Grep",
+        "Glob",
+        "Edit",
+        "Write",
+        "NotebookEdit",
+        "Agent",
+        "Task",
+        "TaskOutput",
+        "TaskStop",
+        "Skill",
+        "ToolSearch",
+        "TodoWrite",
+        "AskUserQuestion",
+        "mcp__agent_run_worker__notify_orchestrator",
+        "mcp__agent_run_worker__pool_post",
+        "mcp__agent_run_worker__pool_read",
+        "mcp__agent_run_worker__pool_propose",
+        "mcp__agent_run_worker__pool_vote",
+        "mcp__agent_run_worker__save_report",
+    ];
+    let Some(tools) = frame["tools"].as_array().filter(|items| items.len() <= 64) else {
+        return json!({"version":1,"complete":false,"tool_names":[],"unknown_count":null});
+    };
+    let mut names = Vec::new();
+    let mut unknown = 0_usize;
+    for tool in tools {
+        if let Some(known) = tool
+            .as_str()
+            .and_then(|name| KNOWN.iter().find(|known| **known == name))
+        {
+            names.push(*known);
+        } else {
+            unknown += 1;
+        }
+    }
+    names.sort_unstable();
+    names.dedup();
+    json!({"version":1,"complete":unknown==0&&names.len()==tools.len(),"tool_names":names,"unknown_count":unknown})
+}
+
 /// Builds content-free metadata for one native result, including ignored frames.
 ///
 /// `index` is one-based within the execution; `ignored` describes the current
@@ -410,8 +462,10 @@ fn result_failure_kind(subtype: &str, text: Option<&str>) -> &'static str {
 ///
 /// A fresh launch may publish a later nonempty native session identifier, and
 /// the latest identifier becomes the durable result identity. Resumed launches
-/// instead reject any identifier other than their requested session. The
-/// function journals recognized events, services bounded control commands, and
+/// instead reject any identifier other than their requested session. The first
+/// observed identity and each genuine change are journaled once per execution;
+/// unchanged frame identities still validate but never contend for a writer.
+/// The function journals recognized events, services bounded control commands, and
 /// returns malformed stream data or persistence failures as domain errors.
 /// Native input UUIDs and replay batches correlate results to the latest task or
 /// steering input; pool-only results cannot complete it. Every result is observed
@@ -557,6 +611,17 @@ pub async fn run(
         };
         let v = match event {
             Event::Json(v) => v,
+            Event::OwnershipFailure(error) => {
+                // Required cleanup is owned by the supervisor; a failed journal
+                // flush must not replace the original persistence/identity cause.
+                let _ = flush_assistant(
+                    store,
+                    &record.id,
+                    &mut assistant_redactor,
+                    message_id.as_deref(),
+                );
+                return Err(error);
+            }
             Event::Eof => {
                 flush_assistant(
                     store,
@@ -684,8 +749,17 @@ pub async fn run(
             // Fresh Claude launches can legitimately report a new session after
             // initialization. A resumed launch is different: its identity is a
             // grant boundary and must remain exactly the requested session.
-            store.runtime_session(&record.id, s)?;
-            session = Some(s.into());
+            if session.as_deref() != Some(s) {
+                store.runtime_session(&record.id, s)?;
+                session = Some(s.into());
+            }
+        }
+        if record.request.profile == "research" && v["type"] == "system" && v["subtype"] == "init" {
+            let _ = store.event(
+                &record.id,
+                "native_init_inventory_v1",
+                &native_init_inventory(&v),
+            );
         }
         // Only top-level protocol frames feed the native signal state.
         signals.observe(&v);
@@ -1171,6 +1245,27 @@ mod tests {
         assert_eq!(
             result_failure_kind("error_during_execution", Some("boom")),
             "runtime_failed"
+        );
+    }
+
+    /// Safe inventory receipts are complete only for recognized tool names;
+    /// raw private payloads and unknown tool-name canaries never enter the JSON.
+    #[test]
+    fn research_init_inventory_is_closed_and_content_free() {
+        let data = super::native_init_inventory(
+            &serde_json::json!({"tools":["WebSearch","WebFetch","mcp__agent_run_worker__save_report"],"session_id":"SOURCE_SECRET","environment":"SOURCE_SECRET"}),
+        );
+        assert_eq!(data["complete"], true);
+        assert!(!data.to_string().contains("SOURCE_SECRET"));
+        let unknown = super::native_init_inventory(
+            &serde_json::json!({"tools":["WebSearch","SOURCE_SECRET"]}),
+        );
+        assert_eq!(unknown["complete"], false);
+        assert_eq!(unknown["unknown_count"], 1);
+        assert!(!unknown.to_string().contains("SOURCE_SECRET"));
+        assert_eq!(
+            super::native_init_inventory(&serde_json::json!({}))["complete"],
+            false
         );
     }
 }

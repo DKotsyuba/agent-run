@@ -2189,8 +2189,8 @@ fn concurrent_settlement_is_single_and_the_completed_record_stays_frozen() {
     store
         .conn
         .execute(
-            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id,parent_agent_id,sequence) \
-             SELECT 'ag-20260101-000000-0000000088',runtime,model,profile,'t','t',workdir,'{}','running',9.0,10.0,'cfg',id,id,2 FROM agents WHERE id=?",
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id,parent_agent_id,sequence) \
+             SELECT 'ag-20260101-000000-0000000088',runtime,model,profile,'t','t',workdir,'{}','running',9.0,'cfg',id,id,2 FROM agents WHERE id=?",
             [members[0].0.as_str()],
         )
         .unwrap();
@@ -2627,8 +2627,8 @@ fn pool_activity_projects_lifecycle_without_changing_stored_state() {
     store
         .conn
         .execute(
-            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id,parent_agent_id,sequence) \
-             SELECT 'ag-20260101-000000-0000000077',runtime,model,profile,'t','t',workdir,'{}','running',9.0,10.0,'cfg',id,id,2 FROM agents WHERE id=?",
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id,parent_agent_id,sequence) \
+             SELECT 'ag-20260101-000000-0000000077',runtime,model,profile,'t','t',workdir,'{}','running',9.0,'cfg',id,id,2 FROM agents WHERE id=?",
             [members[0].0.as_str()],
         )
         .unwrap();
@@ -2662,8 +2662,8 @@ fn pool_activity_projects_lifecycle_without_changing_stored_state() {
     store
         .conn
         .execute(
-            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id,parent_agent_id,sequence) \
-             SELECT 'ag-20260101-000000-0000000078',runtime,model,profile,'t','t',workdir,'{}','running',9.0,10.0,'cfg',id,id,2 FROM agents WHERE id=?",
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id,parent_agent_id,sequence) \
+             SELECT 'ag-20260101-000000-0000000078',runtime,model,profile,'t','t',workdir,'{}','running',9.0,'cfg',id,id,2 FROM agents WHERE id=?",
             [members[0].0.as_str()],
         )
         .unwrap();

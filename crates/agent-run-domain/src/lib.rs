@@ -26,7 +26,7 @@ pub use catalog::{
     SecretHandle, SecretRef, SelectionIntent,
 };
 pub use credential_ref::CredentialRef;
-pub use error::{Error, MachineCode, ProtocolMapping, PublicError, Result};
+pub use error::{Error, MachineCode, OwnershipStage, ProtocolMapping, PublicError, Result};
 pub use fsm::{ACTIVE, TERMINAL, validate_transition};
 pub use provider_start::ProviderStartRequest;
 pub use tools::{

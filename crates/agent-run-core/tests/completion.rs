@@ -197,45 +197,36 @@ fn cancel_records_the_answer_evidence_it_had() {
     assert_eq!(outcome.failure_text.as_deref(), Some("silence=3.0s/active"));
 }
 
-/// Mirrors `test_cancel_and_timeout_preserve_a_complete_answer`. Rust's
-/// `Outcome` carries no `answer_*` fields (see `verify::completion` module
-/// docs) — the caller already holds the `AnswerProof`/`Proof` it built, so
-/// this checks that value directly instead of round-tripping it through
-/// `Outcome`.
+/// Cancellation preserves the caller's complete answer evidence and native session.
 #[test]
-fn cancel_and_timeout_preserve_a_complete_answer() {
+fn cancel_preserves_a_complete_answer() {
     let h = common::Home::new();
     let body = format!("usable partial result\n{SENTINEL}\n");
     let answer = proof(&h.path, Some(&body));
-    for (reason, status) in [
-        (verify::StopReason::Cancel, Status::Cancelled),
-        (verify::StopReason::Timeout, Status::TimedOut),
-    ] {
-        let outcome = verify::verify_completion(
-            Some(Outcome::success(Some("sess-stop".into()))),
-            Some(reason),
-            Some(&answer),
-            true,
-            None,
-            0.0,
-            60.0,
-        )
-        .unwrap();
-        assert_eq!(outcome.status, status);
-        assert_eq!(outcome.runtime_session_id.as_deref(), Some("sess-stop"));
-        assert!(answer.complete());
-        assert_eq!(answer.size_bytes, body.len() as u64);
-    }
+    let outcome = verify::verify_completion(
+        Some(Outcome::success(Some("sess-stop".into()))),
+        Some(verify::StopReason::Cancel),
+        Some(&answer),
+        true,
+        None,
+        0.0,
+        60.0,
+    )
+    .unwrap();
+    assert_eq!(outcome.status, Status::Cancelled);
+    assert_eq!(outcome.runtime_session_id.as_deref(), Some("sess-stop"));
+    assert!(answer.complete());
+    assert_eq!(answer.size_bytes, body.len() as u64);
 }
 
-/// Mirrors `test_timeout_without_any_answer_reports_silence`.
+/// Explicit cancellation without an answer retains truthful silence diagnostics.
 #[test]
-fn timeout_without_any_answer_reports_silence() {
+fn cancel_without_any_answer_reports_silence() {
     let h = common::Home::new();
     let answer = proof(&h.path, None);
     let outcome = verify::verify_completion(
         None,
-        Some(verify::StopReason::Timeout),
+        Some(verify::StopReason::Cancel),
         Some(&answer),
         true,
         None,
@@ -243,7 +234,7 @@ fn timeout_without_any_answer_reports_silence() {
         60.0,
     )
     .unwrap();
-    assert_eq!(outcome.status, Status::TimedOut);
+    assert_eq!(outcome.status, Status::Cancelled);
     assert_eq!(outcome.failure_kind.as_deref(), Some(NO_ANSWER));
     assert_eq!(outcome.failure_text.as_deref(), Some("silence=no_progress"));
 }
@@ -256,7 +247,7 @@ fn unknown_stop_reason_is_refused() {
     assert!(
         verify::verify_completion_with_stop_reason(
             None,
-            Some("unknown"),
+            Some("timeout"),
             Some(&answer),
             true,
             None,
@@ -267,14 +258,14 @@ fn unknown_stop_reason_is_refused() {
     );
 }
 
-/// Mirrors `test_timeout_with_a_silent_engine_says_silent`.
+/// A cancelled silent engine remains cancelled and keeps incomplete-answer evidence.
 #[test]
-fn timeout_with_a_silent_engine_says_silent() {
+fn cancel_with_a_silent_engine_says_silent() {
     let h = common::Home::new();
     let answer = proof(&h.path, Some("cut off"));
     let outcome = verify::verify_completion(
         None,
-        Some(verify::StopReason::Timeout),
+        Some(verify::StopReason::Cancel),
         Some(&answer),
         true,
         Some(10.0),
@@ -305,7 +296,7 @@ fn engine_success_without_a_complete_answer_is_a_failure() {
 }
 
 /// Mirrors `test_success_with_a_complete_answer_carries_the_proof` (adapted:
-/// see `cancel_and_timeout_preserve_a_complete_answer` docs above).
+/// see `cancel_preserves_a_complete_answer` docs above).
 #[test]
 fn success_with_a_complete_answer_passes_through() {
     let h = common::Home::new();

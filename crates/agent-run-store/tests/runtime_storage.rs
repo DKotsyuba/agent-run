@@ -497,9 +497,9 @@ fn rows_survive_history_and_removal_requires_no_references() {
         .conn
         .execute(
             "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,\
-             status,created_at,timeout_seconds,config_revision,identity_json) \
+             status,created_at,config_revision,identity_json) \
              VALUES('agt_ref','mock','fixture','review','task','summary','/tmp','{}','failed',1.0,\
-             10.0,'cfg',?)",
+             'cfg',?)",
             rusqlite::params![identity.to_string()],
         )
         .unwrap();

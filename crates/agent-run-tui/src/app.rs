@@ -1160,7 +1160,6 @@ mod tests {
             "elapsed_seconds": 1.0,
             "last_progress_at": None::<f64>,
             "silence_seconds": None::<f64>,
-            "warned": false,
             "failure_kind": None::<String>,
             "failure_text": None::<String>,
             "answer_available": false,

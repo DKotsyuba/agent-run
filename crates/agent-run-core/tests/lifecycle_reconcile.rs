@@ -23,13 +23,8 @@ use std::{
 };
 
 /// Admit a row without launching a supervisor, returning its durable id.
-fn admitted(
-    home: &common::Home,
-    store: &mut Store,
-    timeout: Option<f64>,
-) -> agent_run_core::domain::AgentId {
-    let mut request = home.request();
-    request.timeout_seconds = timeout;
+fn admitted(home: &common::Home, store: &mut Store) -> agent_run_core::domain::AgentId {
+    let request = home.request();
     store
         .admit(&request, &home.config, &json!({}), None)
         .expect("admission succeeds")
@@ -66,7 +61,7 @@ fn active(
 fn broker_crash_reconciles_only_a_dead_start_owner() {
     let home = common::Home::new();
     let mut store = home.store();
-    let id = admitted(&home, &mut store, None);
+    let id = admitted(&home, &mut store);
     store
         .conn
         .execute(
@@ -97,7 +92,7 @@ fn broker_crash_reconciles_only_a_dead_start_owner() {
 fn dead_pre_spawn_supervisor_releases_prepared_attempt() {
     let home = common::Home::new();
     let mut store = home.store();
-    let id = admitted(&home, &mut store, None);
+    let id = admitted(&home, &mut store);
     store.conn.execute(
         "UPDATE agents SET status='starting',supervisor_pid=4246,supervisor_identity='linux:fixture:6',supervisor_birth_time=6.0,heartbeat_at=? WHERE id=?",
         rusqlite::params![agent_run_core::domain::now(), id.as_str()],
@@ -159,7 +154,7 @@ fn dead_pre_spawn_supervisor_cleans_journaled_mcp_discovery() {
     owned.refresh();
     let home = common::Home::new();
     let mut store = home.store();
-    let id = admitted(&home, &mut store, None);
+    let id = admitted(&home, &mut store);
     active(&store, &id, 4246, "fixture:dead:6", 6.0);
     store.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,phase,ownership_active) VALUES('att_probe',?,1,'prepared','{}',?,'prepared',1)",rusqlite::params![id.as_str(),agent_run_core::domain::now()]).unwrap();
     store.bind_attempt("att_probe");
@@ -195,7 +190,7 @@ fn dead_pre_spawn_supervisor_cleans_journaled_mcp_discovery() {
 fn dead_supervisor_without_group_keeps_uncertain_spawn_owned() {
     let home = common::Home::new();
     let mut store = home.store();
-    let id = admitted(&home, &mut store, None);
+    let id = admitted(&home, &mut store);
     store.conn.execute(
         "UPDATE agents SET status='starting',supervisor_pid=4247,supervisor_identity='linux:fixture:7',supervisor_birth_time=7.0,heartbeat_at=? WHERE id=?",
         rusqlite::params![agent_run_core::domain::now(), id.as_str()],
@@ -231,7 +226,7 @@ fn dead_supervisor_without_group_keeps_uncertain_spawn_owned() {
 fn reused_pid_is_lost_with_identity_mismatch() {
     let home = common::Home::new();
     let mut store = home.store();
-    let id = admitted(&home, &mut store, None);
+    let id = admitted(&home, &mut store);
     active(&store, &id, 4243, "linux:fixture:2", 2.0);
 
     let changed = reconcile_with(&mut store, 10, |_, _, _| ProcessState::Reused).unwrap();
@@ -251,7 +246,7 @@ fn reused_pid_is_lost_with_identity_mismatch() {
 fn lost_reconciliation_finalizes_pending_commands() {
     let home = common::Home::new();
     let mut store = home.store();
-    let id = admitted(&home, &mut store, None);
+    let id = admitted(&home, &mut store);
     active(&store, &id, 4245, "linux:fixture:4", 4.0);
     store
         .enqueue(&id, "steer", &json!({"text":"continue"}))
@@ -293,7 +288,7 @@ fn lost_reconciliation_finalizes_pending_commands() {
 fn lost_reconciliation_is_atomic_with_command_finalization() {
     let home = common::Home::new();
     let mut store = home.store();
-    let id = admitted(&home, &mut store, None);
+    let id = admitted(&home, &mut store);
     active(&store, &id, 4246, "linux:fixture:5", 5.0);
     store
         .enqueue(&id, "steer", &json!({"text":"claimed"}))
@@ -344,7 +339,7 @@ fn lost_reconciliation_is_atomic_with_command_finalization() {
 fn unknown_observation_never_reconciles_an_active_row() {
     let home = common::Home::new();
     let mut store = home.store();
-    let id = admitted(&home, &mut store, None);
+    let id = admitted(&home, &mut store);
     active(&store, &id, 4244, "linux:fixture:3", 3.0);
 
     assert!(
@@ -362,7 +357,7 @@ fn fair_cursor_advances_past_live_rows_to_a_late_dead_supervisor() {
     let mut store = home.store();
     let ids = (0..3)
         .map(|index| {
-            let id = admitted(&home, &mut store, None);
+            let id = admitted(&home, &mut store);
             active(
                 &store,
                 &id,
@@ -401,7 +396,7 @@ fn fair_cursor_advances_past_live_rows_to_a_late_dead_supervisor() {
 fn killed_supervisor_is_observed_dead_by_the_native_platform_probe() {
     let home = common::Home::new();
     let mut store = home.store();
-    let id = admitted(&home, &mut store, None);
+    let id = admitted(&home, &mut store);
     let mut child = Command::new("sh").args(["-c", "sleep 5"]).spawn().unwrap();
     let identity = process::inspect(child.id() as i32).expect("child identity");
     active(&store, &id, identity.pid, &identity.token, identity.birth);
@@ -420,7 +415,7 @@ fn killed_supervisor_is_observed_dead_by_the_native_platform_probe() {
 fn python_test_state_outbox_reconciliation_requires_valid_supplied_proof() {
     let home = common::Home::new();
     let mut store = home.store();
-    let id = admitted(&home, &mut store, None);
+    let id = admitted(&home, &mut store);
     assert!(reconcile_reaped_agent(&mut store, &id, 1, 3.0).is_err());
     assert_eq!(store.get(&id).unwrap().status, Status::Starting);
     active(&store, &id, 100, "pid100:start1", 20.0);
@@ -444,9 +439,9 @@ fn python_test_state_outbox_reconciliation_requires_valid_supplied_proof() {
 fn python_test_state_outbox_reaped_supervisor_reconciles_only_active_rows() {
     let home = common::Home::new();
     let mut store = home.store();
-    let dead = admitted(&home, &mut store, None);
-    let other = admitted(&home, &mut store, None);
-    let terminal = admitted(&home, &mut store, None);
+    let dead = admitted(&home, &mut store);
+    let other = admitted(&home, &mut store);
+    let terminal = admitted(&home, &mut store);
     active(&store, &dead, 100, "pid-100", 1.0);
     active(&store, &other, 200, "pid-200", 1.0);
     active(&store, &terminal, 100, "pid-100", 1.0);
@@ -472,11 +467,11 @@ fn python_test_state_outbox_reaped_supervisor_reconciles_only_active_rows() {
 fn python_test_state_outbox_reaped_agent_closes_pre_identity_starting_window() {
     let home = common::Home::new();
     let mut store = home.store();
-    let id = admitted(&home, &mut store, None);
+    let id = admitted(&home, &mut store);
     assert!(reconcile_reaped_agent(&mut store, &id, 321, 3.0).unwrap());
     assert_eq!(store.get(&id).unwrap().status, Status::Lost);
     assert!(!reconcile_reaped_agent(&mut store, &id, 321, 4.0).unwrap());
-    let other = admitted(&home, &mut store, None);
+    let other = admitted(&home, &mut store);
     active(&store, &other, 999, "pid-999", 1.0);
     assert!(!reconcile_reaped_agent(&mut store, &other, 321, 7.0).unwrap());
     assert_eq!(store.get(&other).unwrap().status, Status::Running);
@@ -487,7 +482,7 @@ fn python_test_state_outbox_reaped_agent_closes_pre_identity_starting_window() {
 fn python_test_state_outbox_supervisor_group_refines_once() {
     let home = common::Home::new();
     let mut store = home.store();
-    let id = admitted(&home, &mut store, None);
+    let id = admitted(&home, &mut store);
     store
         .record_supervisor(&id, 100, "pid-100", 100, None, 6.0)
         .unwrap();
@@ -522,9 +517,9 @@ fn python_test_state_outbox_supervisor_group_refines_once() {
 fn python_test_state_outbox_sweep_closes_dead_supervisors_without_signalling() {
     let home = common::Home::new();
     let mut store = home.store();
-    let surviving = admitted(&home, &mut store, None);
-    let foreign = admitted(&home, &mut store, None);
-    let terminal = admitted(&home, &mut store, None);
+    let surviving = admitted(&home, &mut store);
+    let foreign = admitted(&home, &mut store);
+    let terminal = admitted(&home, &mut store);
     active(&store, &surviving, 100, "pid-100", 1.0);
     active(&store, &foreign, 101, "pid-101", 1.0);
     active(&store, &terminal, 102, "pid-102", 1.0);
@@ -547,10 +542,10 @@ fn python_test_state_outbox_sweep_closes_dead_supervisors_without_signalling() {
 fn python_test_state_outbox_sweep_reconciles_only_proven_reused_pid() {
     let home = common::Home::new();
     let mut store = home.store();
-    let exact = admitted(&home, &mut store, None);
-    let boundary = admitted(&home, &mut store, None);
-    let unavailable = admitted(&home, &mut store, None);
-    let mismatch = admitted(&home, &mut store, None);
+    let exact = admitted(&home, &mut store);
+    let boundary = admitted(&home, &mut store);
+    let unavailable = admitted(&home, &mut store);
+    let mismatch = admitted(&home, &mut store);
     for (id, pid, birth) in [
         (&exact, 200, 20.0),
         (&boundary, 201, 21.0),
@@ -580,8 +575,8 @@ fn python_test_state_outbox_sweep_reconciles_only_proven_reused_pid() {
 fn python_test_state_outbox_one_stale_row_does_not_abort_sweep() {
     let home = common::Home::new();
     let mut store = home.store();
-    let stale = admitted(&home, &mut store, None);
-    let healthy = admitted(&home, &mut store, None);
+    let stale = admitted(&home, &mut store);
+    let healthy = admitted(&home, &mut store);
     active(&store, &stale, 300, "pid-300", 1.0);
     active(&store, &healthy, 301, "pid-301", 2.0);
     store
@@ -602,8 +597,8 @@ fn python_test_state_outbox_one_stale_row_does_not_abort_sweep() {
 fn python_test_state_outbox_each_row_is_timed_after_its_probe() {
     let home = common::Home::new();
     let mut store = home.store();
-    let first = admitted(&home, &mut store, None);
-    let second = admitted(&home, &mut store, None);
+    let first = admitted(&home, &mut store);
+    let second = admitted(&home, &mut store);
     active(&store, &first, 400, "pid-400", 1.0);
     active(&store, &second, 401, "pid-401", 1.0);
     let path = home.path.clone();
@@ -629,7 +624,7 @@ fn python_test_state_outbox_each_row_is_timed_after_its_probe() {
 async fn wait_observes_a_terminal_transition_committed_by_another_connection() {
     let home = common::Home::new();
     let mut initial = home.store();
-    let id = admitted(&home, &mut initial, Some(0.001));
+    let id = admitted(&home, &mut initial);
     active(&initial, &id, 4400, "linux:fixture:wait", 4.0);
     drop(initial);
     let path = home.path.clone();
@@ -656,7 +651,7 @@ async fn wait_observes_a_terminal_transition_committed_by_another_connection() {
 async fn wait_honors_its_own_bound_without_using_the_legacy_run_timeout() {
     let home = common::Home::new();
     let mut store = home.store();
-    let id = admitted(&home, &mut store, Some(0.001));
+    let id = admitted(&home, &mut store);
     active(&store, &id, 4401, "linux:fixture:bound", 5.0);
     let started = Instant::now();
     let value = Service::new(home.path.clone())
@@ -673,9 +668,9 @@ async fn wait_honors_its_own_bound_without_using_the_legacy_run_timeout() {
 fn identity_less_starting_rows_are_never_lost_by_age() {
     let home = common::Home::new();
     let mut store = home.store();
-    let stale = admitted(&home, &mut store, None);
-    let recent = admitted(&home, &mut store, None);
-    let owned = admitted(&home, &mut store, None);
+    let stale = admitted(&home, &mut store);
+    let recent = admitted(&home, &mut store);
+    let owned = admitted(&home, &mut store);
     clear_startup_claim(&store, &stale);
     clear_startup_claim(&store, &recent);
     clear_startup_claim(&store, &owned);
@@ -732,7 +727,7 @@ fn lost_convergence_releases_active_capacity() {
 fn live_owner_survives_elapsed_startup_deadline() {
     let home = common::Home::new();
     let mut store = home.store();
-    let id = admitted(&home, &mut store, None);
+    let id = admitted(&home, &mut store);
     clear_startup_claim(&store, &id);
     store
         .claim_startup(
@@ -757,7 +752,7 @@ fn live_owner_survives_elapsed_startup_deadline() {
 fn handoff_renews_deadline_until_late_supervisor_proof() {
     let home = common::Home::new();
     let mut store = home.store();
-    let id = admitted(&home, &mut store, None);
+    let id = admitted(&home, &mut store);
     clear_startup_claim(&store, &id);
     let owner = "123 detached-supervisor";
     store
@@ -798,7 +793,7 @@ fn handoff_renews_deadline_until_late_supervisor_proof() {
 fn elapsed_handoff_with_live_owner_remains_starting() {
     let home = common::Home::new();
     let mut store = home.store();
-    let id = admitted(&home, &mut store, None);
+    let id = admitted(&home, &mut store);
     clear_startup_claim(&store, &id);
     let owner = "123 detached-supervisor";
     store
@@ -826,7 +821,7 @@ fn generated_handoff_never_uses_elapsed_time_as_loss_proof() {
             for ready_before_expiry in [false, true] {
                 let home = common::Home::new();
                 let mut store = home.store();
-                let id = admitted(&home, &mut store, None);
+                let id = admitted(&home, &mut store);
                 clear_startup_claim(&store, &id);
                 let owner = "123 generated-owner";
                 store
@@ -866,7 +861,7 @@ fn generated_handoff_never_uses_elapsed_time_as_loss_proof() {
 fn delayed_startup_can_bind_a_supervisor() {
     let home = common::Home::new();
     let mut store = home.store();
-    let id = admitted(&home, &mut store, None);
+    let id = admitted(&home, &mut store);
     clear_startup_claim(&store, &id);
     store
         .claim_startup(&id, "1 stale", None, 10.0, 1.0)
@@ -883,7 +878,7 @@ fn delayed_startup_can_bind_a_supervisor() {
 fn owned_supervisor_can_refine_its_group_after_startup_expiry() {
     let home = common::Home::new();
     let mut store = home.store();
-    let id = admitted(&home, &mut store, None);
+    let id = admitted(&home, &mut store);
     clear_startup_claim(&store, &id);
     store
         .claim_startup(&id, "1 owner", None, 10.0, 1.0)
@@ -909,8 +904,8 @@ fn lost_agent_with_attempt(
     store
         .conn
         .execute(
-            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id,process_group_id) \
-             VALUES(?1,'mock','fixture','review','t','t','/tmp','{}','lost',?2,1.0,'fixture',?1,?3)",
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id,process_group_id) \
+             VALUES(?1,'mock','fixture','review','t','t','/tmp','{}','lost',?2,'fixture',?1,?3)",
             rusqlite::params![agent, created, group],
         )
         .unwrap();

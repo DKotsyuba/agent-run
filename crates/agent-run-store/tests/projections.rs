@@ -25,7 +25,28 @@ fn python_test_service_fixture_pages_are_ordered_and_cursor_stable() {
     assert_eq!(page.items.len(), 2);
     assert!(page.items[0].created_at >= page.items[1].created_at);
     assert_eq!(page.next_offset, Some(2));
-    assert_eq!(page.revision, 40);
+    // The original forty events remain byte-positioned; migration appends one
+    // historical policy event for each of the eleven existing agents.
+    assert_eq!(page.revision, 51);
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM events WHERE seq<=40", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        40
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind=\'historical_execution_policy\'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        11
+    );
 }
 
 /// Mirrors Python `test_state_store.py::test_transcript_uses_immutable_sequence_cursors`.

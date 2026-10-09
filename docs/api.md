@@ -142,9 +142,8 @@ member voted ready on one proposal, ended successfully, cleanup verified) and
 delivers exactly one common notice; that is not proof the result is correct.
 
 An attached existing member keeps its current owned RUNNING execution, task,
-account, grants, native session, reservation and original deadline. Its admission
-member row adds `existing: true` and an `enrollment` view (`state`, remaining
-seconds, optional failure reason); ordinary new-only member shapes stay unchanged.
+account, grants, native session and reservation. Its admission
+member row adds `existing: true` and an `enrollment` view (`state`, optional failure reason); ordinary new-only member shapes stay unchanged.
 The worker-only `pool_read` adds its own attempt-pinned ACK challenge. Only an
 exact `pool_post` summary using that challenge changes `pending` to `joined`;
 unjoined members cannot vote or settle. `needs_action` reports failed awareness

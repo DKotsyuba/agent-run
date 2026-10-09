@@ -262,6 +262,14 @@ fn main() {
             .to_owned();
         (task, Some(value))
     };
+    // Each qualified load scenario starts behind the same owned barrier; the
+    // suffix selects an existing finite native protocol fault after admission.
+    let task = if let Some(mode) = task.strip_prefix("fixture:load-barrier:") {
+        wait_marker("fixture-load-release");
+        format!("fixture:{mode}")
+    } else {
+        task
+    };
     let mut result_input = input
         .as_ref()
         .and_then(|input| input.get("uuid"))
@@ -271,6 +279,11 @@ fn main() {
     // proof that every peer identity was already committed when it started.
     if task.contains("fixture:pool-observe") {
         std::fs::write("pool-observed.txt", &task).expect("fixture pool record");
+    }
+    // Finite cohort barrier for the real-broker load fixture. No paid turn,
+    // external signal, credential read or unrelated process is involved.
+    if task == "fixture:load-barrier" {
+        wait_marker("fixture-load-release");
     }
     if task == "fixture:slow-start" {
         std::thread::sleep(Duration::from_secs(2));
@@ -328,6 +341,20 @@ fn main() {
     emit(
         json!({"type":"assistant","session_id":session,"message":{"content":[{"type":"text","text":"fixture partial\n"}]}}),
     );
+    if task == "fixture:dense-tools" {
+        for n in 0..200 {
+            let id = format!("load-tool-{n}");
+            emit(
+                json!({"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","id":id,"name":"fixture_tool"}}}),
+            );
+            emit(
+                json!({"type":"assistant","session_id":session,"message":{"id":format!("load-message-{n}"),"role":"assistant","content":[{"type":"tool_use","id":id,"name":"fixture_tool","input":{}}]}}),
+            );
+            emit(
+                json!({"type":"user","session_id":session,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":id,"is_error":false,"content":"synthetic result"}]}}),
+            );
+        }
+    }
     if task == "fixture:truncated" {
         // No terminating newline: the reader must reject this as a truncated
         // frame instead of blocking forever or dropping it silently.

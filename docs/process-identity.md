@@ -25,7 +25,8 @@ TERM immediately to captured live descendants. Queued output drains without
 counting downstream processing time as silence; each idle read after exit is
 limited to 200ms. Cancellation of a read does not reset its idle deadline.
 Captured writers still alive after two seconds receive KILL even if they keep
-producing output. The overall run deadline also bounds unobserved writers.
+producing output. There is no overall execution deadline; ownership checkpoints and the bounded
+post-exit cleanup path remain responsible for process evidence.
 The supervisor then completes bounded escalation and
 records the final cleanup proof. Normal protocol completion still follows the
 same supervisor cleanup path even if the primary PID has not exited yet.

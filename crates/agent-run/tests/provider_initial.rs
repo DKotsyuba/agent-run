@@ -395,8 +395,7 @@ readiness={command="/usr/bin/true"}
     let mut broker = resident_broker(&home);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
     broker_ready(&home, &mut broker).await;
-    let mut request = request(&home);
-    request.timeout_seconds = Some(10.0);
+    let request = request(&home);
     let submitted = socket::client(&home, "start", serde_json::to_value(request).unwrap())
         .await
         .unwrap();
@@ -483,8 +482,7 @@ readiness={command="/bin/sh",args=["-c","printf started > probe-started; exec /b
     let _cleanup = ServiceProcesses(home.clone());
     let mut broker = resident_broker(&home);
     broker_ready(&home, &mut broker).await;
-    let mut request = request(&home);
-    request.timeout_seconds = Some(8.0);
+    let request = request(&home);
     let submitted = socket::client(&home, "start", serde_json::to_value(request).unwrap())
         .await
         .unwrap();
@@ -657,8 +655,7 @@ async fn managed_services_real_codegraph_qualification() {
     );
     fs::write(home.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
     let service = Service::new(home.clone());
-    let mut request = request(&home);
-    request.timeout_seconds = Some(40.0);
+    let request = request(&home);
     let accepted = service
         .admit_provider_trusted(request, candidates(committed(&home)))
         .unwrap();
@@ -1114,65 +1111,70 @@ async fn provider_start_completes_one_owned_fake_engine_attempt() {
     assert_eq!(replay["agent_id"], admitted["agent_id"]);
 }
 
-/// Characterizes a complete, valid success result followed by a root engine
-/// that keeps its stdout open (`fixture:result-then-hang`, 20 s ceiling) under a
-/// short run deadline. EOF plus the exit proof stay mandatory, so the result
-/// alone is not success: the deadline ends the run as `timed_out`, cleanup
-/// terminates the engine long before the fixture's own ceiling, and the
-/// final-result text is *not* promoted to a sealed answer. The streamed
-/// assistant transcript remains durable. Documents the policy gap that an
-/// already-received result is discarded when the deadline wins.
+/// A valid result does not end a still-live provider engine. Old admission age
+/// never signals it; explicit cancellation preserves transcript and cleanup evidence.
 #[tokio::test]
-async fn result_then_hang_is_ended_by_the_run_deadline() {
+async fn result_then_hang_waits_for_explicit_cancellation() {
     let (_temp, home) = home();
-    // Declared after the temp dir so it drops first and terminates any engine
-    // the failed assertions below left behind.
     let _processes = ServiceProcesses(home.clone());
     let service = Service::new(home.clone());
     let mut request = request(&home);
     request.task = "fixture:result-then-hang".into();
-    request.timeout_seconds = Some(3.0);
     let admitted = service
         .admit_provider_trusted(request, candidates(committed(&home)))
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
-    let started = std::time::Instant::now();
     let mut child = supervisor(&home, &id);
-    let exit = tokio::time::timeout(Duration::from_secs(20), child.wait())
-        .await
-        .expect("supervisor outlived the fixture's own 20 s ceiling")
+    let started = std::time::Instant::now();
+    loop {
+        let count: i64 = Store::open(&home).unwrap().conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE agent_id=? AND role='assistant' AND content LIKE '%fixture partial%'",
+            [id.as_str()], |r| r.get(0),
+        ).unwrap();
+        if count > 0 {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(10));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    Store::open(&home)
+        .unwrap()
+        .conn
+        .execute(
+            "UPDATE agents SET created_at=created_at-7776000 WHERE id=?",
+            [id.as_str()],
+        )
         .unwrap();
-    let elapsed = started.elapsed();
-    assert!(exit.success(), "supervisor exit: {exit}");
-    // The 3 s deadline plus bounded cleanup; far below the engine's ceiling.
-    assert!(elapsed < Duration::from_secs(12), "elapsed {elapsed:?}");
-    let store = Store::open(&home).unwrap();
-    let row = store.get(&id).unwrap();
-    assert_eq!(row.status, Status::TimedOut);
-    assert_eq!(row.failure_kind.as_deref(), Some("no_answer"));
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), child.wait())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        Store::open(&home).unwrap().get(&id).unwrap().status,
+        Status::Running
+    );
     assert_eq!(service.answer(&id).unwrap()["available"], false);
+    service.cancel(&id).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(20), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    let store = Store::open(&home).unwrap();
+    assert_eq!(store.get(&id).unwrap().status, Status::Cancelled);
     assert!(
         store
             .last_event(&id, "run_deadline_expired")
             .unwrap()
-            .is_some()
+            .is_none()
     );
-    let cleanup = store
-        .last_event(&id, "process_cleanup")
-        .unwrap()
-        .expect("process_cleanup event recorded");
-    assert_eq!(cleanup["confirmed"], true);
-    assert_eq!(cleanup["group_gone"], true);
-    let assistant: String = store
-        .conn
-        .query_row(
-            "SELECT COALESCE(group_concat(content, ''),'') FROM messages \
-             WHERE agent_id=? AND role='assistant'",
-            [id.as_str()],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert!(assistant.contains("fixture partial"));
+    assert_eq!(
+        store.last_event(&id, "process_cleanup").unwrap().unwrap()["confirmed"],
+        true
+    );
 }
 
 /// Automatic selection freezes the eligible scope without inventing a
@@ -1565,6 +1567,48 @@ async fn provider_replay_precedes_changed_config_and_quota() {
         .unwrap();
     assert_eq!(replay["created"], false);
     assert_eq!(replay["agent_id"], admitted["agent_id"]);
+    let mut historical = identity.clone();
+    historical["provider_request"]["timeout_seconds"] = serde_json::json!(600.0);
+    let mut legacy_raw = historical["provider_request"].clone();
+    legacy_raw["orchestrator"]["transport"] = serde_json::json!("codex");
+    historical["replay_request_sha256"] =
+        serde_json::json!(agent_run_domain::canonical::sha256_hex(&legacy_raw, true));
+    let frozen_bytes = historical.to_string();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET identity_json=? WHERE id=?",
+            (&frozen_bytes, id.as_str()),
+        )
+        .unwrap();
+    let old_replay = service
+        .admit_provider_observed(original.clone(), &mut |_| {
+            panic!("historical replay must not rank or submit")
+        })
+        .unwrap();
+    assert_eq!(old_replay["agent_id"], admitted["agent_id"]);
+    assert_eq!(old_replay["created"], false);
+    let retained: String = store
+        .conn
+        .query_row(
+            "SELECT identity_json FROM agents WHERE id=?",
+            [id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, frozen_bytes);
+    historical["provider_request"]["timeout_seconds"] = serde_json::json!(601.0);
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET identity_json=? WHERE id=?",
+            (historical.to_string(), id.as_str()),
+        )
+        .unwrap();
+    assert!(matches!(
+        service.admit_provider(original.clone()),
+        Err(agent_run_domain::Error::Conflict)
+    ));
     let mut conflicting = original;
     conflicting.task = "fixture:other".into();
     assert!(matches!(
@@ -1746,15 +1790,13 @@ async fn provider_harness_options_are_validated_and_carried() {
     );
 }
 
-/// Configured effort choices and the timeout bound are enforced before any
-/// row exists: an effort outside `allowed_params.effort` and an absurd
-/// `timeout_seconds` (initial or as a resume override) are validation errors
-/// that write nothing, while an allowed effort is admitted.
+/// Configured effort choices remain validated before admission; rejected effort
+/// writes no row and an allowed or valid default effort remains frozen.
 #[tokio::test]
-async fn provider_effort_and_timeout_are_bounded_before_admission() {
+async fn provider_effort_is_validated_before_admission() {
     let (_temp, home) = home();
     let service = Service::new(home.clone());
-    let parent = completed_parent(&home, &service, "bounded-parent").await;
+    completed_parent(&home, &service, "bounded-parent").await;
     edit_config(&home, |config| {
         let offering = &mut config["providers"]["glm-user"]["models"][0];
         offering.as_table_mut().unwrap().insert(
@@ -1765,22 +1807,6 @@ async fn provider_effort_and_timeout_are_bounded_before_admission() {
     let mut low = request_for(&home, "glm-user", "effort-low", None);
     low.effort = Some("low".into());
     let refused = service.admit_provider(low).unwrap_err();
-    assert_eq!(refused.machine_code().as_str(), "ValidationError");
-    let mut huge = request_for(&home, "glm-user", "timeout-huge", None);
-    huge.timeout_seconds = Some(1e308);
-    let refused = service.admit_provider(huge).unwrap_err();
-    assert_eq!(refused.machine_code().as_str(), "ValidationError");
-    let parent_row = Store::open(&home).unwrap().get(&parent).unwrap();
-    let refused = service
-        .admit_provider_resume(
-            &parent_row,
-            "fixture:answer".into(),
-            Some(1e308),
-            Some("resume-huge".into()),
-            None,
-            None,
-        )
-        .unwrap_err();
     assert_eq!(refused.machine_code().as_str(), "ValidationError");
     assert_eq!(rows(&home), (1, 1), "refused requests write nothing");
     let mut high = request_for(&home, "glm-user", "effort-high", None);
@@ -1869,7 +1895,6 @@ async fn provider_resume_checks_frozen_default_effort() {
     let refused = service.admit_provider_resume(
         &parent,
         "fixture:answer".into(),
-        None,
         Some("default-effort-revoked".into()),
         None,
         None,
@@ -1961,7 +1986,6 @@ async fn provider_resume_continues_the_proven_native_session() {
         service.admit_provider_resume(
             &Store::open(&home).unwrap().get(&id).unwrap(),
             "fixture:answer".into(),
-            None,
             Some(request_id.into()),
             None,
             Some(orchestrator.clone()),
@@ -2087,7 +2111,6 @@ async fn provider_resume_continues_the_proven_native_session() {
         .admit_provider_resume(
             &Store::open(&home).unwrap().get(&child_id).unwrap(),
             "fixture:answer".into(),
-            None,
             Some("resume-3".into()),
             None,
             Some(orchestrator.clone()),
@@ -2151,7 +2174,6 @@ async fn provider_resume_honors_new_model_restrictions() {
     let resumed = service.admit_provider_resume(
         &parent,
         "fixture:answer".into(),
-        None,
         Some("revoked-resume".into()),
         None,
         None,
@@ -2186,7 +2208,6 @@ async fn concurrent_provider_resumes_admit_one_child() {
                     .admit_provider_resume(
                         &parent,
                         "fixture:answer".into(),
-                        None,
                         Some(format!("race-{index}")),
                         None,
                         Some(
@@ -2255,7 +2276,6 @@ async fn provider_resume_enforces_current_alias_role_and_cap() {
             .admit_provider_resume(
                 &parent(),
                 "fixture:answer".into(),
-                None,
                 Some(request_id.into()),
                 None,
                 None,
@@ -2347,7 +2367,6 @@ async fn provider_resume_enforces_mcp_caps_and_keeps_frozen_global_selection() {
         service.admit_provider_resume(
             &parent,
             "fixture:answer".into(),
-            None,
             Some(key.into()),
             None,
             None,
@@ -2415,7 +2434,6 @@ async fn cancelled_resume_never_spawns_or_touches_history() {
         .admit_provider_resume(
             &Store::open(&home).unwrap().get(&id).unwrap(),
             "fixture:answer".into(),
-            None,
             Some("cancelled-child".into()),
             None,
             None,
@@ -2586,7 +2604,6 @@ async fn handoff_refuses_a_seal_for_another_history_root() {
         .admit_provider_resume(
             &Store::open(&home).unwrap().get(&id).unwrap(),
             "fixture:answer".into(),
-            None,
             Some("root-child".into()),
             None,
             None,
@@ -3060,7 +3077,6 @@ async fn codex_global_fast_mode_start_and_resume_policy() {
         .admit_provider_resume(
             &parent,
             "fixture:usage".into(),
-            None,
             Some("global-fast-child".into()),
             None,
             None,
@@ -3090,7 +3106,6 @@ async fn codex_global_fast_mode_start_and_resume_policy() {
             .admit_provider_resume(
                 &parent,
                 "fixture:usage".into(),
-                None,
                 Some("global-fast-child".into()),
                 None,
                 None
@@ -3127,7 +3142,6 @@ async fn codex_global_fast_mode_start_and_resume_policy() {
         .admit_provider_resume(
             &child_row,
             "fixture:usage".into(),
-            None,
             Some("global-fast-disabled".into()),
             None,
             None,
@@ -3235,7 +3249,6 @@ async fn codex_resume_usage_and_display_names_are_durable() {
         .admit_provider_resume(
             &parent,
             "fixture:usage".into(),
-            None,
             Some("metadata-child".into()),
             None,
             None,
@@ -3248,7 +3261,6 @@ async fn codex_resume_usage_and_display_names_are_durable() {
             .admit_provider_resume(
                 &parent,
                 "fixture:usage".into(),
-                None,
                 Some("metadata-child".into()),
                 Some("工程師 / review".into()),
                 None
@@ -3260,7 +3272,6 @@ async fn codex_resume_usage_and_display_names_are_durable() {
         service.admit_provider_resume(
             &parent,
             "fixture:usage".into(),
-            None,
             Some("metadata-child".into()),
             Some("Changed".into()),
             None
@@ -3321,7 +3332,6 @@ async fn codex_resume_usage_and_display_names_are_durable() {
         .admit_provider_resume(
             &child_row,
             "fixture:usage".into(),
-            None,
             Some("metadata-renamed".into()),
             Some("Мария: follow-up".into()),
             None,
@@ -3496,7 +3506,6 @@ async fn inherited_identical_text_cannot_prove_an_explicit_child_task() {
         .admit_provider_resume(
             &Store::open(&home).unwrap().get(&parent).unwrap(),
             "fixture:original-task".into(),
-            None,
             Some("child-1".into()),
             None,
             None,
@@ -4047,13 +4056,11 @@ async fn reconcile_closes_a_never_spawned_owned_attempt() {
     assert_eq!(attempts(&home, &id).len(), 2);
 }
 
-/// Admits one automatic `codex-user` run with an optional timeout, without
-/// starting its supervisor.
-fn codex_admit(home: &Path, request_id: &str, timeout: Option<f64>) -> AgentId {
+/// Admits one automatic `codex-user` execution without starting its supervisor.
+fn codex_admit(home: &Path, request_id: &str) -> AgentId {
     let mut request: ProviderStartRequest = serde_json::from_value(serde_json::json!({
         "provider":"codex-user","model":"fixture","profile":"review",
         "task":"fixture:original-task","workdir":home,"request_id":request_id,
-        "timeout_seconds":timeout,
         "orchestrator":{"transport":"codex_queue","external_session_id":"codex-session"},
     }))
     .unwrap();
@@ -4064,70 +4071,63 @@ fn codex_admit(home: &Path, request_id: &str, timeout: Option<f64>) -> AgentId {
     serde_json::from_value(admitted["agent_id"].clone()).unwrap()
 }
 
-/// (created_at, finished_at) of the agent and of attempt `number`.
-fn times(home: &Path, id: &AgentId, number: u32) -> ((f64, f64), (f64, f64)) {
-    let store = Store::open(home).unwrap();
-    let agent = store
-        .conn
-        .query_row(
-            "SELECT created_at,finished_at FROM agents WHERE id=?",
-            [id.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    let attempt = store
-        .conn
-        .query_row(
-            "SELECT created_at,finished_at FROM attempts WHERE agent_id=? AND number=?",
-            rusqlite::params![id.as_str(), number],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    (agent, attempt)
-}
-
-/// With the configurable margin disabled, one deadline spans the whole run:
-/// A spends 3 s of a 5 s budget before exhaustion; B hangs and is stopped at
-/// the original deadline. A fresh B budget would end after at least 8 s.
-/// The larger consumed portion leaves cleanup headroom without relaxing the
-/// timing, confirmed-cleanup, single-timeout or attempt-count assertions.
+/// A switched native attempt has no inherited time budget. Old admission age
+/// cannot end its live engine; cancellation still releases both attempts exactly once.
 #[tokio::test]
-async fn one_deadline_spans_attempts_and_cleans_a_hung_engine() {
+async fn switched_engine_has_no_execution_lifetime() {
     let (_temp, home) = codex_home(["exhausted-slow", "ok-hold"]);
-    edit_config(&home, |config| {
-        config.as_table_mut().unwrap().insert(
-            "core".into(),
-            toml::Value::Table(toml::toml! { timeout_multiplier = 1.0 }),
-        );
-    });
-    let id = codex_admit(&home, "deadline-1", Some(5.0));
-    run_to_end(&home, &id).await;
-    let row = Store::open(&home).unwrap().get(&id).unwrap();
-    assert_eq!(row.status, Status::TimedOut, "{:?}", row.failure_text);
-    let attempts = attempts(&home, &id);
-    assert_eq!(attempts.len(), 2, "{attempts:?}");
-    assert!(
-        attempts.iter().all(|attempt| attempt.3 == 0),
-        "{attempts:?}"
-    );
-    let ((created, finished), (b_created, b_finished)) = times(&home, &id, 2);
-    assert!(b_created - created >= 1.4, "A consumed part of the budget");
-    assert!(
-        finished - created < 6.3,
-        "B only had the remainder: {}",
-        finished - created
-    );
-    assert!(
-        b_finished - b_created < 5.0 - 1.4,
-        "B's own runtime was the remainder"
-    );
-    let proof: String = Store::open(&home)
+    let _processes = ServiceProcesses(home.clone());
+    let id = codex_admit(&home, "unlimited-switch");
+    let mut child = supervisor(&home, &id);
+    let started = std::time::Instant::now();
+    loop {
+        if count(
+            &home,
+            "SELECT COUNT(*) FROM attempts WHERE agent_id=? AND number=2 AND state='running'",
+            &id,
+        ) == 1
+        {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(15));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    Store::open(&home)
         .unwrap()
+        .conn
+        .execute(
+            "UPDATE agents SET created_at=created_at-7776000 WHERE id=?",
+            [id.as_str()],
+        )
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), child.wait())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        Store::open(&home).unwrap().get(&id).unwrap().status,
+        Status::Running
+    );
+    Service::new(home.clone()).cancel(&id).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(20), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    let store = Store::open(&home).unwrap();
+    assert_eq!(store.get(&id).unwrap().status, Status::Cancelled);
+    let attempts = attempts(&home, &id);
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts.iter().all(|attempt| attempt.3 == 0));
+    let proof: String = store
         .conn
         .query_row(
             "SELECT cleanup_proof_json FROM attempts WHERE agent_id=? AND number=2",
             [id.as_str()],
-            |row| row.get(0),
+            |r| r.get(0),
         )
         .unwrap();
     assert!(proof.contains("\"confirmed\":true"), "{proof}");
@@ -4141,23 +4141,25 @@ async fn one_deadline_spans_attempts_and_cleans_a_hung_engine() {
     );
 }
 
-/// A deadline that expires while A finishes (positioned by shortening the
-/// durable timeout during A) allocates and spawns no B.
+/// Age is not a handoff veto: verified cleanup and history allow the next eligible
+/// account after quota exhaustion even when the admitted run is arbitrarily old.
 #[tokio::test]
-async fn expiry_between_attempts_spawns_no_next_attempt() {
+async fn old_execution_can_switch_after_quota_exhaustion() {
     let (_temp, home) = codex_home(["exhausted-hold", "ok"]);
-    let shorten = home.clone();
+    let aged = home.clone();
     let id = held_codex_run(&home, move |_| {
-        Store::open(&shorten)
+        Store::open(&aged)
             .unwrap()
             .conn
-            .execute("UPDATE agents SET timeout_seconds=0.001", [])
+            .execute("UPDATE agents SET created_at=created_at-7776000", [])
             .unwrap();
     })
     .await;
     let row = Store::open(&home).unwrap().get(&id).unwrap();
-    assert_eq!(row.status, Status::TimedOut, "{:?}", row.failure_text);
-    assert_eq!(attempts(&home, &id).len(), 1);
+    assert_eq!(row.status, Status::Succeeded, "{:?}", row.failure_text);
+    let attempts = attempts(&home, &id);
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts.iter().all(|attempt| attempt.3 == 0));
 }
 
 /// Handoff barrier after B was allocated and planned but before it spawned:
@@ -4169,7 +4171,7 @@ async fn expiry_between_attempts_spawns_no_next_attempt() {
 async fn handoff_after_allocation_honours_cancel_and_revocation() {
     for case in ["cancel", "revoke", "policy", "connection", "unbind"] {
         let (_temp, home) = codex_home(["exhausted", "ok"]);
-        let id = codex_admit(&home, "handoff-1", None);
+        let id = codex_admit(&home, "handoff-1");
         fs::write(home.join("fixture-pause-spawn-2"), "").unwrap();
         let mut child = supervisor(&home, &id);
         for _ in 0..400 {
@@ -4408,7 +4410,7 @@ fn read_until(pipe: &mut std::process::ChildStdout, needle: &str) -> String {
 #[tokio::test]
 async fn follow_viewer_spans_attempts_and_survives_interrupt() {
     let (_temp, home) = codex_home(["exhausted", "ok-hold"]);
-    let id = codex_admit(&home, "viewer-1", None);
+    let id = codex_admit(&home, "viewer-1");
     let mut child = supervisor(&home, &id);
     let root = loop {
         let root = Store::open(&home)
@@ -4534,7 +4536,7 @@ async fn reconcile_keeps_unprovable_cleanup_owned_with_a_typed_blocker() {
 async fn cleanup_error_stays_owned_until_recovery_proves_members_gone() {
     let (_temp, home) = codex_home(["exhausted", "ok"]);
     fs::write(home.join("fixture-cleanup-error-1"), "").unwrap();
-    let id = codex_admit(&home, "cleanup-error", None);
+    let id = codex_admit(&home, "cleanup-error");
     let mut child = supervisor(&home, &id);
     let exit = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
@@ -5081,7 +5083,6 @@ async fn private_launch_creates_the_store_before_the_first_publication() {
         .admit_provider_resume(
             &second_row,
             "fixture:answer".into(),
-            None,
             Some("resume-1".into()),
             None,
             Some(orchestrator),
@@ -5095,12 +5096,10 @@ async fn private_launch_creates_the_store_before_the_first_publication() {
     );
 }
 
-/// A Codex run whose role carries a managed skill is materialized, relocated
-/// into the shared store after store validation, launched through its
-/// committed registry mapping, and after cleanup still consolidates its native
-/// caches: the post-cleanup publication plans through that same verified
-/// mapping instead of the strict private verifier, which rejects the managed
-/// link and would silently skip every managed-role home.
+/// A managed Codex home publishes required launch assets, then completes without
+/// optional cache publication. Explicit offline compaction still freezes a newly
+/// accumulated native cache through the same verified registry mapping; source
+/// content, immutable managed skills and the sealed successful answer survive.
 #[tokio::test]
 async fn managed_codex_home_consolidates_through_its_registry_mapping() {
     let (_temp, home) = codex_home_with(&["ok"]);
@@ -5122,17 +5121,53 @@ async fn managed_codex_home_consolidates_through_its_registry_mapping() {
     );
     assert!(
         runtime_home.join("skills/demo").is_symlink(),
-        "the managed skill was relocated into the shared store"
+        "required launch assets remain shared"
     );
-    let events = |kind: &str| {
+    assert_eq!(
         count(
             &home,
-            &format!("SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='{kind}'"),
-            &id,
-        )
-    };
-    assert_eq!(events("native_cache_consolidation_skipped"), 0);
-    assert_eq!(events("native_cache_consolidated"), 1);
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='native_cache_consolidated'",
+            &id
+        ),
+        0,
+        "optional publication must not run before terminal delivery"
+    );
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='native_cache_consolidation_deferred'",
+            &id
+        ),
+        1
+    );
+    let parent = runtime_home.join("plugins/cache/remote/offline-plugin");
+    fs::create_dir_all(parent.join("1.0.0")).unwrap();
+    fs::write(parent.join("1.0.0/plugin.toml"), "name = \"offline\"\n").unwrap();
+    fs::write(
+        parent.join(".codex-remote-plugin-install.json"),
+        "{\"schema_version\":1,\"remote_plugin_id\":\"offline-plugin\"}\n",
+    )
+    .unwrap();
+    let result = agent_run::storage_admin::compact(&home, true).expect("offline consolidation");
+    let native = result["native"].as_array().unwrap();
+    assert!(
+        native
+            .iter()
+            .any(|item| item["consolidated"]["frozen"].as_u64().unwrap_or(0) >= 1),
+        "{result}"
+    );
+    assert!(
+        parent.is_symlink(),
+        "offline compaction keeps native cache sharing"
+    );
+    assert_eq!(
+        fs::read_to_string(parent.join("1.0.0/plugin.toml")).unwrap(),
+        "name = \"offline\"\n"
+    );
+    assert_eq!(
+        Store::open(&home).unwrap().get(&id).unwrap().answer_sha256,
+        row.answer_sha256
+    );
 }
 
 /// A managed Claude home relocates into the shared store and launches its
@@ -5242,153 +5277,127 @@ async fn repeat_compact_consolidates_caches_of_an_already_shared_home() {
     );
 }
 
-/// `core.timeout_multiplier` scales each new provider admission's effective
-/// timeout exactly once — an explicit request and the configured default both
-/// land in the authoritative `agents.timeout_seconds` column multiplied — and a
-/// config change reaches only admissions made after it: an already admitted
-/// row keeps the allowance it was admitted with, and a request whose scaled
-/// timeout leaves the run-timeout ceiling is refused before any row exists.
-#[tokio::test]
-async fn timeout_multiplier_scales_new_provider_admissions_once() {
-    let (_temp, home) = home_with("[core]\ndefault_timeout_seconds = 600\n", &[]);
+/// Provider and nested pool inputs reject every retired lifetime parameter;
+/// current admitted requests have no replacement budget, deadline or margin.
+#[test]
+fn provider_input_has_no_execution_lifetime() {
+    let (_temp, home) = home();
     let service = Service::new(home.clone());
-    let admitted = |request: agent_run_domain::ProviderStartRequest| {
-        let value = service.admit_provider(request).unwrap();
-        let id: AgentId = serde_json::from_value(value["agent_id"].clone()).unwrap();
-        Store::open(&home)
+    for value in [serde_json::json!(600), serde_json::json!(null)] {
+        let mut raw = serde_json::to_value(request(&home)).unwrap();
+        raw["timeout_seconds"] = value;
+        assert!(serde_json::from_value::<ProviderStartRequest>(raw).is_err());
+    }
+    assert_eq!(rows(&home), (0, 0));
+    let admitted = service.admit_provider(request(&home)).unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    assert!(
+        serde_json::to_value(row.request)
             .unwrap()
-            .conn
-            .query_row(
-                "SELECT timeout_seconds FROM agents WHERE id=?",
-                [id.as_str()],
-                |row| row.get::<_, f64>(0),
-            )
-            .unwrap()
-    };
-    let mut explicit = request_for(&home, "glm-user", "multiplied-explicit", None);
-    explicit.timeout_seconds = Some(600.0);
-    let first = admitted(explicit);
-    assert_eq!(first, 720.0, "600 times the default 1.2");
-    let before = rows(&home);
-    let mut overflow = request_for(&home, "glm-user", "multiplied-overflow", None);
-    overflow.timeout_seconds = Some(2_500_000.0);
-    let refused = service.admit_provider(overflow).unwrap_err();
-    assert_eq!(refused.machine_code().as_str(), "ValidationError");
-    assert_eq!(
-        rows(&home),
-        before,
-        "the overflowing request admits nothing"
+            .get("timeout_seconds")
+            .is_none()
     );
-    assert_eq!(
-        admitted(request_for(&home, "glm-user", "multiplied-default", None)),
-        720.0,
-        "the omitted timeout takes the scaled default"
+    assert!(
+        row.identity.unwrap()["provider_request"]
+            .get("timeout_seconds")
+            .is_none()
     );
-    edit_config(&home, |config| {
-        config
-            .as_table_mut()
-            .unwrap()
-            .entry("core")
-            .or_insert_with(|| toml::Value::Table(Default::default()))
-            .as_table_mut()
-            .unwrap()
-            .insert("timeout_multiplier".into(), toml::Value::Float(1.0));
-    });
-    let mut unscaled = request_for(&home, "glm-user", "unscaled-explicit", None);
-    unscaled.timeout_seconds = Some(600.0);
-    assert_eq!(
-        admitted(unscaled),
-        600.0,
-        "an explicit 1.0 disables the margin"
-    );
-    let reread: f64 = {
-        // The reload changed nothing for the row admitted under 1.2.
-        let store = Store::open(&home).unwrap();
-        store
-            .conn
-            .query_row(
-                "SELECT timeout_seconds FROM agents WHERE request_id=?",
-                ["multiplied-explicit"],
-                |row| row.get(0),
-            )
-            .unwrap()
-    };
-    assert_eq!(reread, 720.0, "existing admissions are never rescaled");
 }
 
-/// A resume's newly requested timeout is scaled once, while an omitted one
-/// inherits the parent's already-effective allowance: the margin is applied to
-/// a base value exactly once per lineage, never compounded (600 -> 720 -> 720,
-/// not 600 -> 720 -> 864).
+/// Frozen history verifies original request/config digests before discarding
+/// retired clocks in memory. Even a tampered discarded field must fail integrity.
+#[test]
+fn historical_provider_identity_verifies_retired_policy_before_projection() {
+    let (_temp, home) = home();
+    let admitted = Service::new(home.clone())
+        .admit_provider(request(&home))
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    let mut row = Store::open(&home).unwrap().get(&id).unwrap();
+    let mut original = row.identity.take().unwrap();
+    original["provider_request"]["timeout_seconds"] = serde_json::json!(120.0);
+    original["replay_request_sha256"] = serde_json::json!(agent_run_domain::canonical::sha256_hex(
+        &original["provider_request"],
+        true
+    ));
+    original["provider_config"]["core"] = serde_json::json!({
+        "max_active_agents": 6, "default_timeout_seconds": 480.0,
+        "timeout_multiplier": 2.5, "warning_fraction": 0.9, "stalled_after_seconds": 900.0,
+    });
+    original["provider_config_snapshot"] =
+        agent_run_config::provider_config::ProviderConfig::snapshot_document(
+            &original["provider_config"],
+        )
+        .unwrap();
+    row.identity = Some(original.clone());
+    let projected = agent_run::service::ProviderLaunchIdentity::read(&row).unwrap();
+    assert_eq!(
+        serde_json::to_value(projected.provider_config.core).unwrap(),
+        serde_json::json!({"max_active_agents":6})
+    );
+    assert!(
+        serde_json::to_value(projected.provider_request)
+            .unwrap()
+            .get("timeout_seconds")
+            .is_none()
+    );
+    assert_eq!(row.identity.as_ref().unwrap(), &original);
+    row.identity.as_mut().unwrap()["provider_config"]["core"]["default_timeout_seconds"] =
+        serde_json::json!(999.0);
+    assert!(matches!(
+        agent_run::service::ProviderLaunchIdentity::read(&row),
+        Err(agent_run::Error::Integrity(_))
+    ));
+    row.identity = Some(original);
+    row.identity.as_mut().unwrap()["provider_request"]["timeout_seconds"] =
+        serde_json::json!(121.0);
+    assert!(matches!(
+        agent_run::service::ProviderLaunchIdentity::read(&row),
+        Err(agent_run::Error::Integrity(_))
+    ));
+}
+
+/// Repeated native continuations preserve one stable lineage with no lifetime
+/// policy, inherited allowance or independent resume-count gate.
 #[tokio::test]
-async fn provider_resume_timeout_is_scaled_once_without_compounding() {
-    let (_temp, home) = home_with("[core]\ndefault_timeout_seconds = 600\n", &[]);
+async fn provider_resumes_repeatedly_without_execution_lifetime() {
+    let (_temp, home) = home();
     let service = Service::new(home.clone());
-    let mut parent_request = request(&home);
-    parent_request.request_id = Some("resume-multiplier-parent".into());
-    parent_request.timeout_seconds = Some(600.0);
-    let revision = Store::open(&home)
-        .unwrap()
-        .quota_capacity_revision()
-        .unwrap();
-    let value = service
-        .admit_provider_trusted(parent_request, candidates(revision))
-        .unwrap();
-    let parent: AgentId = serde_json::from_value(value["agent_id"].clone()).unwrap();
-    run_to_end(&home, &parent).await;
-    let column = |id: &AgentId| {
-        Store::open(&home)
-            .unwrap()
-            .conn
-            .query_row(
-                "SELECT timeout_seconds FROM agents WHERE id=?",
-                [id.as_str()],
-                |row| row.get::<_, f64>(0),
+    let root = completed_parent(&home, &service, "unlimited-parent").await;
+    let mut parent = root.clone();
+    for n in 1..=32 {
+        let row = Store::open(&home).unwrap().get(&parent).unwrap();
+        let request_key = format!("unlimited-child-{n}");
+        let admitted = service
+            .admit_provider_resume(
+                &row,
+                "fixture:answer".into(),
+                Some(request_key.clone()),
+                None,
+                None,
             )
-            .unwrap()
-    };
-    assert_eq!(
-        column(&parent),
-        720.0,
-        "the parent base 600 was scaled once"
-    );
-    let parent_row = Store::open(&home).unwrap().get(&parent).unwrap();
-    let inherited = service
-        .admit_provider_resume(
-            &parent_row,
-            "fixture:answer".into(),
-            None,
-            Some("resume-multiplier-inherited".into()),
-            None,
-            None,
-        )
-        .unwrap();
-    let child: AgentId = serde_json::from_value(inherited["agent_id"].clone()).unwrap();
-    assert_eq!(
-        column(&child),
-        720.0,
-        "an omitted timeout reuses the parent's effective allowance, not 600*1.2*1.2"
-    );
-    // The second resume reads the child's frozen identity, which exists only
-    // once the child has actually run and sealed its runtime session.
-    run_to_end(&home, &child).await;
-    let child_row = Store::open(&home).unwrap().get(&child).unwrap();
-    let explicit = service
-        .admit_provider_resume(
-            &child_row,
-            "fixture:answer".into(),
-            Some(600.0),
-            Some("resume-multiplier-explicit".into()),
-            None,
-            None,
-        )
-        .unwrap();
-    let grandchild: AgentId = serde_json::from_value(explicit["agent_id"].clone()).unwrap();
-    assert_eq!(
-        column(&grandchild),
-        720.0,
-        "a newly requested 600 is scaled once, however deep the lineage"
-    );
+            .unwrap();
+        let next: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+        run_to_end(&home, &next).await;
+        let next_row = Store::open(&home).unwrap().get(&next).unwrap();
+        assert_eq!(next_row.root_agent_id, root);
+        assert_eq!(next_row.sequence, n + 1);
+        assert_eq!(next_row.status, Status::Succeeded);
+        assert!(
+            serde_json::to_value(&next_row.request)
+                .unwrap()
+                .get("timeout_seconds")
+                .is_none()
+        );
+        let retry = service
+            .admit_provider_resume(&row, "fixture:answer".into(), Some(request_key), None, None)
+            .unwrap();
+        assert_eq!(retry["created"], false);
+        assert_eq!(retry["agent_id"], serde_json::json!(next));
+        parent = next;
+    }
+    assert_eq!(rows(&home), (33, 33));
 }
 
 /// One strict pool request on `glm-user`; each member is `(role, task, pin)`.
@@ -6097,8 +6106,8 @@ async fn pool_replace_races_never_create_parallel_members() {
         store
             .conn
             .execute(
-                "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision,root_agent_id,parent_agent_id,sequence) \
-                 VALUES('ag-20260101-000000-0000000077','glm-user','fixture','review','t','t','/tmp','{}','running',9.0,10.0,'cfg',?1,?1,2)",
+                "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id,parent_agent_id,sequence) \
+                 VALUES('ag-20260101-000000-0000000077','glm-user','fixture','review','t','t','/tmp','{}','running',9.0,'cfg',?1,?1,2)",
                 [ids[0].as_str()],
             )
             .unwrap();
@@ -6352,7 +6361,6 @@ async fn pool_composed_task_survives_native_history_failover_and_resume() {
         .admit_provider_resume(
             &row,
             "POOL-RESUME-TASK-MARKER follow up".into(),
-            None,
             Some("pool-resume".into()),
             None,
             None,

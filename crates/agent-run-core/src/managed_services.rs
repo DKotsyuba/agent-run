@@ -875,10 +875,6 @@ pub async fn wait_for_gate(home: &Path, id: &AgentId) -> Result<()> {
             }
             return Ok(());
         }
-        let row = store.get(id)?;
-        if now() >= row.created_at + row.request.timeout_seconds.unwrap_or(480.0) {
-            return Err(invalid("service warmup exceeded agent deadline"));
-        }
         drop(store);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -910,7 +906,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = Store::initialize(home.path()).unwrap();
         let old = now() - 7200.0;
-        store.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,finished_at,timeout_seconds,config_revision) VALUES ('agent','fixture','fixture','review','fixture','fixture','/tmp','{}','lost',?1,?1,60,'fixture')", [old]).unwrap();
+        store.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,finished_at,config_revision) VALUES ('agent','fixture','fixture','review','fixture','fixture','/tmp','{}','lost',?1,?1,'fixture')", [old]).unwrap();
         store.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES ('attempt','agent',1,'lost','{}',?,1)", [old]).unwrap();
         store.conn.execute("INSERT INTO managed_service_generations(id,service_id,revision,definition_json,state,broker_identity_json,created_at) VALUES ('generation','fixture',?,'{}','ready','{}',?)",params!["a".repeat(64),old]).unwrap();
         store
