@@ -46,6 +46,65 @@ fn body(statements: impl IntoIterator<Item = String>) -> String {
     joined.join("; ")
 }
 
+/// An observer failure has a typed first cause during initialization and stream
+/// draining. A control already sent remains uncertain, while its exact cause is
+/// retained for the next runner read; only this fixture's owned child is cleaned.
+#[tokio::test]
+async fn ownership_failure_is_typed_and_control_acceptance_stays_uncertain() {
+    use agent_run_domain::{Error, OwnershipStage};
+    let mut fixture = Fixture(Process::spawn(&engine("printf '{}\\n'")).unwrap());
+    let initial = fixture
+        .0
+        .observe_ownership(|_| {
+            Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "SOURCE_SECRET",
+            )))
+        })
+        .unwrap_err();
+    assert!(matches!(
+        initial,
+        Error::OwnershipCheckpoint {
+            stage: OwnershipStage::Initial,
+            ..
+        }
+    ));
+    assert!(!initial.public().message.contains("SOURCE_SECRET"));
+    let result = fixture
+        .0
+        .rpc_exchange("turn/steer", serde_json::json!({}), Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        result,
+        RpcDisposition::Uncertain(RpcUncertain::Transport(
+            "engine_ownership_checkpoint_failed"
+        ))
+    );
+    match next(&mut fixture).await {
+        Event::OwnershipFailure(Error::OwnershipCheckpoint {
+            stage: OwnershipStage::Streaming,
+            source,
+        }) => {
+            assert!(
+                matches!(*source, Error::Io(ref io) if io.kind() == std::io::ErrorKind::PermissionDenied)
+            );
+        }
+        _ => panic!("the typed checkpoint cause was lost"),
+    }
+    let final_error = fixture
+        .0
+        .checkpoint_ownership_at(OwnershipStage::Final)
+        .unwrap_err();
+    assert!(matches!(
+        final_error,
+        Error::OwnershipCheckpoint {
+            stage: OwnershipStage::Final,
+            ..
+        }
+    ));
+}
+
 /// Pressure after a possible write stops before reading: the backlog keeps
 /// its fixed capacity, the next engine event stays in the channel, and every
 /// notification eventually reaches the consumer in channel-then-backlog

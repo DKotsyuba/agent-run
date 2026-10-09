@@ -4,7 +4,7 @@ use crate::{
     LaunchPlan,
     redact::{DiagnosticTail, Redactor, StreamingRedactor},
 };
-use agent_run_domain::{Error, Result};
+use agent_run_domain::{Error, OwnershipStage, Result};
 use agent_run_platform::{
     frame,
     process::{OwnedProcess, OwnershipSnapshot},
@@ -102,6 +102,9 @@ pub enum Event {
     Eof,
     /// Framing or JSON decoding failed without retaining unbounded input.
     Failure(&'static str),
+    /// A typed observation/persistence failure; it never proves process death.
+    /// Only closed metadata is persisted by the supervisor, not source messages.
+    OwnershipFailure(Error),
 }
 
 /// Returns whether an adapter write failed because the child closed its pipe.
@@ -259,11 +262,19 @@ impl Process {
     ) -> Result<()> {
         self.ownership_observer = Some(Box::new(observer));
         self.ownership_revision = None;
-        self.checkpoint_ownership()
+        self.checkpoint_ownership_at(OwnershipStage::Initial)
     }
 
     /// Persists newly captured members once; successful unchanged captures never touch the database.
     pub fn checkpoint_ownership(&mut self) -> Result<()> {
+        self.checkpoint_ownership_at(OwnershipStage::Streaming)
+    }
+
+    /// Persists the current append-only snapshot for the supplied closed phase.
+    /// Unchanged revisions are no-ops. A failed observer keeps the prior revision
+    /// and typed cause, so later verified cleanup can retry without fabricating
+    /// successful persistence or treating storage failure as process death.
+    pub fn checkpoint_ownership_at(&mut self, stage: OwnershipStage) -> Result<()> {
         let Some(observer) = self.ownership_observer.as_mut() else {
             return Ok(());
         };
@@ -271,11 +282,13 @@ impl Process {
         if self.ownership_revision == Some(revision) {
             return Ok(());
         }
-        let snapshot = self
-            .owner
-            .snapshot()
-            .ok_or_else(|| Error::Integrity("process root identity is unavailable".into()))?;
-        observer(&snapshot)?;
+        let snapshot = self.owner.snapshot().ok_or_else(|| {
+            Error::ownership_checkpoint(
+                stage,
+                Error::Integrity("process root identity is unavailable".into()),
+            )
+        })?;
+        observer(&snapshot).map_err(|source| Error::ownership_checkpoint(stage, source))?;
         self.ownership_revision = Some(revision);
         Ok(())
     }
@@ -355,12 +368,20 @@ impl Process {
     }
     /// Returns a retained notification or observes stdout and the primary PID together.
     pub async fn next(&mut self) -> Event {
+        // A control exchange retained this first cause while returning an
+        // uncertain acknowledgement. Consume it before another checkpoint.
+        if matches!(self.backlog.front(), Some(Event::OwnershipFailure(_))) {
+            return self.backlog.pop_front().expect("checked ownership failure");
+        }
         if !self.backlog.is_empty() {
-            if self.observe_primary_exit().is_err() {
-                return Event::Failure("engine_process_observation_failed");
+            if let Err(source) = self.observe_primary_exit() {
+                return Event::OwnershipFailure(Error::ownership_checkpoint(
+                    OwnershipStage::Observation,
+                    source,
+                ));
             }
-            if self.checkpoint_ownership().is_err() {
-                return Event::Failure("engine_process_ownership_failed");
+            if let Err(error) = self.checkpoint_ownership() {
+                return Event::OwnershipFailure(error);
             }
             self.backlog.pop_front().expect("checked backlog")
         } else {
@@ -397,11 +418,14 @@ impl Process {
                 self.owner.refresh();
                 self.observed_at = now;
             }
-            if self.observe_primary_exit().is_err() {
-                return Event::Failure("engine_process_observation_failed");
+            if let Err(source) = self.observe_primary_exit() {
+                return Event::OwnershipFailure(Error::ownership_checkpoint(
+                    OwnershipStage::Observation,
+                    source,
+                ));
             }
-            if self.checkpoint_ownership().is_err() {
-                return Event::Failure("engine_process_ownership_failed");
+            if let Err(error) = self.checkpoint_ownership() {
+                return Event::OwnershipFailure(error);
             }
             if self.primary_exited {
                 let deadline = *self.exit_drain_deadline.get_or_insert_with(|| {
@@ -420,7 +444,7 @@ impl Process {
             tokio::select! {
                 biased;
                 exit = self.child.wait() => {
-                    if exit.is_err() { return Event::Failure("engine_process_observation_failed"); }
+                    if let Err(error) = exit { return Event::OwnershipFailure(Error::ownership_checkpoint(OwnershipStage::Observation, error.into())); }
                     // The next iteration records exit and sends the first TERM sweep.
                 }
                 event = self.events.recv() => return event.unwrap_or(Event::Eof),
@@ -452,6 +476,14 @@ impl Process {
                 Err(self.closed_error(method, deadline).await)
             }
             RpcDisposition::Uncertain(RpcUncertain::Transport(kind)) => {
+                if matches!(self.backlog.front(), Some(Event::OwnershipFailure(_))) {
+                    let Event::OwnershipFailure(error) =
+                        self.backlog.pop_front().expect("checked failure")
+                    else {
+                        unreachable!()
+                    };
+                    return Err(error);
+                }
                 Err(Error::Runtime(kind.into()))
             }
             RpcDisposition::Uncertain(RpcUncertain::MalformedReply) => {
@@ -549,6 +581,14 @@ impl Process {
                 }
                 Event::Json(v) => self.backlog.push_back(Event::Json(v)),
                 Event::Eof => return Ok(RpcDisposition::Uncertain(RpcUncertain::Closed)),
+                Event::OwnershipFailure(error) => {
+                    // The request may already be accepted. Keep control delivery
+                    // uncertain and retain the exact typed cause for the runner.
+                    self.backlog.push_front(Event::OwnershipFailure(error));
+                    return Ok(RpcDisposition::Uncertain(RpcUncertain::Transport(
+                        "engine_ownership_checkpoint_failed",
+                    )));
+                }
                 Event::Failure(kind) => {
                     return Ok(RpcDisposition::Uncertain(RpcUncertain::Transport(kind)));
                 }

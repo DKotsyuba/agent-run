@@ -72,7 +72,7 @@ use std::{
     io::{Read, Write},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 
 /// Fixed namespace this unit owns beneath the validated shared-store root.
@@ -615,8 +615,12 @@ fn lower_object_mtime(
 /// oversized, malformed, foreign-owned or foreign-linked entries are
 /// preserved untouched with explicit dispositions, and reuse of an
 /// already-shared link is claimed only after its object is re-verified.
-/// The report's `complete` is `false` when the directory scan hit its entry
-/// bound or lost its stream. Nothing outside the one cache directory, this
+/// The report's `complete` is `false` when the publish lock is busy, the
+/// directory scan hit its entry bound or lost its stream. Contention never
+/// waits or changes the home; the next optional/offline pass may retry. A
+/// two-second cooperative budget stops before the next entry; each started
+/// bounded file/atomic swap finishes safely. Filesystem syscall latency is not
+/// preempted. Nothing outside the one cache directory, this
 /// unit's own temporary link names, and `native-cache/<scope>/` is ever
 /// touched.
 pub fn pack_native_cache(
@@ -649,6 +653,7 @@ pub fn pack_native_cache_with_fault(
     domain: &NativeCacheDomain,
     fault: Option<&dyn Fn(NativeCacheFault) -> Result<()>>,
 ) -> Result<NativeCacheReport> {
+    let deadline = Instant::now() + Duration::from_secs(2);
     let root = validated_dir(store_root, "shared store root")?;
     let home = validated_dir(home, "native cache home")?;
     if home == root || home.starts_with(&root) || root.starts_with(&home) {
@@ -691,13 +696,16 @@ pub fn pack_native_cache_with_fault(
         }
         Ok(None) => {}
     }
-    let _guard = SharedStoreLock::acquire(&root)?;
+    let Some(_guard) = SharedStoreLock::try_acquire(&root, true)? else {
+        report.complete = false;
+        return Ok(report);
+    };
     let Some(cache) = open_native_cache_dir(&home_dir, cache_dir, &mut report) else {
         return Ok(report);
     };
     let mut scan = BoundedNames::open(&cache)?;
     while let Some(name) = scan.next(&mut report.complete)? {
-        if report.entries.len() >= MAX_DIR_ENTRIES {
+        if report.entries.len() >= MAX_DIR_ENTRIES || Instant::now() >= deadline {
             report.complete = false;
             break;
         }
@@ -2153,8 +2161,9 @@ mod tests {
         let _ = (store, before_home, after_home);
     }
 
-    /// Concurrent packs of the same payload converge on one verified object
-    /// and one inode.
+    /// Optional concurrent packs may explicitly skip contention without touching
+    /// a private entry. A later uncontended retry must complete and every home
+    /// still converges on the one verified object/inode with immutable mode.
     #[test]
     fn concurrent_packs_converge() {
         let (store, root) = store_root();
@@ -2182,9 +2191,27 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         let mut objects = BTreeSet::new();
-        for report in &reports {
-            assert!(report.complete);
-            objects.insert(sole_object(report));
+        for ((_, path), first) in homes.iter().zip(&reports) {
+            if !first.complete {
+                assert!(
+                    first.entries.is_empty(),
+                    "contended skip cannot claim packed entries"
+                );
+                let private = path.join(TOOLS_CACHE_DIR).join(IDENTITY);
+                assert!(
+                    !fs::symlink_metadata(&private)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                );
+                assert_eq!(fs::read(&private).unwrap(), bytes);
+            }
+            let domain = NativeCacheDomain::new(NativeCacheKind::Tools, DOMAIN).unwrap();
+            let retry = pack_native_cache(&root, path, &domain).unwrap();
+            assert!(retry.complete, "uncontended optional retry must converge");
+            // A completed first pass is AlreadyShared on retry; every path
+            // must still resolve to the exact single immutable object.
+            objects.insert(fs::read_link(path.join(TOOLS_CACHE_DIR).join(IDENTITY)).unwrap());
         }
         assert_eq!(objects.len(), 1, "every publisher converged on one object");
         let object = objects.pop_first().unwrap();

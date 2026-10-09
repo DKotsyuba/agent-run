@@ -18,8 +18,8 @@ use std::{
 /// One disposable schema-2 home with one Claude Messages provider bound to
 /// one fake environment reference, and its real resident broker.
 struct Broker {
-    /// Keeps the short Unix-socket base directory alive.
-    _temp: tempfile::TempDir,
+    /// Owns the short socket directory unless retained as fixture evidence.
+    _temp: Option<tempfile::TempDir>,
     /// Home passed to every child process.
     home: PathBuf,
     /// The broker child, terminated on drop.
@@ -36,6 +36,15 @@ impl Broker {
     /// [`Self::start`] with extra environment for the broker process only
     /// (test-fixtures seams such as `AGENT_RUN_FIXTURE_ALWAYS_STALE`).
     fn start_with(environment: &[(&str, &str)]) -> Self {
+        Self::start_with_limit(
+            environment,
+            agent_run_config::config::Core::default().max_active_agents,
+        )
+    }
+
+    /// Starts an isolated synthetic broker with a fixture-only active limit;
+    /// production configuration, credentials and running jobs are untouched.
+    fn start_with_limit(environment: &[(&str, &str)], active_limit: usize) -> Self {
         let base = std::env::var_os("AGENT_RUN_TEST_TMP").unwrap_or_else(|| "/tmp".into());
         let temp = tempfile::Builder::new()
             .prefix("ar-pb-")
@@ -52,7 +61,7 @@ impl Broker {
         std::fs::write(
             home.join("config.toml"),
             format!(
-                "schema_version = 2\n[harnesses.codex]\nbinary = \"{fixture}\"\nhome = \"{h}/codex\"\n[harnesses.claude-code]\nbinary = \"{fixture}\"\nhome = \"{h}/claude\"\n[providers.glm-user]\nharness = \"claude-code\"\nconnection = {{ kind = \"custom\", endpoint = \"https://gateway.example/api\", protocol = \"messages\" }}\nauth_family = \"anthropic\"\nlimits_source = \"none\"\n[[providers.glm-user.models]]\nid = \"fixture\"\nnative_model = \"fixture\"\n[[providers.glm-user.bindings]]\nlabel = \"work\"\naccount = \"acct-work\"\n",
+                "schema_version = 2\n[core]\nmax_active_agents = {active_limit}\n[harnesses.codex]\nbinary = \"{fixture}\"\nhome = \"{h}/codex\"\n[harnesses.claude-code]\nbinary = \"{fixture}\"\nhome = \"{h}/claude\"\n[providers.glm-user]\nharness = \"claude-code\"\nconnection = {{ kind = \"custom\", endpoint = \"https://gateway.example/api\", protocol = \"messages\" }}\nauth_family = \"anthropic\"\nlimits_source = \"none\"\n[[providers.glm-user.models]]\nid = \"fixture\"\nnative_model = \"fixture\"\n[[providers.glm-user.bindings]]\nlabel = \"work\"\naccount = \"acct-work\"\n",
                 h = home.display()
             ),
         )
@@ -71,7 +80,7 @@ impl Broker {
             ],
         );
         assert!(registered.status.success(), "{registered:?}");
-        let child = Command::new(env!("CARGO_BIN_EXE_agent-run"))
+        let child = Command::new(qualification_binary())
             .arg("--home")
             .arg(&home)
             .args(["api", "serve"])
@@ -90,9 +99,47 @@ impl Broker {
             std::thread::sleep(Duration::from_millis(20));
         }
         Self {
-            _temp: temp,
+            _temp: Some(temp),
             home,
             child,
+        }
+    }
+
+    /// Retains this synthetic home as qualification evidence even after panic;
+    /// only its broker/processes are stopped, never a production home or job.
+    fn retain_evidence(&mut self) {
+        if let Some(temp) = self._temp.take() {
+            let _retained_path = temp.keep();
+        }
+    }
+
+    /// Restarts only this fixture's unreaped broker child while native fixture
+    /// supervisors retain their immutable identities and work. The replacement
+    /// must answer a real socket ping within ten seconds; no agent is replayed.
+    async fn restart(&mut self) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+        self.child = Command::new(qualification_binary())
+            .arg("--home")
+            .arg(&self.home)
+            .args(["api", "serve"])
+            .env("FAKE_TOKEN", "synthetic-token")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let client = BrokerClient::new(self.home.join("api.sock"));
+            if client.call("ping", None).await.is_ok() {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "owned replacement broker did not become ready"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -184,16 +231,39 @@ impl Broker {
 }
 
 impl Drop for Broker {
-    /// Terminates only this test's broker.
+    /// Releases an owned load barrier even on panic and gives only this home's
+    /// supervisors a finite cleanup interval before reaping its broker child.
     fn drop(&mut self) {
+        let _ = std::fs::write(self.home.join("fixture-load-release"), "fixture cleanup");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let remaining = rusqlite::Connection::open_with_flags(self.home.join("state.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok().and_then(|s| s.query_row("SELECT (SELECT COUNT(*) FROM agents WHERE status IN ('created','starting','running','cancelling'))+(SELECT COUNT(*) FROM attempts WHERE ownership_active=1)", [], |r|r.get::<_,i64>(0)).ok());
+            if remaining == Some(0) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
-/// Runs the real CLI against `home`.
+/// Selects the compiled candidate by default, or an explicitly supplied absolute
+/// existing binary for a comparative qualification. The override affects only
+/// this isolated fixture; every invocation still names its synthetic home.
+fn qualification_binary() -> std::ffi::OsString {
+    match std::env::var_os("AGENT_RUN_QUALIFICATION_BINARY") {
+        Some(path) => {
+            assert!(Path::new(&path).is_absolute() && Path::new(&path).is_file());
+            path
+        }
+        None => env!("CARGO_BIN_EXE_agent-run").into(),
+    }
+}
+
+/// Runs the selected real CLI against the explicitly supplied synthetic `home`.
 fn cli(home: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_agent-run"))
+    Command::new(qualification_binary())
         .arg("--home")
         .arg(home)
         .args(args)
@@ -218,7 +288,7 @@ async fn mcp_tool(home: &Path, name: &str, arguments: Value) -> Value {
 /// on an observation timeout. Host Desktop routing is disabled for this fixture.
 async fn mcp_request(home: &Path, protocol: &str, method: &str, params: Value) -> Value {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_agent-run"))
+    let mut child = tokio::process::Command::new(qualification_binary())
         .arg("--home")
         .arg(home)
         .arg("mcp")
@@ -382,6 +452,432 @@ async fn broker_client_starts_through_the_real_schema2_dispatcher() {
     assert_eq!(typed.attempt_id.as_deref(), response["attempt_id"].as_str());
     assert!(typed.attempt_id.is_none());
     broker.wait_terminal(typed.agent_id.as_str());
+}
+
+/// Finite fifteen-process cohorts cover dense native tool streams, empty and
+/// malformed answers, quota faults, nonzero exits, owned cancellation/restart,
+/// idempotent admission and measured quiet/draining reads. Every terminal tip
+/// requires actual cleanup and released ownership. Homes/receipts are retained;
+/// no provider request, credential or production job is involved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fifteen_agent_cohorts_keep_controls_idempotent_and_cleanup_verified() {
+    let scenarios = [
+        ("fixture:load-barrier", "succeeded"),
+        ("fixture:load-barrier", "succeeded"),
+        ("fixture:load-barrier", "succeeded"),
+        ("fixture:load-barrier:dense-tools", "succeeded"),
+        ("fixture:load-barrier:empty-result", "failed"),
+        ("fixture:load-barrier:truncated", "failed"),
+        ("fixture:load-barrier:quota", "failed"),
+        ("fixture:load-barrier:nonzero-after-result", "failed"),
+        ("fixture:load-barrier", "cancelled"),
+        ("fixture:load-barrier", "succeeded"), // held WAL writer after native roots are durable
+    ];
+    for (round, (task, outcome)) in scenarios.into_iter().enumerate() {
+        let mut broker = Broker::start_with_limit(&[], 20);
+        broker.retain_evidence();
+        if round == 0 {
+            let version = cli(&broker.home, &["--version"]);
+            assert!(version.status.success());
+            eprintln!(
+                "LOAD_BINARY path={} version={}",
+                Path::new(&qualification_binary()).display(),
+                String::from_utf8_lossy(&version.stdout).trim()
+            );
+        }
+        let socket = broker.home.join("api.sock");
+        let mut launches = Vec::new();
+        for n in 0..15 {
+            let request = broker.request(task, &format!("load-{round}-{n}"));
+            let client = BrokerClient::new(socket.clone());
+            launches.push(tokio::spawn(async move {
+                let deadline = Instant::now() + Duration::from_secs(15);
+                let mut busy = 0_u32;
+                loop {
+                    match client.start(&request).await {
+                        Ok(started) => return Ok((started, busy)),
+                        Err(Error::Broker {
+                            broker_error_code: Some(ref code),
+                            ..
+                        }) if code == "selection_busy" && Instant::now() < deadline => {
+                            busy += 1;
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }));
+        }
+        let mut ids = Vec::new();
+        let mut busy_refusals = 0_u32;
+        for job in launches {
+            let (started, busy) = tokio::time::timeout(Duration::from_secs(20), job)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            busy_refusals += busy;
+            assert!(started.created);
+            ids.push(started.agent_id);
+        }
+        let client = BrokerClient::new(socket.clone());
+        let ready_until = Instant::now() + Duration::from_secs(20);
+        let leaders = loop {
+            let page = client
+                .call(
+                    "list_agents",
+                    Some(json!({"active":true,"limit":50,"offset":0})),
+                )
+                .await
+                .unwrap();
+            assert_eq!(page["total"], 15);
+            if page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|a| a["status"] == "running")
+            {
+                let read = rusqlite::Connection::open_with_flags(
+                    broker.home.join("state.db"),
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                let mut stmt = read.prepare("SELECT leader_json FROM process_ownership WHERE owner_kind='attempt' ORDER BY owner_id").unwrap();
+                let roots: Vec<agent_run_platform::process::Identity> = stmt
+                    .query_map([], |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .map(|raw| serde_json::from_str(&raw.unwrap()).unwrap())
+                    .collect();
+                if roots.len() == 15
+                    && roots.iter().all(|p| {
+                        agent_run_platform::process::observe(
+                            Some(p.pid),
+                            Some(&p.token),
+                            Some(p.birth),
+                        ) == agent_run_platform::process::ProcessState::Alive
+                    })
+                {
+                    break roots;
+                }
+            }
+            assert!(Instant::now() < ready_until, "cohort never reached running");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        eprintln!(
+            "LOAD_OWNERS round={round} verified_live_native_leaders={}",
+            leaders.len()
+        );
+        let replay = client
+            .start(&broker.request(task, &format!("load-{round}-0")))
+            .await
+            .unwrap();
+        assert!(!replay.created);
+        assert_eq!(replay.agent_id, ids[0]);
+        let mut samples = Vec::new();
+        for n in 0..200 {
+            let before = Instant::now();
+            let reply = if n % 10 == 0 {
+                client
+                    .start(&broker.request(task, &format!("load-{round}-0")))
+                    .await
+                    .map(|replayed| {
+                        assert!(!replayed.created);
+                        assert_eq!(replayed.agent_id, ids[0]);
+                    })
+            } else if n % 2 == 0 {
+                client.call("ping", None).await.map(drop)
+            } else {
+                client
+                    .call(
+                        "list_agents",
+                        Some(json!({"active":true,"limit":50,"offset":0})),
+                    )
+                    .await
+                    .map(drop)
+            };
+            reply.unwrap();
+            samples.push(before.elapsed().as_micros() as u64);
+        }
+        samples.sort_unstable();
+        eprintln!("LOAD_ADMISSION round={round} busy_refusals={busy_refusals}");
+        eprintln!(
+            "LOAD_COHORT round={round} active=15 samples=200 p50_us={} p95_us={} p99_us={}",
+            samples[99], samples[189], samples[197]
+        );
+        assert!(
+            samples[189] <= 250_000,
+            "warm p95 read/control exceeded 250 ms"
+        );
+        assert!(
+            samples[197] <= 1_000_000,
+            "warm p99 read/control exceeded one second"
+        );
+        if round == 2 {
+            broker.restart().await;
+            let recovered = client
+                .call(
+                    "list_agents",
+                    Some(json!({"active":true,"limit":50,"offset":0})),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                recovered["total"], 15,
+                "broker restart must retain all original work"
+            );
+            assert_eq!(
+                client
+                    .start(&broker.request(task, &format!("load-{round}-0")))
+                    .await
+                    .unwrap()
+                    .agent_id,
+                ids[0]
+            );
+        }
+        if round == 1 || outcome == "cancelled" {
+            for id in ids.iter().take(if round == 1 { 3 } else { 15 }) {
+                let before = Instant::now();
+                client
+                    .call("cancel", Some(json!({"agent_id":id})))
+                    .await
+                    .unwrap();
+                let elapsed = before.elapsed();
+                assert!(
+                    elapsed <= Duration::from_millis(250),
+                    "cancel acknowledgement exceeded250ms"
+                );
+                eprintln!("LOAD_CANCEL_ACK round={round} us={}", elapsed.as_micros());
+            }
+        }
+        let held_writer = if round == 9 {
+            let (ready, waiting) = std::sync::mpsc::sync_channel(0);
+            let path = broker.home.join("state.db");
+            let job = std::thread::spawn(move || {
+                let conn = rusqlite::Connection::open(path).unwrap();
+                conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                ready.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(350));
+                conn.execute_batch("ROLLBACK").unwrap();
+            });
+            waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+            Some(job)
+        } else {
+            None
+        };
+        std::fs::write(broker.home.join("fixture-load-release"), "release").unwrap();
+        let drain_client = BrokerClient::new(socket.clone());
+        let drain_reads = tokio::spawn(async move {
+            let mut samples = Vec::new();
+            for _ in 0..200 {
+                let before = Instant::now();
+                drain_client.call("ping", None).await.unwrap();
+                samples.push(before.elapsed().as_micros() as u64);
+            }
+            samples.sort_unstable();
+            samples
+        });
+        for (n, id) in ids.iter().enumerate() {
+            let answer = tokio::time::timeout(
+                Duration::from_secs(30),
+                client.call("wait", Some(json!({"agent_id":id,"timeout_seconds":25}))),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let expected = if round == 1 && n < 3 {
+                "cancelled"
+            } else {
+                outcome
+            };
+            assert_eq!(answer["status"], expected, "{answer}");
+            if expected == "succeeded" {
+                assert_eq!(answer["available"], true);
+            }
+        }
+        if let Some(writer) = held_writer {
+            writer.join().unwrap();
+        }
+        let draining = drain_reads.await.unwrap();
+        eprintln!(
+            "LOAD_DRAIN round={round} task={task} samples=200 p50_us={} p95_us={} p99_us={}",
+            draining[99], draining[189], draining[197]
+        );
+        assert!(draining[189] <= 250_000, "draining p95 exceeded 250 ms");
+        assert!(
+            draining[197] <= 1_000_000,
+            "draining p99 exceeded one second"
+        );
+        // Read the chosen version's state without migrating a live baseline.
+        let store = rusqlite::Connection::open_with_flags(
+            broker.home.join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        if round == 3 {
+            let results: i64 = store.query_row("SELECT COUNT(*) FROM messages WHERE role='tool_result' AND name='fixture_tool'", [], |r| r.get(0)).unwrap();
+            let session_writes: i64 = store
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE kind='runtime_session'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                results, 3000,
+                "all dense native tool results were journaled"
+            );
+            assert_eq!(
+                session_writes, 15,
+                "unchanged frame identities cannot flood the SQLite writer"
+            );
+            eprintln!("LOAD_DENSE tool_results={results} session_writes={session_writes}");
+        }
+        let terminal_delay: f64 = store.query_row("SELECT MAX(a.finished_at-(SELECT MAX(e.at) FROM events e WHERE e.agent_id=a.id AND e.kind='process_cleanup')) FROM agents a", [], |r| r.get(0)).unwrap();
+        assert!(
+            terminal_delay.is_finite() && terminal_delay <= 1.0,
+            "cleanup to terminal exceeded one second: {terminal_delay}"
+        );
+        eprintln!(
+            "LOAD_TERMINAL round={round} cleanup_to_terminal_max_ms={} home={}",
+            terminal_delay * 1000.0,
+            broker.home.display()
+        );
+        assert_eq!(
+            store
+                .query_row(
+                    "SELECT COUNT(*) FROM attempts WHERE ownership_active=1",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        let bad: i64=store.query_row("SELECT COUNT(*) FROM attempts WHERE cleanup_proof_json IS NULL OR json_extract(cleanup_proof_json,'$.confirmed') IS NOT 1 OR json_extract(cleanup_proof_json,'$.group_gone') IS NOT 1 OR json_extract(cleanup_proof_json,'$.descendants_gone') IS NOT 1",[],|r|r.get(0)).unwrap();
+        assert_eq!(
+            bad, 0,
+            "every owned process/descendant requires real cleanup proof"
+        );
+        for p in &leaders {
+            assert!(
+                matches!(
+                    agent_run_platform::process::observe(
+                        Some(p.pid),
+                        Some(&p.token),
+                        Some(p.birth)
+                    ),
+                    agent_run_platform::process::ProcessState::Dead
+                        | agent_run_platform::process::ProcessState::Reused
+                ),
+                "an owned native identity survived or became unobservable"
+            );
+        }
+        assert_eq!(
+            client
+                .call(
+                    "list_agents",
+                    Some(json!({"active":true,"limit":50,"offset":0}))
+                )
+                .await
+                .unwrap()["total"],
+            0
+        );
+    }
+}
+
+/// Fifteen overlapping owned harnesses lose their initial cleanup observation.
+/// The real broker must retain that diagnostic and recover only through fresh
+/// process proof; a valid native result never becomes success or a new attempt.
+/// Fixture files/processes remain isolated and the synthetic home is retained.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fifteen_agents_with_unavailable_cleanup_never_publish_success() {
+    let mut broker = Broker::start_with_limit(&[], 20);
+    broker.retain_evidence();
+    std::fs::write(
+        broker.home.join("fixture-cleanup-error-1"),
+        "fixture denial",
+    )
+    .unwrap();
+    let client = BrokerClient::new(broker.home.join("api.sock"));
+    let mut ids = Vec::new();
+    for n in 0..15 {
+        let started = client
+            .start(&broker.request("fixture:load-barrier", &format!("cleanup-error-{n}")))
+            .await
+            .unwrap();
+        assert!(started.created);
+        ids.push(started.agent_id);
+    }
+    let until = Instant::now() + Duration::from_secs(20);
+    loop {
+        let read = rusqlite::Connection::open_with_flags(
+            broker.home.join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut stmt = read
+            .prepare("SELECT leader_json FROM process_ownership WHERE owner_kind='attempt'")
+            .unwrap();
+        let roots: Vec<agent_run_platform::process::Identity> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|raw| serde_json::from_str(&raw.unwrap()).unwrap())
+            .collect();
+        if roots.len() == 15
+            && roots.iter().all(|p| {
+                agent_run_platform::process::observe(Some(p.pid), Some(&p.token), Some(p.birth))
+                    == agent_run_platform::process::ProcessState::Alive
+            })
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "all fifteen actual native identities must be live before release"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    std::fs::write(broker.home.join("fixture-load-release"), "release").unwrap();
+    for id in &ids {
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            client.call("wait", Some(json!({"agent_id":id,"timeout_seconds":25}))),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result["status"], "lost", "{result}");
+        assert_eq!(
+            result["available"], false,
+            "unverified initial cleanup cannot seal a successful answer"
+        );
+    }
+    let read = rusqlite::Connection::open_with_flags(
+        broker.home.join("state.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let unavailable: i64 = read
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE kind='process_cleanup_unavailable'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let attempts: i64 = read
+        .query_row("SELECT COUNT(*) FROM attempts", [], |r| r.get(0))
+        .unwrap();
+    let successes: i64 = read
+        .query_row(
+            "SELECT COUNT(*) FROM agents WHERE status='succeeded'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!((unavailable, attempts, successes), (15, 15, 0));
+    eprintln!(
+        "LOAD_UNAVAILABLE_CLEANUP actual_native_leaders=15 original_denials={unavailable} successes={successes} home={}",
+        broker.home.display()
+    );
 }
 
 /// Stable references survive repeated native resumes and old-request replay;

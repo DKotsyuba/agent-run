@@ -22,6 +22,35 @@ use std::{
     time::Duration,
 };
 
+std::thread_local! {
+    /// One synchronous SQLite busy sequence on this supervisor thread. A zero
+    /// callback count starts a new sequence; no transaction crosses an await.
+    static JOURNAL_BUSY_STARTED: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Uses short two-millisecond busy sleeps for a supervisor's hot native journal.
+/// `prior_calls` is SQLite's zero-based invocation count for this synchronous
+/// busy sequence. Reuses the ordinary store's monotonic five-second allowance,
+/// then refuses with the original SQLite error; never retries permanent errors.
+/// Short sleeps let final writes compete with dense frame writers instead of
+/// missing many free slots during SQLite's escalating hundred-millisecond sleeps.
+/// The connection remains thread-affine; no state or transaction crosses await.
+fn journal_busy(prior_calls: i32) -> bool {
+    JOURNAL_BUSY_STARTED.with(|started| {
+        if prior_calls == 0 {
+            started.set(Some(std::time::Instant::now()));
+        }
+        if started
+            .get()
+            .is_none_or(|at| at.elapsed() >= agent_run_store::BUSY_TIMEOUT)
+        {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+        true
+    })
+}
+
 /// Start one detached `_supervisor` session leader and return after its READY.
 ///
 /// Spawning is `posix_spawn(POSIX_SPAWN_SETSID)`-first (`launch.rs`). A failed
@@ -82,6 +111,8 @@ pub async fn launch(home: &Path, id: &AgentId) -> Result<()> {
 ///
 /// `fds` are the inherited ready, identity and error descriptors.  The first
 /// heartbeat makes the complete ownership record eligible for later recovery.
+/// Native journal writes use short busy sleeps within the unchanged ordinary
+/// store allowance, preserving typed SQLite failures and durable transactions.
 /// Execution errors are logged by fixed public class without persisting task
 /// text or credentials, including errors whose owned process prevents finish.
 pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
@@ -98,6 +129,7 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
     }
     let owned = (|| {
         let mut store = Store::open(home)?;
+        store.conn.busy_handler(Some(journal_busy))?;
         let owner = process::inspect(std::process::id() as i32)?;
         record_owner(&mut store, id, &owner)?;
         Ok::<_, Error>(store)
@@ -117,13 +149,18 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
     match execute(home, id, &mut store).await {
         Ok(()) => Ok(()),
         Err(error) => {
+            // Final checkpoint failures can return before an engine result is
+            // committed; their closed diagnostic must survive that path too.
+            let metadata = execution_error_metadata(&error);
+            let _ = store.event(id, "execution_failure_v1", &metadata);
             if let Some(logger) = crate::logging::configured() {
                 logger.log(
                     crate::logging::Level::Error,
                     &format!(
-                        "supervisor execution failed agent_id={} class={}",
+                        "supervisor execution failed agent_id={} class={} cause={}",
                         id,
-                        error.public().kind
+                        error.public().kind,
+                        metadata
                     ),
                 );
             }
@@ -155,12 +192,91 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
     }
 }
 
+/// Opens one private ownership writer for an admitted attempt. The returned
+/// callback persists only authenticated process snapshots, reuses its connection,
+/// and retries SQLITE_BUSY/LOCKED at most twice. Required initial persistence
+/// splits the connection's existing busy allowance (normally five seconds)
+/// across those attempts, before any native task is released. Later checkpoints
+/// keep the 250 ms control allowance. Both are capped by the original run
+/// deadline. Permanent errors are returned unchanged for typed phase wrapping;
+/// successful callbacks never leave a transaction or statement across an await.
+fn ownership_writer(
+    home: &Path,
+    attempt: String,
+    deadline: f64,
+) -> Result<
+    impl FnMut(&agent_run_platform::process::OwnershipSnapshot) -> Result<()> + Send + 'static,
+> {
+    let mut writer = Store::open(home).map_err(|error| {
+        Error::ownership_checkpoint(agent_run_domain::OwnershipStage::Initial, error)
+    })?;
+    let startup_budget = Duration::from_millis(
+        writer
+            .conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get::<_, u64>(0))
+            .map_err(|error| {
+                Error::ownership_checkpoint(agent_run_domain::OwnershipStage::Initial, error.into())
+            })?,
+    );
+    let mut initial = true;
+    Ok(
+        move |snapshot: &agent_run_platform::process::OwnershipSnapshot| {
+            let (budget, lock_wait) = if initial {
+                (startup_budget, startup_budget / 2)
+            } else {
+                (Duration::from_millis(250), Duration::from_millis(100))
+            };
+            let until = std::time::Instant::now() + budget;
+            for retry in 0..2 {
+                let left = until.saturating_duration_since(std::time::Instant::now());
+                let run_left = Duration::try_from_secs_f64((deadline - domain::now()).max(0.0))
+                    .unwrap_or(Duration::MAX);
+                if left.is_zero() || run_left.is_zero() {
+                    return Err(Error::Runtime(
+                        "run deadline expired before ownership persistence".into(),
+                    ));
+                }
+                writer
+                    .conn
+                    .busy_timeout(left.min(run_left).min(lock_wait))?;
+                match writer.remember_processes("attempt", &attempt, snapshot) {
+                    Ok(()) => {
+                        initial = false;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        let transient = matches!(&error, Error::Sql(source) if matches!(source.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)));
+                        if retry == 1
+                            || !transient
+                            || std::time::Instant::now() >= until
+                            || domain::now() >= deadline
+                        {
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+            unreachable!("both bounded attempts return or retry")
+        },
+    )
+}
+
 /// Returns closed, content-free categories for an execution error. Original
 /// messages, SQL text, paths, JSON contents and credential/environment values
 /// never enter diagnostics. Native numeric errno/SQLite codes remain nullable.
 fn execution_error_metadata(error: &Error) -> serde_json::Value {
     let mut data = json!({"version":1,"stage":"engine_execution","class":error.public().kind});
     match error {
+        Error::OwnershipCheckpoint { stage, source } => {
+            data = execution_error_metadata(source);
+            data["stage"] = json!(stage);
+            data["ownership_category"] = json!(match source.as_ref() {
+                Error::Integrity(_) | Error::AnswerIntegrity(_) => "integrity_failure",
+                Error::Sql(_) => "persistence_sqlite",
+                Error::Io(_) => "io_failure",
+                _ => "checkpoint_failure",
+            });
+        }
         Error::Io(source) => {
             data["io_kind"] = json!(format!("{:?}", source.kind()));
             data["os_code"] = json!(source.raw_os_error());
@@ -201,6 +317,11 @@ fn failed_execution(store: &Store, id: &AgentId, error: &Error) -> adapters::Eng
         Error::Integrity(_) | Error::AnswerIntegrity(_) => "runtime_integrity_failed",
         Error::Validation(_) => "runtime_contract_rejected",
         Error::Sql(_) => "runtime_storage_failed",
+        Error::OwnershipCheckpoint {
+            stage: agent_run_domain::OwnershipStage::Observation,
+            ..
+        } => "runtime_ownership_observation_failed",
+        Error::OwnershipCheckpoint { .. } => "runtime_ownership_checkpoint_failed",
         Error::Json(_) => "runtime_protocol_failed",
         _ => "runtime_transport_failed",
     });
@@ -385,9 +506,7 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
             rusqlite::params![leader.token, leader.birth, attempt],
         )?;
         let ownership_home = home.to_owned();
-        process.observe_ownership(move |snapshot| {
-            Store::open(&ownership_home)?.remember_processes("attempt", &attempt, snapshot)
-        })?;
+        process.observe_ownership(ownership_writer(&ownership_home, attempt, deadline)?)?;
         crate::journal(store, id, "user", &row.request.task, None, None)?;
         match runtime.kind()? {
             Adapter::Codex => {
@@ -413,7 +532,14 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
     };
     let cleanup = process.owner.cleanup(Duration::from_secs(2)).await;
     let exit = process.reap().await;
-    process.checkpoint_ownership()?;
+    if let Err(error) = process.checkpoint_ownership_at(agent_run_domain::OwnershipStage::Final) {
+        let _ = store.event(
+            id,
+            "ownership_checkpoint_failure_v1",
+            &execution_error_metadata(&error),
+        );
+        return execution.and(Err(error));
+    }
     let cleanup = cleanup?;
     store.event(id, "process_cleanup", &serde_json::to_value(&cleanup)?)?;
     if cleanup.confirmed {
@@ -918,6 +1044,8 @@ fn verify_sealed_home(
 }
 
 /// Runs an admitted provider attempt through fenced process ownership and the terminal outbox.
+/// After the durable outcome, logs only public execution identity and numeric
+/// per-stage completion durations; logging never changes that outcome.
 /// Checkpoints root and descendant identities through cleanup, and injects an attempt-bound
 /// worker capability. Preparation, execution, cleanup and durable-store failures propagate;
 /// an unconfirmed cleanup keeps ownership reserved for recovery.
@@ -1239,13 +1367,11 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             store.provider_process(id, &attempt_id, leader)?;
             let ownership_home = home.to_owned();
             let ownership_attempt = attempt_id.clone();
-            process.observe_ownership(move |snapshot| {
-                Store::open(&ownership_home)?.remember_processes(
-                    "attempt",
-                    &ownership_attempt,
-                    snapshot,
-                )
-            })?;
+            process.observe_ownership(ownership_writer(
+                &ownership_home,
+                ownership_attempt,
+                deadline,
+            )?)?;
             if switched {
                 // The logical run is already running; its start time (and
                 // so any deadline) is kept. No user entry is journaled.
@@ -1297,9 +1423,19 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             Err(_) => (Err(Error::Runtime("run deadline expired".into())), true),
         };
         let cleanup = process.owner.cleanup(Duration::from_secs(2)).await;
-        let checkpoint = process.checkpoint_ownership();
+        let cleanup_ended = std::time::Instant::now();
+        let checkpoint = process.checkpoint_ownership_at(agent_run_domain::OwnershipStage::Final);
         let exit = process.reap().await;
-        checkpoint?;
+        if let Err(error) = checkpoint {
+            let _ = store.event(
+                id,
+                "ownership_checkpoint_failure_v1",
+                &execution_error_metadata(&error),
+            );
+            // Cleanup diagnostics cannot replace an earlier engine failure.
+            // A valid result still fails when its final checkpoint is missing.
+            return execution.and(Err(error));
+        }
         #[cfg(feature = "test-fixtures")]
         let cleanup = injected_cleanup_error(home, &attempt_id, store, cleanup)?;
         match &cleanup {
@@ -1322,6 +1458,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         let cleanup = cleanup?;
         store.provider_cleanup(id, &attempt_id, &cleanup)?;
         store.event(id, "process_cleanup", &serde_json::to_value(&cleanup)?)?;
+        let cleanup_recorded = std::time::Instant::now();
         let cancelled = store.cancel_pending(id)?;
         let mut result = match execution {
             Ok(result) => result,
@@ -1335,6 +1472,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         // Continuation evidence and the typed native failure are recorded on
         // the attempt; the failure carries trusted supervisor context (never
         // the payload's): this attempt, its account, provider and model.
+        let history_started = std::time::Instant::now();
         let mut state = history_evidence(
             store,
             id,
@@ -1342,6 +1480,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             &identity,
             &planned.launch.environment,
         );
+        let history_captured = std::time::Instant::now();
         let quota = matches!(
             result.native_failure,
             Some(adapters::native_failure::NativeFailure::QuotaExhausted { .. })
@@ -1370,6 +1509,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             state["native_failure"] = data;
         }
         store.provider_history(id, &attempt_id, &state)?;
+        let history_recorded = std::time::Instant::now();
         // Cancellation wins over expiry; an expired run takes no next attempt.
         let expired = expired || domain::now() >= run_deadline(store, id)?;
         if expired && !cancelled {
@@ -1393,12 +1533,14 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 }
             }
         }
+        let answer_started = std::time::Instant::now();
         let proof = match result.answer.as_deref() {
             Some(text) if !text.trim().is_empty() => {
                 Some(verify::seal(&agent_dir, Path::new("answer.md"), text)?)
             }
             _ => None,
         };
+        let answer_sealed = std::time::Instant::now();
         let evidence = match &proof {
             Some(proof) => verify::AnswerProof::sealed(proof),
             None => verify::AnswerProof::absent(agent_dir.join("answer.md")),
@@ -1416,54 +1558,23 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             domain::now(),
             verify::DEFAULT_SILENCE_THRESHOLD_SECONDS,
         )?;
-        // Only the Codex harness has native caches; validating any other
-        // harness would only prepare a no-op publication.
+        let verdict_recorded = std::time::Instant::now();
+        // Optional native tree hashing/copying never holds a verified answer
+        // behind filesystem work. The existing offline compactor replays the
+        // frozen authority under exclusive home/broker ownership; no work is
+        // scheduled after terminal state and the private cache remains intact.
         if cleanup.confirmed && identity.authority.harness == HarnessId::Codex {
-            // The destination is still exclusively owned: resume admission
-            // cannot observe it as terminal until the following store.finish.
-            // Consolidation covers every terminal outcome and every resumed
-            // run, and never changes the model's completion verdict: a
-            // failed optional cache step is reported and skipped, never
-            // allowed to fail a valid answer or erase valid source data.
-            // Publication happens only into the root validated against the
-            // frozen plan and account: a refused root leaves the private home
-            // exactly as it was.
-            let witness = native_publication_root(
-                store,
-                home,
-                &identity,
-                &account,
-                &runtime_home,
-                &row.request,
+            let _ = store.event(
+                id,
+                "native_cache_consolidation_deferred",
+                &json!({"reason": "offline_compaction"}),
             );
-            match witness.and_then(|root| {
-                crate::runtime_cache::consolidate(
-                    store,
-                    id,
-                    &identity,
-                    &account,
-                    home,
-                    &runtime_home,
-                    &root,
-                )
-            }) {
-                Ok(report)
-                    if report.frozen + report.packed + report.already_frozen + report.skipped
-                        > 0 =>
-                {
-                    let _ = store.event(id, "native_cache_consolidated", &json!(report));
-                }
-                Err(error) => {
-                    let _ = store.event(
-                        id,
-                        "native_cache_consolidation_skipped",
-                        &json!({"class": error.public().kind}),
-                    );
-                }
-                _ => {}
-            }
         }
+        let terminal_started = std::time::Instant::now();
         store.finish(id, &outcome, proof.as_ref(), result.usage.as_ref())?;
+        if let Some(logger) = crate::logging::configured() {
+            logger.log(crate::logging::Level::Info, &format!("terminal_stage_ms agent_id={} cleanup_record={} history_capture={} history_record={} answer_seal={} verdict={} terminal_write={} total={}", id, cleanup_recorded.duration_since(cleanup_ended).as_millis(), history_captured.duration_since(history_started).as_millis(), history_recorded.duration_since(history_captured).as_millis(), answer_sealed.duration_since(answer_started).as_millis(), verdict_recorded.duration_since(answer_sealed).as_millis(), terminal_started.elapsed().as_millis(), cleanup_ended.elapsed().as_millis()));
+        }
         commands::complete_terminal(store, id)?;
         return Ok(());
     }
@@ -1965,6 +2076,196 @@ mod tests {
     }
     use super::error_text;
     use crate::Error;
+
+    /// Checkpoint causes retain their closed phase and SQLite numeric class;
+    /// neither public errors nor durable outcomes expose source diagnostics or
+    /// turn persistence failures into proof that an owned process died.
+    #[test]
+    fn ownership_checkpoint_diagnostics_keep_phase_and_hide_source() {
+        for stage in [
+            agent_run_domain::OwnershipStage::Initial,
+            agent_run_domain::OwnershipStage::Streaming,
+            agent_run_domain::OwnershipStage::Final,
+        ] {
+            let error = Error::ownership_checkpoint(
+                stage,
+                Error::Sql(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(5),
+                    Some("SOURCE_SECRET".into()),
+                )),
+            );
+            let data = execution_error_metadata(&error);
+            assert_eq!(data["stage"], serde_json::json!(stage));
+            assert_eq!(data["class"], "StorageError");
+            assert_eq!(data["sqlite_extended_code"], 5);
+            assert!(!data.to_string().contains("SOURCE_SECRET"));
+            assert!(!error.public().message.contains("SOURCE_SECRET"));
+            let home = tempfile::tempdir().unwrap();
+            let store = Store::initialize(home.path()).unwrap();
+            let id: AgentId = "ag-20260101-000000-0123456789".parse().unwrap();
+            let result = failed_execution(&store, &id, &error);
+            assert_eq!(
+                result.outcome.failure_kind.as_deref(),
+                Some("runtime_ownership_checkpoint_failed")
+            );
+            assert_eq!(result.outcome.status, Status::Failed);
+            assert!(
+                !result
+                    .outcome
+                    .failure_text
+                    .unwrap()
+                    .contains("SOURCE_SECRET")
+            );
+        }
+    }
+
+    /// A real held WAL writer is retried within the unchanged ordinary allowance,
+    /// then committed once. An expired synchronous busy sequence refuses rather
+    /// than extending its clock; these synthetic databases contain no native job.
+    #[test]
+    fn journal_busy_waits_for_a_real_writer_and_refuses_expired_sequences() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::initialize(home.path()).unwrap();
+        store.conn.busy_handler(Some(super::journal_busy)).unwrap();
+        let (ready, waiting) = std::sync::mpsc::sync_channel(0);
+        let path = home.path().to_path_buf();
+        let held = std::thread::spawn(move || {
+            let lock = Store::open(&path).unwrap();
+            lock.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            ready.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            lock.conn.execute_batch("ROLLBACK").unwrap();
+        });
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        store
+            .conn
+            .execute_batch("CREATE TABLE busy_fixture(value INTEGER)")
+            .unwrap();
+        held.join().unwrap();
+        super::JOURNAL_BUSY_STARTED.with(|at| {
+            at.set(Some(
+                std::time::Instant::now() - agent_run_store::BUSY_TIMEOUT,
+            ))
+        });
+        assert!(
+            !super::journal_busy(1),
+            "expired write allowance must preserve SQLite refusal"
+        );
+    }
+
+    /// A real held SQLite writer cannot consume the default multi-second wait
+    /// for each ownership snapshot. Inert evidence is never signalled; after
+    /// release a permanent missing-owner refusal is returned without retrying.
+    #[test]
+    fn ownership_writer_bounds_contention_and_keeps_permanent_refusal() {
+        let home = tempfile::tempdir().unwrap();
+        let lock = Store::initialize(home.path()).unwrap();
+        let id = "ag-20260101-000000-0000000098";
+        lock.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision) VALUES (?,'mock','fixture','review','t','t','/tmp','{}','starting',1,30,'cfg')",[id]).unwrap();
+        let attempt = format!("{id}:1");
+        lock.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES (?,?,1,'starting','{}',1,1)",rusqlite::params![attempt,id]).unwrap();
+        let mut write =
+            super::ownership_writer(home.path(), attempt, agent_run_domain::domain::now() + 30.0)
+                .unwrap();
+        let root = agent_run_platform::process::Identity {
+            pid: 10,
+            ppid: 2,
+            group: 10,
+            birth: 123.0,
+            token: "fixture-root".into(),
+            zombie: false,
+        };
+        let snapshot = agent_run_platform::process::OwnershipSnapshot {
+            leader: root.clone(),
+            members: vec![root],
+            descendants_observed: true,
+        };
+        write(&snapshot).unwrap();
+        lock.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let before = std::time::Instant::now();
+        let error = write(&snapshot).unwrap_err();
+        assert!(
+            before.elapsed() < std::time::Duration::from_secs(1),
+            "ownership write exceeded its bounded contention allowance"
+        );
+        assert!(
+            matches!(error, Error::Sql(ref source) if source.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy))
+        );
+        lock.conn.execute_batch("ROLLBACK").unwrap();
+        let mut missing = super::ownership_writer(
+            home.path(),
+            "missing-attempt".into(),
+            agent_run_domain::domain::now() + 30.0,
+        )
+        .unwrap();
+        assert!(matches!(missing(&snapshot), Err(Error::Validation(_))));
+    }
+
+    /// Initial required ownership may wait beyond one control tick before any
+    /// native task is released. After the root is durable, busy stream snapshots
+    /// retain the short control budget; neither stage signals these inert IDs.
+    #[test]
+    fn initial_root_waits_for_writer_and_stream_checkpoints_stay_short() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::initialize(home.path()).unwrap();
+        let id = "ag-20260101-000000-0000000099";
+        store.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,timeout_seconds,config_revision) VALUES (?,'mock','fixture','review','t','t','/tmp','{}','starting',1,30,'cfg')",[id]).unwrap();
+        let attempt = format!("{id}:1");
+        store.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES (?,?,1,'starting','{}',1,1)",rusqlite::params![attempt,id]).unwrap();
+        let mut write = super::ownership_writer(
+            home.path(),
+            attempt.clone(),
+            agent_run_domain::domain::now() + 30.0,
+        )
+        .unwrap();
+        let (ready, waiting) = std::sync::mpsc::sync_channel(0);
+        let path = home.path().to_path_buf();
+        let held = std::thread::spawn(move || {
+            let lock = Store::open(&path).unwrap();
+            lock.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            ready.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            lock.conn.execute_batch("ROLLBACK").unwrap();
+        });
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let root = agent_run_platform::process::Identity {
+            pid: 10,
+            ppid: 2,
+            group: 10,
+            birth: 123.0,
+            token: "fixture-root".into(),
+            zombie: false,
+        };
+        let snapshot = agent_run_platform::process::OwnershipSnapshot {
+            leader: root.clone(),
+            members: vec![root],
+            descendants_observed: true,
+        };
+        let result = write(&snapshot);
+        held.join().unwrap();
+        result
+            .expect("required initial persistence survives contention longer than a control tick");
+        assert!(
+            store
+                .remembered_processes("attempt", &attempt)
+                .unwrap()
+                .is_some()
+        );
+        store.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let before = std::time::Instant::now();
+        assert!(
+            matches!(write(&snapshot),Err(Error::Sql(ref source)) if source.sqlite_error_code()==Some(rusqlite::ErrorCode::DatabaseBusy))
+        );
+        assert!(
+            before.elapsed() < std::time::Duration::from_millis(400),
+            "stream checkpoint exceeded its short control allowance"
+        );
+        store.conn.execute_batch("ROLLBACK").unwrap();
+    }
 
     /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_blank_startup_error_uses_exception_type_in_ready_failure`.
     #[test]

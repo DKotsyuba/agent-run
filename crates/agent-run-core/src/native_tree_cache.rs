@@ -154,6 +154,9 @@ pub enum FreezeOutcome {
     /// The root is not a remote-managed native cache — its marker is absent
     /// or invalid — and was left completely unchanged.
     SkippedUnchanged,
+    /// Publication lock contention left the private root unchanged. No caller
+    /// may claim the root was frozen; a later optional/offline pass may retry.
+    SkippedBusy,
 }
 
 /// One census pass over a caller-supplied page of extant retained homes.
@@ -475,6 +478,9 @@ fn walk_capture(
         return Err(invalid("native cache capture exceeded its time budget"));
     }
     for name in directory.list(None)? {
+        if Instant::now() >= deadline {
+            return Err(invalid("native cache capture exceeded its time budget"));
+        }
         if entries.len() > MAX_TREE_ENTRIES {
             return Err(invalid("native cache tree exceeds the entry bound"));
         }
@@ -506,7 +512,7 @@ fn walk_capture(
                 )?;
             }
             EntryType::File => {
-                let (sha256, length, executable) = hash_entry(directory, text)?;
+                let (sha256, length, executable) = hash_entry(directory, text, deadline)?;
                 *total = total.saturating_add(length);
                 if *total > MAX_TREE_BYTES {
                     return Err(invalid("native cache tree exceeds the aggregate bound"));
@@ -531,9 +537,9 @@ fn walk_capture(
 
 /// Streams one regular file through a running SHA-256 and returns its
 /// digest, length, and execution bit, refusing files beyond the payload
-/// bound. The hash reads the same no-follow descriptor the identity check
-/// classified.
-fn hash_entry(directory: &Dir, name: &str) -> Result<(String, u64, bool)> {
+/// bound or the caller's capture deadline, checked before each bounded chunk.
+/// The hash reads the same no-follow descriptor the identity check classified.
+fn hash_entry(directory: &Dir, name: &str, deadline: Instant) -> Result<(String, u64, bool)> {
     let identity = directory.entry(Some(Path::new(name)))?;
     let mut file = directory.open_file(Path::new(name))?;
     if file.metadata()?.len() > MAX_FILE_BYTES as u64 {
@@ -544,6 +550,9 @@ fn hash_entry(directory: &Dir, name: &str) -> Result<(String, u64, bool)> {
     let mut buffer = vec![0_u8; STREAM_CHUNK];
     let mut length = 0_u64;
     loop {
+        if Instant::now() >= deadline {
+            return Err(invalid("native cache capture exceeded its time budget"));
+        }
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -845,6 +854,30 @@ pub fn freeze(
     root_key: &str,
     scope: &str,
 ) -> Result<FreezeOutcome> {
+    freeze_with_contention(store_root, home_path, root_key, scope, false)
+}
+
+/// Optional freeze uses exactly the required topology/ownership/durability
+/// checks but returns SkippedBusy before an unavailable publication lock. An
+/// unchanged private root and recoverable journal are never claimed frozen.
+pub fn try_freeze(
+    store_root: &Path,
+    home_path: &Path,
+    root_key: &str,
+    scope: &str,
+) -> Result<FreezeOutcome> {
+    freeze_with_contention(store_root, home_path, root_key, scope, true)
+}
+
+/// Shared required/optional freeze; nonblocking changes only lock waiting,
+/// never validation, source preservation, publication or cleanup proofs.
+fn freeze_with_contention(
+    store_root: &Path,
+    home_path: &Path,
+    root_key: &str,
+    scope: &str,
+    nonblocking: bool,
+) -> Result<FreezeOutcome> {
     let kind = classify(root_key)?;
     if !is_scope(scope) {
         return Err(invalid(
@@ -874,12 +907,22 @@ pub fn freeze(
             if !eligible {
                 return Ok(FreezeOutcome::SkippedUnchanged);
             }
-            freeze_directory(&root, &home_path, &home, root_key, scope)
+            freeze_directory(&root, &home_path, &home, root_key, scope, nonblocking)
         }
         Ok(kind) => Err(invalid(format!(
             "native cache root has an unsupported shape: {kind:?}"
         ))),
         Err(error) => Err(error),
+    }
+}
+
+/// Acquires the existing publication lock, preserving required blocking
+/// semantics. Only explicitly optional callers may receive an occupied skip.
+fn publication_lock(root: &Path, nonblocking: bool) -> Result<Option<SharedStoreLock>> {
+    if nonblocking {
+        SharedStoreLock::try_acquire(root, true)
+    } else {
+        Ok(Some(SharedStoreLock::acquire(root)?))
     }
 }
 
@@ -892,7 +935,11 @@ fn freeze_directory(
     home: &Dir,
     root_key: &str,
     scope: &str,
+    nonblocking: bool,
 ) -> Result<FreezeOutcome> {
+    let Some(guard) = publication_lock(root, nonblocking)? else {
+        return Ok(FreezeOutcome::SkippedBusy);
+    };
     let source = home.subdir(Path::new(root_key))?;
     let deadline = Instant::now() + TIME_BUDGET;
     let captured = capture(&source, deadline)?;
@@ -912,20 +959,35 @@ fn freeze_directory(
     // tree meanwhile; every later pass sees the record's pin. Anything else
     // — missing or unverifiable — goes through the publisher (which takes
     // the lock itself), and it refuses a corrupt destination.
-    let existing = {
-        let _guard = SharedStoreLock::acquire(root)?;
-        shared_assets::verify_shared_tree(root, &reference).is_ok()
-    };
+    let existing = shared_assets::verify_shared_tree(root, &reference).is_ok();
+    drop(guard);
     if !existing {
         let staged_rel = Path::new(&backup).join(STAGING).join(root_key);
         stage_capture(home, &staged_rel, Path::new(root_key), &source, &captured)?;
-        shared_assets::import_shared_tree(root, scope, home_path, &staged_rel)?;
+        let imported = if nonblocking {
+            shared_assets::try_import_shared_tree(root, scope, home_path, &staged_rel)?
+        } else {
+            Some(shared_assets::import_shared_tree(
+                root,
+                scope,
+                home_path,
+                &staged_rel,
+            )?)
+        };
+        if imported.is_none() {
+            remove_backup_child(home, &backup, STAGING)?;
+            finish_backup_removal(home, &backup)?;
+            return Ok(FreezeOutcome::SkippedBusy);
+        }
         shared_assets::verify_shared_tree(root, &reference)?;
         remove_backup_child(home, &backup, STAGING)?;
     }
     // The link install and original hand-off hold the global lock so store
     // guard scans and collectors never observe a half-switched home.
-    let _guard = SharedStoreLock::acquire(root)?;
+    let Some(_guard) = publication_lock(root, nonblocking)? else {
+        finish_backup_removal(home, &backup)?;
+        return Ok(FreezeOutcome::SkippedBusy);
+    };
     home.rename_entry_no_replace(Path::new(root_key), &Path::new(&backup).join(root_key))?;
     let target = shared_assets::shared_tree_root(root, &reference)?;
     home.symlink(&target, Path::new(root_key))?;

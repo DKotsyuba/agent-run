@@ -8,6 +8,16 @@ packs under `.tmp/plugins`.
 `agent-run-core::native_tree_cache` removes those duplicates while idle
 without changing what the native SDK sees or does.
 
+
+Optional packing/freezing is deferred to explicit offline `storage compact
+--apply`, under its existing startup locks and all-terminal ownership checks.
+Live completion retains private native caches and does not perform this work
+before notifying the owner or schedule it after terminal state. Nonblocking
+publication-lock skips and cooperative budgets do not preempt filesystem I/O.
+Required launch-time freezing retains serialized blocking publication and all
+convergence checks. Only explicitly optional offline freezing uses try_freeze;
+occupied skips leave the private tree and recoverable evidence intact.
+
 ## Kinds and eligibility
 
 - `skills/.system` — the whole root. Native discovery reads through a

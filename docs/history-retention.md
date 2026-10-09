@@ -153,3 +153,20 @@ used scan restarts at the beginning if that limit is reached. A broker restart
 also rescans from the beginning; immutable
 names and fresh reference checks make partial cleanup safe to resume. Unknown,
 foreign-owned, special or unreadable entries are retained.
+
+## Compact incident ledger (schema 27)
+
+A separate immutable execution/phase ledger keeps closed terminal, execution,
+cleanup and delivery observations for thirty days and at most 10,000 phase
+records. It has no cascading agent foreign key. Records contain only validated
+public execution IDs, known enums, numeric codes, timestamps and nullable
+cleanup/ambiguity facts, each bounded to 4096 UTF-8 bytes. Prompts, answers,
+native session IDs, arguments, environment/credential values, paths and
+free-form error strings are excluded. Missing old causes remain unknown.
+
+Capture after a terminal or delivery commit is best effort and cannot undo
+the original outcome. Before pruning incident-bearing source journals, the
+batch requires the compact projection; a failed ledger write defers retirement
+without destroying its source. Independent ledger expiry uses the existing
+maintenance cadence and an idle read-only probe. Doctor reports aggregate
+counts through a bounded read-only connection, without a new public SQL tool.

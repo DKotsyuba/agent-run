@@ -505,7 +505,7 @@ impl Store {
         // An idle database must not take the writer lock at all: the probe
         // above is read-only, so an ordinary workload never sees a no-op
         // maintenance transaction compete for the single WAL writer.
-        if !self.prune_work_pending(cutoff)? {
+        if !self.prune_work_pending(cutoff)? && !crate::incidents::prune_pending(&self.conn, at)? {
             return Ok(0);
         }
         let tx = self
@@ -609,6 +609,18 @@ impl Store {
              ORDER BY a.finished_at,a.id LIMIT 32",
             params![cutoff, at],
         )?;
+        // Compact failure evidence must commit before any journal or notice
+        // disappears. A broken ledger aborts this batch and preserves sources.
+        let ids = {
+            let mut statement = tx.prepare("SELECT id FROM retention_agents ORDER BY id")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for id in ids {
+            crate::incidents::capture(&tx, &id, at)?;
+        }
+        crate::incidents::prune(&tx, at)?;
         deleted += tx.execute(
             "DELETE FROM delivery_attempt_evidence WHERE rowid IN
              (SELECT e.rowid FROM delivery_attempt_evidence e JOIN deliveries d ON d.id=e.delivery_id

@@ -168,5 +168,8 @@ pub fn finish(
         )?;
     }
     tx.commit()?;
+    // Incident diagnostics cannot undo the durable outcome. Retention retries
+    // this projection before it is allowed to destroy the source history.
+    let _ = crate::incidents::capture(&store.conn, id.as_str(), time);
     Ok(())
 }

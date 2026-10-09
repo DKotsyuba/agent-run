@@ -106,6 +106,21 @@ pub struct ProtocolMapping {
     pub cli_exit_code: i32,
 }
 
+/// Closed ownership-checkpoint phases; they describe persistence/observation,
+/// never assert that a process died or grant permission to signal one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnershipStage {
+    /// Initial root snapshot before native RPC or model execution.
+    Initial,
+    /// Newly captured members during RPC and stream processing.
+    Streaming,
+    /// Final snapshot after the supervisor's verified cleanup.
+    Final,
+    /// The owned child's wait/observation failed; identity remains uncertain.
+    Observation,
+}
+
 /// Expected domain failures; source-bearing variants never expose source diagnostics publicly.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -145,6 +160,16 @@ pub enum Error {
     /// A safe runtime error message.
     #[error("{0}")]
     Runtime(String),
+    /// An ownership observer/checkpoint failed. The typed source stays private;
+    /// diagnostics retain only closed stage/category and safe numeric codes.
+    #[error("runtime ownership checkpoint failed")]
+    OwnershipCheckpoint {
+        /// Closed lifecycle phase of the first failure.
+        stage: OwnershipStage,
+        /// Original cause, never rendered as a public error message.
+        #[source]
+        source: Box<Error>,
+    },
     /// A domain error returned by the resident broker, retaining its stable broker code.
     #[error("{message}")]
     Broker {
@@ -198,6 +223,18 @@ pub struct PublicError {
     pub failure_stage: Option<String>,
 }
 impl Error {
+    /// Wraps an observer failure with a closed phase, preserving an already
+    /// wrapped first cause rather than replacing it during later cleanup.
+    pub fn ownership_checkpoint(stage: OwnershipStage, source: Self) -> Self {
+        match source {
+            wrapped @ Self::OwnershipCheckpoint { .. } => wrapped,
+            source => Self::OwnershipCheckpoint {
+                stage,
+                source: Box::new(source),
+            },
+        }
+    }
+
     /// Returns the stable machine code without formatting untrusted source diagnostics.
     ///
     /// A broker-returned error keeps the broker's own code when it is an
@@ -231,7 +268,9 @@ impl Error {
                 broker_error_code: Some(code),
                 ..
             } => MachineCode::from_wire(code).unwrap_or(MachineCode::RuntimeError),
-            Self::Runtime(_) | Self::Broker { .. } => MachineCode::RuntimeError,
+            Self::Runtime(_) | Self::OwnershipCheckpoint { .. } | Self::Broker { .. } => {
+                MachineCode::RuntimeError
+            }
             Self::Bootstrap { .. } => MachineCode::ValidationError,
             Self::Io(_) => MachineCode::IOError,
             Self::Sql(_) => MachineCode::StorageError,

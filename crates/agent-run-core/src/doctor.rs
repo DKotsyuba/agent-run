@@ -633,6 +633,24 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
     );
     supervisors(&snapshot.agents, &mut report.findings);
     terminal_attempt_ownership(&report.home, &mut report.findings);
+    match state::incidents::read_summary(&report.home.join("state.db")) {
+        Ok(value) => report.diagnostics.checks.push(check(
+            "incident_ledger",
+            CheckStatus::Ok,
+            &format!(
+                "{} retained content-free phase records",
+                value["records"].as_i64().unwrap_or(0)
+            ),
+            "none",
+        )),
+        Err(_) => add(
+            &mut report.findings,
+            "incident_ledger_unavailable",
+            "warning",
+            "state",
+            "read-only incident summary is unavailable",
+        ),
+    }
     canary(
         &report.home,
         dependencies.canary_executable.as_deref(),

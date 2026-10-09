@@ -205,10 +205,7 @@ where
         process: Process::spawn(&probe).map_err(|_| failure("server could not be started"))?,
         armed: true,
     };
-    child
-        .process
-        .observe_ownership(observer)
-        .map_err(|_| failure("process ownership could not be persisted"))?;
+    child.process.observe_ownership(observer)?;
     let result = tokio::time::timeout(timeout, async {
         child
             .process
@@ -223,8 +220,7 @@ where
     let cleanup = child.process.owner.cleanup(CLEANUP_GRACE).await;
     child
         .process
-        .checkpoint_ownership()
-        .map_err(|_| failure("final process ownership could not be persisted"))?;
+        .checkpoint_ownership_at(agent_run_domain::OwnershipStage::Final)?;
     child.process.reap().await;
     let reaped = child
         .process
@@ -328,8 +324,10 @@ async fn exchange(
         .await
         .map_err(|_| failure("request write failed"))?;
     for _ in 0..128 {
-        let Event::Json(value) = process.next().await else {
-            return Err(failure("server closed or returned malformed JSON"));
+        let value = match process.next().await {
+            Event::Json(value) => value,
+            Event::OwnershipFailure(error) => return Err(error),
+            _ => return Err(failure("server closed or returned malformed JSON")),
         };
         *bytes += serde_json::to_vec(&value)
             .map_err(|_| failure("invalid JSON response"))?

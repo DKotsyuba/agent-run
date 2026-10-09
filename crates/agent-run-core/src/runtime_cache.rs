@@ -259,15 +259,20 @@ fn plugin_parents(runtime_home: &Path) -> Result<Vec<String>> {
 
 /// Consolidates one exclusively owned, quiescent home's native caches.
 ///
-/// The caller proves exclusivity and quiescence — confirmed cleanup before
-/// the terminal state is committed, or the operator's offline locks over an
-/// all-terminal lineage — so no native process can hold these trees. The home
+/// The operator's offline locks prove exclusive ownership of an all-terminal
+/// lineage, so no native process can hold these trees. Live terminal execution
+/// never calls this function. The home
 /// is first anchored in the layout registry (a cache-only home has no managed
 /// roots to map; the row is what keeps it in the collector's census after its
 /// agent history expires), then eligible native trees — the system skills,
 /// the curated clone's working tree and Git packs, and remote plugin
 /// parents — are frozen and both
 /// metadata caches packed under the caller-supplied compatibility domain.
+/// Explicit offline maintenance visits every configured root; restarting an
+/// overall budget at each pass would starve late roots behind expensive verified
+/// prefixes. Required layout registration stays serialized; optional tree/file
+/// publication skips occupied locks and retains entry/chunk bounds. No budget preempts a
+/// blocked filesystem syscall or an already-started atomic publication.
 /// Every step is reported and skipped on failure: an optional cache never
 /// turns a valid answer into a failure, and a failed preparation with a
 /// journal stays recoverable by the next entry or the operator.
@@ -295,6 +300,15 @@ pub fn consolidate(
             "native cache publication requires the validated shared store root",
         ));
     }
+    // Required layout anchoring serializes on the publication lock. Refuse an
+    // already occupied store before recovery, anchoring or optional capture.
+    let Some(probe) = agent_run_platform::shared_assets::SharedStoreLock::try_acquire(&root, true)?
+    else {
+        report.bounded = true;
+        report.skipped = 1;
+        return Ok(report);
+    };
+    drop(probe);
     crate::native_tree_cache::recover(&root, runtime_home)?;
     // The anchor precedes any publication: from here on the registry names
     // this physical home, whatever its agent rows later become.
@@ -310,12 +324,17 @@ pub fn consolidate(
     roots.extend(curated_roots(runtime_home)?);
     roots.extend(plugin_parents(runtime_home)?);
     for root_key in roots {
-        match crate::native_tree_cache::freeze(&root, runtime_home, &root_key, &scope) {
+        match crate::native_tree_cache::try_freeze(&root, runtime_home, &root_key, &scope) {
             Ok(crate::native_tree_cache::FreezeOutcome::Frozen(_)) => report.frozen += 1,
             Ok(crate::native_tree_cache::FreezeOutcome::AlreadyFrozen(_)) => {
                 report.already_frozen += 1
             }
             Ok(crate::native_tree_cache::FreezeOutcome::SkippedUnchanged) => report.skipped += 1,
+            Ok(crate::native_tree_cache::FreezeOutcome::SkippedBusy) => {
+                report.bounded = true;
+                report.skipped += 1;
+                return Ok(report);
+            }
             Err(error) => {
                 // Best effort by contract: report and continue.
                 if let Some(logger) = crate::logging::configured() {

@@ -375,6 +375,11 @@ pub(crate) fn complete(
         .conn
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     owned_attempt(&tx, delivery_id, owner, at, evidence)?;
+    let incident_agent: String = tx.query_row(
+        "SELECT agent_id FROM deliveries WHERE id=?",
+        [delivery_id],
+        |row| row.get(0),
+    )?;
     finish_claim(
         &tx,
         delivery_id,
@@ -387,6 +392,7 @@ pub(crate) fn complete(
         remote_message_id,
     )?;
     tx.commit()?;
+    let _ = crate::incidents::capture(&store.conn, &incident_agent, at);
     Ok(())
 }
 
@@ -408,6 +414,11 @@ pub(crate) fn fail(
         .conn
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     owned_attempt(&tx, delivery_id, owner, at, evidence)?;
+    let incident_agent: String = tx.query_row(
+        "SELECT agent_id FROM deliveries WHERE id=?",
+        [delivery_id],
+        |row| row.get(0),
+    )?;
     finish_claim(
         &tx,
         delivery_id,
@@ -420,6 +431,7 @@ pub(crate) fn fail(
         None,
     )?;
     tx.commit()?;
+    let _ = crate::incidents::capture(&store.conn, &incident_agent, at);
     Ok(())
 }
 
@@ -450,6 +462,11 @@ pub(crate) fn retry(
     let exponent = attempts.saturating_sub(1).min(20);
     let delay = (base_delay * 2_f64.powi(exponent as i32)).min(max_delay);
     let next = at + delay;
+    let incident_agent: String = tx.query_row(
+        "SELECT agent_id FROM deliveries WHERE id=?",
+        [delivery_id],
+        |row| row.get(0),
+    )?;
     finish_claim(
         &tx,
         delivery_id,
@@ -462,6 +479,7 @@ pub(crate) fn retry(
         None,
     )?;
     tx.commit()?;
+    let _ = crate::incidents::capture(&store.conn, &incident_agent, at);
     Ok(next)
 }
 

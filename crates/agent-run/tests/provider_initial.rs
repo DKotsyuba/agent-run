@@ -5095,12 +5095,10 @@ async fn private_launch_creates_the_store_before_the_first_publication() {
     );
 }
 
-/// A Codex run whose role carries a managed skill is materialized, relocated
-/// into the shared store after store validation, launched through its
-/// committed registry mapping, and after cleanup still consolidates its native
-/// caches: the post-cleanup publication plans through that same verified
-/// mapping instead of the strict private verifier, which rejects the managed
-/// link and would silently skip every managed-role home.
+/// A managed Codex home publishes required launch assets, then completes without
+/// optional cache publication. Explicit offline compaction still freezes a newly
+/// accumulated native cache through the same verified registry mapping; source
+/// content, immutable managed skills and the sealed successful answer survive.
 #[tokio::test]
 async fn managed_codex_home_consolidates_through_its_registry_mapping() {
     let (_temp, home) = codex_home_with(&["ok"]);
@@ -5122,17 +5120,53 @@ async fn managed_codex_home_consolidates_through_its_registry_mapping() {
     );
     assert!(
         runtime_home.join("skills/demo").is_symlink(),
-        "the managed skill was relocated into the shared store"
+        "required launch assets remain shared"
     );
-    let events = |kind: &str| {
+    assert_eq!(
         count(
             &home,
-            &format!("SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='{kind}'"),
-            &id,
-        )
-    };
-    assert_eq!(events("native_cache_consolidation_skipped"), 0);
-    assert_eq!(events("native_cache_consolidated"), 1);
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='native_cache_consolidated'",
+            &id
+        ),
+        0,
+        "optional publication must not run before terminal delivery"
+    );
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='native_cache_consolidation_deferred'",
+            &id
+        ),
+        1
+    );
+    let parent = runtime_home.join("plugins/cache/remote/offline-plugin");
+    fs::create_dir_all(parent.join("1.0.0")).unwrap();
+    fs::write(parent.join("1.0.0/plugin.toml"), "name = \"offline\"\n").unwrap();
+    fs::write(
+        parent.join(".codex-remote-plugin-install.json"),
+        "{\"schema_version\":1,\"remote_plugin_id\":\"offline-plugin\"}\n",
+    )
+    .unwrap();
+    let result = agent_run::storage_admin::compact(&home, true).expect("offline consolidation");
+    let native = result["native"].as_array().unwrap();
+    assert!(
+        native
+            .iter()
+            .any(|item| item["consolidated"]["frozen"].as_u64().unwrap_or(0) >= 1),
+        "{result}"
+    );
+    assert!(
+        parent.is_symlink(),
+        "offline compaction keeps native cache sharing"
+    );
+    assert_eq!(
+        fs::read_to_string(parent.join("1.0.0/plugin.toml")).unwrap(),
+        "name = \"offline\"\n"
+    );
+    assert_eq!(
+        Store::open(&home).unwrap().get(&id).unwrap().answer_sha256,
+        row.answer_sha256
+    );
 }
 
 /// A managed Claude home relocates into the shared store and launches its

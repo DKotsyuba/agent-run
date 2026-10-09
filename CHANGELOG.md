@@ -4,6 +4,18 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- fix(runtime): defer optional native cache publication to explicit offline
+  compaction so verified answers are not delayed by filesystem work
+- fix(ownership): retain typed initial/stream/final checkpoint and observation
+  causes with bounded SQLite contention retries and unchanged signalling guards
+- feat(diagnostics): retain immutable content-free incident phases in schema 27
+  after ordinary session retirement, with bounded age/count retention and a
+  read-only summary; preserve original outcomes when diagnostic capture fails
+- test(stability): qualify concurrent 15-agent broker cohorts, typed admission
+  retry, cancellation, idempotency, cleanup and paired schema migration/rollback
+- feat(research): capture safe Claude initialization tool-name inventory without
+  retaining raw frames, unknown names, credentials or native session identifiers
+
 ## 0.22.7
 
 - feat(research): enable native web search and page retrieval with a frozen

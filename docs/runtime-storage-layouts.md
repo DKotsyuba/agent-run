@@ -71,8 +71,9 @@ as `prepared` in one `IMMEDIATE` transaction:
   spawn, an unknown phase, and a released attempt (`ownership_active=0`)
   without verified cleanup all keep holding the home.
 - The one holder itself may register, passed as `owner`, when it proves it
-  holds nothing live. A `running` owner — the consolidation window before its
-  terminal commit — must show every attempt with a confirmed cleanup proof,
+  holds nothing live. A trusted caller supplying a `running` owner must show every attempt with a
+  confirmed cleanup proof; ordinary live finalization defers optional consolidation
+  to explicit offline compaction,
   never merely `prepared` attempts.
 - With an existing row the call is strictly idempotent: a `prepared` row
   returns itself unchanged (same operation token, same bytes) only for the
@@ -148,7 +149,10 @@ same UID rests on modes and digest verification, never on an OS write denial
 and remote-parent thaw) precedes planning and publication. An already-shared
 managed home is planned through its verified committed registry mapping,
 exactly as it launches, never through the strict private verifier that rejects
-its links.
+its links. Optional native consolidation runs during explicit offline compaction,
+with startup locks and zero active work. Live terminal finalization preserves
+the private cache and records its deferred disposition; it does not queue work
+after the home becomes resumable.
 
 Every harness launch — first attempt, account switch and resume, private or
 shared — names the store: `launch_shared_assets` creates the empty trusted root
