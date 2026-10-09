@@ -4,6 +4,13 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- fix(supervisor): reuse short monotonic SQLite busy sleeps for ownership
+  checkpoints; preserve the original initial/streaming allowances, bounded
+  retries, typed refusal and unchanged process signalling guards
+- feat(runtime)!: include the unlimited execution lifecycle and schema-28
+  migration from the unpublished 0.24.0 candidate; start/resume have no
+  lifetime parameter and continuations retain native history and authority
+
 ## 0.24.0
 
 - feat(runtime)!: remove agent execution deadlines, the global time margin and
