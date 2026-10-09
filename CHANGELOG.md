@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.24.1
+
 - fix(supervisor): reuse short monotonic SQLite busy sleeps for ownership
   checkpoints; preserve the original initial/streaming allowances, bounded
   retries, typed refusal and unchanged process signalling guards
