@@ -120,7 +120,8 @@ fn python_transport_error_mapping_preserves_answer_integrity() {
     assert_eq!(integrity.protocol_mapping().cli_exit_code, 2);
 }
 
-/// Mirrors Python `_jsonable` dataclass ordering and null emission for agent pages.
+/// Preserve legacy page ordering/nulls and accept explicit lifecycle fields
+/// without relaxing the shared DTO's refusal of unknown fields.
 #[test]
 fn python_view_dtos_keep_field_order_and_nulls() {
     let id: AgentId = "ag-20260825-010203-0123456789".parse().unwrap();
@@ -166,6 +167,9 @@ fn python_view_dtos_keep_field_order_and_nulls() {
         policy: None,
         phase: "accepted".into(),
         phase_started_at: 1.0,
+        completion_mode: None,
+        turn_count: None,
+        idle_seconds: None,
         process_state: "not_started".into(),
         observed_at: 1.0,
         runtime_outcome: None,
@@ -193,6 +197,18 @@ fn python_view_dtos_keep_field_order_and_nulls() {
         keys[..4],
         ["acceptance", "agent_id", "answer_available", "answer_bytes"]
     );
+    let mut idle = value["items"][0].clone();
+    idle["phase"] = json!("idle");
+    idle["completion_mode"] = json!("explicit_finish");
+    idle["turn_count"] = json!(2);
+    idle["idle_seconds"] = json!(120.5);
+    let parsed: AgentView = serde_json::from_value(idle.clone()).unwrap();
+    assert_eq!(parsed.phase, "idle");
+    assert_eq!(parsed.completion_mode.as_deref(), Some("explicit_finish"));
+    assert_eq!(parsed.turn_count, Some(2));
+    assert_eq!(parsed.idle_seconds, Some(120.5));
+    idle["forged_authority"] = json!(true);
+    assert!(serde_json::from_value::<AgentView>(idle).is_err());
 }
 
 // --- provider orchestration catalog contracts (schema v17 preparation) ---

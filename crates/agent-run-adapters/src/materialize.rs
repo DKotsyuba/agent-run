@@ -698,6 +698,9 @@ fn materialize_with_provider(
                     toml::Value::Array(s.args.iter().cloned().map(toml::Value::String).collect()),
                 );
                 let mut forwarded = s.env_from.clone();
+                if name == agent_run_domain::worker::SERVER_NAME {
+                    forwarded.push(agent_run_domain::worker::FINISH_ENV.into());
+                }
                 if research && name == agent_run_domain::worker::SERVER_NAME {
                     // Select the six-tool catalog inside Codex's separately
                     // filtered MCP child; broker authority remains independent.

@@ -293,6 +293,23 @@ async fn worker_tool_call(
         Ok(json!({"error": {"code": denial.code(), "message": denial.message()}}))
     };
     match tool {
+        WorkerTool::Finish => {
+            let input: agent_run_domain::worker::FinishRequest = serde_json::from_value(call.input)
+                .map_err(|_| invalid("invalid finish arguments"))?;
+            let home = service.home.clone();
+            let receipt = tokio::task::spawn_blocking(move || {
+                crate::state::Store::open(&home)?.accept_worker_finish(
+                    &call.run_id,
+                    &call.attempt_id,
+                    &call.token,
+                    &input,
+                    crate::domain::now(),
+                )
+            })
+            .await
+            .map_err(|_| crate::Error::Runtime("worker finish failed".into()))??;
+            Ok(serde_json::to_value(receipt)?)
+        }
         WorkerTool::SaveReport => {
             let input: agent_run_domain::worker::SaveReportRequest =
                 serde_json::from_value(call.input.clone())

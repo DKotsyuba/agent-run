@@ -419,6 +419,7 @@ fn native_init_inventory(frame: &Value) -> Value {
         "mcp__agent_run_worker__pool_propose",
         "mcp__agent_run_worker__pool_vote",
         "mcp__agent_run_worker__save_report",
+        "mcp__agent_run_worker__finish",
     ];
     let Some(tools) = frame["tools"].as_array().filter(|items| items.len() <= 64) else {
         return json!({"version":1,"complete":false,"tool_names":[],"unknown_count":null});
@@ -576,6 +577,7 @@ pub async fn run(
     )?;
     let mut session = None;
     let mut final_result: Option<EngineResult> = None;
+    let mut closing_at: Option<tokio::time::Instant> = None;
     let mut result_frame_index = 0_u64;
     let mut legacy_result_seen = false;
     let mut selected_result_index = None;
@@ -596,6 +598,25 @@ pub async fn run(
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        if record.request.explicit_finish && store.worker_finish_intent(&record.id, true)?.is_some()
+        {
+            if closing_at.is_none() {
+                closing_at = Some(tokio::time::Instant::now());
+                process.input.take();
+            }
+            if closing_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(2)) {
+                store.event(
+                    &record.id,
+                    "finish_usage_incomplete_v1",
+                    &json!({"protocol":"claude"}),
+                )?;
+                if let Some(result) =
+                    crate::worker_finish::result(process, store, record, session.clone(), None)?
+                {
+                    return Ok(result);
+                }
+            }
+        }
         let event = tokio::select! {
             biased;
             event = process.next() => Some(event),
@@ -626,6 +647,16 @@ pub async fn run(
                         usage: None,
                     });
                 }
+                if record.request.explicit_finish
+                    && store.worker_finish_intent(&record.id, false)?.is_some()
+                {
+                    store.complete_command(
+                        &record.id,
+                        cid,
+                        &json!({"accepted":false,"reason":"finish_accepted"}),
+                    )?;
+                    continue;
+                }
                 if command == "steer" {
                     if let Some(text) = commands::steer_text(&payload) {
                         let id = uuid::Uuid::new_v4().to_string();
@@ -633,6 +664,7 @@ pub async fn run(
                         let accepted = send_user_text(process, text, &id, deadline).await;
                         if accepted {
                             inputs.sent(id, true);
+                            store.worker_turn(&record.id, false, crate::domain::now())?;
                         } else if open {
                             inputs.uncertain_write = true;
                         }
@@ -659,6 +691,7 @@ pub async fn run(
                             let open = process.input.is_some();
                             if send_user_text(process, &text, &id, deadline).await {
                                 inputs.sent(id, false);
+                                store.worker_turn(&record.id, false, crate::domain::now())?;
                                 commands::pool_result("written", "stdin_write")
                             } else {
                                 inputs.uncertain_write |= open;
@@ -700,6 +733,19 @@ pub async fn run(
                     message_id.as_deref(),
                 )?;
                 let code = process.reap().await;
+                if closing_at.is_some() {
+                    store.event(
+                        &record.id,
+                        "finish_usage_incomplete_v1",
+                        &json!({"protocol":"claude"}),
+                    )?;
+                    if let Some(mut result) =
+                        crate::worker_finish::result(process, store, record, session.clone(), None)?
+                    {
+                        result.outcome.exit_code = code;
+                        return Ok(result);
+                    }
+                }
                 store.event(
                     &record.id,
                     "native_result_exit_v1",
@@ -731,7 +777,9 @@ pub async fn run(
                     return Ok(result);
                 }
                 let diagnostic = process.diagnostic_tail();
-                let kind = if result_frame_index > 0 {
+                let kind = if record.request.explicit_finish {
+                    "ended_without_finish"
+                } else if result_frame_index > 0 {
                     "uncorrelated_result"
                 } else if saw_answer {
                     "cut_off"
@@ -802,6 +850,13 @@ pub async fn run(
             );
             return Err(error);
         }
+        if v.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification")
+            || v.get("type").and_then(Value::as_str) == Some("assistant")
+            || (v.get("type").and_then(Value::as_str) == Some("stream_event")
+                && v.pointer("/event/type").and_then(Value::as_str) == Some("message_start"))
+        {
+            store.worker_turn(&record.id, false, crate::domain::now())?;
+        }
         // Capture every observed result before identity/shape validation can reject it.
         let result_scope = if v.get("type").and_then(Value::as_str) == Some("result") {
             result_frame_index += 1;
@@ -842,6 +897,11 @@ pub async fn run(
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
         {
+            if record.request.explicit_finish
+                && session.as_deref().is_some_and(|expected| expected != s)
+            {
+                return Err(invalid("explicit run changed its native session"));
+            }
             if record
                 .resume_of_runtime_session_id
                 .as_deref()
@@ -849,9 +909,8 @@ pub async fn run(
             {
                 return Err(invalid("runtime resumed a different native session"));
             }
-            // Fresh Claude launches can legitimately report a new session after
-            // initialization. A resumed launch is different: its identity is a
-            // grant boundary and must remain exactly the requested session.
+            // Legacy fresh launches can rebind after initialization. Explicit
+            // and resumed runs keep one identity across every idle/wake boundary.
             if session.as_deref() != Some(s) {
                 store.runtime_session(&record.id, s)?;
                 session = Some(s.into());
@@ -1054,6 +1113,14 @@ pub async fn run(
                                 .unwrap_or_else(|| {
                                     block.get("content").unwrap_or(&Value::Null).to_string()
                                 });
+                            if block["tool_use_id"]
+                                .as_str()
+                                .and_then(|id| tool_names.get(id))
+                                .is_some_and(|name| name == "mcp__agent_run_worker__finish")
+                                && block.get("is_error").and_then(Value::as_bool) != Some(true)
+                            {
+                                crate::worker_finish::receipt(process, store, record, &text)?;
+                            }
                             crate::journal_with_error(
                                 store,
                                 &record.id,
@@ -1105,6 +1172,19 @@ pub async fn run(
                     return Err(invalid("result exceeds answer size bound"));
                 }
                 let usage = runtime_result_usage(&v);
+                if let Some(result) = crate::worker_finish::result(
+                    process,
+                    store,
+                    record,
+                    session.clone(),
+                    Some(usage.clone()),
+                )? {
+                    return Ok(result);
+                }
+                if record.request.explicit_finish && outcome.status == Status::Succeeded {
+                    store.worker_turn(&record.id, true, crate::domain::now())?;
+                    continue;
+                }
                 if record.resume_of_runtime_session_id.is_some()
                     && outcome.runtime_session_id != record.resume_of_runtime_session_id
                 {

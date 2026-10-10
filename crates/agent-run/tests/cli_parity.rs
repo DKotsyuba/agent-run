@@ -161,7 +161,15 @@ fn python_cli_spec_command_surface_is_present() {
         // selector while retaining JSON as its default; the oracle stays frozen.
         let (removed, added): (&[&str], &[&str]) = match path {
             "doctor" => (&[], &["--json"]),
-            "start" => (&["--runtime", "--timeout"], &["--provider", "--name"]),
+            "start" => (
+                &["--runtime", "--timeout"],
+                &[
+                    "--provider",
+                    "--name",
+                    "--explicit-finish",
+                    "--legacy-completion",
+                ],
+            ),
             "models" => (&[], &["--provider", "--profile", "--model"]),
             "capacity order" => (&[], &["--model"]),
             "resume" => (&["--timeout"], &["--run-id", "--name"]),

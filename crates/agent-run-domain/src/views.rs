@@ -197,6 +197,16 @@ pub struct AgentView {
     pub phase: String,
     /// UTC epoch seconds when the current phase began.
     pub phase_started_at: f64,
+    /// Observed completion contract (`explicit_finish`); omitted for legacy
+    /// executions or before their private lifecycle has been initialized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_mode: Option<String>,
+    /// Internal native turn count, distinct from public resume sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_count: Option<u64>,
+    /// Observed nonnegative idle seconds, frozen at terminal completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_seconds: Option<f64>,
     /// Process observation state name.
     pub process_state: String,
     /// UTC epoch seconds when this view was built.

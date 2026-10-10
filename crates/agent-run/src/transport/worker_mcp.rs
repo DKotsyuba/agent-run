@@ -41,6 +41,8 @@ pub struct WorkerProxy {
     catalog_registered: Arc<AtomicBool>,
     /// Frozen supervisor-selected report surface; broker authorization remains authoritative.
     research: bool,
+    /// Native completion catalog selected by frozen supervisor admission.
+    explicit_finish: bool,
 }
 
 /// Converts every domain-owned worker definition through the pinned SDK.
@@ -57,8 +59,19 @@ fn tools() -> std::result::Result<Vec<Tool>, ErrorData> {
 
 impl WorkerProxy {
     /// Returns the role-bound embedded surface. Research adds only the report
-    /// writer; ordinary workers retain their original exact five-tool inventory.
+    /// writer; legacy ordinary workers retain their exact five-tool inventory.
+    /// Explicit mode adds only finish, with no additional role authority.
     fn tools(&self) -> std::result::Result<Vec<Tool>, ErrorData> {
+        if self.explicit_finish {
+            return agent_run_domain::worker::finish_tools_json(self.research)
+                .into_iter()
+                .map(|tool| {
+                    serde_json::from_value(tool).map_err(|_| {
+                        ErrorData::internal_error("invalid finish worker registry", None)
+                    })
+                })
+                .collect();
+        }
         if !self.research {
             return tools();
         }
@@ -84,8 +97,14 @@ impl WorkerProxy {
             run_id: self.run_id.clone(),
             attempt_id: self.attempt_id.clone(),
             token: self.token.clone(),
-            version: agent_run_domain::worker::POOL_CATALOG_VERSION,
-            digest: if self.research {
+            version: if self.explicit_finish {
+                agent_run_domain::worker::FINISH_CATALOG_VERSION
+            } else {
+                agent_run_domain::worker::POOL_CATALOG_VERSION
+            },
+            digest: if self.explicit_finish {
+                agent_run_domain::worker::finish_catalog_digest(self.research)
+            } else if self.research {
                 agent_run_domain::worker::research_catalog_digest()
             } else {
                 agent_run_domain::worker::pool_catalog_digest()
@@ -122,6 +141,11 @@ impl WorkerProxy {
         use agent_run_domain::pool::{PoolMessage, PoolPropose, PoolReadRequest, PoolVote};
         use agent_run_domain::worker::WorkerTool;
         let validated = match tool {
+            WorkerTool::Finish => validated_input(
+                arguments,
+                name,
+                agent_run_domain::worker::FinishRequest::validate,
+            ),
             WorkerTool::Notify => validated_input(arguments, name, NotifyRequest::validate),
             WorkerTool::SaveReport => validated_input(
                 arguments,
@@ -182,6 +206,19 @@ impl WorkerProxy {
         value: Value,
         request_id: Option<&str>,
     ) -> rmcp::model::CallToolResult {
+        if tool == agent_run_domain::worker::WorkerTool::Finish {
+            return match serde_json::from_value::<agent_run_domain::worker::FinishReceipt>(value) {
+                Ok(receipt) => {
+                    rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                        serde_json::to_string(&receipt).unwrap_or_default(),
+                    )])
+                }
+                Err(_) => super::mcp_text::error_result(
+                    "invalid_finish_receipt",
+                    "Finish receipt is uncertain; retry the exact same payload.",
+                ),
+            };
+        }
         if tool == agent_run_domain::worker::WorkerTool::SaveReport {
             return match serde_json::from_value::<agent_run_domain::worker::SaveReportReceipt>(
                 value,
@@ -291,7 +328,9 @@ impl ServerHandler for WorkerProxy {
         info.capabilities = serde_json::from_value(json!({"tools":{"listChanged":false}}))
             .expect("static capabilities");
         info.server_info = Implementation::new("agent-run-worker", env!("CARGO_PKG_VERSION"));
-        let catalog = if self.research {
+        let catalog = if self.explicit_finish {
+            "mode-bound explicit-finish catalog"
+        } else if self.research {
             "fixed six-tool research catalog"
         } else {
             "fixed five-tool catalog"
@@ -299,6 +338,9 @@ impl ServerHandler for WorkerProxy {
         info.instructions = Some(format!(
             "This private surface exposes the {catalog} for the supervisor-bound attempt. Receipts confirm durable recording, never delivery, reading, approval or completion. Reconcile uncertainty with the same request_id and content; never send credentials."
         ));
+        if self.explicit_finish {
+            info.instructions=Some("This private MCP binds the CURRENT execution. A supervised explicit resume admits a new execution in retained native history; earlier finish receipts do not close this one. Preserve earlier summaries and finish the current assigned task with its own new summary. End a turn while waiting for an event; this execution stays active. Stop after this execution's own accepted finish. Retry its uncertain finish with identical payload. Receipts are intent, not cleanup or owner approval. Other tools keep their bounded role authority.".into());
+        }
         info
     }
 
@@ -376,6 +418,8 @@ pub async fn serve_from_env() -> Result<()> {
         catalog_registered: Arc::new(AtomicBool::new(false)),
         research: std::env::var(agent_run_domain::worker::RESEARCH_ENV)
             .is_ok_and(|value| value == "1"),
+        explicit_finish: std::env::var(agent_run_domain::worker::FINISH_ENV)
+            .is_ok_and(|value| value == "1"),
     };
     proxy.register_catalog().await;
     let service = proxy
@@ -395,8 +439,8 @@ pub async fn serve_from_env() -> Result<()> {
 #[cfg(test)]
 mod tests {
 
-    /// Research adds only its confined report writer; neither surface exposes
-    /// operator launches, shell tools or generic filesystem writes.
+    /// Completion mode adds only finish; research adds only its confined report
+    /// writer. No mode exposes operator launches, shell or arbitrary writes.
     #[test]
     fn research_inventory_adds_only_report_writer() {
         let mut proxy = WorkerProxy {
@@ -406,6 +450,7 @@ mod tests {
             token: "a".repeat(64),
             catalog_registered: Arc::new(AtomicBool::new(false)),
             research: false,
+            explicit_finish: false,
         };
         let ordinary = proxy.tools().unwrap();
         assert_eq!(ordinary.len(), 5);
@@ -419,6 +464,13 @@ mod tests {
                 .all(|tool| research.iter().any(|item| item.name == tool.name))
         );
         assert!(proxy.get_tool("save_report").is_some());
+        for research in [false, true] {
+            proxy.research = research;
+            proxy.explicit_finish = true;
+            assert_eq!(proxy.tools().unwrap().len(), if research { 7 } else { 6 });
+            assert!(proxy.get_tool("finish").is_some());
+            assert_eq!(proxy.get_tool("save_report").is_some(), research);
+        }
         for name in ["start", "resume", "Bash", "exec_command", "write_file"] {
             assert!(proxy.get_tool(name).is_none(), "{name}");
         }
@@ -437,6 +489,7 @@ mod tests {
             token: "a".repeat(64),
             catalog_registered: Arc::new(AtomicBool::new(false)),
             research: false,
+            explicit_finish: false,
         };
         for (tool, input) in [
             (
@@ -542,6 +595,7 @@ mod tests {
             token: "a".repeat(64),
             catalog_registered: Arc::new(AtomicBool::new(false)),
             research: false,
+            explicit_finish: false,
         };
         for _ in 0..3 {
             proxy.register_catalog().await;
@@ -566,6 +620,7 @@ mod tests {
             token: "a".repeat(64),
             catalog_registered: Arc::new(AtomicBool::new(false)),
             research: false,
+            explicit_finish: false,
         };
         let names: Vec<_> = tools()
             .unwrap()
@@ -633,6 +688,7 @@ mod tests {
             token: "a".repeat(64),
             catalog_registered: Arc::new(AtomicBool::new(false)),
             research: false,
+            explicit_finish: false,
         };
         let (mut input_writer, input_reader) = tokio::io::duplex(64 * 1024);
         let (output_writer, output_reader) = tokio::io::duplex(64 * 1024);

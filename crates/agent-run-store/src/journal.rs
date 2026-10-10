@@ -228,10 +228,23 @@ impl Store {
     /// Claims the oldest pending command, preferring cancellation over
     /// steering over pool delivery, exactly once.
     pub fn claim_command(&mut self, id: &AgentId) -> Result<Option<(i64, String, Value)>> {
+        self.claim_command_for_turn(id, true)
+    }
+
+    /// Claim control commands normally, but hold native-completion wakes until
+    /// an explicit turn is idle. Cancellation always remains claimable. This
+    /// preserves the existing queue/priority and avoids overlapping model turns.
+    pub fn claim_command_for_turn(
+        &mut self,
+        id: &AgentId,
+        allow_native_wake: bool,
+    ) -> Result<Option<(i64, String, Value)>> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row = tx.query_row("SELECT id,kind,payload_json FROM commands WHERE agent_id=? AND state='pending' ORDER BY CASE kind WHEN 'cancel' THEN 0 WHEN 'steer' THEN 1 ELSE 2 END,id LIMIT 1", [id.as_str()], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))).optional()?;
+        let row = tx.query_row("SELECT id,kind,payload_json FROM commands WHERE agent_id=? AND state='pending' \
+            AND (? OR kind='cancel' OR COALESCE(json_extract(payload_json,'$.native_completion'),0)<>1) \
+            ORDER BY CASE kind WHEN 'cancel' THEN 0 WHEN 'steer' THEN 1 ELSE 2 END,id LIMIT 1", params![id.as_str(),allow_native_wake], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))).optional()?;
         let Some((command_id, kind, payload)) = row else {
             tx.commit()?;
             return Ok(None);

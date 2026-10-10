@@ -171,6 +171,7 @@ impl ProviderLaunchIdentity {
             || identity.provider_request.profile != row.request.profile
             || identity.provider_request.task != row.request.task
             || identity.provider_request.workdir != row.request.workdir
+            || identity.provider_request.explicit_finish != row.request.explicit_finish
             || !effort_matches
             || identity.provider_request.request_id != row.request.request_id
             || identity.provider_request.orchestrator != row.request.orchestrator
@@ -1505,7 +1506,7 @@ impl Service {
     ///
     /// The child keeps the parent's provider, harness, explicit model,
     /// workdir, role grants, sealed assets, frozen configuration, runtime
-    /// home and native session; task text, timeout, orchestrator, current global
+    /// home, completion mode and native session; task text, orchestrator, current global
     /// Codex Fast policy and the per-attempt account lease may change. A request-id replay is answered
     /// before any configuration or quota read. The parent's selection intent
     /// is kept: a pinned run never switches; an automatic run keeps its
@@ -1961,6 +1962,15 @@ impl Service {
             "created_at":row.created_at,"started_at":row.started_at,"finished_at":row.finished_at,"elapsed_seconds":(row.finished_at.unwrap_or(observed)-row.started_at.unwrap_or(row.created_at)).max(0.0),"last_progress_at":progress,"silence_seconds":if row.status.terminal(){None}else{Some((observed-progress.or(row.started_at).unwrap_or(row.created_at)).max(0.0))},"failure_kind":row.failure_kind,"failure_text":row.failure_text,"answer_available":row.answer_path.is_some(),"answer_bytes":row.answer_bytes,"answer_sha256":row.answer_sha256,"effort":row.request.effort,
             "delivery":store.delivery_status(&row.id)?,"parent_agent_id":row.parent_agent_id,"root_agent_id":row.root_agent_id,"sequence":row.sequence,"cleanup":store.last_event(&row.id,"process_cleanup")?,"policy":policy,"phase":phase,"phase_started_at":row.finished_at.or(row.started_at).unwrap_or(row.created_at),"process_state":process::observe(row.supervisor_pid,row.supervisor_identity.as_deref(),row.supervisor_birth_time),"observed_at":observed,"runtime_outcome":if row.status.terminal(){Some(row.status.as_str())}else{None},"acceptance":"pending","workdir":row.request.workdir.display().to_string(),
             "usage":store.usage_view(&row.id)?,"usage_cumulative":store.usage_cumulative(&row.root_agent_id)?,"tool_counts":store.tool_counts(&row.id)?});
+        if let Some(lifecycle) = store.worker_lifecycle_view_at(&row.id, observed)? {
+            if !row.status.terminal() && row.status == Status::Running {
+                view["phase"] = lifecycle["phase"].clone();
+                view["phase_started_at"] = lifecycle["transition_at"].clone();
+            }
+            view["completion_mode"] = json!("explicit_finish");
+            view["turn_count"] = lifecycle["turn_count"].clone();
+            view["idle_seconds"] = lifecycle["idle_seconds"].clone();
+        }
         let mcp = agent_run_store::projections::selected_mcp(row.identity.as_ref());
         if !mcp.is_empty() {
             view["mcp"] = serde_json::to_value(mcp)?;
@@ -2361,6 +2371,14 @@ pub(crate) fn prepare_provider(
         })
         .transpose()?;
     let mut profile = profiles::load_provider(config, &request)?;
+    if request.explicit_finish {
+        if let Some(schema) = &request.output_schema {
+            agent_run_domain::worker::finish_schema(schema)?;
+        }
+        profile.body.push_str(include_str!(
+            "../../../assets/explicit_finish_instructions.md"
+        ));
+    }
     profile
         .required_constraints
         .extend(offering.restrictions.iter().copied());

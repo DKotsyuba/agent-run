@@ -839,10 +839,11 @@ account = "acct-work"
     (temp, root)
 }
 
-/// Returns one strict provider request with an explicit local account pin.
+/// Legacy native-result fixture request with a local account pin; callback-mode
+/// behavior is tested separately, so this fake engine explicitly opts out.
 fn request(home: &Path) -> ProviderStartRequest {
     serde_json::from_value(serde_json::json!({
-        "provider":"glm-user","model":"fixture","profile":"review",
+        "provider":"glm-user","model":"fixture","profile":"review","explicit_finish":false,
         "task":"fixture:answer","workdir":home,"account":"work","request_id":"provider-1",
         "orchestrator":{"transport":"codex_queue","external_session_id":"test-session"}
     }))
@@ -2831,7 +2832,7 @@ fn provider_preflight_reuses_native_grant_before_durable_admission() {
     fs::write(home.join("profiles/implement.md"),
         "+++\nrevision = \"1\"\nwrite = true\nnetwork = false\nallow_external_read_roots = true\nskills = []\nmcp = []\nrequired_constraints = []\n+++\nImplement safely.\n").unwrap();
     let bad: ProviderStartRequest = serde_json::from_value(serde_json::json!({
-        "provider":"codex-user","model":"fixture","profile":"implement","account":"a",
+        "provider":"codex-user","model":"fixture","profile":"implement","explicit_finish":false,"account":"a",
         "task":"fixture:answer","workdir":home,"read_roots":[external.path()],
         "request_id":"preflight-bad",
     }))
@@ -3009,7 +3010,7 @@ async fn provider_execution_error_persists_content_free_cause() {
 /// supervisor to the end.
 async fn codex_run(home: &Path, request_id: &str, account: Option<&str>) -> AgentId {
     let mut request: ProviderStartRequest = serde_json::from_value(serde_json::json!({
-        "provider":"codex-user","model":"fixture","profile":"review",
+        "provider":"codex-user","model":"fixture","profile":"review","explicit_finish":false,
         "task":"fixture:original-task","workdir":home,"request_id":request_id,"account":account,
         "orchestrator":{"transport":"codex_queue","external_session_id":"codex-session"},
     }))
@@ -3725,7 +3726,7 @@ async fn exhausted_runs_stop_with_the_exact_blocker() {
 async fn cancel_during_the_exhausted_attempt_prevents_the_switch() {
     let (_temp, home) = codex_home(["exhausted-hold", "ok"]);
     let mut request: ProviderStartRequest = serde_json::from_value(serde_json::json!({
-        "provider":"codex-user","model":"fixture","profile":"review",
+        "provider":"codex-user","model":"fixture","profile":"review","explicit_finish":false,
         "task":"fixture:original-task","workdir":home,"request_id":"cancel-switch",
         "orchestrator":{"transport":"codex_queue","external_session_id":"codex-session"},
     }))
@@ -3819,7 +3820,7 @@ async fn claude_exhaustion_never_switches_accounts() {
 async fn crash_after_the_switch_reconciles_without_a_duplicate() {
     let (_temp, home) = codex_home(["exhausted", "ok-hold"]);
     let mut request: ProviderStartRequest = serde_json::from_value(serde_json::json!({
-        "provider":"codex-user","model":"fixture","profile":"review",
+        "provider":"codex-user","model":"fixture","profile":"review","explicit_finish":false,
         "task":"fixture:original-task","workdir":home,"request_id":"crash-switch",
         "orchestrator":{"transport":"codex_queue","external_session_id":"codex-session"},
     }))
@@ -3924,7 +3925,7 @@ async fn crash_after_the_switch_reconciles_without_a_duplicate() {
 /// native home) while A is held, then releases A and waits for the end.
 async fn held_codex_run(home: &Path, during: impl FnOnce(&Path)) -> AgentId {
     let mut request: ProviderStartRequest = serde_json::from_value(serde_json::json!({
-        "provider":"codex-user","model":"fixture","profile":"review",
+        "provider":"codex-user","model":"fixture","profile":"review","explicit_finish":false,
         "task":"fixture:original-task","workdir":home,"request_id":"held-run",
         "orchestrator":{"transport":"codex_queue","external_session_id":"codex-session"},
     }))
@@ -4059,7 +4060,7 @@ async fn reconcile_closes_a_never_spawned_owned_attempt() {
 /// Admits one automatic `codex-user` execution without starting its supervisor.
 fn codex_admit(home: &Path, request_id: &str) -> AgentId {
     let mut request: ProviderStartRequest = serde_json::from_value(serde_json::json!({
-        "provider":"codex-user","model":"fixture","profile":"review",
+        "provider":"codex-user","model":"fixture","profile":"review","explicit_finish":false,
         "task":"fixture:original-task","workdir":home,"request_id":request_id,
         "orchestrator":{"transport":"codex_queue","external_session_id":"codex-session"},
     }))
@@ -5414,7 +5415,7 @@ fn pool_request(
             {"transport":"codex_queue","external_session_id":"test-session"})),
         "members": members.iter().map(|(role, task, pin)| serde_json::json!({
             "role": role,
-            "start": {"provider":"glm-user","model":"fixture","profile":"review",
+            "start": {"provider":"glm-user","model":"fixture","profile":"review","explicit_finish":false,
                       "task": task, "workdir": home, "account": pin}
         })).collect::<Vec<_>>()
     }))
@@ -5966,7 +5967,7 @@ async fn pool_replace_replays_the_same_new_identity() {
     assert_eq!(rows(&home).0, agents, "a replay admits nothing");
     assert_eq!(
         go(replace_request(&pool, &ids[0], "rep-1", Some(serde_json::json!({
-            "provider":"glm-user","model":"fixture","profile":"review","task":"other","workdir":home
+            "provider":"glm-user","model":"fixture","profile":"review","explicit_finish":false,"task":"other","workdir":home
         }))))
         .unwrap()
         .unwrap_err(),
@@ -6079,7 +6080,7 @@ async fn pool_replace_reuses_the_original_spec_without_pinning_the_old_account()
             &reused.new.agent_id,
             "explicit",
             Some(serde_json::json!({
-                "provider":"glm-user","model":"fixture","profile":"review",
+                "provider":"glm-user","model":"fixture","profile":"review","explicit_finish":false,
                 "task":"fixture:answer fresh","workdir":home,"account":"work","display_name":"Renamed"
             })),
         ))
@@ -6179,7 +6180,7 @@ async fn pool_replacement_child_receives_roster_and_catch_up() {
                 &ids[0],
                 "observe",
                 Some(serde_json::json!({
-                    "provider":"glm-user","model":"fixture","profile":"review",
+                    "provider":"glm-user","model":"fixture","profile":"review","explicit_finish":false,
                     "task":"fixture:pool-observe again","workdir":home,"account":"work"
                 })),
             ),
@@ -6272,9 +6273,9 @@ async fn pool_composed_task_survives_native_history_failover_and_resume() {
             "acceptance": [{"id": "crit", "text": "POOL-CRITERION-MARKER holds"}],
             "members": [
                 {"role": "lead", "start": {"provider":"codex-user","model":"fixture",
-                    "profile":"review","task":"POOL-OWN-TASK-MARKER lead work","workdir":home}},
+                    "profile":"review","explicit_finish":false,"task":"POOL-OWN-TASK-MARKER lead work","workdir":home}},
                 {"role": "peer", "start": {"provider":"codex-user","model":"fixture",
-                    "profile":"review","task":"peer work","workdir":home}},
+                    "profile":"review","explicit_finish":false,"task":"peer work","workdir":home}},
             ]
         }))
         .unwrap();

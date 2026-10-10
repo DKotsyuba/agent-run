@@ -45,6 +45,7 @@ const V1_TABLES: &[&str] = &[
 /// Every migration file, ordered by the version it produces, embedded at
 /// compile time so the binary needs no data directory alongside it.
 const PENDING_FILES: &[(i64, &str)] = &[
+    // Appended below in numerical order; historical payloads retain legacy mode.
     (
         2,
         include_str!("../../../sql/migrations/002_workflow_tables.sql"),
@@ -149,6 +150,10 @@ const PENDING_FILES: &[(i64, &str)] = &[
     (
         28,
         include_str!("../../../sql/migrations/028_unlimited_executions.sql"),
+    ),
+    (
+        29,
+        include_str!("../../../sql/migrations/029_worker_finish.sql"),
     ),
 ];
 

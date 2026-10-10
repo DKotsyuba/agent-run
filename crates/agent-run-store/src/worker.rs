@@ -53,6 +53,7 @@ pub fn authenticate_attempt(
     let row: Option<(String, Option<String>, bool)> = conn
         .query_row(
             "SELECT c.token_sha256,a.orchestrator_session_id,t.state='running' AND a.status='running' \
+             AND NOT EXISTS(SELECT 1 FROM worker_lifecycle l WHERE l.attempt_id=t.id AND l.phase='closing') \
              FROM worker_capabilities c \
              JOIN attempts t ON t.id=c.attempt_id JOIN agents a ON a.id=t.agent_id \
              LEFT JOIN orchestrator_sessions s ON s.id=a.orchestrator_session_id \

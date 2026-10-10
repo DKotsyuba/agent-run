@@ -31,6 +31,7 @@ pub mod service;
 pub mod storage_gc;
 pub mod stream;
 pub mod supervisor;
+pub mod worker_finish;
 
 pub use agent_run_adapters as adapters;
 pub use agent_run_config::{config, policy, profiles};

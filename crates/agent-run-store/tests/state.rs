@@ -24,9 +24,21 @@ fn schema_initialization_and_reopen() {
     let a = h.store().health().unwrap();
     assert_eq!(a["ok"], true);
     assert_eq!(a["schema_version"], agent_run_store::VERSION);
-    assert_eq!(a["tables"], 34);
+    assert_eq!(a["tables"], 36);
     assert_eq!(h.store().health().unwrap()["integrity"], "ok");
     let store = h.store();
+    for name in ["worker_lifecycle", "worker_native_wakes"] {
+        assert!(
+            store
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)",
+                    [name],
+                    |row| row.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+    }
     assert!(store.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pool_enrollments')",[],|row|row.get::<_,bool>(0)).unwrap());
     assert!(store.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='incident_ledger')",[],|row|row.get::<_,bool>(0)).unwrap());
     assert_eq!(

@@ -143,10 +143,11 @@ impl Broker {
         }
     }
 
-    /// The strict provider start request for `task` with `request_id`.
+    /// Legacy fake-engine start for `task`/`request_id`; explicit false keeps the
+    /// pre-callback native-result fixtures meaningful under the new public default.
     fn request(&self, task: &str, request_id: &str) -> ProviderStartRequest {
         serde_json::from_value(json!({
-            "provider":"glm-user","model":"fixture","profile":"review",
+            "provider":"glm-user","model":"fixture","profile":"review","explicit_finish":false,
             "task":task,"workdir":self.home,"request_id":request_id,
         }))
         .unwrap()
@@ -199,7 +200,7 @@ impl Broker {
             &self.home,
             "start",
             json!({
-                "provider":"glm-user", "model":"fixture", "profile":"review",
+                "provider":"glm-user", "model":"fixture", "profile":"review","explicit_finish":false,
                 "task":"fixture:answer", "workdir":self.home,
             }),
         )
@@ -357,7 +358,7 @@ async fn mixed_pool_attaches_active_worker_over_live_mcp_without_restart() {
         .unwrap()
         .get(&agent)
         .unwrap();
-    let response=mcp_tool(&broker.home,"start_pool",json!({"request_id":"live-mixed","goal":"Verify mixed pool enrollment","acceptance":[{"id":"goal","text":"Existing work remains intact"}],"members":[{"existing_agent_id":agent,"role":"review"},{"start":{"provider":"glm-user","model":"fixture","profile":"review","task":"fixture:pool-observe","workdir":broker.home,"display_name":"new helper"},"role":"helper"}]})).await;
+    let response=mcp_tool(&broker.home,"start_pool",json!({"request_id":"live-mixed","goal":"Verify mixed pool enrollment","acceptance":[{"id":"goal","text":"Existing work remains intact"}],"members":[{"existing_agent_id":agent,"role":"review"},{"start":{"provider":"glm-user","model":"fixture","profile":"review","explicit_finish":false,"task":"fixture:pool-observe","workdir":broker.home,"display_name":"new helper"},"role":"helper"}]})).await;
     assert_ne!(response["result"]["isError"], true, "{response}");
     assert!(response.get("error").is_none(), "{response}");
     let until = Instant::now() + Duration::from_secs(10);
