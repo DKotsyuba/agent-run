@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.25.0
+
 - feat(runtime)!: new admissions finish only through an authenticated private
   callback; native turn boundaries become unbounded idle with same-session
   pool/steering/native-job wakes and immutable callback summaries
