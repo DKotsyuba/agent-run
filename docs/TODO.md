@@ -4,7 +4,7 @@
 
 - [x] Separate owned native task notifications from runner input acknowledgements; preserve coalesced task/steering correlation and contextual-only results.
 - [x] Reject unknown or duplicate replays, runner-ID collisions, malformed origins and foreign sessions; retain content-free refusal categories.
-- [ ] Qualify background-command completion and native continuation through Sonnet and GLM before release.
+Release gate: background-command completion and native continuation through Sonnet and GLM must be verified on the exact candidate before publication.
 
 ## Synchronous start admission preflight
 
