@@ -90,7 +90,9 @@ Native process identity and signalling are described in
   bounded native runId label), canonical UUID,
   user text shape and established session can register one. Notification text
   cannot grant task authority. Runner inputs still own task/steering correlation;
-  coalesced batches may end in a notification, and notification-only results
+  coalesced terminals may name the last notification or the most recent runner
+  input followed only by validated native context. An older steer cannot complete
+  a newer task, and notification-only results
   cannot replace a task answer. Unknown, duplicate, malformed or foreign-session
   replays fail closed. A bounded refusal event retains only a fixed reason tag.
 - Engine binaries and authentication remain external. Agent tasks execute through

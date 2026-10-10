@@ -339,7 +339,8 @@ impl ResultInputs {
     }
 
     /// Resolves the terminal's native user-message UUID, never its position or text.
-    /// A coalesced batch must end with that UUID; its current task may occur earlier.
+    /// A coalesced terminal may name its tail or its most recent runner input when
+    /// only validated native context follows it; older steering IDs remain ambiguous.
     /// Missing correlations retain only the historical single-result compatibility.
     fn scope(&mut self, frame: &Value) -> ResultScope {
         let replayed = std::mem::take(&mut self.replayed);
@@ -356,10 +357,19 @@ impl ResultInputs {
                 ResultScope::Ambiguous
             };
         };
+        let batch_matches = replayed.last().is_none_or(|last| {
+            last == id
+                || (self.sent.contains(id)
+                    && replayed
+                        .iter()
+                        .rev()
+                        .find(|candidate| self.sent.contains(candidate.as_str()))
+                        .is_some_and(|last_runner| last_runner == id))
+        });
         if (!self.sent.contains(id) && !self.native_context.contains(id))
             || self.completed.contains(id)
             || replayed.iter().any(|id| self.completed.contains(id))
-            || replayed.last().is_some_and(|last| last != id)
+            || !batch_matches
         {
             return ResultScope::Ambiguous;
         }
@@ -795,6 +805,17 @@ pub async fn run(
         // Capture every observed result before identity/shape validation can reject it.
         let result_scope = if v.get("type").and_then(Value::as_str) == Some("result") {
             result_frame_index += 1;
+            // Closed booleans/counts explain correlation without retaining native IDs.
+            let terminal_input = v.get("user_message_uuid").and_then(Value::as_str);
+            let correlation_evidence = json!({
+                "known_input":terminal_input.map(|id| inputs.sent.contains(id) || inputs.native_context.contains(id)),
+                "completed_input":terminal_input.map(|id| inputs.completed.contains(id)),
+                "replay_tail_matches":terminal_input.and_then(|id| inputs.replayed.last().map(|last| last == id)),
+                "latest_runner_matches":terminal_input.and_then(|id| inputs.replayed.iter().rev()
+                    .find(|candidate| inputs.sent.contains(candidate.as_str()))
+                    .map(|last| last == id)),
+                "replay_count":inputs.replayed.len(),
+            });
             let scope = inputs.scope(&v);
             let failed = v.get("is_error").and_then(Value::as_bool) == Some(true)
                 || v.get("subtype").and_then(Value::as_str) != Some("success")
@@ -810,6 +831,7 @@ pub async fn run(
             let ignored = prior_failed || (scope == ResultScope::Context && !failed);
             let mut metadata = native_result_metadata(result_frame_index, &v, ignored);
             metadata["correlation"] = json!(scope.label());
+            metadata["correlation_evidence"] = correlation_evidence;
             store.event(&record.id, "native_result_frame_v1", &metadata)?;
             Some(scope)
         } else {
@@ -1260,6 +1282,24 @@ mod tests {
         );
     }
 
+    /// A terminal may name the most recent runner input after trailing native context.
+    #[test]
+    fn task_uuid_can_end_a_native_notification_batch() {
+        use super::{ResultInputs, ResultScope};
+        let mut inputs = ResultInputs::default();
+        inputs.sent("task".into(), true);
+        inputs
+            .replay(&json!({"isReplay":true,"uuid":"task"}), None)
+            .unwrap();
+        inputs
+            .replay(
+                &native_notification("c0454a3f-7d83-4e18-bd6d-8b6a7d369490"),
+                Some("session"),
+            )
+            .unwrap();
+        assert!(inputs.scope(&json!({"user_message_uuid":"task"})) == ResultScope::Task);
+    }
+
     /// Produces the CLI's owned-session text notification shape; IDs stay test-local.
     fn native_notification(id: &str) -> serde_json::Value {
         json!({"type":"user","isReplay":true,"uuid":id,
@@ -1369,24 +1409,37 @@ mod tests {
         assert!(inputs.native_context.is_empty());
     }
 
-    /// A steering batch remains authoritative even when native notifications finish it.
+    /// Both terminal forms cover the latest steer; an older ID consumes no task authority.
     #[test]
     fn native_notification_batch_preserves_latest_steering() {
         use super::{ResultInputs, ResultScope};
-        let mut inputs = ResultInputs::default();
-        inputs.sent("old".into(), true);
-        inputs.sent("steer".into(), true);
-        for id in ["old", "steer"] {
-            inputs
-                .replay(&json!({"isReplay":true,"uuid":id}), None)
-                .unwrap();
-        }
         let id = "c0454a3f-7d83-4e18-bd6d-8b6a7d369490";
-        let mut frame = native_notification(id);
-        frame["message"]["content"] = json!([{"type":"text","text":"notice"}]);
-        inputs.replay(&frame, Some("session")).unwrap();
-        assert!(inputs.scope(&json!({"user_message_uuid":id})) == ResultScope::Task);
-        assert!(inputs.scope(&json!({"user_message_uuid":"steer"})) == ResultScope::Ambiguous);
+        for (terminal, expected) in [
+            ("steer", ResultScope::Task),
+            (id, ResultScope::Task),
+            ("old", ResultScope::Ambiguous),
+        ] {
+            let mut inputs = ResultInputs::default();
+            inputs.sent("old".into(), true);
+            inputs.sent("steer".into(), true);
+            for id in ["old", "steer"] {
+                inputs
+                    .replay(&json!({"isReplay":true,"uuid":id}), None)
+                    .unwrap();
+            }
+            let mut frame = native_notification(id);
+            frame["message"]["content"] = json!([{"type":"text","text":"notice"}]);
+            inputs.replay(&frame, Some("session")).unwrap();
+            assert!(inputs.scope(&json!({"user_message_uuid":terminal})) == expected);
+            if expected == ResultScope::Task {
+                assert!(
+                    inputs.scope(&json!({"user_message_uuid":"steer"})) == ResultScope::Ambiguous
+                );
+            } else {
+                assert!(!inputs.completed.contains("steer"));
+                assert_eq!(inputs.task.as_deref(), Some("steer"));
+            }
+        }
     }
 
     /// Result diagnostics retain types/counts but omit every supplied content field.
