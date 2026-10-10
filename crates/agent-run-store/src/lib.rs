@@ -38,6 +38,7 @@ pub mod terminal;
 pub mod transcript;
 /// Authenticated, bounded worker reports and their durable outbox rows.
 pub mod worker;
+pub mod worker_finish;
 use agent_run_domain::{
     Error, Result,
     catalog::{AccountId, PhysicalQuotaKey},
@@ -1174,6 +1175,10 @@ impl Store {
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
         if row.status.terminal() {
             return Err(invalid("agent is already terminal"));
+        }
+        if kind != "cancel" && tx.query_row("SELECT EXISTS(SELECT 1 FROM worker_lifecycle l JOIN attempts t ON t.id=l.attempt_id \
+            WHERE t.agent_id=? AND t.ownership_active=1 AND l.finish_json IS NOT NULL)",[id.as_str()],|r|r.get::<_,bool>(0))? {
+            return Err(invalid("finish already accepted; no new turn may be admitted"));
         }
         tx.execute("INSERT INTO commands(agent_id,kind,payload_json,state,created_at) VALUES(?,?,?,'pending',?)",params![id.as_str(),kind,serde_json::to_string(payload)?,now()])?;
         let cid = tx.last_insert_rowid();

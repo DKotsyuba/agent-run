@@ -21,10 +21,12 @@ use serde_json::{Value, json};
 /// rolls all of them back. Confirmed legacy cleanup releases ownership in this
 /// transaction; unconfirmed attempts remain owned for recovery. Successful current pool members
 /// omit the individual notice because pool settlement owns the common success
-/// notice. A pending cancel observed while a successful or timed-out run is
-/// being committed wins in this same transaction and receives its terminal
+/// notice. A pending cancel observed while success or an explicit-mode outcome
+/// is being committed wins in this same transaction and receives its terminal
 /// command result. Repeating a completion after a prior terminal commit is a
 /// no-op.
+/// Explicit success also requires an observed done finish; any supplied answer
+/// proof must match that current attempt's immutable callback summary.
 pub fn finish(
     store: &mut Store,
     id: &AgentId,
@@ -52,6 +54,36 @@ pub fn finish(
     if row.status.terminal() {
         return Ok(());
     }
+    if row.request.explicit_finish {
+        let intent: Option<(String,bool)> = tx.query_row(
+            "SELECT l.finish_json,l.receipt_observed FROM worker_lifecycle l JOIN attempts t ON t.id=l.attempt_id \
+             WHERE t.agent_id=? AND t.ownership_active=1 AND t.finished_at IS NULL AND l.finish_json IS NOT NULL",
+            [id.as_str()],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let intent = intent
+            .map(|(payload, observed)| {
+                serde_json::from_str::<agent_run_domain::worker::FinishRequest>(&payload)
+                    .map(|intent| (intent, observed))
+            })
+            .transpose()?;
+        if outcome.status == Status::Succeeded
+            && !intent.as_ref().is_some_and(|(intent, observed)| {
+                *observed && intent.status == agent_run_domain::worker::FinishStatus::Done
+            })
+        {
+            return Err(invalid(
+                "explicit success requires an observed private done finish receipt",
+            ));
+        }
+        if let Some(proof) = proof {
+            let (intent, _) =
+                intent.ok_or_else(|| invalid("explicit answer requires a finish intent"))?;
+            if proof.sha256 != agent_run_platform::fs::sha256(intent.summary.as_bytes())
+                || proof.bytes != intent.summary.len() as u64
+            {
+                return Err(invalid("answer does not match immutable finish summary"));
+            }
+        }
+    }
     let provider_attempt: Option<String> = if row
         .identity
         .as_ref()
@@ -71,7 +103,7 @@ pub fn finish(
     } else {
         None
     };
-    let pending_cancel = if outcome.status == Status::Succeeded {
+    let pending_cancel = if outcome.status == Status::Succeeded || row.request.explicit_finish {
         tx.query_row(
             "SELECT id FROM commands WHERE agent_id=? AND kind='cancel' AND state='pending' ORDER BY id LIMIT 1",
             [id.as_str()],

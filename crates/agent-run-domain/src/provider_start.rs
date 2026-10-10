@@ -47,6 +47,11 @@ pub struct ProviderStartRequest {
     /// Existing Codex fast-mode request flag.
     #[serde(default)]
     pub fast: bool,
+    /// New admissions default to callback completion. Explicit false selects
+    /// legacy compatibility. Always serialize the choice so transport decoding
+    /// cannot replace an explicit false with the new-admission default.
+    #[serde(default = "crate::worker::default_explicit_finish")]
+    pub explicit_finish: bool,
     /// Existing output schema for supporting harnesses.
     #[serde(default)]
     pub output_schema: Option<serde_json::Map<String, serde_json::Value>>,
@@ -106,6 +111,9 @@ impl ProviderStartRequest {
     pub fn from_history(mut document: serde_json::Value) -> Result<Self> {
         if let Some(object) = document.as_object_mut() {
             object.remove("timeout_seconds");
+            object
+                .entry("explicit_finish")
+                .or_insert(serde_json::Value::Bool(false));
         }
         Ok(serde_json::from_value(document)?)
     }
@@ -124,6 +132,7 @@ impl ProviderStartRequest {
             workdir: self.workdir.clone(),
             write: self.write,
             fast: self.fast,
+            explicit_finish: self.explicit_finish,
             effort: self.effort.clone(),
             display_name: self.display_name.clone(),
             read_roots: self.read_roots.clone(),

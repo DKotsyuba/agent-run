@@ -302,6 +302,11 @@ pub struct StartRequest {
     pub write: bool,
     #[serde(default)]
     pub fast: bool,
+    /// Opt-in completion contract: native turn completion becomes idle; only
+    /// this attempt's authenticated finish callback supplies the final answer.
+    /// Omitted/false preserves historical request bytes and legacy behavior.
+    #[serde(default, skip_serializing_if = "crate::worker::legacy_completion")]
+    pub explicit_finish: bool,
     #[serde(default)]
     pub effort: Option<String>,
     /// Optional human display label for the agent; normalized in place by
@@ -334,7 +339,7 @@ fn unique_constraints<'de, D: serde::Deserializer<'de>>(
 impl StartRequest {
     /// Validates admission inputs and canonicalizes directory paths, the optional
     /// human label and known orchestrator aliases in place. Task text is nonblank
-    /// and at most 512 KiB; timeout, namespace and request-id bounds use shared
+    /// and at most 512 KiB; namespace and request-id bounds use shared
     /// validators. Unsupported transports and duplicate canonical read roots are
     /// rejected before durable admission.
     pub fn validate(&mut self) -> Result<()> {

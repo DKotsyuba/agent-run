@@ -5,7 +5,7 @@
 //! time is never evidence that an admitted run stopped.
 
 use agent_run_domain::{
-    Result,
+    Error, Result,
     domain::{AgentId, Status, now},
     error::invalid,
 };
@@ -53,7 +53,8 @@ struct StartupOwner {
 
 /// Reconcile up to `limit` active rows with the native PID-reuse-aware observer.
 ///
-/// The return value contains only rows that durably became `lost`.  `limit`
+/// The return value contains rows durably lost or recovered from an observed
+/// explicit finish with verified cleanup. `limit`
 /// must be between one and 1000.  `Unknown`, `Denied`, `Alive`, and incomplete
 /// ownership evidence leave rows untouched. A verified-dead READY supervisor
 /// can be lost before an engine group exists; its attempt cleanup remains
@@ -244,6 +245,9 @@ struct OwnedAttempt {
     /// The run's recorded process group (the attempt leader's pid).
     group: Option<i32>,
 }
+
+/// Current finish-recovery attempt: id, optional leader token/birth, saved cleanup.
+type FinishRecoveryAttempt = (String, Option<String>, Option<f64>, Option<String>);
 
 /// Probe only the indexed owning agent's history for a recorded unresolved outcome.
 ///
@@ -608,6 +612,9 @@ fn guarded_lost(
     evidence: serde_json::Value,
     checked_at: f64,
 ) -> Result<bool> {
+    if let Some(recovered) = recover_finish(store, expected, checked_at)? {
+        return Ok(recovered);
+    }
     let tx = store
         .conn
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -686,6 +693,142 @@ fn guarded_lost(
     crate::commands::complete_pending_in(&tx, &expected.id, finished_at)?;
     tx.commit()?;
     Ok(true)
+}
+
+/// Reconcile an acknowledged finish after its supervisor dies. Existing birth
+/// proofs gate every cleanup signal. Missing/uncertain evidence leaves closing
+/// active for another observation, never success by age. The immutable summary
+/// is resealed and the existing terminal transaction supplies exactly one notice.
+/// None means this was not an acknowledged explicit finish and ordinary loss
+/// recovery applies. No database transaction spans process cleanup.
+fn recover_finish(store: &mut Store, expected: &Candidate, at: f64) -> Result<Option<bool>> {
+    let row = store.get(&expected.id)?;
+    if !row.request.explicit_finish || row.status.terminal() {
+        return Ok(None);
+    }
+    let Some(intent) = store.worker_finish_intent(&row.id, true)? else {
+        return Ok(None);
+    };
+    let current = read_candidates(store, "SELECT * FROM agents WHERE id=?", [row.id.as_str()])?;
+    if current
+        .first()
+        .is_none_or(|current| !same_ownership(expected, current))
+    {
+        return Ok(Some(false));
+    }
+    if !matches!(
+        process::observe(
+            expected.supervisor_pid,
+            expected.supervisor_identity.as_deref(),
+            expected.supervisor_birth_time
+        ),
+        ProcessState::Dead | ProcessState::Reused
+    ) {
+        return Ok(Some(false));
+    }
+    let attempt: Option<FinishRecoveryAttempt> = store
+        .conn
+        .query_row(
+            "SELECT id,process_identity,process_birth_time,cleanup_proof_json FROM attempts \
+         WHERE agent_id=? AND ownership_active=1 AND finished_at IS NULL",
+            [row.id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((attempt, token, birth, saved)) = attempt else {
+        return Ok(Some(false));
+    };
+    if !cleanup_mcp_discovery(store, &attempt)? {
+        return Ok(Some(false));
+    }
+    let proof = match saved
+        .as_deref()
+        .map(serde_json::from_str::<process::Cleanup>)
+        .transpose()?
+    {
+        Some(proof) if proof.confirmed && proof.group_gone => proof,
+        _ => {
+            let Some(mut owned) = store.remembered_processes("attempt", &attempt)? else {
+                return Ok(Some(false));
+            };
+            if !owned.leader.as_ref().is_some_and(|leader| {
+                Some(leader.token.as_str()) == token.as_deref() && Some(leader.birth) == birth
+            }) {
+                return Ok(Some(false));
+            }
+            let proof = owned.cleanup_blocking(ORPHAN_GRACE)?;
+            if let Some(snapshot) = owned.snapshot() {
+                store.remember_processes("attempt", &attempt, &snapshot)?;
+            }
+            if !proof.confirmed || !proof.group_gone {
+                return Ok(Some(false));
+            }
+            store.provider_cleanup(&row.id, &attempt, &proof)?;
+            store.event(&row.id, "process_cleanup", &serde_json::to_value(&proof)?)?;
+            proof
+        }
+    };
+    // Preserve an existing seal verbatim. Recovery must never replace it with
+    // a new baseline from possibly changed files. Missing history stays a typed
+    // continuation refusal, independent of the acknowledged answer's success.
+    let raw: String = store.conn.query_row(
+        "SELECT adapter_state_json FROM attempts WHERE id=? AND agent_id=?",
+        rusqlite::params![attempt, row.id.as_str()],
+        |r| r.get(0),
+    )?;
+    let mut history: serde_json::Value = serde_json::from_str(&raw)?;
+    if !history.is_object() {
+        return Err(Error::Integrity(
+            "attempt history metadata is not an object".into(),
+        ));
+    }
+    if history.get("native_history").is_none()
+        && history.get("native_history_unavailable").is_none()
+    {
+        history["native_history_unavailable"] =
+            json!("supervisor exited before native history was sealed");
+        store.provider_history(&row.id, &attempt, &history)?;
+    }
+    let root = store.home.join("agents").join(row.id.as_str());
+    agent_run_platform::fs::private_dir(&root)?;
+    let answer = agent_run_platform::verify::seal(
+        &root,
+        std::path::Path::new("answer.md"),
+        &intent.summary,
+    )?;
+    let mut outcome = match intent.status {
+        agent_run_domain::worker::FinishStatus::Done => {
+            agent_run_domain::domain::Outcome::success(row.runtime_session_id.clone())
+        }
+        agent_run_domain::worker::FinishStatus::Blocked => {
+            agent_run_domain::domain::Outcome::failure("worker_blocked")
+        }
+        agent_run_domain::worker::FinishStatus::Failed => {
+            agent_run_domain::domain::Outcome::failure("worker_failed")
+        }
+    };
+    outcome.runtime_session_id = row.runtime_session_id.clone();
+    if store.cancel_pending(&row.id)? {
+        outcome.status = Status::Cancelled;
+    }
+    let evidence = agent_run_platform::verify::AnswerProof::sealed(&answer);
+    let outcome = agent_run_platform::verify::verify_completion(
+        Some(outcome),
+        None,
+        Some(&evidence),
+        proof.group_gone,
+        store.last_progress(&row.id)?,
+        at,
+        agent_run_platform::verify::DEFAULT_SILENCE_THRESHOLD_SECONDS,
+    )?;
+    store.event(
+        &row.id,
+        "worker_finish_recovered_v1",
+        &json!({"receipt_observed":true,"cleanup_confirmed":true}),
+    )?;
+    store.finish(&row.id, &outcome, Some(&answer), None)?;
+    crate::commands::complete_terminal(store, &row.id)?;
+    Ok(Some(true))
 }
 
 /// Compare only the immutable ownership facts needed by the specific sweep.

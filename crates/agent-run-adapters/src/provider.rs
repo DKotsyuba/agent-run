@@ -437,6 +437,8 @@ pub fn plan_selected(
 }
 
 /// Builds one attempt from verified immutable assets and the selected account.
+/// Host worker capabilities and mode markers are discarded; the supervisor
+/// supplies them after planning from the current attempt and frozen authority.
 ///
 /// The caller supplies fresh task text, an optional exact native session id
 /// and the admitted request's [`LaunchOptions`]; none can alter frozen
@@ -515,7 +517,10 @@ pub fn plan_selected_with(
         app_home,
         host,
     )?;
-    for name in agent_run_domain::worker::ENV_NAMES {
+    for name in agent_run_domain::worker::ENV_NAMES.into_iter().chain([
+        agent_run_domain::worker::FINISH_ENV,
+        agent_run_domain::worker::RESEARCH_ENV,
+    ]) {
         environment.remove(name);
     }
     let host_home = host

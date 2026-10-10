@@ -1162,6 +1162,18 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         } else {
             identity.provider_request.task.as_str()
         };
+        // The supervisor, not task text, declares the verified new execution.
+        // Retained history contains earlier finish receipts which must not fence
+        // this separately admitted continuation or overwrite its parent's answer.
+        let resumed_task =
+            (row.request.explicit_finish && row.parent_agent_id.is_some() && continuing.is_none())
+                .then(|| {
+                    format!(
+                        "{}\n\n{task}",
+                        agent_run_domain::worker::EXPLICIT_RESUME_BOUNDARY
+                    )
+                });
+        let task = resumed_task.as_deref().unwrap_or(task);
         let mut planned = adapters::provider::plan_selected_with(
             &config,
             &catalog,
@@ -1198,6 +1210,16 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 uuid::Uuid::new_v4().simple()
             );
             store.issue_worker_capability(id, &attempt_id, &token, domain::now())?;
+            store.begin_worker_lifecycle(id, &attempt_id, domain::now())?;
+            planned.launch.environment.insert(
+                agent_run_domain::worker::FINISH_ENV.into(),
+                if row.request.explicit_finish {
+                    "1"
+                } else {
+                    "0"
+                }
+                .into(),
+            );
             let values = [
                 home.to_string_lossy().into_owned(),
                 id.as_str().to_owned(),
@@ -1455,7 +1477,11 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         }
         store.provider_history(id, &attempt_id, &state)?;
         let history_recorded = std::time::Instant::now();
-        if quota && !cancelled && result.outcome.status == Status::Failed {
+        if quota
+            && !cancelled
+            && result.outcome.status == Status::Failed
+            && store.worker_finish_intent(id, false)?.is_none()
+        {
             match failover(home, id, store, &identity) {
                 Ok(next) => {
                     store.event(id, "account_switched", &next)?;
@@ -1472,6 +1498,11 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                     result.outcome.failure_text = Some(format!("failover_blocked: {blocker}"));
                 }
             }
+        }
+        if row.request.explicit_finish {
+            result.answer = store.worker_finish_intent(id, false)?.and_then(|intent| {
+                (process.redact(&intent.summary) == intent.summary).then_some(intent.summary)
+            });
         }
         let answer_started = std::time::Instant::now();
         let proof = match result.answer.as_deref() {

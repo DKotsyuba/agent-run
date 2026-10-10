@@ -1,5 +1,5 @@
 #![cfg(feature = "test-fixtures")]
-//! These tests launch only the feature-gated local fake engine, never providers.
+//! These tests launch only the feature-gated local legacy fake engine, never providers.
 use agent_run::{
     domain::{AgentId, Status},
     service::Service,
@@ -100,12 +100,14 @@ impl Harness {
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
     }
+    /// Submit a legacy fake-engine task; it emits native results, not finish callbacks.
     fn submit_cli(&self, task: &str) -> AgentId {
         let out = Command::new(env!("CARGO_BIN_EXE_agent-run"))
             .arg("--home")
             .arg(&self.home)
             .args([
                 "start",
+                "--legacy-completion",
                 "--provider",
                 "mock",
                 "--model",
@@ -183,7 +185,7 @@ async fn worker_mcp_queues_a_report_without_ending_the_run() {
         &h.home,
         "start",
         json!({
-            "provider":"mock","model":"fixture","profile":"review",
+            "provider":"mock","model":"fixture","profile":"review","explicit_finish":false,
             "task":"fixture:worker-notify","workdir":h.home,
             "orchestrator":{"transport":"codex_queue","external_session_id":"fixture-worker-thread"}
         }),
@@ -512,7 +514,7 @@ async fn scripted_pool_completes_with_one_correlated_common_notice() {
     }
     let member = |role: &str, task: &str| {
         json!({"role": role, "start": {
-            "provider":"mock","model":"fixture","profile":"review","task":task,
+            "provider":"mock","model":"fixture","profile":"review","task":task,"explicit_finish":false,
             "workdir":h.home}})
     };
     let pool_start = json!({

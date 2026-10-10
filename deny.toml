@@ -6,7 +6,9 @@ ignore = []
 maximum-db-staleness = "P1D"
 
 [licenses]
-allow = ["Apache-2.0", "BSD-3-Clause", "CDLA-Permissive-2.0", "ISC", "MIT", "Unicode-3.0", "Zlib"]
+# Reviewed borrow-or-share's published MIT-0 text (via jsonschema/referencing):
+# the MIT permission/warranty terms without an attribution requirement.
+allow = ["Apache-2.0", "BSD-3-Clause", "CDLA-Permissive-2.0", "ISC", "MIT", "MIT-0", "Unicode-3.0", "Zlib"]
 confidence-threshold = 0.95
 
 [bans]

@@ -4,6 +4,15 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.25.0
+
+- feat(runtime)!: new admissions finish only through an authenticated private
+  callback; native turn boundaries become unbounded idle with same-session
+  pool/steering/native-job wakes and immutable callback summaries
+- feat(store): migrate to schema 29 for durable finish intent, receipt and
+  native-wake deduplication; preserve frozen legacy mode, historical answers,
+  ownership protections and explicit native-history continuations
+
 ## 0.24.2
 
 - fix(stream): accept owned native Claude CLI background notifications as

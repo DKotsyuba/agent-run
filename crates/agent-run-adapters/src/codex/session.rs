@@ -108,6 +108,19 @@ impl Session {
     }
 
     /// Returns whether an envelope belongs to the active thread and turn.
+    /// Leave one verified completed turn while preserving its thread. Only a
+    /// matching active turn may idle; stale or duplicate boundaries are refused.
+    pub fn turn_completed(&mut self, turn_id: &str) -> Result<()> {
+        if self.state != SessionState::TurnActive || self.turn_id.as_deref() != Some(turn_id) {
+            return Err(invalid("Codex idle boundary does not own the active turn"));
+        }
+        self.turn_id = None;
+        self.require_turn_id = true;
+        self.state = SessionState::ThreadActive;
+        Ok(())
+    }
+
+    /// Returns whether an envelope belongs to the active thread and turn.
     ///
     /// An absent turn ID is tolerated for fresh threads for compatibility with
     /// older app-server item notifications, but never for resumed threads.

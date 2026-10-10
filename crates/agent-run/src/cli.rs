@@ -567,6 +567,12 @@ pub struct Start {
     pub write: bool,
     #[arg(long)]
     pub fast: bool,
+    /// Callback completion is the default; false selects legacy compatibility.
+    #[arg(long, action=clap::ArgAction::Set, num_args=0..=1, default_value="true", default_missing_value="true")]
+    pub explicit_finish: bool,
+    /// Compatibility only: complete on the native result instead of finish.
+    #[arg(long, conflicts_with = "explicit_finish")]
+    pub legacy_completion: bool,
     #[arg(long)]
     pub effort: Option<String>,
     #[arg(long = "read-root", id = "read_root")]
@@ -1532,6 +1538,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                     "workdir": absolute(&a.workdir.unwrap_or(std::env::current_dir()?))?,
                     "write": a.write,
                     "fast": a.fast,
+                    "explicit_finish": a.explicit_finish && !a.legacy_completion,
                     "effort": a.effort,
                     "read_roots": read_roots,
                     "output_schema": schema,

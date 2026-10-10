@@ -509,6 +509,8 @@ fn native_provider_keeps_login_and_model_alias() {
             ("AGENT_RUN_WORKER_RUN_ID".into(), "stale-run".into()),
             ("AGENT_RUN_WORKER_ATTEMPT_ID".into(), "stale-attempt".into()),
             ("AGENT_RUN_WORKER_TOKEN".into(), "stale-capability".into()),
+            (agent_run_domain::worker::FINISH_ENV.into(), "1".into()),
+            (agent_run_domain::worker::RESEARCH_ENV.into(), "1".into()),
         ]),
         &FakeReader,
         "task",
@@ -528,12 +530,22 @@ fn native_provider_keeps_login_and_model_alias() {
         toml::from_str(&fs::read_to_string(run_home.join("config.toml")).unwrap()).unwrap();
     let worker = &native_config["mcp_servers"]["agent_run_worker"];
     assert_eq!(worker["args"][0].as_str(), Some("_worker-mcp"));
-    assert_eq!(worker["env_vars"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        worker["env_vars"].as_array().unwrap(),
+        &agent_run_domain::worker::ENV_NAMES
+            .into_iter()
+            .chain([agent_run_domain::worker::FINISH_ENV])
+            .map(|name| toml::Value::String(name.into()))
+            .collect::<Vec<_>>()
+    );
     assert_eq!(
         worker["default_tools_approval_mode"].as_str(),
         Some("approve")
     );
-    for name in agent_run_domain::worker::ENV_NAMES {
+    for name in agent_run_domain::worker::ENV_NAMES.into_iter().chain([
+        agent_run_domain::worker::FINISH_ENV,
+        agent_run_domain::worker::RESEARCH_ENV,
+    ]) {
         assert!(!plan.launch.environment.contains_key(name));
     }
     assert!(

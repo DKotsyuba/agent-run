@@ -69,6 +69,8 @@ fn cleanup(value: Option<String>) -> Option<CleanupView> {
 
 impl Store {
     /// Builds one current agent view at `observed_at` from committed rows only.
+    /// Explicit lifecycle supplies idle/closing phase, turn count and idle time;
+    /// terminal phases and elapsed/idle observations stay frozen at completion.
     pub fn agent_view_at(&self, id: &AgentId, observed_at: f64) -> Result<AgentView> {
         if !observed_at.is_finite() || observed_at < 0.0 {
             return Err(invalid("observed_at must be finite and nonnegative"));
@@ -82,7 +84,7 @@ impl Store {
         let cleanup_json = self.conn.query_row("SELECT data_json FROM events WHERE agent_id=? AND kind='process_cleanup' ORDER BY seq DESC LIMIT 1", [id.as_str()], |row| row.get::<_, String>(0)).optional()?;
         let phase_row = self.conn.query_row("SELECT at,data_json FROM events WHERE agent_id=? AND kind='phase' ORDER BY seq DESC LIMIT 1", [id.as_str()], |row| Ok((row.get::<_, f64>(0)?, row.get::<_, String>(1)?))).optional()?;
         let delivery = self.delivery_view(&record)?;
-        let (phase, phase_started_at) = match record.status {
+        let (mut phase, mut phase_started_at) = match record.status {
             status if status.terminal() => (
                 "terminal".to_owned(),
                 record.finished_at.unwrap_or(record.created_at),
@@ -127,6 +129,15 @@ impl Store {
                     .max(0.0),
             )
         };
+        let lifecycle = self.worker_lifecycle_view_at(&record.id, observed_at)?;
+        if record.status == Status::Running
+            && let Some(lifecycle) = &lifecycle
+        {
+            phase = lifecycle["phase"].as_str().unwrap_or("running").into();
+            phase_started_at = lifecycle["transition_at"]
+                .as_f64()
+                .unwrap_or(phase_started_at);
+        }
         Ok(AgentView {
             mcp: selected_mcp(record.identity.as_ref()),
             parent_run_id: None,
@@ -164,6 +175,9 @@ impl Store {
                 .and_then(|value| value.get("effective_policy").cloned()),
             phase,
             phase_started_at,
+            completion_mode: lifecycle.as_ref().map(|_| "explicit_finish".into()),
+            turn_count: lifecycle.as_ref().and_then(|v| v["turn_count"].as_u64()),
+            idle_seconds: lifecycle.as_ref().and_then(|v| v["idle_seconds"].as_f64()),
             process_state,
             observed_at,
             runtime_outcome: record
