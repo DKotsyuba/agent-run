@@ -1,5 +1,11 @@
 # Agent Run backlog
 
+## Claude CLI native background notifications
+
+- [x] Separate owned native task notifications from runner input acknowledgements; preserve coalesced task/steering correlation and contextual-only results.
+- [x] Reject unknown or duplicate replays, runner-ID collisions, malformed origins and foreign sessions; retain content-free refusal categories.
+Release gate: background-command completion and native continuation through Sonnet and GLM must be verified on the exact candidate before publication.
+
 ## Synchronous start admission preflight
 
 - [x] Validate that the requested launch is supported before `start` accepts asynchronous work and returns an agent ID. Unsupported harness/profile/model/account/options or permission combinations must return a typed error in that same tool call.

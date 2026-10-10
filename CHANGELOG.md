@@ -4,6 +4,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.24.2
+
+- fix(stream): accept owned native Claude CLI background notifications as
+  contextual input for Sonnet and GLM; preserve task/steering result correlation,
+  reject spoofed or duplicate replays, and retain content-free refusal reasons
+
 ## 0.24.1
 
 - fix(supervisor): reuse short monotonic SQLite busy sleeps for ownership

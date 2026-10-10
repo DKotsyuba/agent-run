@@ -278,3 +278,61 @@ async fn tool_results_carry_native_error_evidence() {
     assert_eq!(counts.failed, None, "the unresulted call keeps failed null");
     assert_eq!(counts.unknown_results, Some(1));
 }
+
+/// A post-task background notification remains context and cannot replace the saved answer.
+#[tokio::test]
+async fn background_notification_preserves_task_answer() {
+    let id = "c0454a3f-7d83-4e18-bd6d-8b6a7d369490";
+    let lines = [
+        json!({"type":"system","subtype":"init","session_id":"owned-session"}),
+        json!({"type":"result","subtype":"success","is_error":false,"result":"TASK_ANSWER"}),
+        json!({"type":"user","isReplay":true,"uuid":id,"session_id":"owned-session",
+            "parent_tool_use_id":null,
+            "origin":{"kind":"task-notification","producer":"session-task"},
+            "message":{"role":"user","content":"background completed"}}),
+        json!({"type":"result","subtype":"success","is_error":false,
+            "user_message_uuid":id,"result":"CONTEXT_ANSWER"}),
+    ];
+    let (_, answer) = run_stream(&lines).await;
+    assert_eq!(answer.as_deref(), Some("TASK_ANSWER"));
+}
+
+/// Foreign notification sessions refuse before rebind and retain no content in diagnostics.
+#[tokio::test]
+async fn background_notification_rejects_session_rebind_with_safe_reason() {
+    let home = common::Home::new();
+    let (id, _) = home
+        .store()
+        .admit(&home.request(), &home.config, &json!({}), None)
+        .unwrap();
+    let mut store = home.store();
+    let record = store.get(&id).unwrap();
+    let lines = [
+        json!({"type":"system","subtype":"init","session_id":"owned-session"}),
+        json!({"type":"user","isReplay":true,
+            "uuid":"c0454a3f-7d83-4e18-bd6d-8b6a7d369490",
+            "session_id":"FOREIGN_SESSION","parent_tool_use_id":null,
+            "origin":{"kind":"task-notification","producer":"session-task"},
+            "message":{"role":"user","content":"PRIVATE_NOTIFICATION_TEXT"}}),
+    ];
+    let mut process = Process::spawn(&fake_engine(&home.path, &lines)).unwrap();
+    let result = stream::run(&mut process, &mut store, &record, None).await;
+    let cleanup = process
+        .owner
+        .cleanup(std::time::Duration::from_secs(1))
+        .await;
+    process.reap().await;
+    assert!(cleanup.unwrap().confirmed);
+    let error = result.err().expect("foreign notification refused");
+    assert!(!error.to_string().contains("PRIVATE"));
+    let session = store.get(&id).unwrap().runtime_session_id;
+    assert_eq!(session.as_deref(), Some("owned-session"));
+    let metadata: String = store.conn.query_row(
+        "SELECT data_json FROM events WHERE agent_id=? AND kind='native_user_replay_refused_v1'",
+        [id.as_str()], |row| row.get(0)).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&metadata).unwrap(),
+        json!({"version":1,"reason":"invalid_notification"})
+    );
+    assert!(!metadata.contains("PRIVATE") && !metadata.contains("FOREIGN"));
+}
