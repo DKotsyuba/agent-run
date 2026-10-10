@@ -265,7 +265,8 @@ impl ResultInputs {
 
     /// Accepts runner acknowledgements or closed native task-notification replays.
     /// Native notifications require an established matching session, a canonical UUID,
-    /// a top-level user text frame and the CLI's exact origin; their text grants nothing.
+    /// a top-level user text frame and the CLI's closed origin (including its optional
+    /// bounded runId label); neither the label nor notification text grants authority.
     /// Duplicate notifications and runner-ID collisions fail closed. Both replay kinds
     /// may coalesce, but only a runner-issued task can authorize a task result.
     fn replay(&mut self, frame: &Value, session: Option<&str>) -> Result<()> {
@@ -298,7 +299,18 @@ impl ResultInputs {
                 && frame
                     .get("origin")
                     .and_then(Value::as_object)
-                    .is_some_and(|origin| origin.len() == 2)
+                    .is_some_and(|origin| {
+                        origin
+                            .keys()
+                            .all(|key| matches!(key.as_str(), "kind" | "producer" | "runId"))
+                            && origin.get("runId").is_none_or(|value| {
+                                value.as_str().is_some_and(|label| {
+                                    !label.is_empty()
+                                        && label.len() <= 128
+                                        && !label.chars().any(char::is_control)
+                                })
+                            })
+                    })
                 && frame.pointer("/origin/producer").and_then(Value::as_str)
                     == Some("session-task")
                 && frame.pointer("/message/role").and_then(Value::as_str) == Some("user")
@@ -1235,7 +1247,7 @@ mod tests {
             "type":"user","isReplay":true,
             "uuid":"c0454a3f-7d83-4e18-bd6d-8b6a7d369490",
             "session_id":"session","parent_tool_use_id":null,
-            "origin":{"kind":"task-notification","producer":"session-task"},
+            "origin":{"kind":"task-notification","producer":"session-task","runId":"background-task"},
             "message":{"role":"user","content":"background command completed"}
         });
         inputs
@@ -1299,6 +1311,18 @@ mod tests {
             ),
             ("origin", json!({"kind":"prompt","producer":"session-task"})),
             ("origin", json!("task-notification")),
+            (
+                "origin",
+                json!({"kind":"task-notification","producer":"session-task","runId":false}),
+            ),
+            (
+                "origin",
+                json!({"kind":"task-notification","producer":"session-task","runId":""}),
+            ),
+            (
+                "origin",
+                json!({"kind":"task-notification","producer":"session-task","runId":"x".repeat(129)}),
+            ),
             ("session_id", json!("foreign")),
             ("session_id", json!(null)),
             ("parent_tool_use_id", json!("foreign")),

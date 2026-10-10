@@ -86,7 +86,8 @@ Native process identity and signalling are described in
 - **Claude Code** uses its native CLI protocol and retains the session identity
   for continuation. The GLM adapter belongs to historical schema-1 runs.
 - Claude CLI background-task notifications are contextual native input. Only the
-  exact top-level replay origin (task-notification/session-task), canonical UUID,
+  closed top-level replay origin (task-notification/session-task, with an optional
+  bounded native runId label), canonical UUID,
   user text shape and established session can register one. Notification text
   cannot grant task authority. Runner inputs still own task/steering correlation;
   coalesced batches may end in a notification, and notification-only results
