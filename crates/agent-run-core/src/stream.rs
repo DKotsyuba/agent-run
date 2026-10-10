@@ -215,6 +215,8 @@ pub fn plan_with_environment(
 struct ResultInputs {
     /// IDs written by this runner; unknown native correlations fail closed.
     sent: std::collections::BTreeSet<String>,
+    /// Native notification UUIDs observed on the owned session; never task authority.
+    native_context: std::collections::BTreeSet<String>,
     /// Most recent initial task or written steering input; pool notes do not replace it.
     task: Option<String>,
     /// Native replay acknowledgements since the preceding terminal frame, in order.
@@ -261,19 +263,64 @@ impl ResultInputs {
         self.sent.insert(id);
     }
 
-    /// Accepts only CLI replay acknowledgements of this runner's known inputs.
-    /// Other user frames, including tool results, do not establish task completion.
-    fn replay(&mut self, frame: &Value) -> Result<()> {
+    /// Accepts runner acknowledgements or closed native task-notification replays.
+    /// Native notifications require an established matching session, a canonical UUID,
+    /// a top-level user text frame and the CLI's exact origin; their text grants nothing.
+    /// Duplicate notifications and runner-ID collisions fail closed. Both replay kinds
+    /// may coalesce, but only a runner-issued task can authorize a task result.
+    fn replay(&mut self, frame: &Value, session: Option<&str>) -> Result<()> {
         if frame.get("isReplay").and_then(Value::as_bool) != Some(true) {
             return Ok(());
         }
         let id = frame
             .get("uuid")
             .and_then(Value::as_str)
-            .filter(|id| self.sent.contains(*id))
             .ok_or_else(|| invalid("native user replay has unknown input correlation"))?;
-        if self.replayed.iter().any(|seen| seen == id) {
+        let native = !self.sent.contains(id);
+        let notification =
+            frame.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification");
+        if native {
+            if !notification {
+                return Err(invalid("native user replay has unknown input correlation"));
+            }
+            let content = frame.pointer("/message/content");
+            let text_only = content.is_some_and(|content| {
+                content.is_string()
+                    || content.as_array().is_some_and(|blocks| {
+                        !blocks.is_empty()
+                            && blocks.iter().all(|block| {
+                                block.get("type").and_then(Value::as_str) == Some("text")
+                                    && block.get("text").is_some_and(Value::is_string)
+                            })
+                    })
+            });
+            let valid = frame.get("type").and_then(Value::as_str) == Some("user")
+                && frame
+                    .get("origin")
+                    .and_then(Value::as_object)
+                    .is_some_and(|origin| origin.len() == 2)
+                && frame.pointer("/origin/producer").and_then(Value::as_str)
+                    == Some("session-task")
+                && frame.pointer("/message/role").and_then(Value::as_str) == Some("user")
+                && frame.get("parent_tool_use_id").is_some_and(Value::is_null)
+                && session.is_some_and(|session| {
+                    frame.get("session_id").and_then(Value::as_str) == Some(session)
+                })
+                && uuid::Uuid::parse_str(id).is_ok_and(|uuid| uuid.hyphenated().to_string() == id)
+                && text_only;
+            if !valid {
+                return Err(invalid("native internal notification contract rejected"));
+            }
+        } else if notification {
+            return Err(invalid(
+                "native internal notification collides with runner input",
+            ));
+        }
+        if self.replayed.iter().any(|seen| seen == id) || self.native_context.contains(id) {
             return Err(invalid("native user replay duplicated an input"));
+        }
+        if native {
+            self.native_context.insert(id.to_owned());
         }
         self.replayed.push(id.to_owned());
         Ok(())
@@ -285,8 +332,9 @@ impl ResultInputs {
     fn scope(&mut self, frame: &Value) -> ResultScope {
         let replayed = std::mem::take(&mut self.replayed);
         let Some(id) = frame.get("user_message_uuid").and_then(Value::as_str) else {
-            let single_input = self.sent.is_empty()
-                || (self.sent.len() == 1 && self.task.is_some() && !self.unframed_initial);
+            let single_input = self.native_context.is_empty()
+                && (self.sent.is_empty()
+                    || (self.sent.len() == 1 && self.task.is_some() && !self.unframed_initial));
             return if replayed.is_empty()
                 && single_input
                 && frame.get("user_message_uuid").is_none_or(Value::is_null)
@@ -296,7 +344,7 @@ impl ResultInputs {
                 ResultScope::Ambiguous
             };
         };
-        if !self.sent.contains(id)
+        if (!self.sent.contains(id) && !self.native_context.contains(id))
             || self.completed.contains(id)
             || replayed.iter().any(|id| self.completed.contains(id))
             || replayed.last().is_some_and(|last| last != id)
@@ -711,6 +759,27 @@ pub async fn run(
                 });
             }
         };
+        // Validate notification ownership before a frame can rebind a fresh session.
+        if v.get("type").and_then(Value::as_str) == Some("user")
+            && let Err(error) = inputs.replay(&v, session.as_deref())
+        {
+            let reason = match &error {
+                crate::Error::Validation(message) => match message.as_str() {
+                    "native user replay has unknown input correlation" => "unknown_input",
+                    "native internal notification contract rejected" => "invalid_notification",
+                    "native internal notification collides with runner input" => "runner_collision",
+                    "native user replay duplicated an input" => "duplicate_input",
+                    _ => "contract",
+                },
+                _ => "contract",
+            };
+            let _ = store.event(
+                &record.id,
+                "native_user_replay_refused_v1",
+                &json!({"version":1,"reason":reason}),
+            );
+            return Err(error);
+        }
         // Capture every observed result before identity/shape validation can reject it.
         let result_scope = if v.get("type").and_then(Value::as_str) == Some("result") {
             result_frame_index += 1;
@@ -941,7 +1010,6 @@ pub async fn run(
                 }
             }
             Some("user") => {
-                inputs.replay(&v)?;
                 if let Some(content) = v.pointer("/message/content").and_then(Value::as_array) {
                     for block in content {
                         if block.get("type").and_then(Value::as_str) == Some("tool_result") {
@@ -1022,7 +1090,13 @@ pub async fn run(
                 }
                 if outcome.status == Status::Succeeded {
                     if scope == ResultScope::Ambiguous
-                        || (legacy_result_seen && result_frame_index != 1)
+                        || (legacy_result_seen
+                            && result_frame_index != 1
+                            // An owned native notification is context, never a second
+                            // legacy task result. Unknown and repeated terminals still fail.
+                            && !(scope == ResultScope::Context
+                                && v.get("user_message_uuid").and_then(Value::as_str)
+                                    .is_some_and(|id| inputs.native_context.contains(id))))
                     {
                         outcome = Outcome::failure("ambiguous_result");
                         outcome.runtime_session_id = session.clone();
@@ -1082,7 +1156,7 @@ mod tests {
     use super::{native_result_metadata, result_failure_kind, result_text, runtime_result_usage};
     use serde_json::json;
 
-    /// Native correlations cover coalesced replay batches, not write counts or text.
+    /// Runner replays retain task/steering authority and reject unknown or repeated results.
     #[test]
     fn result_inputs_correlate_tasks_context_and_coalesced_steering() {
         use super::{ResultInputs, ResultScope};
@@ -1090,33 +1164,33 @@ mod tests {
         inputs.sent("task".into(), true);
         inputs.sent("context".into(), false);
         inputs
-            .replay(&json!({"isReplay":true,"uuid":"context"}))
+            .replay(&json!({"isReplay":true,"uuid":"context"}), None)
             .unwrap();
         assert!(inputs.scope(&json!({"user_message_uuid":"context"})) == ResultScope::Context);
         inputs
-            .replay(&json!({"isReplay":true,"uuid":"task"}))
+            .replay(&json!({"isReplay":true,"uuid":"task"}), None)
             .unwrap();
         assert!(inputs.scope(&json!({"user_message_uuid":"task"})) == ResultScope::Task);
         assert!(inputs.scope(&json!({"user_message_uuid":"task"})) == ResultScope::Ambiguous);
-
         let mut inputs = ResultInputs::default();
         inputs.sent("task".into(), true);
         inputs.sent("note".into(), false);
         for id in ["task", "note"] {
-            inputs.replay(&json!({"isReplay":true,"uuid":id})).unwrap();
+            inputs
+                .replay(&json!({"isReplay":true,"uuid":id}), None)
+                .unwrap();
         }
         assert!(inputs.scope(&json!({"user_message_uuid":"note"})) == ResultScope::Task);
         assert!(inputs.scope(&json!({"user_message_uuid":"task"})) == ResultScope::Ambiguous);
-
         let mut inputs = ResultInputs::default();
         inputs.sent("old".into(), true);
         inputs.sent("steer".into(), true);
         inputs
-            .replay(&json!({"isReplay":true,"uuid":"old"}))
+            .replay(&json!({"isReplay":true,"uuid":"old"}), None)
             .unwrap();
         assert!(inputs.scope(&json!({"user_message_uuid":"old"})) == ResultScope::Context);
         inputs
-            .replay(&json!({"isReplay":true,"uuid":"steer"}))
+            .replay(&json!({"isReplay":true,"uuid":"steer"}), None)
             .unwrap();
         assert!(inputs.scope(&json!({"user_message_uuid":"steer"})) == ResultScope::Task);
         assert!(inputs.scope(&json!({"user_message_uuid":"unknown"})) == ResultScope::Ambiguous);
@@ -1128,14 +1202,167 @@ mod tests {
         single.sent("note".into(), false);
         assert!(single.scope(&json!({})) == ResultScope::Ambiguous);
         inputs
-            .replay(&json!({"isReplay":true,"uuid":"steer"}))
+            .replay(&json!({"isReplay":true,"uuid":"steer"}), None)
             .unwrap();
         assert!(inputs.scope(&json!({})) == ResultScope::Ambiguous);
         assert!(
             inputs
-                .replay(&json!({"isReplay":true,"uuid":"unknown"}))
+                .replay(&json!({"isReplay":true,"uuid":"unknown"}), None)
                 .is_err()
         );
+        let mut duplicate = ResultInputs::default();
+        duplicate.sent("known".into(), true);
+        duplicate
+            .replay(&json!({"isReplay":true,"uuid":"known"}), None)
+            .unwrap();
+        assert!(
+            duplicate
+                .replay(&json!({"isReplay":true,"uuid":"known"}), None)
+                .is_err()
+        );
+    }
+
+    /// Native CLI notifications coalesce with a task without replacing its authority.
+    #[test]
+    fn native_background_notification_keeps_task_correlation() {
+        use super::{ResultInputs, ResultScope};
+        let mut inputs = ResultInputs::default();
+        inputs.sent("task".into(), true);
+        inputs
+            .replay(&json!({"isReplay":true,"uuid":"task"}), None)
+            .unwrap();
+        let notification = json!({
+            "type":"user","isReplay":true,
+            "uuid":"c0454a3f-7d83-4e18-bd6d-8b6a7d369490",
+            "session_id":"session","parent_tool_use_id":null,
+            "origin":{"kind":"task-notification","producer":"session-task"},
+            "message":{"role":"user","content":"background command completed"}
+        });
+        inputs
+            .replay(&notification, Some("session"))
+            .expect("native background replay");
+        assert!(
+            inputs.scope(&json!({
+                "user_message_uuid":"c0454a3f-7d83-4e18-bd6d-8b6a7d369490"
+            })) == ResultScope::Task
+        );
+    }
+
+    /// Produces the CLI's owned-session text notification shape; IDs stay test-local.
+    fn native_notification(id: &str) -> serde_json::Value {
+        json!({"type":"user","isReplay":true,"uuid":id,
+            "session_id":"session","parent_tool_use_id":null,
+            "origin":{"kind":"task-notification","producer":"session-task"},
+            "message":{"role":"user","content":"PRIVATE_NOTIFICATION_TEXT"}})
+    }
+
+    /// Notification-only results cannot certify or replace a task or accept a duplicate UUID.
+    #[test]
+    fn native_notifications_are_context_without_task_authority() {
+        use super::{ResultInputs, ResultScope};
+        let mut inputs = ResultInputs::default();
+        inputs.sent("task".into(), true);
+        inputs
+            .replay(&json!({"isReplay":true,"uuid":"task"}), None)
+            .unwrap();
+        assert!(inputs.scope(&json!({"user_message_uuid":"task"})) == ResultScope::Task);
+        for id in [
+            "c0454a3f-7d83-4e18-bd6d-8b6a7d369490",
+            "cd077b95-90f8-43e1-a5cc-2f32a6820e72",
+        ] {
+            let frame = native_notification(id);
+            inputs.replay(&frame, Some("session")).unwrap();
+            assert!(inputs.scope(&json!({"user_message_uuid":id})) == ResultScope::Context);
+            assert!(inputs.replay(&frame, Some("session")).is_err());
+            assert!(inputs.scope(&json!({"user_message_uuid":id})) == ResultScope::Ambiguous);
+        }
+        assert!(inputs.scope(&json!({})) == ResultScope::Ambiguous);
+        assert!(inputs.scope(&json!({"user_message_uuid":"task"})) == ResultScope::Ambiguous);
+    }
+
+    /// Only exact native metadata on the owned session admits a new contextual UUID.
+    #[test]
+    fn native_notifications_reject_spoofed_unowned_and_malformed_frames() {
+        use super::ResultInputs;
+        let valid = native_notification("c0454a3f-7d83-4e18-bd6d-8b6a7d369490");
+        let mut malformed = Vec::new();
+        for (key, value) in [
+            ("type", json!("assistant")),
+            ("uuid", json!("PRIVATE_UUID")),
+            (
+                "origin",
+                json!({"kind":"task-notification","producer":"foreign"}),
+            ),
+            (
+                "origin",
+                json!({"kind":"task-notification","producer":"session-task","extra":true}),
+            ),
+            ("origin", json!({"kind":"prompt","producer":"session-task"})),
+            ("origin", json!("task-notification")),
+            ("session_id", json!("foreign")),
+            ("session_id", json!(null)),
+            ("parent_tool_use_id", json!("foreign")),
+            (
+                "message",
+                json!({"role":"assistant","content":"PRIVATE_NOTIFICATION_TEXT"}),
+            ),
+            (
+                "message",
+                json!({"role":"user","content":[{"type":"tool_result","content":"PRIVATE_NOTIFICATION_TEXT"}]}),
+            ),
+        ] {
+            let mut frame = valid.clone();
+            frame[key] = value;
+            malformed.push(frame);
+        }
+        let mut missing_origin = valid.clone();
+        missing_origin.as_object_mut().unwrap().remove("origin");
+        malformed.push(missing_origin);
+        for frame in malformed {
+            let error = ResultInputs::default()
+                .replay(&frame, Some("session"))
+                .unwrap_err();
+            assert!(!error.to_string().contains("PRIVATE"));
+        }
+        assert!(ResultInputs::default().replay(&valid, None).is_err());
+        let mut collision = ResultInputs::default();
+        collision.sent(valid["uuid"].as_str().unwrap().into(), true);
+        assert!(collision.replay(&valid, Some("session")).is_err());
+
+        // Notification-like text on an ordinary unknown replay confers no authority.
+        let mut text_only = valid.clone();
+        text_only.as_object_mut().unwrap().remove("origin");
+        assert!(
+            ResultInputs::default()
+                .replay(&text_only, Some("session"))
+                .is_err()
+        );
+        // Origin metadata without an actual replay never registers a contextual result.
+        let mut not_replayed = valid;
+        not_replayed["isReplay"] = json!(false);
+        let mut inputs = ResultInputs::default();
+        inputs.replay(&not_replayed, Some("session")).unwrap();
+        assert!(inputs.native_context.is_empty());
+    }
+
+    /// A steering batch remains authoritative even when native notifications finish it.
+    #[test]
+    fn native_notification_batch_preserves_latest_steering() {
+        use super::{ResultInputs, ResultScope};
+        let mut inputs = ResultInputs::default();
+        inputs.sent("old".into(), true);
+        inputs.sent("steer".into(), true);
+        for id in ["old", "steer"] {
+            inputs
+                .replay(&json!({"isReplay":true,"uuid":id}), None)
+                .unwrap();
+        }
+        let id = "c0454a3f-7d83-4e18-bd6d-8b6a7d369490";
+        let mut frame = native_notification(id);
+        frame["message"]["content"] = json!([{"type":"text","text":"notice"}]);
+        inputs.replay(&frame, Some("session")).unwrap();
+        assert!(inputs.scope(&json!({"user_message_uuid":id})) == ResultScope::Task);
+        assert!(inputs.scope(&json!({"user_message_uuid":"steer"})) == ResultScope::Ambiguous);
     }
 
     /// Result diagnostics retain types/counts but omit every supplied content field.
