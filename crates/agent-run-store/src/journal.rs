@@ -1,6 +1,8 @@
 //! Durable event, command, attempt, and transcript journal operations.
 //!
-//! Each mutating operation opens and commits its own immediate SQLite transaction;
+//! Claims/appends use short immediate transactions; an empty command poll is
+//! read-only and acknowledgements use one autocommit statement. SQL failures
+//! carry closed operation labels and elapsed time, without generic replay;
 //! callers must keep a [`Store`] on the thread that created its connection.
 
 use crate::Store;
@@ -144,43 +146,48 @@ impl Store {
         data: &Value,
         attempt_id: Option<&str>,
     ) -> Result<i64> {
-        if kind.trim().is_empty() {
-            return Err(invalid("event kind must be a nonblank string"));
-        }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM agents WHERE id=?)",
-            [id.as_str()],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            return Err(Error::NotFound(id.to_string()));
-        }
-        if let Some(attempt_id) = attempt_id {
-            let owned: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM attempts WHERE id=? AND agent_id=?)",
-                params![attempt_id, id.as_str()],
-                |row| row.get(0),
-            )?;
-            if !owned {
-                return Err(invalid("attempt is unknown or owned by another agent"));
-            }
-        }
-        tx.execute(
-            "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES(?,?,?,?,?)",
-            params![
-                id.as_str(),
-                attempt_id,
-                now(),
-                kind,
-                serde_json::to_string(data)?
-            ],
-        )?;
-        let seq = tx.last_insert_rowid();
-        tx.commit()?;
-        Ok(seq)
+        crate::persistence(
+            agent_run_domain::error::PersistenceOperation::EventAppend,
+            || {
+                if kind.trim().is_empty() {
+                    return Err(invalid("event kind must be a nonblank string"));
+                }
+                let tx = self
+                    .conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agents WHERE id=?)",
+                    [id.as_str()],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    return Err(Error::NotFound(id.to_string()));
+                }
+                if let Some(attempt_id) = attempt_id {
+                    let owned: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM attempts WHERE id=? AND agent_id=?)",
+                        params![attempt_id, id.as_str()],
+                        |row| row.get(0),
+                    )?;
+                    if !owned {
+                        return Err(invalid("attempt is unknown or owned by another agent"));
+                    }
+                }
+                tx.execute(
+                    "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES(?,?,?,?,?)",
+                    params![
+                        id.as_str(),
+                        attempt_id,
+                        now(),
+                        kind,
+                        serde_json::to_string(data)?
+                    ],
+                )?;
+                let seq = tx.last_insert_rowid();
+                tx.commit()?;
+                Ok(seq)
+            },
+        )
     }
 
     /// Appends one timestamped transcript row, spooling bodies above 32 KiB and checking attempt ownership.
@@ -193,36 +200,41 @@ impl Store {
         raw_ref: Option<&str>,
         attempt_id: Option<&str>,
     ) -> Result<i64> {
-        if !["user", "assistant", "system", "tool_call", "tool_result"].contains(&role) {
-            return Err(invalid("unknown transcript role"));
-        }
-        let content_complete = content.len() <= MAX_INLINE_MESSAGE_BYTES;
-        let (content, raw_ref) = message_storage(&self.home, id, content, raw_ref)?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM agents WHERE id=?)",
-            [id.as_str()],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            return Err(Error::NotFound(id.to_string()));
-        }
-        if let Some(attempt_id) = attempt_id {
-            let owned: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM attempts WHERE id=? AND agent_id=?)",
-                params![attempt_id, id.as_str()],
-                |row| row.get(0),
-            )?;
-            if !owned {
-                return Err(invalid("attempt is unknown or owned by another agent"));
-            }
-        }
-        tx.execute("INSERT INTO messages(agent_id,attempt_id,at,role,name,content,raw_ref,content_complete,root_agent_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,(SELECT COALESCE(NULLIF(root_agent_id,''),id) FROM agents WHERE id=?1))", params![id.as_str(), attempt_id, now(), role, name, content, raw_ref, content_complete])?;
-        let seq = tx.last_insert_rowid();
-        tx.commit()?;
-        Ok(seq)
+        crate::persistence(
+            agent_run_domain::error::PersistenceOperation::TranscriptAppend,
+            || {
+                if !["user", "assistant", "system", "tool_call", "tool_result"].contains(&role) {
+                    return Err(invalid("unknown transcript role"));
+                }
+                let content_complete = content.len() <= MAX_INLINE_MESSAGE_BYTES;
+                let (content, raw_ref) = message_storage(&self.home, id, content, raw_ref)?;
+                let tx = self
+                    .conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agents WHERE id=?)",
+                    [id.as_str()],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    return Err(Error::NotFound(id.to_string()));
+                }
+                if let Some(attempt_id) = attempt_id {
+                    let owned: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM attempts WHERE id=? AND agent_id=?)",
+                        params![attempt_id, id.as_str()],
+                        |row| row.get(0),
+                    )?;
+                    if !owned {
+                        return Err(invalid("attempt is unknown or owned by another agent"));
+                    }
+                }
+                tx.execute("INSERT INTO messages(agent_id,attempt_id,at,role,name,content,raw_ref,content_complete,root_agent_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,(SELECT COALESCE(NULLIF(root_agent_id,''),id) FROM agents WHERE id=?1))", params![id.as_str(), attempt_id, now(), role, name, content, raw_ref, content_complete])?;
+                let seq = tx.last_insert_rowid();
+                tx.commit()?;
+                Ok(seq)
+            },
+        )
     }
 
     /// Claims the oldest pending command, preferring cancellation over
@@ -234,43 +246,68 @@ impl Store {
     /// Claim control commands normally, but hold native-completion wakes until
     /// an explicit turn is idle. Cancellation always remains claimable. This
     /// preserves the existing queue/priority and avoids overlapping model turns.
+    /// A read-only eligibility probe skips empty/held-wake write transactions;
+    /// acquisition rechecks under the writer lock, so concurrent claims remain
+    /// exactly once. None can delay a newly enqueued command until the next poll.
+    /// SQL errors identify CommandClaim/timing/count=1; claimed work never replays.
     pub fn claim_command_for_turn(
         &mut self,
         id: &AgentId,
         allow_native_wake: bool,
     ) -> Result<Option<(i64, String, Value)>> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row = tx.query_row("SELECT id,kind,payload_json FROM commands WHERE agent_id=? AND state='pending' \
+        crate::persistence(
+            agent_run_domain::error::PersistenceOperation::CommandClaim,
+            || {
+                // Idle control reads never contend for the single WAL writer. Eligibility
+                // is rechecked inside the immediate claim transaction when work exists.
+                let pending: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM commands WHERE agent_id=? AND state='pending' AND (? OR kind='cancel' OR COALESCE(json_extract(payload_json,'$.native_completion'),0)<>1))",
+            params![id.as_str(), allow_native_wake], |row| row.get(0),
+        )?;
+                if !pending {
+                    return Ok(None);
+                }
+                let tx = self
+                    .conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let row = tx.query_row("SELECT id,kind,payload_json FROM commands WHERE agent_id=? AND state='pending' \
             AND (? OR kind='cancel' OR COALESCE(json_extract(payload_json,'$.native_completion'),0)<>1) \
             ORDER BY CASE kind WHEN 'cancel' THEN 0 WHEN 'steer' THEN 1 ELSE 2 END,id LIMIT 1", params![id.as_str(),allow_native_wake], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))).optional()?;
-        let Some((command_id, kind, payload)) = row else {
-            tx.commit()?;
-            return Ok(None);
-        };
-        let changed = tx.execute(
+                let Some((command_id, kind, payload)) = row else {
+                    tx.commit()?;
+                    return Ok(None);
+                };
+                let changed = tx.execute(
             "UPDATE commands SET state='claimed',claimed_at=? WHERE id=? AND state='pending'",
             params![now(), command_id],
         )?;
-        if changed != 1 {
-            return Err(Error::Conflict);
-        }
-        tx.commit()?;
-        Ok(Some((command_id, kind, serde_json::from_str(&payload)?)))
+                if changed != 1 {
+                    return Err(Error::Conflict);
+                }
+                tx.commit()?;
+                Ok(Some((command_id, kind, serde_json::from_str(&payload)?)))
+            },
+        )
     }
 
     /// Completes a claimed command only when it is owned by the supplied agent.
+    /// SQL errors identify CommandWrite/timing/count=1. An uncertain ack never
+    /// replays the model, tool or control action; non-claimed state is a conflict.
     pub fn complete_command(
         &mut self,
         id: &AgentId,
         command_id: i64,
         result: &Value,
     ) -> Result<()> {
-        let changed = self.conn.execute("UPDATE commands SET state='completed',completed_at=?,result_json=? WHERE id=? AND agent_id=? AND state='claimed'", params![now(), serde_json::to_string(result)?, command_id, id.as_str()])?;
-        if changed != 1 {
-            return Err(Error::Conflict);
-        }
-        Ok(())
+        crate::persistence(
+            agent_run_domain::error::PersistenceOperation::CommandWrite,
+            || {
+                let changed = self.conn.execute("UPDATE commands SET state='completed',completed_at=?,result_json=? WHERE id=? AND agent_id=? AND state='claimed'", params![now(), serde_json::to_string(result)?, command_id, id.as_str()])?;
+                if changed != 1 {
+                    return Err(Error::Conflict);
+                }
+                Ok(())
+            },
+        )
     }
 }

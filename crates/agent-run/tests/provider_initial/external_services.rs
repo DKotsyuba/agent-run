@@ -70,7 +70,7 @@ async fn finish(home: &Path, id: &AgentId) {
 #[tokio::test]
 async fn managed_services_external_reuse_and_race_never_claim_or_stop_foreign_process() {
     for race in [false, true] {
-        let mut foreign = Command::new("/bin/sleep")
+        let mut foreign = isolated_command("/bin/sleep")
             .arg("30")
             .kill_on_drop(true)
             .spawn()
@@ -195,7 +195,7 @@ readiness={command="/bin/sh",args=["-c",'test "$AGENT_RUN_SERVICE_OWNERSHIP" = m
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     // A broker can die during external preflight, before any service was spawned.
     // The replacement must authorize its own bootstrap with its new identity.
-    let mut retired = Command::new("/bin/sleep")
+    let mut retired = isolated_command("/bin/sleep")
         .arg("20")
         .kill_on_drop(true)
         .spawn()
@@ -246,7 +246,7 @@ readiness={command="/bin/sh",args=["-c",'test "$AGENT_RUN_SERVICE_OWNERSHIP" = m
 #[tokio::test]
 async fn managed_services_external_survives_broker_pid_change() {
     use agent_run::transport::socket;
-    let mut foreign = Command::new("/bin/sleep")
+    let mut foreign = isolated_command("/bin/sleep")
         .arg("40")
         .kill_on_drop(true)
         .spawn()
@@ -302,7 +302,7 @@ async fn managed_services_external_survives_broker_pid_change() {
 /// Loss of an externally managed endpoint blocks a new real supervisor without launching a replacement under active leases.
 #[tokio::test]
 async fn managed_services_external_health_loss_blocks_new_harness() {
-    let mut foreign = Command::new("/bin/sleep")
+    let mut foreign = isolated_command("/bin/sleep")
         .arg("20")
         .kill_on_drop(true)
         .spawn()

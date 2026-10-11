@@ -4,6 +4,17 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.25.1
+
+- fix(supervisor): preserve mandatory process ownership across transient SQLite
+  writer contention with bounded, cancellation-safe pre-transaction retries;
+  retain existing SQLite timeouts and PID-reuse/cleanup protections
+- fix(storage): avoid write transactions for empty control polls; retain private
+  cleanup and candidate-answer evidence when final persistence is unavailable,
+  and report closed operation, elapsed time and attempt diagnostics
+- test(runtime): cover competing writers, parallel failure isolation,
+  exactly-once records and resume lineage; isolate test child runtime bindings
+
 ## 0.25.0
 
 - feat(runtime)!: new admissions finish only through an authenticated private

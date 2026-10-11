@@ -110,10 +110,15 @@ pub fn is_writer_contention(error: &Error) -> bool {
     )
 }
 
-/// Returns the SQLite source error when the domain error carries one.
+/// Returns the original SQLite source through closed persistence/ownership
+/// wrappers, or None for other causes. Numeric maintenance classification stays
+/// unchanged when diagnostics add a boundary; source messages remain excluded.
 fn as_sqlite(error: &Error) -> Option<&rusqlite::Error> {
     match error {
         Error::Sql(source) => Some(source),
+        Error::Persistence { source, .. } | Error::OwnershipCheckpoint { source, .. } => {
+            as_sqlite(source)
+        }
         _ => None,
     }
 }

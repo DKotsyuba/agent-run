@@ -43,7 +43,7 @@ use agent_run_domain::{
     Error, Result,
     catalog::{AccountId, PhysicalQuotaKey},
     domain::{self, AgentId, Outcome, StartRequest, Status, now},
-    error::invalid,
+    error::{PersistenceOperation, invalid},
 };
 use agent_run_platform::{fs, verify::Proof};
 use rusqlite::{
@@ -56,6 +56,17 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+/// Label a single synchronous storage operation without replaying it. Only SQL
+/// failures are wrapped, preserving validation/identity contracts. Timing includes
+/// busy waits and commit; the transaction/statement is dropped before returning.
+fn persistence<T>(operation: PersistenceOperation, work: impl FnOnce() -> Result<T>) -> Result<T> {
+    let started = std::time::Instant::now();
+    work().map_err(|error| match error {
+        error @ Error::Sql(_) => Error::persistence(operation, started.elapsed(), error),
+        other => other,
+    })
+}
+
 /// The current schema; the canonical value lives with the sealed-release
 /// metadata so release, deployment and migration agree on it.
 pub const VERSION: i64 = agent_run_platform::release::STORE_SCHEMA_VERSION;
@@ -372,8 +383,18 @@ impl Store {
         fs::private_dir(home)?;
         Self::connect(home, true)
     }
+    /// Open the existing thread-affine store. SQLite failures carry a closed
+    /// open-boundary label and monotonic elapsed time; migrations never replay.
     pub fn open(home: &Path) -> Result<Self> {
-        Self::connect(home, false)
+        let started = std::time::Instant::now();
+        Self::connect(home, false).map_err(|error| match error {
+            error @ Error::Sql(_) => Error::persistence(
+                agent_run_domain::error::PersistenceOperation::StoreOpen,
+                started.elapsed(),
+                error,
+            ),
+            other => other,
+        })
     }
     /// Opens a thread-affine connection for `home`, migrating existing content
     /// and initializing a new schema when `create` is true. The connection
@@ -544,8 +565,15 @@ impl Store {
     pub fn bound_attempt(&self) -> Option<&str> {
         self.attempt.as_deref()
     }
+    /// Append one service/native-result event for id, bound to this handle's
+    /// attempt. kind/data are persisted as supplied, never included in failure
+    /// diagnostics. One synchronous autocommit statement uses the existing busy
+    /// allowance; SQL errors carry EventAppend/timing/count=1 and never replay.
     pub fn event(&self, id: &AgentId, kind: &str, data: &Value) -> Result<()> {
-        self.conn.execute(
+        crate::persistence(
+            agent_run_domain::error::PersistenceOperation::EventAppend,
+            || {
+                self.conn.execute(
             &format!(
                 "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES(?1,{ATTEMPT_OF},?3,?4,?5)"
             ),
@@ -557,7 +585,9 @@ impl Store {
                 serde_json::to_string(data)?
             ],
         )?;
-        Ok(())
+                Ok(())
+            },
+        )
     }
     /// Binds an existing durable agent to one immutable orchestrator session.
     ///
@@ -1045,17 +1075,22 @@ impl Store {
     ///
     /// The connection remains thread-affine; callers on another thread must open their own
     /// [`Store`] from the same home. Repeated calls retain the latest session identity and
-    /// append the corresponding event for the lifecycle journal.
+    /// append the corresponding event for the lifecycle journal. SQL failures
+    /// identify RuntimeSession and elapsed milliseconds with one attempt. No
+    /// transaction crosses an await and no ambiguous commit is replayed.
     pub fn runtime_session(&mut self, id: &AgentId, session: &str) -> Result<()> {
-        domain::external_id("runtime_session_id", session)?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "UPDATE agents SET runtime_session_id=? WHERE id=?",
-            params![session, id.as_str()],
-        )?;
-        tx.execute(
+        crate::persistence(
+            agent_run_domain::error::PersistenceOperation::RuntimeSession,
+            || {
+                domain::external_id("runtime_session_id", session)?;
+                let tx = self
+                    .conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                tx.execute(
+                    "UPDATE agents SET runtime_session_id=? WHERE id=?",
+                    params![session, id.as_str()],
+                )?;
+                tx.execute(
             &format!(
                 "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES(?1,{ATTEMPT_OF},?3,?4,?5)"
             ),
@@ -1067,8 +1102,10 @@ impl Store {
                 json!({"id":session}).to_string()
             ],
         )?;
-        tx.commit()?;
-        Ok(())
+                tx.commit()?;
+                Ok(())
+            },
+        )
     }
     /// Appends historical raw text, preserving empty-text no-op behavior.
     /// Ownership and spool guards are shared with native evidence writes.
@@ -1089,7 +1126,9 @@ impl Store {
     /// Writes one native transcript row, including an empty tool output. Error
     /// evidence is allowed only on tool results and names an allowlisted native
     /// field; None stays unknown. Content above 32 KiB uses the owned spool guard.
-    /// Attempt and stable root are internal only. SQLite errors propagate.
+    /// Attempt and stable root are internal only. SQLite errors identify
+    /// TranscriptAppend/timing/count=1. Spooling precedes database mutation;
+    /// neither the insert nor an ambiguous commit is automatically replayed.
     pub fn message_with_error(
         &self,
         id: &AgentId,
@@ -1099,24 +1138,27 @@ impl Store {
         raw_ref: Option<&str>,
         error: Option<(bool, &str)>,
     ) -> Result<()> {
-        if error.is_some_and(|(_, source)| {
-            role != "tool_result"
-                || ![
-                    "claude.is_error",
-                    "codex.command.exitCode",
-                    "codex.command.status",
-                    "codex.mcp.status",
-                    "codex.mcp.error",
-                ]
-                .contains(&source)
-        }) {
-            return Err(invalid("invalid native tool error evidence"));
-        }
-        if !["user", "assistant", "system", "tool_call", "tool_result"].contains(&role) {
-            return Err(invalid("unknown transcript role"));
-        }
-        let (content, raw_ref) = journal::message_storage(&self.home, id, text, raw_ref)?;
-        self.conn.execute(
+        crate::persistence(
+            agent_run_domain::error::PersistenceOperation::TranscriptAppend,
+            || {
+                if error.is_some_and(|(_, source)| {
+                    role != "tool_result"
+                        || ![
+                            "claude.is_error",
+                            "codex.command.exitCode",
+                            "codex.command.status",
+                            "codex.mcp.status",
+                            "codex.mcp.error",
+                        ]
+                        .contains(&source)
+                }) {
+                    return Err(invalid("invalid native tool error evidence"));
+                }
+                if !["user", "assistant", "system", "tool_call", "tool_result"].contains(&role) {
+                    return Err(invalid("unknown transcript role"));
+                }
+                let (content, raw_ref) = journal::message_storage(&self.home, id, text, raw_ref)?;
+                self.conn.execute(
             &format!(
                 "INSERT INTO messages(agent_id,attempt_id,at,role,name,content,raw_ref,error,error_source,content_complete,root_agent_id) VALUES(?1,{ATTEMPT_OF},?3,?4,?5,?6,?7,?8,?9,?10,(SELECT COALESCE(NULLIF(root_agent_id,''),id) FROM agents WHERE id=?1))"
             ),
@@ -1133,8 +1175,15 @@ impl Store {
                 text.len() <= journal::MAX_INLINE_MESSAGE_BYTES,
             ],
         )?;
-        Ok(())
+                Ok(())
+            },
+        )
     }
+    /// Verify the supplied answer proof and atomically commit terminal outcome,
+    /// usage, ownership release and eligible completion notice for id. Delegates
+    /// identity/cleanup/explicit-finish gates to terminal::finish; a previously
+    /// terminal row is a no-op. SQL errors carry TerminalCommit/timing/count=1,
+    /// including ambiguous commit refusals; no automatic replay occurs.
     pub fn finish(
         &mut self,
         id: &AgentId,
@@ -1142,7 +1191,10 @@ impl Store {
         proof: Option<&Proof>,
         usage: Option<&Value>,
     ) -> Result<()> {
-        terminal::finish(self, id, outcome, proof, usage)
+        crate::persistence(
+            agent_run_domain::error::PersistenceOperation::TerminalCommit,
+            || terminal::finish(self, id, outcome, proof, usage),
+        )
     }
     /// Recomputes one agent's normalized run statistics from durable events.
     ///
