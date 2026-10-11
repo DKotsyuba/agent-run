@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.25.1
+
 - fix(supervisor): preserve mandatory process ownership across transient SQLite
   writer contention with bounded, cancellation-safe pre-transaction retries;
   retain existing SQLite timeouts and PID-reuse/cleanup protections
