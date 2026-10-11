@@ -163,6 +163,14 @@ pub struct Process {
     ownership_observer: Option<OwnershipObserver>,
     /// Last successfully persisted append-only capture revision.
     ownership_revision: Option<(usize, bool)>,
+    /// Finite persistence allowance supplied by the idempotent supervisor writer.
+    ownership_retry_budget: Option<Duration>,
+    /// First attempt timestamp retained across select cancellation.
+    ownership_retry_started: Option<std::time::Instant>,
+    /// Completed pre-transaction attempts across synchronous slices.
+    ownership_retry_attempts: u32,
+    /// Last safe BEGIN refusal retained so cancellation cannot renew an expired allowance.
+    ownership_retry_error: Option<Error>,
 }
 impl Process {
     /// Spawns the planned engine with isolated environment and line-framed pipes.
@@ -251,6 +259,10 @@ impl Process {
             observed_at: tokio::time::Instant::now(),
             ownership_observer: None,
             ownership_revision: None,
+            ownership_retry_budget: None,
+            ownership_retry_started: None,
+            ownership_retry_attempts: 0,
+            ownership_retry_error: None,
         })
     }
 
@@ -263,6 +275,85 @@ impl Process {
         self.ownership_observer = Some(Box::new(observer));
         self.ownership_revision = None;
         self.checkpoint_ownership_at(OwnershipStage::Initial)
+    }
+
+    /// Attach an idempotent writer identifying safe, pre-transaction ownership
+    /// contention. Initial persistence precedes native input. Streaming and final
+    /// progress remain gated until persistence succeeds or the supplied budget
+    /// expires. Each synchronous callback keeps its control slice; asynchronous
+    /// waits own no SQLite transaction. Arbitrary errors/commits never retry.
+    pub fn observe_ownership_with_retry(
+        &mut self,
+        observer: impl FnMut(&OwnershipSnapshot) -> Result<()> + Send + 'static,
+        budget: Duration,
+    ) -> Result<()> {
+        if budget.is_zero() {
+            return Err(Error::Runtime(
+                "ownership persistence allowance must be positive".into(),
+            ));
+        }
+        self.ownership_retry_budget = Some(budget);
+        self.ownership_retry_started = None;
+        self.ownership_retry_attempts = 0;
+        self.ownership_retry_error = None;
+        self.observe_ownership(observer)
+    }
+
+    /// Gate native progress on required persistence. Only a classified BEGIN
+    /// SQLITE_BUSY is replayable: no snapshot mutation/commit has occurred.
+    /// Timing/counts survive select cancellation; success clears them. No model,
+    /// input, tool or engine is replayed, and pending frames remain unread.
+    pub async fn checkpoint_ownership_ready(&mut self, stage: OwnershipStage) -> Result<()> {
+        let Some(budget) = self.ownership_retry_budget else {
+            return self.checkpoint_ownership_at(stage);
+        };
+        let started = *self
+            .ownership_retry_started
+            .get_or_insert_with(std::time::Instant::now);
+        loop {
+            // Never reset an exhausted operation after outer select cancellation.
+            if started.elapsed() >= budget
+                && let Some(error) = self.ownership_retry_error.take()
+            {
+                let error =
+                    error.persistence_totals(started.elapsed(), self.ownership_retry_attempts);
+                self.ownership_retry_started = None;
+                self.ownership_retry_attempts = 0;
+                return Err(error);
+            }
+            if let Err(source) = self.observe_primary_exit() {
+                self.ownership_retry_started = None;
+                self.ownership_retry_attempts = 0;
+                self.ownership_retry_error = None;
+                return Err(Error::ownership_checkpoint(
+                    OwnershipStage::Observation,
+                    source,
+                ));
+            }
+            match self.checkpoint_ownership_at(stage) {
+                Ok(()) => {
+                    self.ownership_retry_started = None;
+                    self.ownership_retry_attempts = 0;
+                    self.ownership_retry_error = None;
+                    return Ok(());
+                }
+                Err(error) => {
+                    self.ownership_retry_attempts = self
+                        .ownership_retry_attempts
+                        .saturating_add(error.persistence_attempts());
+                    if !error.retryable_ownership_acquire() || started.elapsed() >= budget {
+                        let error = error
+                            .persistence_totals(started.elapsed(), self.ownership_retry_attempts);
+                        self.ownership_retry_started = None;
+                        self.ownership_retry_attempts = 0;
+                        self.ownership_retry_error = None;
+                        return Err(error);
+                    }
+                    self.ownership_retry_error = Some(error);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
     }
 
     /// Persists newly captured members once; successful unchanged captures never touch the database.
@@ -380,7 +471,10 @@ impl Process {
                     source,
                 ));
             }
-            if let Err(error) = self.checkpoint_ownership() {
+            if let Err(error) = self
+                .checkpoint_ownership_ready(OwnershipStage::Streaming)
+                .await
+            {
                 return Event::OwnershipFailure(error);
             }
             self.backlog.pop_front().expect("checked backlog")
@@ -424,7 +518,10 @@ impl Process {
                     source,
                 ));
             }
-            if let Err(error) = self.checkpoint_ownership() {
+            if let Err(error) = self
+                .checkpoint_ownership_ready(OwnershipStage::Streaming)
+                .await
+            {
                 return Event::OwnershipFailure(error);
             }
             if self.primary_exited {

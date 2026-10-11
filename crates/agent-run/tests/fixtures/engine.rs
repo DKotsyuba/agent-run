@@ -225,6 +225,9 @@ fn control_input() -> Value {
 /// Runs one offline protocol scenario selected by fixture task text. Claude
 /// inputs echo their UUIDs and replay batches; control readers have finite
 /// deadlines. Existing subprocess scenarios retain their ownership contracts.
+/// SQLite stream fixtures wait behind a finite marker, create one environment-
+/// cleared one-second descendant, and emit each native frame once. A fixture
+/// statement refusal stops only its own execution; no provider/model is called.
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // A detached helper mode used only by `fixture:descendant`: sleep past the
@@ -337,6 +340,19 @@ fn main() {
             json!({"type":"result","subtype":"success","is_error":false,"session_id":session,
             "result":"","num_turns":0,"duration_ms":0,"usage":{"input_tokens":0,"output_tokens":0}}),
         );
+    }
+    // The disposable database driver holds the WAL writer before releasing
+    // this finite synthetic engine; one child changes its ownership revision.
+    if task == "fixture:sqlite-stream" || task == "fixture:sqlite-stream-fail" {
+        std::fs::write("sqlite-ready", b"ready").unwrap();
+        wait_marker("sqlite-release");
+        let mut descendant = std::process::Command::new("/bin/sleep")
+            .arg("1")
+            .env_clear()
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        descendant.wait().unwrap();
     }
     emit(
         json!({"type":"assistant","session_id":session,"message":{"content":[{"type":"text","text":"fixture partial\n"}]}}),

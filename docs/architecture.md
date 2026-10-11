@@ -69,6 +69,18 @@ alone. Recovery uses an attempt-matching snapshot even if a crash occurred befor
 the agent group field was updated, and persists newly captured members before
 recording an unresolved cleanup. PID/token/birth fences still guard every signal.
 
+Ownership persistence gates native progress. A competing WAL writer may delay
+only an authenticated, idempotent snapshot whose BEGIN IMMEDIATE refused with
+SQLITE_BUSY before any mutation. The unchanged ordinary five-second store
+allowance spans short synchronous slices and transaction-free async waits; its
+clock survives cancelled reads. Writes, commits, SQLITE_LOCKED and arbitrary
+observer failures never replay. Empty command polls and held native wakes remain
+read-only. Before final database writes, each supervisor retains private
+per-attempt cleanup/identity evidence and any sealed candidate separately from
+SQLite. This receipt cannot prove terminal success or authorize signalling;
+recovery must verify current database and native ownership. See
+[sqlite-contention.md](sqlite-contention.md).
+
 Provider and legacy executions have no wall-clock limit. Preparation and account
 switches do not consume an overall time budget. Native completion, failure or
 explicit cancellation ends execution; silence only provides diagnostic evidence.

@@ -121,6 +121,34 @@ pub enum OwnershipStage {
     Observation,
 }
 
+/// Closed storage boundaries; diagnostics contain these labels and numeric facts only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistenceOperation {
+    /// Failed BEGIN IMMEDIATE before any ownership snapshot mutation; replay is safe.
+    OwnershipAcquire,
+    /// Snapshot statements inside the acquired transaction; never retried automatically.
+    OwnershipWrite,
+    /// Commit of the snapshot transaction; an ambiguous commit is never replayed.
+    OwnershipCommit,
+    /// Opening/initializing a store connection; no automatic migration replay.
+    StoreOpen,
+    /// Appending transcript/native-result data; no outside-the-transaction replay.
+    TranscriptAppend,
+    /// Recording a native session identity and event atomically.
+    RuntimeSession,
+    /// Appending one service event; no generic event replay.
+    EventAppend,
+    /// Atomically committing terminal state and its completion notice.
+    TerminalCommit,
+    /// Recording exact-attempt verified cleanup without replaying signals.
+    CleanupWrite,
+    /// Claiming one control command; no action is executed during persistence.
+    CommandClaim,
+    /// Recording an acknowledgement; an ambiguous write never replays a tool.
+    CommandWrite,
+}
+
 /// Expected domain failures; source-bearing variants never expose source diagnostics publicly.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -167,6 +195,20 @@ pub enum Error {
         /// Closed lifecycle phase of the first failure.
         stage: OwnershipStage,
         /// Original cause, never rendered as a public error message.
+        #[source]
+        source: Box<Error>,
+    },
+    /// An identified persistence boundary with closed operation and numeric wait facts.
+    /// Source errors remain private; only ownership BEGIN contention permits replay.
+    #[error("state persistence operation failed")]
+    Persistence {
+        /// Closed operation identifier; never SQL text or a caller-provided label.
+        operation: PersistenceOperation,
+        /// Monotonic elapsed milliseconds for the attempted persistence boundary.
+        elapsed_ms: u64,
+        /// Number of completed attempts, including a failing attempt.
+        attempts: u32,
+        /// Original typed source; never rendered as a diagnostic message.
         #[source]
         source: Box<Error>,
     },
@@ -235,6 +277,64 @@ impl Error {
         }
     }
 
+    /// Attach a closed persistence boundary to a typed cause; no source contents are copied.
+    pub fn persistence(
+        operation: PersistenceOperation,
+        elapsed: std::time::Duration,
+        source: Self,
+    ) -> Self {
+        Self::Persistence {
+            operation,
+            elapsed_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+            attempts: 1,
+            source: Box::new(source),
+        }
+    }
+
+    /// Whether ownership BEGIN failed before acquiring a transaction with SQLITE_BUSY.
+    /// LOCKED, write/commit failures and arbitrary observer errors remain non-replayable.
+    pub fn retryable_ownership_acquire(&self) -> bool {
+        match self {
+            Self::OwnershipCheckpoint { source, .. } => source.retryable_ownership_acquire(),
+            Self::Persistence {
+                operation: PersistenceOperation::OwnershipAcquire,
+                source,
+                ..
+            } => {
+                matches!(source.as_ref(), Self::Sql(error) if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy))
+            }
+            _ => false,
+        }
+    }
+
+    /// Return counted persistence attempts through the ownership wrapper, or zero for unrelated causes.
+    pub fn persistence_attempts(&self) -> u32 {
+        match self {
+            Self::OwnershipCheckpoint { source, .. } => source.persistence_attempts(),
+            Self::Persistence { attempts, .. } => *attempts,
+            _ => 0,
+        }
+    }
+
+    /// Replace only numeric operation totals after a bounded, proven-safe replay sequence.
+    pub fn persistence_totals(self, elapsed: std::time::Duration, count: u32) -> Self {
+        match self {
+            Self::OwnershipCheckpoint { stage, source } => Self::OwnershipCheckpoint {
+                stage,
+                source: Box::new(source.persistence_totals(elapsed, count)),
+            },
+            Self::Persistence {
+                operation, source, ..
+            } => Self::Persistence {
+                operation,
+                source,
+                elapsed_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+                attempts: count,
+            },
+            other => other,
+        }
+    }
+
     /// Returns the stable machine code without formatting untrusted source diagnostics.
     ///
     /// A broker-returned error keeps the broker's own code when it is an
@@ -274,6 +374,7 @@ impl Error {
             Self::Bootstrap { .. } => MachineCode::ValidationError,
             Self::Io(_) => MachineCode::IOError,
             Self::Sql(_) => MachineCode::StorageError,
+            Self::Persistence { source, .. } => source.machine_code(),
         }
     }
 

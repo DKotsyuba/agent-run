@@ -683,6 +683,20 @@ fn maintenance_diagnostics_map_busy_locked_and_interrupt_codes() {
             );
         }
     }
+    // Operation diagnostics cannot hide contention from maintenance consumers.
+    let wrapped = Error::ownership_checkpoint(
+        agent_run_domain::OwnershipStage::Streaming,
+        Error::persistence(
+            agent_run_domain::error::PersistenceOperation::StoreOpen,
+            std::time::Duration::from_millis(12),
+            Error::Sql(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(517),
+                Some("never logged".into()),
+            )),
+        ),
+    );
+    assert!(retention::is_writer_contention(&wrapped));
+    assert_eq!(retention::sqlite_codes(&wrapped).unwrap().extended, 517);
     // Non-SQLite failures classify as neither contention nor SQLite detail.
     let plain = Error::Validation("fixture".into());
     assert!(retention::sqlite_codes(&plain).is_none());

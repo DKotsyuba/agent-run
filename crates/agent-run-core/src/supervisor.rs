@@ -161,6 +161,15 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
             // Final checkpoint failures can return before an engine result is
             // committed; their closed diagnostic must survive that path too.
             let metadata = execution_error_metadata(&error);
+            // A database outage must not erase the operation's safe failure facts.
+            let directory = home.join("agents").join(id.as_str());
+            let _ = fs::Dir::open(&directory).and_then(|dir| {
+                dir.write(
+                    Path::new("execution-failure.json"),
+                    &fs::canonical_json(&metadata)?,
+                    0o600,
+                )
+            });
             let _ = store.event(id, "execution_failure_v1", &metadata);
             if let Some(logger) = crate::logging::configured() {
                 logger.log(
@@ -203,10 +212,12 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
 
 /// Opens one private ownership writer for an admitted attempt. The returned
 /// callback persists only authenticated process snapshots, reuses its connection,
-/// and retries SQLITE_BUSY/LOCKED at most twice. Required initial persistence
+/// and retries only pre-transaction SQLITE_BUSY at most twice per slice. Required initial persistence
 /// splits the connection's existing busy allowance (normally five seconds)
 /// across those attempts, before any native task is released. Later checkpoints
-/// keep the 250 ms control allowance. These operation bounds never limit an
+/// keep the 250 ms synchronous slice; Process gates progress across safe acquire
+/// retries within the unchanged ordinary store allowance, retaining its clock
+/// across select cancellation. These operation bounds never limit an
 /// execution's lifetime. Permanent errors retain their typed phase/cause;
 /// successful callbacks never leave a transaction or statement across an await.
 fn ownership_writer(
@@ -235,7 +246,8 @@ fn ownership_writer(
             } else {
                 (Duration::from_millis(250), Duration::from_millis(100))
             };
-            let until = std::time::Instant::now() + budget;
+            let started = std::time::Instant::now();
+            let until = started + budget;
             for retry in 0..2 {
                 let left = until.saturating_duration_since(std::time::Instant::now());
                 if left.is_zero() {
@@ -254,9 +266,9 @@ fn ownership_writer(
                         return Ok(());
                     }
                     Err(error) => {
-                        let transient = matches!(&error, Error::Sql(source) if matches!(source.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)));
+                        let transient = error.retryable_ownership_acquire();
                         if retry == 1 || !transient || std::time::Instant::now() >= until {
-                            return Err(error);
+                            return Err(error.persistence_totals(started.elapsed(), retry + 1));
                         }
                     }
                 }
@@ -264,6 +276,59 @@ fn ownership_writer(
             unreachable!("both bounded attempts return or retry")
         },
     )
+}
+
+/// Preserve exact owned identities, observed cleanup and an optional sealed
+/// candidate before final database operations. The private per-attempt receipt
+/// is NOT a terminal verdict, a signalling capability or permission to replay
+/// SQL/native work: recovery must recheck the database and native identities.
+/// It contains no environment, credentials, SQL or original error messages.
+/// The candidate is already redacted; its hash alone cannot establish success.
+/// Atomic no-follow writes use the existing agent-directory durability guard.
+/// Candidate sealing failure still writes cleanup evidence, then returns the
+/// original error; optional answer handling cannot discard required proof.
+fn retain_cleanup_evidence(
+    agent_dir: &Path,
+    attempt: &str,
+    process: &Process,
+    cleanup: &Result<agent_run_platform::process::Cleanup>,
+    execution: &Result<adapters::EngineResult>,
+    exit: Option<i32>,
+) -> Result<()> {
+    let candidate = match execution {
+        Ok(result) => result
+            .answer
+            .as_deref()
+            .filter(|text| !text.trim().is_empty()),
+        Err(_) => None,
+    };
+    let candidate = candidate
+        .map(|text| {
+            verify::seal(
+                agent_dir,
+                Path::new(&format!("recovery.{attempt}.answer.md")),
+                text,
+            )
+        })
+        .transpose();
+    let candidate_diagnostic = candidate.as_ref().err().map(execution_error_metadata);
+    let cleanup = match cleanup {
+        Ok(proof) => serde_json::to_value(proof)?,
+        Err(error) => json!({"confirmed":false,"diagnostic":execution_error_metadata(error)}),
+    };
+    let diagnostic = execution.as_ref().err().map(execution_error_metadata);
+    let data = json!({"version":1,"attempt":attempt,"recorded_at":domain::now(),
+        "terminal_commit":"not_proven_by_receipt","ownership":process.owner.snapshot(),
+        "cleanup":cleanup,"engine_result_available":execution.is_ok(),
+        "native_status":execution.as_ref().ok().map(|result|result.outcome.status),
+        "candidate":candidate.as_ref().ok().and_then(|proof|proof.as_ref()),
+        "candidate_diagnostic":candidate_diagnostic,"exit_code":exit,"diagnostic":diagnostic});
+    fs::Dir::open(agent_dir)?.write(
+        Path::new(&format!("recovery.{attempt}.json")),
+        &fs::canonical_json(&data)?,
+        0o600,
+    )?;
+    candidate.map(|_| ())
 }
 
 /// Returns closed, content-free categories for an execution error. Original
@@ -277,10 +342,27 @@ fn execution_error_metadata(error: &Error) -> serde_json::Value {
             data["stage"] = json!(stage);
             data["ownership_category"] = json!(match source.as_ref() {
                 Error::Integrity(_) | Error::AnswerIntegrity(_) => "integrity_failure",
-                Error::Sql(_) => "persistence_sqlite",
+                Error::Sql(_) | Error::Persistence { .. } => "persistence_sqlite",
                 Error::Io(_) => "io_failure",
                 _ => "checkpoint_failure",
             });
+        }
+        Error::Persistence {
+            operation,
+            elapsed_ms,
+            attempts,
+            source,
+        } => {
+            data = execution_error_metadata(source);
+            data["stage"] = json!(match operation {
+                agent_run_domain::error::PersistenceOperation::TerminalCommit
+                | agent_run_domain::error::PersistenceOperation::CleanupWrite => "final",
+                agent_run_domain::error::PersistenceOperation::StoreOpen => "store_open",
+                _ => "streaming",
+            });
+            data["operation"] = json!(operation);
+            data["wait_ms"] = json!(elapsed_ms);
+            data["attempts"] = json!(attempts);
         }
         Error::Io(source) => {
             data["io_kind"] = json!(format!("{:?}", source.kind()));
@@ -321,7 +403,7 @@ fn failed_execution(store: &Store, id: &AgentId, error: &Error) -> adapters::Eng
     let mut outcome = Outcome::failure(match error {
         Error::Integrity(_) | Error::AnswerIntegrity(_) => "runtime_integrity_failed",
         Error::Validation(_) => "runtime_contract_rejected",
-        Error::Sql(_) => "runtime_storage_failed",
+        Error::Sql(_) | Error::Persistence { .. } => "runtime_storage_failed",
         Error::OwnershipCheckpoint {
             stage: agent_run_domain::OwnershipStage::Observation,
             ..
@@ -502,7 +584,10 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
             rusqlite::params![leader.token, leader.birth, attempt],
         )?;
         let ownership_home = home.to_owned();
-        process.observe_ownership(ownership_writer(&ownership_home, attempt)?)?;
+        process.observe_ownership_with_retry(
+            ownership_writer(&ownership_home, attempt)?,
+            agent_run_store::BUSY_TIMEOUT,
+        )?;
         crate::journal(store, id, "user", &row.request.task, None, None)?;
         match runtime.kind()? {
             Adapter::Codex => {
@@ -522,7 +607,18 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
     let execution = execution.await;
     let cleanup = process.owner.cleanup(Duration::from_secs(2)).await;
     let exit = process.reap().await;
-    if let Err(error) = process.checkpoint_ownership_at(agent_run_domain::OwnershipStage::Final) {
+    retain_cleanup_evidence(
+        &agent_dir,
+        &format!("{id}:1"),
+        &process,
+        &cleanup,
+        &execution,
+        exit,
+    )?;
+    if let Err(error) = process
+        .checkpoint_ownership_ready(agent_run_domain::OwnershipStage::Final)
+        .await
+    {
         let _ = store.event(
             id,
             "ownership_checkpoint_failure_v1",
@@ -1277,7 +1373,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             store.record_resume_usage_baseline(id)?;
         }
         #[cfg(feature = "test-fixtures")]
-        spawn_barrier(home, &attempt_id, store)?;
+        fixture_barrier(home, &attempt_id, store, "spawn")?;
         // A switched attempt re-checks, at the handoff itself, that its
         // selected account is still enabled and the current configuration
         // still permits the frozen execution; otherwise it never spawns.
@@ -1343,7 +1439,10 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             store.provider_process(id, &attempt_id, leader)?;
             let ownership_home = home.to_owned();
             let ownership_attempt = attempt_id.clone();
-            process.observe_ownership(ownership_writer(&ownership_home, ownership_attempt)?)?;
+            process.observe_ownership_with_retry(
+                ownership_writer(&ownership_home, ownership_attempt)?,
+                agent_run_store::BUSY_TIMEOUT,
+            )?;
             if switched {
                 // The logical run is already running; its original start
                 // time is kept. No user entry is journaled.
@@ -1391,8 +1490,20 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         let execution = execution.await;
         let cleanup = process.owner.cleanup(Duration::from_secs(2)).await;
         let cleanup_ended = std::time::Instant::now();
-        let checkpoint = process.checkpoint_ownership_at(agent_run_domain::OwnershipStage::Final);
         let exit = process.reap().await;
+        retain_cleanup_evidence(
+            &agent_dir,
+            &attempt_id,
+            &process,
+            &cleanup,
+            &execution,
+            exit,
+        )?;
+        #[cfg(feature = "test-fixtures")]
+        fixture_barrier(home, &attempt_id, store, "terminal")?;
+        let checkpoint = process
+            .checkpoint_ownership_ready(agent_run_domain::OwnershipStage::Final)
+            .await;
         if let Err(error) = checkpoint {
             let _ = store.event(
                 id,
@@ -1917,23 +2028,30 @@ fn current_bindings(
         .unwrap_or_default()
 }
 
-/// Test-only handoff barrier: when `<home>/fixture-pause-spawn-<n>` exists
-/// for this attempt's number `n`, write `fixture-paused-spawn-<n>` and wait
-/// (at most 20 s) for `fixture-resume-spawn-<n>`. Absent in production.
+/// Test-only finite barrier for the internal spawn or terminal phase. For
+/// attempt number n, an existing fixture-pause-PHASE-n marker makes the driver
+/// observe fixture-paused-PHASE-n then release fixture-resume-PHASE-n. No SQLite
+/// transaction is held while waiting up to twenty seconds. Absent in production.
 #[cfg(feature = "test-fixtures")]
-fn spawn_barrier(home: &Path, attempt: &str, store: &Store) -> Result<()> {
+fn fixture_barrier(home: &Path, attempt: &str, store: &Store, phase: &str) -> Result<()> {
     let number: u32 =
         store
             .conn
             .query_row("SELECT number FROM attempts WHERE id=?", [attempt], |row| {
                 row.get(0)
             })?;
-    if !home.join(format!("fixture-pause-spawn-{number}")).exists() {
+    if !home
+        .join(format!("fixture-pause-{phase}-{number}"))
+        .exists()
+    {
         return Ok(());
     }
-    std::fs::write(home.join(format!("fixture-paused-spawn-{number}")), "")?;
+    std::fs::write(home.join(format!("fixture-paused-{phase}-{number}")), "")?;
     for _ in 0..400 {
-        if home.join(format!("fixture-resume-spawn-{number}")).exists() {
+        if home
+            .join(format!("fixture-resume-{phase}-{number}"))
+            .exists()
+        {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -2136,9 +2254,7 @@ mod tests {
             before.elapsed() < std::time::Duration::from_secs(1),
             "ownership write exceeded its bounded contention allowance"
         );
-        assert!(
-            matches!(error, Error::Sql(ref source) if source.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy))
-        );
+        assert!(error.retryable_ownership_acquire());
         lock.conn.execute_batch("ROLLBACK").unwrap();
         let mut missing = super::ownership_writer(home.path(), "missing-attempt".into()).unwrap();
         assert!(matches!(missing(&snapshot), Err(Error::Validation(_))));
@@ -2208,14 +2324,333 @@ mod tests {
         );
         store.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         let before = std::time::Instant::now();
-        assert!(
-            matches!(write(&snapshot),Err(Error::Sql(ref source)) if source.sqlite_error_code()==Some(rusqlite::ErrorCode::DatabaseBusy))
-        );
+        assert!(write(&snapshot).unwrap_err().retryable_ownership_acquire());
         assert!(
             before.elapsed() < std::time::Duration::from_millis(400),
             "stream checkpoint exceeded its short control allowance"
         );
         store.conn.execute_batch("ROLLBACK").unwrap();
+    }
+
+    /// A real, finite synthetic shell adds a child while another connection owns
+    /// the WAL writer for 450ms. No model/tool is replayed: the same next frame
+    /// must wait for mandatory ownership and then expose one native result.
+    #[tokio::test]
+    async fn streaming_snapshot_survives_transient_writer_without_native_replay() {
+        use agent_run_adapters::{
+            LaunchPlan,
+            io::{Event, Process},
+        };
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::initialize(home.path()).unwrap();
+        let id = "ag-20260101-000000-0000000097";
+        store.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision) VALUES (?,'mock','fixture','review','t','t','/tmp','{}','starting',1,'cfg')",[id]).unwrap();
+        let attempt = format!("{id}:1");
+        store.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES (?,?,1,'running','{}',1,1)",rusqlite::params![attempt,id]).unwrap();
+        let plan = LaunchPlan {
+            binary: "/bin/sh".into(),
+            args: vec!["-c".into(), r#"read launch; /bin/sleep 2 & child=$!; printf '%s' "$child" > child.pid; printf '%s
+' '{"type":"result","session_id":"synthetic","result":"ONE_NATIVE_RESULT"}'; wait "$child""#.into()],
+            cwd: home.path().into(), environment: Default::default(), initial_input: None,
+        };
+        let mut process = Process::spawn(&plan).unwrap();
+        process
+            .observe_ownership_with_retry(
+                super::ownership_writer(home.path(), attempt.clone()).unwrap(),
+                agent_run_store::BUSY_TIMEOUT,
+            )
+            .unwrap();
+        process.text("launch\n").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !home.path().join("child.pid").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        process.owner.refresh();
+        assert!(process.owner.snapshot().unwrap().members.len() >= 2);
+        let (ready, waiting) = std::sync::mpsc::sync_channel(0);
+        let path = home.path().to_path_buf();
+        let held = std::thread::spawn(move || {
+            let lock = Store::open(&path).unwrap();
+            lock.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            ready.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(450));
+            lock.conn.execute_batch("ROLLBACK").unwrap();
+        });
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let event = process.next().await;
+        let cleanup = process
+            .owner
+            .cleanup(std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        process.reap().await;
+        held.join().unwrap();
+        assert!(cleanup.confirmed && cleanup.group_gone && cleanup.descendants_gone == Some(true));
+        if let Event::OwnershipFailure(ref error) = event {
+            eprintln!(
+                "pre-fix checkpoint diagnostic: {}",
+                super::execution_error_metadata(error)
+            );
+        }
+        assert!(
+            matches!(event,Event::Json(ref value) if value["result"]=="ONE_NATIVE_RESULT"),
+            "transient WAL writer aborted the native stream: {event:?}"
+        );
+        let persisted = store
+            .remembered_processes("attempt", &attempt)
+            .unwrap()
+            .unwrap();
+        assert!(persisted.snapshot().unwrap().members.len() >= 2);
+    }
+
+    /// A real, finite synthetic shell adds a child while another connection owns
+    /// the WAL writer beyond the finite allowance. No model/tool is replayed: the same next frame
+    /// must wait for mandatory ownership and then expose one native result.
+    #[tokio::test]
+    async fn streaming_snapshot_exhaustion_retains_cleanup_and_closed_diagnostic() {
+        use agent_run_adapters::{
+            LaunchPlan,
+            io::{Event, Process},
+        };
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::initialize(home.path()).unwrap();
+        let id = "ag-20260101-000000-0000000097";
+        store.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision) VALUES (?,'mock','fixture','review','t','t','/tmp','{}','starting',1,'cfg')",[id]).unwrap();
+        let attempt = format!("{id}:1");
+        store.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES (?,?,1,'running','{}',1,1)",rusqlite::params![attempt,id]).unwrap();
+        let plan = LaunchPlan {
+            binary: "/bin/sh".into(),
+            args: vec!["-c".into(), r#"read launch; /bin/sleep 15 & child=$!; printf '%s' "$child" > child.pid; printf '%s
+' '{"type":"result","session_id":"synthetic","result":"ONE_NATIVE_RESULT"}'; wait "$child""#.into()],
+            cwd: home.path().into(), environment: Default::default(), initial_input: None,
+        };
+        let mut process = Process::spawn(&plan).unwrap();
+        process
+            .observe_ownership_with_retry(
+                super::ownership_writer(home.path(), attempt.clone()).unwrap(),
+                std::time::Duration::from_millis(600),
+            )
+            .unwrap();
+        process.text("launch\n").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !home.path().join("child.pid").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        process.owner.refresh();
+        assert!(process.owner.snapshot().unwrap().members.len() >= 2);
+        let (ready, waiting) = std::sync::mpsc::sync_channel(0);
+        let path = home.path().to_path_buf();
+        let held = std::thread::spawn(move || {
+            let lock = Store::open(&path).unwrap();
+            lock.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            ready.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1800));
+            lock.conn.execute_batch("ROLLBACK").unwrap();
+        });
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        // Cancelling the read cannot renew its ownership allowance. Resume
+        // after expiry while the writer still holds the lock: no native frame
+        // or new BEGIN may pass the pending mandatory checkpoint.
+        let first =
+            tokio::time::timeout(std::time::Duration::from_millis(210), process.next()).await;
+        assert!(
+            first.is_err(),
+            "fixture did not cancel a pending persistence read"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        let event = process.next().await;
+        let cleanup = process
+            .owner
+            .cleanup(std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        let directory = home.path().join("agents").join(id);
+        agent_run_platform::fs::private_dir(&directory).unwrap();
+        let failed = Err(Error::Runtime("synthetic_failure".into()));
+        super::retain_cleanup_evidence(
+            &directory,
+            &attempt,
+            &process,
+            &Ok(cleanup.clone()),
+            &failed,
+            None,
+        )
+        .unwrap();
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.join(format!("recovery.{attempt}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["cleanup"]["confirmed"], true);
+        assert_eq!(
+            receipt["ownership"]["members"].as_array().unwrap().len(),
+            process.owner.snapshot().unwrap().members.len()
+        );
+        assert_eq!(receipt["terminal_commit"], "not_proven_by_receipt");
+        // Optional candidate I/O cannot discard the observed cleanup proof.
+        let refused_dir = directory.join("candidate-refusal");
+        agent_run_platform::fs::private_dir(&refused_dir).unwrap();
+        let occupied = refused_dir.join(format!("recovery.{attempt}.answer.md"));
+        std::fs::create_dir(&occupied).unwrap();
+        let victim = occupied.join("victim");
+        std::fs::write(&victim, "unchanged").unwrap();
+        let candidate = Ok(agent_run_adapters::EngineResult {
+            outcome: agent_run_domain::domain::Outcome::failure("fixture_incomplete"),
+            answer: Some("synthetic candidate".into()),
+            usage: None,
+            native_failure: None,
+        });
+        assert!(
+            super::retain_cleanup_evidence(
+                &refused_dir,
+                &attempt,
+                &process,
+                &Ok(cleanup.clone()),
+                &candidate,
+                None
+            )
+            .is_err()
+        );
+        let retained: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(refused_dir.join(format!("recovery.{attempt}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(retained["cleanup"]["confirmed"], true);
+        assert!(retained["candidate"].is_null());
+        assert!(retained["candidate_diagnostic"]["class"].is_string());
+        assert_eq!(std::fs::read_to_string(victim).unwrap(), "unchanged");
+
+        process.reap().await;
+        held.join().unwrap();
+        assert!(cleanup.confirmed && cleanup.group_gone && cleanup.descendants_gone == Some(true));
+        let Event::OwnershipFailure(error) = event else {
+            panic!("long lock released a native frame without required ownership");
+        };
+        let data = super::execution_error_metadata(&error);
+        assert_eq!(data["operation"], "ownership_acquire");
+        assert_eq!(data["stage"], "streaming");
+        assert_eq!(data["sqlite_extended_code"], 5);
+        assert!(data["wait_ms"].as_u64().unwrap() >= 600);
+        assert!(data["wait_ms"].as_u64().unwrap() < 1000);
+        assert!(data["attempts"].as_u64().unwrap() >= 4);
+        assert!(store.conn.is_autocommit());
+        assert_eq!(
+            super::failed_execution(&store, &id.parse().unwrap(), &error)
+                .outcome
+                .status,
+            Status::Failed
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM process_members WHERE owner_id=?",
+                    [&attempt],
+                    |row| row.get::<_, u64>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    /// Pending persistence still observes primary exit and preserves the existing
+    /// two-second descendant escalation. This finite shell tree ignores TERM;
+    /// a four-second writer outage must not keep those captured processes alive.
+    #[tokio::test]
+    async fn busy_ownership_wait_preserves_primary_exit_escalation() {
+        use agent_run_adapters::{LaunchPlan, io::Process};
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::initialize(home.path()).unwrap();
+        let id = "ag-20260101-000000-0000000096";
+        store.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision) VALUES (?,'mock','fixture','review','t','t','/tmp','{}','starting',1,'cfg')",[id]).unwrap();
+        let attempt = format!("{id}:1");
+        store.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES (?,?,1,'running','{}',1,1)",rusqlite::params![attempt,id]).unwrap();
+        let plan = LaunchPlan { binary: "/bin/sh".into(),
+            args: vec!["-c".into(), r#"read launch; /bin/sh -c 'trap "" TERM; printf ready > ignoring; /bin/sleep 8' & printf '%s' "$!" > child.pid; read exit"#.into()],
+            cwd: home.path().into(), environment: Default::default(), initial_input: None };
+        let mut process = Process::spawn(&plan).unwrap();
+        process
+            .observe_ownership_with_retry(
+                super::ownership_writer(home.path(), attempt).unwrap(),
+                agent_run_store::BUSY_TIMEOUT,
+            )
+            .unwrap();
+        process.text("launch\n").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !home.path().join("ignoring").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        process.owner.refresh();
+        let pid: i32 = std::fs::read_to_string(home.path().join("child.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let identity = process
+            .owner
+            .snapshot()
+            .unwrap()
+            .members
+            .into_iter()
+            .find(|member| member.pid == pid)
+            .unwrap();
+        let (ready, waiting) = std::sync::mpsc::sync_channel(0);
+        let path = home.path().to_path_buf();
+        let held = std::thread::spawn(move || {
+            let lock = Store::open(&path).unwrap();
+            lock.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            ready.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(4));
+            lock.conn.execute_batch("ROLLBACK").unwrap();
+        });
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        process.text("exit\n").await.unwrap();
+        let gone = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_millis(3300), async {
+                loop {
+                    if matches!(
+                        agent_run_platform::process::observe(
+                            Some(identity.pid),
+                            Some(&identity.token),
+                            Some(identity.birth)
+                        ),
+                        agent_run_platform::process::ProcessState::Dead
+                            | agent_run_platform::process::ProcessState::Reused
+                    ) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+        });
+        let _ = process.next().await;
+        let cleanup = process
+            .owner
+            .cleanup(std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        process.reap().await;
+        held.join().unwrap();
+        assert!(
+            gone.await.unwrap().is_ok(),
+            "database wait delayed descendant escalation"
+        );
+        assert!(cleanup.confirmed);
     }
 
     /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_blank_startup_error_uses_exception_type_in_ready_failure`.

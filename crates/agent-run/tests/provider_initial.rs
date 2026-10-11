@@ -23,6 +23,29 @@ use tokio::process::Command;
 #[path = "provider_initial/external_services.rs"]
 mod external_services;
 
+/// Construct a non-worker test child. Remove the ambient production home and
+/// every worker identity/token/finish flag from this command only, retaining
+/// ordinary toolchain environment. Tests may add fresh fixture bindings later;
+/// the real executing agent's environment is never changed or logged.
+fn isolated_sync_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command.env_remove("AGENT_RUN_HOME");
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("AGENT_RUN_WORKER_") {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
+/// Tokio form of the same child-only test isolation; no process is started here.
+fn isolated_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    Command::from(isolated_sync_command(program))
+}
+
+#[path = "provider_initial/sqlite_busy.rs"]
+mod sqlite_busy;
+
 /// Duplicates one inert test descriptor above the supervisor bootstrap range.
 fn bootstrap_fd() -> OwnedFd {
     let file = fs::File::options()
@@ -39,6 +62,8 @@ fn bootstrap_fd() -> OwnedFd {
 
 /// Starts the ordinary agent-run supervisor executable with its three
 /// inherited bootstrap descriptors and one synthetic environment token.
+/// Parent runtime home/worker bindings are removed from the child before the
+/// explicit disposable home and fixture credential are installed.
 fn supervisor(home: &Path, id: &AgentId) -> tokio::process::Child {
     use std::os::unix::process::CommandExt;
 
@@ -46,7 +71,7 @@ fn supervisor(home: &Path, id: &AgentId) -> tokio::process::Child {
     let identity = bootstrap_fd();
     let error = bootstrap_fd();
     let sources = [ready.as_raw_fd(), identity.as_raw_fd(), error.as_raw_fd()];
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-run"));
+    let mut command = isolated_command(env!("CARGO_BIN_EXE_agent-run"));
     command
         .arg("--home")
         .arg(home)
@@ -340,9 +365,10 @@ readiness={command="/usr/bin/false",timeout_seconds=1}
     manager.tick().await.unwrap();
 }
 
-/// Starts a real disposable broker with the fixture credential and no inherited interactive streams.
+/// Starts a real disposable broker with the fixture credential and no inherited
+/// interactive streams, production runtime home or worker capability bindings.
 fn resident_broker(home: &Path) -> tokio::process::Child {
-    Command::new(env!("CARGO_BIN_EXE_agent-run"))
+    isolated_command(env!("CARGO_BIN_EXE_agent-run"))
         .arg("--home")
         .arg(home)
         .args(["api", "serve"])
@@ -598,7 +624,7 @@ async fn managed_services_real_codegraph_qualification() {
     .unwrap();
     let initialized = tokio::time::timeout(
         Duration::from_secs(30),
-        Command::new(&launcher)
+        isolated_command(&launcher)
             .args(["init", "--yes"])
             .arg(&project)
             .env("HOME", &private_home)
@@ -688,7 +714,7 @@ async fn managed_services_real_codegraph_qualification() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     manager.tick().await.unwrap();
-    let mut wrong = Command::new(&node)
+    let mut wrong = isolated_command(&node)
         .arg(&probe)
         .arg(&project)
         .arg("1.6.0")
@@ -708,7 +734,7 @@ async fn managed_services_real_codegraph_qualification() {
         "probe must reject another PID"
     );
     for _ in 0..2 {
-        let mut client = Command::new(&node)
+        let mut client = isolated_command(&node)
             .arg(&probe)
             .arg(&project)
             .arg("1.6.0")
@@ -4428,7 +4454,7 @@ async fn follow_viewer_spans_attempts_and_survives_interrupt() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     let viewer = |home: &Path| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_agent-run"))
+        isolated_sync_command(env!("CARGO_BIN_EXE_agent-run"))
             .arg("--home")
             .arg(home)
             .args(["transcript", id.as_str(), "--follow", "--format", "text"])
@@ -4485,7 +4511,7 @@ async fn reconcile_keeps_unprovable_cleanup_owned_with_a_typed_blocker() {
     let service = Service::new(home.clone());
     let id = completed_parent(&home, &service, "unresolved-parent").await;
     // A real pid that has exited and been reaped: provably not our leader.
-    let mut gone = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+    let mut gone = isolated_sync_command("/usr/bin/true").spawn().unwrap();
     let pid = gone.id() as i32;
     gone.wait().unwrap();
     let store = Store::open(&home).unwrap();
@@ -4840,7 +4866,7 @@ async fn codex_source_buckets_govern_bound_models() {
     for (account, used) in [("acct-cx-a", 100.0), ("acct-cx-b", 20.0)] {
         use std::io::Write;
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/collectors");
-        let mut parser = std::process::Command::new("jq")
+        let mut parser = isolated_sync_command("jq")
             .args(["-e", "-L"])
             .arg(&root)
             .args(["--argjson", "ctx"])
@@ -5201,7 +5227,7 @@ async fn managed_claude_home_launches_the_native_binary_directly() {
         Store::open(&home).unwrap().get(&id).unwrap().status,
         Status::Succeeded
     );
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-run"));
+    let mut command = isolated_command(env!("CARGO_BIN_EXE_agent-run"));
     command
         .arg("--home")
         .arg(&home)

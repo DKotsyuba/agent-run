@@ -206,19 +206,27 @@ impl Store {
 
     /// Records verified process-group and descendant cleanup for the exact
     /// owned attempt. An unknown cleanup cannot release its reservation.
+    /// One autocommit statement uses the existing busy allowance and reports
+    /// CleanupWrite/timing/count=1 on SQL refusal. Neither signals nor writes
+    /// are replayed; callers preserve observed proof outside SQLite on outage.
     pub fn provider_cleanup(&self, id: &AgentId, attempt: &str, proof: &Cleanup) -> Result<()> {
-        if !proof.confirmed {
-            return Err(invalid("provider process cleanup is unverified"));
-        }
-        let changed = self.conn.execute(
-            "UPDATE attempts SET cleanup_proof_json=?,phase='cleanup_complete' \
+        crate::persistence(
+            agent_run_domain::error::PersistenceOperation::CleanupWrite,
+            || {
+                if !proof.confirmed {
+                    return Err(invalid("provider process cleanup is unverified"));
+                }
+                let changed = self.conn.execute(
+                    "UPDATE attempts SET cleanup_proof_json=?,phase='cleanup_complete' \
              WHERE id=? AND agent_id=? AND ownership_active=1 AND process_identity IS NOT NULL",
-            params![serde_json::to_string(proof)?, attempt, id.as_str()],
-        )?;
-        if changed != 1 {
-            return Err(Error::Conflict);
-        }
-        Ok(())
+                    params![serde_json::to_string(proof)?, attempt, id.as_str()],
+                )?;
+                if changed != 1 {
+                    return Err(Error::Conflict);
+                }
+                Ok(())
+            },
+        )
     }
 
     /// Records the attempt's continuation evidence (`native_history` seal or
