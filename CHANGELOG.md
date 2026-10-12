@@ -4,6 +4,13 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- fix(storage)!: deliver the schema-30 bounded resident writer, atomic operation
+  receipts and reusable tokio-rusqlite execution through sqlite-access
+- test(pool): observe persisted native identity and atomically published complete
+  first-turn roster evidence, with a deterministic visibility control
+- fix(release): retain closed failed-check evidence and direct exit diagnostics
+  without disclosing captured private output
+
 ## 0.26.0
 
 - fix(storage)!: route online writes through one bounded resident writer with
