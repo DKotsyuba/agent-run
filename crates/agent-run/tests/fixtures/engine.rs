@@ -228,6 +228,11 @@ fn control_input() -> Value {
 /// SQLite stream fixtures wait behind a finite marker, create one environment-
 /// cleared one-second descendant, and emit each native frame once. A fixture
 /// statement refusal stops only its own execution; no provider/model is called.
+/// Runs offline Codex/Claude protocol scenarios selected by CLI or streamed task input.
+/// Reads synthetic MCP configuration, emits flushed native frames, and creates owned
+/// fixture markers/children with finite scenario waits. Pool text becomes visible only
+/// after its entire staging file is written. Invalid input or fixture I/O panics;
+/// no provider endpoint is contacted and task text is never executed.
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // A detached helper mode used only by `fixture:descendant`: sleep past the
@@ -306,7 +311,18 @@ fn main() {
     // Pool fixtures record the exact first-turn text this child received, as
     // proof that every peer identity was already committed when it started.
     if task.contains("fixture:pool-observe") {
-        std::fs::write("pool-observed.txt", &task).expect("fixture pool record");
+        // Publish only a complete record; parallel peers use separate staging names.
+        let pending = format!(".pool-observed-{}.pending", uuid::Uuid::new_v4());
+        let mut record = std::fs::File::create(&pending).expect("fixture pool record");
+        if task.contains("fixture:pool-observe-publication-barrier") {
+            std::fs::write("pool-publication-staged", "record opened").unwrap();
+            wait_marker("pool-publication-release");
+        }
+        record
+            .write_all(task.as_bytes())
+            .expect("fixture pool text");
+        drop(record);
+        std::fs::rename(pending, "pool-observed.txt").expect("fixture pool publication");
     }
     // Finite cohort barrier for the real-broker load fixture. No paid turn,
     // external signal, credential read or unrelated process is involved.

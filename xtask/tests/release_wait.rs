@@ -868,6 +868,7 @@ fn controlled_interrupt_persists_cancelled_result() {
 /// The publisher workflow creates/verifies "dist" relative to its checkout.
 /// Absolute and relative CLI paths must inspect/extract the same sealed bytes;
 /// directory handling must retain regular-file/tamper/inventory refusals.
+/// A failed custom check preserves its direct code but never discloses private output.
 #[test]
 fn package_create_verify_accept_relative_and_absolute_directories() {
     for absolute in [false, true] {
@@ -957,6 +958,29 @@ fn package_create_verify_accept_relative_and_absolute_directories() {
         let output = fixture.output(verify);
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("asset size/hash mismatch"));
+        let failed = fixture.root.join("failed-check.json");
+        let mut accept = ci_command();
+        accept.args([
+            "package",
+            "accept",
+            "--accepted-commit",
+            &fixture.manifest.commit,
+            "--output",
+            failed.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf PRIVATE_CHECK_SENTINEL >&2; exit 7",
+        ]);
+        let output = fixture.output(accept);
+        assert_eq!(output.status.code(), Some(2));
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(diagnostic.contains("check=custom exit=7"), "{diagnostic}");
+        assert!(!diagnostic.contains("PRIVATE_CHECK_SENTINEL"));
+        let retained = fs::read_to_string(failed).unwrap();
+        assert!(!retained.contains("PRIVATE_CHECK_SENTINEL"));
+        let evidence: Value = serde_json::from_str(&retained).unwrap();
+        assert_eq!(evidence["checks"][0]["exit_code"], 7);
     }
 }
 

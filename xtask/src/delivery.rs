@@ -488,6 +488,8 @@ pub(crate) fn create_json(path: &Path, value: &impl Serialize) -> Result<(), Str
 
 /// Records an actually executed check against one immutable source/run identity.
 /// Failed outcomes are persisted but cannot be used to create a release manifest.
+/// Errors disclose only the closed check category and direct exit code, never
+/// command arguments, captured streams, environment values or credentials.
 pub fn accept(
     root: &Path,
     output: &Path,
@@ -525,9 +527,9 @@ pub fn accept(
     if evidence.checks.len() >= 64 {
         return Err("acceptance check count limit exceeded".into());
     }
-    evidence
-        .checks
-        .push(check_record(command, code, &stdout, &stderr)?);
+    let check = check_record(command, code, &stdout, &stderr)?;
+    let check_id = check.check_id.clone();
+    evidence.checks.push(check);
     if output.exists() {
         let temporary = output.with_extension("pending.json");
         create_json(&temporary, &evidence)?;
@@ -538,7 +540,9 @@ pub fn accept(
     if code == 0 {
         Ok(())
     } else {
-        Err("acceptance check failed; failed evidence retained".into())
+        Err(format!(
+            "acceptance check failed: check={check_id} exit={code}; failed evidence retained"
+        ))
     }
 }
 

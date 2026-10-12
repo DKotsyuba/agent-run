@@ -341,9 +341,13 @@ async fn mcp_request(home: &Path, protocol: &str, method: &str, params: Value) -
 /// A real broker, public raw MCP admission and an already initialized private
 /// worker MCP join one pool without restarting or reserving the existing run.
 /// Fixture TTLs bound every child; no provider endpoint or production home runs.
+/// Native identity must be persisted before comparison. A staged-file barrier
+/// proves that readers cannot observe an unwritten roster; synthetic evidence is retained.
 #[tokio::test]
 async fn mixed_pool_attaches_active_worker_over_live_mcp_without_restart() {
-    let broker = Broker::start();
+    let mut broker = Broker::start();
+    // Retain the synthetic roster and database when this boundary assertion fails.
+    broker.retain_evidence();
     let client = BrokerClient::new(broker.home.join("api.sock"));
     let request = broker.request("fixture:pool-enroll", "independent-join");
     let started = client.start(&request).await.unwrap();
@@ -352,7 +356,8 @@ async fn mixed_pool_attaches_active_worker_over_live_mcp_without_restart() {
     loop {
         let store = agent_run_store::fixture::open(&broker.home).unwrap();
         let ready:bool=store.conn.query_row("SELECT EXISTS(SELECT 1 FROM worker_capabilities c JOIN attempts t ON t.id=c.attempt_id WHERE t.agent_id=? AND c.pool_catalog_version=1 AND t.state='running' AND t.ownership_active=1)",[agent.as_str()],|r|r.get(0)).unwrap();
-        if ready && broker.home.join("enrollment-worker-ready").exists() {
+        let identity_ready = store.get(&agent).unwrap().runtime_session_id.is_some();
+        if ready && identity_ready && broker.home.join("enrollment-worker-ready").exists() {
             break;
         }
         assert!(
@@ -365,7 +370,7 @@ async fn mixed_pool_attaches_active_worker_over_live_mcp_without_restart() {
         .unwrap()
         .get(&agent)
         .unwrap();
-    let response=mcp_tool(&broker.home,"start_pool",json!({"request_id":"live-mixed","goal":"Verify mixed pool enrollment","acceptance":[{"id":"goal","text":"Existing work remains intact"}],"members":[{"existing_agent_id":agent,"role":"review"},{"start":{"provider":"glm-user","model":"fixture","profile":"review","explicit_finish":false,"task":"fixture:pool-observe","workdir":broker.home,"display_name":"new helper"},"role":"helper"}]})).await;
+    let response=mcp_tool(&broker.home,"start_pool",json!({"request_id":"live-mixed","goal":"Verify mixed pool enrollment","acceptance":[{"id":"goal","text":"Existing work remains intact"}],"members":[{"existing_agent_id":agent,"role":"review"},{"start":{"provider":"glm-user","model":"fixture","profile":"review","explicit_finish":false,"task":"fixture:pool-observe-publication-barrier","workdir":broker.home,"display_name":"new helper"},"role":"helper"}]})).await;
     assert_ne!(response["result"]["isError"], true, "{response}");
     assert!(response.get("error").is_none(), "{response}");
     let until = Instant::now() + Duration::from_secs(10);
@@ -409,6 +414,23 @@ async fn mixed_pool_attaches_active_worker_over_live_mcp_without_restart() {
         "joined"
     );
     let until = Instant::now() + Duration::from_secs(10);
+    while !broker.home.join("pool-publication-staged").exists() {
+        assert!(
+            Instant::now() < until,
+            "fixture must stage its first-turn record"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(
+        !broker.home.join("pool-observed.txt").exists(),
+        "unwritten fixture roster must not become visible"
+    );
+    std::fs::write(
+        broker.home.join("pool-publication-release"),
+        "publish complete roster",
+    )
+    .unwrap();
+    let until = Instant::now() + Duration::from_secs(10);
     while !broker.home.join("pool-observed.txt").exists() {
         assert!(
             Instant::now() < until,
@@ -416,10 +438,11 @@ async fn mixed_pool_attaches_active_worker_over_live_mcp_without_restart() {
         );
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
+    let observed = std::fs::read_to_string(broker.home.join("pool-observed.txt")).unwrap();
     assert!(
-        std::fs::read_to_string(broker.home.join("pool-observed.txt"))
-            .unwrap()
-            .contains(agent.as_str())
+        observed.contains(agent.as_str()),
+        "complete mixed-pool roster must include the existing member; observed bytes={}",
+        observed.len()
     );
     std::fs::write(
         broker.home.join("enrollment-release"),
