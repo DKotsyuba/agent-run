@@ -443,10 +443,81 @@ async fn sustained_real_process_replay_load() {
     wave(64, seconds).await;
 }
 
+/// Own a foreign fixture lock thread and release it even when a parent assertion unwinds.
+struct HeldWriteLock {
+    /// Explicit release follows the long-refusal and no-mutation assertions.
+    release: Option<std::sync::mpsc::Sender<()>>,
+    /// Joining prevents a failed fixture from leaving a thread or database lock behind.
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HeldWriteLock {
+    /// Release and join normally, propagating any SQL/thread failure as a failed test.
+    fn release_and_join(mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        self.thread.take().unwrap().join().unwrap();
+    }
+}
+
+impl Drop for HeldWriteLock {
+    /// Unwind releases the foreign transaction and reaps its thread without a second panic.
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Parent unwinding before receiving readiness must release and reap the SQL lock thread.
+#[test]
+fn held_write_lock_unwind_before_readiness_releases_and_joins() {
+    let temp = tempfile::Builder::new()
+        .prefix("ar-load-unwind-")
+        .tempdir_in(scratch())
+        .unwrap();
+    let path = temp.path().join("fixture.db");
+    rusqlite::Connection::open(&path).unwrap();
+    let (ready, readiness) = std::sync::mpsc::sync_channel(1);
+    let (release, released) = std::sync::mpsc::channel();
+    let (done, completed) = std::sync::mpsc::sync_channel(1);
+    let child_path = path.clone();
+    let thread = std::thread::spawn(move || {
+        let connection = rusqlite::Connection::open(child_path).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        ready.send(()).unwrap();
+        let result = released.recv_timeout(Duration::from_secs(2));
+        connection.execute_batch("ROLLBACK").unwrap();
+        result.unwrap();
+        done.send(()).unwrap();
+    });
+    // The moved handle is consumed only by the guard's Drop; no shared state is reused after panic.
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _lock = HeldWriteLock {
+            release: Some(release),
+            thread: Some(thread),
+        };
+        panic!("synthetic parent assertion before readiness receive");
+    }));
+    assert!(unwind.is_err());
+    readiness.recv_timeout(Duration::from_secs(2)).unwrap();
+    completed.recv_timeout(Duration::from_secs(2)).unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
+        .unwrap();
+}
+
 /// An independent writer lock is acquired before submitting. The short lock
 /// commits before the 250ms allowance; a long lock yields no false receipt or
-/// mutation and closed diagnostics. After release the same identity commits
-/// once, its repeat replays, and a fresh neighbour also succeeds.
+/// mutation and closed diagnostics while an explicit release channel keeps it
+/// occupied through the assertions. After release the same identity commits
+/// once, its repeat replays, and a fresh neighbour also succeeds. The release
+/// wait is bounded to 30 seconds and unwind always releases and joins the thread.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lock_release_and_long_refusal_preserve_neighbour_progress() {
     let temp = tempfile::Builder::new()
@@ -460,14 +531,27 @@ async fn lock_release_and_long_refusal_preserve_neighbour_progress() {
     let mut stream = connect(&home).await;
     for (worker, hold, expect_commit) in [(100, 50, true), (101, 700, false), (102, 0, true)] {
         let path = home.clone();
-        let (send, receive) = std::sync::mpsc::sync_channel(0);
-        let lock = std::thread::spawn(move || {
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
             let connection = rusqlite::Connection::open(path.join("state.db")).unwrap();
             connection.execute_batch("BEGIN IMMEDIATE").unwrap();
             send.send(()).unwrap();
-            std::thread::sleep(Duration::from_millis(hold));
+            let release_result = if worker == 101 {
+                Some(released.recv_timeout(Duration::from_secs(30)))
+            } else {
+                std::thread::sleep(Duration::from_millis(hold));
+                None
+            };
             connection.execute_batch("ROLLBACK").unwrap();
+            if let Some(result) = release_result {
+                result.expect("long lock must be explicitly released after assertions");
+            }
         });
+        let lock = HeldWriteLock {
+            release: Some(release),
+            thread: Some(thread),
+        };
         receive.recv_timeout(Duration::from_secs(2)).unwrap();
         let request = envelope(worker, 1, 0);
         let started = Instant::now();
@@ -508,7 +592,7 @@ async fn lock_release_and_long_refusal_preserve_neighbour_progress() {
                     .any(|record| record.account_id.as_str() == "load-101-1")
             );
         }
-        lock.join().unwrap();
+        lock.release_and_join();
         if !expect_commit {
             let SubmitResult::Committed(first) = submit(&mut stream, &request, 201).await else {
                 panic!("same identity must succeed after known no-write refusal");
