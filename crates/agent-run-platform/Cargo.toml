@@ -20,3 +20,8 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[[test]]
+name = "launch_fd6"
+path = "tests/launch_fd6.rs"
+harness = false

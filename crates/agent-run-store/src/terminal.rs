@@ -1,7 +1,8 @@
 //! Atomic terminal lifecycle commits.
 //!
 //! A terminal state, its event, answer proof metadata, and exactly one durable
-//! completion-delivery row are written under one immediate SQLite transaction.
+//! completion-delivery row are written under one write scope; statistics and
+//! incident projections are separate operations outside it.
 
 use crate::{Record, Store, delivery, run_stats, tx_event};
 use agent_run_domain::{
@@ -10,23 +11,16 @@ use agent_run_domain::{
     error::invalid,
 };
 use agent_run_platform::verify::{self, Proof};
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
-/// Commits one terminal result and any individual completion notice it needs.
+/// Legacy terminal entry for callers not yet routed through the writer.
 ///
-/// The answer proof is verified before opening the transaction. Once started,
-/// the state update, attempt close, event append, answer metadata, eligible
-/// outbox row, and aggregate run statistics either commit together or SQLite
-/// rolls all of them back. Confirmed legacy cleanup releases ownership in this
-/// transaction; unconfirmed attempts remain owned for recovery. Successful current pool members
-/// omit the individual notice because pool settlement owns the common success
-/// notice. A pending cancel observed while success or an explicit-mode outcome
-/// is being committed wins in this same transaction and receives its terminal
-/// command result. Repeating a completion after a prior terminal commit is a
-/// no-op.
-/// Explicit success also requires an observed done finish; any supplied answer
-/// proof must match that current attempt's immutable callback summary.
+/// Verifies the answer proof (filesystem read, before any transaction), runs
+/// [`commit_terminal`] and only after its commit records the statistics row
+/// and incident projection in separate best-effort scopes, so neither can
+/// hold or fail the terminal transaction. Repeating after a prior terminal
+/// commit is a no-op.
 pub fn finish(
     store: &mut Store,
     id: &AgentId,
@@ -43,16 +37,54 @@ pub fn finish(
     if let Some(proof) = proof {
         verify::read(&store.home.join("agents").join(id.as_str()), proof, 0)?;
     }
-    let tx = store
-        .conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(time) = commit_terminal(store, id, outcome, proof, usage)? {
+        // Statistics and incident projections are observability snapshots,
+        // not part of the terminal proof; failures never undo the outcome.
+        let _ = run_stats::record(store, id);
+        let _ = crate::incidents::capture(&store.conn, id.as_str(), time);
+    }
+    Ok(())
+}
+
+/// Commits one terminal result and any individual completion notice it needs
+/// (writer unit of `FinishTerminal`); the proof must already be verified by
+/// the producer.
+///
+/// Inside one write scope the state update, attempt close, event append,
+/// answer metadata and eligible outbox row either commit together or roll
+/// back; no statistics or incident data is read or written here. Confirmed
+/// legacy cleanup releases ownership in this scope; unconfirmed attempts
+/// remain owned for recovery. A provider attempt that provably never spawned
+/// gets its never-spawned cleanup proof in the same scope, before the proof
+/// prerequisite is checked. Successful current pool members omit the
+/// individual notice because pool settlement owns the common success notice.
+/// A pending cancel observed while success or an explicit-mode outcome is
+/// being committed wins in this same scope and receives its terminal command
+/// result. Explicit success also requires an observed done finish; any
+/// supplied answer proof must match that attempt's immutable callback
+/// summary. Returns the commit time, or `None` when the execution was already
+/// terminal (no-op).
+pub fn commit_terminal(
+    store: &mut Store,
+    id: &AgentId,
+    outcome: &Outcome,
+    proof: Option<&Proof>,
+    usage: Option<&Value>,
+) -> Result<Option<f64>> {
+    if !outcome.status.terminal() {
+        return Err(invalid("outcome must be terminal"));
+    }
+    if outcome.status == Status::Succeeded && proof.is_none() {
+        return Err(invalid("success requires a sealed answer proof"));
+    }
+    let tx = crate::writer::WriteTx::begin(&store.conn)?;
     let row = tx.query_row(
         "SELECT * FROM agents WHERE id=?",
         [id.as_str()],
         Record::read,
     )?;
     if row.status.terminal() {
-        return Ok(());
+        return Ok(None);
     }
     if row.request.explicit_finish {
         let intent: Option<(String,bool)> = tx.query_row(
@@ -89,6 +121,19 @@ pub fn finish(
         .as_ref()
         .is_some_and(|value| value["provider_identity_version"] == 2)
     {
+        // An attempt that provably never spawned (cancellation or preparation
+        // failure before spawn) receives its never-spawned proof here,
+        // atomically with the terminal row; a success never does.
+        if outcome.status != Status::Succeeded {
+            tx.execute(
+                &format!(
+                    "UPDATE attempts SET cleanup_proof_json='{{\"never_spawned\":true}}',phase='cleanup_complete' \
+                     WHERE id IN (SELECT t.id FROM attempts t WHERE t.agent_id=? AND {})",
+                    crate::provider_admission::NEVER_SPAWNED
+                ),
+                [id.as_str()],
+            )?;
+        }
         let proof: (String, Option<String>) = tx.query_row(
             "SELECT id,cleanup_proof_json FROM attempts WHERE agent_id=? AND ownership_active=1",
             [id.as_str()],
@@ -181,10 +226,6 @@ pub fn finish(
         };
         tx_event(&tx, id, kind, None, None, usage)?;
     }
-    // Statistics are an observability snapshot, not part of the terminal
-    // lifecycle proof. A malformed or unavailable stats table must not turn a
-    // committed engine outcome back into an active row.
-    let _stats_error = run_stats::record_in_transaction(&tx, id, time).is_err();
     if let Some(attempt) = provider_attempt {
         tx.execute(
             "UPDATE attempts SET ownership_active=0 WHERE id=? AND agent_id=?",
@@ -200,8 +241,5 @@ pub fn finish(
         )?;
     }
     tx.commit()?;
-    // Incident diagnostics cannot undo the durable outcome. Retention retries
-    // this projection before it is allowed to destroy the source history.
-    let _ = crate::incidents::capture(&store.conn, id.as_str(), time);
-    Ok(())
+    Ok(Some(time))
 }

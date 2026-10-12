@@ -27,7 +27,7 @@ async fn ready(manager: &mut Manager, home: &Path) {
     tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             manager.tick().await.unwrap();
-            let state: String = Store::open(home)
+            let state: String = agent_run_store::fixture::open(home)
                 .unwrap()
                 .conn
                 .query_row("SELECT state FROM agent_service_gates", [], |row| {
@@ -47,12 +47,15 @@ async fn ready(manager: &mut Manager, home: &Path) {
 
 /// Runs the admitted fake-engine task through the production supervisor with a ten-second ceiling.
 async fn finish(home: &Path, id: &AgentId) {
-    let mut child = supervisor(home, id);
+    let mut child = supervisor(home, id).await;
     let exit = tokio::time::timeout(Duration::from_secs(10), child.wait())
         .await
         .unwrap()
         .unwrap();
-    let row = Store::open(home).unwrap().get(id).unwrap();
+    let row = agent_run_store::fixture::open(home)
+        .unwrap()
+        .get(id)
+        .unwrap();
     assert!(
         exit.success(),
         "{}: {:?} {:?}",
@@ -61,7 +64,11 @@ async fn finish(home: &Path, id: &AgentId) {
         row.failure_text
     );
     assert_eq!(
-        Store::open(home).unwrap().get(id).unwrap().status,
+        agent_run_store::fixture::open(home)
+            .unwrap()
+            .get(id)
+            .unwrap()
+            .status,
         Status::Succeeded
     );
 }
@@ -84,19 +91,22 @@ async fn managed_services_external_reuse_and_race_never_claim_or_stop_foreign_pr
         }
         let (_temp, home) = home_with(&external_config(pid, &available, &spawned), &[]);
         let _cleanup = ServiceProcesses(home.clone());
-        let service = Service::new(home.clone());
+        let service = fixture_service(home.clone()).await;
         let admitted = service
             .admit_provider_trusted(request(&home), candidates(committed(&home)))
+            .await
             .unwrap();
         let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
-        let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into()).unwrap();
+        let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into())
+            .unwrap()
+            .with_writer(test_broker::broker_for(&home).await.lane("services"));
         ready(&mut manager, &home).await;
         assert_eq!(
             spawned.exists(),
             race,
             "a ready external endpoint must skip launch"
         );
-        let store = Store::open(&home).unwrap();
+        let store = agent_run_store::fixture::open(&home).unwrap();
         let (ownership, root, cleanup): (String, Option<String>, Option<String>) = store.conn.query_row(
             "SELECT ownership,process_identity_json,cleanup_json FROM managed_service_generations", [],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
@@ -124,7 +134,9 @@ async fn managed_services_external_reuse_and_race_never_claim_or_stop_foreign_pr
         );
         drop(store);
         drop(manager);
-        let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into()).unwrap();
+        let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into())
+            .unwrap()
+            .with_writer(test_broker::broker_for(&home).await.lane("services"));
         manager.tick().await.unwrap();
         let report = agent_run_core::doctor::run(&home).unwrap();
         assert!(
@@ -140,11 +152,11 @@ async fn managed_services_external_reuse_and_race_never_claim_or_stop_foreign_pr
         if !race {
             // Recovery removed an interrupted probe after an earlier retirement
             // retained its unknown result. Confirmation must be recomputed now.
-            Store::open(&home).unwrap().conn.execute(
+            agent_run_store::fixture::open(&home).unwrap().conn.execute(
                 "UPDATE managed_service_generations SET state='unknown',cleanup_json='{\"external\":true,\"confirmed\":false,\"probes_gone\":false}'",[]
             ).unwrap();
         }
-        Store::open(&home)
+        agent_run_store::fixture::open(&home)
             .unwrap()
             .conn
             .execute(
@@ -153,7 +165,7 @@ async fn managed_services_external_reuse_and_race_never_claim_or_stop_foreign_pr
             )
             .unwrap();
         manager.tick().await.unwrap();
-        let state: String = Store::open(&home)
+        let state: String = agent_run_store::fixture::open(&home)
             .unwrap()
             .conn
             .query_row("SELECT state FROM managed_service_generations", [], |row| {
@@ -188,9 +200,10 @@ readiness={command="/bin/sh",args=["-c",'test "$AGENT_RUN_SERVICE_OWNERSHIP" = m
         &[],
     );
     let _cleanup = ServiceProcesses(home.clone());
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let admitted = service
         .admit_provider_trusted(request(&home), candidates(committed(&home)))
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     // A broker can die during external preflight, before any service was spawned.
@@ -207,13 +220,15 @@ readiness={command="/bin/sh",args=["-c",'test "$AGENT_RUN_SERVICE_OWNERSHIP" = m
         .unwrap()
         .0;
     let definition = &config.services["shared"];
-    Store::open(&home).unwrap().conn.execute(
+    agent_run_store::fixture::open(&home).unwrap().conn.execute(
         "INSERT INTO managed_service_generations(id,service_id,revision,definition_json,state,ownership,broker_identity_json,created_at) VALUES ('interrupted-preflight','shared',?,?,'starting','external',?,?)",
         rusqlite::params![definition.revision().unwrap(),serde_json::to_string(definition).unwrap(),serde_json::to_string(&previous).unwrap(),agent_run::domain::now()],
     ).unwrap();
-    let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into()).unwrap();
+    let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into())
+        .unwrap()
+        .with_writer(test_broker::broker_for(&home).await.lane("services"));
     ready(&mut manager, &home).await;
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let (ownership, root): (String, String) = store
         .conn
         .query_row(
@@ -227,7 +242,7 @@ readiness={command="/bin/sh",args=["-c",'test "$AGENT_RUN_SERVICE_OWNERSHIP" = m
     drop(store);
     finish(&home, &id).await;
     manager.tick().await.unwrap();
-    Store::open(&home)
+    agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .execute(
@@ -271,7 +286,10 @@ async fn managed_services_external_survives_broker_pid_change() {
         let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
         tokio::time::timeout(Duration::from_secs(12), async {
             loop {
-                let row = Store::open(&home).unwrap().get(&id).unwrap();
+                let row = agent_run_store::fixture::open(&home)
+                    .unwrap()
+                    .get(&id)
+                    .unwrap();
                 if row.status.terminal() {
                     assert_eq!(row.status, Status::Succeeded, "{:?}", row.failure_text);
                     break;
@@ -281,7 +299,7 @@ async fn managed_services_external_survives_broker_pid_change() {
         })
         .await
         .unwrap();
-        let generation:String=Store::open(&home).unwrap().conn.query_row(
+        let generation:String=agent_run_store::fixture::open(&home).unwrap().conn.query_row(
             "SELECT id FROM managed_service_generations WHERE ownership='external' AND state='ready'",[],|row|row.get(0),
         ).unwrap();
         if let Some((id, pid)) = &original {
@@ -316,14 +334,17 @@ async fn managed_services_external_health_loss_blocks_new_harness() {
         &[],
     );
     let _cleanup = ServiceProcesses(home.clone());
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let first = service
         .admit_provider_trusted(request(&home), candidates(committed(&home)))
+        .await
         .unwrap();
     let first_id: AgentId = serde_json::from_value(first["agent_id"].clone()).unwrap();
-    let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into()).unwrap();
+    let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into())
+        .unwrap()
+        .with_writer(test_broker::broker_for(&home).await.lane("services"));
     ready(&mut manager, &home).await;
-    Store::open(&home)
+    agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .execute("UPDATE managed_service_generations SET checked_at=0", [])
@@ -335,7 +356,7 @@ async fn managed_services_external_health_loss_blocks_new_harness() {
     manager.tick().await.unwrap();
     foreign.kill().await.unwrap();
     foreign.wait().await.unwrap();
-    Store::open(&home)
+    agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .execute("UPDATE managed_service_generations SET checked_at=0", [])
@@ -345,10 +366,11 @@ async fn managed_services_external_health_loss_blocks_new_harness() {
     next.request_id = Some("after-health-loss".into());
     let admitted = service
         .admit_provider_trusted(next, candidates(committed(&home)))
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     manager.tick().await.unwrap();
-    let mut child = supervisor(&home, &id);
+    let mut child = supervisor(&home, &id).await;
     assert!(
         !tokio::time::timeout(Duration::from_secs(8), child.wait())
             .await
@@ -356,7 +378,10 @@ async fn managed_services_external_health_loss_blocks_new_harness() {
             .unwrap()
             .success()
     );
-    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     assert_eq!(row.status, Status::Failed);
     assert!(row.runtime_session_id.is_none());
     assert!(!spawned.exists());
@@ -392,16 +417,19 @@ readiness={{command="{node}",args=["{probe}","{project}","1.6.0"],timeout_second
     );
     let (_temp, home) = home_with(&config, &[]);
     let _cleanup = ServiceProcesses(home.clone());
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let admitted = service
         .admit_provider_trusted(request(&home), candidates(committed(&home)))
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
-    let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into()).unwrap();
+    let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into())
+        .unwrap()
+        .with_writer(test_broker::broker_for(&home).await.lane("services"));
     ready(&mut manager, &home).await;
     finish(&home, &id).await;
     manager.tick().await.unwrap();
-    Store::open(&home)
+    agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .execute(
@@ -410,15 +438,16 @@ readiness={{command="{node}",args=["{probe}","{project}","1.6.0"],timeout_second
         )
         .unwrap();
     manager.tick().await.unwrap();
-    let (ownership, state, root): (String, String, Option<String>) = Store::open(&home)
-        .unwrap()
-        .conn
-        .query_row(
-            "SELECT ownership,state,process_identity_json FROM managed_service_generations",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
+    let (ownership, state, root): (String, String, Option<String>) =
+        agent_run_store::fixture::open(&home)
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT ownership,state,process_identity_json FROM managed_service_generations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
     assert_eq!(
         (ownership.as_str(), state.as_str(), root),
         ("external", "stopped", None)

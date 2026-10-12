@@ -1,6 +1,5 @@
 //! Account administration against disposable homes and fake references only.
 
-use agent_run_store::Store;
 use serde_json::Value;
 use std::{path::Path, process::Command};
 
@@ -20,7 +19,7 @@ fn invoke(home: &Path, args: &[&str]) -> std::process::Output {
 #[test]
 fn scoped_account_cli_never_emits_credential_references() {
     let home = tempfile::tempdir().unwrap();
-    Store::initialize(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
     let registered = invoke(
         home.path(),
         &[

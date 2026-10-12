@@ -16,7 +16,7 @@ use agent_run_domain::pool::{
 };
 use agent_run_domain::worker::WorkerMessageKind;
 use agent_run_domain::{Error, Result};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 /// Maximum ordinary chat rows per pool before the budget refusal.
@@ -286,7 +286,7 @@ fn authenticated_member(
     }
 }
 
-impl Store {
+impl Store<'_> {
     /// Appends one authenticated pool entry under the writer's stamped
     /// identity, or replays the identical request, or returns a typed denial.
     pub fn pool_write(
@@ -296,9 +296,7 @@ impl Store {
         token: &str,
         write: PoolWrite,
     ) -> Result<std::result::Result<PoolWriteReceipt, PoolDenial>> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let member = match authenticated_member(&tx, run_id, attempt_id, token)? {
             Ok(member) => member,
             Err(denial) => return Ok(Err(denial)),
@@ -563,9 +561,7 @@ impl Store {
         request_id: &str,
         message: &str,
     ) -> Result<std::result::Result<PoolWriteReceipt, PoolDenial>> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let Some((state, roster_revision)) = tx
             .query_row(
                 "SELECT state,roster_revision FROM pools WHERE id=?",
@@ -867,7 +863,7 @@ pub fn entry_view(row: &rusqlite::Row<'_>) -> rusqlite::Result<PoolEntryView> {
 
 /// Reads the durable shape of an existing entry for replay comparison.
 fn replay_shape_of(
-    tx: &Transaction<'_>,
+    tx: &rusqlite::Connection,
     pool_id: &str,
     seq: i64,
 ) -> Result<Vec<(&'static str, Value)>> {
@@ -910,7 +906,7 @@ fn replay_shape_of(
 
 /// Appends one ordinary chat entry within the shared chat budget.
 fn append_message(
-    tx: &Transaction<'_>,
+    tx: &rusqlite::Connection,
     member: &Membership,
     run_id: &AgentId,
     attempt_id: &str,
@@ -947,7 +943,7 @@ fn append_message(
 
 /// Appends one proposal within the proposal budget.
 fn append_proposal(
-    tx: &Transaction<'_>,
+    tx: &rusqlite::Connection,
     member: &Membership,
     run_id: &AgentId,
     attempt_id: &str,
@@ -980,7 +976,7 @@ fn append_proposal(
 
 /// Appends one vote or revoke on the current proposal with full validation.
 fn append_vote(
-    tx: &Transaction<'_>,
+    tx: &rusqlite::Connection,
     member: &Membership,
     run_id: &AgentId,
     attempt_id: &str,
@@ -1056,7 +1052,7 @@ fn append_vote(
 /// Inserts the immutable entry with the stamped author and returns its seq.
 #[allow(clippy::too_many_arguments)]
 fn append_entry(
-    tx: &Transaction<'_>,
+    tx: &rusqlite::Connection,
     member: &Membership,
     run_id: &AgentId,
     attempt_id: &str,
@@ -1116,7 +1112,7 @@ fn append_entry(
 /// `pool_read`. Called inside the writer's transaction so the entry and its
 /// commands commit or roll back together.
 pub(crate) fn fanout_entry(
-    tx: &Transaction<'_>,
+    tx: &rusqlite::Connection,
     pool_id: &str,
     sender_seat: &str,
     seq: u64,

@@ -7,6 +7,7 @@
 //! `capacity.rs`/`capacity_collectors.rs`, which hold the already-ported
 //! capacity behaviors.
 
+mod common;
 use agent_run_core::capacity::{
     self, Forecast, Key, Pool, Route, Sample, Slice, Topology,
     advice::{advice_key, build_advice, capacity_label},
@@ -371,10 +372,12 @@ fn tp_slice(
 /// write. The two Python sub-cases that pass a non-`LimitSample` sample and a
 /// non-`CapacityTopology` topology are unrepresentable in the Rust types and
 /// have no runtime counterpart.
-#[test]
-fn slice_validates_everything_before_persistence() {
+#[tokio::test]
+async fn slice_validates_everything_before_persistence() {
     let home = tempfile::tempdir().unwrap();
-    agent_run_store::Store::initialize(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
+    let writer = common::writer::Harness::start(home.path());
+    let _socket = writer.serve_unix(home.path());
     let shared = tp_key("primary", "five_hour", None);
     let topology = Topology {
         pools: vec![tp_pool("pool-shared", shared.clone())],
@@ -390,7 +393,7 @@ fn slice_validates_everything_before_persistence() {
         100.0,
         200.0,
     );
-    assert_eq!(persist(home.path(), &ok, 10).unwrap(), 1);
+    assert_eq!(persist(home.path(), &ok, 10).await.unwrap(), 1);
 
     let empty_topology = Topology::default();
     for (label, bad) in [
@@ -444,17 +447,19 @@ fn slice_validates_everything_before_persistence() {
         ),
     ] {
         assert!(
-            persist(home.path(), &bad, 10).is_err(),
+            persist(home.path(), &bad, 10).await.is_err(),
             "{label} must not persist"
         );
     }
 }
 
 /// Mirrors `tests/test_capacity_topology.py::CollectSliceTests::test_same_runtime_keeps_distinct_scopes_and_key_runtimes`.
-#[test]
-fn same_runtime_keeps_distinct_scopes_and_key_runtimes() {
+#[tokio::test]
+async fn same_runtime_keeps_distinct_scopes_and_key_runtimes() {
     let home = tempfile::tempdir().unwrap();
-    agent_run_store::Store::initialize(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
+    let writer = common::writer::Harness::start(home.path());
+    let _socket = writer.serve_unix(home.path());
     let key = tp_key("primary", "five_hour", Some("team1"));
     let topology = Topology {
         pools: vec![tp_pool("pool-team1", key.clone())],
@@ -481,10 +486,11 @@ fn same_runtime_keeps_distinct_scopes_and_key_runtimes() {
             ),
             10,
         )
+        .await
         .unwrap();
     }
 
-    let store = agent_run_store::Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
     let scopes: Vec<String> = store
         .conn
         .prepare("SELECT scope_id FROM capacity_route_snapshots WHERE runtime=? ORDER BY scope_id")
@@ -635,7 +641,7 @@ impl Default for Scope<'_> {
 /// sample-free scopes the Python fixtures need stay expressible. `at` is the
 /// live epoch the fixture timestamps are anchored to.
 fn append_scope(home: &std::path::Path, at: f64, spec: &Scope) {
-    let store = agent_run_store::Store::open(home).unwrap();
+    let store = agent_run_store::fixture::open(home).unwrap();
     let account = spec
         .account
         .map(str::to_owned)
@@ -710,7 +716,7 @@ fn order_home(runtimes: &[&str]) -> tempfile::TempDir {
         ));
     }
     std::fs::write(path.join("config.toml"), text).unwrap();
-    agent_run_store::Store::initialize(path).unwrap();
+    agent_run_store::fixture::initialize(path).unwrap();
     temp
 }
 
@@ -884,7 +890,7 @@ fn bad_scopes_do_not_hide_an_independent_fresh_scope() {
             ..Default::default()
         },
     );
-    agent_run_store::Store::open(home.path())
+    agent_run_store::fixture::open(home.path())
         .unwrap()
         .conn
         .execute(
@@ -934,7 +940,7 @@ fn missing_unknown_and_legacy_evidence_never_become_routes() {
         },
     );
     // A legacy sample with no persisted topology infers no route at all.
-    agent_run_store::Store::open(home.path())
+    agent_run_store::fixture::open(home.path())
         .unwrap()
         .conn
         .execute(
@@ -998,10 +1004,12 @@ fn invalid_snapshot_inputs_are_rejected() {
 /// canonicalizes where it matters instead: `order()` keys definitions by id,
 /// so two scopes that declare the same parts in opposite order agree rather
 /// than conflict.
-#[test]
-fn topology_validation_is_independent_of_input_order() {
+#[tokio::test]
+async fn topology_validation_is_independent_of_input_order() {
     let at = agent_run_core::domain::now();
     let home = order_home(&[TP_RUNTIME]);
+    let writer = common::writer::Harness::start(home.path());
+    let _socket = writer.serve_unix(home.path());
     let key_a = tp_key("primary", "five_hour", None);
     let key_b = tp_key("secondary", "seven_day", None);
     let pool_a = tp_pool("pool-a", key_a.clone());
@@ -1034,6 +1042,7 @@ fn topology_validation_is_independent_of_input_order() {
             ),
             10,
         )
+        .await
         .unwrap();
     }
 
@@ -1092,7 +1101,7 @@ fn collect_home(runtimes: &[(&str, &str, &str)]) -> tempfile::TempDir {
         ));
     }
     std::fs::write(path.join("config.toml"), text).unwrap();
-    agent_run_store::Store::initialize(path).unwrap();
+    agent_run_store::fixture::initialize(path).unwrap();
     temp
 }
 
@@ -1116,6 +1125,8 @@ async fn failed_empty_and_unsupported_outcomes_are_reported() {
         ("empty", "claude", "native"),
         ("unsupported", "claude", "none"),
     ]);
+    let writer = common::writer::Harness::start(home.path());
+    let _socket = writer.serve_unix(home.path());
     let report = sources::collect(home.path()).await.unwrap();
     for (runtime, status) in [
         ("failed", "failed"),
@@ -1138,11 +1149,15 @@ async fn failed_empty_and_unsupported_outcomes_are_reported() {
 #[tokio::test]
 async fn collect_report_marks_only_degraded_rounds() {
     let clean = collect_home(&[("unsupported", "claude", "none")]);
+    let clean_writer = common::writer::Harness::start(clean.path());
+    let _clean_socket = clean_writer.serve_unix(clean.path());
     let report = sources::collect(clean.path()).await.unwrap();
     assert_eq!(result_for(&report, "unsupported")["status"], "unsupported");
     assert_eq!(report["ok"], true);
 
     let degraded = collect_home(&[("failed", "codex", "codexbar")]);
+    let degraded_writer = common::writer::Harness::start(degraded.path());
+    let _degraded_socket = degraded_writer.serve_unix(degraded.path());
     let report = sources::collect(degraded.path()).await.unwrap();
     assert_eq!(result_for(&report, "failed")["status"], "failed");
     assert_eq!(report["ok"], false);
@@ -1161,13 +1176,15 @@ async fn collect_report_marks_only_degraded_rounds() {
 #[tokio::test]
 async fn unsupported_source_yields_no_slice() {
     let home = collect_home(&[("cortex-runtime", "claude", "none")]);
+    let writer = common::writer::Harness::start(home.path());
+    let _socket = writer.serve_unix(home.path());
     let report = sources::collect(home.path()).await.unwrap();
     let result = result_for(&report, "cortex-runtime");
     assert_eq!(result["status"], "unsupported");
     assert_eq!(result["sample_count"], 0);
     assert!(result["issues"].as_array().unwrap().is_empty());
     assert_eq!(result["error"], serde_json::Value::Null);
-    let store = agent_run_store::Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
     let snapshots: i64 = store
         .conn
         .query_row("SELECT COUNT(*) FROM capacity_route_snapshots", [], |row| {

@@ -11,7 +11,7 @@ use agent_run_domain::{
     error::invalid,
     pool::{AcceptanceCriterion, PoolId},
 };
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, params};
 
 /// One member of a pool admission, with its pre-minted stable identity.
 pub struct PoolMemberAdmission<'a> {
@@ -61,7 +61,7 @@ pub struct PoolAdmissionInput<'a> {
 }
 
 /// A member as recorded, without any internal run or attempt detail.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PoolMemberRecord {
     /// Stable identity.
     pub agent_id: AgentId,
@@ -74,7 +74,7 @@ pub struct PoolMemberRecord {
 }
 
 /// A committed pool, newly created or replayed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PoolAdmission {
     /// Pool identity.
     pub pool_id: PoolId,
@@ -114,7 +114,7 @@ fn members_of(conn: &rusqlite::Connection, pool_id: &str) -> Result<Vec<PoolMemb
     .collect()
 }
 
-impl Store {
+impl Store<'_> {
     /// Returns an existing pool for the exact original client request, `None`
     /// when the key is unused, or `Conflict` when another request used it.
     pub fn replay_pool(
@@ -136,9 +136,7 @@ impl Store {
     /// earlier members, and a failure of any member rolls back every row. The
     /// quota capacity revision advances once. Nothing is launched.
     pub fn admit_pool(&mut self, input: PoolAdmissionInput<'_>) -> Result<PoolAdmission> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         if let Some(found) = replay_pool(
             &tx,
             input.request_namespace,

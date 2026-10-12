@@ -122,7 +122,7 @@ pub enum OwnershipStage {
 }
 
 /// Closed storage boundaries; diagnostics contain these labels and numeric facts only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PersistenceOperation {
     /// Failed BEGIN IMMEDIATE before any ownership snapshot mutation; replay is safe.
@@ -147,6 +147,10 @@ pub enum PersistenceOperation {
     CommandClaim,
     /// Recording an acknowledgement; an ambiguous write never replays a tool.
     CommandWrite,
+    /// A sole-writer operation without a legacy boundary label; the operation
+    /// kind is the validated envelope/receipt `op_kind`, never SQL text or
+    /// arguments. Never retried automatically.
+    WriterApply,
 }
 
 /// Expected domain failures; source-bearing variants never expose source diagnostics publicly.
@@ -208,6 +212,10 @@ pub enum Error {
         elapsed_ms: u64,
         /// Number of completed attempts, including a failing attempt.
         attempts: u32,
+        /// Closed writer phase (acquire, statement, commit, ...) when known;
+        /// `None` for legacy boundaries that never recorded one. Distinct from
+        /// [`OwnershipStage`].
+        phase: Option<crate::storage::RejectStage>,
         /// Original typed source; never rendered as a diagnostic message.
         #[source]
         source: Box<Error>,
@@ -278,6 +286,7 @@ impl Error {
     }
 
     /// Attach a closed persistence boundary to a typed cause; no source contents are copied.
+    /// Legacy constructor: the writer phase is unknown (`None`).
     pub fn persistence(
         operation: PersistenceOperation,
         elapsed: std::time::Duration,
@@ -287,17 +296,21 @@ impl Error {
             operation,
             elapsed_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
             attempts: 1,
+            phase: None,
             source: Box::new(source),
         }
     }
 
     /// Whether ownership BEGIN failed before acquiring a transaction with SQLITE_BUSY.
     /// LOCKED, write/commit failures and arbitrary observer errors remain non-replayable.
+    /// A recorded writer phase other than `Acquire` is never replayable; a
+    /// legacy boundary without a phase keeps the old predicate.
     pub fn retryable_ownership_acquire(&self) -> bool {
         match self {
             Self::OwnershipCheckpoint { source, .. } => source.retryable_ownership_acquire(),
             Self::Persistence {
                 operation: PersistenceOperation::OwnershipAcquire,
+                phase: None | Some(crate::storage::RejectStage::Acquire),
                 source,
                 ..
             } => {
@@ -316,7 +329,8 @@ impl Error {
         }
     }
 
-    /// Replace only numeric operation totals after a bounded, proven-safe replay sequence.
+    /// Replace only numeric operation totals after a bounded, proven-safe replay sequence;
+    /// the operation, writer phase and source are preserved.
     pub fn persistence_totals(self, elapsed: std::time::Duration, count: u32) -> Self {
         match self {
             Self::OwnershipCheckpoint { stage, source } => Self::OwnershipCheckpoint {
@@ -324,9 +338,13 @@ impl Error {
                 source: Box::new(source.persistence_totals(elapsed, count)),
             },
             Self::Persistence {
-                operation, source, ..
+                operation,
+                phase,
+                source,
+                ..
             } => Self::Persistence {
                 operation,
+                phase,
                 source,
                 elapsed_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
                 attempts: count,

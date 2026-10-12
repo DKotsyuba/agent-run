@@ -2,8 +2,9 @@
 
 use agent_run_core::{
     delivery::{
-        CompletionNotice, NOTICE_VERSION, Notice, Receipt, claude, dispatch, dispatch_once,
-        dispatch_with_batch, relay, safe_evidence,
+        CompletionNotice, NOTICE_VERSION, Notice, Receipt, claude, dispatch as real_dispatch,
+        dispatch_once as real_dispatch_once, dispatch_with_batch as real_dispatch_with_batch,
+        relay, safe_evidence,
     },
     domain::{AgentId, Status, now},
 };
@@ -82,7 +83,7 @@ fn fixture(path: &str) -> PathBuf {
 
 /// Inserts the minimum terminal agent, bound session, and delivery rows for a dispatcher test.
 fn delivery(home: &Path, id: &str, transport: &str, state: &str) {
-    let connection = Connection::open(home.join("state.db")).unwrap();
+    let connection = fixture_connection(home.join("state.db")).unwrap();
     connection
         .execute(
             "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) VALUES('sess',?,?,?,?)",
@@ -115,7 +116,7 @@ fn delivery_config(home: &Path, base: f64, cap: f64, max_attempts: u32) {
 
 /// Makes one pending delivery due immediately after an earlier attempt.
 fn make_due(home: &Path, id: &str) {
-    Connection::open(home.join("state.db"))
+    fixture_connection(home.join("state.db"))
         .unwrap()
         .execute(
             "UPDATE deliveries SET next_attempt_at=? WHERE id=?",
@@ -203,7 +204,7 @@ fn evidence_redacts_secret_shaped_tails_and_caps_utf8() {
 async fn stability_cancelled_notice_does_not_block_outbox() {
     let home = common::Home::new();
     delivery(&home.path, "ntf_first", "fixture-unsupported", "pending");
-    let db = Connection::open(home.path.join("state.db")).unwrap();
+    let db = fixture_connection(home.path.join("state.db")).unwrap();
     db.execute(
         "UPDATE agents SET status='cancelled',failure_kind='cancelled_before_spawn'",
         [],
@@ -231,7 +232,7 @@ async fn stability_cancelled_notice_does_not_block_outbox() {
 async fn stability_invalid_payload_isolated_from_next_notice() {
     let home = common::Home::new();
     delivery(&home.path, "ntf_first", "fixture-unsupported", "pending");
-    let db = Connection::open(home.path.join("state.db")).unwrap();
+    let db = fixture_connection(home.path.join("state.db")).unwrap();
     db.execute("UPDATE agents SET root_agent_id='invalid'", [])
         .unwrap();
     db.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) VALUES('ag-20261004-000000-0000000002','mock','fixture','review','t','t','/tmp','{}','succeeded',1,'fixture','ag-20261004-000000-0000000002')", []).unwrap();
@@ -254,7 +255,7 @@ async fn unavailable_queue_retries_once_with_one_evidence_row() {
     let home = common::Home::new();
     delivery(&home.path, "ntf_retry", "codex_queue", "pending");
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
-    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let connection = fixture_connection(home.path.join("state.db")).unwrap();
     let row: (String, u32, Option<f64>, Option<String>) = connection
         .query_row(
             "SELECT state,attempts,next_attempt_at,last_error FROM deliveries WHERE id='ntf_retry'",
@@ -296,7 +297,7 @@ async fn ambiguous_acknowledgement_is_recorded_and_retried() {
     let result = dispatch_with_batch(&home.path, 1).await.unwrap();
     assert_eq!((result.claimed, result.ambiguous), (1, 1));
     peer.await.unwrap();
-    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let connection = fixture_connection(home.path.join("state.db")).unwrap();
     let row: (String, bool, String) = connection
         .query_row(
             "SELECT state,ambiguous_result,last_error FROM deliveries WHERE id='ntf_ambiguous'",
@@ -315,7 +316,7 @@ async fn unknown_transport_is_terminal_and_unbound_from_schedule() {
     let home = common::Home::new();
     delivery(&home.path, "ntf_unknown", "not-configured", "pending");
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
-    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let connection = fixture_connection(home.path.join("state.db")).unwrap();
     let row: (String, Option<f64>) = connection
         .query_row(
             "SELECT state,next_attempt_at FROM deliveries WHERE id='ntf_unknown'",
@@ -340,7 +341,7 @@ async fn schema_two_delivery_completes_without_legacy_config() {
     delivery(&home.path, "ntf_schema_two", "not-configured", "pending");
 
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
-    let (state, attempts): (String, i64) = Connection::open(home.path.join("state.db"))
+    let (state, attempts): (String, i64) = fixture_connection(home.path.join("state.db"))
         .unwrap()
         .query_row(
             "SELECT state,attempts FROM deliveries WHERE id='ntf_schema_two'",
@@ -355,7 +356,7 @@ async fn schema_two_delivery_completes_without_legacy_config() {
 #[tokio::test]
 async fn unbound_terminal_delivery_expires_before_claiming() {
     let home = common::Home::new();
-    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let connection = fixture_connection(home.path.join("state.db")).unwrap();
     let agent = "ag-20260825-120000-0123456789";
     connection.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", params![agent,"mock","fixture","review","private task","summary",home.path.to_string_lossy(),"{}","succeeded",now()-7200.0,"fixture",agent]).unwrap();
     connection
@@ -368,7 +369,7 @@ async fn unbound_terminal_delivery_expires_before_claiming() {
     connection.execute("INSERT INTO deliveries(id,agent_id,terminal_event_seq,state) VALUES(?,?,?,'waiting_binding')", params!["ntf_expire",agent,event]).unwrap();
     drop(connection);
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 0);
-    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let connection = fixture_connection(home.path.join("state.db")).unwrap();
     let state: String = connection
         .query_row(
             "SELECT state FROM deliveries WHERE id='ntf_expire'",
@@ -391,7 +392,7 @@ fn golden_delivery_database_is_read_from_a_copy() {
         &copy,
     )
     .unwrap();
-    let connection = Connection::open(copy).unwrap();
+    let connection = fixture_connection(copy).unwrap();
     let rows: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM delivery_attempt_evidence",
@@ -1089,7 +1090,7 @@ async fn claude_uds_reset_after_write_body(home: &Path) {
             drop(stream);
         }
     });
-    let connection = Connection::open(home.join("state.db")).unwrap();
+    let connection = fixture_connection(home.join("state.db")).unwrap();
     connection
         .execute(
             "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) VALUES('sess','claude_uds','session-1',?1,?1)",
@@ -1111,7 +1112,7 @@ async fn claude_uds_reset_after_write_body(home: &Path) {
     drop(connection);
     assert_eq!(dispatch_once(home).await.unwrap(), 1);
     peer.await.unwrap();
-    let row: (String, u32, Option<f64>, bool) = Connection::open(home.join("state.db"))
+    let row: (String, u32, Option<f64>, bool) = fixture_connection(home.join("state.db"))
         .unwrap()
         .query_row(
             "SELECT state,attempts,next_attempt_at,ambiguous_result FROM deliveries WHERE id='ntf_reset'",
@@ -1159,7 +1160,7 @@ async fn claude_uds_unconfirmed_write_body(home: &Path) {
             assert_eq!(received.lines().count(), 2);
         }
     });
-    let connection = Connection::open(home.join("state.db")).unwrap();
+    let connection = fixture_connection(home.join("state.db")).unwrap();
     connection
         .execute(
             "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) VALUES('sess','claude_uds','session-1',?1,?1)",
@@ -1180,7 +1181,7 @@ async fn claude_uds_unconfirmed_write_body(home: &Path) {
         .unwrap();
     assert_eq!(dispatch_once(home).await.unwrap(), 1);
     peer.await.unwrap();
-    let connection = Connection::open(home.join("state.db")).unwrap();
+    let connection = fixture_connection(home.join("state.db")).unwrap();
     let row: (String, u32, Option<String>, Option<f64>, bool) = connection
         .query_row(
             "SELECT state,attempts,last_error,next_attempt_at,ambiguous_result FROM deliveries WHERE id='ntf_unconfirmed'",
@@ -1208,7 +1209,7 @@ async fn claude_uds_unconfirmed_write_body(home: &Path) {
     );
     // The public status view exposes the last attempt instead of null.
     let agent: AgentId = "ag-20260825-120000-0123456789".parse().unwrap();
-    let status = agent_run_store::Store::open(home)
+    let status = agent_run_store::fixture::open(home)
         .unwrap()
         .delivery_status(&agent)
         .unwrap();
@@ -1234,7 +1235,7 @@ async fn claude_uds_known_unsent_attempt_still_retries() {
 async fn claude_uds_known_unsent_attempt_body(home: &Path) {
     let registry = home.join("sessions");
     std::fs::create_dir(&registry).unwrap();
-    let connection = Connection::open(home.join("state.db")).unwrap();
+    let connection = fixture_connection(home.join("state.db")).unwrap();
     for sql in [
         "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) VALUES('sess','claude_uds','session-gone',1.0,1.0)",
         "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary','/tmp','{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',1.0,'fixture','ag-20260825-120000-0123456789')",
@@ -1295,7 +1296,7 @@ async fn legacy_possibly_sent_claude_retry_body(home: &Path) {
         );
         frame
     });
-    let connection = Connection::open(home.join("state.db")).unwrap();
+    let connection = fixture_connection(home.join("state.db")).unwrap();
     for sql in [
         "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) VALUES('sess','claude_uds','session-1',1.0,1.0)",
         "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) VALUES('ag-20260825-120000-0123456789','mock','fixture','review','private task','summary','/tmp','{\"runtime\":\"mock\",\"model\":\"fixture\",\"profile\":\"review\",\"task\":\"fixture task\",\"workdir\":\"/tmp\"}','succeeded',1.0,'fixture','ag-20260825-120000-0123456789')",
@@ -1373,7 +1374,7 @@ async fn claude_uds_hold_receipt_body(home: &Path) {
         let (mut stream, _) = listener.accept().await.unwrap();
         native_inbox_connection(&mut stream, &inbox, Some(("ntf_held", "held"))).await
     });
-    let connection = Connection::open(home.join("state.db")).unwrap();
+    let connection = fixture_connection(home.join("state.db")).unwrap();
     connection
         .execute(
             "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) VALUES('sess','claude_uds','session-1',?1,?1)",
@@ -1401,7 +1402,7 @@ async fn claude_uds_hold_receipt_body(home: &Path) {
     );
     assert_eq!(frame["msg_id"], "ntf_held");
     let row: (String, Option<f64>, Option<String>, bool) =
-        Connection::open(home.join("state.db"))
+        fixture_connection(home.join("state.db"))
             .unwrap()
             .query_row(
                 "SELECT state,next_attempt_at,last_error,ambiguous_result FROM deliveries WHERE id='ntf_held'",
@@ -1413,7 +1414,7 @@ async fn claude_uds_hold_receipt_body(home: &Path) {
     assert_eq!(row.1, None);
     assert_eq!(row.2, None);
     assert!(!row.3);
-    let evidence: (i64, String) = Connection::open(home.join("state.db"))
+    let evidence: (i64, String) = fixture_connection(home.join("state.db"))
         .unwrap()
         .query_row(
             "SELECT COUNT(*),MAX(evidence_json) FROM delivery_attempt_evidence WHERE delivery_id='ntf_held'",
@@ -1427,7 +1428,7 @@ async fn claude_uds_hold_receipt_body(home: &Path) {
     assert!(!evidence.1.contains("ntf_held"), "no notice id persisted");
     assert!(!evidence.1.contains("session-1"), "no session id persisted");
     let agent: AgentId = "ag-20260825-120000-0123456789".parse().unwrap();
-    let status = agent_run_store::Store::open(home)
+    let status = agent_run_store::fixture::open(home)
         .unwrap()
         .delivery_status(&agent)
         .unwrap();
@@ -1936,7 +1937,7 @@ async fn dispatch_records_retry_and_success_evidence_for_one_bound_notice() {
 
     let home = common::Home::new();
     delivery(&home.path, "ntf_once", "codex_queue", "pending");
-    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let connection = fixture_connection(home.path.join("state.db")).unwrap();
     connection
         .execute(
             "UPDATE agents SET runtime='codex',model='gpt-5',request_json='{broken'",
@@ -1959,7 +1960,7 @@ async fn dispatch_records_retry_and_success_evidence_for_one_bound_notice() {
             .unwrap();
         serde_json::from_slice::<Value>(&data).unwrap()
     });
-    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let connection = fixture_connection(home.path.join("state.db")).unwrap();
     connection
         .execute(
             "UPDATE deliveries SET next_attempt_at=? WHERE id='ntf_once'",
@@ -1969,7 +1970,7 @@ async fn dispatch_records_retry_and_success_evidence_for_one_bound_notice() {
     drop(connection);
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
     let request = peer.await.unwrap();
-    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let connection = fixture_connection(home.path.join("state.db")).unwrap();
     let row: (String, i64, Option<f64>) = connection
         .query_row(
             "SELECT state,attempts,next_attempt_at FROM deliveries WHERE id='ntf_once'",
@@ -1999,7 +2000,7 @@ async fn retry_dispatch_canonicalizes_legacy_transport_alias() {
 
     let home = common::Home::new();
     delivery(&home.path, "ntf_legacy_alias", "codex", "retry_wait");
-    Connection::open(home.path.join("state.db"))
+    fixture_connection(home.path.join("state.db"))
         .unwrap()
         .execute(
             "UPDATE deliveries SET attempts=1,next_attempt_at=? WHERE id='ntf_legacy_alias'",
@@ -2022,7 +2023,7 @@ async fn retry_dispatch_canonicalizes_legacy_transport_alias() {
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
     assert_eq!(peer.await.unwrap()["op"], "completion");
     assert_eq!(
-        Connection::open(home.path.join("state.db"))
+        fixture_connection(home.path.join("state.db"))
             .unwrap()
             .query_row(
                 "SELECT state FROM deliveries WHERE id='ntf_legacy_alias'",
@@ -2041,7 +2042,7 @@ async fn dispatches_worker_report_without_completion_status() {
 
     let home = common::Home::new();
     delivery(&home.path, "ntf_worker", "codex_queue", "pending");
-    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let connection = fixture_connection(home.path.join("state.db")).unwrap();
     connection.execute(
         "INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at) VALUES('attempt-worker',?,1,'finished','{}',?)",
         params!["ag-20260825-120000-0123456789", now()],
@@ -2113,7 +2114,7 @@ async fn pool_linked_worker_report_is_rendered_with_the_stamped_sender() {
 
     let home = common::Home::new();
     delivery(&home.path, "ntf_pool", "codex_queue", "pending");
-    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let connection = fixture_connection(home.path.join("state.db")).unwrap();
     let agent = "ag-20260825-120000-0123456789";
     let body = "x".repeat(2048);
     connection
@@ -2165,7 +2166,7 @@ async fn pool_linked_worker_report_is_rendered_with_the_stamped_sender() {
 /// Inserts one completed pool anchored on the fixture agent: its frozen
 /// completion event, the linked delivery and the pool row.
 fn completed_pool(home: &Path, delivery_id: &str, notice: &str) {
-    let connection = Connection::open(home.join("state.db")).unwrap();
+    let connection = fixture_connection(home.join("state.db")).unwrap();
     let agent = "ag-20260825-120000-0123456789";
     connection
         .execute(
@@ -2223,7 +2224,7 @@ async fn pool_completion_is_dispatched_as_one_common_conclusion() {
                "notification_id":"ntf_poolc","pool_id":"pool-20261003-120000-0123456789",
                "message":text})
     );
-    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let connection = fixture_connection(home.path.join("state.db")).unwrap();
     let (state, evidence): (String, i64) = (
         connection
             .query_row(
@@ -2410,12 +2411,12 @@ async fn relay_ambiguity_is_classified_as_at_least_once() {
 #[tokio::test]
 async fn missing_relay_does_not_create_a_replacement_agent() {
     let home = common::Home::new();
-    let before: i64 = Connection::open(home.path.join("state.db"))
+    let before: i64 = fixture_connection(home.path.join("state.db"))
         .unwrap()
         .query_row("SELECT COUNT(*) FROM agents", [], |row| row.get(0))
         .unwrap();
     let evidence = relay::send(&home.path, "gone", &notice()).await;
-    let after: i64 = Connection::open(home.path.join("state.db"))
+    let after: i64 = fixture_connection(home.path.join("state.db"))
         .unwrap()
         .query_row("SELECT COUNT(*) FROM agents", [], |row| row.get(0))
         .unwrap();
@@ -2515,7 +2516,7 @@ async fn unavailable_relay_and_unknown_transport_are_delivery_failures() {
     );
     delivery(&home.path, "ntf_foreign", "slack", "pending");
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
-    let state: String = Connection::open(home.path.join("state.db"))
+    let state: String = fixture_connection(home.path.join("state.db"))
         .unwrap()
         .query_row(
             "SELECT state FROM deliveries WHERE id='ntf_foreign'",
@@ -2556,7 +2557,7 @@ async fn cancellation_during_send_wins_over_a_late_acknowledgement() {
         let length = stream.read_u32_le().await.unwrap() as usize;
         let mut request = vec![0; length];
         stream.read_exact(&mut request).await.unwrap();
-        let mut store = agent_run_store::Store::open(&cancel_home).unwrap();
+        let mut store = agent_run_store::fixture::open(&cancel_home).unwrap();
         assert!(store.cancel_delivery("ntf_cancel_send").unwrap());
         let reply = br#"{"outcome":"accepted"}"#;
         stream.write_u32_le(reply.len() as u32).await.unwrap();
@@ -2564,7 +2565,7 @@ async fn cancellation_during_send_wins_over_a_late_acknowledgement() {
     });
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
     peer.await.unwrap();
-    let state: String = Connection::open(home.path.join("state.db"))
+    let state: String = fixture_connection(home.path.join("state.db"))
         .unwrap()
         .query_row(
             "SELECT state FROM deliveries WHERE id='ntf_cancel_send'",
@@ -2580,11 +2581,11 @@ async fn cancellation_during_send_wins_over_a_late_acknowledgement() {
 async fn cancelled_delivery_is_not_claimed_again() {
     let home = common::Home::new();
     delivery(&home.path, "ntf_cancelled", "codex_queue", "pending");
-    let mut store = agent_run_store::Store::open(&home.path).unwrap();
+    let mut store = agent_run_store::fixture::open(&home.path).unwrap();
     assert!(store.cancel_delivery("ntf_cancelled").unwrap());
     drop(store);
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 0);
-    let state: String = Connection::open(home.path.join("state.db"))
+    let state: String = fixture_connection(home.path.join("state.db"))
         .unwrap()
         .query_row(
             "SELECT state FROM deliveries WHERE id='ntf_cancelled'",
@@ -2604,7 +2605,7 @@ async fn exhausted_attempt_budget_fails_without_a_third_retry() {
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
     make_due(&home.path, "ntf_exhausted");
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
-    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let connection = fixture_connection(home.path.join("state.db")).unwrap();
     let row: (String, u32, Option<f64>) = connection
         .query_row(
             "SELECT state,attempts,next_attempt_at FROM deliveries WHERE id='ntf_exhausted'",
@@ -2620,7 +2621,7 @@ async fn exhausted_attempt_budget_fails_without_a_third_retry() {
 #[tokio::test]
 async fn running_unbound_delivery_never_expires() {
     let home = common::Home::new();
-    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let connection = fixture_connection(home.path.join("state.db")).unwrap();
     let agent = "ag-20260825-120000-0123456789";
     connection.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", params![agent,"mock","fixture","review","task","summary",home.path.to_string_lossy(),"{}","running",now()-7200.0,"fixture",agent]).unwrap();
     connection
@@ -2633,7 +2634,7 @@ async fn running_unbound_delivery_never_expires() {
     connection.execute("INSERT INTO deliveries(id,agent_id,terminal_event_seq,state) VALUES(?,?,?,'waiting_binding')", params!["ntf_running",agent,event]).unwrap();
     drop(connection);
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 0);
-    let state: String = Connection::open(home.path.join("state.db"))
+    let state: String = fixture_connection(home.path.join("state.db"))
         .unwrap()
         .query_row(
             "SELECT state FROM deliveries WHERE id='ntf_running'",
@@ -2648,7 +2649,7 @@ async fn running_unbound_delivery_never_expires() {
 #[tokio::test]
 async fn recent_unbound_terminal_delivery_waits_for_binding() {
     let home = common::Home::new();
-    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let connection = fixture_connection(home.path.join("state.db")).unwrap();
     let agent = "ag-20260825-120000-0123456789";
     connection.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", params![agent,"mock","fixture","review","task","summary",home.path.to_string_lossy(),"{}","succeeded",now()-3599.0,"fixture",agent]).unwrap();
     connection
@@ -2661,7 +2662,7 @@ async fn recent_unbound_terminal_delivery_waits_for_binding() {
     connection.execute("INSERT INTO deliveries(id,agent_id,terminal_event_seq,state) VALUES(?,?,?,'waiting_binding')", params!["ntf_recent",agent,event]).unwrap();
     drop(connection);
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 0);
-    let state: String = Connection::open(home.path.join("state.db"))
+    let state: String = fixture_connection(home.path.join("state.db"))
         .unwrap()
         .query_row(
             "SELECT state FROM deliveries WHERE id='ntf_recent'",
@@ -2679,7 +2680,7 @@ async fn bounded_dispatch_drains_backlog_and_leaves_overflow_due() {
 
     let home = common::Home::new();
     delivery(&home.path, "ntf_batch_1", "codex_queue", "pending");
-    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let connection = fixture_connection(home.path.join("state.db")).unwrap();
     for index in 2..=3 {
         let session = format!("sess{index}");
         let id = format!("ntf_batch_{index}");
@@ -2742,11 +2743,27 @@ async fn concurrent_dispatchers_have_one_nonblocking_owner() {
     let first_home = home.path.clone();
     let first_task = tokio::spawn(async move { dispatch_with_batch(&first_home, 1).await });
     ready_rx.await.unwrap();
+    // The first notice is leased, so empty-schedule preflight correctly skips a lock.
+    // A second due notice makes this a genuine nonblocking ownership contention.
+    fixture_connection(home.path.join("state.db")).unwrap().execute(
+        "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,next_attempt_at) SELECT 'ntf_other_due',agent_id,orchestrator_session_id,'pending',0 FROM deliveries WHERE id='ntf_lock'", [],
+    ).unwrap();
     let blocked = dispatch_with_batch(&home.path, 1).await.unwrap();
     assert!(blocked.locked_out);
     release_tx.send(()).unwrap();
     let first = first_task.await.unwrap().unwrap();
     assert_eq!((first.claimed, first.delivered), (1, 1));
+    assert_eq!(
+        fixture_connection(home.path.join("state.db"))
+            .unwrap()
+            .query_row(
+                "SELECT attempts FROM deliveries WHERE id='ntf_other_due'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
     peer.await.unwrap();
 }
 
@@ -2785,7 +2802,7 @@ async fn malformed_effort_values_degrade_to_unspecified_without_blocking_deliver
         efforts
     });
     for raw in malformed {
-        Connection::open(home.path.join("state.db"))
+        fixture_connection(home.path.join("state.db"))
             .unwrap()
             .execute(
                 "UPDATE agents SET request_json=? WHERE id=?",
@@ -2794,7 +2811,7 @@ async fn malformed_effort_values_degrade_to_unspecified_without_blocking_deliver
             .unwrap();
         if raw != "not json" {
             make_due(&home.path, "ntf_effort");
-            Connection::open(home.path.join("state.db"))
+            fixture_connection(home.path.join("state.db"))
                 .unwrap()
                 .execute(
                     "UPDATE deliveries SET state='pending' WHERE id='ntf_effort'",
@@ -2823,7 +2840,7 @@ async fn expired_send_lease_is_claim_lost_and_reclaimable() {
         let length = stream.read_u32_le().await.unwrap() as usize;
         let mut request = vec![0; length];
         stream.read_exact(&mut request).await.unwrap();
-        Connection::open(first_home.join("state.db"))
+        fixture_connection(first_home.join("state.db"))
             .unwrap()
             .execute(
                 "UPDATE deliveries SET lease_until=? WHERE id='ntf_lease'",
@@ -2836,7 +2853,7 @@ async fn expired_send_lease_is_claim_lost_and_reclaimable() {
     });
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
     first_peer.await.unwrap();
-    let state: String = Connection::open(home.path.join("state.db"))
+    let state: String = fixture_connection(home.path.join("state.db"))
         .unwrap()
         .query_row(
             "SELECT state FROM deliveries WHERE id='ntf_lease'",
@@ -2858,7 +2875,7 @@ async fn expired_send_lease_is_claim_lost_and_reclaimable() {
     });
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
     second_peer.await.unwrap();
-    let state: String = Connection::open(home.path.join("state.db"))
+    let state: String = fixture_connection(home.path.join("state.db"))
         .unwrap()
         .query_row(
             "SELECT state FROM deliveries WHERE id='ntf_lease'",
@@ -2884,7 +2901,7 @@ async fn unexpected_transport_outcome_is_sanitized_and_releases_the_claim() {
         "pending",
     );
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
-    let row: (String, Option<String>, Option<String>, Option<f64>) = Connection::open(
+    let row: (String, Option<String>, Option<String>, Option<f64>) = fixture_connection(
         home.path.join("state.db"),
     )
     .unwrap()
@@ -2931,7 +2948,7 @@ async fn unusable_dispatcher_lock_is_loud_not_contention() {
         dispatch_once(&home.path).await.is_err(),
         "the single-shot drain must fail loudly too"
     );
-    let state: String = Connection::open(home.path.join("state.db"))
+    let state: String = fixture_connection(home.path.join("state.db"))
         .unwrap()
         .query_row(
             "SELECT state FROM deliveries WHERE id='ntf_flock'",
@@ -2956,7 +2973,7 @@ async fn notice_projection_tolerates_rows_without_metadata() {
     let home = common::Home::new();
     delivery_config(&home.path, 1.0, 1.0, 5);
     delivery(&home.path, "ntf_bare", "codex_queue", "pending");
-    Connection::open(home.path.join("state.db"))
+    fixture_connection(home.path.join("state.db"))
         .unwrap()
         .execute(
             "UPDATE agents SET runtime='',model='   ',request_json='',failure_kind=NULL WHERE id=?",
@@ -2968,7 +2985,7 @@ async fn notice_projection_tolerates_rows_without_metadata() {
         1,
         "a metadata-free row is still claimed and attempted"
     );
-    let row: (String, u32) = Connection::open(home.path.join("state.db"))
+    let row: (String, u32) = fixture_connection(home.path.join("state.db"))
         .unwrap()
         .query_row(
             "SELECT state,attempts FROM deliveries WHERE id='ntf_bare'",
@@ -3062,7 +3079,7 @@ async fn relay_with_config_damaged_mid_send(
     });
     assert_eq!(dispatch_once(&home.path).await.unwrap(), 1);
     peer.await.unwrap();
-    let connection = Connection::open(home.path.join("state.db")).unwrap();
+    let connection = fixture_connection(home.path.join("state.db")).unwrap();
     let (state, attempts, last_error) = connection
         .query_row(
             "SELECT state,attempts,last_error FROM deliveries WHERE id=?",
@@ -3107,7 +3124,7 @@ async fn acknowledgement_survives_config_damage_after_claim() {
         // The delivered row is terminal, so a later drain claims nothing.
         make_due(&home.path, name);
         assert_eq!(dispatch_once(&home.path).await.unwrap(), 0);
-        let attempts: u32 = Connection::open(home.path.join("state.db"))
+        let attempts: u32 = fixture_connection(home.path.join("state.db"))
             .unwrap()
             .query_row("SELECT attempts FROM deliveries WHERE id=?", [name], |r| {
                 r.get(0)
@@ -3149,7 +3166,7 @@ async fn malformed_config_before_claim_leaves_delivery_pending() {
     delivery(&home.path, "ntf_cfg_pre", "codex_queue", "pending");
     std::fs::write(home.path.join("config.toml"), "schema_version = [").unwrap();
     assert!(dispatch_once(&home.path).await.is_err());
-    let (state, attempts): (String, u32) = Connection::open(home.path.join("state.db"))
+    let (state, attempts): (String, u32) = fixture_connection(home.path.join("state.db"))
         .unwrap()
         .query_row(
             "SELECT state,attempts FROM deliveries WHERE id='ntf_cfg_pre'",
@@ -3167,7 +3184,7 @@ async fn enrollment_attention_waits_for_v5_without_losing_outbox() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let home = common::Home::new();
     delivery(&home.path, "ntf_attention", "codex_queue", "pending");
-    let conn = Connection::open(home.path.join("state.db")).unwrap();
+    let conn = fixture_connection(home.path.join("state.db")).unwrap();
     conn.execute("INSERT INTO events(agent_id,at,kind,data_json) VALUES('ag-20260825-120000-0123456789',?,'pool_join_needs_action',?)",
         params![now(),json!({"pool_id":"pool-20261003-120000-0123456789","notice":"Existing enrollment needs action."}).to_string()]).unwrap();
     let seq = conn.last_insert_rowid();
@@ -3276,4 +3293,58 @@ async fn enrollment_attention_uses_distinct_claude_inbox_framing() {
             .starts_with("agent-run/pool-attention\n")
     );
     assert_eq!(evidence.classifier, "uds_receipt_held");
+}
+
+/// Open test SQL with the existing fixture fence; this is setup, never an online production fallback.
+fn fixture_connection(path: impl AsRef<Path>) -> rusqlite::Result<Connection> {
+    let connection = Connection::open(path)?;
+    agent_run_store::fixture::fenced(&connection).expect("fixture fence installs");
+    Ok(connection)
+}
+
+/// Retain one actual writer/socket per disposable delivery fixture so repeated calls share one connection.
+static DELIVERY_WRITERS: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<PathBuf, (common::writer::Harness, common::writer::NativeSocket)>,
+    >,
+> = std::sync::OnceLock::new();
+
+/// Supply the actual writer only for a nonempty schedule; empty read-only preflight remains observable.
+fn ready_writer(home: &Path) -> agent_run_domain::Result<()> {
+    if !agent_run_store::writer::StoreReader::open(home)?.delivery_pending(now())? {
+        return Ok(());
+    }
+    let mut writers = DELIVERY_WRITERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap();
+    writers.entry(home.to_path_buf()).or_insert_with(|| {
+        let writer = common::writer::Harness::start(home);
+        let socket = writer.serve_unix(home);
+        (writer, socket)
+    });
+    Ok(())
+}
+
+/// Execute one production dispatcher call with its real fixture writer when due work exists.
+async fn dispatch_once(home: &Path) -> agent_run_domain::Result<usize> {
+    ready_writer(home)?;
+    real_dispatch_once(home).await
+}
+
+/// Execute the bounded production dispatcher with its real fixture writer, preserving original batch limits.
+async fn dispatch_with_batch(
+    home: &Path,
+    batch: usize,
+) -> agent_run_domain::Result<agent_run_core::delivery::DispatchResult> {
+    ready_writer(home)?;
+    real_dispatch_with_batch(home, batch).await
+}
+
+/// Execute the default production dispatcher with its actual fixture writer.
+async fn dispatch(
+    home: &Path,
+) -> agent_run_domain::Result<agent_run_core::delivery::DispatchResult> {
+    ready_writer(home)?;
+    real_dispatch(home).await
 }

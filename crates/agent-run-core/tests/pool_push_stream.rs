@@ -35,6 +35,9 @@ async fn push_through(script: &str, initial: Option<&str>) -> Value {
         .unwrap();
     store.enqueue(&id, "pool", &json!({"seq": 1})).unwrap();
     let record = store.get(&id).unwrap();
+    let prep = common::writer::prepare_supervisor(&mut store, &id);
+    let harness = common::writer::Harness::start(&home.path);
+    let mut persist = harness.supervisor(&home.path, prep, &id).await;
     let plan = LaunchPlan {
         binary: "/bin/sh".into(),
         args: vec!["-c".into(), script.into()],
@@ -45,11 +48,12 @@ async fn push_through(script: &str, initial: Option<&str>) -> Value {
     let mut process = Process::spawn(&plan).expect("shell engine");
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        stream::run(&mut process, &mut store, &record, initial),
+        stream::run(&mut process, &mut persist, &record, initial),
     )
     .await
     .expect("finite engine ends")
     .expect("stream completes");
+    persist.flush().await.unwrap();
     assert_eq!(result.outcome.status, Status::Succeeded);
     process.reap().await;
     let raw: String = store

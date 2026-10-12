@@ -93,6 +93,9 @@ async fn research_is_rejected_when_native_controls_are_missing() {
         .unwrap();
     let mut store = fixture.store();
     let record = store.get(&id).unwrap();
+    let prep = common::writer::prepare_supervisor(&mut store, &id);
+    let harness = common::writer::Harness::start(&fixture.path);
+    let mut persist = harness.supervisor(&fixture.path, prep, &id).await;
     let app_home = fixture.path.join("codex-home");
     fs::private_dir(&app_home).unwrap();
     let mut role = profile();
@@ -103,13 +106,14 @@ async fn research_is_rejected_when_native_controls_are_missing() {
     let mut process = Process::spawn(&fake_plan()).unwrap();
     let result = codex::run(
         &mut process,
-        &mut store,
+        &mut persist,
         &record,
         &runtime(fixture.path.join("runtime")),
         &role,
         &app_home,
     )
     .await;
+    persist.flush().await.unwrap();
     assert!(
         result
             .err()
@@ -138,6 +142,9 @@ async fn research_verifies_controls_and_private_catalog_before_turn() {
             .unwrap();
         let mut store = fixture.store();
         let record = store.get(&id).unwrap();
+        let prep = common::writer::prepare_supervisor(&mut store, &id);
+        let harness = common::writer::Harness::start(&fixture.path);
+        let mut persist = harness.supervisor(&fixture.path, prep, &id).await;
         let app_home = fixture.path.join("codex-home");
         fs::private_dir(&app_home).unwrap();
         let mut role = profile();
@@ -175,13 +182,14 @@ esac; done"#,
         let mut process = Process::spawn(&plan).unwrap();
         let result = codex::run(
             &mut process,
-            &mut store,
+            &mut persist,
             &record,
             &runtime(fixture.path.join("runtime")),
             &role,
             &app_home,
         )
         .await;
+        persist.flush().await.unwrap();
         if extra_mcp {
             assert!(
                 result
@@ -264,13 +272,16 @@ async fn python_test_codex_app_server_unknown_item_completion_is_durable() {
         .expect("admit fixture");
     let mut store = fixture.store();
     let record = store.get(&id).expect("admitted row");
+    let prep = common::writer::prepare_supervisor(&mut store, &id);
+    let harness = common::writer::Harness::start(&fixture.path);
+    let mut persist = harness.supervisor(&fixture.path, prep, &id).await;
     let app_home = fixture.path.join("codex-home");
     fs::private_dir(&app_home).expect("owned Codex home");
     let mut process = Process::spawn(&fake_plan()).expect("fake app-server starts");
 
     let result = codex::run(
         &mut process,
-        &mut store,
+        &mut persist,
         &record,
         &runtime(fixture.path.join("runtime")),
         &profile(),
@@ -278,6 +289,7 @@ async fn python_test_codex_app_server_unknown_item_completion_is_durable() {
     )
     .await
     .expect("fake turn succeeds");
+    persist.flush().await.unwrap();
 
     assert_eq!(result.outcome.status, Status::Succeeded);
     let stored = store.get(&id).expect("persisted Codex row");
@@ -310,13 +322,16 @@ async fn python_test_codex_app_server_repeated_chunks_are_journaled_after_idle_p
         .expect("admit fixture");
     let mut store = fixture.store();
     let record = store.get(&id).expect("admitted row");
+    let prep = common::writer::prepare_supervisor(&mut store, &id);
+    let harness = common::writer::Harness::start(&fixture.path);
+    let mut persist = harness.supervisor(&fixture.path, prep, &id).await;
     let app_home = fixture.path.join("codex-home");
     fs::private_dir(&app_home).expect("owned Codex home");
     let mut process = Process::spawn(&streaming_plan()).expect("fake app-server starts");
 
     let result = codex::run(
         &mut process,
-        &mut store,
+        &mut persist,
         &record,
         &runtime(fixture.path.join("runtime")),
         &profile(),
@@ -324,6 +339,7 @@ async fn python_test_codex_app_server_repeated_chunks_are_journaled_after_idle_p
     )
     .await
     .expect("fake stream succeeds");
+    persist.flush().await.unwrap();
 
     assert_eq!(result.outcome.status, Status::Succeeded);
     // Rust-internal assertion: repeated deltas must remain separate journal
@@ -358,6 +374,9 @@ async fn custom_codex_stdout_redacts_split_token_and_command_output() {
         .unwrap();
     let mut store = fixture.store();
     let record = store.get(&id).unwrap();
+    let prep = common::writer::prepare_supervisor(&mut store, &id);
+    let harness = common::writer::Harness::start(&fixture.path);
+    let mut persist = harness.supervisor(&fixture.path, prep, &id).await;
     let app_home = fixture.path.join("codex-home");
     fs::private_dir(&app_home).unwrap();
     let mut process = Process::spawn(&secret_plan()).unwrap();
@@ -368,7 +387,7 @@ async fn custom_codex_stdout_redacts_split_token_and_command_output() {
 
     let result = codex::run(
         &mut process,
-        &mut store,
+        &mut persist,
         &record,
         &runtime(fixture.path.join("runtime")),
         &profile(),
@@ -376,6 +395,7 @@ async fn custom_codex_stdout_redacts_split_token_and_command_output() {
     )
     .await
     .unwrap();
+    persist.flush().await.unwrap();
     let transcript = store.transcript(&id, 0, 20).unwrap().to_string();
     let events: String = store
         .conn
@@ -410,6 +430,9 @@ async fn first_codex_delta_is_journaled_on_arrival() {
         .expect("admit fixture");
     let mut store = fixture.store();
     let record = store.get(&id).expect("admitted row");
+    let prep = common::writer::prepare_supervisor(&mut store, &id);
+    let harness = common::writer::Harness::start(&fixture.path);
+    let mut persist = harness.supervisor(&fixture.path, prep, &id).await;
     let app_home = fixture.path.join("codex-home");
     fs::private_dir(&app_home).expect("owned Codex home");
     let mut process = Process::spawn(&lone_delta_plan()).expect("fake app-server starts");
@@ -417,7 +440,7 @@ async fn first_codex_delta_is_journaled_on_arrival() {
     let profile = profile();
     let run = codex::run(
         &mut process,
-        &mut store,
+        &mut persist,
         &record,
         &runtime,
         &profile,
@@ -460,6 +483,9 @@ async fn terminal_turn_keeps_redactor_tail_without_item_completion() {
         .unwrap();
     let mut store = fixture.store();
     let record = store.get(&id).unwrap();
+    let prep = common::writer::prepare_supervisor(&mut store, &id);
+    let harness = common::writer::Harness::start(&fixture.path);
+    let mut persist = harness.supervisor(&fixture.path, prep, &id).await;
     let app_home = fixture.path.join("codex-home");
     fs::private_dir(&app_home).unwrap();
     let mut plan = lone_delta_plan();
@@ -468,7 +494,7 @@ async fn terminal_turn_keeps_redactor_tail_without_item_completion() {
     let mut process = Process::spawn(&plan).unwrap();
     let result = codex::run(
         &mut process,
-        &mut store,
+        &mut persist,
         &record,
         &runtime(fixture.path.join("runtime")),
         &profile(),
@@ -476,6 +502,7 @@ async fn terminal_turn_keeps_redactor_tail_without_item_completion() {
     )
     .await
     .unwrap();
+    persist.flush().await.unwrap();
     assert_eq!(result.outcome.status, Status::Succeeded);
     let transcript = store.transcript(&id, 0, 10).unwrap();
     assert!(
@@ -600,6 +627,9 @@ async fn codex_turn_errors_cross_the_runner_boundary_typed() {
             .expect("admit fixture");
         let mut store = fixture.store();
         let record = store.get(&id).expect("admitted row");
+        let prep = common::writer::prepare_supervisor(&mut store, &id);
+        let harness = common::writer::Harness::start(&fixture.path);
+        let mut persist = harness.supervisor(&fixture.path, prep, &id).await;
         let app_home = fixture.path.join("codex-home");
         fs::private_dir(&app_home).expect("owned Codex home");
         let mut plan = fake_plan();
@@ -607,7 +637,7 @@ async fn codex_turn_errors_cross_the_runner_boundary_typed() {
         let mut process = Process::spawn(&plan).expect("fake app-server starts");
         let result = codex::run(
             &mut process,
-            &mut store,
+            &mut persist,
             &record,
             &runtime(fixture.path.join("runtime")),
             &profile(),
@@ -615,6 +645,7 @@ async fn codex_turn_errors_cross_the_runner_boundary_typed() {
         )
         .await
         .expect("fake turn ends");
+        persist.flush().await.unwrap();
         let class = result.native_failure.as_ref().map(|failure| match failure {
             NativeFailure::QuotaExhausted { signal, .. } => {
                 assert_eq!(*signal, "codex.usageLimitExceeded");
@@ -643,6 +674,9 @@ async fn codex_failure_redacts_before_truncating() {
         .unwrap();
     let mut store = fixture.store();
     let record = store.get(&id).unwrap();
+    let prep = common::writer::prepare_supervisor(&mut store, &id);
+    let harness = common::writer::Harness::start(&fixture.path);
+    let mut persist = harness.supervisor(&fixture.path, prep, &id).await;
     let app_home = fixture.path.join("codex-home");
     fs::private_dir(&app_home).unwrap();
     let mut plan = fake_plan();
@@ -658,7 +692,7 @@ async fn codex_failure_redacts_before_truncating() {
     let mut process = Process::spawn(&plan).unwrap();
     let result = codex::run(
         &mut process,
-        &mut store,
+        &mut persist,
         &record,
         &runtime(fixture.path.join("runtime")),
         &profile(),
@@ -666,6 +700,7 @@ async fn codex_failure_redacts_before_truncating() {
     )
     .await
     .unwrap();
+    persist.flush().await.unwrap();
     let failure = result.outcome.failure_text.unwrap();
     assert!(!failure.contains("synthet"));
     assert!(failure.chars().count() <= 512);
@@ -702,13 +737,16 @@ async fn codex_tool_evidence_journals_once_with_native_flags() {
         .expect("admit fixture");
     let mut store = fixture.store();
     let record = store.get(&id).expect("admitted row");
+    let prep = common::writer::prepare_supervisor(&mut store, &id);
+    let harness = common::writer::Harness::start(&fixture.path);
+    let mut persist = harness.supervisor(&fixture.path, prep, &id).await;
     let app_home = fixture.path.join("codex-home");
     fs::private_dir(&app_home).expect("owned Codex home");
     let mut process = Process::spawn(&tool_evidence_plan()).expect("fake app-server starts");
 
     let result = codex::run(
         &mut process,
-        &mut store,
+        &mut persist,
         &record,
         &runtime(fixture.path.join("runtime")),
         &profile(),
@@ -716,6 +754,7 @@ async fn codex_tool_evidence_journals_once_with_native_flags() {
     )
     .await
     .expect("fake turn succeeds");
+    persist.flush().await.unwrap();
 
     assert_eq!(result.outcome.status, Status::Succeeded);
     let page = store.transcript(&id, 0, 1000).expect("journal page");
@@ -830,12 +869,15 @@ async fn run_with_command(
     }))
     .unwrap();
     request.validate().unwrap();
-    let mut store = agent_run_core::state::Store::open(home).unwrap();
+    let mut store = agent_run_store::fixture::open(home).unwrap();
     let (id, _) = store.admit(&request, &config, &json!({}), None).unwrap();
     enqueue(&mut store, &id);
     drop(store);
-    let mut store = agent_run_core::state::Store::open(home).unwrap();
+    let mut store = agent_run_store::fixture::open(home).unwrap();
     let record = store.get(&id).unwrap();
+    let prep = common::writer::prepare_supervisor(&mut store, &id);
+    let harness = common::writer::Harness::start(home);
+    let mut persist = harness.supervisor(home, prep, &id).await;
     let app_home = home.join("codex-home");
     fs::private_dir(&app_home).unwrap();
     let runtime_home = home.join("runtime");
@@ -843,7 +885,7 @@ async fn run_with_command(
     let mut process = Process::spawn(&plan).expect("fake app-server starts");
     let result = codex::run(
         &mut process,
-        &mut store,
+        &mut persist,
         &record,
         &runtime(runtime_home),
         &profile(),
@@ -851,6 +893,7 @@ async fn run_with_command(
     )
     .await
     .expect("fake turn succeeds");
+    persist.flush().await.unwrap();
     assert_eq!(result.outcome.status, Status::Succeeded);
     drop(process.input.take());
     process.reap().await;
@@ -862,7 +905,7 @@ fn command_result(
     home: &std::path::Path,
     id: &agent_run_domain::domain::AgentId,
 ) -> serde_json::Value {
-    let store = agent_run_core::state::Store::open(home).unwrap();
+    let store = agent_run_store::fixture::open(home).unwrap();
     store
         .conn
         .query_row(
@@ -876,7 +919,7 @@ fn command_result(
 
 /// Counts journal rows containing the fixture steer text.
 fn steer_rows(home: &std::path::Path, id: &agent_run_domain::domain::AgentId) -> i64 {
-    let store = agent_run_core::state::Store::open(home).unwrap();
+    let store = agent_run_store::fixture::open(home).unwrap();
     store
         .conn
         .query_row(
@@ -906,7 +949,7 @@ async fn steer_pressure_is_uncertain_and_late_reply_is_metadata() {
         0,
         "unproven text is not journaled"
     );
-    let store = agent_run_core::state::Store::open(&fixture.path).unwrap();
+    let store = agent_run_store::fixture::open(&fixture.path).unwrap();
     let uncertain: i64 = store
         .conn
         .query_row(
@@ -956,7 +999,11 @@ async fn steer_rejection_is_proven_false() {
 async fn steer_reply_journals_the_delivered_text() {
     let fixture = common::Home::new();
     let id = run_with_steer(&fixture.path, steer_plan("result", false)).await;
-    assert_eq!(command_result(&fixture.path, &id), json!({"accepted":true}));
+    // The atomic observed-result operation stamps its evidence strength.
+    assert_eq!(
+        command_result(&fixture.path, &id),
+        json!({"accepted":true,"observation":"native_accepted"})
+    );
     assert_eq!(steer_rows(&fixture.path, &id), 1);
 }
 
@@ -999,7 +1046,7 @@ fn pool_result(
     home: &std::path::Path,
     id: &agent_run_domain::domain::AgentId,
 ) -> serde_json::Value {
-    let store = agent_run_core::state::Store::open(home).unwrap();
+    let store = agent_run_store::fixture::open(home).unwrap();
     store
         .conn
         .query_row(

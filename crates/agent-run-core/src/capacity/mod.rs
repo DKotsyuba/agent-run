@@ -11,7 +11,6 @@ pub mod quota_auth;
 pub mod ranking;
 pub mod sources;
 use crate::{Result, config::Config, domain::now, error::invalid, state::Store};
-use rusqlite::{TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -201,7 +200,7 @@ pub fn account_token_with(account: Option<&str>, absent: &str) -> String {
 /// Returns the number of samples committed. Errors are `Validation` for a
 /// malformed slice or an oversized (>64 KiB) topology payload, or the store's
 /// own error when the transaction fails.
-pub fn persist(home: &Path, slice: &Slice, retention: usize) -> Result<usize> {
+pub async fn persist(home: &Path, slice: &Slice, retention: usize) -> Result<usize> {
     // A blank runtime is rejected before the topology check: an empty topology
     // would otherwise validate against it and persist an unowned snapshot row.
     if slice.runtime.is_empty() {
@@ -237,17 +236,40 @@ pub fn persist(home: &Path, slice: &Slice, retention: usize) -> Result<usize> {
     if payload.len() > 65536 {
         return Err(invalid("quota topology exceeds 64 KiB"));
     }
-    let mut store = Store::open(home)?;
-    let tx = store
-        .conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    for s in &slice.samples {
-        tx.execute("INSERT INTO capacity_samples(runtime,lane,window,target,source,remaining_percent,reset_at,observed_at,valid_until,payload_json) VALUES(?,?,?,?,?,?,?,?,?,'null')",params![s.key.runtime,s.key.lane,s.key.window,s.key.target,s.key.source,s.remaining_percent,s.reset_at,s.observed_at,s.valid_until])?;
-    }
-    tx.execute("INSERT INTO capacity_route_snapshots(runtime,scope_id,observed_at,valid_until,payload_json) VALUES(?,?,?,?,?) ON CONFLICT(runtime,scope_id) DO UPDATE SET observed_at=excluded.observed_at,valid_until=excluded.valid_until,payload_json=excluded.payload_json",params![slice.runtime,slice.scope_id,slice.observed_at,slice.valid_until,payload])?;
-    tx.execute("DELETE FROM capacity_samples WHERE id NOT IN (SELECT id FROM capacity_samples ORDER BY observed_at DESC,id DESC LIMIT ?)",[retention as i64])?;
-    tx.commit()?;
-    Ok(slice.samples.len())
+    crate::persist::collector_producer(home)
+        .call(
+            agent_run_store::ops::PersistCapacitySamples {
+                runtime: slice.runtime.clone(),
+                scope_id: slice.scope_id.clone(),
+                observed_at: slice.observed_at,
+                valid_until: slice.valid_until,
+                topology_json: payload,
+                retention,
+                samples: slice
+                    .samples
+                    .iter()
+                    .map(|sample| {
+                        Ok(agent_run_store::ops::CapacitySampleRow {
+                            runtime: sample.key.runtime.clone(),
+                            lane: sample.key.lane.clone(),
+                            window: sample.key.window.clone(),
+                            target: sample.key.target.clone(),
+                            source: sample.key.source.clone(),
+                            remaining_percent: sample.remaining_percent,
+                            reset_at: sample.reset_at,
+                            observed_at: sample
+                                .observed_at
+                                .ok_or_else(|| invalid("capacity observation timestamp missing"))?,
+                            valid_until: sample
+                                .valid_until
+                                .ok_or_else(|| invalid("capacity validity timestamp missing"))?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            },
+            crate::broker_writer::BROKER_BUDGET,
+        )
+        .await
 }
 /// Trims the durable sample history to the newest `retention` rows.
 ///
@@ -258,16 +280,17 @@ pub fn persist(home: &Path, slice: &Slice, retention: usize) -> Result<usize> {
 /// round **regardless of whether any runtime collected**, so a round in which
 /// every runtime failed still enforces the global bound. A zero `retention` is
 /// a `Validation` error rather than a silent history wipe.
-pub fn prune(home: &Path, retention: usize) -> Result<()> {
+pub async fn prune(home: &Path, retention: usize) -> Result<()> {
     if retention == 0 {
         return Err(invalid("invalid quota retention"));
     }
-    let store = Store::open(home)?;
-    store.conn.execute(
-        "DELETE FROM capacity_samples WHERE id NOT IN (SELECT id FROM capacity_samples ORDER BY observed_at DESC,id DESC LIMIT ?)",
-        [retention as i64],
-    )?;
-    Ok(())
+    crate::persist::collector_producer(home)
+        .call(
+            agent_run_store::ops::PruneCapacitySamples { retention },
+            crate::broker_writer::BROKER_BUDGET,
+        )
+        .await
+        .map(drop)
 }
 fn row_sample(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sample> {
     Ok(Sample {

@@ -3,7 +3,6 @@
 mod common;
 
 use agent_run_domain::{Error, domain::Status};
-use agent_run_store::Store;
 use serde_json::json;
 use std::{
     process::Command,
@@ -130,7 +129,7 @@ fn parallel_admissions_share_one_active_slot() {
         let config = config.clone();
         let barrier = Arc::clone(&barrier);
         thread::spawn(move || {
-            let mut store = Store::open(&path).unwrap();
+            let mut store = agent_run_store::fixture::open(&path).unwrap();
             let mut request: agent_run_domain::domain::StartRequest =
                 serde_json::from_value(json!({
                     "runtime": "mock", "model": "fixture", "profile": "review", "task": task,

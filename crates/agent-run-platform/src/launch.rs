@@ -6,7 +6,7 @@
 //! parent then waits for the child's PID proof and READY token, verifies that
 //! the leader heads its own group, and on failure signals only that verified
 //! group before reaping it. See `docs/process-identity.md`.
-use crate::process::{self, Identity, ProcessState};
+use crate::process::{self, Identity};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
@@ -34,6 +34,15 @@ pub const READY_FD: RawFd = 3;
 pub const IDENTITY_FD: RawFd = 4;
 /// Child descriptor that receives one bounded bootstrap failure record.
 pub const ERROR_FD: RawFd = 5;
+/// Child descriptor that carries the optional per-launch writer capability.
+///
+/// It is the read end of a private pipe created for exactly one launch; the
+/// parent writes the secret only after durable startup evidence exists and then
+/// closes its end. The child reads it with [`read_capability`], which closes the
+/// descriptor, so no later child (native harness) can inherit it.
+pub const CAPABILITY_FD: RawFd = 6;
+/// Upper bound on the capability secret a launch may carry.
+pub const CAPABILITY_MAX_BYTES: usize = 128;
 /// Failure kind when the launch executable is unusable before spawning.
 pub const FAILURE_KIND_EXECUTABLE_MISSING: &str = "supervisor_executable_missing";
 /// Failure kind when the child died before proving its identity.
@@ -161,56 +170,261 @@ pub struct Termination {
 /// `on_spawned` runs once with the provisional PID before any proof, for
 /// durable startup evidence; its error is handled like a failed handshake.
 /// Every failure after spawning reaps the child or reports failed cleanup.
+/// This synchronous form carries no capability; asynchronous callers use
+/// [`spawn_launch`] so they can await durable evidence between the steps.
 pub fn launch_detached(
     program: &Path,
     args: &[&OsStr],
     timeouts: Timeouts,
     on_spawned: impl FnOnce(i32, SpawnBackend) -> Result<(), String>,
 ) -> Result<Launched, LaunchError> {
+    let started = spawn_launch(program, args, timeouts, false)?;
+    match on_spawned(started.pid, started.backend) {
+        Ok(()) => started.complete(timeouts),
+        Err(message) => Err(started.abandon(
+            timeouts,
+            format!("supervisor startup evidence was not recorded: {message}"),
+        )),
+    }
+}
+
+/// A spawned but not yet proven detached supervisor.
+///
+/// Splitting the launch lets an asynchronous caller await durable startup
+/// evidence while holding the child at its first gate: when a capability was
+/// requested the child cannot authenticate (and therefore cannot do anything
+/// durable) until [`Self::release_capability`] runs. Dropping the value without
+/// calling [`Self::complete`] or [`Self::abandon`] leaves the child to the
+/// caller's recovery; both methods own verified cleanup.
+#[derive(Debug)]
+pub struct StartedLaunch {
+    /// Exact spawned PID, not yet proven by the child.
+    pub pid: i32,
+    /// Backend that created the session.
+    pub backend: SpawnBackend,
+    /// Single deadline for identity proof, capability hand-over and READY.
+    deadline: Instant,
+    ready: OwnedFd,
+    identity: OwnedFd,
+    error: OwnedFd,
+    /// Parent write end of the capability pipe until it is released.
+    capability: Option<OwnedFd>,
+}
+
+/// Preflight the executable and spawn a detached session leader without
+/// waiting for any proof.
+///
+/// With `with_capability` the child additionally inherits the read end of a
+/// private pipe as [`CAPABILITY_FD`] and receives `--capability-fd 6` on its
+/// command line; the secret itself is never an argument or environment value.
+/// The one `timeouts.ready` budget starts here.
+///
+/// # Errors
+/// [`LaunchError::Bootstrap`] when the executable is unusable, and
+/// [`LaunchError::Spawn`] when pipes or the spawn call fail (never retried
+/// through another backend).
+pub fn spawn_launch(
+    program: &Path,
+    args: &[&OsStr],
+    timeouts: Timeouts,
+    with_capability: bool,
+) -> Result<StartedLaunch, LaunchError> {
     preflight(program)?;
     let (ready_r, ready_w) = cloexec_pipe().map_err(LaunchError::Spawn)?;
     let (identity_r, identity_w) = cloexec_pipe().map_err(LaunchError::Spawn)?;
     let (error_r, error_w) = cloexec_pipe().map_err(LaunchError::Spawn)?;
-    let (pid, backend) = spawn_session_leader(program, args, [&ready_w, &identity_w, &error_w])
-        .map_err(LaunchError::Spawn)?;
-    drop((ready_w, identity_w, error_w));
-    let deadline = Instant::now() + timeouts.ready;
-    let mut leader = None;
-    let result = on_spawned(pid, backend)
-        .map_err(|message| LaunchError::Refused {
-            pid,
-            message: format!("supervisor startup evidence was not recorded: {message}"),
-        })
-        .and_then(|()| prove_identity(pid, &identity_r, &error_r, deadline))
-        .and_then(|()| {
+    let (capability_r, capability_w) = if with_capability {
+        let (read, write) = cloexec_pipe().map_err(LaunchError::Spawn)?;
+        (Some(read), Some(write))
+    } else {
+        (None, None)
+    };
+    let (pid, backend) = spawn_with_fds(
+        program,
+        args,
+        [&ready_w, &identity_w, &error_w],
+        capability_r.as_ref(),
+    )
+    .map_err(LaunchError::Spawn)?;
+    drop((ready_w, identity_w, error_w, capability_r));
+    Ok(StartedLaunch {
+        pid,
+        backend,
+        deadline: Instant::now() + timeouts.ready,
+        ready: ready_r,
+        identity: identity_r,
+        error: error_r,
+        capability: capability_w,
+    })
+}
+
+impl StartedLaunch {
+    /// Write the capability secret to the child and close the parent's end.
+    ///
+    /// Call only after durable startup evidence exists. The pipe buffer holds
+    /// the bounded secret, so this never blocks. The launch's single original
+    /// budget still governs: once its deadline passed the secret is NOT granted
+    /// (the pipe stays unreleased and unwritten), because the child's READY
+    /// window is over and the caller must [`Self::abandon`]. Releasing twice,
+    /// releasing a launch spawned without a capability, or an oversize secret is
+    /// refused without side effects on the child.
+    ///
+    /// # Errors
+    /// `InvalidInput` for a refused call, `TimedOut` after the original deadline
+    /// (no budget is renewed), or the pipe write error (for example the child
+    /// already exited); after any error the caller must [`Self::abandon`].
+    pub fn release_capability(&mut self, secret: &[u8]) -> io::Result<()> {
+        if secret.is_empty() || secret.len() > CAPABILITY_MAX_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "capability secret must be 1..=128 bytes",
+            ));
+        }
+        if self.capability.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "launch has no unreleased capability",
+            ));
+        }
+        if Instant::now() >= self.deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "launch budget expired before the capability was released",
+            ));
+        }
+        let fd = self.capability.take().expect("presence checked above");
+        let mut pipe = std::fs::File::from(fd);
+        // Dropping `pipe` after the write closes the parent end, giving the
+        // child EOF so it can bound its read.
+        io::Write::write_all(&mut pipe, secret)
+    }
+
+    /// Prove the child's identity and READY under the remaining launch budget.
+    ///
+    /// A capability launch must have released its secret first, otherwise the
+    /// child is still gated and this fails with a READY timeout and verified
+    /// cleanup. Every failure reaps the child or reports failed cleanup.
+    pub fn complete(self, timeouts: Timeouts) -> Result<Launched, LaunchError> {
+        let mut leader = None;
+        let deadline = self.deadline;
+        let pid = self.pid;
+        let backend = self.backend;
+        let result = prove_identity(pid, &self.identity, &self.error, deadline).and_then(|()| {
             leader = verify_group(pid)?;
-            wait_ready(pid, &ready_r, deadline)
+            wait_ready(pid, &self.ready, deadline)
         });
-    drop((ready_r, identity_r, error_r));
-    let error = match result {
-        Ok(()) => {
-            return Ok(Launched {
+        drop(self);
+        match result {
+            Ok(()) => Ok(Launched {
                 pid,
                 backend,
                 leader,
-            });
+            }),
+            Err(error) => Err(finish_failed(pid, leader, error, deadline, timeouts)),
         }
-        Err(error) => error,
-    };
+    }
+
+    /// Clean up the not-yet-authenticated child after the caller could not
+    /// record durable startup evidence or release the capability.
+    ///
+    /// Only a verified group is signalled; the returned error carries `message`
+    /// unless cleanup itself failed, in which case that failure wins.
+    pub fn abandon(self, timeouts: Timeouts, message: String) -> LaunchError {
+        let (pid, deadline) = (self.pid, self.deadline);
+        drop(self);
+        finish_failed(
+            pid,
+            None,
+            LaunchError::Refused { pid, message },
+            deadline,
+            timeouts,
+        )
+    }
+}
+
+/// Shared failure path: wait for natural exit, else signal only a verified group.
+fn finish_failed(
+    pid: i32,
+    leader: Option<Identity>,
+    error: LaunchError,
+    deadline: Instant,
+    timeouts: Timeouts,
+) -> LaunchError {
     if Instant::now() < deadline
         && wait_child(pid, timeouts.dispatch + Duration::from_millis(250)).is_some()
     {
-        return Err(error);
+        return error;
     }
     let leader = leader.or_else(|| verify_group(pid).ok().flatten());
     match cleanup(pid, leader.as_ref(), timeouts) {
-        Ok(()) => Err(error),
+        Ok(()) => error,
         Err(message) => {
             // Never leave a zombie behind, even when the group outlived cleanup.
             let _ = spawn_reaper(pid);
-            Err(LaunchError::Refused { pid, message })
+            LaunchError::Refused { pid, message }
         }
     }
+}
+
+/// Child half of the capability hand-over: read the secret from
+/// [`CAPABILITY_FD`] until the parent closes its end, then close the descriptor.
+///
+/// The descriptor is consumed even on failure so a later spawned harness can
+/// never inherit it. Reads at most [`CAPABILITY_MAX_BYTES`] before `timeout`.
+///
+/// # Errors
+/// `TimedOut` when the parent keeps the pipe open, `UnexpectedEof` when it
+/// closed without a secret, `InvalidData` when the secret is oversize.
+pub fn read_capability(fd: RawFd, timeout: Duration) -> io::Result<Vec<u8>> {
+    let pipe = inherit(fd)?;
+    let raw = pipe.as_raw_fd();
+    // The launcher's dup2 cleared close-on-exec so this process could inherit the
+    // descriptor. Restore it BEFORE any blocking wait so a concurrent exec in
+    // this process (a native harness) can never inherit the secret's pipe; on
+    // failure `pipe` drops and closes the descriptor.
+    set_cloexec(raw)?;
+    let deadline = Instant::now() + timeout;
+    let mut secret = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "capability was not released in time",
+            ));
+        }
+        if !poll_readable(raw, remaining)? {
+            continue;
+        }
+        let mut chunk = [0u8; 64];
+        // SAFETY: `chunk` is writable for its full length.
+        let read = unsafe { libc::read(raw, chunk.as_mut_ptr().cast(), chunk.len()) };
+        match read {
+            0 => break,
+            n if n > 0 => {
+                secret.extend_from_slice(&chunk[..n as usize]);
+                if secret.len() > CAPABILITY_MAX_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "capability exceeds its bound",
+                    ));
+                }
+            }
+            _ => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    if secret.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "launcher closed the capability pipe without a secret",
+        ));
+    }
+    Ok(secret)
 }
 
 /// Create a pipe whose both ends are close-on-exec.
@@ -250,7 +464,21 @@ pub fn spawn_session_leader(
     args: &[&OsStr],
     fds: [&OwnedFd; 3],
 ) -> io::Result<(i32, SpawnBackend)> {
-    let plan = prepare(program, args, fds)?;
+    spawn_with_fds(program, args, fds, None)
+}
+
+/// [`spawn_session_leader`] with an optional fourth descriptor.
+///
+/// `capability` (a pipe read end) becomes child descriptor [`CAPABILITY_FD`]
+/// and `--capability-fd 6` is appended to the command line; every other
+/// descriptor of this process stays closed in the child.
+pub fn spawn_with_fds(
+    program: &Path,
+    args: &[&OsStr],
+    fds: [&OwnedFd; 3],
+    capability: Option<&OwnedFd>,
+) -> io::Result<(i32, SpawnBackend)> {
+    let plan = prepare(program, args, fds, capability)?;
     match posix_spawn_setsid(&plan)? {
         Some(pid) => Ok((pid, SpawnBackend::PosixSpawnSetsid)),
         None => fork_setsid(&plan).map(|pid| (pid, SpawnBackend::ForkSetsid)),
@@ -262,7 +490,7 @@ pub fn spawn_session_leader(
 /// The child runs only async-signal-safe libc calls on memory prepared before
 /// fork; an exec failure writes one bounded record to descriptor 5's pipe.
 pub fn fork_session_leader(program: &Path, args: &[&OsStr], fds: [&OwnedFd; 3]) -> io::Result<i32> {
-    fork_setsid(&prepare(program, args, fds)?)
+    fork_setsid(&prepare(program, args, fds, None)?)
 }
 
 /// Reap exactly `pid` on a dedicated thread and return its raw wait status.
@@ -288,11 +516,46 @@ pub fn spawn_reaper(pid: i32) -> io::Result<JoinHandle<Option<i32>>> {
         })
 }
 
+/// Whether `leader` is, right now, the same live process (PID, birth/token)
+/// and still the leader of its own group, judged from ONE fresh snapshot.
+///
+/// Evaluated immediately before EVERY signal so a leader that exited or was
+/// reused during a grace wait is never trusted from an earlier observation. A
+/// single [`process::inspect`] supplies every fact (PID, birth, token, current
+/// group, zombie state); mixing two snapshots could let a reused PID satisfy one
+/// check with another process's facts. Identity matching follows the recorded
+/// evidence: Rust-written `linux:`/`darwin:` tokens must match exactly, and the
+/// birth time must always match. Dead, reused, zombie, unreadable, denied or
+/// no-longer-leading all answer `false`.
+fn leader_may_be_signalled(leader: &Identity) -> bool {
+    let pgid = leader.pid;
+    if pgid <= 1 || leader.group != pgid {
+        return false;
+    }
+    let Ok(current) = process::inspect(pgid) else {
+        return false;
+    };
+    let token_matches = if leader.token.starts_with("linux:") || leader.token.starts_with("darwin:")
+    {
+        current.token == leader.token
+    } else {
+        true
+    };
+    current.pid == pgid
+        && token_matches
+        && current.birth == leader.birth
+        && current.group == pgid
+        && !current.zombie
+}
+
 /// Python `terminate_process_group` without descendant snapshots.
 ///
 /// TERM, then KILL, the group led by `leader`, but only while that exact
-/// PID/birth identity is alive and leads its group. A reused, exited, unknown
-/// or denied leader is never signalled.
+/// PID/birth identity is alive and leads its group, re-verified immediately
+/// before each signal. A reused, exited, unknown or denied leader is never
+/// signalled: if the leader disappears during the TERM grace wait while
+/// members remain, no KILL is sent and the result honestly reports
+/// `group_gone == false` (cleanup unconfirmed) rather than assuming success.
 pub fn terminate_group(
     leader: &Identity,
     grace: Duration,
@@ -306,15 +569,11 @@ pub fn terminate_group(
             group_gone: true,
         });
     }
-    let may_signal = pgid > 1
-        && leader.group == pgid
-        && process::observe(Some(pgid), Some(&leader.token), Some(leader.birth))
-            == ProcessState::Alive;
-    if may_signal && signal_group(pgid, libc::SIGTERM)? {
+    if leader_may_be_signalled(leader) && signal_group(pgid, libc::SIGTERM)? {
         signals.push("SIGTERM");
     }
     let mut group_gone = await_group_exit(pgid, grace);
-    if !group_gone && may_signal {
+    if !group_gone && leader_may_be_signalled(leader) {
         if signal_group(pgid, libc::SIGKILL)? {
             signals.push("SIGKILL");
         }
@@ -365,6 +624,20 @@ pub fn report_ready(ready_fd: RawFd, outcome: Result<(), &str>) -> io::Result<()
     io::Write::write_all(&mut ready, line.as_bytes())
 }
 
+/// Set `FD_CLOEXEC` on an open descriptor.
+fn set_cloexec(fd: RawFd) -> io::Result<()> {
+    // SAFETY: F_GETFD reads the flags of an open descriptor; no pointers.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: F_SETFD stores plain flags on an open descriptor; no pointers.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Take ownership of one inherited bootstrap descriptor named on the command line.
 fn inherit(fd: RawFd) -> io::Result<std::fs::File> {
     if fd <= 2 {
@@ -387,12 +660,18 @@ struct Prepared {
     program: CString,
     argv: Vec<CString>,
     envp: Vec<CString>,
-    /// Close-on-exec duplicates numbered >= 10, so dup2 onto 3..=5 never clobbers a source.
+    /// Close-on-exec duplicates numbered >= 10, so dup2 onto 3..=6 never clobbers a source.
+    /// Index 3, when present, is the capability pipe read end.
     sources: Vec<OwnedFd>,
 }
 
 /// Build argv, a consistent environment snapshot and collision-free sources.
-fn prepare(program: &Path, args: &[&OsStr], fds: [&OwnedFd; 3]) -> io::Result<Prepared> {
+fn prepare(
+    program: &Path,
+    args: &[&OsStr],
+    fds: [&OwnedFd; 3],
+    capability: Option<&OwnedFd>,
+) -> io::Result<Prepared> {
     let program = cstring(program.as_os_str().as_bytes())?;
     let mut argv = vec![program.clone()];
     for arg in args {
@@ -406,6 +685,10 @@ fn prepare(program: &Path, args: &[&OsStr], fds: [&OwnedFd; 3]) -> io::Result<Pr
         argv.push(cstring(flag.as_bytes())?);
         argv.push(cstring(fd.to_string().as_bytes())?);
     }
+    if capability.is_some() {
+        argv.push(cstring(b"--capability-fd")?);
+        argv.push(cstring(CAPABILITY_FD.to_string().as_bytes())?);
+    }
     // std's environment lock makes this one snapshot; NUL-bearing entries cannot be passed.
     let envp = std::env::vars_os()
         .filter_map(|(key, value)| {
@@ -417,6 +700,8 @@ fn prepare(program: &Path, args: &[&OsStr], fds: [&OwnedFd; 3]) -> io::Result<Pr
         .collect();
     let sources = fds
         .iter()
+        .copied()
+        .chain(capability)
         .map(|fd| {
             // SAFETY: F_DUPFD_CLOEXEC duplicates a caller-owned open descriptor; no pointers.
             let high = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
@@ -504,7 +789,11 @@ fn posix_spawn_setsid(plan: &Prepared) -> io::Result<Option<i32>> {
         check(unsafe { libc::posix_spawnattr_setsigmask(attr, &empty) })?;
         // SAFETY: attr is initialized and `sigpipe` lives on this stack frame.
         check(unsafe { libc::posix_spawnattr_setsigdefault(attr, &sigpipe) })?;
-        for (source, target) in plan.sources.iter().zip([READY_FD, IDENTITY_FD, ERROR_FD]) {
+        for (source, target) in
+            plan.sources
+                .iter()
+                .zip([READY_FD, IDENTITY_FD, ERROR_FD, CAPABILITY_FD])
+        {
             // SAFETY: actions is initialized; each source (>= 10) differs from every target.
             check(unsafe {
                 libc::posix_spawn_file_actions_adddup2(actions, source.as_raw_fd(), target)
@@ -553,6 +842,7 @@ fn fork_setsid(plan: &Prepared) -> io::Result<i32> {
         plan.sources[0].as_raw_fd(),
         plan.sources[1].as_raw_fd(),
         plan.sources[2].as_raw_fd(),
+        plan.sources.get(3).map_or(-1, AsRawFd::as_raw_fd),
     ];
     // SAFETY: fork takes no pointers; the child branch only enters `exec_child`.
     match unsafe { libc::fork() } {
@@ -572,7 +862,7 @@ unsafe fn exec_child(
     program: *const libc::c_char,
     argv: &[*mut libc::c_char],
     envp: &[*mut libc::c_char],
-    sources: [RawFd; 3],
+    sources: [RawFd; 4],
     mask: &libc::sigset_t,
 ) -> ! {
     // SAFETY: the caller guarantees a forked child; every pointer was prepared before fork.
@@ -581,6 +871,7 @@ unsafe fn exec_child(
             && libc::dup2(sources[0], READY_FD) == READY_FD
             && libc::dup2(sources[1], IDENTITY_FD) == IDENTITY_FD
             && libc::dup2(sources[2], ERROR_FD) == ERROR_FD
+            && (sources[3] < 0 || libc::dup2(sources[3], CAPABILITY_FD) == CAPABILITY_FD)
         {
             let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
             if null >= 0 {
@@ -939,5 +1230,131 @@ fn signal_group(pgid: i32, signal: libc::c_int) -> io::Result<bool> {
         Ok(false)
     } else {
         Err(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Both spawn backends map the capability pipe to descriptor 6 and announce
+    //! it only as a descriptor number, never as a secret.
+    use super::*;
+    use std::io::Write;
+
+    /// Spawn `plan` through `backend`, release `secret` on the capability pipe
+    /// and return what the child's `cat <&6` wrote to its output file.
+    fn through(backend: fn(&Prepared) -> io::Result<Option<i32>>, secret: &[u8]) -> String {
+        let temp = tempfile::tempdir().unwrap();
+        let out = temp.path().join("received");
+        let (_ready_r, ready_w) = cloexec_pipe().unwrap();
+        let (_identity_r, identity_w) = cloexec_pipe().unwrap();
+        let (_error_r, error_w) = cloexec_pipe().unwrap();
+        let (capability_r, capability_w) = cloexec_pipe().unwrap();
+        let plan = prepare(
+            Path::new("/usr/bin/env"),
+            &[
+                OsStr::new("-i"),
+                OsStr::new("PATH=/usr/bin:/bin"),
+                OsStr::new("/bin/sh"),
+                OsStr::new("-c"),
+                OsStr::new(r#"cat <&6 > "$1"; printf ' %s %s' "$8" "$9" >> "$1""#),
+                OsStr::new("sh"),
+                out.as_os_str(),
+            ],
+            [&ready_w, &identity_w, &error_w],
+            Some(&capability_r),
+        )
+        .unwrap();
+        let pid = backend(&plan).unwrap().expect("backend spawned");
+        let mut pipe = std::fs::File::from(capability_w);
+        pipe.write_all(secret).unwrap();
+        drop(pipe);
+        let mut status = 0;
+        // SAFETY: blocking waitpid on the exact child just spawned.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        std::fs::read_to_string(&out).unwrap()
+    }
+
+    /// The `posix_spawn` backend delivers the secret on descriptor 6.
+    #[test]
+    fn posix_spawn_maps_the_capability_descriptor() {
+        assert_eq!(
+            through(posix_spawn_setsid, b"posix-secret"),
+            "posix-secret --capability-fd 6"
+        );
+    }
+
+    /// The fork fallback maps the same descriptor the same way.
+    #[test]
+    fn fork_fallback_maps_the_capability_descriptor() {
+        assert_eq!(
+            through(|plan| fork_setsid(plan).map(Some), b"fork-secret"),
+            "fork-secret --capability-fd 6"
+        );
+    }
+
+    /// Spawn `sleep` with an empty child environment as the leader of its own
+    /// process group; return its captured identity and child handle for teardown.
+    fn group_leader() -> (std::process::Child, Identity) {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30").env_clear().process_group(0);
+        let child = command.spawn().unwrap();
+        let identity = process::inspect(child.id() as i32).unwrap();
+        (child, identity)
+    }
+
+    /// One fresh snapshot gates signalling: the exact identity passes, and a
+    /// changed token, birth, group or PID fails even though everything else is
+    /// the live leader's own data (no actual PID reuse is needed).
+    #[test]
+    fn leader_predicate_requires_every_fact_of_one_snapshot() {
+        let (mut child, leader) = group_leader();
+        assert_eq!(leader.group, leader.pid, "fixture leads its own group");
+        assert!(leader_may_be_signalled(&leader));
+        let mut other = leader.clone();
+        other.token = format!("{}-other", leader.token);
+        assert!(!leader_may_be_signalled(&other), "changed token");
+        let mut other = leader.clone();
+        other.birth += 1.0;
+        assert!(!leader_may_be_signalled(&other), "changed birth");
+        let mut other = leader.clone();
+        other.group = leader.pid + 1;
+        assert!(
+            !leader_may_be_signalled(&other),
+            "recorded group is not its own"
+        );
+        let mut other = leader.clone();
+        other.pid = 1;
+        assert!(
+            !leader_may_be_signalled(&other),
+            "init is never a leader target"
+        );
+        // A killed but not yet reaped leader is not signalling-eligible. On Linux the
+        // snapshot reports it as a zombie (covered by the explicit zombie check); on
+        // macOS the kernel reports it as absent. Either way the answer is `false`.
+        child.kill().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process::inspect(leader.pid).is_ok_and(|now| !now.zombie) {
+            assert!(Instant::now() < deadline, "leader never became a zombie");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!leader_may_be_signalled(&leader), "zombie leader");
+        child.wait().unwrap();
+        assert!(!leader_may_be_signalled(&leader), "dead leader");
+    }
+
+    /// A recorded leader that no longer leads its group (here: the test process,
+    /// which belongs to another group) is never a signalling target.
+    #[test]
+    fn a_non_leader_is_never_signalled() {
+        let me = process::inspect(std::process::id() as i32).unwrap();
+        assert_ne!(me.group, me.pid);
+        let mut claimed = me.clone();
+        claimed.group = me.pid;
+        assert!(
+            !leader_may_be_signalled(&claimed),
+            "claimed leadership is re-checked"
+        );
     }
 }

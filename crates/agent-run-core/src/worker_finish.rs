@@ -2,6 +2,7 @@
 use crate::{
     Result,
     domain::{Outcome, Status},
+    persist::Persist,
     state::{Record, Store},
 };
 use agent_run_adapters::{EngineResult, io::Process};
@@ -11,7 +12,12 @@ use serde_json::Value;
 /// Observe a native private finish tool's reply only when it contains the
 /// current immutable digest. Unknown or error tool output cannot close a run.
 /// The caller has already verified native tool identity and session ownership.
-pub fn receipt(process: &Process, store: &Store, record: &Record, text: &str) -> Result<()> {
+pub async fn receipt(
+    process: &mut Process,
+    store: &mut Persist,
+    record: &Record,
+    text: &str,
+) -> Result<()> {
     if record.request.explicit_finish
         && store
             .worker_lifecycle_view(&record.id)?
@@ -26,7 +32,9 @@ pub fn receipt(process: &Process, store: &Store, record: &Record, text: &str) ->
                 "finish summary contains launch secret material".into(),
             ));
         }
-        store.observe_worker_finish_receipt(&record.id)?;
+        process
+            .observing(store.observe_worker_finish_receipt(&record.id))
+            .await?;
     }
     Ok(())
 }

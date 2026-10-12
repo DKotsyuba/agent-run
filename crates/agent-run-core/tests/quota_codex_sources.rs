@@ -3,6 +3,7 @@
 //! truthful round outcomes across rounds. Runs in its own process because
 //! the native login is located through the process `CODEX_HOME`.
 
+mod common;
 use agent_run_domain::catalog::{AccountId, AccountRecord, AccountStatus, AuthFamily};
 use rusqlite::Connection;
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, str::FromStr};
@@ -146,7 +147,7 @@ account = "acct-work"
         ),
     )
     .unwrap();
-    let mut store = agent_run_store::Store::initialize(&home).unwrap();
+    let mut store = agent_run_store::fixture::initialize(&home).unwrap();
     for (id, reference) in [
         ("acct-native", "native:codex"),
         ("acct-work", "named:codex:work"),
@@ -162,6 +163,8 @@ account = "acct-work"
     }
     drop(store);
 
+    let writer = common::writer::Harness::start(&home);
+    let _socket = writer.serve_unix(&home);
     let report = agent_run_core::capacity::sources::collect(&home)
         .await
         .unwrap();

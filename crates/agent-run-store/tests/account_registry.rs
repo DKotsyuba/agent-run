@@ -6,7 +6,6 @@ use agent_run_domain::{
         AccountRecord, AccountStatus, AttemptCredentials, ProviderCatalog, ProviderDefinition,
     },
 };
-use agent_run_store::Store;
 
 /// Builds one fake metadata-only account record.
 fn record(id: &str, family: &str, reference: &str) -> AccountRecord {
@@ -23,8 +22,8 @@ fn record(id: &str, family: &str, reference: &str) -> AccountRecord {
 #[test]
 fn registry_keeps_global_identity_and_reference_metadata() {
     let home = tempfile::tempdir().unwrap();
-    Store::initialize(home.path()).unwrap();
-    let mut store = Store::open(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
     let account = record("acct-one", "openai", "native:codex");
     store.register_account(&account).unwrap();
     assert!(store.register_account(&account).is_err());
@@ -109,7 +108,7 @@ fn registry_keeps_global_identity_and_reference_metadata() {
 #[test]
 fn registry_mutations_advance_the_capacity_revision() {
     let home = tempfile::tempdir().unwrap();
-    let mut store = Store::initialize(home.path()).unwrap();
+    let mut store = agent_run_store::fixture::initialize(home.path()).unwrap();
     let before = store.quota_capacity_revision().unwrap();
     store
         .register_account(&record("acct-rev", "anthropic", "env:FAKE_REV_TOKEN"))

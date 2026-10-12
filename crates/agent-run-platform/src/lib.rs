@@ -3,6 +3,7 @@ pub mod frame;
 pub mod fs;
 pub mod keychain;
 pub mod launch;
+pub mod monotonic;
 pub mod paths;
 pub mod plugin_views;
 pub mod process;

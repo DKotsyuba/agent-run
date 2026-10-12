@@ -63,9 +63,13 @@ async fn split_claude_deltas_are_redacted_before_journaling() {
     };
     let mut process = Process::spawn(&plan).unwrap();
     let record = store.get(&id).unwrap();
-    let result = agent_run_core::stream::run(&mut process, &mut store, &record, None)
+    let prep = common::writer::prepare_supervisor(&mut store, &id);
+    let harness = common::writer::Harness::start(&home.path);
+    let mut persist = harness.supervisor(&home.path, prep, &id).await;
+    let result = agent_run_core::stream::run(&mut process, &mut persist, &record, None)
         .await
         .unwrap();
+    persist.flush().await.unwrap();
     let transcript = store.transcript(&id, 0, 20).unwrap().to_string();
     assert!(!transcript.contains("synthetic-secret"));
     assert!(!transcript.contains("synthetic-"));

@@ -6,7 +6,7 @@ use agent_run_domain::{
     catalog::{AccountId, AccountRecord, AccountStatus, AuthFamily, SecretRef},
     error::invalid,
 };
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, params};
 use std::str::FromStr;
 
 /// Decodes one trusted registry row into validated public identity types.
@@ -33,7 +33,7 @@ pub fn list_at(connection: &rusqlite::Connection) -> Result<Vec<AccountRecord>> 
     rows.into_iter().map(account_record).collect()
 }
 
-impl Store {
+impl Store<'_> {
     /// Registers one global account with an existing, typed credential
     /// reference. Neither credentials nor provider-local labels are stored.
     ///
@@ -46,9 +46,7 @@ impl Store {
         if !CredentialRef::from_secret(&record.secret_ref)?.matches_family(&record.auth_family) {
             return Err(invalid("native credential family does not match account"));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let result = tx.execute(
             "INSERT INTO provider_accounts(account_id,auth_family,secret_ref,status,created_at,updated_at) \
              VALUES (?1,?2,?3,?4,?5,?5)",
@@ -101,9 +99,7 @@ impl Store {
     /// transaction, so availability can never change under an unchanged
     /// advertised revision. An unknown id changes nothing.
     pub fn disable_account(&mut self, id: &AccountId) -> Result<()> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let changed = tx.execute(
             "UPDATE provider_accounts SET status='disabled',updated_at=? WHERE account_id=?",
             params![agent_run_domain::domain::now(), id.as_str()],

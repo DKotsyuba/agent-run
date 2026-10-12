@@ -86,7 +86,7 @@ fn python_test_resume_lineage_has_one_concurrent_latest_child() {
         let parent = parent.clone();
         let barrier = barrier.clone();
         workers.push(thread::spawn(move || {
-            let mut store = agent_run_store::Store::open(&path).unwrap();
+            let mut store = agent_run_store::fixture::open(&path).unwrap();
             barrier.wait();
             store.admit(&request, &config, &json!({}), Some(&parent))
         }));

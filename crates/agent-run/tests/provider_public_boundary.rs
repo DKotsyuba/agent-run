@@ -154,16 +154,23 @@ impl Broker {
     }
 
     /// Waits (bounded) until the agent reaches a terminal status.
+    /// Wait for terminal state and the original supervisor's verified exit; post-terminal statistics persist before process exit.
     fn wait_terminal(&self, agent: &str) {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let store = agent_run::state::Store::open(&self.home).unwrap();
-            if store
-                .get(&agent.parse().unwrap())
-                .unwrap()
-                .status
-                .terminal()
-            {
+            let store = agent_run_store::fixture::open(&self.home).unwrap();
+            let row = store.get(&agent.parse().unwrap()).unwrap();
+            let supervisor_done = matches!(
+                agent_run_platform::process::observe(
+                    row.supervisor_pid,
+                    row.supervisor_identity.as_deref(),
+                    row.supervisor_birth_time
+                ),
+                agent_run_platform::process::ProcessState::Dead
+                    | agent_run_platform::process::ProcessState::Reused
+                    | agent_run_platform::process::ProcessState::NotStarted
+            );
+            if row.status.terminal() && supervisor_done {
                 return;
             }
             assert!(Instant::now() < deadline, "agent did not finish");
@@ -343,7 +350,7 @@ async fn mixed_pool_attaches_active_worker_over_live_mcp_without_restart() {
     let agent: agent_run_domain::domain::AgentId = started.agent_id.parse().unwrap();
     let until = Instant::now() + Duration::from_secs(10);
     loop {
-        let store = agent_run::state::Store::open(&broker.home).unwrap();
+        let store = agent_run_store::fixture::open(&broker.home).unwrap();
         let ready:bool=store.conn.query_row("SELECT EXISTS(SELECT 1 FROM worker_capabilities c JOIN attempts t ON t.id=c.attempt_id WHERE t.agent_id=? AND c.pool_catalog_version=1 AND t.state='running' AND t.ownership_active=1)",[agent.as_str()],|r|r.get(0)).unwrap();
         if ready && broker.home.join("enrollment-worker-ready").exists() {
             break;
@@ -354,7 +361,7 @@ async fn mixed_pool_attaches_active_worker_over_live_mcp_without_restart() {
         );
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
-    let before = agent_run::state::Store::open(&broker.home)
+    let before = agent_run_store::fixture::open(&broker.home)
         .unwrap()
         .get(&agent)
         .unwrap();
@@ -372,7 +379,7 @@ async fn mixed_pool_attaches_active_worker_over_live_mcp_without_restart() {
         );
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
-    let store = agent_run::state::Store::open(&broker.home).unwrap();
+    let store = agent_run_store::fixture::open(&broker.home).unwrap();
     let after = store.get(&agent).unwrap();
     assert_eq!(after.id, before.id);
     assert_eq!(after.request, before.request);
@@ -899,7 +906,7 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
     assert!(started.get("run_id").is_none());
     assert_eq!(started["agent"]["name"], "Мария / review");
     broker.wait_terminal(&runs[0]);
-    let parent = agent_run::state::Store::open(&broker.home)
+    let parent = agent_run_store::fixture::open(&broker.home)
         .unwrap()
         .get(&agent.parse().unwrap())
         .unwrap();
@@ -940,7 +947,7 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
         };
         assert_eq!(continued["agent_id"], agent);
         assert!(continued.get("run_id").is_none());
-        let store = agent_run::state::Store::open(&broker.home).unwrap();
+        let store = agent_run_store::fixture::open(&broker.home).unwrap();
         let run = agent_run_core::agent_identity::resolve_sequence(
             &store,
             &agent.parse().unwrap(),
@@ -970,7 +977,7 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
     let text = mcp_list["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("name: 工程師: next"), "{text}");
     assert!(text.contains("usage: in 2 out 3"), "{text}");
-    let store = agent_run::state::Store::open(&broker.home).unwrap();
+    let store = agent_run_store::fixture::open(&broker.home).unwrap();
     let native = store
         .get(&runs[0].parse().unwrap())
         .unwrap()
@@ -1085,7 +1092,7 @@ async fn stable_agent_identity_survives_resume_history_and_concurrent_controls()
 async fn admission_codes_survive_every_public_transport() {
     let broker = Broker::start();
     let now = agent_run_domain::domain::now();
-    agent_run::state::Store::open(&broker.home)
+    agent_run_store::fixture::open(&broker.home)
         .unwrap()
         .latch_native_exhaustion(
             &"acct-work".parse().unwrap(),
@@ -1122,7 +1129,7 @@ async fn static_launch_preflight_refuses_every_public_transport_without_admissio
     );
     std::fs::write(path, toml::to_string(&config).unwrap()).unwrap();
     broker.assert_refused("ValidationError").await;
-    let store = agent_run::state::Store::open(&broker.home).unwrap();
+    let store = agent_run_store::fixture::open(&broker.home).unwrap();
     for table in ["agents", "attempts"] {
         let count: i64 = store
             .conn
@@ -1142,7 +1149,7 @@ async fn static_launch_preflight_refuses_every_public_transport_without_admissio
 async fn selection_busy_survives_every_public_transport() {
     let broker = Broker::start_with(&[("AGENT_RUN_FIXTURE_ALWAYS_STALE", "1")]);
     broker.assert_refused("selection_busy").await;
-    let admitted: i64 = agent_run::state::Store::open(&broker.home)
+    let admitted: i64 = agent_run_store::fixture::open(&broker.home)
         .unwrap()
         .conn
         .query_row("SELECT COUNT(*) FROM agents", [], |row| row.get(0))
@@ -1198,7 +1205,7 @@ async fn profile_symlink_escape_keeps_path_escape_error_on_every_transport() {
 async fn consolidated_routing_discovery_and_legacy_aliases_work_live() {
     let broker = Broker::start();
     let client = BrokerClient::new(broker.home.join("api.sock"));
-    let store = agent_run_store::Store::open(&broker.home).unwrap();
+    let store = agent_run_store::fixture::open(&broker.home).unwrap();
     let at = agent_run_core::domain::now();
     store.conn.execute(
         "INSERT INTO capacity_samples(runtime,lane,window,target,source,remaining_percent,reset_at,observed_at,valid_until,payload_json,account_id,quota_key)

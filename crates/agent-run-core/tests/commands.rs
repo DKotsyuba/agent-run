@@ -46,7 +46,7 @@ fn pool_entry_text_validates_membership_and_renders() {
     let mut request = home.request();
     request.workdir = home.path.clone();
     request.validate().unwrap();
-    let mut store = agent_run_core::state::Store::open(&home.path).unwrap();
+    let mut store = agent_run_store::fixture::open(&home.path).unwrap();
     let (member, _) = store
         .admit(&request, &config, &serde_json::json!({}), None)
         .unwrap();
@@ -199,7 +199,7 @@ fn complete_terminal_settles_a_fully_proven_pool() {
     let mut request = home.request();
     request.workdir = home.path.clone();
     request.validate().unwrap();
-    let mut store = agent_run_core::state::Store::open(&home.path).unwrap();
+    let mut store = agent_run_store::fixture::open(&home.path).unwrap();
     let ids: Vec<_> = (0..2)
         .map(|_| {
             store

@@ -5,7 +5,7 @@
 //! engine has stopped, so every pending command receives one stable result
 //! without attempting an engine operation twice.
 
-use crate::{Result, domain::AgentId, state::Store};
+use crate::{Result, domain::AgentId, persist::Persist, state::Store};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 
@@ -14,21 +14,32 @@ pub const COMMAND_PAGE_LIMIT: usize = 16;
 /// Maximum elapsed monotonic time spent draining one live-engine command page.
 pub const COMMAND_PAGE_SECONDS: f64 = 1.0;
 
-/// Completes all commands that became pending after an agent reached a terminal state.
+/// Completes all commands that became pending after an agent reached a terminal
+/// state, as ONE writer operation of the supervisor's ordered lane.
 ///
-/// The caller invokes this only after its terminal transition has committed;
-/// lost reconciliation instead uses `complete_pending_in` inside its own
-/// transaction. Commands are claimed one at a time in cancellation-first order and are
-/// recorded as terminal rather than delivered to an absent engine.  A command
-/// already claimed by the crashed owning supervisor is deliberately untouched:
-/// replaying it could duplicate an engine-side steer or interrupt.
+/// The caller invokes this only after its terminal transition has committed.
+/// Commands are answered in cancellation-first order and are recorded as
+/// terminal rather than delivered to an absent engine. A command already claimed
+/// by the crashed owning supervisor is deliberately untouched: replaying it
+/// could duplicate an engine-side steer or interrupt.
+pub async fn complete_terminal_persisted(store: &mut Persist, agent_id: &AgentId) -> Result<()> {
+    // One atomic operation answers every still-pending command. A member ending
+    // may complete its pool; settlement belongs to the broker (formal and
+    // idempotent, retried by its maintenance sweep), never to a supervisor.
+    store.complete_terminal(agent_id).await?;
+    Ok(())
+}
+
+/// Completes all commands that became pending after an agent reached a terminal
+/// state through a raw store connection (cancellation-first, one at a time).
+///
+/// Used by the resident broker's legacy reconciliation path and by offline
+/// tools holding the exclusive offline guard; a supervisor uses
+/// [`complete_terminal_persisted`].
 pub fn complete_terminal(store: &mut Store, agent_id: &AgentId) -> Result<()> {
     while let Some((command_id, kind, _)) = store.claim_command(agent_id)? {
         store.complete_command(agent_id, command_id, &terminal_result(&kind))?;
     }
-    // A member ending may complete its pool. Settlement is formal and
-    // idempotent, and the maintenance sweep retries it, so a failure here must
-    // never turn an already recorded terminal outcome into an error.
     let _ = store.settle_pool_of(agent_id);
     Ok(())
 }

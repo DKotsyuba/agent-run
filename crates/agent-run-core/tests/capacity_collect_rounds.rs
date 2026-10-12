@@ -1,4 +1,5 @@
 //! Retired schema-1 collectors remain inspectable but can never execute provider code.
+mod common;
 use agent_run_core::capacity::sources;
 use std::{fs, os::unix::fs::PermissionsExt};
 
@@ -19,8 +20,10 @@ async fn legacy_collectors_never_launch_and_keep_samples() {
         text.push_str(&format!("[runtimes.{name}]\nenabled=true\nadapter={adapter:?}\nbinary={binary:?}\nhome={root:?}\nmodels=[\"fixture\"]\nlimits_source={source:?}\n",binary=binary.to_str().unwrap(),root=home.path().to_str().unwrap()));
     }
     fs::write(home.path().join("config.toml"), text).unwrap();
-    let store = agent_run_store::Store::initialize(home.path()).unwrap();
+    let store = agent_run_store::fixture::initialize(home.path()).unwrap();
     store.conn.execute("INSERT INTO capacity_samples(runtime,lane,window,source,remaining_percent,observed_at,payload_json) VALUES('a','shared','five_hour','historical',50,1,'null')",[]).unwrap();
+    let writer = common::writer::Harness::start(home.path());
+    let _socket = writer.serve_unix(home.path());
     let report = sources::collect(home.path()).await.unwrap();
     assert_eq!(report["ok"], false);
     for row in report["results"].as_array().unwrap() {

@@ -2035,7 +2035,7 @@ mod tests {
     #[test]
     fn terminal_owned_attempt_diagnostics_are_read_only_and_lineage_scoped() {
         let home = tempfile::tempdir().unwrap();
-        let store = state::Store::initialize(home.path()).unwrap();
+        let store = agent_run_store::fixture::initialize(home.path()).unwrap();
         for (id, status, parent, root) in [
             (
                 "ag-20260101-000000-0000000001",
@@ -2128,7 +2128,7 @@ mod tests {
     #[test]
     fn service_diagnostics_are_read_only_and_secret_safe() {
         let home = tempfile::tempdir().unwrap();
-        state::Store::initialize(home.path()).unwrap();
+        agent_run_store::fixture::initialize(home.path()).unwrap();
         let config = agent_run_config::provider_config::ProviderConfig::parse(
             r#"schema_version=2
 [services.hot]
@@ -2145,7 +2145,7 @@ readiness={command="/bin/true"}
         managed_services(&config, home.path(), 100.0, &mut findings);
         assert_eq!(findings[0].code, "managed_service_cold");
         assert_eq!(findings[0].severity, "info");
-        let mut store = state::Store::open(home.path()).unwrap();
+        let mut store = agent_run_store::fixture::open(home.path()).unwrap();
         let owner = process::OwnedProcess::capture(std::process::id() as i32);
         let root = owner.leader.as_ref().unwrap();
         store.conn.execute("INSERT INTO managed_service_generations(id,service_id,revision,definition_json,state,broker_identity_json,process_identity_json,created_at,checked_at) VALUES ('fixture','hot',?1,?2,'ready',?3,?3,1,100)",rusqlite::params![config.services["hot"].revision().unwrap(),serde_json::to_string(&config.services["hot"]).unwrap(),serde_json::to_string(root).unwrap()]).unwrap();

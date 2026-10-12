@@ -153,7 +153,7 @@ fn names(store: &Path, namespace: &str) -> Vec<String> {
 fn shared_payload_survives_until_last_reference_is_gone() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
-    let mut store = Store::initialize(&app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
     let first = seal(root.path(), "one", b"shared-payload\n");
     let second = seal(root.path(), "two", b"shared-payload\n");
     let first_key = share(&mut store, &first.home, &app_home, &first);
@@ -217,7 +217,7 @@ fn shared_payload_survives_until_last_reference_is_gone() {
 fn legacy_readonly_directories_are_verified_and_collected() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
-    let mut store = Store::initialize(&app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
     let sealed = seal(root.path(), "legacy", b"legacy-payload\n");
     let layout = runtime_storage::plan(
         &store,
@@ -263,7 +263,7 @@ fn legacy_readonly_directories_are_verified_and_collected() {
 fn prepared_config_and_service_references_pin_objects() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
-    let mut store = Store::initialize(&app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
     let sealed = seal(root.path(), "home", b"pinned-payload\n");
     let layout = runtime_storage::plan(
         &store,
@@ -379,7 +379,7 @@ fn prepared_config_and_service_references_pin_objects() {
 fn publish_and_collection_serialize_through_one_lock() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
-    let mut store = Store::initialize(&app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
     let sealed = seal(root.path(), "home", b"race-payload\n");
     let key = share(&mut store, &sealed.home, &app_home, &sealed);
     permit_tree(&sealed.home);
@@ -403,7 +403,7 @@ fn publish_and_collection_serialize_through_one_lock() {
 fn corrupt_proof_retains_and_reports_incomplete() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
-    let mut store = Store::initialize(&app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
     let sealed = seal(root.path(), "home", b"corrupt-payload\n");
     share(&mut store, &sealed.home, &app_home, &sealed);
     permit_tree(&sealed.home);
@@ -439,7 +439,7 @@ fn corrupt_proof_retains_and_reports_incomplete() {
 fn staging_orphans_need_exact_provenance() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
-    let mut store = Store::initialize(&app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
     let sealed = seal(root.path(), "home", b"staging-payload\n");
     share(&mut store, &sealed.home, &app_home, &sealed);
     let root_store = store_root(&app_home);
@@ -476,7 +476,7 @@ fn staging_orphans_need_exact_provenance() {
 fn collection_never_follows_symlinks_out_of_the_store() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
-    let mut store = Store::initialize(&app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
     let sealed = seal(root.path(), "home", b"symlink-payload\n");
     share(&mut store, &sealed.home, &app_home, &sealed);
     let root_store = store_root(&app_home);
@@ -513,7 +513,7 @@ fn collection_never_follows_symlinks_out_of_the_store() {
 fn derived_blob_names_match_the_published_layout() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
-    let mut store = Store::initialize(&app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
     let sealed = seal(root.path(), "home", b"layout-payload\n");
     let layout = runtime_storage::plan(
         &store,
@@ -556,7 +556,7 @@ fn derived_blob_names_match_the_published_layout() {
 fn views_collect_before_their_trees_and_only_when_unreferenced() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
-    let mut store = Store::initialize(&app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
     let sealed = seal_plugin(root.path(), "plugins", b"view-payload\n");
     let layout = runtime_storage::plan(
         &store,
@@ -674,7 +674,7 @@ fn digest(index: usize) -> String {
 fn preview_is_truly_read_only() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
-    let mut store = Store::initialize(&app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
     let sealed = seal(root.path(), "gone", b"preview-bytes\n");
     share(&mut store, &sealed.home, &app_home, &sealed);
     permit_tree(&sealed.home);
@@ -723,7 +723,7 @@ fn corrupt_or_missing_pinned_manifest_stops_blob_collection() {
     for corrupt in [true, false] {
         let root = TempDir::new().expect("fixture root");
         let app_home = app(root.path());
-        let mut store = Store::initialize(&app_home).expect("store");
+        let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
         let sealed = seal(root.path(), "home", b"pinned-bytes\n");
         share(&mut store, &sealed.home, &app_home, &sealed);
         let root_store = store_root(&app_home);
@@ -832,7 +832,7 @@ impl Drop for CensusChild {
 fn partial_reference_census_body() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
-    let mut store = Store::initialize(&app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
     // One live home plus one garbage tree, then a registry far beyond the
     // one-page census bound the seam imposes.
     let sealed = seal(root.path(), "live", b"census-bytes\n");
@@ -902,7 +902,7 @@ fn partial_reference_census_body() {
 fn protected_view_pins_its_tree_and_payloads() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
-    let mut store = Store::initialize(&app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
     let sealed = seal_plugin(root.path(), "plugins", b"view-pin\n");
     // Import the tree and materialize a view with no layout row at all: only
     // the service reference keeps them alive.
@@ -962,7 +962,7 @@ fn protected_view_pins_its_tree_and_payloads() {
 fn many_retained_objects_before_garbage_converge() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
-    let mut store = Store::initialize(&app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
     let store_root = store_root(&app_home);
     ensure_store(&app_home);
     // Many referenced trees, each named by one unreleased service argument.
@@ -1058,7 +1058,7 @@ fn many_retained_objects_before_garbage_converge() {
 fn staging_partial_drain_resumes_and_foreign_blobs_are_retained() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
-    let mut store = Store::initialize(&app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
     let root_store = store_root(&app_home);
     let scope_dir = root_store.join("trees").join(scope());
     stdfs::create_dir_all(&scope_dir).expect("scope");
@@ -1097,7 +1097,7 @@ fn staging_partial_drain_resumes_and_foreign_blobs_are_retained() {
 fn unresolvable_home_is_not_gone() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
-    let mut store = Store::initialize(&app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
     // A home path whose parent is a regular file resolves with ENOTDIR, which
     // is not a proof of absence.
     let base = root.path().canonicalize().expect("canonical base");
@@ -1133,7 +1133,7 @@ fn unresolvable_home_is_not_gone() {
 fn invalid_configuration_retains_everything() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
-    let mut store = Store::initialize(&app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
     let garbage = seal(root.path(), "garbage", b"invalid-config\n");
     let store_root = store_root(&app_home);
     ensure_store(&app_home);
@@ -1165,7 +1165,7 @@ fn invalid_configuration_retains_everything() {
 fn oversized_garbage_tree_moves_to_staging_and_converges() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
-    let mut store = Store::initialize(&app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
     let source = root.path().join("big-source");
     stdfs::create_dir_all(&source).expect("source");
     // Sized just under the manifest's own metadata bound: the safety property
@@ -1236,7 +1236,7 @@ fn oversized_garbage_tree_moves_to_staging_and_converges() {
 fn ancestor_scope_reference_pins_every_object_beneath_it() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
-    let mut store = Store::initialize(&app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
     let store_root = store_root(&app_home);
     ensure_store(&app_home);
     for name in ["one", "two"] {
@@ -1313,7 +1313,7 @@ fn view_scope_and_namespace_references_pin_backing_trees() {
     for label in ["scope", "namespace", "store"] {
         let root = TempDir::new().expect("fixture root");
         let app_home = app(root.path());
-        let mut store = Store::initialize(&app_home).expect("store");
+        let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
         let store_root = store_root(&app_home);
         ensure_store(&app_home);
         let sealed = seal_plugin(root.path(), "plugins", b"view-scope\n");
@@ -1390,7 +1390,7 @@ fn view_scope_and_namespace_references_pin_backing_trees() {
 fn unreadable_home_parent_keeps_row_and_reports_incomplete() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
-    let mut store = Store::initialize(&app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
     let base = root.path().canonicalize().expect("canonical base");
     let secret = base.join("secret");
     stdfs::create_dir_all(&secret).expect("secret parent");
@@ -1432,7 +1432,7 @@ fn unreadable_home_parent_keeps_row_and_reports_incomplete() {
 fn unreadable_home_itself_keeps_row_and_all_objects() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
-    let mut store = Store::initialize(&app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
     let sealed = seal(root.path(), "sealed", b"unreadable-home\n");
     share(&mut store, &sealed.home, &app_home, &sealed);
     let root_store = store_root(&app_home);
@@ -1486,7 +1486,7 @@ fn unreadable_home_itself_keeps_row_and_all_objects() {
 fn prepared_row_pins_even_when_physical_home_is_missing() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
-    let mut store = Store::initialize(&app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app_home).expect("store");
     let interrupted = seal(root.path(), "interrupted", b"prepared-pin\n");
     let layout = runtime_storage::plan(
         &store,
@@ -1550,7 +1550,7 @@ fn prepared_row_pins_even_when_physical_home_is_missing() {
 fn partial_staging_orphan_drains_after_restart() {
     let root = TempDir::new().expect("fixture root");
     let app_home = app(root.path());
-    let store = Store::initialize(&app_home).expect("store");
+    let store = agent_run_store::fixture::initialize(&app_home).expect("store");
     let store_root = store_root(&app_home);
     let scope_dir = store_root.join("trees").join(scope());
     stdfs::create_dir_all(&scope_dir).expect("scope");
@@ -1567,7 +1567,7 @@ fn partial_staging_orphan_drains_after_restart() {
     assert!(!scope_dir.join("0".repeat(64)).exists());
     // A restarted process opens its own store handle and finds exactly this.
     drop(store);
-    let mut store = Store::open(&app_home).expect("reopened store");
+    let mut store = agent_run_store::fixture::open(&app_home).expect("reopened store");
     let mut removed = 0;
     let mut passes = 0;
     for _ in 0..8 {

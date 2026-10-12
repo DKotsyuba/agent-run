@@ -3,6 +3,7 @@
 //! The complement is a launch-time snapshot: tools added by a server after discovery
 //! are not covered. Codex uses its native positive allowlist instead of this module.
 
+use crate::io::PersistFuture;
 use crate::{
     LaunchPlan,
     io::{ENGINE_FRAME, Event, Process},
@@ -74,7 +75,7 @@ fn literal_name(name: &str) -> bool {
 /// supervisor death; observer failures reject discovery and clean the child.
 pub async fn apply_claude_tool_filters<F>(plan: &mut ProviderLaunchPlan, observer: F) -> Result<()>
 where
-    F: Fn(&OwnershipSnapshot) -> Result<()> + Send + Sync + Clone + 'static,
+    F: Fn(OwnershipSnapshot) -> PersistFuture + Send + Sync + Clone + 'static,
 {
     tokio::time::timeout(TOTAL_DISCOVERY_TIMEOUT, apply_filters(plan, observer))
         .await
@@ -85,7 +86,7 @@ where
 /// Arguments change only after every server and size check succeeds.
 async fn apply_filters<F>(plan: &mut ProviderLaunchPlan, observer: F) -> Result<()>
 where
-    F: Fn(&OwnershipSnapshot) -> Result<()> + Send + Sync + Clone + 'static,
+    F: Fn(OwnershipSnapshot) -> PersistFuture + Send + Sync + Clone + 'static,
 {
     if !plan
         .role
@@ -170,7 +171,7 @@ async fn discover<F>(
     observer: F,
 ) -> Result<BTreeSet<String>>
 where
-    F: Fn(&OwnershipSnapshot) -> Result<()> + Send + Sync + Clone + 'static,
+    F: Fn(OwnershipSnapshot) -> PersistFuture + Send + Sync + Clone + 'static,
 {
     if server.transport != "stdio" {
         return Err(failure("restricted discovery requires stdio transport"));
@@ -205,7 +206,10 @@ where
         process: Process::spawn(&probe).map_err(|_| failure("server could not be started"))?,
         armed: true,
     };
-    child.process.observe_ownership(observer)?;
+    child
+        .process
+        .observe_ownership(Box::new(move |snapshot| observer(snapshot)))
+        .await?;
     let result = tokio::time::timeout(timeout, async {
         child
             .process
@@ -220,7 +224,8 @@ where
     let cleanup = child.process.owner.cleanup(CLEANUP_GRACE).await;
     child
         .process
-        .checkpoint_ownership_at(agent_run_domain::OwnershipStage::Final)?;
+        .checkpoint_ownership_ready(agent_run_domain::OwnershipStage::Final)
+        .await?;
     child.process.reap().await;
     let reaped = child
         .process
@@ -505,9 +510,11 @@ done
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let mut plan = fixture(&root, "ping");
-        apply_claude_tool_filters(&mut plan, |_| Ok(()))
-            .await
-            .unwrap();
+        apply_claude_tool_filters(&mut plan, |_| -> PersistFuture {
+            Box::pin(async { Ok(()) })
+        })
+        .await
+        .unwrap();
         assert_eq!(
             plan.launch.args[1],
             "WebFetch,WebSearch,mcp__fixture_server__beta"
@@ -526,14 +533,18 @@ done
         let temp = tempfile::tempdir().unwrap();
         let mut plan = fixture(temp.path(), "hang");
         plan.role.mcp[0].allowed_tools = None;
-        apply_claude_tool_filters(&mut plan, |_| Ok(()))
-            .await
-            .unwrap();
+        apply_claude_tool_filters(&mut plan, |_| -> PersistFuture {
+            Box::pin(async { Ok(()) })
+        })
+        .await
+        .unwrap();
         assert_eq!(plan.launch.args[1], "WebFetch,WebSearch");
         plan.role.mcp[0].allowed_tools = Some(vec![]);
-        apply_claude_tool_filters(&mut plan, |_| Ok(()))
-            .await
-            .unwrap();
+        apply_claude_tool_filters(&mut plan, |_| -> PersistFuture {
+            Box::pin(async { Ok(()) })
+        })
+        .await
+        .unwrap();
         assert_eq!(
             plan.launch.args[1],
             "WebFetch,WebSearch,mcp__fixture_server__*"
@@ -560,9 +571,11 @@ done
                 plan.role.mcp[0].allowed_tools = Some(vec!["typo".into()]);
             }
             let before = plan.launch.args.clone();
-            let error = apply_claude_tool_filters(&mut plan, |_| Ok(()))
-                .await
-                .unwrap_err();
+            let error = apply_claude_tool_filters(&mut plan, |_| -> PersistFuture {
+                Box::pin(async { Ok(()) })
+            })
+            .await
+            .unwrap_err();
             assert!(!error.to_string().contains("fixture-secret"));
             assert_eq!(plan.launch.args, before, "{mode}");
             assert_stopped(&root);
@@ -578,9 +591,12 @@ done
             let plan = fixture(&root, "hang");
             if cancel {
                 let task = tokio::spawn(async move {
-                    discover(&plan.role.mcp[0], &plan.launch, DISCOVERY_TIMEOUT, |_| {
-                        Ok(())
-                    })
+                    discover(
+                        &plan.role.mcp[0],
+                        &plan.launch,
+                        DISCOVERY_TIMEOUT,
+                        |_| -> PersistFuture { Box::pin(async { Ok(()) }) },
+                    )
                     .await
                 });
                 tokio::time::timeout(Duration::from_secs(2), async {
@@ -602,7 +618,7 @@ done
                     &plan.role.mcp[0],
                     &plan.launch,
                     Duration::from_millis(350),
-                    |_| Ok(()),
+                    |_| -> PersistFuture { Box::pin(async { Ok(()) }) },
                 )
                 .await
                 .unwrap_err();
@@ -620,28 +636,34 @@ done
             let mut plan = fixture(temp.path(), "hang");
             plan.role.mcp[0].id = id.into();
             assert!(
-                apply_claude_tool_filters(&mut plan, |_| Ok(()))
-                    .await
-                    .is_err()
+                apply_claude_tool_filters(&mut plan, |_| -> PersistFuture {
+                    Box::pin(async { Ok(()) })
+                })
+                .await
+                .is_err()
             );
         }
         let mut plan = fixture(temp.path(), "hang");
         plan.launch.environment.remove("REQUIRED_TOKEN");
         assert!(
-            apply_claude_tool_filters(&mut plan, |_| Ok(()))
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("environment")
+            apply_claude_tool_filters(&mut plan, |_| -> PersistFuture {
+                Box::pin(async { Ok(()) })
+            })
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("environment")
         );
         let mut plan = fixture(temp.path(), "hang");
         plan.role.mcp[0].args.push("${TOKEN}".into());
         assert!(
-            apply_claude_tool_filters(&mut plan, |_| Ok(()))
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("interpolation")
+            apply_claude_tool_filters(&mut plan, |_| -> PersistFuture {
+                Box::pin(async { Ok(()) })
+            })
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("interpolation")
         );
         assert!(!temp.path().join("pids").exists());
     }
@@ -657,9 +679,9 @@ done
         let mut plan = fixture(temp.path(), "hang");
         let captured = Arc::new(AtomicI32::new(0));
         let pid = captured.clone();
-        let error = apply_claude_tool_filters(&mut plan, move |snapshot| {
+        let error = apply_claude_tool_filters(&mut plan, move |snapshot| -> PersistFuture {
             pid.store(snapshot.leader.pid, Ordering::SeqCst);
-            Err(failure("fixture observer rejected ownership"))
+            Box::pin(async { Err(failure("fixture observer rejected ownership")) })
         })
         .await
         .unwrap_err();

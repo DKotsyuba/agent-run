@@ -8,8 +8,8 @@
 //! * `--apply` names the installed pre-migration release (`--from-release`), a
 //!   sealed release directory whose `COMPLETE`/`SHA256SUMS`/`metadata.json`
 //!   must verify and whose recorded schema must equal the database's; nothing
-//!   is executed to learn its version. It holds the broker startup lock
-//!   (`.api.sock.lock`) throughout, refuses active agents, and writes an
+//!   is executed to learn its version. It holds an offline session of the home
+//!   (broker, writer and service-manager exclusion) throughout, refuses active agents, and writes an
 //!   exclusive, read-only snapshot (original config bytes, an online SQLite
 //!   backup, the mapping, `manifest.json`, `COMPLETE` last). The numbered
 //!   migration and the declared accounts are applied to a staged copy of the
@@ -40,14 +40,13 @@
 //! Historical snapshot filenames and v1/v2 digest keys mean before/after for
 //! both input schemas. Recovery restores the original pair; there is no roll-forward.
 
-use crate::{Result, config::Config, fs, state::Store};
+use crate::{Result, config::Config, fs};
 use agent_run_config::{
     provider_config::ProviderConfig,
     provider_migration::{MigrationMapping, plan_v1},
 };
 use agent_run_domain::error::invalid;
 use agent_run_platform::release;
-use fs2::FileExt;
 use rusqlite::{Connection, OpenFlags, functions::FunctionFlags};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -114,40 +113,6 @@ pub fn require_current_store(home: &Path) -> Result<()> {
         ))),
         _ => Ok(()),
     }
-}
-
-/// Holds both broker and service-manager startup locks, including custom-socket brokers.
-/// Returned files retain exclusion throughout publication and rollback.
-///
-/// Offline storage administration (`storage compact --apply` and
-/// `storage recover`) takes exactly this exclusion, so a broker, its service
-/// manager and their writers cannot race a relocation or a collection pass.
-pub(crate) fn broker_exclusion(home: &Path) -> Result<(std::fs::File, std::fs::File)> {
-    exclusive(home)
-}
-
-fn exclusive(home: &Path) -> Result<(std::fs::File, std::fs::File)> {
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(home.join(".api.sock.lock"))?;
-    lock.try_lock_exclusive()
-        .map_err(|_| invalid("stop the resident broker before a config migration"))?;
-    let services = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(home.join(".services.lock"))?;
-    services.try_lock_exclusive().map_err(|_| {
-        invalid("stop the resident broker and its service manager before migration")
-    })?;
-    Ok((lock, services))
 }
 
 /// Reads one operator-supplied configuration or mapping with the same one-MiB bound as runtime configuration.
@@ -565,7 +530,8 @@ fn migrate_input(
             "--from-release must be the installed pre-migration release, not this binary",
         ));
     }
-    let _lock = exclusive(home)?;
+    // Excludes every broker (API and writer sockets), writer and service manager.
+    let _session = crate::offline::acquire(home)?;
     // Everything below runs with brokers excluded. Refusals write nothing.
     require_no_journal(home)?;
     let mut live = lease(home)?;
@@ -633,12 +599,16 @@ fn migrate_input(
             stage.join("state.db"),
             std::fs::Permissions::from_mode(0o600),
         )?;
-        let mut store = Store::open(&stage)?;
+        // The staged copy is a home of its own: its database is written only
+        // under an offline session of that home.
+        let mut session = crate::offline::acquire(&stage)?;
+        session.guard.migrate()?;
+        let store = session.guard.store()?;
         for record in accounts {
             store.register_account(&record)?;
         }
         ProviderConfig::parse(&rendered, home)?.resolve_catalog(store.list_accounts()?)?;
-        drop(store);
+        drop(session);
         checkpoint("staged")?;
         content_digest(&read_only_at(&stage.join("state.db"))?)
     })();
@@ -814,7 +784,8 @@ pub fn rollback(home: &Path, snapshot: &Path) -> Result<Value> {
             "the recorded pre-migration release is missing, unsealed or changed; restore it first",
         ));
     }
-    let _lock = exclusive(home)?;
+    // Excludes every broker (API and writer sockets), writer and service manager.
+    let _session = crate::offline::acquire(home)?;
     let mut live = lease(home)?;
     let pending: Option<Value> = match std::fs::read(journal_path(home)) {
         Ok(bytes) => Some(serde_json::from_slice(&bytes)?),

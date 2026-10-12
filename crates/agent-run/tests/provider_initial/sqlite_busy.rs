@@ -6,7 +6,7 @@ use super::*;
 async fn ready(home: &Path, work: &Path, id: &AgentId, result: bool) {
     tokio::time::timeout(Duration::from_secs(6), async {
         loop {
-            let observed = !result || Store::open(home).unwrap().conn.query_row(
+            let observed = !result || agent_run_store::fixture::open(home).unwrap().conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM events WHERE agent_id=? AND kind='native_result_frame_v1')",
                 [id.as_str()], |r| r.get::<_, bool>(0)).unwrap();
             if work.join("sqlite-ready").exists() && observed { break; }
@@ -22,7 +22,7 @@ fn writer(home: &Path, hold: Duration) -> std::thread::JoinHandle<()> {
     let home = home.to_path_buf();
     let (send, receive) = std::sync::mpsc::sync_channel(0);
     let held = std::thread::spawn(move || {
-        let store = Store::open(&home).unwrap();
+        let store = agent_run_store::fixture::open(&home).unwrap();
         store.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         send.send(()).unwrap();
         std::thread::sleep(hold);
@@ -41,7 +41,7 @@ fn writer(home: &Path, hold: Duration) -> std::thread::JoinHandle<()> {
 async fn concurrent_streaming_busy_preserves_results_and_resume_lineage() {
     let (_temp, home) = home();
     let _cleanup = ServiceProcesses(home.clone());
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let mut runs = Vec::new();
     fs::write(home.join("fixture-pause-terminal-1"), b"pause").unwrap();
     for n in 0..3 {
@@ -58,9 +58,10 @@ async fn concurrent_streaming_busy_preserves_results_and_resume_lineage() {
         req.request_id = Some(format!("sqlite-stream-{n}"));
         let admitted = service
             .admit_provider_trusted(req, candidates(committed(&home)))
+            .await
             .unwrap();
         let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
-        let child = supervisor(&home, &id);
+        let child = supervisor(&home, &id).await;
         ready(&home, &work, &id, false).await;
         runs.push((
             id,
@@ -69,7 +70,7 @@ async fn concurrent_streaming_busy_preserves_results_and_resume_lineage() {
             admitted["attempt_id"].as_str().unwrap().to_owned(),
         ));
     }
-    Store::open(&home).unwrap().conn.execute_batch(
+    agent_run_store::fixture::open(&home).unwrap().conn.execute_batch(
         "CREATE TRIGGER fixture_one_owner_refusal BEFORE INSERT ON process_members \
          WHEN NEW.owner_id=(SELECT id FROM attempts WHERE agent_id=(SELECT id FROM agents WHERE task='fixture:sqlite-stream-fail')) \
          AND NEW.pid<>(SELECT process_group_id FROM agents WHERE task='fixture:sqlite-stream-fail') \
@@ -93,7 +94,7 @@ async fn concurrent_streaming_busy_preserves_results_and_resume_lineage() {
     })
     .await
     .unwrap();
-    Store::open(&home)
+    agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .execute_batch("DROP TRIGGER fixture_one_owner_refusal")
@@ -110,10 +111,16 @@ async fn concurrent_streaming_busy_preserves_results_and_resume_lineage() {
         );
     }
     held.join().unwrap();
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     for (id, _, _, attempt) in runs.iter().take(2) {
         let row = store.get(id).unwrap();
-        assert_eq!(row.status, Status::Succeeded);
+        assert_eq!(
+            row.status,
+            Status::Succeeded,
+            "execution {id}: failure_kind={:?}, failure_text={:?}",
+            row.failure_kind,
+            row.failure_text
+        );
         assert!(row.runtime_session_id.is_some());
         assert_eq!(
             service.answer(id).unwrap()["content"],
@@ -222,6 +229,7 @@ async fn concurrent_streaming_busy_preserves_results_and_resume_lineage() {
             None,
             None,
         )
+        .await
         .unwrap();
     let child: AgentId = serde_json::from_value(resumed["agent_id"].clone()).unwrap();
     run_to_end(&home, &child).await;
@@ -239,24 +247,25 @@ async fn concurrent_streaming_busy_preserves_results_and_resume_lineage() {
     );
 }
 
-/// A normal final writer contention commits exactly once. An outage beyond the
-/// existing five-second allowance cannot publish success; private no-follow
-/// recovery evidence retains cleanup and the candidate answer for inspection.
+/// A final writer contention, short or longer than any former per-process busy
+/// allowance, commits exactly once through the resident writer; private
+/// no-follow recovery evidence still retains cleanup and the candidate answer.
 #[tokio::test]
-async fn terminal_busy_keeps_exactly_once_success_or_recoverable_incomplete_state() {
+async fn terminal_busy_commits_exactly_once_through_the_writer() {
     for hold in [Duration::from_millis(450), Duration::from_secs(8)] {
         let (_temp, home) = home();
         let _cleanup = ServiceProcesses(home.clone());
-        let service = Service::new(home.clone());
+        let service = fixture_service(home.clone()).await;
         let mut req = request(&home);
         req.task = "fixture:answer".into();
         let admitted = service
             .admit_provider_trusted(req, candidates(committed(&home)))
+            .await
             .unwrap();
         let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
         let attempt = admitted["attempt_id"].as_str().unwrap();
         fs::write(home.join("fixture-pause-terminal-1"), b"pause").unwrap();
-        let mut child = supervisor(&home, &id);
+        let mut child = supervisor(&home, &id).await;
         tokio::time::timeout(Duration::from_secs(6), async {
             while !home.join("fixture-paused-terminal-1").exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -273,7 +282,7 @@ async fn terminal_busy_keeps_exactly_once_success_or_recoverable_incomplete_stat
             .unwrap();
         assert!(before.elapsed() < Duration::from_secs(12));
         held.join().unwrap();
-        let store = Store::open(&home).unwrap();
+        let store = agent_run_store::fixture::open(&home).unwrap();
         let row = store.get(&id).unwrap();
         let dir = home.join("agents").join(id.as_str());
         let receipt: serde_json::Value = serde_json::from_slice(
@@ -293,49 +302,46 @@ async fn terminal_busy_keeps_exactly_once_success_or_recoverable_incomplete_stat
             "fixture final answer\n"
         );
         assert!(!receipt.to_string().contains("synthetic-token"));
-        if hold < Duration::from_secs(1) {
-            assert!(exit.success());
-            assert_eq!(row.status, Status::Succeeded);
-            assert_eq!(
-                store
-                    .conn
-                    .query_row(
-                        "SELECT count(*) FROM deliveries WHERE agent_id=?",
-                        [id.as_str()],
-                        |r| r.get::<_, i64>(0)
-                    )
-                    .unwrap(),
-                1
-            );
-        } else {
-            assert!(!exit.success());
-            assert!(!row.status.terminal());
-            assert!(!service.answer(&id).unwrap()["available"].as_bool().unwrap());
-            assert_eq!(
-                store
-                    .conn
-                    .query_row(
-                        "SELECT ownership_active FROM attempts WHERE id=?",
-                        [attempt],
-                        |r| r.get::<_, i64>(0)
-                    )
-                    .unwrap(),
-                1
-            );
-            let diag: String = store.conn.query_row("SELECT data_json FROM events WHERE agent_id=? AND kind='execution_failure_v1' ORDER BY seq DESC LIMIT 1",[id.as_str()],|r|r.get(0)).unwrap();
-            let diag: serde_json::Value = serde_json::from_str(&diag).unwrap();
-            assert_eq!(diag["operation"], "cleanup_write");
-            assert_eq!(diag["sqlite_extended_code"], 5);
-            assert!(diag["wait_ms"].as_u64().unwrap() >= 4900);
-            assert_eq!(diag["attempts"], 1);
-        }
+        // The single resident writer waits out a foreign lock holder inside the
+        // supervisor's original deadline: whatever the outage length, the final
+        // commit lands exactly once (no per-process busy allowance remains).
+        assert!(
+            exit.success(),
+            "hold {hold:?}: failure_kind={:?}, failure_text={:?}",
+            row.failure_kind,
+            row.failure_text
+        );
+        assert_eq!(row.status, Status::Succeeded);
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM deliveries WHERE agent_id=?",
+                    [id.as_str()],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM events WHERE agent_id=? AND to_status='succeeded'",
+                    [id.as_str()],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1,
+            "one terminal transition"
+        );
     }
 }
 
 /// Child construction removes all actually inherited worker bindings without
 /// mutating the genuine parent. Fresh synthetic tokens added later remain usable.
-#[test]
-fn test_children_strip_real_context_and_preserve_explicit_fixture_bindings() {
+#[tokio::test]
+async fn test_children_strip_real_context_and_preserve_explicit_fixture_bindings() {
     let before: Vec<_> = std::env::vars_os()
         .filter(|(key, _)| {
             key == "AGENT_RUN_HOME" || key.to_string_lossy().starts_with("AGENT_RUN_WORKER_")

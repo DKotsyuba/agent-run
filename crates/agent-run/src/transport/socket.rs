@@ -475,7 +475,7 @@ impl Lanes {
     }
 }
 /// Removes only the listener inode this broker created while retaining its lock.
-struct SocketGuard {
+pub(crate) struct SocketGuard {
     path: PathBuf,
     device: u64,
     inode: u64,
@@ -691,54 +691,20 @@ async fn connection(
         }
     }
 }
-/// Serves the default `<home>/api.sock` broker endpoint until a termination signal.
-pub async fn serve(home: &Path) -> Result<()> {
-    serve_at(home, &home.join("api.sock")).await
-}
-
-/// Serves one selected private socket until SIGINT or SIGTERM.
+/// Binds one private same-user broker socket under its exclusive startup lock.
 ///
-/// The adjacent lock fences stale-socket probing and binding for the complete
-/// listener lifetime. Shutdown stops accepts and gives admitted handlers five
-/// seconds to finish before refusing remaining work by closing their streams.
-pub async fn serve_at(home: &Path, socket_path: &Path) -> Result<()> {
-    serve_at_with_options(home, socket_path, ServeOptions::default()).await
-}
-
-/// Serves one selected socket with explicit bounded connection and deadline options.
-/// Owns reconciliation, service supervision and bounded history-retention workers;
-/// shutdown cancels their schedules while in-flight SQLite work uses progress deadlines.
-pub async fn serve_at_with_options(
-    home: &Path,
-    socket_path: &Path,
-    options: ServeOptions,
-) -> Result<()> {
-    if options.max_connections == 0 || options.max_pending_requests == 0 {
-        return Err(crate::error::invalid("socket limits must be positive"));
-    }
-    if options.request_timeout.is_zero() || options.idle_timeout.is_zero() {
-        return Err(crate::error::invalid("socket deadlines must be positive"));
-    }
-    agent_run_core::logging::configure(home, "api");
-    // An older database is only ever upgraded by the paired config migration.
-    crate::migrate::require_current_store(home)?;
-    // Either a valid schema-2 provider config or a valid schema-1 config.
-    if agent_run_config::provider_config::ProviderConfig::load(home).is_err() {
-        let _ = crate::config::Config::load(home)?;
-    }
-    let _ = crate::state::Store::open(home)?;
-    let directory = std::fs::symlink_metadata(home)?;
+/// The adjacent `.<name>.lock` file fences stale-socket probing and binding for
+/// the complete listener lifetime (it is also the lock offline tools take to
+/// prove the broker is not serving). A stale socket inode of this user is
+/// reclaimed; a live listener, a foreign inode or a non-socket is refused.
+/// The returned guard removes only the inode it created and keeps the lock.
+///
+/// # Errors
+/// The lock is held (`socket is already in use`), the path is not a private
+/// owned socket, or the bind fails.
+pub(crate) async fn bind_private(socket_path: &Path) -> Result<(UnixListener, SocketGuard)> {
     // SAFETY: geteuid is a read-only process identity query.
     let uid = unsafe { libc::geteuid() };
-    if !directory.is_dir()
-        || directory.file_type().is_symlink()
-        || directory.uid() != uid
-        || directory.mode() & 0o077 != 0
-    {
-        return Err(crate::error::invalid(
-            "agent-run home must be an owned mode-0700 directory",
-        ));
-    }
     let path = socket_path.to_path_buf();
     let lock_path = path.with_file_name(format!(
         ".{}.lock",
@@ -790,64 +756,204 @@ pub async fn serve_at_with_options(
     let listener = UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     let meta = std::fs::symlink_metadata(&path)?;
-    let _guard = SocketGuard {
+    let guard = SocketGuard {
         path,
         device: meta.dev(),
         inode: meta.ino(),
         _lock: lock,
     };
-    let service = Service::new(home.to_owned());
-    let _ = service.reconcile()?;
+    Ok((listener, guard))
+}
+
+/// Serves the default `<home>/api.sock` broker endpoint until a termination signal.
+pub async fn serve(home: &Path) -> Result<()> {
+    serve_at(home, &home.join("api.sock")).await
+}
+
+/// Serves one selected private socket until SIGINT or SIGTERM.
+///
+/// The adjacent lock fences stale-socket probing and binding for the complete
+/// listener lifetime. Shutdown stops accepts and gives admitted handlers five
+/// seconds to finish before refusing remaining work by closing their streams.
+pub async fn serve_at(home: &Path, socket_path: &Path) -> Result<()> {
+    serve_at_with_options(home, socket_path, ServeOptions::default()).await
+}
+
+/// Serves one selected socket with explicit bounded connection and deadline options.
+/// Owns reconciliation, service supervision and bounded history-retention workers;
+/// shutdown cancels their schedules while in-flight SQLite work uses progress deadlines.
+pub async fn serve_at_with_options(
+    home: &Path,
+    socket_path: &Path,
+    options: ServeOptions,
+) -> Result<()> {
+    if options.max_connections == 0 || options.max_pending_requests == 0 {
+        return Err(crate::error::invalid("socket limits must be positive"));
+    }
+    if options.request_timeout.is_zero() || options.idle_timeout.is_zero() {
+        return Err(crate::error::invalid("socket deadlines must be positive"));
+    }
+    agent_run_core::logging::configure(home, "api");
+    // An older database is only ever upgraded by the paired config migration.
+    crate::migrate::require_current_store(home)?;
+    // Either a valid schema-2 provider config or a valid schema-1 config.
+    if agent_run_config::provider_config::ProviderConfig::load(home).is_err() {
+        let _ = crate::config::Config::load(home)?;
+    }
+    let directory = std::fs::symlink_metadata(home)?;
+    // SAFETY: geteuid is a read-only process identity query.
+    let uid = unsafe { libc::geteuid() };
+    if !directory.is_dir()
+        || directory.file_type().is_symlink()
+        || directory.uid() != uid
+        || directory.mode() & 0o077 != 0
+    {
+        return Err(crate::error::invalid(
+            "agent-run home must be an owned mode-0700 directory",
+        ));
+    }
+    let (listener, _guard) = bind_private(socket_path).await?;
+    // The writer socket is bound before anything is served: its startup lock is
+    // what offline tools take to prove that no broker serves this home.
+    let (writer_listener, writer_guard) = bind_private(&home.join("writer.sock")).await?;
+    // The one resident writer: acquires the home-wide writer lease and opens the
+    // EXISTING schema-30 store on its dedicated thread (never initializes or
+    // migrates; an absent or old schema is a typed refusal).
+    let writer_service = agent_run_core::writer::WriterService::start(
+        home,
+        agent_run_core::writer::WriterConfig::default(),
+    )?;
+    let broker_writer = agent_run_core::broker_writer::BrokerWriter::new(writer_service.handle());
+    let endpoint = agent_run_core::writer_server::WriterEndpoint::new(
+        writer_service.handle(),
+        crate::process::inspect(std::process::id() as i32)?,
+        home,
+    );
+    let (writer_stop, writer_stopped) = tokio::sync::oneshot::channel::<()>();
+    // The listener's result is observed: a fatal error ends API admission too
+    // (a broker whose writer socket is dead must not look alive).
+    let mut writer_task = Some(tokio::spawn(async move {
+        let _guard = writer_guard;
+        super::writer_socket::serve_listener(writer_listener, endpoint, async {
+            let _ = writer_stopped.await;
+        })
+        .await
+    }));
+    let mut writer_failure: Option<Error> = None;
+    let service = Service::new(home.to_owned()).with_writer(broker_writer.clone());
+    let _ = service.reconcile().await?;
     let mut services =
-        agent_run_core::managed_services::Manager::new(home, std::env::current_exe()?)?;
+        agent_run_core::managed_services::Manager::new(home, std::env::current_exe()?)?
+            .with_writer(broker_writer.lane("services"));
     // JoinSet aborts maintenance on every exit path, including cancellation of
     // serve_at itself; dropping a bare JoinHandle would detach these loops.
     let mut workers = JoinSet::new();
     let history_home = home.to_owned();
+    let retention_lane = broker_writer.lane("retention");
     workers.spawn(async move {
         // Database expiry/compaction and filesystem retention keep independent
         // schedules: a filesystem backlog drains in one-second passes without
         // forcing a database writer transaction every second, and one side
         // deferring, failing or backlogging never changes the other's cadence.
         let mut schedules = MaintenanceSchedules::starting_at(tokio::time::Instant::now());
+        // Volatile scan position only; the writer rechecks every deletion proof.
+        let mut history_cursor = None;
         loop {
             if schedules.next_due() > tokio::time::Instant::now() {
                 tokio::time::sleep_until(schedules.next_due()).await;
             }
             if schedules.next_database <= tokio::time::Instant::now() {
                 let home = history_home.clone();
+                let after = history_cursor.clone();
                 // SQLite work runs outside the async executor. One job at a time;
                 // short SQL deadlines also bound it if the broker task is aborted.
-                let result = tokio::task::spawn_blocking(
-                    move || -> std::result::Result<usize, (&'static str, Error)> {
-                        let mut store =
-                            crate::state::Store::open(&home).map_err(|error| ("open", error))?;
-                        store
-                            .conn
-                            .busy_timeout(Duration::from_millis(100))
-                            .map_err(|error| ("open", Error::from(error)))?;
-                        let now = crate::domain::now();
-                        let removed = store.prune_history(now).map_err(|error| ("prune", error))?;
-                        // SQLite compaction follows its own idle rules: it only
-                        // runs once expiry reports no remaining work, so a page
-                        // backlog keeps its own cadence without delaying expiry.
-                        Ok(removed
-                            + usize::from(
-                                removed == 0
-                                    && store.vacuum_history().map_err(|error| ("vacuum", error))?,
-                            ))
-                    },
-                )
+                let result: Result<usize> = async {
+                    let (batch, next_cursor, pending) = tokio::task::spawn_blocking(move || {
+                        let reader = crate::state::writer::StoreReader::open_with(
+                            &home,
+                            Duration::from_millis(100),
+                        )?;
+                        let at = crate::domain::now();
+                        let pending = reader.history_work_pending(at)?;
+                        let (batch, cursor) = reader.history_page(at, 32, after.as_ref())?;
+                        Ok::<_, Error>((batch, cursor, pending))
+                    })
+                    .await
+                    .map_err(|_| Error::Runtime("history reader stopped".into()))??;
+                    let removed = if batch.candidates.is_empty() && !pending {
+                        0
+                    } else {
+                        let result = retention_lane
+                            .local(batch, agent_run_core::broker_writer::BROKER_BUDGET)
+                            .await?;
+                        result["removed"]
+                            .as_u64()
+                            .and_then(|v| usize::try_from(v).ok())
+                            .ok_or_else(|| {
+                                Error::Integrity("invalid history prune result".into())
+                            })?
+                    };
+                    history_cursor = next_cursor;
+                    retention_lane
+                        .local(
+                            crate::state::ops::PruneIncidentLedger {
+                                at: crate::domain::now(),
+                            },
+                            agent_run_core::broker_writer::BROKER_BUDGET,
+                        )
+                        .await?;
+                    let (boot_id, now_ns) = agent_run_platform::monotonic::now()?;
+                    retention_lane
+                        .local(
+                            crate::state::ops::PruneReceipts {
+                                at: crate::domain::now(),
+                                boot_id: boot_id.clone(),
+                                now_ns,
+                            },
+                            agent_run_core::broker_writer::BROKER_BUDGET,
+                        )
+                        .await?;
+                    if removed == 0 {
+                        let checkpoint = retention_lane
+                            .handle()
+                            .maintain(
+                                crate::state::ops::MaintenanceOp::CheckpointWal { truncate: false },
+                                agent_run_domain::storage::MonoDeadline {
+                                    boot_id,
+                                    ns: now_ns.saturating_add(250_000_000),
+                                },
+                            )
+                            .await;
+                        match checkpoint {
+                            agent_run_domain::storage::MaintenanceOutcome::Interrupted => {
+                                return Err(Error::Runtime(
+                                    "history checkpoint interrupted".into(),
+                                ));
+                            }
+                            agent_run_domain::storage::MaintenanceOutcome::Refused(error) => {
+                                return Err(error.into_error());
+                            }
+                            agent_run_domain::storage::MaintenanceOutcome::Checkpoint {
+                                busy,
+                                log,
+                                checkpointed,
+                            } if busy != 0 || checkpointed < log => {
+                                eprintln!(
+                                    "history checkpoint deferred: busy={busy} backlog={}",
+                                    log.saturating_sub(checkpointed)
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(removed)
+                }
                 .await;
                 let at = tokio::time::Instant::now();
                 match result {
-                    Ok(Ok(removed)) => schedules.database_pass(at, removed),
-                    Ok(Err((stage, error))) => {
-                        maintenance_diagnostic("history", stage, &error);
-                        schedules.next_database = at + MAINTENANCE_RETRY;
-                    }
-                    Err(_) => {
-                        eprintln!("history maintenance: worker failed");
+                    Ok(removed) => schedules.database_pass(at, removed),
+                    Err(error) => {
+                        maintenance_diagnostic("history", "queued", &error);
                         schedules.next_database = at + MAINTENANCE_RETRY;
                     }
                 }
@@ -857,22 +963,26 @@ pub async fn serve_at_with_options(
                 // Filesystem retention runs on its own schedule, even while
                 // database batches still report work, so a large journal
                 // backlog can never starve reclaiming disposable files on disk.
-                let result = tokio::task::spawn_blocking(move || -> Result<usize> {
-                    let mut store = crate::state::Store::open(&home)?;
-                    store.conn.busy_timeout(Duration::from_millis(100))?;
-                    let now = crate::domain::now();
-                    agent_run_core::housekeeping::sweep(&home, now, &mut store)
-                })
+                // Reads use a read-only handle; the one registry mutation of the
+                // pass is an ordered operation of the retention lane.
+                let result: Result<usize> = async {
+                    let reader = crate::state::writer::StoreReader::open_with(
+                        &home,
+                        Duration::from_millis(100),
+                    )?;
+                    let mut layout = agent_run_core::runtime_storage::BrokerLayout {
+                        lane: retention_lane.clone(),
+                        reader,
+                    };
+                    agent_run_core::housekeeping::sweep_on(&home, crate::domain::now(), &mut layout)
+                        .await
+                }
                 .await;
                 let at = tokio::time::Instant::now();
                 match result {
-                    Ok(Ok(removed)) => schedules.filesystem_pass(at, removed),
-                    Ok(Err(error)) => {
+                    Ok(removed) => schedules.filesystem_pass(at, removed),
+                    Err(error) => {
                         maintenance_diagnostic("filesystem", "sweep", &error);
-                        schedules.next_filesystem = at + MAINTENANCE_RETRY;
-                    }
-                    Err(_) => {
-                        eprintln!("filesystem maintenance: worker failed");
                         schedules.next_filesystem = at + MAINTENANCE_RETRY;
                     }
                 }
@@ -890,8 +1000,14 @@ pub async fn serve_at_with_options(
         }
     });
     let reconciler = service.clone();
-    spawn_reconcile_loop(&mut workers, Duration::from_secs(1), move || {
-        let _ = reconciler.reconcile();
+    workers.spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            ticker.tick().await;
+            if let Err(error) = reconciler.reconcile().await {
+                maintenance_diagnostic("reconcile", "queued", &error);
+            }
+        }
     });
     let refresher = service.clone();
     let home = service.home.clone();
@@ -915,6 +1031,15 @@ pub async fn serve_at_with_options(
         tokio::select! {
             _=tokio::signal::ctrl_c()=>break,
             _=term.recv()=>break,
+            ended = writer_task.as_mut().expect("held while selectable"), if writer_task.is_some() => {
+                writer_task = None;
+                writer_failure = Some(match ended {
+                    Ok(Ok(())) => Error::Runtime("writer socket stopped unexpectedly".into()),
+                    Ok(Err(error)) => error,
+                    Err(_) => Error::Runtime("writer socket task failed".into()),
+                });
+                break;
+            }
             accepted=listener.accept()=>{
                 let(mut stream,_)=accepted?;
                 let (permit, control_only) = match gate.clone().try_acquire_owned() {
@@ -947,7 +1072,24 @@ pub async fn serve_at_with_options(
         }
     }
     handlers.abort_all();
-    Ok(())
+    // The writer socket stops accepting, then the writer drains: queued work is
+    // answered `NotEnqueued(Draining)`, the executing job finishes, the thread
+    // is joined and the writer lease is released.
+    let _ = writer_stop.send(());
+    if let Some(task) = writer_task {
+        let _ = task.await;
+    }
+    let (boot_id, now_ns) = agent_run_platform::monotonic::now()?;
+    let drained = writer_service
+        .shutdown(agent_run_domain::storage::MonoDeadline {
+            boot_id,
+            ns: now_ns + 5_000_000_000,
+        })
+        .await;
+    match writer_failure {
+        Some(error) => Err(error),
+        None => drained,
+    }
 }
 /// Spawns the serial lease/process reconciliation loop on `workers`.
 ///
@@ -957,6 +1099,7 @@ pub async fn serve_at_with_options(
 /// delivery loop never waits on it. Aborting the task (shutdown) stops the loop
 /// at its next await; an already running bounded pass is left to finish rather
 /// than being cut mid-cleanup.
+#[cfg(test)]
 fn spawn_reconcile_loop<R>(workers: &mut JoinSet<()>, period: Duration, run: R)
 where
     R: Fn() + Send + Sync + 'static,

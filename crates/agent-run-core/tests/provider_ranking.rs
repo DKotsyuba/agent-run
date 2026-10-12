@@ -23,8 +23,8 @@ const AT: f64 = 1000.0;
 /// Opens one initialized disposable store with fake account references.
 fn home(accounts: &[(&str, &str)]) -> tempfile::TempDir {
     let home = tempfile::tempdir().unwrap();
-    Store::initialize(home.path()).unwrap();
-    let mut store = Store::open(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
     for (id, name) in accounts {
         store
             .register_account(&AccountRecord {
@@ -204,7 +204,7 @@ fn known_scores_weight_and_order_before_unknown() {
         ("acct-b", "FAKE_B"),
         ("acct-c", "FAKE_C"),
     ]);
-    let store = Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
     let catalog = catalog(&store);
     sample(&store, "acct-a", "fixture", 20.0);
     sample(&store, "acct-b", "fixture", 30.0);
@@ -253,7 +253,7 @@ fn labels_and_aliases_deduplicate_to_one_physical_candidate() {
         ("acct-b", "FAKE_B"),
         ("acct-c", "FAKE_C"),
     ]);
-    let store = Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
     let catalog = catalog(&store);
     sample(&store, "acct-a", "fixture", 20.0);
     let set = candidates(&store, &catalog, "fixture");
@@ -312,7 +312,7 @@ fn renamed_alias_keeps_fresh_physical_window_known() {
             ("acct-b", "FAKE_B"),
             ("acct-c", "FAKE_C"),
         ]);
-        let store = Store::open(home.path()).unwrap();
+        let store = agent_run_store::fixture::open(home.path()).unwrap();
         let catalog = catalog(&store);
         for (runtime, observed, valid, remaining) in [
             (if renamed { "a-old" } else { "b-new" }, 800.0, 900.0, 70.0),
@@ -370,7 +370,7 @@ fn exhaustion_is_model_specific_and_latches_survive_stale_evidence() {
         ("acct-b", "FAKE_B"),
         ("acct-c", "FAKE_C"),
     ]);
-    let store = Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
     let catalog = catalog(&store);
     // acct-a: fresh authoritative zero on the fixture lane only.
     sample(&store, "acct-a", "fixture", 0.0);
@@ -446,7 +446,7 @@ fn exhaustion_is_model_specific_and_latches_survive_stale_evidence() {
 #[test]
 fn equal_priorities_share_rank_and_output_is_row_order_independent() {
     let first_home = home(&[("acct-a", "FAKE_A"), ("acct-b", "FAKE_B")]);
-    let store = Store::open(first_home.path()).unwrap();
+    let store = agent_run_store::fixture::open(first_home.path()).unwrap();
     let providers = serde_json::from_value(json!([
         {
             "id":"glm-user","harness":"claude-code",
@@ -474,7 +474,7 @@ fn equal_priorities_share_rank_and_output_is_row_order_independent() {
 
     // Reversed physical row order produces the identical set.
     let other_home = home(&[("acct-a", "FAKE_A"), ("acct-b", "FAKE_B")]);
-    let second = Store::open(other_home.path()).unwrap();
+    let second = agent_run_store::fixture::open(other_home.path()).unwrap();
     let second_catalog = ProviderCatalog::new(
         second.list_accounts().unwrap(),
         serde_json::from_value(json!([
@@ -500,7 +500,7 @@ fn equal_priorities_share_rank_and_output_is_row_order_independent() {
     // Activity on the better-scoring account never reorders producer output:
     // different quota scores keep their order across reproductions.
     let tilted_home = home(&[("acct-a", "FAKE_A"), ("acct-b", "FAKE_B")]);
-    let mut busy = Store::open(tilted_home.path()).unwrap();
+    let mut busy = agent_run_store::fixture::open(tilted_home.path()).unwrap();
     let busy_catalog = ProviderCatalog::new(busy.list_accounts().unwrap(), serde_json::from_value(json!([
         {
             "id":"glm-user","harness":"claude-code",
@@ -554,7 +554,7 @@ fn pinning_resolves_one_account_and_unknown_accounts_admit() {
         ("acct-b", "FAKE_B"),
         ("acct-fresh", "FAKE_F"),
     ]);
-    let mut store = Store::open(home.path()).unwrap();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
     sample(&store, "acct-a", "fixture", 20.0);
     let catalog = {
         let providers = serde_json::from_value(json!([
@@ -673,7 +673,7 @@ fn producing_candidates_is_read_only_and_revision_consistent() {
         ("acct-b", "FAKE_B"),
         ("acct-c", "FAKE_C"),
     ]);
-    let mut store = Store::open(home.path()).unwrap();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
     let catalog = catalog(&store);
     sample(&store, "acct-a", "fixture", 20.0);
     sample(&store, "acct-b", "fixture", 30.0);
@@ -768,7 +768,7 @@ fn producing_candidates_is_read_only_and_revision_consistent() {
 #[test]
 fn invalid_input_overflow_and_alias_conflicts_are_explicit() {
     let home = home(&[("acct-a", "FAKE_A")]);
-    let store = Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
     let providers = serde_json::from_value(json!([
         {
             "id":"plus","harness":"claude-code",
@@ -906,7 +906,7 @@ fn empty_providers_are_accounted_explicitly() {
         ("acct-b", "FAKE_B"),
         ("acct-c", "FAKE_C"),
     ]);
-    let store = Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
     let catalog = catalog(&store);
     let order = provider_order_at(&store, &catalog, &none_ineligible(), AT).unwrap();
     let bare = order

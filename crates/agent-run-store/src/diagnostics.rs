@@ -38,7 +38,25 @@ fn row_object(row: &Row<'_>) -> rusqlite::Result<Value> {
     Ok(Value::Object(object))
 }
 
+/// The database path with its directory resolved and its final name kept:
+/// NOFOLLOW refuses any symlinked component, so the directory (the current
+/// directory for a bare file name) is canonicalized while a symlinked file
+/// itself still refuses.
+fn resolved(path: &Path) -> Result<std::path::PathBuf> {
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    Ok(std::fs::canonicalize(directory)?.join(path.file_name().unwrap_or_default()))
+}
+
 /// Opens an existing current database read-only and returns Python-compatible bounded diagnostics.
+///
+/// The connection is an ordinary WAL-aware read-only `query_only` handle (never
+/// `immutable=1`, which would skip locking and change detection on a live
+/// database) and both queries run in one short read transaction, so the
+/// snapshot is consistent and includes committed rows still in the WAL. The
+/// file is never created, migrated or written.
 pub fn diagnostic_snapshot(
     path: &Path,
     observed_at: f64,
@@ -56,26 +74,30 @@ pub fn diagnostic_snapshot(
             path.display()
         )));
     }
-    let uri = format!("file:{}?mode=ro&immutable=1", path.display());
     let conn = Connection::open_with_flags(
-        uri,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        resolved(path)?,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
+    conn.busy_timeout(std::time::Duration::from_millis(250))?;
     conn.pragma_update(None, "query_only", true)?;
+    let snapshot = conn.unchecked_transaction()?;
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version != VERSION {
         return Err(invalid(format!(
             "state migration required: found v{version}, expected v{VERSION}"
         )));
     }
-    let mut agents_stmt = conn.prepare(&format!(
+    let mut agents_stmt = snapshot.prepare(&format!(
         "SELECT * FROM agents WHERE status IN {ACTIVE_SQL} ORDER BY created_at DESC,id DESC LIMIT ?"
     ))?;
     let agents = agents_stmt
         .query_map([limit as i64], row_object)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut capacity_stmt = conn.prepare("SELECT id,runtime,lane,window,target,source,observed_at,valid_until FROM (SELECT *,ROW_NUMBER() OVER (PARTITION BY runtime,lane,window,target,source ORDER BY observed_at DESC,id DESC) AS position FROM capacity_samples) WHERE position=1 ORDER BY observed_at DESC,id DESC LIMIT ?")?;
+    let mut capacity_stmt = snapshot.prepare("SELECT id,runtime,lane,window,target,source,observed_at,valid_until FROM (SELECT *,ROW_NUMBER() OVER (PARTITION BY runtime,lane,window,target,source ORDER BY observed_at DESC,id DESC) AS position FROM capacity_samples) WHERE position=1 ORDER BY observed_at DESC,id DESC LIMIT ?")?;
     let capacity = capacity_stmt.query_map([limit as i64], |row| Ok(json!({ "id": row.get::<_, i64>(0)?, "runtime": row.get::<_, String>(1)?, "lane": row.get::<_, String>(2)?, "window": row.get::<_, String>(3)?, "target": row.get::<_, Option<String>>(4)?, "source": row.get::<_, String>(5)?, "observed_at": row.get::<_, Option<f64>>(6)?, "valid_until": row.get::<_, Option<f64>>(7)? })))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(agents_stmt);
+    drop(capacity_stmt);
+    snapshot.finish()?;
     Ok(DiagnosticSnapshot { agents, capacity })
 }
 
@@ -110,7 +132,7 @@ pub fn provider_accounts_snapshot(
     Ok(accounts)
 }
 
-impl Store {
+impl Store<'_> {
     /// Returns active agents visible to one orchestrator session, newest first, with silence and warning state.
     pub fn active_context(
         &self,
@@ -142,5 +164,30 @@ impl Store {
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Database path resolution of the read-only diagnostic snapshot.
+    use super::*;
+
+    /// A bare file name resolves against the current directory (without
+    /// changing it), a nested path against its canonical directory, and the
+    /// final name is never resolved.
+    #[test]
+    fn resolved_keeps_bare_names_and_final_component() {
+        let cwd = std::fs::canonicalize(".").unwrap();
+        assert_eq!(
+            resolved(Path::new("state.db")).unwrap(),
+            cwd.join("state.db")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(
+            resolved(&dir.path().join("state.db")).unwrap(),
+            canonical.join("state.db")
+        );
+        assert!(resolved(&dir.path().join("missing/state.db")).is_err());
     }
 }

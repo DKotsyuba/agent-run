@@ -125,7 +125,7 @@ fn admitted(home: &tempfile::TempDir) -> agent_run::domain::AgentId {
         "task":"fixture", "workdir":home.path()
     }))
     .unwrap();
-    agent_run::state::Store::open(home.path())
+    agent_run_store::fixture::open(home.path())
         .unwrap()
         .admit(&request, &config, &json!({}), None)
         .unwrap()
@@ -138,7 +138,7 @@ fn completed(home: &tempfile::TempDir) -> agent_run::domain::AgentId {
     let root = home.path().join("agents").join(id.as_str());
     agent_run::fs::private_dir(&root).unwrap();
     let proof = verify::seal(&root, std::path::Path::new("answer.md"), "done").unwrap();
-    let mut store = agent_run::state::Store::open(home.path()).unwrap();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
     store.running(&id, 42).unwrap();
     store
         .finish(&id, &Outcome::success(None), Some(&proof), None)
@@ -564,7 +564,7 @@ async fn python_wait_timeout_validation_is_typed() {
 async fn python_wait_timeout_is_a_normal_result() {
     let home = tempfile::tempdir().unwrap();
     configure(home.path());
-    let mut store = agent_run::state::Store::open(home.path()).unwrap();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
     let request: agent_run::domain::StartRequest = serde_json::from_value(json!({
         "runtime":"mock", "model":"fixture", "profile":"review",
         "task":"fixture", "workdir":home.path()
@@ -600,7 +600,7 @@ async fn list_long_poll_wakes_on_journal_progress() {
     let (home, path, task) = broker().await;
     let id = admitted(&home);
     let (revision, message_revision) = {
-        let store = agent_run::state::Store::open(home.path()).unwrap();
+        let store = agent_run_store::fixture::open(home.path()).unwrap();
         (store.revision().unwrap(), store.message_revision().unwrap())
     };
     assert_eq!(message_revision, 0, "a fresh fixture has no journal rows");
@@ -608,7 +608,7 @@ async fn list_long_poll_wakes_on_journal_progress() {
         let home = home.path().to_owned();
         async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            agent_run::state::Store::open(&home)
+            agent_run_store::fixture::open(&home)
                 .unwrap()
                 .message(&id, "assistant", "progress", None, None)
                 .unwrap();

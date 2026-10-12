@@ -3,7 +3,7 @@
 
 #![cfg(feature = "test-fixtures")]
 
-use agent_run::{domain::AgentId, state::Store, transport::socket};
+use agent_run::{domain::AgentId, transport::socket};
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, Write},
@@ -70,7 +70,11 @@ fn spawn_worker() -> (
 ) {
     let home = tempfile::Builder::new()
         .prefix("ar-pool-wire-")
-        .tempdir_in("/tmp")
+        .tempdir_in(
+            std::env::var_os("AGENT_RUN_TEST_TMP")
+                .or_else(|| std::env::var_os("TMPDIR"))
+                .expect("project test temporary directory must be supplied"),
+        )
         .unwrap();
     let path = home.path().canonicalize().unwrap();
     let init = Command::new(env!("CARGO_BIN_EXE_agent-run"))
@@ -124,7 +128,7 @@ fn spawn_worker() -> (
             "task":"fixture","workdir":path
         }))
         .unwrap();
-        let mut store = Store::open(&path).unwrap();
+        let mut store = agent_run_store::fixture::open(&path).unwrap();
         let (run, _) = store.admit(&request, &config, &json!({}), None).unwrap();
         store
             .conn

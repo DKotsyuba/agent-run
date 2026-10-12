@@ -8,9 +8,9 @@ use agent_run_domain::{
     worker::{FinishReceipt, FinishRequest},
 };
 use agent_run_platform::fs::sha256;
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, params};
 
-impl Store {
+impl Store<'_> {
     /// Queue one owned native completion through existing steering. The caller
     /// has already verified the native thread, turn, started item and redacted
     /// result. A 64-byte digest deduplicates retries within the current attempt;
@@ -34,9 +34,7 @@ impl Store {
         {
             return Err(invalid("invalid native wake"));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let attempt: Option<String> = tx.query_row("SELECT t.id FROM attempts t JOIN worker_lifecycle l ON l.attempt_id=t.id \
             JOIN agents a ON a.id=t.agent_id WHERE t.agent_id=? AND t.ownership_active=1 AND t.finished_at IS NULL \
             AND a.status='running' AND a.finished_at IS NULL AND l.finish_json IS NULL",[run.as_str()],|r|r.get(0)).optional()?;
@@ -70,9 +68,7 @@ impl Store {
         if input.summary.contains(token) || !at.is_finite() || at < 0.0 {
             return Err(invalid("invalid finish payload"));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let auth = crate::worker::authenticate_attempt(&tx, run, attempt, token, at)?;
         if auth.is_none() {
             return Err(invalid("invalid worker capability"));
@@ -192,12 +188,13 @@ impl Store {
     /// Commit a turn boundary only on the current owned explicit attempt; never
     /// overwrite accepted finish. Repeated idle observations are no-ops. A wake
     /// increments the turn count once; phases and times never expire authority.
-    pub fn worker_turn(&self, run: &AgentId, idle: bool, at: f64) -> Result<()> {
+    /// Returns whether the phase changed (false for a no-op observation).
+    pub fn worker_turn(&self, run: &AgentId, idle: bool, at: f64) -> Result<bool> {
         let phase = if idle { "idle" } else { "running" };
         if !at.is_finite() || at < 0.0 {
             return Err(invalid("invalid turn observation"));
         }
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let changed=tx.execute("UPDATE worker_lifecycle SET idle_seconds=idle_seconds+CASE WHEN phase='idle' THEN MAX(0,?-transition_at) ELSE 0 END, \
             phase=?,transition_at=?,turn_count=turn_count+? \
             WHERE phase<>? AND finish_json IS NULL AND attempt_id IN \
@@ -210,7 +207,7 @@ impl Store {
                 params![run.as_str(),at,serde_json::json!({"phase":phase}).to_string(),run.as_str()])?;
         }
         tx.commit()?;
-        Ok(())
+        Ok(changed != 0)
     }
 
     /// Read current turn phase/counter for public observations; legacy rows have

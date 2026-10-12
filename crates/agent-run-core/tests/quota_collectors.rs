@@ -1,4 +1,5 @@
 //! External collector contract, account isolation, history retention and process lifetime.
+mod common;
 use agent_run_config::provider_config::ProviderConfig;
 use agent_run_core::capacity::{collectors::collect_providers, executable};
 use agent_run_domain::catalog::{AccountRecord, CollectorBinding};
@@ -27,7 +28,7 @@ fn configured(root: &Path, command: &CollectorBinding) -> ProviderConfig {
     let secret = root.join("credential");
     fs::write(&secret, "private-fixture-token").unwrap();
     fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
-    let mut store = agent_run_store::Store::initialize(root).unwrap();
+    let mut store = agent_run_store::fixture::initialize(root).unwrap();
     store
         .register_account(&AccountRecord {
             account_id: "acct-test".parse().unwrap(),
@@ -63,6 +64,8 @@ jq -e 'if .version != 1 or .account.id != "acct-test" or .auth.token != "private
 "#,
     );
     let config = configured(root.path(), &command);
+    let writer = common::writer::Harness::start(root.path());
+    let _socket = writer.serve_unix(root.path());
     let result = agent_run_core::capacity::sources::collect(root.path())
         .await
         .unwrap();
@@ -71,7 +74,7 @@ jq -e 'if .version != 1 or .account.id != "acct-test" or .auth.token != "private
     assert_eq!(fs::read_to_string(root.path().join("calls")).unwrap(), "x");
     assert!(!root.path().join("INJECTED").exists());
     assert!(!result.to_string().contains("private-fixture-token"));
-    let store = agent_run_store::Store::open(root.path()).unwrap();
+    let store = agent_run_store::fixture::open(root.path()).unwrap();
     let remaining: f64 = store
         .conn
         .query_row("SELECT remaining_percent FROM capacity_samples", [], |r| {
@@ -103,6 +106,8 @@ async fn changed_script_failure_preserves_facts_and_backs_off() {
         r#"jq '{version:1,windows:[{pool:"shared",window:"five_hour",models:(.models|keys),remaining_percent:50,observed_at:.now}]}'"#,
     );
     let config = configured(root.path(), &command);
+    let writer = common::writer::Harness::start(root.path());
+    let _socket = writer.serve_unix(root.path());
     assert_eq!(
         collect_providers(root.path(), &config).await.unwrap()["ok"],
         true
@@ -158,7 +163,7 @@ async fn changed_script_failure_preserves_facts_and_backs_off() {
             .unwrap()
             .contains("collector_exit_status:22")
     );
-    let store = agent_run_store::Store::open(root.path()).unwrap();
+    let store = agent_run_store::fixture::open(root.path()).unwrap();
     let count: i64 = store
         .conn
         .query_row("SELECT count(*) FROM capacity_samples", [], |r| r.get(0))
@@ -177,10 +182,12 @@ async fn invalid_or_secret_output_never_persists() {
         let root = tempfile::tempdir().unwrap();
         let command = script(root.path(), &format!("jq '{expression}'"));
         let config = configured(root.path(), &command);
+        let writer = common::writer::Harness::start(root.path());
+        let _socket = writer.serve_unix(root.path());
         let result = collect_providers(root.path(), &config).await.unwrap();
         assert_eq!(result["ok"], false, "{result}");
         assert!(!result.to_string().contains("private-fixture-token"));
-        let store = agent_run_store::Store::open(root.path()).unwrap();
+        let store = agent_run_store::fixture::open(root.path()).unwrap();
         let count: i64 = store
             .conn
             .query_row("SELECT count(*) FROM capacity_samples", [], |r| r.get(0))
@@ -197,6 +204,8 @@ async fn missing_command_and_empty_catalog_are_explicit() {
     command.command = root.path().join("missing-executable");
     command.source = "glm-quota".into();
     let mut config = configured(root.path(), &command);
+    let writer = common::writer::Harness::start(root.path());
+    let _socket = writer.serve_unix(root.path());
     let failed = collect_providers(root.path(), &config).await.unwrap();
     assert_eq!(
         failed["results"][0]["issues"],
@@ -366,6 +375,8 @@ async fn supplied_http_collectors_emit_the_shared_contract() {
         )
         .unwrap();
         let config = configured(root.path(), &command);
+        let writer = common::writer::Harness::start(root.path());
+        let _socket = writer.serve_unix(root.path());
         let result = collect_providers(root.path(), &config).await.unwrap();
         assert_eq!(result["ok"], true, "{script_name}: {result}");
         assert_eq!(result["results"][0]["windows"], windows);
@@ -518,10 +529,12 @@ async fn failing_account_does_not_block_healthy_account() {
 {version:1,windows:[{pool:"shared",window:"five_hour",models:(.models|keys),remaining_percent:50,observed_at:.now}]} end'"#,
     );
     let mut config = configured(root.path(), &command);
+    let writer = common::writer::Harness::start(root.path());
+    let _socket = writer.serve_unix(root.path());
     let credential = root.path().join("second-credential");
     fs::write(&credential, "second-fixture-token").unwrap();
     fs::set_permissions(&credential, fs::Permissions::from_mode(0o600)).unwrap();
-    let mut store = agent_run_store::Store::open(root.path()).unwrap();
+    let mut store = agent_run_store::fixture::open(root.path()).unwrap();
     store
         .register_account(&AccountRecord {
             account_id: "acct-bad".parse().unwrap(),

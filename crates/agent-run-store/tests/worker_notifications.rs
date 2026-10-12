@@ -12,9 +12,9 @@ use rusqlite::params;
 const TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 /// Builds one bound running execution with active attempt ownership.
-fn running() -> (tempfile::TempDir, Store, AgentId, String) {
+fn running() -> (tempfile::TempDir, Store<'static>, AgentId, String) {
     let home = tempfile::tempdir().unwrap();
-    let store = Store::initialize(home.path()).unwrap();
+    let store = agent_run_store::fixture::initialize(home.path()).unwrap();
     let run: AgentId = "ag-20260928-000000-0123456789".parse().unwrap();
     store.conn.execute(
         "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at)

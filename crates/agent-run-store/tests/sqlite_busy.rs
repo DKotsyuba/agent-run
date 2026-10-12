@@ -169,7 +169,7 @@ fn ordinary_storage_boundaries_commit_once_and_preserve_failed_terminal_state() 
     let path = home.path.clone();
     let (send, receive) = std::sync::mpsc::sync_channel(0);
     let held = std::thread::spawn(move || {
-        let lock = agent_run_store::Store::open(&path).unwrap();
+        let lock = agent_run_store::fixture::open(&path).unwrap();
         lock.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         send.send(()).unwrap();
         std::thread::sleep(Duration::from_millis(450));

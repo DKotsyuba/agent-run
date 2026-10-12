@@ -12,11 +12,23 @@ use agent_run_domain::{
 };
 use agent_run_platform::process;
 use agent_run_platform::process::{Cleanup, Identity};
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
+/// SQL predicate on an `attempts` row `t` that provably never spawned a
+/// child: its execution's only owned attempt, still `prepared`, with no
+/// recorded engine identity or birth, no cleanup proof yet and no process
+/// ownership (leader/group) or member rows. A `spawning` phase, any process
+/// evidence or an existing (even unconfirmed) cleanup proof is never
+/// treated as never-spawned.
+pub(crate) const NEVER_SPAWNED: &str = "t.ownership_active=1 AND t.phase='prepared' \
+     AND t.process_identity IS NULL AND t.process_birth_time IS NULL AND t.cleanup_proof_json IS NULL \
+     AND (SELECT COUNT(*) FROM attempts u WHERE u.agent_id=t.agent_id AND u.ownership_active=1)=1 \
+     AND NOT EXISTS(SELECT 1 FROM process_ownership o WHERE o.owner_kind='attempt' AND o.owner_id=t.id) \
+     AND NOT EXISTS(SELECT 1 FROM process_members m WHERE m.owner_kind='attempt' AND m.owner_id=t.id)";
+
 /// One durable first-attempt selection, including an idempotent replay.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProviderAdmission {
     /// One logical agent id retained across future attempts.
     pub agent_id: AgentId,
@@ -106,7 +118,7 @@ fn replayed(
     })
 }
 
-impl Store {
+impl Store<'_> {
     /// Returns the one owned first attempt and selected account for an
     /// admitted v2 agent; no account label or runtime spelling is inferred.
     pub fn provider_attempt(&self, id: &AgentId) -> Result<(String, AccountId)> {
@@ -249,9 +261,7 @@ impl Store {
     /// without a status transition and without touching `started_at`, so the
     /// logical run's start (and any deadline derived from it) is preserved.
     pub fn provider_rerunning(&mut self, id: &AgentId, attempt: &str, pgid: i32) -> Result<()> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let agent = tx.execute(
             "UPDATE agents SET process_group_id=? WHERE id=? AND status='running'",
             params![pgid, id.as_str()],
@@ -278,12 +288,16 @@ impl Store {
         )?)
     }
 
-    /// Certifies an attempt that remained prepared never spawned a child.
-    /// This is only for cancellation or preparation failure before spawn.
+    /// Certifies an attempt that remained prepared never spawned a child
+    /// (see the internal `NEVER_SPAWNED` proof). This is only for cancellation or preparation
+    /// failure before spawn; the sole writer synthesizes the same proof inside
+    /// the terminal transaction instead (row 42).
     pub fn provider_never_spawned(&self, id: &AgentId) -> Result<bool> {
         let changed = self.conn.execute(
-            "UPDATE attempts SET cleanup_proof_json='{\"never_spawned\":true}',phase='cleanup_complete' \
-             WHERE agent_id=? AND ownership_active=1 AND phase='prepared' AND process_identity IS NULL",
+            &format!(
+                "UPDATE attempts SET cleanup_proof_json='{{\"never_spawned\":true}}',phase='cleanup_complete' \
+                 WHERE id IN (SELECT t.id FROM attempts t WHERE t.agent_id=? AND {NEVER_SPAWNED})"
+            ),
             [id.as_str()],
         )?;
         Ok(changed == 1)
@@ -382,9 +396,7 @@ impl Store {
         pinned: Option<&AccountId>,
         resume: Option<ProviderResume<'_>>,
     ) -> Result<ProviderAdmission> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let session = admission::replay_session(&tx, effective)?;
         if (effective.orchestrator.is_none() || session.is_some())
             && let Some(found) =
@@ -483,7 +495,7 @@ pub struct AdmissionInputs<'a> {
 /// batch members count. The caller commits and advances the quota capacity
 /// revision exactly once; this function does neither.
 pub(crate) fn admit_in_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     catalog: &ProviderCatalog,
     id: AgentId,
     inputs: &AdmissionInputs<'_>,
@@ -671,7 +683,7 @@ pub(crate) fn admit_in_tx(
 /// reservations (aliases share physical keys), then account id.
 #[allow(clippy::too_many_arguments)]
 fn choose<'a>(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     catalog: &ProviderCatalog,
     provider: &agent_run_domain::catalog::ProviderId,
     model: &str,
@@ -742,7 +754,7 @@ pub struct NextAttempt {
     pub released: String,
 }
 
-impl Store {
+impl Store<'_> {
     /// Atomically replaces a logical agent's cleaned-up attempt with the next
     /// one, in one immediate transaction; explicit public resume stays a
     /// separate new logical child.
@@ -769,9 +781,7 @@ impl Store {
         catalog: &ProviderCatalog,
         candidates: &QuotaCandidateSet,
     ) -> Result<NextAttempt> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let record = tx.query_row(
             "SELECT * FROM agents WHERE id=?",
             [id.as_str()],

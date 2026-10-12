@@ -31,20 +31,31 @@ fn reaped(pid: i32) -> bool {
     waited == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
 }
 
+/// The real `_supervisor` binary proves its session identity to the launcher
+/// before it reports that it cannot start (here: no broker serves the home), and
+/// the launcher reaps it.
 #[test]
 fn the_real_supervisor_binary_proves_identity_before_reporting_failure() {
     let home = tempfile::tempdir().unwrap();
-    let result = launch::launch_detached(
+    // The supervisor now authenticates with a launch capability, so the test
+    // hands it one exactly like the broker's launch does.
+    let args = [
+        OsStr::new("--home"),
+        home.path().as_os_str(),
+        OsStr::new("_supervisor"),
+        OsStr::new("ag-20260916-120000-0123456789"),
+    ];
+    let mut started = launch::spawn_launch(
         Path::new(env!("CARGO_BIN_EXE_agent-run")),
-        &[
-            OsStr::new("--home"),
-            home.path().as_os_str(),
-            OsStr::new("_supervisor"),
-            OsStr::new("ag-20260916-120000-0123456789"),
-        ],
+        &args,
         quick(),
-        |_, _| Ok(()),
-    );
+        true,
+    )
+    .expect("spawn");
+    started
+        .release_capability(&[b'a'; 64])
+        .expect("capability released");
+    let result = started.complete(quick());
     let (pid, message) = refusal(result);
     // Identity was proven by the real child; only the missing run made it fail.
     assert!(

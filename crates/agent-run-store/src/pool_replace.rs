@@ -19,7 +19,7 @@ use agent_run_domain::{
     domain::{AgentId, OrchestratorRef, Status, now},
     pool::{AcceptanceCriterion, PoolDenial, PoolId},
 };
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
 
 /// Everything an operator replacement must know about the pool and the seat
@@ -47,7 +47,7 @@ pub struct PoolReplaceContext {
 }
 
 /// A committed replacement, new or replayed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PoolReplacement {
     /// Pool identity.
     pub pool_id: PoolId,
@@ -186,7 +186,7 @@ fn replayed(
     })))
 }
 
-impl Store {
+impl Store<'_> {
     /// For `pool_id`, checks whether any current member except `old` matches `name` under the
     /// same Unicode lowercase comparison as initial pool admission.
     fn current_name_taken(
@@ -334,9 +334,7 @@ impl Store {
         &mut self,
         input: PoolReplaceInput<'_>,
     ) -> Result<std::result::Result<PoolReplacement, PoolDenial>> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         if let Some(found) = replayed(&tx, input.pool_id, input.request_id, input.request_sha256)? {
             tx.commit()?;
             return Ok(found);

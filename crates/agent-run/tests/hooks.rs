@@ -1,10 +1,11 @@
 //! CLI-surface hook parser coverage using only temporary homes and fake payloads.
+#[path = "support/test_broker.rs"]
+mod test_broker;
 
 use agent_run::{
     cli::{Bind, Cli, Command, Context, Hook, HookTransport},
     config::Config,
     domain::StartRequest,
-    state::Store,
 };
 use clap::Parser;
 use serde_json::{Value, json};
@@ -24,10 +25,10 @@ fn fake_agent_home() -> (tempfile::TempDir, String) {
         "/bin/true"
     };
     std::fs::write(home.path().join("config.toml"), format!("schema_version=1\n[runtimes.mock]\nenabled=true\nadapter='claude'\nbinary={}\nhome={}\nmodels=['fixture']\nlimits_source='none'\n", toml::Value::String(binary.into()), toml::Value::String(home.path().join("runtimes/mock").to_string_lossy().into_owned()))).expect("fake config");
-    Store::initialize(home.path()).expect("fake state");
+    agent_run_store::fixture::initialize(home.path()).expect("fake state");
     let config = Config::load(home.path()).expect("fake config loads");
     let request: StartRequest = serde_json::from_value(json!({"runtime":"mock","model":"fixture","profile":"review","task":"fake task","workdir":home.path()})).expect("fake request");
-    let (id, _) = Store::open(home.path())
+    let (id, _) = agent_run_store::fixture::open(home.path())
         .expect("store")
         .admit(&request, &config, &json!({}), None)
         .expect("fake admission");
@@ -122,9 +123,10 @@ fn python_context_cli_and_hook_parser_accept_only_host_transports() {
 }
 
 /// Mirrors Python `test_bind_hook.py::test_binding_is_immutable_empty_then_same_target_but_never_another`.
-#[test]
-fn python_hook_bind_reads_raw_json_stdin_and_is_idempotent() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn python_hook_bind_reads_raw_json_stdin_and_is_idempotent() {
     let (home, agent_id) = fake_agent_home();
+    let _broker = test_broker::broker_for(home.path()).await;
     let payload = json!({"session_id":"session-1","hook_event_name":"PostToolUse","tool_response":{"agent_id":agent_id}});
     let first = hook(home.path(), "bind", payload.clone());
     let second = hook(home.path(), "bind", payload);
@@ -139,9 +141,10 @@ fn python_hook_bind_reads_raw_json_stdin_and_is_idempotent() {
 }
 
 /// Mirrors Python `test_context_hook.py::test_first_prompt_creates_receipt_dedups_and_reuses_later_binding`.
-#[test]
-fn python_hook_context_injects_once_then_returns_an_empty_object() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn python_hook_context_injects_once_then_returns_an_empty_object() {
     let (home, _) = fake_agent_home();
+    let _broker = test_broker::broker_for(home.path()).await;
     let payload = json!({"session_id":"session-1","hook_event_name":"UserPromptSubmit"});
     let first = hook(home.path(), "context", payload.clone());
     let second = hook(home.path(), "context", payload);

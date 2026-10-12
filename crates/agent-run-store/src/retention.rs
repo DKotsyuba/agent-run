@@ -3,7 +3,7 @@
 
 use crate::Store;
 use agent_run_domain::{Error, Result, domain::AgentId, error::invalid};
-use rusqlite::{ErrorCode, TransactionBehavior, params};
+use rusqlite::{Connection, ErrorCode, params};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 use std::{
@@ -26,6 +26,12 @@ pub const HISTORY_SECONDS: f64 = 14.0 * 24.0 * 3600.0;
 pub const HISTORY_SESSIONS: i64 = 100;
 /// Maximum rows removed from each large journal in one transaction.
 const ROW_BATCH: i64 = 2_000;
+/// Executions removed by one history batch at most.
+const CANDIDATES: usize = 32;
+/// Candidates one batch examines at most, so deferred ones (waiting for
+/// ledger room or a fresh projection) never block the eligible ones behind
+/// them while the batch's work stays bounded.
+const SCANNED_CANDIDATES: usize = 256;
 
 /// SQL for one agent `x` that retention may treat as expired for a pool:
 /// terminal with a known finish time older than the cutoff (`?1`) or in a
@@ -57,12 +63,84 @@ fn pool_releasable() -> String {
     )
 }
 
+/// SQL predicate on an `agents` row `a` eligible for history removal: a
+/// terminal agent finished before the cutoff (`?1`) or in a count-expired
+/// lineage (`retention_roots`), with no owned attempt, child, pool
+/// membership, workflow step, unreleased service lease, live sending
+/// delivery (lease still valid at the time bound as `at`) or prepared
+/// runtime layout. Shared by the writer batch and the reader preparer.
+fn agent_eligible(at: &str) -> String {
+    format!(
+        "a.status IN ('succeeded','failed','timed_out','cancelled','lost') \
+         AND (a.finished_at < ?1 \
+              OR (a.finished_at IS NOT NULL \
+                  AND COALESCE(NULLIF(a.root_agent_id,''),a.id) IN (SELECT root FROM retention_roots))) \
+         AND NOT EXISTS (SELECT 1 FROM attempts t WHERE t.agent_id=a.id AND t.ownership_active=1) \
+         AND NOT EXISTS (SELECT 1 FROM agents child WHERE child.parent_agent_id=a.id) \
+         AND NOT EXISTS (SELECT 1 FROM pool_members pm WHERE pm.agent_id=COALESCE(NULLIF(a.root_agent_id,''),a.id)) \
+         AND NOT EXISTS (SELECT 1 FROM workflow_steps s WHERE s.agent_id=a.id) \
+         AND NOT EXISTS (SELECT 1 FROM managed_service_leases l WHERE l.agent_id=a.id AND l.released_at IS NULL) \
+         AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.agent_id=a.id AND d.state='sending' \
+           AND (d.lease_until IS NULL OR d.lease_until > {at})) \
+         AND NOT EXISTS (SELECT 1 FROM runtime_storage_layouts r \
+           WHERE r.state='prepared' \
+             AND r.runtime_home=json_extract(a.identity_json,'$.runtime_home'))"
+    )
+}
+
 /// SQL defining `retention_roots` as a CTE with the count-expired lineages
 /// (everything ranked outside the newest [`HISTORY_SESSIONS`], bound as `?2`),
 /// for read-only queries that mirror the batch's temp table.
 const ROOTS_CTE: &str = "WITH retention_roots(root) AS (SELECT session FROM ( \
      SELECT COALESCE(NULLIF(root_agent_id,''),id) AS session, MAX(created_at) AS latest \
      FROM agents GROUP BY session ORDER BY latest DESC, session LIMIT -1 OFFSET ?2))";
+
+/// Reader half of a history batch: up to `limit` eligible candidates at
+/// time `at`, strictly after the optional keyset cursor, oldest finish first.
+/// Eligibility still comes from [`agent_eligible`]; the cursor grants no deletion rights.
+pub(crate) fn history_candidates(
+    conn: &Connection,
+    at: f64,
+    limit: usize,
+    after: Option<&HistoryCursor>,
+) -> Result<Vec<HistoryCursor>> {
+    let mut statement = conn.prepare(&format!(
+        "{ROOTS_CTE} SELECT a.id,a.finished_at FROM agents a WHERE {} \
+         AND (?5 IS NULL OR a.finished_at>?5 OR (a.finished_at=?5 AND a.id>?6)) \
+         ORDER BY a.finished_at,a.id LIMIT ?4",
+        agent_eligible("?3")
+    ))?;
+    statement
+        .query_map(
+            params![
+                at - HISTORY_SECONDS,
+                HISTORY_SESSIONS,
+                at,
+                limit as i64,
+                after.map(|cursor| cursor.finished_at),
+                after.map(|cursor| cursor.execution.as_str())
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
+        )?
+        .map(|row| {
+            let (id, finished_at) = row?;
+            Ok(HistoryCursor {
+                execution: id.parse()?,
+                finished_at,
+            })
+        })
+        .collect()
+}
+
+/// Volatile keyset position for bounded history scans; never an authorization proof.
+/// A completed pass wraps to None. Restarting merely repeats safe idempotent scans.
+#[derive(Clone, Debug)]
+pub struct HistoryCursor {
+    /// Terminal finish timestamp in finite Unix seconds.
+    pub finished_at: f64,
+    /// Execution id breaking ties in finish time.
+    pub execution: AgentId,
+}
 
 /// Safe structured SQLite result-code detail extracted from one store error.
 ///
@@ -241,7 +319,7 @@ impl StorageProtection {
     }
 }
 
-impl Store {
+impl Store<'_> {
     /// Removes one bounded portion of expired history at finite Unix time `at`.
     ///
     /// Returns the number of deleted rows (zero means no eligible work remains).
@@ -254,7 +332,8 @@ impl Store {
     /// All logical sessions are counted when ranking, and protected work can
     /// keep an expired lineage stored, so more than [`HISTORY_SESSIONS`]
     /// sessions may survive; safety never yields to the numerical cap.
-    /// Up to 32 terminal leaf agents are considered; recent/active descendants,
+    /// Up to 32 terminal leaf agents are removed, examining at most 256 so
+    /// deferred ones never block those behind them; recent/active descendants,
     /// workflows, unreleased service leases, unresolved process ownership and
     /// in-flight deliveries retain their dependencies, as does a runtime home
     /// with a still-prepared storage-layout row (an unfinished relocation).
@@ -279,11 +358,46 @@ impl Store {
         let deadline = Instant::now() + Duration::from_secs(2);
         self.conn
             .progress_handler(1_000, Some(move || Instant::now() >= deadline))?;
-        let result = self.prune_history_batch(at);
+        let result = self.prune_history_batch(at, None);
         let cleanup = self.conn.progress_handler(0, None::<fn() -> bool>);
-        let deleted = result?;
+        let (deleted, _) = result?;
         cleanup?;
         Ok(deleted)
+    }
+
+    /// One history batch of the sole writer (row 85) over the candidates and
+    /// incident projections a reader prepared (see
+    /// `StoreReader::history_batch`). Malformed, duplicate or foreign
+    /// projections refuse before mutation. Only still-eligible candidates
+    /// are considered; each carried projection must equal what its source
+    /// yields inside this transaction, else that candidate is deferred
+    /// (never deleted), as is a candidate without one or whose evidence is
+    /// not durable after storing. Executions outside the candidates are
+    /// untouched. Returns removed rows and deferred candidates.
+    pub fn prune_history_prepared(
+        &mut self,
+        op: &crate::ops::PruneHistoryBatch,
+    ) -> Result<serde_json::Value> {
+        if !op.at.is_finite() || op.at < HISTORY_SECONDS {
+            return Err(invalid("history retention requires a finite Unix time"));
+        }
+        if op.candidates.len() > 2000 || op.projections.len() > op.candidates.len() {
+            return Err(invalid("history batch exceeds its bound"));
+        }
+        // Every carried projection is well formed, unique and for a
+        // candidate before anything is touched.
+        for (index, projection) in op.projections.iter().enumerate() {
+            crate::incidents::validate(projection)?;
+            if !op.candidates.contains(&projection.execution)
+                || op.projections[..index]
+                    .iter()
+                    .any(|other| other.execution == projection.execution)
+            {
+                return Err(invalid("history batch projections are inconsistent"));
+            }
+        }
+        let (removed, deferred) = self.prune_history_batch(op.at, Some(op))?;
+        Ok(serde_json::json!({"removed": removed, "deferred": deferred}))
     }
 
     /// Captures retained path evidence without taking a database writer lock.
@@ -451,7 +565,7 @@ impl Store {
     /// least one count-expired candidate. `false` therefore proves the next
     /// batch would delete nothing, so callers skip taking the database
     /// writer lock at all; WAL readers never block a concurrent writer.
-    fn prune_work_pending(&self, cutoff: f64) -> Result<bool> {
+    pub(crate) fn prune_work_pending(&self, cutoff: f64) -> Result<bool> {
         let releasable = pool_releasable();
         let pending: bool = self.conn.query_row(
             &format!(
@@ -505,17 +619,22 @@ impl Store {
     }
 
     /// Runs one short transaction under the caller's progress/lock deadlines.
-    fn prune_history_batch(&mut self, at: f64) -> Result<usize> {
+    /// With `prepared`, only its candidates are eligible and incident
+    /// projections come from it instead of being captured on this
+    /// connection. Returns removed rows and deferred candidates.
+    fn prune_history_batch(
+        &mut self,
+        at: f64,
+        prepared: Option<&crate::ops::PruneHistoryBatch>,
+    ) -> Result<(usize, usize)> {
         let cutoff = at - HISTORY_SECONDS;
         // An idle database must not take the writer lock at all: the probe
         // above is read-only, so an ordinary workload never sees a no-op
         // maintenance transaction compete for the single WAL writer.
         if !self.prune_work_pending(cutoff)? && !crate::incidents::prune_pending(&self.conn, at)? {
-            return Ok(0);
+            return Ok((0, 0));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         tx.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS retention_agents(id TEXT PRIMARY KEY);
              CREATE TEMP TABLE IF NOT EXISTS retention_workflows(id TEXT PRIMARY KEY);
@@ -595,37 +714,88 @@ impl Store {
             "DELETE FROM workflow_runs WHERE id IN retention_workflows",
             [],
         )?;
-        tx.execute(
-            "INSERT INTO retention_agents SELECT a.id FROM agents a
-             WHERE a.status IN ('succeeded','failed','timed_out','cancelled','lost')
-             AND (a.finished_at < ?1
-                  OR (a.finished_at IS NOT NULL
-                      AND COALESCE(NULLIF(a.root_agent_id,''),a.id) IN retention_roots))
-             AND NOT EXISTS (SELECT 1 FROM attempts t WHERE t.agent_id=a.id AND t.ownership_active=1)
-             AND NOT EXISTS (SELECT 1 FROM agents child WHERE child.parent_agent_id=a.id)
-             AND NOT EXISTS (SELECT 1 FROM pool_members pm WHERE pm.agent_id=COALESCE(NULLIF(a.root_agent_id,''),a.id))
-             AND NOT EXISTS (SELECT 1 FROM workflow_steps s WHERE s.agent_id=a.id)
-             AND NOT EXISTS (SELECT 1 FROM managed_service_leases l WHERE l.agent_id=a.id AND l.released_at IS NULL)
-             AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.agent_id=a.id AND d.state='sending'
-               AND (d.lease_until IS NULL OR d.lease_until > ?2))
-             AND NOT EXISTS (SELECT 1 FROM runtime_storage_layouts r
-               WHERE r.state='prepared'
-                 AND r.runtime_home=json_extract(a.identity_json,'$.runtime_home'))
-             ORDER BY a.finished_at,a.id LIMIT 32",
-            params![cutoff, at],
-        )?;
         // Compact failure evidence must commit before any journal or notice
-        // disappears. A broken ledger aborts this batch and preserves sources.
-        let ids = {
-            let mut statement = tx.prepare("SELECT id FROM retention_agents ORDER BY id")?;
-            statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for id in ids {
-            crate::incidents::capture(&tx, &id, at)?;
+        // disappears. Each candidate's projection is checked against its
+        // source in this transaction: a carried one must equal what the
+        // source yields now, else only that candidate is deferred; without a
+        // prepared batch it is computed here. All are stored, protected from
+        // ledger pruning and verified durable before any source row goes; an
+        // uncovered candidate is deferred. Deferred candidates do not block
+        // progress: windows past them are scanned (bounded) until enough
+        // candidates are kept. A broken ledger aborts this batch and
+        // preserves sources.
+        let prepared_ids = prepared
+            .map(|prepared| serde_json::to_string(&prepared.candidates))
+            .transpose()?;
+        let mut deferred: Vec<String> = Vec::new();
+        let mut kept = Vec::new();
+        let mut scanned = 0;
+        while kept.len() < CANDIDATES && scanned < SCANNED_CANDIDATES {
+            let window: Vec<String> = {
+                let mut statement = tx.prepare(&format!(
+                    "SELECT a.id FROM agents a WHERE {} \
+                     AND (?3 IS NULL OR a.id IN (SELECT value FROM json_each(?3))) \
+                     AND a.id NOT IN (SELECT value FROM json_each(?4)) \
+                     AND a.id NOT IN retention_agents \
+                     ORDER BY a.finished_at,a.id LIMIT ?5",
+                    agent_eligible("?2")
+                ))?;
+                statement
+                    .query_map(
+                        params![
+                            cutoff,
+                            at,
+                            prepared_ids,
+                            serde_json::to_string(&deferred)?,
+                            (CANDIDATES - kept.len()).min(SCANNED_CANDIDATES - scanned) as i64
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            if window.is_empty() {
+                break;
+            }
+            scanned += window.len();
+            for id in window {
+                let projection = match prepared {
+                    None => crate::incidents::project(&tx, &id, at)?,
+                    Some(prepared) => match prepared
+                        .projections
+                        .iter()
+                        .find(|projection| projection.execution.as_str() == id.as_str())
+                    {
+                        Some(carried) if crate::incidents::current(&tx, carried)? => {
+                            Some(carried.clone())
+                        }
+                        _ => None,
+                    },
+                };
+                match projection {
+                    Some(projection)
+                        if crate::incidents::validate(&projection).is_ok()
+                            && crate::incidents::fits(&tx, &projection)? =>
+                    {
+                        crate::incidents::store(&tx, &projection)?;
+                        tx.execute("INSERT INTO retention_agents(id) VALUES(?)", [&id])?;
+                        kept.push(projection)
+                    }
+                    _ => deferred.push(id),
+                }
+            }
         }
+        // Candidates still have their agents row here, so ledger pruning
+        // cannot evict their evidence in this transaction.
         crate::incidents::prune(&tx, at)?;
+        for projection in &kept {
+            if !crate::incidents::covered(&tx, projection)? {
+                deferred.push(projection.execution.to_string());
+            }
+        }
+        for id in &deferred {
+            tx.execute("DELETE FROM retention_agents WHERE id=?", [id])?;
+        }
+        let deferred = deferred.len();
         deleted += tx.execute(
             "DELETE FROM delivery_attempt_evidence WHERE rowid IN
              (SELECT e.rowid FROM delivery_attempt_evidence e JOIN deliveries d ON d.id=e.delivery_id
@@ -731,7 +901,7 @@ impl Store {
             [],
         )?;
         tx.commit()?;
-        Ok(deleted)
+        Ok((deleted, deferred))
     }
 
     /// Reclaims up to 1,024 free SQLite pages without rebuilding the database.

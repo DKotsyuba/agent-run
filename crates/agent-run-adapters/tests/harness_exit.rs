@@ -48,10 +48,11 @@ async fn leader_exit_closes_stream_without_waiting_for_descendant_eof() {
     let recorded = captures.clone();
     fixture
         .0
-        .observe_ownership(move |snapshot| {
+        .observe_ownership(Box::new(move |snapshot| {
             recorded.lock().unwrap().push(snapshot.members.len());
-            Ok(())
-        })
+            Box::pin(async { Ok(()) })
+        }))
+        .await
         .unwrap();
     fixture.0.text("finish\n").await.unwrap();
     let Event::Json(value) = fixture.0.next().await else {

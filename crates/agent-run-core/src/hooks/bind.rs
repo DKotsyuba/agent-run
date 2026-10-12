@@ -39,14 +39,23 @@ impl BindResult {
 /// The same target is idempotent.  A conflicting target, malformed reference,
 /// or missing agent is converted by [`run_hook`] into the deliberately loud
 /// confirmation failure expected by host hooks.
-pub fn bind(
-    store: &mut Store,
+pub async fn bind(
+    home: &std::path::Path,
     agent_id: AgentId,
     reference: OrchestratorRef,
     at: f64,
 ) -> Result<BindResult> {
-    let root = store.get(&agent_id)?.root_agent_id;
-    let session_id = store.bind_orchestrator(&agent_id, &reference, at)?;
+    let root = Store::open(home)?.get(&agent_id)?.root_agent_id;
+    let session_id = crate::persist::operator_producer(home)
+        .call(
+            agent_run_store::ops::BindOrchestrator {
+                execution: agent_id.clone(),
+                reference,
+                at,
+            },
+            crate::broker_writer::BROKER_BUDGET,
+        )
+        .await?;
     Ok(BindResult {
         agent_id: root,
         run_id: agent_id,
@@ -60,8 +69,8 @@ pub fn bind(
 /// the session from `session_id`; normalized payloads must contain exactly the
 /// documented bind fields.  Every failure is rendered as a loud, secret-safe
 /// error so the host keeps the turn available for recovery.
-pub fn run_hook(
-    store: &mut Store,
+pub async fn run_hook(
+    home: &std::path::Path,
     payload: &Value,
     transport: &str,
     at: Option<f64>,
@@ -80,18 +89,19 @@ pub fn run_hook(
         .map_err(|error| loud(&agent_id, &error))?;
     let execution = match normalized.sequence {
         Some(sequence) => {
-            crate::agent_identity::resolve_sequence(store, &parsed, sequence)
+            crate::agent_identity::resolve_sequence(&Store::open(home)?, &parsed, sequence)
                 .map_err(|error| loud(&agent_id, &error))?
                 .id
         }
         None => parsed,
     };
     bind(
-        store,
+        home,
         execution,
         normalized.reference,
         at.unwrap_or_else(now),
     )
+    .await
     .map_err(|error| loud(&agent_id, &error))
 }
 
@@ -137,8 +147,8 @@ impl HookBound {
 /// [`run_hook`] that also recognizes a structured `start_pool` receipt, which
 /// binds the pool and every current member tip atomically (conflicts change
 /// nothing) and activates the pool's waiting common notice once.
-pub fn run_hook_bound(
-    store: &mut Store,
+pub async fn run_hook_bound(
+    home: &std::path::Path,
     payload: &Value,
     transport: &str,
     at: Option<f64>,
@@ -149,12 +159,22 @@ pub fn run_hook_bound(
         .unwrap_or("None");
     let normalized = normalize(payload, true, transport).map_err(|error| loud(hint, &error))?;
     let Some(pool_id) = normalized.pool_id else {
-        return run_hook(store, payload, transport, at).map(HookBound::Agent);
+        return run_hook(home, payload, transport, at)
+            .await
+            .map(HookBound::Agent);
     };
     let pool: agent_run_domain::pool::PoolId =
         pool_id.parse().map_err(|error| loud(&pool_id, &error))?;
-    let session_id = store
-        .bind_pool(&pool, &normalized.reference, at.unwrap_or_else(now))
+    let session_id = crate::persist::operator_producer(home)
+        .call(
+            agent_run_store::ops::BindPool {
+                pool_id: pool,
+                reference: normalized.reference,
+                at: at.unwrap_or_else(now),
+            },
+            crate::broker_writer::BROKER_BUDGET,
+        )
+        .await
         .map_err(|error| loud(&pool_id, &error))?;
     Ok(HookBound::Pool(PoolBindResult {
         pool_id,

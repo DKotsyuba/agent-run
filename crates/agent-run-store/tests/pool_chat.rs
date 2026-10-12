@@ -2152,7 +2152,7 @@ fn concurrent_settlement_is_single_and_the_completed_record_stays_frozen() {
         .map(|_| {
             let (path, pool_id) = (home.path.clone(), pool_id.clone());
             std::thread::spawn(move || {
-                Store::open(&path)
+                agent_run_store::fixture::open(&path)
                     .unwrap()
                     .settle_pool(&pool_id)
                     .unwrap()

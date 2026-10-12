@@ -7,6 +7,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+sqlite-access = { path = "../sqlite-access" }
+tokio.workspace = true
 fs2.workspace = true
 libc.workspace = true
 agent-run-config = { path = "../agent-run-config" }
@@ -17,7 +19,12 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 
+[features]
+# Fenced raw store access for tests; never enabled by production builds.
+test-fixtures = []
+
 [dev-dependencies]
+agent-run-store = { path = ".", features = ["test-fixtures"] }
 regex.workspace = true
 agent-run-core = { path = "../agent-run-core" }
 tempfile.workspace = true

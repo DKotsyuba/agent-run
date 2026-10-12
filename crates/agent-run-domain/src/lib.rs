@@ -10,6 +10,8 @@ pub mod pool;
 mod provider_connection;
 pub mod provider_start;
 pub mod quota_snapshot;
+/// Protocol types of the single resident SQLite writer.
+pub mod storage;
 pub mod tools;
 /// Shared transcript bounds and representation options.
 pub mod transcript;

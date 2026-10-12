@@ -29,6 +29,8 @@ toml.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# Fenced raw store access for test fixtures; never part of a production build.
+agent-run-store = { path = "../agent-run-store", features = ["test-fixtures"] }
 rusqlite.workspace = true
 tempfile.workspace = true
 

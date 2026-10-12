@@ -1,6 +1,6 @@
 //! Schema-28 migration preserves exact historical evidence while retiring active clocks.
 mod common;
-use agent_run_store::{Store, VERSION, migrations};
+use agent_run_store::{VERSION, migrations};
 use rusqlite::{Connection, params};
 use serde_json::json;
 
@@ -40,7 +40,7 @@ fn migration_preserves_history_and_retires_execution_clocks() {
     conn.execute("INSERT INTO pool_members(agent_id,pool_id,slot,name,role,personal_task,joined_roster_revision) VALUES(?,'pool-history',1,'existing','review','task',1)",[id.as_str()]).unwrap();
     conn.execute("INSERT INTO pool_enrollments(agent_id,run_id,attempt_id,challenge,deadline,created_at) VALUES(?1,?1,'att-history','join-history',601,1)",[id.as_str()]).unwrap();
     drop(conn);
-    let store = Store::open(&home.path).unwrap();
+    let store = agent_run_store::fixture::initialize(&home.path).unwrap();
     assert_eq!(store.health().unwrap()["schema_version"], VERSION);
     // Automatic intermediate backups retire after a verified commit; explicit
     // paired config migration retains its recoverable snapshot (tested separately).

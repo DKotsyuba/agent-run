@@ -24,8 +24,12 @@
 //! only child processes are the launch preflight's metadata-only probes, and
 //! only under `--apply`.
 
-use crate::{Result, migrate};
-use agent_run_core::{fs, runtime_storage, state::Store, storage_gc};
+use crate::{Result, migrate, offline};
+use agent_run_core::{
+    fs, runtime_storage,
+    state::{Store, writer::StoreReader},
+    storage_gc,
+};
 use agent_run_domain::error::invalid;
 use serde_json::{Value, json};
 use std::{
@@ -406,7 +410,7 @@ fn survey(home: &Path, store: &Store) -> Result<Survey> {
 /// `agent-run storage status`: a read-only report; never a store write.
 pub fn status(home: &Path) -> Result<Value> {
     migrate::require_current_store(home)?;
-    let store = Store::open(home)?;
+    let store = StoreReader::open(home)?;
     Ok(survey(home, &store)?.report)
 }
 
@@ -447,19 +451,20 @@ fn shared_scope() -> String {
 /// are never mutated.
 pub fn compact(home: &Path, apply: bool) -> Result<Value> {
     migrate::require_current_store(home)?;
-    let mut store = Store::open(home)?;
     if !apply {
-        let plan = survey(home, &store)?;
-        let collection = storage_gc::sweep(&mut store, home, storage_gc::Mode::Preview)?;
+        let reader = StoreReader::open(home)?;
+        let plan = survey(home, &reader)?;
+        let collection = storage_gc::preview(&reader, home)?;
         return Ok(json!({
             "applied": false,
             "plan": plan.report,
             "collect": collection_report(&collection),
         }));
     }
-    let _locks = migrate::broker_exclusion(home)?;
-    require_idle(&store)?;
-    let plan = survey(home, &store)?;
+    let mut session = offline::acquire(home)?;
+    let store = session.guard.store()?;
+    require_idle(store)?;
+    let plan = survey(home, store)?;
     // Each eligible home relocates once, behind its latest terminal
     // execution's recorded authority; internal per-run ids stay here.
     let mut selected = plan.executors.clone();
@@ -477,7 +482,7 @@ pub fn compact(home: &Path, apply: bool) -> Result<Value> {
                 continue;
             }
         };
-        let outcome = agent_run_core::supervisor::relocate_retained_home(&mut store, home, &agent);
+        let outcome = agent_run_core::supervisor::relocate_retained_home(store, home, &agent);
         let result = match outcome {
             Ok(agent_run_core::supervisor::Relocation::Installed) => {
                 json!({"runtime_home": home_path, "relocated": true})
@@ -521,8 +526,7 @@ pub fn compact(home: &Path, apply: bool) -> Result<Value> {
             }
         };
         let result =
-            match agent_run_core::supervisor::consolidate_retained_native(&mut store, home, &agent)
-            {
+            match agent_run_core::supervisor::consolidate_retained_native(store, home, &agent) {
                 Ok(report) => json!({"runtime_home": home_path, "consolidated": report}),
                 Err(reason) => {
                     json!({"runtime_home": home_path, "consolidated": false, "reason": reason})
@@ -530,7 +534,7 @@ pub fn compact(home: &Path, apply: bool) -> Result<Value> {
             };
         native.push(result);
     }
-    let collection = storage_gc::sweep(&mut store, home, storage_gc::Mode::Apply)?;
+    let collection = storage_gc::sweep(store, home, storage_gc::Mode::Apply)?;
     Ok(json!({
         "applied": true,
         "plan": plan.report,
@@ -549,9 +553,9 @@ pub fn compact(home: &Path, apply: bool) -> Result<Value> {
 /// explicit operation.
 pub fn recover(home: &Path) -> Result<Value> {
     migrate::require_current_store(home)?;
-    let _locks = migrate::broker_exclusion(home)?;
-    let mut store = Store::open(home)?;
-    require_idle(&store)?;
+    let mut session = offline::acquire(home)?;
+    let store = session.guard.store()?;
+    require_idle(store)?;
     // Interrupted native operations recover alongside the managed
     // coordinator: every extant registered home's own journals complete or
     // roll back from their records, before anything is reported.
@@ -587,7 +591,7 @@ pub fn recover(home: &Path) -> Result<Value> {
     let mut outcomes = Vec::new();
     for record in store.pending_runtime_storage_layouts(RECOVER_ROWS)? {
         let path = PathBuf::from(&record.runtime_home);
-        let result = match runtime_storage::recover(&mut store, home, &path) {
+        let result = match runtime_storage::recover(store, home, &path) {
             Ok(()) => json!({"runtime_home": record.runtime_home, "recovered": true}),
             Err(error) => json!({
                 "runtime_home": record.runtime_home,

@@ -40,12 +40,13 @@ fn identity(home: &common::Home) -> Value {
 #[tokio::test]
 async fn retained_agent_tools_dispatch() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
     let request = home.request();
     let (agent_id, _) = home
         .store()
         .admit(&request, &home.config, &identity(&home), None)
         .unwrap();
-    let service = Service::new(home.path.clone());
+    let service = Service::new(home.path.clone()).with_writer(writer.broker());
     let id = agent_id.to_string();
     dispatch::call(&service, "cancel", json!({"agent_id": id}))
         .await
@@ -151,12 +152,13 @@ async fn restored_operator_tools_dispatch() {
 #[tokio::test]
 async fn cancel_returns_the_current_agent_view() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
     let request = home.request();
     let (agent_id, _) = home
         .store()
         .admit(&request, &home.config, &identity(&home), None)
         .unwrap();
-    let service = Service::new(home.path.clone());
+    let service = Service::new(home.path.clone()).with_writer(writer.broker());
     let view = dispatch::call(&service, "cancel", json!({"agent_id": agent_id}))
         .await
         .unwrap();

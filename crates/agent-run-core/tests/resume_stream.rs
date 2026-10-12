@@ -49,6 +49,9 @@ async fn resume_refuses_missing_or_wrong_stream_identity() {
             )
             .unwrap();
         let record = store.get(&id).unwrap();
+        let prep = common::writer::prepare_supervisor(&mut store, &id);
+        let harness = common::writer::Harness::start(&home.path);
+        let mut persist = harness.supervisor(&home.path, prep, &id).await;
         let mut result = json!({
             "type": "result",
             "subtype": "success",
@@ -61,7 +64,8 @@ async fn resume_refuses_missing_or_wrong_stream_identity() {
         }
         let mut process =
             Process::spawn(&fake_engine(&home.path, &result.to_string())).expect("fake engine");
-        let outcome = stream::run(&mut process, &mut store, &record, None).await;
+        let outcome = stream::run(&mut process, &mut persist, &record, None).await;
+        persist.flush().await.unwrap();
         if identity == Some("saved") {
             let confirmed = outcome.expect("the requested session is confirmed");
             assert_eq!(confirmed.outcome.status, Status::Succeeded);
@@ -86,7 +90,8 @@ async fn resume_refuses_missing_or_wrong_stream_identity() {
 #[tokio::test]
 async fn dispatch_inherits_authority_and_preserves_caller() {
     let home = common::Home::new();
-    let service = Service::new(home.path.clone());
+    let writer = common::writer::Harness::start(&home.path);
+    let service = Service::new(home.path.clone()).with_writer(writer.broker());
     let parent = "ag-20260916-120000-0123456789";
 
     let overridden = dispatch::call(

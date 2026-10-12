@@ -14,7 +14,7 @@ use std::thread;
 fn admitted(
     home: &common::Home,
     request: &StartRequest,
-) -> (Store, agent_run_domain::domain::AgentId) {
+) -> (Store<'static>, agent_run_domain::domain::AgentId) {
     let mut store = home.store();
     let (id, created) = store
         .admit(request, &home.config, &json!({}), None)
@@ -27,7 +27,7 @@ fn admitted_with_config(
     home: &common::Home,
     request: &StartRequest,
     config: &agent_run_config::config::Config,
-) -> (Store, agent_run_domain::domain::AgentId) {
+) -> (Store<'static>, agent_run_domain::domain::AgentId) {
     let mut store = home.store();
     let (id, created) = store.admit(request, config, &json!({}), None).unwrap();
     assert!(created);
@@ -48,7 +48,7 @@ fn concurrent_same_request_id_creates_one_row() {
             let request = request.clone();
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
-                let mut store = Store::open(&path).unwrap();
+                let mut store = agent_run_store::fixture::open(&path).unwrap();
                 barrier.wait();
                 store.admit(&request, &config, &json!({}), None)
             })
@@ -403,7 +403,7 @@ fn path_reopens_an_independent_writable_connection() {
     let home = common::Home::new();
     let (store, id) = admitted(&home, &home.request());
     assert_eq!(store.path(), home.path.join("state.db"));
-    let mut second = Store::open(store.path().parent().unwrap()).unwrap();
+    let mut second = agent_run_store::fixture::open(store.path().parent().unwrap()).unwrap();
     second
         .append_event(&id, "from_second_connection", &json!({}), None)
         .unwrap();

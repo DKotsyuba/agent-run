@@ -1,12 +1,14 @@
 //! Ported capacity-order CLI behaviors with a complete injectable service fake.
 
+#[path = "support/test_broker.rs"]
+mod test_broker;
+
 use agent_run::{
     capacity::{self, Key, Pool, Route, Sample, Slice, Topology},
     cli::{Cli, CliBroker, CliDependencies, CliFuture, CliService},
     domain::{AgentId, now},
     error::invalid,
     service::Query,
-    state::Store,
 };
 use clap::Parser;
 use serde_json::{Value, json};
@@ -196,12 +198,14 @@ fn order_config(home: &Path) {
         ));
     }
     std::fs::write(home.join("config.toml"), text).expect("order config writes");
-    Store::initialize(home).expect("order store initializes");
+    agent_run_store::fixture::initialize(home).expect("order store initializes");
 }
 
 /// Persists one current sample for the named runtime.
-fn persist_sample(home: &Path, runtime: &str, remaining: f64, observed: f64) {
+async fn persist_sample(home: &Path, runtime: &str, remaining: f64, observed: f64) {
+    let _broker = test_broker::broker_for(home).await;
     capacity::persist(home, &quota_slice(runtime, remaining, observed), 1000)
+        .await
         .expect("quota sample persists");
 }
 
@@ -242,8 +246,8 @@ async fn test_order_emits_the_service_shape_once() {
 }
 
 /// Mirrors `tests/test_capacity_cli.py::CapacityOrderCliTests::test_order_rejects_unexpected_arguments`
-#[test]
-fn test_order_rejects_unexpected_arguments() {
+#[tokio::test]
+async fn test_order_rejects_unexpected_arguments() {
     // `--model` is the schema-2 exact model filter; any other flag still fails.
     let parsed = Cli::try_parse_from(["agent-run", "capacity", "order", "--account", "a"]);
     assert!(
@@ -254,13 +258,13 @@ fn test_order_rejects_unexpected_arguments() {
 }
 
 /// Mirrors `tests/test_capacity_cli.py::CapacityOrderCliTests::test_real_state_reorders_and_explains_nonworking_runtimes`
-#[test]
-fn test_real_state_reorders_and_explains_nonworking_runtimes() {
+#[tokio::test]
+async fn test_real_state_reorders_and_explains_nonworking_runtimes() {
     let scratch = tempfile::tempdir().expect("capacity home");
     order_config(scratch.path());
     let at = now();
     for (runtime, remaining) in [("alpha", 80.0), ("beta", 60.0), ("empty", 0.0)] {
-        persist_sample(scratch.path(), runtime, remaining, at);
+        persist_sample(scratch.path(), runtime, remaining, at).await;
     }
 
     let service = agent_run_core::service::Service::new(scratch.path().into());
@@ -271,8 +275,8 @@ fn test_real_state_reorders_and_explains_nonworking_runtimes() {
     assert_eq!(first["omitted"][0]["runtime"], "empty");
     assert_eq!(first["unavailable_runtimes"], json!(["missing"]));
 
-    persist_sample(scratch.path(), "alpha", 20.0, now());
-    persist_sample(scratch.path(), "beta", 90.0, now());
+    persist_sample(scratch.path(), "alpha", 20.0, now()).await;
+    persist_sample(scratch.path(), "beta", 90.0, now()).await;
     let second = service
         .capacity_order(Default::default())
         .expect("second order");
@@ -284,7 +288,7 @@ fn test_real_state_reorders_and_explains_nonworking_runtimes() {
 async fn test_default_facade_serves_capacity_order_without_injection() {
     let scratch = tempfile::tempdir().expect("capacity home");
     order_config(scratch.path());
-    persist_sample(scratch.path(), "alpha", 80.0, now());
+    persist_sample(scratch.path(), "alpha", 80.0, now()).await;
 
     let mut dependencies = CliDependencies::production(PathBuf::from(scratch.path()));
     let output = Arc::new(Mutex::new(Vec::new()));
@@ -315,8 +319,8 @@ async fn test_default_facade_serves_capacity_order_without_injection() {
 }
 
 /// Mirrors `tests/test_capacity_outcomes.py::CapacityOutcomeRegressionTests::test_capacity_collect_cli_preserves_status_counts_and_degraded_exit`.
-#[test]
-fn collect_once_prints_the_report_and_returns_degraded_exit_status() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collect_once_prints_the_report_and_returns_degraded_exit_status() {
     let scratch = tempfile::tempdir().expect("capacity home");
     let auth = scratch.path().join("auth.json");
     std::fs::write(&auth, "{}").expect("fixture auth source");
@@ -330,7 +334,10 @@ fn collect_once_prints_the_report_and_returns_degraded_exit_status() {
         ),
     )
     .expect("collect config writes");
-    Store::initialize(scratch.path()).expect("capacity store initializes");
+    agent_run_store::fixture::initialize(scratch.path()).expect("capacity store initializes");
+
+    // The blocking CLI child needs the actual fixture writer socket served concurrently.
+    let _broker = test_broker::broker_for(scratch.path()).await;
 
     let output = Command::new(env!("CARGO_BIN_EXE_agent-run"))
         .args([

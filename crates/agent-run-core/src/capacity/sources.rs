@@ -766,7 +766,7 @@ pub async fn collect(home: &Path) -> Result<Value> {
                         "sample_count":0,"error":issues.first(),"issues":issues})
                 })
                 .collect();
-            super::prune(home, config.capacity.sample_retention)?;
+            super::prune(home, config.capacity.sample_retention).await?;
             Ok(json!({"ok":results.iter().all(|row|row["status"]!="failed"),"results":results}))
         }
     }

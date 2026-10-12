@@ -80,6 +80,7 @@ fn python_test_codex_account_runtime_home_is_scoped_only_for_labels() {
 #[tokio::test]
 async fn python_test_python_created_codex_run_is_explicitly_refused() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
     let (id, _) = home
         .store()
         .admit(&home.request(), &home.config, &json!({}), None)
@@ -111,6 +112,7 @@ async fn python_test_python_created_codex_run_is_explicitly_refused() {
         Err(Error::Unsupported(_))
     ));
     let error = Service::new(home.path.clone())
+        .with_writer(writer.broker())
         .resume(&id, "continue".into(), None, None, None)
         .await
         .unwrap_err();
@@ -124,6 +126,7 @@ async fn python_test_python_created_codex_run_is_explicitly_refused() {
 #[tokio::test]
 async fn python_test_resume_without_native_session_is_refused() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
     let (id, _) = home
         .store()
         .admit(&home.request(), &home.config, &json!({}), None)
@@ -133,6 +136,7 @@ async fn python_test_resume_without_native_session_is_refused() {
         .unwrap();
 
     let error = Service::new(home.path.clone())
+        .with_writer(writer.broker())
         .resume(&id, "continue".into(), None, None, None)
         .await
         .unwrap_err();
@@ -508,6 +512,7 @@ fn finish_with_session(home: &common::Home, id: &agent_run_domain::domain::Agent
 #[tokio::test]
 async fn stability_resume_replays_without_current_policy() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
     let mut initial = home.request();
     let workspace = home.path.join("workspace");
     std::fs::create_dir(&workspace).unwrap();
@@ -531,7 +536,7 @@ async fn stability_resume_replays_without_current_policy() {
         .unwrap();
     std::fs::remove_dir(&workspace).unwrap();
     std::fs::remove_file(home.path.join("config.toml")).unwrap();
-    let service = Service::new(home.path.clone());
+    let service = Service::new(home.path.clone()).with_writer(writer.broker());
     let retry = service
         .resume(
             &root,
@@ -623,6 +628,7 @@ async fn stability_resume_replays_without_current_policy() {
 #[tokio::test]
 async fn old_parent_resume_retry_replays_through_later_continuations() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
     let (alias, canonical) = chat_refs();
     home.store()
         .conn
@@ -659,7 +665,7 @@ async fn old_parent_resume_retry_replays_through_later_continuations() {
 
     std::fs::remove_dir(&workspace).unwrap();
     std::fs::remove_file(home.path.join("config.toml")).unwrap();
-    let service = agent_run_core::service::Service::new(home.path.clone());
+    let service = Service::new(home.path.clone()).with_writer(writer.broker());
     for orchestrator in [None, Some(alias.clone()), Some(canonical.clone())] {
         let replayed = service
             .resume(

@@ -55,10 +55,12 @@ fn response() -> serde_json::Value {
 }
 
 /// Mirrors `tests/test_state_store.py::StateStoreTests::test_capacity_samples_and_route_snapshots_are_atomic_and_isolated`.
-#[test]
-fn capacity_samples_and_route_snapshots_commit_as_one_batch() {
+#[tokio::test]
+async fn capacity_samples_and_route_snapshots_commit_as_one_batch() {
     let home = tempfile::tempdir().unwrap();
-    agent_run_store::Store::initialize(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
+    let writer = common::writer::Harness::start(home.path());
+    let _socket = writer.serve_unix(home.path());
     let key = key();
     let topology = Topology {
         pools: vec![Pool {
@@ -84,17 +86,17 @@ fn capacity_samples_and_route_snapshots_commit_as_one_batch() {
         observed_at,
         valid_until: observed_at + 10.0,
     };
-    persist(home.path(), &slice("mock", 1.0), 10).unwrap();
+    persist(home.path(), &slice("mock", 1.0), 10).await.unwrap();
     let mut broken = slice("mock", 2.0);
     broken.samples.push(broken.samples[0].clone());
-    assert!(persist(home.path(), &broken, 10).is_err());
+    assert!(persist(home.path(), &broken, 10).await.is_err());
     let mut invalid_sample = slice("mock", 3.0);
     invalid_sample.samples[0].remaining_percent = Some(101.0);
-    assert!(persist(home.path(), &invalid_sample, 10).is_err());
+    assert!(persist(home.path(), &invalid_sample, 10).await.is_err());
     let mut expired = slice("mock", 4.0);
     expired.valid_until = 3.0;
-    assert!(persist(home.path(), &expired, 10).is_err());
-    let store = agent_run_store::Store::open(home.path()).unwrap();
+    assert!(persist(home.path(), &expired, 10).await.is_err());
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
     assert_eq!(
         store
             .conn
@@ -107,10 +109,12 @@ fn capacity_samples_and_route_snapshots_commit_as_one_batch() {
 }
 
 /// Mirrors `tests/test_state_store.py::StateStoreTests::test_capacity_sample_runtime_and_payload_constraints`.
-#[test]
-fn capacity_persistence_rejects_cross_runtime_and_oversized_payloads() {
+#[tokio::test]
+async fn capacity_persistence_rejects_cross_runtime_and_oversized_payloads() {
     let home = tempfile::tempdir().unwrap();
-    agent_run_store::Store::initialize(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
+    let writer = common::writer::Harness::start(home.path());
+    let _socket = writer.serve_unix(home.path());
     let mut cross_runtime = sample(50.0, 1.0, 100.0);
     cross_runtime.key.runtime = "other".into();
     let topology = Topology::default();
@@ -122,7 +126,7 @@ fn capacity_persistence_rejects_cross_runtime_and_oversized_payloads() {
         observed_at: 1.0,
         valid_until: 2.0,
     };
-    assert!(persist(home.path(), &slice, 10).is_err());
+    assert!(persist(home.path(), &slice, 10).await.is_err());
     let key = key();
     let oversized = Topology {
         pools: vec![Pool {
@@ -150,14 +154,16 @@ fn capacity_persistence_rejects_cross_runtime_and_oversized_payloads() {
         observed_at: 1.0,
         valid_until: 2.0,
     };
-    assert!(persist(home.path(), &oversized, 10).is_err());
+    assert!(persist(home.path(), &oversized, 10).await.is_err());
 }
 
 /// Mirrors `tests/test_state_store.py::StateStoreTests::test_capacity_history_survives_successful_appends`.
-#[test]
-fn capacity_history_survives_snapshot_upserts() {
+#[tokio::test]
+async fn capacity_history_survives_snapshot_upserts() {
     let home = tempfile::tempdir().unwrap();
-    agent_run_store::Store::initialize(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
+    let writer = common::writer::Harness::start(home.path());
+    let _socket = writer.serve_unix(home.path());
     let key = key();
     let topology = Topology {
         pools: vec![Pool {
@@ -185,9 +191,10 @@ fn capacity_history_survives_snapshot_upserts() {
             },
             10,
         )
+        .await
         .unwrap();
     }
-    let store = agent_run_store::Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
     let rows: Vec<(f64, f64)> = store
         .conn
         .prepare(
@@ -541,15 +548,17 @@ fn every_route_pool_reference_is_validated() {
     assert!(topology.validate("mock").is_err());
 }
 /// Mirrors `tests/test_capacity_topology.py::test_persist_slice_consumes_the_state_api_atomically`.
-#[test]
-fn invalid_atomic_slice_does_not_erase_a_committed_snapshot() {
+#[tokio::test]
+async fn invalid_atomic_slice_does_not_erase_a_committed_snapshot() {
     let h = common::Home::new();
+    let writer = common::writer::Harness::start(&h.path);
+    let _socket = writer.serve_unix(&h.path);
     let (mut slice, _) =
         capacity::sources::normalize_codex("mock", None, &response(), domain::now()).unwrap();
-    capacity::persist(&h.path, &slice, 100).unwrap();
+    capacity::persist(&h.path, &slice, 100).await.unwrap();
     let before = h.store().health().unwrap();
     slice.samples[0].remaining_percent = Some(f64::NAN);
-    assert!(capacity::persist(&h.path, &slice, 100).is_err());
+    assert!(capacity::persist(&h.path, &slice, 100).await.is_err());
     assert_eq!(h.store().health().unwrap(), before);
     let db = rusqlite::Connection::open(h.path.join("state.db")).unwrap();
     let count: i64 = db

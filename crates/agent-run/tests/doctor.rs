@@ -140,7 +140,7 @@ fn python_doctor_reports_missing_static_runtime_artifacts() {
         ),
     )
     .unwrap();
-    let store = agent_run::state::Store::initialize(home).expect("initialize state");
+    let store = agent_run_store::fixture::initialize(home).expect("initialize state");
     drop(store);
     let report = doctor::run(home).expect("doctor report");
     let codes = report
@@ -189,7 +189,7 @@ fn python_doctor_validates_canonical_roles_from_shared_catalogs() {
         ),
     )
     .unwrap();
-    let store = agent_run::state::Store::initialize(home).expect("initialize state");
+    let store = agent_run_store::fixture::initialize(home).expect("initialize state");
     drop(store);
 
     let report = doctor::run(home).expect("doctor report");
@@ -216,7 +216,7 @@ fn schema_two_doctor_reports_unregistered_provider_binding() {
         ),
     )
     .unwrap();
-    let mut store = agent_run::state::Store::initialize(home).unwrap();
+    let mut store = agent_run_store::fixture::initialize(home).unwrap();
     let report = doctor::run(home).unwrap();
     assert!(report.findings.iter().any(|finding| {
         finding.code == "provider_bindings_invalid" && finding.severity == "error"

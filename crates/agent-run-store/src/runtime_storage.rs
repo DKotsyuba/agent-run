@@ -17,7 +17,7 @@
 use crate::{ACTIVE_SQL, Store};
 use agent_run_domain::{Error, Result, domain::AgentId, domain::now, error::invalid};
 use agent_run_platform::fs;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -407,7 +407,7 @@ const CLEANED_PROOF: &str = "(COALESCE(t.phase,'')='cleanup_complete' \
 /// and whose hold on it is unresolved: an unfinished status, `lost`, or any
 /// attempt that is not provably inert — including released-attempt rows
 /// (`ownership_active=0`) whose cleanup was never verified.
-fn unsettled_home_holders(tx: &Transaction<'_>, runtime_home: &str) -> Result<Vec<String>> {
+fn unsettled_home_holders(tx: &rusqlite::Connection, runtime_home: &str) -> Result<Vec<String>> {
     let active = ACTIVE_SQL;
     let inert = INERT_ATTEMPT;
     let mut stmt = tx.prepare(&format!(
@@ -430,7 +430,7 @@ fn unsettled_home_holders(tx: &Transaction<'_>, runtime_home: &str) -> Result<Ve
 /// it qualifies only with at least one attempt, all of them proven cleaned
 /// by [`CLEANED_PROOF`] — never on merely `prepared` attempts, which is the
 /// account-switch spawn window.
-fn holds_nothing_live(tx: &Transaction<'_>, agent: &AgentId) -> Result<bool> {
+fn holds_nothing_live(tx: &rusqlite::Connection, agent: &AgentId) -> Result<bool> {
     let inert = INERT_ATTEMPT;
     let cleaned = CLEANED_PROOF;
     let unresolved: i64 = tx.query_row(
@@ -455,7 +455,10 @@ fn holds_nothing_live(tx: &Transaction<'_>, agent: &AgentId) -> Result<bool> {
 /// prepared a moment later or earlier can never race a new child into the
 /// home. A committed row, or an identity without a recorded runtime home,
 /// admits unchanged.
-pub(crate) fn refuse_prepared_resume_home(tx: &Transaction<'_>, identity: &Value) -> Result<()> {
+pub(crate) fn refuse_prepared_resume_home(
+    tx: &rusqlite::Connection,
+    identity: &Value,
+) -> Result<()> {
     let Some(home) = identity
         .get("runtime_home")
         .and_then(Value::as_str)
@@ -479,7 +482,7 @@ pub(crate) fn refuse_prepared_resume_home(tx: &Transaction<'_>, identity: &Value
     Ok(())
 }
 
-impl Store {
+impl Store<'_> {
     /// Registers one physical storage layout for its own canonical runtime
     /// home as `prepared` and returns the row with its operation token.
     ///
@@ -508,9 +511,7 @@ impl Store {
         let runtime_home = layout.runtime_home.clone();
         let token = format!("rt_{}", uuid::Uuid::new_v4().simple());
         let at = now();
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         if let Some(existing) = row_in(&tx, &runtime_home)? {
             // Retry is idempotent only for the exact recorded values; a
             // committed mapping is never re-opened by this operation. The
@@ -587,9 +588,7 @@ impl Store {
                 "runtime storage layout commit needs an operation token and a lowercase digest",
             ));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let existing = row_in(&tx, runtime_home)?.ok_or_else(|| {
             invalid(format!(
                 "no runtime storage layout is registered for {runtime_home}"
@@ -724,9 +723,7 @@ impl Store {
     /// history and must be removed by this call once all of those proofs
     /// hold.
     pub fn remove_runtime_storage_layout(&mut self, runtime_home: &str) -> Result<bool> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let references: i64 = tx.query_row(
             "SELECT COUNT(*) FROM agents WHERE json_extract(identity_json,'$.runtime_home')=?1",
             [runtime_home],

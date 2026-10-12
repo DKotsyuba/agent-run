@@ -1,4 +1,6 @@
 //! Frozen parser and process-boundary checks mirroring Python CLI tests.
+#[path = "support/test_broker.rs"]
+mod test_broker;
 
 use agent_run::{
     Error,
@@ -337,8 +339,8 @@ fn python_init_emits_home_config_and_state_fields() {
 }
 
 /// Mirrors `test_cli.py::test_producer_shims_and_all_top_level_commands_parse`.
-#[test]
-fn python_delivery_cancel_returns_a_durable_acknowledgement() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn python_delivery_cancel_returns_a_durable_acknowledgement() {
     let home = tempdir().expect("temporary home");
     let initialized = ProcessCommand::new(env!("CARGO_BIN_EXE_agent-run"))
         .args([
@@ -349,6 +351,7 @@ fn python_delivery_cancel_returns_a_durable_acknowledgement() {
         .output()
         .expect("agent-run binary executes");
     assert!(initialized.status.success(), "{initialized:?}");
+    let _broker = test_broker::broker_for(home.path()).await;
     let output = ProcessCommand::new(env!("CARGO_BIN_EXE_agent-run"))
         .args([
             "--home",

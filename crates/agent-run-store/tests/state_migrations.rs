@@ -177,7 +177,7 @@ fn current_binary_fixture_matches_fresh_schema() {
     }
     drop(fixture);
     assert_eq!(
-        Store::open(home.path())
+        agent_run_store::fixture::initialize(home.path())
             .unwrap()
             .quota_capacity_revision()
             .unwrap(),
@@ -240,7 +240,7 @@ fn external_service_migration_preserves_managed_generations() {
     let before: String = conn.query_row(GENERATION, [], |row| row.get(0)).unwrap();
     drop(conn);
 
-    let store = Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::initialize(home.path()).unwrap();
     assert_eq!(user_version(&store.conn), VERSION);
     let after: String = store
         .conn
@@ -314,7 +314,7 @@ fn existing_rows_survive_migration_from_v1() {
     insert_v1_agents(&build);
     drop(build);
 
-    let store = Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::initialize(home.path()).unwrap();
     assert_eq!(store.health().unwrap()["schema_version"], VERSION);
     let conn = open_ro(&db_path);
     assert_eq!(agent_count(&conn), V1_AGENTS.len() as i64);
@@ -581,8 +581,8 @@ fn migration_023_adds_nullable_display_names_without_rewriting_history() {
         .query_row("SELECT COUNT(*) FROM run_stats", [], |row| row.get(0))
         .unwrap();
     drop(build);
-    let store = Store::open(home.path()).unwrap();
-    // Opening migrates through every later migration; the display-name
+    let store = agent_run_store::fixture::initialize(home.path()).unwrap();
+    // Explicit fixture initialization migrates through every later migration; the display-name
     // invariants below hold unchanged at the chain's current end.
     assert_eq!(user_version(&store.conn), VERSION);
     assert_eq!(agent_count(&store.conn), before);
@@ -636,7 +636,7 @@ fn migration_022_registers_runtime_storage_layouts() {
     let build = build_fixture(&path, 21);
     let before = agent_count(&build);
     drop(build);
-    let store = Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::initialize(home.path()).unwrap();
     assert_eq!(user_version(&store.conn), VERSION);
     assert_eq!(agent_count(&store.conn), before);
     assert!(
@@ -698,7 +698,7 @@ fn migration_010_creates_a_bounded_route_snapshot_table() {
     let home = tempfile::tempdir().unwrap();
     let db_path = home.path().join("state.db");
     drop(build_fixture(&db_path, 9));
-    let store = Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::initialize(home.path()).unwrap();
     let columns: Vec<String> = store
         .conn
         .prepare("PRAGMA table_info(capacity_route_snapshots)")
@@ -770,7 +770,7 @@ fn opening_v5_preserves_workflow_history_after_foreign_key_repair() {
     .unwrap();
     conn.execute_batch("PRAGMA user_version=5").unwrap();
     drop(conn);
-    let store = Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::initialize(home.path()).unwrap();
     assert_eq!(
         store
             .conn
@@ -826,7 +826,7 @@ fn concurrent_openers_migrate_a_v1_store_once() {
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
                 barrier.wait();
-                Store::open(path.parent().unwrap())
+                agent_run_store::fixture::initialize(path.parent().unwrap())
                     .unwrap()
                     .health()
                     .unwrap()["schema_version"]
@@ -849,7 +849,7 @@ fn workflow_status_enums_are_enforced_after_upgrade() {
     let home = tempfile::tempdir().unwrap();
     let db_path = home.path().join("state.db");
     drop(build_fixture(&db_path, 1));
-    let store = Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::initialize(home.path()).unwrap();
     assert!(store.conn.execute(
         "INSERT INTO workflow_runs(id,name,script_sha,status,created_at) VALUES('bad','flow','sha','bogus',1)",
         [],
@@ -875,7 +875,7 @@ fn v2_upgrade_adds_nullable_workflow_plan_json() {
         [],
     ).unwrap();
     drop(conn);
-    let store = Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::initialize(home.path()).unwrap();
     let columns: Vec<String> = store
         .conn
         .prepare("PRAGMA table_info(workflow_runs)")
@@ -907,7 +907,7 @@ fn incomplete_versioned_store_is_refused_without_mutation() {
     conn.execute_batch("CREATE TABLE agents (id TEXT PRIMARY KEY); PRAGMA user_version=1")
         .unwrap();
     drop(conn);
-    assert!(Store::open(home.path()).is_err());
+    assert!(agent_run_store::fixture::initialize(home.path()).is_err());
     assert_eq!(user_version(&open_ro(&db_path)), 1);
 }
 
@@ -943,7 +943,7 @@ fn migration_waits_past_the_ordinary_busy_timeout_for_a_locked_store() {
     assert_eq!(migrations::migrate(&db_path).unwrap(), VERSION);
     holder.join().unwrap();
 
-    let store = Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::initialize(home.path()).unwrap();
     assert_eq!(
         store
             .conn
@@ -1006,7 +1006,7 @@ fn provider_orchestration_migration_preserves_history_and_bounds_owned_attempts(
     seed_v16_legacy(&build);
     drop(build);
 
-    let store = Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::initialize(home.path()).unwrap();
     assert_eq!(store.health().unwrap()["schema_version"], VERSION);
     let conn = open_ro(&db_path);
 

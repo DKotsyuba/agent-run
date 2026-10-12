@@ -604,7 +604,7 @@ fn python_test_state_outbox_each_row_is_timed_after_its_probe() {
     let path = home.path.clone();
     let changed = reconcile_with(&mut store, 100, |pid, _, _| {
         if pid == Some(400) {
-            let heartbeat_store = Store::open(&path).unwrap();
+            let heartbeat_store = agent_run_store::fixture::open(&path).unwrap();
             heartbeat_store
                 .conn
                 .execute(
@@ -631,7 +631,7 @@ async fn wait_observes_a_terminal_transition_committed_by_another_connection() {
     let other_id = id.clone();
     let writer = thread::spawn(move || {
         thread::sleep(Duration::from_millis(40));
-        let mut store = Store::open(&path).unwrap();
+        let mut store = agent_run_store::fixture::open(&path).unwrap();
         let mut outcome = Outcome::failure("external_terminal_transition");
         outcome.status = Status::Lost;
         store.finish(&other_id, &outcome, None, None).unwrap();
@@ -933,7 +933,7 @@ fn lost_agent_with_attempt(
 #[test]
 fn orphaned_attempt_release_is_fair_under_a_limit_of_one() {
     let home = common::Home::new();
-    let mut store = Store::open(&home.path).unwrap();
+    let mut store = agent_run_store::fixture::open(&home.path).unwrap();
     let mut gone = std::process::Command::new("/usr/bin/true").spawn().unwrap();
     let pid = gone.id() as i32;
     gone.wait().unwrap();

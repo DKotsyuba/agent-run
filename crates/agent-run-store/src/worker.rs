@@ -7,7 +7,7 @@ use agent_run_domain::{
     worker::{NotifyReceipt, NotifyRequest},
 };
 use agent_run_platform::fs::sha256;
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, params};
 
 /// Maximum distinct reports accepted for one exact run.
 const MAX_MESSAGES: i64 = 20;
@@ -86,7 +86,7 @@ fn resolve_root(conn: &rusqlite::Connection, run_id: &AgentId) -> Result<AgentId
     root.parse()
 }
 
-impl Store {
+impl Store<'_> {
     /// Binds one ephemeral secret hash to a currently owned attempt before launch.
     /// Repeating the same binding is harmless; a replacement secret is refused.
     pub fn issue_worker_capability(
@@ -99,9 +99,7 @@ impl Store {
         if !valid_token(token) || !at.is_finite() || at < 0.0 {
             return Err(Error::Validation("invalid worker capability".into()));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let owned: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM attempts WHERE id=? AND agent_id=? AND ownership_active=1 AND finished_at IS NULL)",
             params![attempt_id, run_id.as_str()],
@@ -145,9 +143,7 @@ impl Store {
                 "worker pool catalog is not supported".into(),
             ));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         if authenticate_attempt(&tx, &proof.run_id, &proof.attempt_id, &proof.token, at)?.is_none()
         {
             return Err(Error::Validation("invalid worker capability".into()));
@@ -186,9 +182,7 @@ impl Store {
         if !valid_token(token) || !at.is_finite() || at < 0.0 || input.message.contains(token) {
             return Err(Error::Validation("invalid worker report".into()));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let auth = authenticate_attempt(&tx, run_id, attempt_id, token, at)?
             .filter(|auth| auth.running)
             .and_then(|auth| {

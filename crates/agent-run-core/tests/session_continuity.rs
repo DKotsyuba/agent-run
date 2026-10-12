@@ -92,11 +92,12 @@ fn identity(home: &common::Home, request: &StartRequest, write_override: Option<
 #[tokio::test]
 async fn grant_tampering_and_unsealed_home_are_typed_refusals() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
     let mut request = home.request();
     request.account = Some("work".into());
     let sealed = identity(&home, &request, None);
     let parent = terminal_parent(&home, request, "thread-native-grants", &sealed);
-    let service = Service::new(home.path.clone());
+    let service = Service::new(home.path.clone()).with_writer(writer.broker());
 
     // Same identity but with the write grant flipped against the request.
     let tampered = identity(&home, &home.request(), Some(true));

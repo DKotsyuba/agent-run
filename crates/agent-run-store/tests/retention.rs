@@ -829,7 +829,7 @@ fn maintenance_concurrent_with_transcripts_and_deliveries_preserves_both() {
         let mut deferred = 0usize;
         let mut passes = 0usize;
         for _ in 0..24 {
-            let Ok(mut store) = Store::open(&maintenance_home) else {
+            let Ok(mut store) = agent_run_store::fixture::open(&maintenance_home) else {
                 continue;
             };
             let _ = store

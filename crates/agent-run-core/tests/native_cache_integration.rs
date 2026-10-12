@@ -264,7 +264,7 @@ fn converge(store: &mut Store, app_home: &Path) -> Vec<storage_gc::Outcome> {
 #[test]
 fn cache_only_home_anchor_freeze_pack_collect_lifecycle() {
     let fixture = fixture("acct-one", b"native-payload\n");
-    let mut store = Store::initialize(&fixture.app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&fixture.app_home).expect("store");
     let report = runtime_cache::consolidate(
         &mut store,
         &"ag-20260101-000000-0000000001".parse().unwrap(),
@@ -369,7 +369,7 @@ fn cache_only_home_anchor_freeze_pack_collect_lifecycle() {
 #[test]
 fn two_homes_share_assets_but_keep_private_state_and_domains_isolate() {
     let first = fixture("acct-one", b"shared-native-payload\n");
-    let mut store = Store::initialize(&first.app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&first.app_home).expect("store");
     runtime_cache::consolidate(
         &mut store,
         &"ag-20260101-000000-0000000001".parse().unwrap(),
@@ -460,7 +460,7 @@ fn two_homes_share_assets_but_keep_private_state_and_domains_isolate() {
 #[test]
 fn prepare_native_thaws_remote_parents_and_detects_shared_links() {
     let fixture = fixture("acct-one", b"thaw-payload\n");
-    let mut store = Store::initialize(&fixture.app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&fixture.app_home).expect("store");
     runtime_cache::consolidate(
         &mut store,
         &"ag-20260101-000000-0000000001".parse().unwrap(),
@@ -510,7 +510,7 @@ fn prepare_native_thaws_remote_parents_and_detects_shared_links() {
 #[test]
 fn refresh_privatizes_and_repacks_and_journals_recover() {
     let fixture = fixture("acct-one", b"journal-payload\n");
-    let mut store = Store::initialize(&fixture.app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&fixture.app_home).expect("store");
     let id: agent_run_core::domain::AgentId = "ag-20260101-000000-0000000001".parse().unwrap();
     runtime_cache::consolidate(
         &mut store,
@@ -623,7 +623,7 @@ fn absent_home_distinguishes_new_from_retained() {
 #[test]
 fn unsupported_names_skip_but_uncertainty_errors() {
     let fixture = fixture("acct-one", b"names\n");
-    let mut store = Store::initialize(&fixture.app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&fixture.app_home).expect("store");
     runtime_cache::consolidate(
         &mut store,
         &"ag-20260101-000000-0000000001".parse().unwrap(),
@@ -686,7 +686,7 @@ fn curated_clone_lifecycle_thaws_before_launch_and_collects_after_last_home() {
     let fixture = fixture("acct-one", b"curated-lifecycle\n");
     let private = common::curated_clone(&fixture.home, &common::curated_shape_small(8192), "one");
     let before = common::private_identity(&private);
-    let mut store = Store::initialize(&fixture.app_home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&fixture.app_home).expect("store");
     let id: agent_run_core::domain::AgentId = "ag-20260101-000000-0000000001".parse().unwrap();
     let consolidate = |store: &mut Store| {
         runtime_cache::consolidate(

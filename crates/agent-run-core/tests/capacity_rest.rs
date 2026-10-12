@@ -6,6 +6,7 @@
 //! OAuth isolation of `tests/test_capacity_oauth_refresh.py`. Neighbour of
 //! `capacity.rs`, `capacity_tail.rs`, and `capacity_collectors.rs`.
 
+mod common;
 use agent_run_core::capacity::{
     self, Key, Route, Sample, Topology, account_token_with, persist,
     sources::{self, claude_native, claude_oauth_token, normalize_codex},
@@ -277,14 +278,16 @@ fn identity_home(runtime: &str) -> tempfile::TempDir {
         ),
     )
     .expect("config writes");
-    agent_run_store::Store::initialize(path).expect("store initializes");
+    agent_run_store::fixture::initialize(path).expect("store initializes");
     temp
 }
 
 /// Mirrors `tests/test_capacity_identity.py::CapacityIdentityTests::test_base_label_persists_beside_the_absent_account`.
-#[test]
-fn base_label_persists_beside_the_absent_account() {
+#[tokio::test]
+async fn base_label_persists_beside_the_absent_account() {
     let home = identity_home("runtime");
+    let writer = common::writer::Harness::start(home.path());
+    let _socket = writer.serve_unix(home.path());
     let at = at_now();
     let observed = at - 1.0;
     let (absent, _) = normalize_codex(
@@ -321,9 +324,11 @@ fn base_label_persists_beside_the_absent_account() {
     );
 
     for slice in [&absent, &labelled] {
-        persist(home.path(), slice, 10).expect("each scope persists on its own");
+        persist(home.path(), slice, 10)
+            .await
+            .expect("each scope persists on its own");
     }
-    let store = agent_run_store::Store::open(home.path()).expect("store opens");
+    let store = agent_run_store::fixture::open(home.path()).expect("store opens");
     let snapshots: i64 = store
         .conn
         .query_row("SELECT COUNT(*) FROM capacity_route_snapshots", [], |row| {

@@ -1,6 +1,7 @@
 //! Application facade: transport code has no direct access to adapters or SQL.
 use crate::{
     Error, Result, adapters,
+    broker_writer::{BrokerLane, BrokerWriter},
     config::Config,
     domain::{AgentId, OrchestratorRef, Outcome, StartRequest, Status, now},
     error::invalid,
@@ -24,10 +25,15 @@ use agent_run_domain::{
     },
 };
 use agent_run_store::{
-    pool_admission::{PoolAdmission, PoolAdmissionInput, PoolMemberAdmission},
-    pool_replace::{PoolReplaceInput, PoolReplacement},
+    pool_admission::{PoolAdmission, PoolMemberAdmission},
+    pool_replace::PoolReplacement,
     provider_admission::AdmissionInputs,
+    writer::StoreReader,
 };
+
+/// Busy allowance of a broker-side read-only store job: reads never wait out a
+/// writer's long transaction on an executor thread.
+const READ_ALLOWANCE: Duration = Duration::from_millis(250);
 
 /// Most `selection_stale` recalculations after the initial selection in
 /// [`Service::admit_provider`]: four admission submissions in total.
@@ -226,6 +232,9 @@ pub struct Service {
     pub home: PathBuf,
     /// Last valid configuration keyed by its exact on-disk SHA-256 revision.
     config: Arc<RwLock<Option<CachedConfig>>>,
+    /// Producer lanes of the resident writer; `None` until the broker attaches
+    /// its writer (a service without one cannot mutate durable state).
+    writer: Option<BrokerWriter>,
 }
 /// One immutable configuration revision retained between service calls.
 #[derive(Clone)]
@@ -303,7 +312,26 @@ impl Service {
         Self {
             home,
             config: Arc::new(RwLock::new(None)),
+            writer: None,
         }
+    }
+
+    /// Attaches the resident writer every mutation of this service goes through.
+    #[must_use]
+    pub fn with_writer(mut self, writer: BrokerWriter) -> Self {
+        self.writer = Some(writer);
+        self
+    }
+
+    /// The broker lane of one subsystem.
+    ///
+    /// # Errors
+    /// [`Error::BrokerUnavailable`] when no writer is attached.
+    pub fn lane(&self, scope: &str) -> Result<BrokerLane> {
+        self.writer
+            .as_ref()
+            .map(|writer| writer.lane(scope))
+            .ok_or(Error::BrokerUnavailable)
     }
 
     /// Reloads `config.toml` only when its content digest changed.
@@ -411,19 +439,8 @@ impl Service {
     /// advances between every ranking and its submission, so a real broker
     /// deterministically spends its stale-retry budget (`selection_busy`).
     /// Absent in production builds.
-    pub fn admit_provider(&self, request: ProviderStartRequest) -> Result<Value> {
-        #[cfg(feature = "test-fixtures")]
-        if std::env::var_os("AGENT_RUN_FIXTURE_ALWAYS_STALE").is_some() {
-            let home = self.home.clone();
-            return self.admit_provider_ranked(request, &mut |_| {
-                let mut store = Store::open(&home)?;
-                let tx = store.conn.transaction()?;
-                Store::advance_quota_capacity_revision(&tx)?;
-                tx.commit()?;
-                Ok(())
-            });
-        }
-        self.admit_provider_ranked(request, &mut |_| Ok(()))
+    pub async fn admit_provider(&self, request: ProviderStartRequest) -> Result<Value> {
+        self.admit_provider_ranked(request, &mut |_| Ok(())).await
     }
 
     /// [`Self::admit_provider`] with a hook run after each candidate set is
@@ -435,20 +452,20 @@ impl Service {
     /// the store transaction. The hook cannot see or change candidates; its
     /// error aborts the call unchanged.
     #[cfg(feature = "test-fixtures")]
-    pub fn admit_provider_observed(
+    pub async fn admit_provider_observed(
         &self,
         request: ProviderStartRequest,
-        before_admission: &mut dyn FnMut(u32) -> Result<()>,
+        before_admission: &mut (dyn FnMut(u32) -> Result<()> + Send),
     ) -> Result<Value> {
-        self.admit_provider_ranked(request, before_admission)
+        self.admit_provider_ranked(request, before_admission).await
     }
 
     /// Ranked admission shared by [`Self::admit_provider`] and its test seam;
     /// `before_admission` runs between each ranking and its submission.
-    fn admit_provider_ranked(
+    async fn admit_provider_ranked(
         &self,
         request: ProviderStartRequest,
-        before_admission: &mut dyn FnMut(u32) -> Result<()>,
+        before_admission: &mut (dyn FnMut(u32) -> Result<()> + Send),
     ) -> Result<Value> {
         self.admit_provider_with(
             request,
@@ -467,6 +484,7 @@ impl Service {
                 Ok(candidates)
             },
         )
+        .await
     }
 
     /// Admits a strict provider request from trusted Rust quota candidates.
@@ -474,12 +492,13 @@ impl Service {
     /// without asking a test binary to respawn itself as `agent-run`.
     /// No transport accepts candidates from caller JSON. A fixed set cannot
     /// become fresh, so `selection_stale` returns without retry.
-    pub fn admit_provider_trusted(
+    pub async fn admit_provider_trusted(
         &self,
         request: ProviderStartRequest,
         candidates: QuotaCandidateSet,
     ) -> Result<Value> {
         self.admit_provider_with(request, 0, &mut |_, _, _, _| Ok(candidates.clone()))
+            .await
     }
 
     /// Shared admission: replay first, authority once, then up to
@@ -488,16 +507,19 @@ impl Service {
     /// `produce` builds one candidate set from the committed store state for
     /// the resolved catalog; it runs outside any write transaction and gets
     /// the zero-based submission number. See [`Self::admit_provider`].
-    fn admit_provider_with(
+    async fn admit_provider_with(
         &self,
         mut request: ProviderStartRequest,
         stale_retries: u32,
-        produce: &mut dyn FnMut(
+        produce: &mut (
+                 dyn FnMut(
             &Store,
             &agent_run_domain::catalog::ProviderCatalog,
             &ProviderStartRequest,
             u32,
-        ) -> Result<QuotaCandidateSet>,
+        ) -> Result<QuotaCandidateSet>
+                     + Send
+             ),
     ) -> Result<Value> {
         request.validate()?;
         if let Some(replay) = Store::open(&self.home)?.replay_provider_request(&request)? {
@@ -523,17 +545,33 @@ impl Service {
         let mut submission = 0;
         let admission = loop {
             let candidates = produce(&Store::open(&self.home)?, &catalog, &request, submission)?;
-            match Store::open(&self.home)?.admit_provider(
-                &request,
-                &effective,
-                &catalog,
-                &authority,
-                &candidates,
-                &identity,
-                global_cap,
-                cap,
-                pinned.as_ref(),
-            ) {
+            #[cfg(feature = "test-fixtures")]
+            if std::env::var_os("AGENT_RUN_FIXTURE_ALWAYS_STALE").is_some() {
+                self.lane("admission")?
+                    .handle()
+                    .fixture_advance_quota_revision()
+                    .await?;
+            }
+            match self
+                .lane("admission")?
+                .local(
+                    agent_run_store::ops::AdmitProvider {
+                        catalog: catalog.clone(),
+                        inputs: agent_run_store::ops::AdmissionSpec {
+                            request: request.clone(),
+                            effective: effective.clone(),
+                            authority: authority.clone(),
+                            candidates,
+                            identity: identity.clone(),
+                            global_cap,
+                            harness_cap: cap,
+                            pinned: pinned.clone(),
+                        },
+                    },
+                    crate::broker_writer::BROKER_BUDGET,
+                )
+                .await
+            {
                 Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
                     if stale_retries > 0 && submission == stale_retries =>
                 {
@@ -559,7 +597,7 @@ impl Service {
     /// to the normal detached provider-aware supervisor; a replayed admission
     /// (`created=false`) never launches another child or reserves again.
     pub async fn start_provider(&self, request: ProviderStartRequest) -> Result<Value> {
-        let mut result = self.admit_provider(request)?;
+        let mut result = self.admit_provider(request).await?;
         self.hand_off_provider(&mut result).await?;
         Ok(result)
     }
@@ -578,20 +616,26 @@ impl Service {
     async fn hand_off_provider(&self, result: &mut Value) -> Result<()> {
         if result["created"] == true {
             let id: AgentId = serde_json::from_value(result["agent_id"].clone())?;
-            if let Err(error) = supervisor::launch(&self.home, &id).await {
-                let mut store = Store::open(&self.home)?;
-                store.event(
+            let lane = self.lane("admission")?;
+            if let Err(error) = supervisor::launch(&self.home, &id, &lane).await {
+                lane.event(
                     &id,
                     "supervisor_handoff_error",
-                    &json!({"kind":error.public().kind}),
-                )?;
-                if matches!(error, Error::Io(_)) && store.provider_never_spawned(&id)? {
+                    json!({"kind":error.public().kind}),
+                )
+                .await?;
+                let never_spawned = matches!(error, Error::Io(_)) && {
+                    let probe = id.clone();
+                    self.read(move |store| {
+                        crate::persist::attempt_never_spawned(&store.conn, &probe)
+                    })
+                    .await?
+                };
+                if never_spawned {
                     let mut outcome = Outcome::failure("supervisor_spawn_failed");
                     outcome.failure_text = Some("the run supervisor could not be started".into());
-                    store.finish(&id, &outcome, None, None)?;
-                    crate::commands::complete_terminal(&mut store, &id)?;
-                    let row = store.get(&id)?;
-                    result["agent"] = self.view(&store, &row)?;
+                    lane.finish_terminal(&id, &outcome).await?;
+                    result["agent"] = self.view_of(&id).await?;
                 }
             }
         }
@@ -605,14 +649,14 @@ impl Service {
         request: ProviderStartRequest,
         candidates: QuotaCandidateSet,
     ) -> Result<Value> {
-        let mut result = self.admit_provider_trusted(request, candidates)?;
+        let mut result = self.admit_provider_trusted(request, candidates).await?;
         self.hand_off_provider(&mut result).await?;
         Ok(result)
     }
     /// Admits a whole cooperative pool atomically, choosing every account from
     /// persisted quota evidence; nothing is spawned. See
     /// `Self::admit_pool_with`.
-    pub fn admit_pool(&self, request: PoolStartRequest) -> Result<Value> {
+    pub async fn admit_pool(&self, request: PoolStartRequest) -> Result<Value> {
         self.admit_pool_with(
             request,
             PROVIDER_STALE_RETRIES,
@@ -628,17 +672,19 @@ impl Service {
                 )
             },
         )
+        .await
     }
 
     /// [`Self::admit_pool`] with one fixed trusted candidate set for every
     /// member, so offline tests can drive the real supervisor. A fixed set
     /// cannot become fresh: `selection_stale` returns without retry.
-    pub fn admit_pool_trusted(
+    pub async fn admit_pool_trusted(
         &self,
         request: PoolStartRequest,
         candidates: QuotaCandidateSet,
     ) -> Result<Value> {
         self.admit_pool_with(request, 0, &mut |_, _, _, _| Ok(candidates.clone()))
+            .await
     }
 
     /// Shared pool admission.
@@ -659,16 +705,19 @@ impl Service {
     ///    `selection_stale` retries like a single start, over the whole batch.
     ///
     /// The result lists only stable identities, names, roles and statuses.
-    fn admit_pool_with(
+    async fn admit_pool_with(
         &self,
         mut request: PoolStartRequest,
         stale_retries: u32,
-        produce: &mut dyn FnMut(
+        produce: &mut (
+                 dyn FnMut(
             &Store,
             &agent_run_domain::catalog::ProviderCatalog,
             &ProviderStartRequest,
             u32,
-        ) -> Result<QuotaCandidateSet>,
+        ) -> Result<QuotaCandidateSet>
+                     + Send
+             ),
     ) -> Result<Value> {
         request.validate()?;
         let request_value = serde_json::to_value(&request)?;
@@ -801,7 +850,7 @@ impl Service {
                         .transpose()?,
                 );
             }
-            let members = request
+            let members: Vec<PoolMemberAdmission<'_>> = request
                 .members
                 .iter()
                 .zip(&seats)
@@ -840,17 +889,44 @@ impl Service {
                     }
                 })
                 .collect();
-            let outcome = Store::open(&self.home)?.admit_pool(PoolAdmissionInput {
-                pool_id: &pool_id,
-                request_namespace: &namespace,
-                request_id: &request.request_id,
-                request_sha256: &sha,
-                goal: &request.goal,
-                acceptance: &request.acceptance,
-                catalog: &catalog,
-                members,
-                orchestrator: binding.as_ref(),
-            });
+            let members: Vec<agent_run_store::ops::PoolMemberSpec> = members
+                .into_iter()
+                .map(
+                    |member: PoolMemberAdmission<'_>| agent_run_store::ops::PoolMemberSpec {
+                        id: member.id,
+                        slot: member.slot,
+                        name: member.name,
+                        role: member.role,
+                        personal_task: member.personal_task,
+                        source: match member.source {
+                            agent_run_store::pool_admission::PoolAdmissionSource::New(inputs) => {
+                                agent_run_store::ops::PoolMemberSource::New(Box::new(inputs.into()))
+                            }
+                            agent_run_store::pool_admission::PoolAdmissionSource::Existing(pin) => {
+                                agent_run_store::ops::PoolMemberSource::Existing(Box::new(pin))
+                            }
+                        },
+                    },
+                )
+                .collect();
+            drop(store);
+            let outcome = self
+                .lane("pools")?
+                .local(
+                    agent_run_store::ops::AdmitPool {
+                        pool_id: pool_id.clone(),
+                        request_namespace: namespace.clone(),
+                        request_id: request.request_id.clone(),
+                        request_sha256: sha.clone(),
+                        goal: request.goal.clone(),
+                        acceptance: request.acceptance.clone(),
+                        catalog: catalog.clone(),
+                        members,
+                        orchestrator: binding.clone(),
+                    },
+                    crate::broker_writer::BROKER_BUDGET,
+                )
+                .await;
             match outcome {
                 Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
                     if stale_retries > 0 && submission == stale_retries =>
@@ -875,7 +951,7 @@ impl Service {
     /// whose launch fails ends terminally with its exact identity visible and
     /// the remaining members are still launched; a replay launches nothing.
     pub async fn start_pool(&self, request: PoolStartRequest) -> Result<Value> {
-        let result = self.admit_pool(request)?;
+        let result = self.admit_pool(request).await?;
         self.hand_off_pool(result).await
     }
 
@@ -885,22 +961,35 @@ impl Service {
         request: PoolStartRequest,
         candidates: QuotaCandidateSet,
     ) -> Result<Value> {
-        let result = self.admit_pool_trusted(request, candidates)?;
+        let result = self.admit_pool_trusted(request, candidates).await?;
         self.hand_off_pool(result).await
     }
 
     /// Appends an operator message to a pool: the author is stamped by the
     /// broker as the operator, the entry fans out to every current member's
     /// tip, and the same key replays. Refusals are typed [`PoolDenial`]s.
-    pub fn pool_post(&self, request: PoolPost) -> Result<std::result::Result<Value, PoolDenial>> {
+    pub async fn pool_post(
+        &self,
+        request: PoolPost,
+    ) -> Result<std::result::Result<Value, PoolDenial>> {
         request.validate()?;
-        let mut store = Store::open(&self.home)?;
-        Ok(store
-            .pool_operator_post(&request.pool_id, &request.request_id, &request.message)?
-            .map(|receipt| {
-                json!({"pool_id": receipt.pool_id, "seq": receipt.seq,
-                                  "created": !receipt.duplicate})
-            }))
+        let outcome = self
+            .lane("pools")?
+            .local(
+                agent_run_store::ops::PoolOperatorPost {
+                    pool_id: request.pool_id,
+                    request_id: request.request_id,
+                    message: request.message,
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await?;
+        Ok(match outcome {
+            agent_run_store::ops::PoolOutcome::Done(receipt) => Ok(json!({
+                "pool_id": receipt.pool_id, "seq": receipt.seq, "created": !receipt.duplicate,
+            })),
+            agent_run_store::ops::PoolOutcome::Denied(denial) => Err(denial),
+        })
     }
 
     /// Discovers a bounded page of pools without admission, settlement or writes.
@@ -925,7 +1014,7 @@ impl Service {
     }
 
     /// Admits a member replacement atomically; nothing is launched.
-    pub fn admit_pool_replacement(
+    pub async fn admit_pool_replacement(
         &self,
         request: PoolReplace,
     ) -> Result<std::result::Result<PoolReplacement, PoolDenial>> {
@@ -944,15 +1033,17 @@ impl Service {
                 )
             },
         )
+        .await
     }
 
     /// [`Self::admit_pool_replacement`] over one fixed trusted candidate set.
-    pub fn admit_pool_replacement_trusted(
+    pub async fn admit_pool_replacement_trusted(
         &self,
         request: PoolReplace,
         candidates: QuotaCandidateSet,
     ) -> Result<std::result::Result<PoolReplacement, PoolDenial>> {
         self.admit_replacement_with(request, 0, &mut |_, _, _, _| Ok(candidates.clone()))
+            .await
     }
 
     /// Shared replacement admission.
@@ -971,16 +1062,19 @@ impl Service {
     /// 4. [`Store::replace_pool_member`] rechecks everything atomically; a
     ///    roster that moved meanwhile recomposes, a stale selection retries
     ///    like a single start.
-    fn admit_replacement_with(
+    async fn admit_replacement_with(
         &self,
         mut request: PoolReplace,
         stale_retries: u32,
-        produce: &mut dyn FnMut(
+        produce: &mut (
+                 dyn FnMut(
             &Store,
             &agent_run_domain::catalog::ProviderCatalog,
             &ProviderStartRequest,
             u32,
-        ) -> Result<QuotaCandidateSet>,
+        ) -> Result<QuotaCandidateSet>
+                     + Send
+             ),
     ) -> Result<std::result::Result<PoolReplacement, PoolDenial>> {
         request.validate()?;
         let sha = agent_run_domain::canonical::sha256_hex(&serde_json::to_value(&request)?, true);
@@ -1061,16 +1155,16 @@ impl Service {
             start.validate()?;
             let prepared = prepare_provider(&config, &revision, &catalog, start)?;
             let candidates = produce(&store, &catalog, &prepared.request, submission)?;
-            let outcome = Store::open(&self.home)?.replace_pool_member(PoolReplaceInput {
-                pool_id: &request.pool_id,
-                old: &request.agent_id,
-                request_id: &request.request_id,
-                request_sha256: &sha,
+            let replacement = agent_run_store::ops::ReplacePoolMember {
+                pool_id: request.pool_id.clone(),
+                old: request.agent_id.clone(),
+                request_id: request.request_id.clone(),
+                request_sha256: sha.clone(),
                 expected_roster_revision: context.roster_revision,
                 new_id: new_id.clone(),
-                name: &name,
-                personal_task: &personal,
-                catalog: &catalog,
+                name: name.clone(),
+                personal_task: personal.clone(),
+                catalog: catalog.clone(),
                 inputs: AdmissionInputs {
                     request: &prepared.request,
                     effective: &prepared.effective,
@@ -1080,8 +1174,18 @@ impl Service {
                     global_cap: config.core.max_active_agents,
                     harness_cap: prepared.cap,
                     pinned: prepared.pinned.as_ref(),
-                },
-            });
+                }
+                .into(),
+            };
+            drop(store);
+            let outcome = self
+                .lane("pools")?
+                .local(replacement, crate::broker_writer::BROKER_BUDGET)
+                .await
+                .map(|outcome| match outcome {
+                    agent_run_store::ops::PoolOutcome::Done(value) => Ok(value),
+                    agent_run_store::ops::PoolOutcome::Denied(denial) => Err(denial),
+                });
             match outcome {
                 Ok(Err(PoolDenial::StaleRoster { .. })) if recomposed < 3 => recomposed += 1,
                 Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
@@ -1107,7 +1211,7 @@ impl Service {
         &self,
         request: PoolReplace,
     ) -> Result<std::result::Result<Value, PoolDenial>> {
-        let admitted = self.admit_pool_replacement(request)?;
+        let admitted = self.admit_pool_replacement(request).await?;
         self.hand_off_replacement(admitted).await
     }
 
@@ -1117,7 +1221,9 @@ impl Service {
         request: PoolReplace,
         candidates: QuotaCandidateSet,
     ) -> Result<std::result::Result<Value, PoolDenial>> {
-        let admitted = self.admit_pool_replacement_trusted(request, candidates)?;
+        let admitted = self
+            .admit_pool_replacement_trusted(request, candidates)
+            .await?;
         self.hand_off_replacement(admitted).await
     }
 
@@ -1298,6 +1404,9 @@ impl Service {
         }
         Ok(result)
     }
+    /// Admits one legacy start request after validating it against the current
+    /// configuration, then hands a newly created execution to the detached
+    /// supervisor. A replay (`created=false`) launches nothing.
     async fn admit(
         &self,
         request: StartRequest,
@@ -1306,37 +1415,62 @@ impl Service {
         parent: Option<&Record>,
         config_revision: &str,
     ) -> Result<Value> {
-        let (id, created) = {
-            let mut store = Store::open(&self.home)?;
-            store.admit_with_config_revision(
-                &request,
-                config,
-                config_revision,
-                &serde_json::to_value(identity)?,
-                parent,
-            )?
-        };
+        let admitted = self
+            .lane("admission")?
+            .local(
+                agent_run_store::ops::AdmitStart {
+                    request: request.clone(),
+                    config: config.clone(),
+                    config_revision: config_revision.to_owned(),
+                    identity: serde_json::to_value(identity)?,
+                    parent: parent.map(|row| row.id.clone()),
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await?;
+        let (id, created) = (admitted.agent_id, !admitted.replayed);
         if created {
             // A failed READY read does not cancel an already admitted durable job.
-            if let Err(error) = supervisor::launch(&self.home, &id).await {
-                let mut store = Store::open(&self.home)?;
-                let row = store.get(&id)?;
-                store.event(
+            let lane = self.lane("admission")?;
+            if let Err(error) = supervisor::launch(&self.home, &id, &lane).await {
+                let probe = id.clone();
+                let row = self.read(move |store| store.get(&probe)).await?;
+                lane.event(
                     &id,
                     "supervisor_handoff_error",
-                    &json!({"kind":error.public().kind}),
-                )?;
+                    json!({"kind":error.public().kind}),
+                )
+                .await?;
                 if row.supervisor_pid.is_none() && matches!(error, Error::Io(_)) {
                     // No owned supervisor was established. Explicit failure is better
                     // than an immortal starting row after a failed OS spawn.
                     let out = Outcome::failure("supervisor_bootstrap_failed");
-                    store.finish(&id, &out, None, None)?;
+                    lane.finish_terminal(&id, &out).await?;
                 }
             }
         }
-        let store = Store::open(&self.home)?;
-        let row = store.get(&id)?;
-        Ok(json!({"agent_id":id,"created":created,"agent":self.view(&store,&row)?}))
+        let agent = self.view_of(&id).await?;
+        Ok(json!({"agent_id":id,"created":created,"agent":agent}))
+    }
+
+    /// Runs one read-only store job off the async executor under the bounded
+    /// read allowance. A contended database ends the job with a typed busy
+    /// error instead of holding an executor thread.
+    async fn read<T: Send + 'static>(
+        &self,
+        job: impl FnOnce(&StoreReader) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let home = self.home.clone();
+        tokio::task::spawn_blocking(move || job(&StoreReader::open_with(&home, READ_ALLOWANCE)?))
+            .await
+            .map_err(|_| Error::Runtime("store read task failed".into()))?
+    }
+
+    /// The public view of one execution, read off the executor.
+    async fn view_of(&self, id: &AgentId) -> Result<Value> {
+        let (service, id) = (self.clone(), id.clone());
+        self.read(move |store| service.view(store, &store.get(&id)?))
+            .await
     }
     /// Admits one native continuation after proving terminal lineage and snapshot identity.
     ///
@@ -1372,8 +1506,9 @@ impl Service {
             .as_ref()
             .is_some_and(|identity| identity["provider_identity_version"] == 2);
         if provider_row {
-            let mut result =
-                self.admit_provider_resume(&parent, task, request_id, display_name, orchestrator)?;
+            let mut result = self
+                .admit_provider_resume(&parent, task, request_id, display_name, orchestrator)
+                .await?;
             self.hand_off_provider(&mut result).await?;
             return Ok(result);
         }
@@ -1525,7 +1660,7 @@ impl Service {
     /// same request id is `Conflict`. Task and orchestrator overrides
     /// remain subject to their normal validation. Returns a durable admission
     /// snapshot; this method does not launch the supervisor.
-    pub fn admit_provider_resume(
+    pub async fn admit_provider_resume(
         &self,
         parent: &Record,
         task: String,
@@ -1725,21 +1860,29 @@ impl Service {
                 pin_label,
                 &hard,
             )?;
-            match Store::open(&self.home)?.admit_provider_resume(
-                &request,
-                &effective,
-                &frozen_catalog,
-                &child_authority,
-                &candidates,
-                &identity,
-                current.core.max_active_agents,
-                cap,
-                pinned.as_ref(),
-                agent_run_store::provider_admission::ProviderResume {
-                    parent: &parent.id,
-                    prefer: &prefer,
-                },
-            ) {
+            drop(store);
+            match self
+                .lane("admission")?
+                .local(
+                    agent_run_store::ops::AdmitProviderResume {
+                        catalog: frozen_catalog.clone(),
+                        parent: parent.id.clone(),
+                        prefer: prefer.clone(),
+                        inputs: agent_run_store::ops::AdmissionSpec {
+                            request: request.clone(),
+                            effective: effective.clone(),
+                            authority: child_authority.clone(),
+                            candidates,
+                            identity: identity.clone(),
+                            global_cap: current.core.max_active_agents,
+                            harness_cap: cap,
+                            pinned: pinned.clone(),
+                        },
+                    },
+                    crate::broker_writer::BROKER_BUDGET,
+                )
+                .await
+            {
                 Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
                     if submission < PROVIDER_STALE_RETRIES =>
                 {
@@ -1769,23 +1912,39 @@ impl Service {
     /// current agent view including its top-level `status`, matching the
     /// archived Python `self.get(agent_id)` response.  An unknown or already
     /// terminal agent fails before any command is queued.
-    pub fn cancel(&self, id: &AgentId) -> Result<Value> {
-        let mut store = Store::open(&self.home)?;
-        store.enqueue(id, "cancel", &json!({}))?;
-        let row = store.get(id)?;
-        self.view(&store, &row)
+    pub async fn cancel(&self, id: &AgentId) -> Result<Value> {
+        self.lane("commands")?
+            .remote(
+                agent_run_store::ops::EnqueueCommand {
+                    execution: id.clone(),
+                    kind: "cancel".into(),
+                    payload: json!({}),
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await?;
+        self.view_of(id).await
     }
     /// Enqueues one nonblank bounded steering message for an active agent.
     ///
     /// `text` may contain arbitrary UTF-8 up to 256 KiB. The command is
     /// persisted before this method returns; unknown agents, invalid text, and
     /// storage failures are returned without contacting the runtime directly.
-    pub fn steer(&self, id: &AgentId, text: &str) -> Result<Value> {
+    pub async fn steer(&self, id: &AgentId, text: &str) -> Result<Value> {
         crate::domain::nonblank("steer text", text)?;
         if text.len() > 256 * 1024 {
             return Err(invalid("steer text exceeds 256 KiB"));
         }
-        Store::open(&self.home)?.enqueue(id, "steer", &json!({"text":text}))
+        self.lane("commands")?
+            .remote(
+                agent_run_store::ops::EnqueueCommand {
+                    execution: id.clone(),
+                    kind: "steer".into(),
+                    payload: json!({"text":text}),
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await
     }
     pub fn answer(&self, id: &AgentId) -> Result<Value> {
         let row = Store::open(&self.home)?.get(id)?;
@@ -1820,8 +1979,16 @@ impl Service {
     ///
     /// A missing, delivered, or already cancelled notification returns `false` in
     /// the Python-compatible acknowledgement; invalid identifiers are rejected.
-    pub fn delivery_cancel(&self, delivery_id: &str) -> Result<Value> {
-        let cancelled = Store::open(&self.home)?.cancel_delivery(delivery_id)?;
+    pub async fn delivery_cancel(&self, delivery_id: &str) -> Result<Value> {
+        let cancelled = self
+            .lane("delivery")?
+            .remote(
+                agent_run_store::ops::CancelDelivery {
+                    delivery_id: delivery_id.to_owned(),
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await?;
         Ok(json!({"delivery_id":delivery_id,"cancelled":cancelled}))
     }
     /// List execution history, optionally waiting for a newer durable revision.
@@ -1981,16 +2148,24 @@ impl Service {
     ///
     /// Native process observation is performed by the lifecycle module and
     /// never treats unavailable OS evidence as a terminal outcome.
-    pub fn reconcile(&self) -> Result<usize> {
-        let mut store = Store::open(&self.home)?;
-        let reconciled = reconcile::reconcile(&mut store, 100)?.len();
-        // Bounded pool convergence for crashes, reconciled losses and cleanup
-        // proof that landed after the terminal write; a failure never hides
-        // the reconciliation result.
+    pub async fn reconcile(&self) -> Result<usize> {
+        let lane = self.lane("reconcile")?;
+        let reconciled = reconcile::queued::reconcile(&self.home, &lane, 100)
+            .await?
+            .len();
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs() as usize);
-        let _ = store.settle_open_pools(POOL_SWEEP_LIMIT, seed);
+        lane.local(
+            agent_run_store::ops::SettlePool {
+                target: agent_run_store::ops::SettleTarget::Open {
+                    limit: POOL_SWEEP_LIMIT,
+                    seed,
+                },
+            },
+            crate::broker_writer::BROKER_BUDGET,
+        )
+        .await?;
         Ok(reconciled)
     }
     /// Returns the active cached config revision after the request-boundary

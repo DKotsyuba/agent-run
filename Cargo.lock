@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-run"
-version = "0.25.1"
+version = "0.26.0"
 dependencies = [
  "agent-run-adapters",
  "agent-run-config",
@@ -29,7 +29,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-adapters"
-version = "0.25.1"
+version = "0.26.0"
 dependencies = [
  "agent-run-config",
  "agent-run-domain",
@@ -49,7 +49,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-config"
-version = "0.25.1"
+version = "0.26.0"
 dependencies = [
  "agent-run-domain",
  "agent-run-platform",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-core"
-version = "0.25.1"
+version = "0.26.0"
 dependencies = [
  "agent-run-adapters",
  "agent-run-config",
@@ -78,6 +78,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sqlite-access",
  "tempfile",
  "tokio",
  "toml",
@@ -86,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-domain"
-version = "0.25.1"
+version = "0.26.0"
 dependencies = [
  "chrono",
  "jsonschema",
@@ -101,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-platform"
-version = "0.25.1"
+version = "0.26.0"
 dependencies = [
  "agent-run-domain",
  "libc",
@@ -115,18 +116,20 @@ dependencies = [
 
 [[package]]
 name = "agent-run-store"
-version = "0.25.1"
+version = "0.26.0"
 dependencies = [
  "agent-run-config",
  "agent-run-core",
  "agent-run-domain",
  "agent-run-platform",
+ "agent-run-store",
  "fs2",
  "libc",
  "regex",
  "rusqlite",
  "serde",
  "serde_json",
+ "sqlite-access",
  "tempfile",
  "tokio",
  "toml",
@@ -135,7 +138,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-tui"
-version = "0.25.1"
+version = "0.26.0"
 dependencies = [
  "agent-run",
  "agent-run-domain",
@@ -466,6 +469,21 @@ checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "crossbeam-channel"
+version = "0.5.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98b0cc327b5bc766e7fda9c9260cc0fa81b43a8e240440422dff70788e3f9ef1"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
 name = "crossterm"
@@ -2167,6 +2185,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlite-access"
+version = "0.26.0"
+dependencies = [
+ "fs2",
+ "libc",
+ "rusqlite",
+ "tempfile",
+ "tokio",
+ "tokio-rusqlite",
+]
+
+[[package]]
 name = "sqlite-wasm-rs"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2360,6 +2390,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.5",
+]
+
+[[package]]
+name = "tokio-rusqlite"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bce5670317c76f8505e7e5a8d655330a435fc35d3deaf756de8406db64a94e8c"
+dependencies = [
+ "crossbeam-channel",
+ "rusqlite",
+ "tokio",
 ]
 
 [[package]]
@@ -2903,7 +2944,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xtask"
-version = "0.25.1"
+version = "0.26.0"
 dependencies = [
  "agent-run-config",
  "agent-run-domain",

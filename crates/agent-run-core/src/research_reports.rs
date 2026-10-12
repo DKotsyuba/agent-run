@@ -14,6 +14,8 @@ use std::path::Path;
 /// No report contents or capability secrets enter event metadata. Validation,
 /// authorization, integrity and I/O errors propagate; a lost receipt can be
 /// reconciled by retrying the same filename/content. No process is spawned.
+/// The durable `research_report_saved` event is recorded by the caller through
+/// the writer; this function only reads the store.
 pub(crate) fn save(
     store: &Store,
     call: &WorkerToolCall,
@@ -96,11 +98,6 @@ pub(crate) fn save(
         sha256: digest,
         duplicate,
     };
-    store.event(
-        &call.run_id,
-        "research_report_saved",
-        &serde_json::to_value(&receipt)?,
-    )?;
     Ok(receipt)
 }
 

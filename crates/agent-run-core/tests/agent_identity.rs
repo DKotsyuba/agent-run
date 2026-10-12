@@ -34,10 +34,12 @@ fn terminal_run(home: &common::Home, parent: Option<&AgentId>, text: &str) -> Ag
 #[tokio::test]
 async fn public_reads_preserve_history_and_do_not_rewrite_user_content() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let root = terminal_run(&home, None, "first answer");
     let user_content = r#"{"agent_id":"user data, not a routing field"}"#;
     let child = terminal_run(&home, Some(&root), user_content);
-    let service = Service::new(home.path.clone());
+    let service = Service::new(home.path.clone()).with_writer(writer.broker());
 
     let latest = dispatch::call(&service, "answer", json!({"agent_id":root}))
         .await
@@ -80,13 +82,15 @@ async fn public_reads_preserve_history_and_do_not_rewrite_user_content() {
 #[tokio::test]
 async fn stable_control_targets_the_active_execution() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let root = terminal_run(&home, None, "finished parent");
     let mut store = home.store();
     let parent = store.get(&root).unwrap();
     let (child, _) = store
         .admit(&home.request(), &home.config, &json!({}), Some(&parent))
         .unwrap();
-    let service = Service::new(home.path.clone());
+    let service = Service::new(home.path.clone()).with_writer(writer.broker());
     let result = dispatch::call(&service, "cancel", json!({"agent_id":root}))
         .await
         .unwrap();
@@ -108,20 +112,23 @@ async fn stable_control_targets_the_active_execution() {
         external_turn_id: None,
     };
     bind::bind(
-        &mut store,
+        &home.path,
         child.clone(),
         reference.clone(),
         agent_run_domain::domain::now(),
     )
+    .await
     .unwrap();
-    let context = agent_run_core::hooks::context::build(&home.path, &reference, None).unwrap();
+    let context = agent_run_core::hooks::context::build(&home.path, &reference, None)
+        .await
+        .unwrap();
     assert!(context.text.contains(root.as_str()), "{}", context.text);
     assert!(!context.text.contains(child.as_str()), "{}", context.text);
 }
 
 /// Discovery advertises only the stable agent selector on every public tool.
-#[test]
-fn tool_inventory_has_no_execution_selector() {
+#[tokio::test]
+async fn tool_inventory_has_no_execution_selector() {
     for tool in dispatch::tools() {
         assert!(
             tool["inputSchema"]["properties"].get("run_id").is_none(),
@@ -135,13 +142,15 @@ fn tool_inventory_has_no_execution_selector() {
 }
 
 /// A delayed post-tool hook binds the reported run even after another resume.
-#[test]
-fn delayed_hook_binds_exact_run_and_rejects_malformed_run_identity() {
+#[tokio::test]
+async fn delayed_hook_binds_exact_run_and_rejects_malformed_run_identity() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let root = terminal_run(&home, None, "root");
     let child = terminal_run(&home, Some(&root), "child");
     let latest = terminal_run(&home, Some(&child), "latest");
-    let mut store = home.store();
+    let store = home.store();
     assert_eq!(
         agent_identity::resolve(&store, &child, None).unwrap().id,
         latest
@@ -150,7 +159,9 @@ fn delayed_hook_binds_exact_run_and_rejects_malformed_run_identity() {
         "hook_event_name":"PostToolUse", "session_id":"caller-session",
         "tool_response":{"structuredContent":{"agent_id":root,"run_id":child}}
     });
-    let bound = bind::run_hook(&mut store, &payload, "codex_queue", None).unwrap();
+    let bound = bind::run_hook(&home.path, &payload, "codex_queue", None)
+        .await
+        .unwrap();
     assert_eq!(bound.agent_id, root);
     assert_eq!(bound.run_id, child);
     assert_eq!(store.delivery_status(&root).unwrap()["bound"], false);
@@ -164,8 +175,8 @@ fn delayed_hook_binds_exact_run_and_rejects_malformed_run_identity() {
 }
 
 /// User JSON mentioning another run cannot override or poison hook metadata.
-#[test]
-fn hook_execution_identity_excludes_arbitrary_task_content() {
+#[tokio::test]
+async fn hook_execution_identity_excludes_arbitrary_task_content() {
     let mut response = json!({
         "agent_id":"ag-root", "run_id":"ag-current", "created":true,
         "agent":{
@@ -192,14 +203,18 @@ fn hook_execution_identity_excludes_arbitrary_task_content() {
 #[tokio::test]
 async fn receipt_pins_delayed_binding_and_wait_without_exposing_run_ids() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let root = terminal_run(&home, None, "root");
     let child = terminal_run(&home, Some(&root), "child");
     let latest = terminal_run(&home, Some(&child), "latest");
-    let mut store = home.store();
+    let store = home.store();
     let payload = json!({"session_id":"receipt-session", "tool_response": {
         "structuredContent":{"agent_id":root,"sequence":2}
     }});
-    let bound = bind::run_hook(&mut store, &payload, "codex_queue", None).unwrap();
+    let bound = bind::run_hook(&home.path, &payload, "codex_queue", None)
+        .await
+        .unwrap();
     assert_eq!(bound.run_id, child);
     assert!(
         serde_json::to_value(&bound)
@@ -209,7 +224,7 @@ async fn receipt_pins_delayed_binding_and_wait_without_exposing_run_ids() {
     );
     assert!(!bound.message().contains(child.as_str()));
     assert_eq!(store.delivery_status(&latest).unwrap()["bound"], false);
-    let service = Service::new(home.path.clone());
+    let service = Service::new(home.path.clone()).with_writer(writer.broker());
     let answer = dispatch::call(&service, "wait", json!({"agent_id":root,"sequence":2}))
         .await
         .unwrap();
@@ -247,8 +262,10 @@ async fn receipt_pins_delayed_binding_and_wait_without_exposing_run_ids() {
 #[tokio::test]
 async fn logical_pages_and_transcript_cursor_span_resumes() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let root = terminal_run(&home, None, "first");
-    let service = Service::new(home.path.clone());
+    let service = Service::new(home.path.clone()).with_writer(writer.broker());
     let first = dispatch::call(&service, "transcript", json!({"agent_id":root,"limit":1}))
         .await
         .unwrap();

@@ -43,7 +43,7 @@ async fn python_second_owner_refuses_a_live_listener() {
 async fn broker_expires_old_history_on_startup() {
     let temp = tempfile::tempdir().unwrap();
     cli::init(temp.path()).unwrap();
-    let store = agent_run::state::Store::open(temp.path()).unwrap();
+    let store = agent_run_store::fixture::open(temp.path()).unwrap();
     store
         .conn
         .execute(
@@ -121,7 +121,7 @@ async fn broker_expires_old_history_on_startup() {
 async fn filesystem_retention_error_does_not_block_database_history() {
     let temp = tempfile::tempdir().unwrap();
     cli::init(temp.path()).unwrap();
-    let mut store = agent_run::state::Store::open(temp.path()).unwrap();
+    let mut store = agent_run_store::fixture::open(temp.path()).unwrap();
     let tx = store.conn.transaction().unwrap();
     for _ in 0..5_000 {
         tx.execute(
@@ -285,7 +285,14 @@ async fn python_control_lane_survives_regular_connection_pressure() {
         let path = path.clone();
         async move { socket::serve_at(&home, &path).await }
     });
-    wait_for_socket(&path).await;
+    // A connect-and-drop readiness probe would transiently occupy the 32nd slot.
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !path.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("control fixture listener bound");
     let mut regular = Vec::new();
     for _ in 0..31 {
         regular.push(UnixStream::connect(&path).await.expect("regular slot"));
@@ -305,9 +312,10 @@ async fn python_control_lane_survives_regular_connection_pressure() {
         .await
         .expect("read reserved control response")
         .expect("response frame");
+    let response_json: serde_json::Value = serde_json::from_slice(&response).expect("JSON");
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&response).expect("JSON")["error"]["code"],
-        -32602
+        response_json["error"]["code"], -32602,
+        "reserved-control response: {response_json}"
     );
     drop(regular);
     task.abort();
@@ -403,7 +411,7 @@ async fn python_sigterm_completes_admitted_requests_and_releases_the_store() {
         assert_eq!(response["result"]["complete"], true, "response={response}");
     }
     assert!(!path.exists());
-    assert!(agent_run::state::Store::open(temp.path()).is_ok());
+    assert!(agent_run_store::fixture::open(temp.path()).is_ok());
 }
 
 /// Waits for the real test listener to publish without using a global socket.

@@ -12,7 +12,7 @@ use agent_run_domain::{
     domain::{AgentId, StartRequest, Status, now},
 };
 use agent_run_platform::process;
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
 /// Return the recorded request-id replay in its canonical or exact legacy namespace.
@@ -92,9 +92,7 @@ pub fn admit_with_config_revision(
     agent_run_domain::domain::nonblank("config_revision", config_revision)?;
     let mut checked = request.clone();
     checked.validate()?;
-    let tx = store
-        .conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = crate::writer::WriteTx::begin(&store.conn)?;
     let accepted_at = now();
 
     // Replay precedes session upsert and capacity: Python deliberately makes a
@@ -193,7 +191,7 @@ pub fn admit_with_config_revision(
 
 /// Resolves the canonical-first existing session family without touching it.
 pub(crate) fn replay_session(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     request: &StartRequest,
 ) -> Result<Option<String>> {
     let Some(reference) = &request.orchestrator else {
@@ -206,7 +204,7 @@ pub(crate) fn replay_session(
 
 /// Finds a request id under the exact session family already present in the transaction.
 pub(crate) fn replay_in_transaction(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     request: &StartRequest,
     session: Option<&str>,
 ) -> Result<Option<Record>> {
@@ -298,7 +296,7 @@ fn ensure_same_replay(
 /// Reuses the shared identity lookup when a new admission has an orchestrator.
 /// Existing exact legacy aliases keep their row id; fresh rows use canonical names.
 pub(crate) fn upsert_session(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     request: &StartRequest,
     accepted_at: f64,
 ) -> Result<Option<String>> {
@@ -309,7 +307,7 @@ pub(crate) fn upsert_session(
         .transpose()
 }
 
-impl Store {
+impl Store<'_> {
     /// Return a prior request-id admission without loading mutable configuration.
     pub fn replay_request(&self, request: &StartRequest) -> Result<Option<Record>> {
         replay_request(self, request)

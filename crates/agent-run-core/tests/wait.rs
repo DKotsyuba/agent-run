@@ -6,7 +6,6 @@ use agent_run_core::{
     domain::{AgentId, Status},
     service::Service,
 };
-use agent_run_store::Store;
 use serde_json::Value;
 use std::{
     sync::{
@@ -109,7 +108,7 @@ async fn test_no_timeout_keeps_polling_until_the_run_ends() {
         while !signal.load(Ordering::Acquire) {
             tokio::task::yield_now().await;
         }
-        let store = Store::open(&update_home).expect("update store");
+        let store = agent_run_store::fixture::open(&update_home).expect("update store");
         store
             .conn
             .execute(

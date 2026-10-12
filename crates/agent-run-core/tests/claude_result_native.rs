@@ -34,6 +34,9 @@ async fn native_claude_correlates_queued_steering() {
         )
         .unwrap();
     let record = store.get(&id).unwrap();
+    let prep = common::writer::prepare_supervisor(&mut store, &id);
+    let harness = common::writer::Harness::start(&home.path);
+    let mut persist = harness.supervisor(&home.path, prep, &id).await;
     let mut environment = BTreeMap::new();
     for key in ["HOME", "PATH", "USER", "LANG"] {
         if let Ok(value) = std::env::var(key) {
@@ -76,9 +79,10 @@ async fn native_claude_correlates_queued_steering() {
     let initial = json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":requested.task}]}}).to_string();
     let result = tokio::time::timeout(
         Duration::from_secs(90),
-        stream::run(&mut process, &mut store, &record, Some(&initial)),
+        stream::run(&mut process, &mut persist, &record, Some(&initial)),
     )
     .await;
+    persist.flush().await.unwrap();
     let cleanup = process.owner.cleanup(Duration::from_secs(2)).await;
     process.reap().await;
     let cleanup = cleanup.expect("owned native cleanup");
@@ -101,9 +105,10 @@ async fn native_claude_correlates_queued_steering() {
     let initial = json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":"Respond with only RESUMED."}]}}).to_string();
     let continuation = tokio::time::timeout(
         Duration::from_secs(90),
-        stream::run(&mut process, &mut store, &resumed, Some(&initial)),
+        stream::run(&mut process, &mut persist, &resumed, Some(&initial)),
     )
     .await;
+    persist.flush().await.unwrap();
     let cleanup = process.owner.cleanup(Duration::from_secs(2)).await;
     process.reap().await;
     let cleanup = cleanup.expect("owned continuation cleanup");
@@ -155,6 +160,9 @@ async fn closed_stdin_control_cannot_certify_success() {
         .unwrap();
     let mut store = home.store();
     let record = store.get(&id).unwrap();
+    let prep = common::writer::prepare_supervisor(&mut store, &id);
+    let harness = common::writer::Harness::start(&home.path);
+    let mut persist = harness.supervisor(&home.path, prep, &id).await;
     let plan = LaunchPlan {
         binary: "/bin/sh".into(),
         args: vec!["-c".into(),
@@ -173,7 +181,7 @@ async fn closed_stdin_control_cannot_certify_success() {
         .await
         .is_ok();
         if ready {
-            let mut control = agent_run_core::state::Store::open(&home.path)?;
+            let mut control = agent_run_store::fixture::open(&home.path)?;
             control.enqueue(&id, "steer", &json!({"text":"changed task"}))?;
         }
         Ok::<bool, agent_run_core::error::Error>(ready)
@@ -182,10 +190,11 @@ async fn closed_stdin_control_cannot_certify_success() {
     let (result, driven) = tokio::join!(
         tokio::time::timeout(
             Duration::from_secs(5),
-            stream::run(&mut process, &mut store, &record, Some(&initial))
+            stream::run(&mut process, &mut persist, &record, Some(&initial))
         ),
         driver,
     );
+    persist.flush().await.unwrap();
     let cleanup = process.owner.cleanup(Duration::from_secs(2)).await;
     process.reap().await;
     assert!(cleanup.unwrap().confirmed);

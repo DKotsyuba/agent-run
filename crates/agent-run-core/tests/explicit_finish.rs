@@ -25,7 +25,7 @@ fn plan(home: &common::Home, script: String) -> LaunchPlan {
 /// Wait for a durable phase only inside the bounded fixture driver. This
 /// exercises the supervisor's DB observation, not model polling or inference.
 async fn phase(
-    store: &agent_run_store::Store,
+    store: &agent_run_store::Store<'_>,
     id: &agent_run_domain::domain::AgentId,
     expected: &str,
 ) {
@@ -59,14 +59,18 @@ async fn native_success_without_callback_is_not_completion() {
             .unwrap();
         let mut store = home.store();
         let row = store.get(&id).unwrap();
+        let prep = common::writer::prepare_supervisor(&mut store, &id);
+        let harness = common::writer::Harness::start(&home.path);
+        let mut persist = harness.supervisor(&home.path, prep, &id).await;
         let mut process = Process::spawn(&plan(
             &home,
             format!("read initial; printf '%s\\n' '{TURN}'"),
         ))
         .unwrap();
-        let result = stream::run(&mut process, &mut store, &row, Some("initial\n"))
+        let result = stream::run(&mut process, &mut persist, &row, Some("initial\n"))
             .await
             .unwrap();
+        persist.flush().await.unwrap();
         assert_eq!(
             result.outcome.status,
             if explicit {
@@ -119,6 +123,9 @@ async fn idle_wake_and_private_finish_keep_one_run_and_exact_summary() {
         .unwrap();
     store.begin_worker_lifecycle(&id, &attempt, 100.0).unwrap();
     let row = store.get(&id).unwrap();
+    let prep = common::writer::prepare_supervisor(&mut store, &id);
+    let harness = common::writer::Harness::start(&home.path);
+    let mut persist = harness.supervisor(&home.path, prep, &id).await;
     let script = format!(
         r#"read initial
 printf '%s\n' '{TURN}'
@@ -157,9 +164,10 @@ sleep 1
     };
     let result = tokio::time::timeout(Duration::from_secs(10), async {
         let (result, ()) = tokio::join!(
-            stream::run(&mut process, &mut store, &row, Some("initial\n")),
+            stream::run(&mut process, &mut persist, &row, Some("initial\n")),
             driver
         );
+        persist.flush().await.unwrap();
         result.unwrap()
     })
     .await

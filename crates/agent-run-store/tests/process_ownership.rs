@@ -24,8 +24,8 @@ fn generation(store: &Store, id: &str) {
 #[test]
 fn restored_members_are_durable_and_owner_conflicts_roll_back() {
     let home = tempfile::tempdir().unwrap();
-    Store::initialize(home.path()).unwrap();
-    let mut store = Store::open(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
     generation(&store, "first");
     generation(&store, "second");
     let root = identity(10, "root");
@@ -54,7 +54,7 @@ fn restored_members_are_durable_and_owner_conflicts_roll_back() {
             .is_none()
     );
     drop(store);
-    let store = Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
     let snapshot = store
         .remembered_processes("service", "first")
         .unwrap()

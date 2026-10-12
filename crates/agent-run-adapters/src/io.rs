@@ -12,6 +12,8 @@ use agent_run_platform::{
 use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
+    future::Future,
+    pin::Pin,
     process::Stdio,
     sync::{
         Arc, Mutex,
@@ -90,8 +92,30 @@ impl RpcUncertain {
     }
 }
 
-/// Synchronous durable checkpoint installed by the supervisor; receives identity metadata only.
-type OwnershipObserver = Box<dyn FnMut(&OwnershipSnapshot) -> Result<()> + Send>;
+/// Owned future of one durable persistence operation; it borrows nothing, so it
+/// can stay pending across cancellation of the call that started it.
+pub type PersistFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + Sync + 'static>>;
+
+/// Durable ownership sink installed by the supervisor.
+///
+/// Each call starts the persistence of one identity-only snapshot and returns
+/// the future that resolves when the write is committed, durably refused or its
+/// original deadline ended. The sink owns retry of the same operation identity
+/// and its single original deadline; [`Process`] never restarts or renews it.
+pub type OwnershipSink = Box<dyn FnMut(OwnershipSnapshot) -> PersistFuture + Send + Sync>;
+
+/// One started, not yet resolved ownership persistence.
+struct PendingOwnership {
+    /// Capture revision the snapshot represented when it was started.
+    revision: (usize, bool),
+    /// Closed phase that started it; reported for its first failure.
+    stage: OwnershipStage,
+    /// The sink's future, polled by whichever wait is active.
+    future: PersistFuture,
+}
+
+/// Interval at which a persistence wait re-observes the primary and descendants.
+const OBSERVE_TICK: Duration = Duration::from_millis(50);
 
 /// One bounded result from the engine stdout reader.
 #[derive(Debug)]
@@ -160,17 +184,15 @@ pub struct Process {
     /// Last descendant snapshot, shared by startup RPC and streaming reads.
     observed_at: tokio::time::Instant,
     /// Optional persistence boundary supplied by core without coupling adapters to SQLite.
-    ownership_observer: Option<OwnershipObserver>,
+    ownership_sink: Option<OwnershipSink>,
     /// Last successfully persisted append-only capture revision.
     ownership_revision: Option<(usize, bool)>,
-    /// Finite persistence allowance supplied by the idempotent supervisor writer.
-    ownership_retry_budget: Option<Duration>,
-    /// First attempt timestamp retained across select cancellation.
-    ownership_retry_started: Option<std::time::Instant>,
-    /// Completed pre-transaction attempts across synchronous slices.
-    ownership_retry_attempts: u32,
-    /// Last safe BEGIN refusal retained so cancellation cannot renew an expired allowance.
-    ownership_retry_error: Option<Error>,
+    /// Started persistence kept across select cancellation; never restarted.
+    ownership_pending: Option<PendingOwnership>,
+    /// First typed failure of a persistence that finished while no checkpoint
+    /// waited (for example during [`Process::observing`]); consumed by the next
+    /// checkpoint or [`Process::next`].
+    ownership_failure: Option<Error>,
 }
 impl Process {
     /// Spawns the planned engine with isolated environment and line-framed pipes.
@@ -257,131 +279,207 @@ impl Process {
             primary_exited: false,
             exit_kill_deadline: None,
             observed_at: tokio::time::Instant::now(),
-            ownership_observer: None,
+            ownership_sink: None,
             ownership_revision: None,
-            ownership_retry_budget: None,
-            ownership_retry_started: None,
-            ownership_retry_attempts: 0,
-            ownership_retry_error: None,
+            ownership_pending: None,
+            ownership_failure: None,
         })
     }
 
-    /// Attaches the supervisor's durable ownership writer and immediately checkpoints the current root.
-    /// Errors propagate so the supervisor cleans up instead of running without required evidence.
-    pub fn observe_ownership(
-        &mut self,
-        observer: impl FnMut(&OwnershipSnapshot) -> Result<()> + Send + 'static,
-    ) -> Result<()> {
-        self.ownership_observer = Some(Box::new(observer));
+    /// Attaches the supervisor's durable ownership sink and persists the
+    /// current root before returning.
+    ///
+    /// The wait is asynchronous: the primary PID and descendants keep being
+    /// observed (including verified TERM/KILL escalation after primary exit)
+    /// while the write is pending, and no native input may be sent until this
+    /// returns. Errors propagate so the supervisor cleans up instead of running
+    /// without required evidence.
+    pub async fn observe_ownership(&mut self, sink: OwnershipSink) -> Result<()> {
+        self.install_ownership_sink(sink);
+        self.checkpoint_ownership_ready(OwnershipStage::Initial)
+            .await
+    }
+
+    /// Installs the durable ownership sink without persisting anything yet.
+    ///
+    /// Resets the persisted revision and any started or failed write; the next
+    /// [`Self::checkpoint_ownership_ready`] persists the current capture. Use
+    /// [`Self::observe_ownership`] for the required initial persistence.
+    pub fn install_ownership_sink(&mut self, sink: OwnershipSink) {
+        self.ownership_sink = Some(sink);
         self.ownership_revision = None;
-        self.checkpoint_ownership_at(OwnershipStage::Initial)
+        self.ownership_pending = None;
+        self.ownership_failure = None;
     }
 
-    /// Attach an idempotent writer identifying safe, pre-transaction ownership
-    /// contention. Initial persistence precedes native input. Streaming and final
-    /// progress remain gated until persistence succeeds or the supplied budget
-    /// expires. Each synchronous callback keeps its control slice; asynchronous
-    /// waits own no SQLite transaction. Arbitrary errors/commits never retry.
-    pub fn observe_ownership_with_retry(
-        &mut self,
-        observer: impl FnMut(&OwnershipSnapshot) -> Result<()> + Send + 'static,
-        budget: Duration,
-    ) -> Result<()> {
-        if budget.is_zero() {
-            return Err(Error::Runtime(
-                "ownership persistence allowance must be positive".into(),
-            ));
-        }
-        self.ownership_retry_budget = Some(budget);
-        self.ownership_retry_started = None;
-        self.ownership_retry_attempts = 0;
-        self.ownership_retry_error = None;
-        self.observe_ownership(observer)
-    }
-
-    /// Gate native progress on required persistence. Only a classified BEGIN
-    /// SQLITE_BUSY is replayable: no snapshot mutation/commit has occurred.
-    /// Timing/counts survive select cancellation; success clears them. No model,
-    /// input, tool or engine is replayed, and pending frames remain unread.
+    /// Gate native progress on required persistence of the newest capture.
+    ///
+    /// Waits for any started persistence (kept across caller cancellation and
+    /// never restarted, so a cancelled caller cannot renew its allowance), then
+    /// starts and awaits further snapshots until the persisted revision equals
+    /// the current capture. Unchanged captures never touch storage. While
+    /// waiting, the primary exit and descendants are re-observed every
+    /// `OBSERVE_TICK`. A failure keeps the previously persisted revision and
+    /// returns the first typed cause, so later verified cleanup can persist
+    /// again without fabricating success or treating storage failure as death.
+    /// At [`OwnershipStage::Final`] one stored earlier failure is discarded and
+    /// the newest capture is persisted again; only that attempt can fail it.
     pub async fn checkpoint_ownership_ready(&mut self, stage: OwnershipStage) -> Result<()> {
-        let Some(budget) = self.ownership_retry_budget else {
-            return self.checkpoint_ownership_at(stage);
-        };
-        let started = *self
-            .ownership_retry_started
-            .get_or_insert_with(std::time::Instant::now);
+        // The final checkpoint judges the final capture by its own persistence:
+        // a failure stored before this call, or by a write still pending when it
+        // began (for example while the writer was refusing or unavailable
+        // during streaming), is discarded, and the
+        // newest capture is persisted again. A failure of that attempt, made
+        // inside this call, is reported.
+        let mut inherited = false;
+        if stage == OwnershipStage::Final {
+            self.ownership_failure = None;
+            inherited = self.ownership_pending.is_some();
+        }
         loop {
-            // Never reset an exhausted operation after outer select cancellation.
-            if started.elapsed() >= budget
-                && let Some(error) = self.ownership_retry_error.take()
-            {
-                let error =
-                    error.persistence_totals(started.elapsed(), self.ownership_retry_attempts);
-                self.ownership_retry_started = None;
-                self.ownership_retry_attempts = 0;
+            if let Some(error) = self.ownership_failure.take() {
                 return Err(error);
             }
             if let Err(source) = self.observe_primary_exit() {
-                self.ownership_retry_started = None;
-                self.ownership_retry_attempts = 0;
-                self.ownership_retry_error = None;
                 return Err(Error::ownership_checkpoint(
                     OwnershipStage::Observation,
                     source,
                 ));
             }
-            match self.checkpoint_ownership_at(stage) {
-                Ok(()) => {
-                    self.ownership_retry_started = None;
-                    self.ownership_retry_attempts = 0;
-                    self.ownership_retry_error = None;
+            if self.ownership_pending.is_none() {
+                if self.ownership_sink.is_none() {
                     return Ok(());
                 }
-                Err(error) => {
-                    self.ownership_retry_attempts = self
-                        .ownership_retry_attempts
-                        .saturating_add(error.persistence_attempts());
-                    if !error.retryable_ownership_acquire() || started.elapsed() >= budget {
-                        let error = error
-                            .persistence_totals(started.elapsed(), self.ownership_retry_attempts);
-                        self.ownership_retry_started = None;
-                        self.ownership_retry_attempts = 0;
-                        self.ownership_retry_error = None;
-                        return Err(error);
+                let revision = self.owner.capture_revision();
+                if self.ownership_revision == Some(revision) {
+                    return Ok(());
+                }
+                self.start_ownership(revision, stage)?;
+            }
+            let mut tick = tokio::time::interval(OBSERVE_TICK);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            while let Some(pending) = self.ownership_pending.as_mut() {
+                tokio::select! {
+                    biased;
+                    result = &mut pending.future => {
+                        self.finish_ownership(result);
+                        // A write started before this final checkpoint is
+                        // awaited, but only a write started by it can fail it.
+                        if inherited {
+                            inherited = false;
+                            self.ownership_failure = None;
+                        }
+                        break;
                     }
-                    self.ownership_retry_error = Some(error);
+                    _ = tick.tick() => {
+                        if let Err(source) = self.observe_tick() {
+                            return Err(Error::ownership_checkpoint(
+                                OwnershipStage::Observation,
+                                source,
+                            ));
+                        }
+                    }
                 }
             }
-            tokio::time::sleep(Duration::from_millis(2)).await;
         }
     }
 
-    /// Persists newly captured members once; successful unchanged captures never touch the database.
-    pub fn checkpoint_ownership(&mut self) -> Result<()> {
-        self.checkpoint_ownership_at(OwnershipStage::Streaming)
-    }
-
-    /// Persists the current append-only snapshot for the supplied closed phase.
-    /// Unchanged revisions are no-ops. A failed observer keeps the prior revision
-    /// and typed cause, so later verified cleanup can retry without fabricating
-    /// successful persistence or treating storage failure as process death.
-    pub fn checkpoint_ownership_at(&mut self, stage: OwnershipStage) -> Result<()> {
-        let Some(observer) = self.ownership_observer.as_mut() else {
-            return Ok(());
-        };
-        let revision = self.owner.capture_revision();
-        if self.ownership_revision == Some(revision) {
-            return Ok(());
-        }
+    /// Starts persistence of the current snapshot for `revision`.
+    fn start_ownership(&mut self, revision: (usize, bool), stage: OwnershipStage) -> Result<()> {
         let snapshot = self.owner.snapshot().ok_or_else(|| {
             Error::ownership_checkpoint(
                 stage,
                 Error::Integrity("process root identity is unavailable".into()),
             )
         })?;
-        observer(&snapshot).map_err(|source| Error::ownership_checkpoint(stage, source))?;
-        self.ownership_revision = Some(revision);
+        let sink = self
+            .ownership_sink
+            .as_mut()
+            .expect("sink presence is checked before starting");
+        self.ownership_pending = Some(PendingOwnership {
+            revision,
+            stage,
+            future: sink(snapshot),
+        });
         Ok(())
+    }
+
+    /// Consumes a resolved persistence: success records its revision, failure
+    /// is stored as the first typed cause for the next checkpoint.
+    fn finish_ownership(&mut self, result: Result<()>) {
+        let Some(pending) = self.ownership_pending.take() else {
+            return;
+        };
+        match result {
+            Ok(()) => self.ownership_revision = Some(pending.revision),
+            Err(source) => {
+                if self.ownership_failure.is_none() {
+                    self.ownership_failure =
+                        Some(Error::ownership_checkpoint(pending.stage, source));
+                }
+            }
+        }
+    }
+
+    /// One observation step: primary exit with escalation, then a descendant
+    /// refresh when 200 ms have passed since the last one.
+    fn observe_tick(&mut self) -> Result<()> {
+        self.observe_primary_exit()?;
+        let now = tokio::time::Instant::now();
+        if now.duration_since(self.observed_at) >= Duration::from_millis(200) {
+            self.owner.refresh();
+            self.observed_at = now;
+        }
+        Ok(())
+    }
+
+    /// Drives `work` (for example a journal or acknowledgement write) while the
+    /// primary PID, descendants and any started ownership persistence keep
+    /// being observed.
+    ///
+    /// This is how supervisor loops wait for storage: it never blocks the
+    /// runtime, escalates a surviving descendant after primary exit on schedule
+    /// and leaves native progress unread. A persistence failure found here is
+    /// kept for the next checkpoint or [`Process::next`]; observation failures
+    /// likewise. `work` is cancel-safe only if the caller's future is.
+    pub async fn observing<T>(&mut self, work: impl Future<Output = T>) -> T {
+        tokio::pin!(work);
+        let mut tick = tokio::time::interval(OBSERVE_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            // Start persisting newly captured members without waiting for them.
+            if self.ownership_pending.is_none()
+                && self.ownership_failure.is_none()
+                && self.ownership_sink.is_some()
+            {
+                let revision = self.owner.capture_revision();
+                if self.ownership_revision != Some(revision)
+                    && let Err(error) = self.start_ownership(revision, OwnershipStage::Streaming)
+                {
+                    self.ownership_failure = Some(error);
+                }
+            }
+            tokio::select! {
+                biased;
+                output = &mut work => return output,
+                result = async {
+                    match self.ownership_pending.as_mut() {
+                        Some(pending) => (&mut pending.future).await,
+                        None => std::future::pending().await,
+                    }
+                } => self.finish_ownership(result),
+                _ = tick.tick() => {
+                    if let Err(source) = self.observe_tick()
+                        && self.ownership_failure.is_none()
+                    {
+                        self.ownership_failure = Some(Error::ownership_checkpoint(
+                            OwnershipStage::Observation,
+                            source,
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     /// Redacts launch secrets from text before core code persists it.

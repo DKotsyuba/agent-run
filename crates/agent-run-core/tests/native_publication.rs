@@ -205,7 +205,7 @@ fn consolidation_requires_the_qualified_witness_root() {
     let root = store_root(&app_home);
     let home = app_home.join("runs").join("ag-20260101-000000-0000000001");
     stdfs::create_dir_all(&home).expect("home");
-    let mut store = agent_run_core::state::Store::initialize(&app_home).unwrap();
+    let mut store = agent_run_store::fixture::initialize(&app_home).unwrap();
     let id: AgentId = "ag-20260101-000000-0000000001".parse().unwrap();
     let identity = fixture_identity(&app_home, &home);
     let account: agent_run_domain::AccountId = "acct-work".parse().unwrap();
@@ -241,7 +241,7 @@ fn consolidation_skips_contended_publication_without_changing_private_home() {
     stdfs::create_dir_all(home.join("skills/.system")).unwrap();
     let payload = home.join("skills/.system/SKILL.md");
     stdfs::write(&payload, "immutable fixture").unwrap();
-    let mut store = agent_run_core::state::Store::initialize(&app_home).unwrap();
+    let mut store = agent_run_store::fixture::initialize(&app_home).unwrap();
     let id: AgentId = "ag-20260101-000000-0000000001".parse().unwrap();
     let identity = fixture_identity(&app_home, &home);
     let account = "acct-work".parse().unwrap();

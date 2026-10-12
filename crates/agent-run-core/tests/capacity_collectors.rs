@@ -1,4 +1,5 @@
 //! Recorded-fixture regressions for the Python capacity collector contracts.
+mod common;
 
 use agent_run_core::capacity::{
     Key, omniroute, sources,
@@ -98,7 +99,7 @@ fn dispatcher_config(root: &Path, adapter: &str, source: &str, binary: &Path) {
         ),
     )
     .unwrap();
-    agent_run_store::Store::initialize(root).unwrap();
+    agent_run_store::fixture::initialize(root).unwrap();
 }
 
 /// Exercises source dispatch's unsupported/empty distinctions without loading an adapter.
@@ -108,6 +109,8 @@ fn dispatcher_config(root: &Path, adapter: &str, source: &str, binary: &Path) {
 async fn capacity_dispatch_keeps_unsupported_sources_distinct() {
     let temporary = tempfile::tempdir().unwrap();
     dispatcher_config(temporary.path(), "claude", "none", Path::new("/bin/true"));
+    let writer = common::writer::Harness::start(temporary.path());
+    let _socket = writer.serve_unix(temporary.path());
     let unsupported = sources::collect(temporary.path()).await.unwrap();
     assert_eq!(unsupported["results"][0]["status"], "unsupported");
 }
@@ -144,7 +147,11 @@ async fn retired_codexbar_source_requires_migration_and_keeps_samples() {
         agent_run_core::domain::now(),
     )
     .unwrap();
-    agent_run_core::capacity::persist(root, &prior, 1000).unwrap();
+    let writer = common::writer::Harness::start(root);
+    let _socket = writer.serve_unix(root);
+    agent_run_core::capacity::persist(root, &prior, 1000)
+        .await
+        .unwrap();
     let report = sources::collect(root).await.unwrap();
     assert_eq!(report["ok"], false);
     let row = &report["results"][0];

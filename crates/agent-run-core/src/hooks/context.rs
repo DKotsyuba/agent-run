@@ -38,7 +38,11 @@ pub struct ContextResult {
 /// no write, while a nonzero visible component is atomically deduplicated by
 /// the store's receipt operation.  Task and transcript text are never read;
 /// only the bounded `task_summary` projection is eligible for display.
-pub fn build(home: &Path, reference: &OrchestratorRef, at: Option<f64>) -> Result<ContextResult> {
+pub async fn build(
+    home: &Path,
+    reference: &OrchestratorRef,
+    at: Option<f64>,
+) -> Result<ContextResult> {
     reference.validate()?;
     // A schema-2 home renders the provider-only order; schema 1 keeps routes.
     let providers = agent_run_config::provider_config::ProviderConfig::load(home).ok();
@@ -51,7 +55,7 @@ pub fn build(home: &Path, reference: &OrchestratorRef, at: Option<f64>) -> Resul
         return Err(invalid("now must be a finite nonnegative number"));
     }
     let budget = max_chars.min(CONTEXT_HARD_LIMIT_CHARS);
-    let mut store = Store::open(home)?;
+    let store = Store::open(home)?;
     let prior_session = store.find_orchestrator_session(reference)?;
     let capacity_text = match &providers {
         Some((config, revision)) => provider_block(home, config, revision)?,
@@ -81,8 +85,17 @@ pub fn build(home: &Path, reference: &OrchestratorRef, at: Option<f64>) -> Resul
             injected: false,
         });
     }
-    let (session_id, changed) =
-        store.record_context_components_for_ref(reference, &components, now)?;
+    drop(store);
+    let (session_id, changed) = crate::persist::operator_producer(home)
+        .call(
+            agent_run_store::ops::RecordContextComponents {
+                reference: reference.clone(),
+                components: components.clone(),
+                at: now,
+            },
+            std::time::Duration::from_millis(500),
+        )
+        .await?;
     let text = [
         changed
             .iter()

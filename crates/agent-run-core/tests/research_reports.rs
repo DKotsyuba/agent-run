@@ -1,5 +1,6 @@
 //! Real shared dispatcher and filesystem boundary checks; no engine or model runs.
-use agent_run_core::{dispatch, service::Service, state::Store};
+mod common;
+use agent_run_core::{dispatch, service::Service};
 use agent_run_domain::{
     catalog::{AccountRecord, AccountStatus},
     domain::AgentId,
@@ -22,17 +23,20 @@ struct Fixture {
     attempt: String,
     /// Synthetic worker bearer, never a production credential.
     token: String,
+    /// The writer serving the dispatcher, started on the first call (after the
+    /// raw setup above is complete).
+    writer: std::cell::OnceCell<common::writer::Harness>,
 }
 impl Fixture {
     /// Admits a restricted research or ordinary review role using an inert
     /// executable, then marks the synthetic attempt running without spawning.
-    fn new(research: bool) -> Self {
+    async fn new(research: bool) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().canonicalize().unwrap();
         let reports = home.join("reports");
         fs::create_dir_all(&reports).unwrap();
         fs::create_dir_all(home.join("profiles")).unwrap();
-        let mut store = Store::initialize(&home).unwrap();
+        let mut store = agent_run_store::fixture::initialize(&home).unwrap();
         let constraints = if research {
             "[\"research_tools_only\"]"
         } else {
@@ -49,7 +53,12 @@ impl Fixture {
             })
             .unwrap();
         let request = serde_json::from_value(json!({"provider":"claude","model":"fixture","profile":"role","task":"Save a report","workdir":reports})).unwrap();
-        let admitted = Service::new(home.clone()).admit_provider(request).unwrap();
+        let writer = common::writer::Harness::start(&home);
+        let admitted = Service::new(home.clone())
+            .with_writer(writer.broker())
+            .admit_provider(request)
+            .await
+            .unwrap();
         let agent: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
         let attempt: String = store
             .conn
@@ -81,12 +90,16 @@ impl Fixture {
             agent,
             attempt,
             token,
+            writer: std::cell::OnceCell::from(writer),
         }
     }
     /// Calls the real private broker route with fixed hidden capability fields.
     async fn save(&self, filename: &str, content: &str) -> agent_run_core::Result<Value> {
+        let writer = self
+            .writer
+            .get_or_init(|| common::writer::Harness::start(&self.home));
         dispatch::call(
-            &Service::new(self.home.clone()),
+            &Service::new(self.home.clone()).with_writer(writer.broker()),
             TOOL_METHOD,
             serde_json::to_value(WorkerToolCall {
                 run_id: self.agent.clone(),
@@ -105,7 +118,7 @@ impl Fixture {
 /// traversal, absolute paths and symlink escapes never modify existing data.
 #[tokio::test]
 async fn research_report_dispatch_enforces_directory_and_create_only_boundary() {
-    let f = Fixture::new(true);
+    let f = Fixture::new(true).await;
     let text = "Primary source: https://example.com/docs\n";
     let receipt = f.save("report.md", text).await.unwrap();
     assert_eq!(
@@ -142,11 +155,11 @@ async fn research_report_dispatch_enforces_directory_and_create_only_boundary() 
 /// The tool cannot grant writing to another role or to a stopped attempt.
 #[tokio::test]
 async fn research_report_requires_live_research_authority() {
-    let ordinary = Fixture::new(false);
+    let ordinary = Fixture::new(false).await;
     assert!(ordinary.save("report.md", "not authorized").await.is_err());
     assert!(!ordinary.reports.join("report.md").exists());
-    let f = Fixture::new(true);
-    Store::open(&f.home)
+    let f = Fixture::new(true).await;
+    agent_run_store::fixture::open(&f.home)
         .unwrap()
         .conn
         .execute(

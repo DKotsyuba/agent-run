@@ -19,7 +19,7 @@ fn python_test_service_fixture_pages_are_ordered_and_cursor_stable() {
         .join("../../tests/fixtures/baseline/db/current-v16.sqlite");
     let temporary = tempfile::tempdir().unwrap();
     std::fs::copy(&fixture, temporary.path().join("state.db")).unwrap();
-    let store = Store::open(temporary.path()).unwrap();
+    let store = agent_run_store::fixture::initialize(temporary.path()).unwrap();
     let page = store.agent_page_at(false, 0, 2, 1_759_000_100.0).unwrap();
     assert_eq!(page.total, 11);
     assert_eq!(page.items.len(), 2);
@@ -56,7 +56,7 @@ fn python_test_state_store_fixture_transcript_rows_keep_sequence_order() {
         .join("../../tests/fixtures/baseline/db/current-v16.sqlite");
     let temporary = tempfile::tempdir().unwrap();
     std::fs::copy(&fixture, temporary.path().join("state.db")).unwrap();
-    let store = Store::open(temporary.path()).unwrap();
+    let store = agent_run_store::fixture::initialize(temporary.path()).unwrap();
     let id: AgentId = "ag-20260101-000003-0000000003".parse().unwrap();
     let first = store.transcript_page(&id, 0, 1).unwrap();
     assert_eq!(first.messages.len(), 1);

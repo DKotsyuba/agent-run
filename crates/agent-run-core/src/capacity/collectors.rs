@@ -392,14 +392,18 @@ pub async fn collect_providers(home: &Path, config: &ProviderConfig) -> Result<V
                     .flat_map(|p| p.windows.iter().map(|w| (p.key.as_str(), w.name.as_str())))
                     .collect::<BTreeSet<_>>()
                     .len();
-                agent_run_store::quota::record_quota_snapshot(
-                    home,
-                    unit.provider.as_str(),
-                    &snapshot,
-                    config.capacity.sample_retention,
-                    now(),
-                )
-                .map_err(|_| STORE_FAILED.to_owned())?;
+                crate::persist::collector_producer(home)
+                    .call(
+                        agent_run_store::ops::RecordQuotaSnapshot {
+                            runtime: unit.provider.as_str().to_owned(),
+                            snapshot,
+                            retention: config.capacity.sample_retention,
+                            at: now(),
+                        },
+                        crate::broker_writer::BROKER_BUDGET,
+                    )
+                    .await
+                    .map_err(|_| STORE_FAILED.to_owned())?;
                 Ok::<_, String>(count)
             }
             .await;

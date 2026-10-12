@@ -11,7 +11,7 @@ use agent_run_domain::{
     domain::{AgentId, now},
     error::invalid,
 };
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
 use std::{
     fs::{self, OpenOptions},
@@ -89,7 +89,7 @@ pub(crate) fn message_storage(
     Ok((stub, Some(reference)))
 }
 
-impl Store {
+impl Store<'_> {
     /// Creates the next numbered adapter attempt for an existing agent and returns its durable id.
     pub fn create_attempt(
         &mut self,
@@ -100,9 +100,7 @@ impl Store {
         if state.trim().is_empty() {
             return Err(invalid("attempt state must be a nonblank string"));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM agents WHERE id=?)",
             [id.as_str()],
@@ -127,9 +125,7 @@ impl Store {
         if state.trim().is_empty() {
             return Err(invalid("attempt state must be a nonblank string"));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let changed = tx.execute("UPDATE attempts SET state=?,finished_at=? WHERE id=? AND agent_id=? AND finished_at IS NULL", params![state, now(), attempt_id, id.as_str()])?;
         if changed != 1 {
             return Err(Error::Conflict);
@@ -152,9 +148,7 @@ impl Store {
                 if kind.trim().is_empty() {
                     return Err(invalid("event kind must be a nonblank string"));
                 }
-                let tx = self
-                    .conn
-                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let tx = crate::writer::WriteTx::begin(&self.conn)?;
                 let exists: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM agents WHERE id=?)",
                     [id.as_str()],
@@ -208,9 +202,7 @@ impl Store {
                 }
                 let content_complete = content.len() <= MAX_INLINE_MESSAGE_BYTES;
                 let (content, raw_ref) = message_storage(&self.home, id, content, raw_ref)?;
-                let tx = self
-                    .conn
-                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let tx = crate::writer::WriteTx::begin(&self.conn)?;
                 let exists: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM agents WHERE id=?)",
                     [id.as_str()],
@@ -267,9 +259,7 @@ impl Store {
                 if !pending {
                     return Ok(None);
                 }
-                let tx = self
-                    .conn
-                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let tx = crate::writer::WriteTx::begin(&self.conn)?;
                 let row = tx.query_row("SELECT id,kind,payload_json FROM commands WHERE agent_id=? AND state='pending' \
             AND (? OR kind='cancel' OR COALESCE(json_extract(payload_json,'$.native_completion'),0)<>1) \
             ORDER BY CASE kind WHEN 'cancel' THEN 0 WHEN 'steer' THEN 1 ELSE 2 END,id LIMIT 1", params![id.as_str(),allow_native_wake], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))).optional()?;
@@ -309,5 +299,176 @@ impl Store {
                 Ok(())
             },
         )
+    }
+}
+
+/// Builds one transcript journal fragment on the producer side: bodies above
+/// 32 KiB are spooled to a private file under the agent directory (filesystem
+/// work that must never run on the writer thread) and replaced by a stub with
+/// `content_complete=false`. Validation of role and error provenance happens
+/// again when the fragment is applied.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_message_fragment(
+    home: &Path,
+    id: &AgentId,
+    role: &str,
+    text: &str,
+    name: Option<&str>,
+    raw_ref: Option<&str>,
+    attempt: Option<&str>,
+    error: Option<(bool, &str)>,
+) -> Result<crate::ops::JournalFragment> {
+    let content_complete = text.len() <= MAX_INLINE_MESSAGE_BYTES;
+    let (content, raw_ref) = message_storage(home, id, text, raw_ref)?;
+    Ok(crate::ops::JournalFragment::Message {
+        role: role.to_owned(),
+        content,
+        content_complete,
+        name: name.map(str::to_owned),
+        raw_ref,
+        attempt: attempt.map(str::to_owned),
+        error: error.map(|(failed, source)| (failed, source.to_owned())),
+    })
+}
+
+/// Native tool error provenance labels accepted on `tool_result` rows.
+const ERROR_SOURCES: [&str; 5] = [
+    "claude.is_error",
+    "codex.command.exitCode",
+    "codex.command.status",
+    "codex.mcp.status",
+    "codex.mcp.error",
+];
+
+impl Store<'_> {
+    /// Appends one prepared journal fragment inside the caller's write scope
+    /// and returns its row sequence. Events check the agent and optional
+    /// attempt ownership exactly like [`Store::append_event`]; messages require
+    /// already-spooled inline content (<= 32 KiB), a known role, valid error
+    /// provenance and a normalized raw reference, and never touch the
+    /// filesystem. Unknown agents are `NotFound`.
+    pub fn append_fragment(
+        &mut self,
+        id: &AgentId,
+        fragment: &crate::ops::JournalFragment,
+    ) -> Result<i64> {
+        match fragment {
+            crate::ops::JournalFragment::Event {
+                kind,
+                data,
+                attempt,
+            } => self.append_event(id, kind, data, attempt.as_deref()),
+            crate::ops::JournalFragment::Message {
+                role,
+                content,
+                content_complete,
+                name,
+                raw_ref,
+                attempt,
+                error,
+            } => {
+                if !["user", "assistant", "system", "tool_call", "tool_result"]
+                    .contains(&role.as_str())
+                {
+                    return Err(invalid("unknown transcript role"));
+                }
+                if content.len() > MAX_INLINE_MESSAGE_BYTES {
+                    return Err(invalid(
+                        "journal fragment content must be spooled by the producer",
+                    ));
+                }
+                if error.as_ref().is_some_and(|(_, source)| {
+                    role != "tool_result" || !ERROR_SOURCES.contains(&source.as_str())
+                }) {
+                    return Err(invalid("invalid native tool error evidence"));
+                }
+                if raw_ref
+                    .as_deref()
+                    .is_some_and(|value| !valid_raw_ref(value))
+                {
+                    return Err(invalid("raw_ref must be a normalized relative path"));
+                }
+                let tx = crate::writer::WriteTx::begin(&self.conn)?;
+                let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agents WHERE id=?)",
+                    [id.as_str()],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    return Err(Error::NotFound(id.to_string()));
+                }
+                if let Some(attempt) = attempt {
+                    let owned: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM attempts WHERE id=? AND agent_id=?)",
+                        params![attempt, id.as_str()],
+                        |row| row.get(0),
+                    )?;
+                    if !owned {
+                        return Err(invalid("attempt is unknown or owned by another agent"));
+                    }
+                }
+                tx.execute(
+                    "INSERT INTO messages(agent_id,attempt_id,at,role,name,content,raw_ref,error,error_source,content_complete,root_agent_id) \
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,(SELECT COALESCE(NULLIF(root_agent_id,''),id) FROM agents WHERE id=?1))",
+                    params![
+                        id.as_str(),
+                        attempt,
+                        now(),
+                        role,
+                        name,
+                        content,
+                        raw_ref,
+                        error.as_ref().map(|(failed, _)| *failed),
+                        error.as_ref().map(|(_, source)| source.as_str()),
+                        content_complete
+                    ],
+                )?;
+                let seq = tx.last_insert_rowid();
+                tx.commit()?;
+                Ok(seq)
+            }
+        }
+    }
+}
+
+impl Store<'_> {
+    /// Completes every still-pending command of a terminal execution with
+    /// its stable terminal result (`cancel` accepted as already stopping,
+    /// others rejected as `agent_terminal`), recording `at` as claim and
+    /// completion time. Claimed commands are untouched: replaying them could
+    /// duplicate an engine action. A nonterminal execution is a transition
+    /// error; an unknown one is `NotFound`. Returns the number completed.
+    pub fn complete_terminal_commands(&mut self, id: &AgentId, at: f64) -> Result<u64> {
+        if !at.is_finite() || at < 0.0 {
+            return Err(invalid("completion time must be finite and nonnegative"));
+        }
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
+        let status: Option<String> = tx
+            .query_row(
+                "SELECT status FROM agents WHERE id=?",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(status) = status else {
+            return Err(Error::NotFound(id.to_string()));
+        };
+        if !matches!(
+            status.as_str(),
+            "succeeded" | "failed" | "cancelled" | "lost" | "timed_out"
+        ) {
+            return Err(Error::Transition(
+                "terminal command completion requires a terminal agent".into(),
+            ));
+        }
+        let completed = tx.execute(
+            "UPDATE commands SET state='completed',claimed_at=?1,completed_at=?1,result_json=CASE kind \
+             WHEN 'cancel' THEN '{\"accepted\":true,\"reason\":\"already_stopping\"}' \
+             ELSE '{\"accepted\":false,\"reason\":\"agent_terminal\"}' END \
+             WHERE agent_id=?2 AND state='pending'",
+            params![at, id.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(completed as u64)
     }
 }

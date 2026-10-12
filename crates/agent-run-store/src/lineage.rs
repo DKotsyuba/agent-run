@@ -5,7 +5,6 @@
 
 use crate::Record;
 use agent_run_domain::{Result, domain::AgentId, error::invalid};
-use rusqlite::Transaction;
 
 /// Verified parent facts a child must inherit when continuing one native runtime session.
 pub(crate) struct ResumeLineage {
@@ -28,7 +27,10 @@ fn group_is_gone(pgid: i32) -> bool {
 }
 
 /// Loads and proves a terminal parent can safely supply exactly one resume child.
-pub(crate) fn resume_parent(tx: &Transaction<'_>, parent_id: &AgentId) -> Result<ResumeLineage> {
+pub(crate) fn resume_parent(
+    tx: &rusqlite::Connection,
+    parent_id: &AgentId,
+) -> Result<ResumeLineage> {
     let parent = tx.query_row(
         "SELECT * FROM agents WHERE id=?",
         [parent_id.as_str()],

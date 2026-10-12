@@ -14,7 +14,7 @@ use agent_run_domain::{
     catalog::{AccountId, NormalizedQuotaSnapshot, PhysicalQuotaKey, QuotaWindow},
     error::invalid,
 };
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, params};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Shelf life granted to a latched exhausted fact whose provider reset time is
@@ -43,7 +43,7 @@ type WindowKey = (String, String, String);
 /// stable collector source, and provider window, so they are independent of
 /// rolling sample retention and of script revisions.
 fn latched_windows(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     account: &AccountId,
 ) -> Result<BTreeMap<WindowKey, QuotaWindow>> {
     let mut stmt = tx.prepare(
@@ -97,7 +97,7 @@ type WindowMembership = BTreeMap<WindowKey, Option<BTreeSet<String>>>;
 /// lane equal to its pool id, the same legacy rule the ranker applies —
 /// malformed metadata is never read as a model mapping.
 fn latched_membership(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     account: &AccountId,
     latched: &BTreeMap<WindowKey, QuotaWindow>,
 ) -> Result<WindowMembership> {
@@ -286,15 +286,37 @@ pub fn record_quota_snapshot(
     retention: usize,
     at: f64,
 ) -> Result<i64> {
+    Store::open(home)?.record_quota_snapshot(runtime, snapshot, retention, at)
+}
+
+impl Store<'_> {
+    /// [`record_quota_snapshot`] on this store's connection, nesting inside an
+    /// open writer transaction (the sole writer's row 78).
+    pub fn record_quota_snapshot(
+        &self,
+        runtime: &str,
+        snapshot: &NormalizedQuotaSnapshot,
+        retention: usize,
+        at: f64,
+    ) -> Result<i64> {
+        record_quota_snapshot_on(&self.conn, runtime, snapshot, retention, at)
+    }
+}
+
+/// Body of [`record_quota_snapshot`] on one connection.
+fn record_quota_snapshot_on(
+    conn: &rusqlite::Connection,
+    runtime: &str,
+    snapshot: &NormalizedQuotaSnapshot,
+    retention: usize,
+    at: f64,
+) -> Result<i64> {
     if runtime.is_empty() || runtime.len() > 512 || retention == 0 {
         return Err(invalid("invalid quota observation persistence"));
     }
     snapshot.validate()?;
     let account = snapshot.account.clone();
-    let mut store = Store::open(home)?;
-    let tx = store
-        .conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = crate::writer::WriteTx::begin(conn)?;
     let registered: i64 = tx.query_row(
         "SELECT COUNT(*) FROM provider_accounts WHERE account_id=?1",
         params![account.as_str()],
@@ -484,7 +506,7 @@ pub fn record_quota_snapshot(
     Ok(revision)
 }
 
-impl Store {
+impl Store<'_> {
     /// Latches one authoritative native exhaustion of an exactly mapped
     /// physical window (`account::lane`, `window`) from `source`, in one
     /// immediate transaction that advances `quota_capacity_revision` once.
@@ -518,9 +540,7 @@ impl Store {
             return Err(invalid("invalid native exhaustion latch"));
         }
         let quota_key = PhysicalQuotaKey::new(account, lane)?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         tx.execute(
             "INSERT INTO quota_exhaustion(account_id,quota_key,source,window_id,observed_at,reset_at,collector_revision) \
              VALUES(?,?,?,?,?,?,NULL) \

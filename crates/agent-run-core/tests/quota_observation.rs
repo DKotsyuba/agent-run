@@ -2,7 +2,7 @@
 
 use agent_run_core::capacity::quota::{CollectorScope, normalize_collector_output};
 use agent_run_domain::catalog::{AccountId, AccountRecord, AccountStatus};
-use agent_run_store::quota::record_quota_snapshot;
+
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::Path, str::FromStr};
 use tempfile::tempdir;
@@ -15,7 +15,7 @@ fn account() -> AccountId {
 /// Registers the fixture account so persisted facts satisfy the registry FK,
 /// returning the capacity revision that registration committed.
 fn registered(home: &std::path::Path) -> i64 {
-    let mut store = agent_run_store::Store::open(home).unwrap();
+    let mut store = agent_run_store::fixture::open(home).unwrap();
     store
         .register_account(&AccountRecord {
             account_id: account(),
@@ -41,7 +41,7 @@ fn scope() -> CollectorScope {
 fn normalize_at(
     raw: &Value,
     at: f64,
-) -> agent_run_domain::Result<agent_run_domain::catalog::NormalizedQuotaSnapshot> {
+) -> agent_run_domain::Result<agent_run_domain::quota_snapshot::NormalizedQuotaSnapshot> {
     normalize_collector_output(&account(), &scope(), raw, at, 256, 256)
 }
 
@@ -153,7 +153,7 @@ fn enforces_explicit_version_envelope_and_host_time_boundary() {
 
 /// Reads the newest persisted row for one lane and account.
 fn latest(home: &Path) -> (Option<f64>, Option<f64>, f64) {
-    let store = agent_run_store::Store::open(home).unwrap();
+    let store = agent_run_store::fixture::open(home).unwrap();
     store
         .conn
         .query_row(
@@ -168,7 +168,7 @@ fn latest(home: &Path) -> (Option<f64>, Option<f64>, f64) {
 #[test]
 fn exhaustion_latch_survives_unknown_and_releases_on_reset_or_evidence() {
     let home = tempdir().unwrap();
-    agent_run_store::Store::initialize(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
     let base = registered(home.path());
     let exhausted = normalize(&json!({
         "version": 1,
@@ -238,7 +238,7 @@ fn exhaustion_latch_survives_unknown_and_releases_on_reset_or_evidence() {
 
 /// Counts durable latch rows for the fixture account.
 fn latch_rows(home: &std::path::Path) -> i64 {
-    let store = agent_run_store::Store::open(home).unwrap();
+    let store = agent_run_store::fixture::open(home).unwrap();
     store
         .conn
         .query_row(
@@ -253,7 +253,7 @@ fn latch_rows(home: &std::path::Path) -> i64 {
 #[test]
 fn empty_observation_keeps_durable_exhaustion() {
     let home = tempdir().unwrap();
-    agent_run_store::Store::initialize(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
     registered(home.path());
     let exhausted = normalize(&json!({
         "version": 1,
@@ -277,7 +277,7 @@ fn empty_observation_keeps_durable_exhaustion() {
 #[test]
 fn older_valid_observation_cannot_clear_newer_exhaustion() {
     let home = tempdir().unwrap();
-    agent_run_store::Store::initialize(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
     registered(home.path());
     let exhausted = normalize(&json!({
         "version": 1,
@@ -304,7 +304,7 @@ fn older_valid_observation_cannot_clear_newer_exhaustion() {
 #[test]
 fn omitted_pool_keeps_exhaustion() {
     let home = tempdir().unwrap();
-    agent_run_store::Store::initialize(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
     registered(home.path());
     let exhausted = normalize(&json!({"version":1,"windows":[
         {"pool":"primary","window":"five_hour","models":["glm-4.7"],
@@ -325,7 +325,7 @@ fn omitted_pool_keeps_exhaustion() {
 #[test]
 fn older_exhaustion_cannot_roll_back_latch() {
     let home = tempdir().unwrap();
-    agent_run_store::Store::initialize(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
     registered(home.path());
     let newer = normalize(&json!({"version":1,"windows":[
         {"pool":"primary","window":"five_hour","models":["glm-4.7"],
@@ -339,7 +339,7 @@ fn older_exhaustion_cannot_roll_back_latch() {
     ]}))
     .unwrap();
     let revision = record_quota_snapshot(home.path(), "glm", &older, 100, 1700.0).unwrap();
-    let store = agent_run_store::Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
     let fact: (f64, Option<f64>) = store
         .conn
         .query_row(
@@ -369,7 +369,7 @@ fn older_exhaustion_cannot_roll_back_latch() {
 #[test]
 fn persistence_requires_a_registered_account() {
     let home = tempdir().unwrap();
-    agent_run_store::Store::initialize(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
     let snapshot = normalize(&json!({
         "version": 1,
         "windows": [{"pool":"primary","window":"five_hour","models":["glm-4.7"],
@@ -385,7 +385,7 @@ fn persistence_requires_a_registered_account() {
 #[test]
 fn exhaustion_latch_survives_a_collector_source_change() {
     let home = tempdir().unwrap();
-    agent_run_store::Store::initialize(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
     registered(home.path());
     let exhausted = normalize(&json!({
         "version": 1,
@@ -415,7 +415,7 @@ fn exhaustion_latch_survives_a_collector_source_change() {
 #[test]
 fn shared_pool_windows_persist_once_with_full_membership() {
     let home = tempdir().unwrap();
-    agent_run_store::Store::initialize(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
     let base = registered(home.path());
     let shared = normalize(&json!({
         "version": 1,
@@ -429,7 +429,7 @@ fn shared_pool_windows_persist_once_with_full_membership() {
     .unwrap();
     let revision = record_quota_snapshot(home.path(), "glm", &shared, 100, 1500.0).unwrap();
     assert_eq!(revision, base + 1);
-    let store = agent_run_store::Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
     let rows: i64 = store
         .conn
         .query_row("SELECT COUNT(*) FROM capacity_samples", [], |row| {
@@ -461,7 +461,7 @@ fn shared_pool_windows_persist_once_with_full_membership() {
 #[test]
 fn malformed_rounds_and_noop_rounds_leave_history_and_revision_untouched() {
     let home = tempdir().unwrap();
-    agent_run_store::Store::initialize(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
     registered(home.path());
     let good = normalize(&json!({
         "version": 1,
@@ -477,7 +477,7 @@ fn malformed_rounds_and_noop_rounds_leave_history_and_revision_untouched() {
     let empty = normalize(&json!({"version": 1, "windows": []})).unwrap();
     let r2 = record_quota_snapshot(home.path(), "glm", &empty, 100, 1100.0).unwrap();
     assert_eq!(r1, r2);
-    let store = agent_run_store::Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
     let rows: i64 = store
         .conn
         .query_row("SELECT COUNT(*) FROM capacity_samples", [], |row| {
@@ -502,9 +502,9 @@ fn malformed_rounds_and_noop_rounds_leave_history_and_revision_untouched() {
 #[test]
 fn native_signal_latch_survives_stale_positive_and_releases_on_fresh() {
     let home = tempdir().unwrap();
-    agent_run_store::Store::initialize(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
     registered(home.path());
-    let mut store = agent_run_store::Store::open(home.path()).unwrap();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
     store
         .latch_native_exhaustion(
             &account(),
@@ -547,7 +547,7 @@ fn native_signal_latch_survives_stale_positive_and_releases_on_fresh() {
 #[test]
 fn same_window_name_from_two_sources_keeps_separate_membership() {
     let home = tempdir().unwrap();
-    agent_run_store::Store::initialize(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
     registered(home.path());
     let window = |source: &str, remaining: f64| {
         json!({"source": source, "name": "five_hour", "remaining_percent": remaining,
@@ -564,7 +564,7 @@ fn same_window_name_from_two_sources_keeps_separate_membership() {
         .unwrap();
     snapshot.validate().unwrap();
     record_quota_snapshot(home.path(), "glm", &snapshot, 100, 1500.0).unwrap();
-    let store = agent_run_store::Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
     let members = |source: &str| -> Value {
         let payload: String = store
             .conn
@@ -585,7 +585,7 @@ fn same_window_name_from_two_sources_keeps_separate_membership() {
 #[test]
 fn partial_unknown_keeps_all_exhausted_window_members() {
     let home = tempdir().unwrap();
-    agent_run_store::Store::initialize(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
     registered(home.path());
     let first = normalize(&json!({"version":1,"windows":[
         {"pool":"primary","window":"five_hour","models":["glm-4.7","glm-4.6"],
@@ -600,7 +600,7 @@ fn partial_unknown_keeps_all_exhausted_window_members() {
     ]}))
     .unwrap();
     record_quota_snapshot(home.path(), "glm", &partial, 100, 1600.0).unwrap();
-    let store = agent_run_store::Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
     let members: String = store
         .conn
         .query_row(
@@ -655,7 +655,7 @@ fn disjoint_unknown_keeps_exhausted_model_blocked() {
     use agent_run_core::capacity::provider_ranking::provider_candidates_at;
     use agent_run_domain::catalog::{ProviderCatalog, QuotaAdmissionError};
     let home = tempdir().unwrap();
-    agent_run_store::Store::initialize(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
     registered(home.path());
     let exhausted = normalize(&json!({"version":1,"windows":[
         {"pool":"primary","window":"five_hour","models":["glm-4.7"],
@@ -668,7 +668,7 @@ fn disjoint_unknown_keeps_exhausted_model_blocked() {
     ]}))
     .unwrap();
     record_quota_snapshot(home.path(), "glm", &disjoint, 100, 1600.0).unwrap();
-    let store = agent_run_store::Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
     let members: String = store
         .conn
         .query_row(
@@ -740,7 +740,7 @@ fn disjoint_zero_keeps_later_latch_reset_until_expiry() {
     use agent_run_core::capacity::provider_ranking::provider_candidates_at;
     use agent_run_domain::catalog::{ProviderCatalog, QuotaAdmissionError};
     let home = tempdir().unwrap();
-    agent_run_store::Store::initialize(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
     registered(home.path());
     let first = normalize(&json!({"version":1,"windows":[
         {"pool":"primary","window":"five_hour","models":["glm-4.7"],
@@ -754,7 +754,7 @@ fn disjoint_zero_keeps_later_latch_reset_until_expiry() {
     ]}))
     .unwrap();
     record_quota_snapshot(home.path(), "glm", &second, 100, 1200.0).unwrap();
-    let store = agent_run_store::Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
     let reset: Option<f64> = store.conn.query_row(
         "SELECT reset_at FROM quota_exhaustion WHERE account_id='acct-main' AND quota_key='acct-main::primary' AND source='glm-native' AND window_id='five_hour'",
         [], |row| row.get(0),
@@ -805,7 +805,7 @@ fn disjoint_zero_keeps_later_latch_reset_until_expiry() {
     assert!(!available.candidates[0].quota_known);
 
     let unknown_home = tempdir().unwrap();
-    agent_run_store::Store::initialize(unknown_home.path()).unwrap();
+    agent_run_store::fixture::initialize(unknown_home.path()).unwrap();
     registered(unknown_home.path());
     let no_reset = normalize(&json!({"version":1,"windows":[
         {"pool":"primary","window":"five_hour","models":["glm-4.7"],
@@ -814,10 +814,21 @@ fn disjoint_zero_keeps_later_latch_reset_until_expiry() {
     .unwrap();
     record_quota_snapshot(unknown_home.path(), "glm", &no_reset, 100, 1100.0).unwrap();
     record_quota_snapshot(unknown_home.path(), "glm", &second, 100, 1200.0).unwrap();
-    let unknown_store = agent_run_store::Store::open(unknown_home.path()).unwrap();
+    let unknown_store = agent_run_store::fixture::open(unknown_home.path()).unwrap();
     let unknown_reset: Option<f64> = unknown_store.conn.query_row(
         "SELECT reset_at FROM quota_exhaustion WHERE account_id='acct-main' AND quota_key='acct-main::primary' AND source='glm-native' AND window_id='five_hour'",
         [], |row| row.get(0),
     ).unwrap();
     assert_eq!(unknown_reset, None);
+}
+
+/// Apply a quota storage fixture on an explicitly fenced test connection, preserving its real transaction/validation logic.
+fn record_quota_snapshot(
+    home: &Path,
+    runtime: &str,
+    snapshot: &agent_run_domain::catalog::NormalizedQuotaSnapshot,
+    retention: usize,
+    at: f64,
+) -> agent_run_domain::Result<i64> {
+    agent_run_store::fixture::open(home)?.record_quota_snapshot(runtime, snapshot, retention, at)
 }

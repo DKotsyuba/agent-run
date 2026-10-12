@@ -7,7 +7,7 @@
 
 use crate::{Record, Store};
 use agent_run_domain::{Result, domain::AgentId};
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
 
 /// One normalized, nullable run-usage snapshot ready for SQLite insertion.
@@ -165,7 +165,7 @@ fn resumed_token_usage(current: Option<&Value>, baseline: Option<&Value>, sessio
 
 /// Parses relevant durable events in sequence order and retains each last payload.
 fn usage_events(
-    tx: &Transaction<'_>,
+    tx: &rusqlite::Connection,
     id: &AgentId,
 ) -> Result<(Option<Value>, Option<Value>, Option<Value>)> {
     let mut statement = tx.prepare(
@@ -196,7 +196,7 @@ fn usage_events(
 }
 
 /// Obtains lifecycle timestamps from their event transitions, matching Python exactly.
-fn transition_times(tx: &Transaction<'_>, id: &AgentId) -> Result<(Option<f64>, Option<f64>)> {
+fn transition_times(tx: &rusqlite::Connection, id: &AgentId) -> Result<(Option<f64>, Option<f64>)> {
     let mut statement = tx.prepare(
         "SELECT at,to_status FROM events WHERE agent_id=? AND to_status IS NOT NULL ORDER BY seq",
     )?;
@@ -217,18 +217,20 @@ fn transition_times(tx: &Transaction<'_>, id: &AgentId) -> Result<(Option<f64>, 
     Ok((started, finished))
 }
 
-/// Recomputes one agent's normalized row within a caller-owned transaction.
-pub(crate) fn record_in_transaction(
-    tx: &Transaction<'_>,
+/// Computes one agent's normalized statistics row from its durable events
+/// without writing. This scans the agent's usage and transition events, so it
+/// runs on a reader (or the legacy path), never on the writer thread.
+pub fn project(
+    conn: &rusqlite::Connection,
     id: &AgentId,
     recorded_at: f64,
-) -> Result<()> {
-    let record = tx.query_row(
+) -> Result<crate::ops::RunStatsRow> {
+    let record = conn.query_row(
         "SELECT * FROM agents WHERE id=?",
         [id.as_str()],
         Record::read,
     )?;
-    let (runtime, current, baseline) = usage_events(tx, id)?;
+    let (runtime, current, baseline) = usage_events(conn, id)?;
     let stats = if let Some(runtime) = runtime.as_ref() {
         runtime_result(runtime)
     } else if let Some(session) = record.resume_of_runtime_session_id.as_deref() {
@@ -236,22 +238,89 @@ pub(crate) fn record_in_transaction(
     } else {
         current.as_ref().map_or_else(empty, token_usage)
     };
-    let (started_at, finished_at) = transition_times(tx, id)?;
+    let (started_at, finished_at) = transition_times(conn, id)?;
     let duration_seconds = started_at
         .zip(finished_at)
         .map(|(start, finish)| (finish - start).max(0.0));
-    tx.execute(
+    Ok(crate::ops::RunStatsRow {
+        agent_id: id.clone(),
+        runtime: record.request.runtime.clone(),
+        model: record.request.model.clone(),
+        profile: record.request.profile.clone(),
+        status: record.status.as_str().to_owned(),
+        failure_kind: record.failure_kind.clone(),
+        started_at,
+        finished_at,
+        duration_seconds,
+        input_tokens: stats.input_tokens,
+        output_tokens: stats.output_tokens,
+        cache_read_tokens: stats.cache_read_tokens,
+        cache_write_tokens: stats.cache_write_tokens,
+        reasoning_tokens: stats.reasoning_tokens,
+        total_tokens: stats.total_tokens,
+        num_turns: stats.num_turns,
+        ttft_ms: stats.ttft_ms,
+        api_duration_ms: stats.api_duration_ms,
+        cost_usd: stats.cost_usd,
+        usage_source: stats.usage_source.to_owned(),
+        recorded_at,
+    })
+}
+
+/// Writes one projected statistics row (insert or replace) on `conn`.
+fn write_row(conn: &rusqlite::Connection, row: &crate::ops::RunStatsRow) -> Result<()> {
+    conn.execute(
         "INSERT OR REPLACE INTO run_stats(agent_id,runtime,model,profile,status,failure_kind,started_at,finished_at,duration_seconds,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,total_tokens,num_turns,ttft_ms,api_duration_ms,cost_usd,usage_source,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        params![id.as_str(), record.request.runtime, record.request.model, record.request.profile, record.status.as_str(), record.failure_kind, started_at, finished_at, duration_seconds, stats.input_tokens, stats.output_tokens, stats.cache_read_tokens, stats.cache_write_tokens, stats.reasoning_tokens, stats.total_tokens, stats.num_turns, stats.ttft_ms, stats.api_duration_ms, stats.cost_usd, stats.usage_source, recorded_at],
+        params![row.agent_id.as_str(), row.runtime, row.model, row.profile, row.status, row.failure_kind, row.started_at, row.finished_at, row.duration_seconds, row.input_tokens, row.output_tokens, row.cache_read_tokens, row.cache_write_tokens, row.reasoning_tokens, row.total_tokens, row.num_turns, row.ttft_ms, row.api_duration_ms, row.cost_usd, row.usage_source, row.recorded_at],
     )?;
     Ok(())
 }
 
+/// Recomputes one agent's normalized row within a caller-owned write scope
+/// (legacy path; the writer persists reader projections instead).
+pub(crate) fn record_in_transaction(
+    tx: &rusqlite::Connection,
+    id: &AgentId,
+    recorded_at: f64,
+) -> Result<()> {
+    write_row(tx, &project(tx, id, recorded_at)?)
+}
+
+impl Store<'_> {
+    /// Persists a reader-computed statistics projection for a terminal
+    /// execution (writer unit of `PersistRunStats`). The row's status must
+    /// equal the stored terminal status; a nonterminal or changed execution is
+    /// a transition error and nothing is written. No events are scanned here.
+    pub fn persist_run_stats(&mut self, row: &crate::ops::RunStatsRow) -> Result<()> {
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
+        let status: Option<String> = tx
+            .query_row(
+                "SELECT status FROM agents WHERE id=?",
+                [row.agent_id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(status) = status else {
+            return Err(agent_run_domain::Error::NotFound(row.agent_id.to_string()));
+        };
+        if status != row.status
+            || !matches!(
+                status.as_str(),
+                "succeeded" | "failed" | "cancelled" | "lost" | "timed_out"
+            )
+        {
+            return Err(agent_run_domain::Error::Transition(
+                "statistics require the stored terminal status".into(),
+            ));
+        }
+        write_row(&tx, row)?;
+        tx.commit()
+    }
+}
+
 /// Idempotently records one current statistics row from its durable source events.
 pub fn record(store: &mut Store, id: &AgentId) -> Result<()> {
-    let tx = store
-        .conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = crate::writer::WriteTx::begin(&store.conn)?;
     record_in_transaction(&tx, id, agent_run_domain::domain::now())?;
     tx.commit()?;
     Ok(())
@@ -281,7 +350,7 @@ pub fn backfill(store: &mut Store) -> Result<(usize, usize)> {
     Ok((backfilled, skipped))
 }
 
-impl Store {
+impl Store<'_> {
     /// Records the resume usage baseline of one resumed execution, exactly once.
     ///
     /// The baseline is the parent execution's last cumulative

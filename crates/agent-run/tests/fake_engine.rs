@@ -1,14 +1,12 @@
 #![cfg(feature = "test-fixtures")]
 //! Fault-controlled fake-engine acceptance tests (task M27).
 //!
-//! None of these tests need the resident broker or its Unix socket: they
-//! admit a row into the durable store directly (the same preparation
-//! `Service::start` performs) and then drive `agent_run::supervisor::run`
-//! by spawning the real `agent-run _supervisor <id>` subcommand as a plain
-//! child process, exactly as `supervisor::launch` would. That keeps them
-//! runnable in a sandbox that cannot open Unix sockets. Broker/CLI-restart
-//! lifecycle behavior is already covered by `tests/end_to_end.rs`, which
-//! does need the broker.
+//! These tests seed disposable homes through fixture-only storage and launch
+//! the real `_supervisor` with a synthetic engine. A shared fixture broker
+//! serves each home's private Unix writer socket; online Service mutations use
+//! its actual writer rather than a direct-write fallback. Resident production
+//! services and model providers are never used. Broker/CLI-restart behavior is
+//! covered separately by `tests/end_to_end.rs`.
 //!
 use agent_run::{
     adapters,
@@ -18,39 +16,28 @@ use agent_run::{
     process::{OwnedProcess, ProcessState},
     profiles,
     service::{LaunchIdentity, Service},
-    state::{Record, Store},
+    state::Record,
     verify,
 };
 use serde_json::json;
 use std::{
     collections::BTreeSet,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::{Path, PathBuf},
-    process::Stdio,
     time::Duration,
 };
-use tokio::{process::Command, time::Instant};
+use tokio::time::Instant;
 
-/// Open one close-on-exec descriptor above the bootstrap descriptor range.
-fn bootstrap_fd() -> OwnedFd {
-    let file = std::fs::File::options()
-        .read(true)
-        .write(true)
-        .open("/dev/null")
-        .expect("open bootstrap descriptor");
-    // SAFETY: F_DUPFD_CLOEXEC duplicates the test-owned descriptor at a number
-    // above the three bootstrap targets; the returned descriptor has one owner.
-    let duplicated = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
-    assert!(duplicated >= 0, "duplicate bootstrap descriptor");
-    // SAFETY: fcntl returned a fresh descriptor that is not owned elsewhere.
-    unsafe { OwnedFd::from_raw_fd(duplicated) }
-}
+#[path = "support/test_broker.rs"]
+mod test_broker;
 
 /// Builds a fixture home with the explicitly provisioned profile Python init omits.
 fn home() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::Builder::new()
         .prefix("ar-fe-")
-        .tempdir_in(std::env::var_os("AGENT_RUN_TEST_TMP").unwrap_or_else(|| "/tmp".into()))
+        .tempdir_in(
+            std::env::var_os("AGENT_RUN_TEST_TMP")
+                .unwrap_or_else(|| std::env::temp_dir().into_os_string()),
+        )
         .unwrap();
     let home = temp.path().canonicalize().unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_agent-run"))
@@ -123,7 +110,7 @@ fn admit_runtime(home: &Path, runtime_name: &str, task: &str) -> AgentId {
         runtime_home: None,
         snapshot_sha256: None,
     };
-    let mut store = Store::open(home).unwrap();
+    let mut store = agent_run_store::fixture::open(home).unwrap();
     let (id, created) = store
         .admit(
             &request,
@@ -142,7 +129,7 @@ fn admit_runtime(home: &Path, runtime_name: &str, task: &str) -> AgentId {
 /// removed. The profile remains intact so the real supervisor, after recording
 /// ownership, reaches the runtime lookup as its first preparation failure.
 fn remove_frozen_runtime(home: &Path, id: &AgentId) {
-    let store = Store::open(home).unwrap();
+    let store = agent_run_store::fixture::open(home).unwrap();
     let mut identity = store.get(id).unwrap().identity.expect("launch identity");
     identity["config"]["runtimes"]
         .as_object_mut()
@@ -153,58 +140,20 @@ fn remove_frozen_runtime(home: &Path, id: &AgentId) {
         .unwrap();
 }
 
-/// Spawns the real `agent-run` binary's hidden `_supervisor` subcommand
-/// directly, the same process `supervisor::launch` spawns in production.
-/// No socket of any kind is involved.
-fn spawn_supervisor(home: &Path, id: &AgentId) -> tokio::process::Child {
-    use std::os::unix::{io::AsRawFd, process::CommandExt};
-
-    let ready = bootstrap_fd();
-    let identity = bootstrap_fd();
-    let error = bootstrap_fd();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-run"));
-    command
-        .arg("--home")
-        .arg(home)
-        .args([
-            "_supervisor",
-            "--ready-fd",
-            "3",
-            "--identity-fd",
-            "4",
-            "--error-fd",
-            "5",
-            id.as_str(),
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let sources = [ready.as_raw_fd(), identity.as_raw_fd(), error.as_raw_fd()];
-    // SAFETY: this test-only pre-exec closure captures only raw descriptors and
-    // invokes the async-signal-safe `setsid` and `dup2` syscalls before exec.
-    unsafe {
-        command.as_std_mut().pre_exec(move || {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            for (source, target) in sources.into_iter().zip([3, 4, 5]) {
-                if libc::dup2(source, target) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            Ok(())
-        });
-    }
-    command
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn supervisor")
+/// Spawns the real `agent-run` binary's hidden `_supervisor` subcommand under an
+/// in-process writer broker: the same process `supervisor::launch` spawns in
+/// production, authenticated to the real writer socket with a launch capability.
+async fn spawn_supervisor(home: &Path, id: &AgentId) -> test_broker::Supervised {
+    test_broker::spawn_supervisor(env!("CARGO_BIN_EXE_agent-run"), home, id).await
 }
 
 async fn wait_status(home: &Path, id: &AgentId, status: Status, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
-        let row = Store::open(home).unwrap().get(id).unwrap();
+        let row = agent_run_store::fixture::open(home)
+            .unwrap()
+            .get(id)
+            .unwrap();
         if row.status == status {
             return;
         }
@@ -240,7 +189,10 @@ async fn wait_status(home: &Path, id: &AgentId, status: Status, timeout: Duratio
 async fn wait_engine_ready(home: &Path, id: &AgentId, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
-        let row = Store::open(home).unwrap().get(id).unwrap();
+        let row = agent_run_store::fixture::open(home)
+            .unwrap()
+            .get(id)
+            .unwrap();
         if row.runtime_session_id.is_some() {
             return;
         }
@@ -266,7 +218,7 @@ async fn wait_engine_poll_marker(home: &Path, id: &AgentId) {
 async fn wait_journaled_text(home: &Path, id: &AgentId, needle: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let markers: i64 = Store::open(home)
+        let markers: i64 = agent_run_store::fixture::open(home)
             .unwrap()
             .conn
             .query_row(
@@ -290,13 +242,17 @@ async fn wait_journaled_text(home: &Path, id: &AgentId, needle: &str) {
 /// subprocess directly.
 async fn run_task(home: &Path, task: &str) -> Record {
     let id = admit(home, task);
-    let mut child = spawn_supervisor(home, &id);
+    let mut child = spawn_supervisor(home, &id).await;
     let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .expect("supervisor subprocess timed out")
         .expect("wait on supervisor subprocess");
     assert!(status.success(), "supervisor subprocess failed: {status:?}");
-    Store::open(home).unwrap().get(&id).unwrap()
+    child.finish().await;
+    agent_run_store::fixture::open(home)
+        .unwrap()
+        .get(&id)
+        .unwrap()
 }
 
 /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_early_exited_engine_succeeds_only_with_complete_answer_evidence`.
@@ -308,13 +264,13 @@ async fn normal_run_produces_verifiable_terminal_evidence() {
     let row = run_task(&home, "hello").await;
     assert_eq!(row.status, Status::Succeeded);
     assert_eq!(row.exit_code, Some(0));
-    let cleanup = Store::open(&home)
+    let cleanup = agent_run_store::fixture::open(&home)
         .unwrap()
         .last_event(&row.id, "process_cleanup")
         .unwrap()
         .expect("process_cleanup event recorded");
     assert_eq!(cleanup["confirmed"], json!(true));
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let (ready_seq, preparing_seq): (i64, i64) = store
         .conn
         .query_row(
@@ -328,7 +284,7 @@ async fn normal_run_produces_verifiable_terminal_evidence() {
     assert!(ready_seq < preparing_seq, "READY must precede preparation");
     assert!(row.supervisor_pid.is_some());
     assert!(row.supervisor_birth_time.is_some());
-    let answer = Service::new(home.clone()).answer(&row.id).unwrap();
+    let answer = fixture_service(home.clone()).await.answer(&row.id).unwrap();
     assert_eq!(answer["available"], json!(true));
     assert_eq!(answer["content"], json!("fixture final answer\n"));
 }
@@ -352,7 +308,7 @@ async fn exit_zero_without_terminal_result_is_not_success() {
     let row = run_task(&home, "fixture:missing-result").await;
     assert_eq!(row.status, Status::Failed);
     assert_eq!(row.failure_kind.as_deref(), Some("cut_off"));
-    let answer = Service::new(home.clone()).answer(&row.id).unwrap();
+    let answer = fixture_service(home.clone()).await.answer(&row.id).unwrap();
     assert_eq!(answer["available"], json!(false));
 }
 
@@ -362,10 +318,10 @@ async fn exit_zero_without_terminal_result_is_not_success() {
 async fn legacy_result_then_hang_waits_for_explicit_cancel() {
     let (_tmp, home) = home();
     let id = admit_runtime(&home, "mock", "fixture:result-then-hang");
-    let mut child = spawn_supervisor(&home, &id);
+    let mut child = spawn_supervisor(&home, &id).await;
     wait_engine_ready(&home, &id, Duration::from_secs(10)).await;
     wait_journaled_text(&home, &id, "fixture partial").await;
-    Store::open(&home)
+    agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .execute(
@@ -378,13 +334,17 @@ async fn legacy_result_then_hang_waits_for_explicit_cancel() {
             .await
             .is_err()
     );
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     assert_eq!(
-        Store::open(&home).unwrap().get(&id).unwrap().status,
+        agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .status,
         Status::Running
     );
     assert_eq!(service.answer(&id).unwrap()["available"], json!(false));
-    service.cancel(&id).unwrap();
+    service.cancel(&id).await.unwrap();
     assert!(
         tokio::time::timeout(Duration::from_secs(20), child.wait())
             .await
@@ -392,7 +352,7 @@ async fn legacy_result_then_hang_waits_for_explicit_cancel() {
             .unwrap()
             .success()
     );
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     assert_eq!(store.get(&id).unwrap().status, Status::Cancelled);
     assert!(
         store
@@ -410,9 +370,9 @@ async fn legacy_result_then_hang_waits_for_explicit_cancel() {
 async fn legacy_completion_has_no_lifetime_expiry() {
     let (_tmp, home) = home();
     let id = admit_runtime(&home, "mock", "fixture:follow-tools");
-    let mut child = spawn_supervisor(&home, &id);
+    let mut child = spawn_supervisor(&home, &id).await;
     wait_engine_ready(&home, &id, Duration::from_secs(10)).await;
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let mut historical = serde_json::to_value(store.get(&id).unwrap().request).unwrap();
     historical["timeout_seconds"] = json!(0.001);
     store
@@ -432,7 +392,7 @@ async fn legacy_completion_has_no_lifetime_expiry() {
             .unwrap()
             .success()
     );
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     assert_eq!(store.get(&id).unwrap().status, Status::Succeeded);
     assert!(
         store
@@ -445,7 +405,7 @@ async fn legacy_completion_has_no_lifetime_expiry() {
         json!(true)
     );
     assert_eq!(
-        Service::new(home.clone()).answer(&id).unwrap()["available"],
+        fixture_service(home.clone()).await.answer(&id).unwrap()["available"],
         json!(true)
     );
 }
@@ -470,7 +430,7 @@ async fn truncated_frame_fails_the_run() {
         Some("engine_transport_failure")
     );
     assert!(
-        Store::open(&home)
+        agent_run_store::fixture::open(&home)
             .unwrap()
             .last_event(&row.id, "process_cleanup")
             .unwrap()
@@ -490,7 +450,7 @@ async fn session_wait_failure_reaches_cleanup_and_durable_failure() {
         row.failure_kind.as_deref(),
         Some("engine_transport_failure")
     );
-    let cleanup = Store::open(&home)
+    let cleanup = agent_run_store::fixture::open(&home)
         .unwrap()
         .last_event(&row.id, "process_cleanup")
         .unwrap()
@@ -506,7 +466,7 @@ async fn session_wait_failure_reaches_cleanup_and_durable_failure() {
 async fn running_transition_failure_reaches_cleanup_and_durable_failure() {
     let (_tmp, home) = home();
     let id = admit(&home, "fixture:hang");
-    Store::open(&home)
+    agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .execute(
@@ -514,13 +474,13 @@ async fn running_transition_failure_reaches_cleanup_and_durable_failure() {
             [],
         )
         .unwrap();
-    let mut child = spawn_supervisor(&home, &id);
+    let mut child = spawn_supervisor(&home, &id).await;
     let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .expect("supervisor timed out")
         .expect("wait on supervisor");
     assert!(status.success());
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let row = store.get(&id).unwrap();
     assert_eq!(row.status, Status::Failed);
     assert_eq!(row.failure_kind.as_deref(), Some("runtime_storage_failed"));
@@ -541,7 +501,7 @@ async fn running_transition_failure_reaches_cleanup_and_durable_failure() {
 async fn terminal_commit_rejection_is_not_swallowed_while_active() {
     let (_tmp, home) = home();
     let id = admit(&home, "hello");
-    Store::open(&home)
+    agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .execute(
@@ -549,13 +509,13 @@ async fn terminal_commit_rejection_is_not_swallowed_while_active() {
             [],
         )
         .unwrap();
-    let mut child = spawn_supervisor(&home, &id);
+    let mut child = spawn_supervisor(&home, &id).await;
     let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .expect("supervisor timed out")
         .expect("wait on supervisor");
     assert!(!status.success());
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     assert_eq!(store.get(&id).unwrap().status, Status::Running);
     assert!(store.last_event(&id, "process_cleanup").unwrap().is_some());
 }
@@ -585,12 +545,15 @@ async fn oversized_frame_fails_the_run() {
 async fn slow_start_delays_admission_then_succeeds_with_a_late_answer() {
     let (_tmp, home) = home();
     let id = admit(&home, "fixture:slow-start");
-    let mut child = spawn_supervisor(&home, &id);
+    let mut child = spawn_supervisor(&home, &id).await;
     // The engine sleeps 2s before writing anything at all. Well before that,
     // the answer must not exist yet: the artifact is sealed only on
     // completion, never speculatively.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let early = Store::open(&home).unwrap().get(&id).unwrap();
+    let early = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     assert!(!early.status.terminal(), "finished suspiciously fast");
     assert!(early.answer_path.is_none());
     let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
@@ -598,7 +561,10 @@ async fn slow_start_delays_admission_then_succeeds_with_a_late_answer() {
         .expect("supervisor timed out")
         .expect("wait on supervisor");
     assert!(status.success());
-    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     assert_eq!(row.status, Status::Succeeded);
     assert!(
         row.answer_path.is_some(),
@@ -615,7 +581,7 @@ async fn slow_start_delays_admission_then_succeeds_with_a_late_answer() {
 async fn terminal_supervisor_commit_persists_runtime_statistics() {
     let (_tmp, home) = home();
     let row = run_task(&home, "hello").await;
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let stats: (String, i64, i64, i64, String) = store
         .conn
         .query_row(
@@ -635,20 +601,24 @@ async fn terminal_supervisor_commit_persists_runtime_statistics() {
 async fn terminal_supervisor_outcome_survives_a_stats_failure() {
     let (_tmp, home) = home();
     let id = admit(&home, "hello");
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     store
         .conn
         .execute("ALTER TABLE run_stats RENAME TO run_stats_unavailable", [])
         .unwrap();
     drop(store);
-    let mut child = spawn_supervisor(&home, &id);
+    let mut child = spawn_supervisor(&home, &id).await;
     let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .expect("supervisor timed out")
         .expect("wait on supervisor");
     assert!(status.success());
     assert_eq!(
-        Store::open(&home).unwrap().get(&id).unwrap().status,
+        agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .status,
         Status::Succeeded
     );
 }
@@ -665,7 +635,7 @@ async fn unavailable_frozen_runtime_fails_durably_after_supervisor_ownership() {
     let (_tmp, home) = home();
     let id = admit(&home, "hello");
     remove_frozen_runtime(&home, &id);
-    let mut child = spawn_supervisor(&home, &id);
+    let mut child = spawn_supervisor(&home, &id).await;
     let exit = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .expect("supervisor subprocess timed out")
@@ -674,7 +644,7 @@ async fn unavailable_frozen_runtime_fails_durably_after_supervisor_ownership() {
         !exit.success(),
         "preparation failure must reach the entrypoint"
     );
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let row = store.get(&id).unwrap();
     assert_eq!(row.status, Status::Failed);
     assert_eq!(row.failure_kind.as_deref(), Some("prepare_runtime_failed"));
@@ -695,7 +665,7 @@ async fn unavailable_frozen_runtime_fails_durably_after_supervisor_ownership() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ten_consecutive_supervisor_entrypoints_land_durably() {
     let (_tmp, home) = home();
-    let parent = Store::open(&home).unwrap();
+    let parent = agent_run_store::fixture::open(&home).unwrap();
     for round in 0..10 {
         let row = run_task(&home, "hello").await;
         assert_eq!(row.status, Status::Succeeded, "round {round}");
@@ -717,7 +687,7 @@ async fn stability_legacy_supervisor_checkpoints_owned_cleanup() {
     let (_tmp, home) = home();
     let row = run_task(&home, "fixture:descendant").await;
     assert_eq!(row.status, Status::Succeeded);
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let attempt = format!("{}:1", row.id);
     let owned = store
         .remembered_processes("attempt", &attempt)
@@ -757,7 +727,7 @@ async fn descendant_process_is_reaped_before_finish() {
     let (_tmp, home) = home();
     let row = run_task(&home, "fixture:descendant").await;
     assert_eq!(row.status, Status::Succeeded);
-    let cleanup = Store::open(&home)
+    let cleanup = agent_run_store::fixture::open(&home)
         .unwrap()
         .last_event(&row.id, "process_cleanup")
         .unwrap()
@@ -777,7 +747,7 @@ async fn escaped_descendant_is_terminated_before_confirmed_cleanup() {
     // holds its leader until the journal proves that refresh happened, so
     // scheduling delay can no longer let the helper escape uncaptured.
     let id = admit(&home, "fixture:escaped-descendant");
-    let mut child = spawn_supervisor(&home, &id);
+    let mut child = spawn_supervisor(&home, &id).await;
     wait_journaled_text(&home, &id, "fixture escaped capture ready").await;
     std::fs::write(home.join("escaped-release"), "").unwrap();
     let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
@@ -785,9 +755,12 @@ async fn escaped_descendant_is_terminated_before_confirmed_cleanup() {
         .expect("supervisor subprocess timed out")
         .expect("wait on supervisor subprocess");
     assert!(status.success(), "supervisor subprocess failed: {status:?}");
-    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     assert_eq!(row.status, Status::Succeeded);
-    let cleanup = Store::open(&home)
+    let cleanup = agent_run_store::fixture::open(&home)
         .unwrap()
         .last_event(&row.id, "process_cleanup")
         .unwrap()
@@ -818,19 +791,26 @@ async fn escaped_descendant_is_terminated_before_confirmed_cleanup() {
 async fn cancellation_stops_a_hanging_engine_and_records_terminal_state() {
     let (_tmp, home) = home();
     let id = admit(&home, "fixture:hang");
-    let mut child = spawn_supervisor(&home, &id);
+    let mut child = spawn_supervisor(&home, &id).await;
     wait_status(&home, &id, Status::Running, Duration::from_secs(10)).await;
-    Service::new(home.clone()).cancel(&id).unwrap();
+    fixture_service(home.clone())
+        .await
+        .cancel(&id)
+        .await
+        .unwrap();
     let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .expect("supervisor timed out")
         .expect("wait on supervisor");
     assert!(status.success());
-    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     assert_eq!(row.status, Status::Cancelled);
-    let answer = Service::new(home.clone()).answer(&id).unwrap();
+    let answer = fixture_service(home.clone()).await.answer(&id).unwrap();
     assert_eq!(answer["available"], json!(false));
-    let cleanup = Store::open(&home)
+    let cleanup = agent_run_store::fixture::open(&home)
         .unwrap()
         .last_event(&id, "process_cleanup")
         .unwrap()
@@ -845,17 +825,17 @@ async fn cancellation_stops_a_hanging_engine_and_records_terminal_state() {
 async fn command_flood_yields_after_one_bounded_page() {
     let (_tmp, home) = home();
     let id = admit(&home, "fixture:command-flood");
-    let mut store = Store::open(&home).unwrap();
+    let mut store = agent_run_store::fixture::open(&home).unwrap();
     for index in 0..40 {
         store
             .enqueue(&id, "steer", &json!({"text": format!("steer {index}")}))
             .unwrap();
     }
     drop(store);
-    let mut child = spawn_supervisor(&home, &id);
+    let mut child = spawn_supervisor(&home, &id).await;
     wait_engine_ready(&home, &id, Duration::from_secs(10)).await;
     wait_engine_poll_marker(&home, &id).await;
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let marker_at: f64 = store
         .conn
         .query_row(
@@ -872,9 +852,17 @@ async fn command_flood_yields_after_one_bounded_page() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(accepted, 16);
+    assert_eq!(agent_run_core::commands::COMMAND_PAGE_LIMIT, 16);
+    assert!(
+        (1..=16).contains(&accepted),
+        "one command page stops at either the count ceiling or its time ceiling: {accepted}"
+    );
     drop(store);
-    Service::new(home.clone()).cancel(&id).unwrap();
+    fixture_service(home.clone())
+        .await
+        .cancel(&id)
+        .await
+        .unwrap();
     let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .expect("supervisor timed out")
@@ -887,17 +875,17 @@ async fn command_flood_yields_after_one_bounded_page() {
 async fn command_page_deadline_bounds_blocked_engine_writes() {
     let (_tmp, home) = home();
     let id = admit(&home, "fixture:command-flood");
-    let mut store = Store::open(&home).unwrap();
+    let mut store = agent_run_store::fixture::open(&home).unwrap();
     let text = "x".repeat(512 * 1024);
     for _ in 0..16 {
         store.enqueue(&id, "steer", &json!({"text": text})).unwrap();
     }
     drop(store);
-    let mut child = spawn_supervisor(&home, &id);
+    let mut child = spawn_supervisor(&home, &id).await;
     wait_engine_ready(&home, &id, Duration::from_secs(10)).await;
     let all_completed = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            let completed: i64 = Store::open(&home)
+            let completed: i64 = agent_run_store::fixture::open(&home)
                 .unwrap()
                 .conn
                 .query_row(
@@ -915,7 +903,11 @@ async fn command_page_deadline_bounds_blocked_engine_writes() {
     .await
     .is_ok();
     assert!(!all_completed, "one command page ignored its deadline");
-    Service::new(home.clone()).cancel(&id).unwrap();
+    fixture_service(home.clone())
+        .await
+        .cancel(&id)
+        .await
+        .unwrap();
     let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .expect("supervisor timed out")
@@ -928,16 +920,16 @@ async fn command_page_deadline_bounds_blocked_engine_writes() {
 async fn steer_commands_are_answered_by_the_runtime_capability() {
     let (_tmp, home) = home();
     let id = admit(&home, "fixture:command-flood");
-    let mut store = Store::open(&home).unwrap();
+    let mut store = agent_run_store::fixture::open(&home).unwrap();
     store
         .enqueue(&id, "steer", &json!({"text":"focus"}))
         .unwrap();
     drop(store);
-    let mut child = spawn_supervisor(&home, &id);
+    let mut child = spawn_supervisor(&home, &id).await;
     wait_engine_ready(&home, &id, Duration::from_secs(10)).await;
     let deadline = Instant::now() + Duration::from_secs(10);
     let result = loop {
-        let result = Store::open(&home)
+        let result = agent_run_store::fixture::open(&home)
             .unwrap()
             .conn
             .query_row(
@@ -953,7 +945,11 @@ async fn steer_commands_are_answered_by_the_runtime_capability() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     assert!(result.contains("\"accepted\":true"));
-    Service::new(home.clone()).cancel(&id).unwrap();
+    fixture_service(home.clone())
+        .await
+        .cancel(&id)
+        .await
+        .unwrap();
     let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .expect("supervisor timed out")
@@ -970,14 +966,18 @@ async fn steer_commands_are_answered_by_the_runtime_capability() {
 async fn pre_spawn_cancellation_never_launches_the_fixture_engine() {
     let (_tmp, home) = home();
     let id = admit(&home, "fixture:hang");
-    Service::new(home.clone()).cancel(&id).unwrap();
-    let mut child = spawn_supervisor(&home, &id);
+    fixture_service(home.clone())
+        .await
+        .cancel(&id)
+        .await
+        .unwrap();
+    let mut child = spawn_supervisor(&home, &id).await;
     let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .expect("supervisor subprocess timed out")
         .expect("wait on supervisor subprocess");
     assert!(status.success());
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     assert_eq!(store.get(&id).unwrap().status, Status::Cancelled);
     assert!(store.last_event(&id, "phase").unwrap().is_none());
 }
@@ -987,7 +987,7 @@ async fn pre_spawn_cancellation_never_launches_the_fixture_engine() {
 async fn ready_accepts_a_cancelling_admission_before_engine_spawn() {
     let (_tmp, home) = home();
     let id = admit(&home, "fixture:hang");
-    let mut store = Store::open(&home).unwrap();
+    let mut store = agent_run_store::fixture::open(&home).unwrap();
     store.enqueue(&id, "cancel", &json!({})).unwrap();
     store
         .conn
@@ -997,14 +997,18 @@ async fn ready_accepts_a_cancelling_admission_before_engine_spawn() {
         )
         .unwrap();
     drop(store);
-    let mut child = spawn_supervisor(&home, &id);
+    let mut child = spawn_supervisor(&home, &id).await;
     let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .expect("supervisor timed out")
         .expect("wait on supervisor");
     assert!(status.success());
     assert_eq!(
-        Store::open(&home).unwrap().get(&id).unwrap().status,
+        agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .status,
         Status::Cancelled
     );
 }
@@ -1017,7 +1021,7 @@ async fn ready_accepts_a_cancelling_admission_before_engine_spawn() {
 async fn terminal_race_cancel_leaves_fsm_and_cleanup_evidence_valid() {
     let (_tmp, home) = home();
     let id = admit(&home, "hello");
-    Store::open(&home)
+    agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .execute(
@@ -1029,14 +1033,14 @@ async fn terminal_race_cancel_leaves_fsm_and_cleanup_evidence_valid() {
             [],
         )
         .unwrap();
-    let mut child = spawn_supervisor(&home, &id);
+    let mut child = spawn_supervisor(&home, &id).await;
     let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .expect("supervisor timed out")
         .expect("wait on supervisor");
     assert!(status.success());
 
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let row = store.get(&id).unwrap();
     assert_eq!(row.status, Status::Succeeded);
     assert_eq!(
@@ -1074,17 +1078,24 @@ async fn terminal_race_cancel_leaves_fsm_and_cleanup_evidence_valid() {
 async fn engine_ignoring_sigterm_requires_sigkill() {
     let (_tmp, home) = home();
     let id = admit(&home, "fixture:ignore-sigterm");
-    let mut child = spawn_supervisor(&home, &id);
+    let mut child = spawn_supervisor(&home, &id).await;
     wait_engine_ready(&home, &id, Duration::from_secs(10)).await;
-    Service::new(home.clone()).cancel(&id).unwrap();
+    fixture_service(home.clone())
+        .await
+        .cancel(&id)
+        .await
+        .unwrap();
     let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .expect("supervisor timed out")
         .expect("wait on supervisor");
     assert!(status.success());
-    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     assert_eq!(row.status, Status::Cancelled);
-    let cleanup = Store::open(&home)
+    let cleanup = agent_run_store::fixture::open(&home)
         .unwrap()
         .last_event(&id, "process_cleanup")
         .unwrap()
@@ -1136,8 +1147,8 @@ async fn corrupted_answer_proof_is_rejected_even_after_a_real_seal() {
 /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_a_surviving_group_is_stopped_before_lost_is_committed`.
 /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_surviving_nonleader_never_claims_group_gone`.
 /// Mirrors Python `tests/test_lifecycle.py::TerminateProcessGroupTests::test_a_surviving_group_is_reported_not_gone`.
-#[test]
-fn a_surviving_process_group_is_never_reported_as_finished() {
+#[tokio::test]
+async fn a_surviving_process_group_is_never_reported_as_finished() {
     let outcome = agent_run::domain::Outcome::success(None);
     let proof = verify::AnswerProof {
         path: PathBuf::from("/tmp/does-not-matter.md"),
@@ -1172,8 +1183,8 @@ fn a_surviving_process_group_is_never_reported_as_finished() {
 /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_reused_group_id_never_receives_native_cancel_or_signal`.
 /// Mirrors Python `tests/test_lifecycle.py::TerminateProcessGroupTests::test_an_already_dead_group_is_not_signalled`.
 /// Mirrors Python `tests/test_lifecycle.py::TerminateProcessGroupTests::test_natural_quiesce_reaps_before_signalling`.
-#[test]
-fn signal_is_never_sent_to_an_already_dead_process() {
+#[tokio::test]
+async fn signal_is_never_sent_to_an_already_dead_process() {
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_agent-run-fixture"))
         .arg("--child-sleep")
         .arg("1")
@@ -1197,4 +1208,143 @@ fn signal_is_never_sent_to_an_already_dead_process() {
     // could already have been recycled by the OS by this point.
     let signalled = owned.signal(libc::SIGTERM).unwrap();
     assert!(!signalled, "must not signal a dead/possibly-reused PID");
+}
+
+/// Runs one legacy execution whose engine forks a descendant at startup and
+/// exits, with the supervisor's FIRST durable write after the spawn held, and
+/// returns the settled row. The engine must be observed throughout the hold.
+async fn run_with_held_first_write(home: &Path, phase: &str) -> (AgentId, Record) {
+    std::fs::write(home.join("fixture-fork-at-start"), "").unwrap();
+    std::fs::write(home.join(format!("fixture-hold-{phase}")), "").unwrap();
+    let id = admit(home, "hold");
+    let mut child = spawn_supervisor(home, &id).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !home.join(format!("fixture-held-{phase}")).exists() {
+        assert!(Instant::now() < deadline, "the first write was never held");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The engine forks its descendant and its primary exits within 600 ms; the
+    // write stays held far longer than that.
+    tokio::time::sleep(Duration::from_millis(1800)).await;
+    std::fs::write(home.join(format!("fixture-release-{phase}")), "").unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(30), child.wait())
+        .await
+        .expect("supervisor timed out")
+        .expect("wait on supervisor");
+    let _ = status;
+    child.finish().await;
+    let row = agent_run_store::fixture::open(home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
+    (id, row)
+}
+
+/// Observation continuity from the spawn: while the supervisor's first durable
+/// write is held (the legacy `running` write), the exited primary is reaped and
+/// the descendant it forked is captured, so ownership evidence names it and
+/// cleanup is confirmed gone; nothing is left running and no native input or
+/// business effect is repeated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_first_write_keeps_the_spawned_engine_observed() {
+    for phase in ["legacy-process", "legacy-anchor"] {
+        held_write_keeps_the_spawned_engine_observed(phase).await;
+    }
+}
+
+/// One phase of [`held_first_write_keeps_the_spawned_engine_observed`].
+async fn held_write_keeps_the_spawned_engine_observed(phase: &str) {
+    let (_tmp, home) = home();
+    let (id, row) = run_with_held_first_write(&home, phase).await;
+    assert!(row.status.terminal(), "{:?}", row.status);
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    let attempt = format!("{id}:1");
+    let owned = store
+        .remembered_processes("attempt", &attempt)
+        .unwrap()
+        .expect("ownership evidence was recorded")
+        .snapshot()
+        .unwrap();
+    let escaped: i32 = std::fs::read_to_string(home.join("escaped.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        owned.members.iter().any(|member| member.pid == escaped),
+        "the group-escaping descendant forked at startup must be captured while the first write was held"
+    );
+    let proof: String = store
+        .conn
+        .query_row(
+            "SELECT cleanup_proof_json FROM attempts WHERE id=?",
+            [&attempt],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let proof: serde_json::Value = serde_json::from_str(&proof).unwrap();
+    assert_eq!(proof["confirmed"], true, "{proof}");
+    assert_eq!(proof["descendants_gone"], true, "{proof}");
+    // Inspection only: the captured descendant must be gone after cleanup.
+    assert_eq!(
+        agent_run::process::observe(Some(escaped), None, None),
+        ProcessState::Dead,
+        "the captured descendant was cleaned up"
+    );
+    let started: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='phase' AND json_extract(data_json,'$.phase')='spawning'",
+            [id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(started, 1, "the engine was spawned exactly once");
+}
+
+/// A launch cancelled at any of its awaits (an API request timeout drops the
+/// caller) never leaves a spawned supervisor gated and unowned: the launch is an
+/// owned task that finishes, so the execution still runs to its terminal state
+/// with exactly one startup owner and no surviving gated child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_launch_still_completes_or_cleans_up_its_child() {
+    for delay_ms in [0_u64, 1, 5, 15, 40, 120] {
+        let (_tmp, home) = home();
+        let id = admit(&home, "hello");
+        let broker = test_broker::TestBroker::start(&home).await;
+        let lane = broker.lane("admission");
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(delay_ms),
+            agent_run::supervisor::launch_program(
+                std::path::Path::new(env!("CARGO_BIN_EXE_agent-run")),
+                &home,
+                &id,
+                &lane,
+            ),
+        )
+        .await;
+        // Whether the caller timed out or the launch won the race, the same
+        // end state must follow.
+        let _ = cancelled;
+        wait_status(&home, &id, Status::Succeeded, Duration::from_secs(30)).await;
+        let store = agent_run_store::fixture::open(&home).unwrap();
+        let row = store.get(&id).unwrap();
+        let owner = row.supervisor_pid.expect("exactly one owner was recorded");
+        // The supervisor and its engine are gone; nothing stays gated.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while agent_run::process::observe(Some(owner), None, None) != ProcessState::Dead {
+            assert!(
+                Instant::now() < deadline,
+                "delay {delay_ms}: supervisor {owner} never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        broker.stop().await;
+    }
+}
+
+/// Attach the actual shared fixture broker, preserving sole-writer admission and authority.
+async fn fixture_service(home: std::path::PathBuf) -> Service {
+    let broker = test_broker::broker_for(&home).await;
+    Service::new(home).with_writer(broker.writer())
 }

@@ -148,10 +148,16 @@ impl CliService for Service {
         Service::public_run_result(self, run_id, value)
     }
     fn cancel(&self, id: &AgentId) -> Result<Value> {
-        Service::cancel(self, id)
+        {
+            let _ = id;
+            Err(crate::Error::BrokerUnavailable)
+        }
     }
     fn steer(&self, id: &AgentId, text: &str) -> Result<Value> {
-        Service::steer(self, id, text)
+        {
+            let _ = (id, text);
+            Err(crate::Error::BrokerUnavailable)
+        }
     }
     /// List execution rows with the common stable-id projection.
     fn list<'a>(&'a self, query: Query) -> CliFuture<'a> {
@@ -198,7 +204,10 @@ impl CliService for Service {
         Service::delivery_status(self, id)
     }
     fn delivery_cancel(&self, id: &str) -> Result<Value> {
-        Service::delivery_cancel(self, id)
+        {
+            let _ = id;
+            Err(crate::Error::BrokerUnavailable)
+        }
     }
 }
 
@@ -206,6 +215,17 @@ impl CliService for Service {
 pub(crate) struct SocketBroker {
     /// Agent-run home whose private socket receives each request.
     pub(crate) home: PathBuf,
+}
+
+/// Authenticated private writer client for operator-only CLI mutations.
+/// The broker derives authority from its kernel peer; unavailable broker
+/// returns an error and never falls back to a local writable Store.
+fn operator(home: &Path) -> agent_run_core::persist::Producer {
+    agent_run_core::persist::Producer::connect(
+        &home.join("writer.sock"),
+        agent_run_core::persist::cli_hello(),
+        agent_run_core::persist::cli_producer_id(),
+    )
 }
 
 impl CliBroker for SocketBroker {
@@ -464,6 +484,9 @@ pub enum Command {
         identity_fd: i32,
         #[arg(long)]
         error_fd: i32,
+        /// Private pipe carrying the launch capability (see `launch::spawn_launch`).
+        #[arg(long)]
+        capability_fd: i32,
     },
     #[command(name = "_deny-command", hide = true)]
     DenyCommand {
@@ -1038,8 +1061,12 @@ fn result_code(value: &Value) -> i32 {
         _ => 0,
     }
 }
+/// Initialize the legacy-compatible operator home under exclusive offline authority.
+/// Existing valid files remain; schema creation/migration completes before health
+/// reads. Active or uncertain ownership refuses before configuration changes.
 pub fn init(home: &Path) -> Result<Value> {
     fs::private_dir(home)?;
+    let mut authority = crate::offline::acquire(home)?;
     let dir = fs::Dir::open(home)?;
     for name in [
         "agents", "accounts", "runtimes", "profiles", "skills", "logs", "probes",
@@ -1105,7 +1132,8 @@ pub fn init(home: &Path) -> Result<Value> {
         }
     }
     let _ = operator_config(home)?;
-    let store = Store::initialize(home)?;
+    authority.guard.initialize()?;
+    let store = authority.guard.store()?;
     let _ = store.health()?;
     Ok(json!({"home":home,"config":home.join("config.toml"),"state":home.join("state.db")}))
 }
@@ -1591,7 +1619,10 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             let id = dependencies
                 .service
                 .resolve_run_id(&agent_id, run_id.as_ref())?;
-            let value = dependencies.service.cancel(&id)?;
+            let value = dependencies
+                .broker
+                .call("cancel", json!({"agent_id":agent_id,"run_id":id}))
+                .await?;
             (dependencies.output)(&dependencies.service.public_run_result(&id, value)?)?
         }
         Command::Steer {
@@ -1602,7 +1633,13 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             let id = dependencies
                 .service
                 .resolve_run_id(&agent_id, run_id.as_ref())?;
-            let value = dependencies.service.steer(&id, &text)?;
+            let value = dependencies
+                .broker
+                .call(
+                    "steer",
+                    json!({"agent_id":agent_id,"run_id":id,"text":text}),
+                )
+                .await?;
             (dependencies.output)(&dependencies.service.public_run_result(&id, value)?)?
         }
         Command::Bind(a) => {
@@ -1611,10 +1648,19 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 external_session_id: a.session_id,
                 external_turn_id: a.session_turn_id,
             };
-            let mut store = Store::open(&home)?;
+            let store = Store::open(&home)?;
             if let Some(pool) = &a.pool {
                 let pool: agent_run_domain::pool::PoolId = pool.parse()?;
-                store.bind_pool(&pool, &reference, crate::domain::now())?;
+                operator(&home)
+                    .call(
+                        agent_run_store::ops::BindPool {
+                            pool_id: pool.clone(),
+                            reference: reference.clone(),
+                            at: crate::domain::now(),
+                        },
+                        agent_run_core::broker_writer::BROKER_BUDGET,
+                    )
+                    .await?;
                 (dependencies.output)(&json!({"pool_id": pool, "bound": true}))?;
                 return Ok(0);
             }
@@ -1623,7 +1669,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 .ok_or_else(|| invalid("agent id or --pool is required"))?;
             let run =
                 agent_run_core::agent_identity::resolve(&store, &agent_id, a.run_id.as_ref())?;
-            hooks::bind::bind(&mut store, run.id.clone(), reference, crate::domain::now())?;
+            hooks::bind::bind(&home, run.id.clone(), reference, crate::domain::now()).await?;
             (dependencies.output)(&agent_run_core::agent_identity::result(
                 &run,
                 store.delivery_status(&run.id)?,
@@ -1712,9 +1758,9 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 external_session_id: a.session_id,
                 external_turn_id: a.session_turn_id,
             };
-            (dependencies.output)(&serde_json::to_value(hooks::context::build(
-                &home, &reference, None,
-            )?)?)?;
+            (dependencies.output)(&serde_json::to_value(
+                hooks::context::build(&home, &reference, None).await?,
+            )?)?;
         }
         Command::Hook { command } => {
             let input = read_stdin(1024 * 1024)?;
@@ -1724,7 +1770,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 Hook::Context(transport) => {
                     let reference =
                         hooks::bind::normalize(&payload, false, &transport.transport)?.reference;
-                    let context = hooks::context::build(&home, &reference, None)?;
+                    let context = hooks::context::build(&home, &reference, None).await?;
                     let output = if context.injected && !context.text.trim().is_empty() {
                         json!({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":context.text}})
                     } else {
@@ -1733,13 +1779,9 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                     (dependencies.output)(&output)?;
                 }
                 Hook::Bind(transport) => {
-                    let mut store = Store::open(&home)?;
-                    let result = hooks::bind::run_hook_bound(
-                        &mut store,
-                        &payload,
-                        &transport.transport,
-                        None,
-                    )?;
+                    let result =
+                        hooks::bind::run_hook_bound(&home, &payload, &transport.transport, None)
+                            .await?;
                     (dependencies.output)(
                         &json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":result.message()}}),
                     )?;
@@ -1995,9 +2037,9 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 let value = dependencies.service.delivery_status(&id)?;
                 (dependencies.output)(&dependencies.service.public_run_result(&id, value)?)?
             }
-            Delivery::Cancel { delivery_id } => {
-                (dependencies.output)(&dependencies.service.delivery_cancel(&delivery_id)?)?
-            }
+            Delivery::Cancel { delivery_id } => (dependencies.output)(
+                &json!({"delivery_id":delivery_id,"cancelled":operator(&home).call(agent_run_store::ops::CancelDelivery { delivery_id: delivery_id.clone() }, agent_run_core::broker_writer::BROKER_BUDGET).await?}),
+            )?,
             Delivery::Launchd {
                 binary,
                 label,
@@ -2087,7 +2129,21 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                     secret_ref: reference,
                     status: AccountStatus::Enabled,
                 };
-                Store::open(&home)?.register_account(&record)?;
+                match crate::offline::route(&home).await? {
+                    crate::offline::Route::Online(producer) => {
+                        producer
+                            .call(
+                                agent_run_store::ops::RegisterAccount {
+                                    record: record.clone(),
+                                },
+                                Duration::from_secs(30),
+                            )
+                            .await?;
+                    }
+                    crate::offline::Route::Offline(mut session) => {
+                        session.guard.store()?.register_account(&record)?;
+                    }
+                }
                 (dependencies.output)(&json!({
                     "account_id": id, "auth_family": auth_family.as_str(),
                     "status": "enabled", "source": source.kind()
@@ -2110,7 +2166,21 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 (dependencies.output)(&json!({"accounts":views}))?;
             }
             AccountCommand::Disable { id } => {
-                Store::open(&home)?.disable_account(&id)?;
+                match crate::offline::route(&home).await? {
+                    crate::offline::Route::Online(producer) => {
+                        producer
+                            .call(
+                                agent_run_store::ops::DisableAccount {
+                                    account: id.clone(),
+                                },
+                                Duration::from_secs(30),
+                            )
+                            .await?;
+                    }
+                    crate::offline::Route::Offline(mut session) => {
+                        session.guard.store()?.disable_account(&id)?;
+                    }
+                }
                 (dependencies.output)(&json!({"account_id":id,"status":"disabled"}))?;
             }
         },
@@ -2121,9 +2191,18 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             ready_fd,
             identity_fd,
             error_fd,
-        } => crate::supervisor::run(&home, &agent_id, [ready_fd, identity_fd, error_fd]).await?,
+            capability_fd,
+        } => {
+            crate::supervisor::run(
+                &home,
+                &agent_id,
+                [ready_fd, identity_fd, error_fd],
+                capability_fd,
+            )
+            .await?
+        }
         Command::ServiceExec { generation } => {
-            agent_run_core::managed_services::bootstrap(&home, &generation)?
+            agent_run_core::managed_services::bootstrap(&home, &generation).await?
         }
         Command::DenyCommand { name: _ } => {
             eprintln!("agent-run: command denied by the configured developer environment");
@@ -2167,20 +2246,19 @@ mod login_selection_tests {
     use super::provider_login_target;
     use agent_run_config::provider_config::ProviderConfig;
     use agent_run_domain::catalog::{AccountRecord, AccountStatus};
-    use agent_run_store::Store;
 
     /// A provider label that is another binding's global ID is ambiguous;
     /// unambiguous labels and IDs still select their registered account.
     #[test]
     fn login_rejects_cross_namespace_account_collision() {
         let home = tempfile::tempdir().unwrap();
-        Store::initialize(home.path()).unwrap();
+        agent_run_store::fixture::initialize(home.path()).unwrap();
         let config = format!(
             "schema_version = 2\n[harnesses.codex]\nbinary = \"/bin/true\"\nhome = \"{0}/codex\"\n[harnesses.claude-code]\nbinary = \"/bin/true\"\nhome = \"{0}/claude\"\n[providers.codex]\nharness = \"codex\"\nconnection = {{ kind = \"native\" }}\nauth_family = \"openai\"\nlimits_source = \"none\"\n[[providers.codex.models]]\nid = \"gpt\"\n[[providers.codex.bindings]]\nlabel = \"acct-b\"\naccount = \"acct-a\"\n[[providers.codex.bindings]]\nlabel = \"b\"\naccount = \"acct-b\"\n",
             home.path().display()
         );
         let config = ProviderConfig::parse(&config, home.path()).unwrap();
-        let mut store = Store::open(home.path()).unwrap();
+        let mut store = agent_run_store::fixture::open(home.path()).unwrap();
         for (id, reference) in [("acct-a", "native:codex"), ("acct-b", "named:codex:b")] {
             store
                 .register_account(&AccountRecord {

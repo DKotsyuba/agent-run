@@ -67,7 +67,7 @@ fn cleanup(value: Option<String>) -> Option<CleanupView> {
     })
 }
 
-impl Store {
+impl Store<'_> {
     /// Builds one current agent view at `observed_at` from committed rows only.
     /// Explicit lifecycle supplies idle/closing phase, turn count and idle time;
     /// terminal phases and elapsed/idle observations stay frozen at completion.

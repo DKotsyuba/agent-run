@@ -1,16 +1,17 @@
 //! Claude-family launch planning and native stream completion. Input correlation
 //! separates task results from context acknowledgements; the supervisor retains
 //! process ownership, durable answer sealing and final cleanup authority.
+use crate::commands;
 use crate::{
     Result,
     config::{Adapter, Config, Runtime},
     domain::{AgentId, Outcome, Status},
     error::invalid,
+    persist::Persist,
     profiles::Profile,
-    state::{Record, Store},
+    state::Record,
     verify,
 };
-use crate::{commands, journal};
 use agent_run_adapters::{
     EngineResult, LaunchPlan,
     io::{Event, Process},
@@ -22,15 +23,17 @@ use std::{collections::BTreeMap, path::Path, time::Duration};
 
 /// Flushes the unresolved suffix of one assistant message only after applying
 /// its launch-secret policy across all streamed fragment boundaries.
-fn flush_assistant(
-    store: &Store,
+async fn flush_assistant(
+    store: &mut Persist,
     id: &AgentId,
     redactor: &mut StreamingRedactor,
     message_id: Option<&str>,
 ) -> Result<()> {
     let text = redactor.finish();
     if !text.is_empty() {
-        journal(store, id, "assistant", &text, None, message_id)?;
+        store
+            .journal(id, "assistant", &text, None, message_id)
+            .await?;
     }
     Ok(())
 }
@@ -549,7 +552,7 @@ fn result_failure_kind(subtype: &str, text: Option<&str>) -> &'static str {
 /// when the engine omits ids, so distinct messages never merge.
 pub async fn run(
     process: &mut Process,
-    store: &mut Store,
+    store: &mut Persist,
     record: &Record,
     initial_input: Option<&str>,
 ) -> Result<EngineResult> {
@@ -570,11 +573,13 @@ pub async fn run(
     } else {
         process.input.take();
     }
-    store.event(
-        &record.id,
-        "native_tool_observer_v1",
-        &json!({"protocol":"claude","version":1}),
-    )?;
+    process
+        .observing(store.event(
+            &record.id,
+            "native_tool_observer_v1",
+            &json!({"protocol":"claude","version":1}),
+        ))
+        .await?;
     let mut session = None;
     let mut final_result: Option<EngineResult> = None;
     let mut closing_at: Option<tokio::time::Instant> = None;
@@ -605,11 +610,13 @@ pub async fn run(
                 process.input.take();
             }
             if closing_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(2)) {
-                store.event(
-                    &record.id,
-                    "finish_usage_incomplete_v1",
-                    &json!({"protocol":"claude"}),
-                )?;
+                process
+                    .observing(store.event(
+                        &record.id,
+                        "finish_usage_incomplete_v1",
+                        &json!({"protocol":"claude"}),
+                    ))
+                    .await?;
                 if let Some(result) =
                     crate::worker_finish::result(process, store, record, session.clone(), None)?
                 {
@@ -622,6 +629,13 @@ pub async fn run(
             event = process.next() => Some(event),
             _ = tick.tick() => None,
         };
+        // Journal rows wait at most one flush age while frames keep arriving and
+        // are written at once when the engine goes quiet.
+        if event.is_some() {
+            process.observing(store.flush_due()).await?;
+        } else {
+            process.observing(store.flush()).await?;
+        }
         let Some(event) = event else {
             let deadline = tokio::time::Instant::now()
                 + Duration::from_secs_f64(commands::COMMAND_PAGE_SECONDS);
@@ -629,11 +643,19 @@ pub async fn run(
                 if tokio::time::Instant::now() >= deadline {
                     break;
                 }
-                let Some((cid, command, payload)) = store.claim_command(&record.id)? else {
+                let Some((cid, command, payload)) =
+                    process.observing(store.claim_command(&record.id)).await?
+                else {
                     break;
                 };
                 if command == "cancel" {
-                    store.complete_command(&record.id, cid, &json!({"accepted":true}))?;
+                    process
+                        .observing(store.complete_command(
+                            &record.id,
+                            cid,
+                            &json!({"accepted":true}),
+                        ))
+                        .await?;
                     return Ok(EngineResult {
                         native_failure: None,
                         outcome: Outcome {
@@ -650,11 +672,13 @@ pub async fn run(
                 if record.request.explicit_finish
                     && store.worker_finish_intent(&record.id, false)?.is_some()
                 {
-                    store.complete_command(
-                        &record.id,
-                        cid,
-                        &json!({"accepted":false,"reason":"finish_accepted"}),
-                    )?;
+                    process
+                        .observing(store.complete_command(
+                            &record.id,
+                            cid,
+                            &json!({"accepted":false,"reason":"finish_accepted"}),
+                        ))
+                        .await?;
                     continue;
                 }
                 if command == "steer" {
@@ -664,20 +688,41 @@ pub async fn run(
                         let accepted = send_user_text(process, text, &id, deadline).await;
                         if accepted {
                             inputs.sent(id, true);
-                            store.worker_turn(&record.id, false, crate::domain::now())?;
-                        } else if open {
-                            inputs.uncertain_write = true;
-                        }
-                        store.complete_command(&record.id, cid, &json!({"accepted":accepted}))?;
-                        if accepted {
-                            journal(store, &record.id, "user", &process.redact(text), None, None)?;
+                            // The bytes reached the engine: its observed result, the
+                            // worker-turn effect and the transcript row are ONE
+                            // atomic operation, never split and never replayed.
+                            let fragments =
+                                store.user_fragments(&record.id, &process.redact(text))?;
+                            process
+                                .observing(store.observed_command_result(
+                                    &record.id,
+                                    cid,
+                                    &json!({"accepted":true}),
+                                    "stdin_written",
+                                    Some(false),
+                                    fragments,
+                                ))
+                                .await?;
+                        } else {
+                            if open {
+                                inputs.uncertain_write = true;
+                            }
+                            process
+                                .observing(store.complete_command(
+                                    &record.id,
+                                    cid,
+                                    &json!({"accepted":false}),
+                                ))
+                                .await?;
                         }
                     } else {
-                        store.complete_command(
-                            &record.id,
-                            cid,
-                            &json!({"accepted":false,"reason":"empty_steer_text"}),
-                        )?;
+                        process
+                            .observing(store.complete_command(
+                                &record.id,
+                                cid,
+                                &json!({"accepted":false,"reason":"empty_steer_text"}),
+                            ))
+                            .await?;
                     }
                 } else if command == "pool" {
                     // Same stdin path and deadline as steer. A successful
@@ -685,13 +730,14 @@ pub async fn run(
                     // consumption — and any error may follow a partial write,
                     // so it is `unknown`, not "not delivered". The durable log
                     // keeps the entry either way.
+                    let mut written = false;
                     let result = match commands::pool_push_text(store, &record.id, &payload) {
                         Ok(text) => {
                             let id = uuid::Uuid::new_v4().to_string();
                             let open = process.input.is_some();
                             if send_user_text(process, &text, &id, deadline).await {
                                 inputs.sent(id, false);
-                                store.worker_turn(&record.id, false, crate::domain::now())?;
+                                written = true;
                                 commands::pool_result("written", "stdin_write")
                             } else {
                                 inputs.uncertain_write |= open;
@@ -700,13 +746,32 @@ pub async fn run(
                         }
                         Err(refusal) => refusal,
                     };
-                    store.complete_command(&record.id, cid, &result)?;
+                    if written {
+                        // Observed stdin write: result and worker turn are one atomic
+                        // operation (transport evidence only, not consumption).
+                        process
+                            .observing(store.observed_command_result(
+                                &record.id,
+                                cid,
+                                &result,
+                                "stdin_written",
+                                Some(false),
+                                Vec::new(),
+                            ))
+                            .await?;
+                    } else {
+                        process
+                            .observing(store.complete_command(&record.id, cid, &result))
+                            .await?;
+                    }
                 } else {
-                    store.complete_command(
-                        &record.id,
-                        cid,
-                        &json!({"accepted":false,"reason":"unsupported_command"}),
-                    )?;
+                    process
+                        .observing(store.complete_command(
+                            &record.id,
+                            cid,
+                            &json!({"accepted":false,"reason":"unsupported_command"}),
+                        ))
+                        .await?;
                 }
             }
             tick.reset();
@@ -717,28 +782,34 @@ pub async fn run(
             Event::OwnershipFailure(error) => {
                 // Required cleanup is owned by the supervisor; a failed journal
                 // flush must not replace the original persistence/identity cause.
-                let _ = flush_assistant(
-                    store,
-                    &record.id,
-                    &mut assistant_redactor,
-                    message_id.as_deref(),
-                );
+                let _ = process
+                    .observing(flush_assistant(
+                        store,
+                        &record.id,
+                        &mut assistant_redactor,
+                        message_id.as_deref(),
+                    ))
+                    .await;
                 return Err(error);
             }
             Event::Eof => {
-                flush_assistant(
-                    store,
-                    &record.id,
-                    &mut assistant_redactor,
-                    message_id.as_deref(),
-                )?;
+                process
+                    .observing(flush_assistant(
+                        store,
+                        &record.id,
+                        &mut assistant_redactor,
+                        message_id.as_deref(),
+                    ))
+                    .await?;
                 let code = process.reap().await;
                 if closing_at.is_some() {
-                    store.event(
-                        &record.id,
-                        "finish_usage_incomplete_v1",
-                        &json!({"protocol":"claude"}),
-                    )?;
+                    process
+                        .observing(store.event(
+                            &record.id,
+                            "finish_usage_incomplete_v1",
+                            &json!({"protocol":"claude"}),
+                        ))
+                        .await?;
                     if let Some(mut result) =
                         crate::worker_finish::result(process, store, record, session.clone(), None)?
                     {
@@ -746,14 +817,16 @@ pub async fn run(
                         return Ok(result);
                     }
                 }
-                store.event(
-                    &record.id,
-                    "native_result_exit_v1",
-                    &json!({
-                        "version": 1, "frames": result_frame_index,
-                        "selected_index": selected_result_index, "exit_code": code,
-                    }),
-                )?;
+                process
+                    .observing(store.event(
+                        &record.id,
+                        "native_result_exit_v1",
+                        &json!({
+                            "version": 1, "frames": result_frame_index,
+                            "selected_index": selected_result_index, "exit_code": code,
+                        }),
+                    ))
+                    .await?;
                 if let Some(mut result) = final_result {
                     result.outcome.exit_code = code;
                     if code != Some(0) && result.outcome.status == Status::Succeeded {
@@ -805,19 +878,23 @@ pub async fn run(
                 });
             }
             Event::Failure(e) => {
-                flush_assistant(
-                    store,
-                    &record.id,
-                    &mut assistant_redactor,
-                    message_id.as_deref(),
-                )?;
+                process
+                    .observing(flush_assistant(
+                        store,
+                        &record.id,
+                        &mut assistant_redactor,
+                        message_id.as_deref(),
+                    ))
+                    .await?;
                 let code = process.reap().await;
-                store.event(
-                    &record.id,
-                    "native_result_exit_v1",
-                    &json!({"version":1,"frames":result_frame_index,
+                process
+                    .observing(store.event(
+                        &record.id,
+                        "native_result_exit_v1",
+                        &json!({"version":1,"frames":result_frame_index,
                         "selected_index":selected_result_index,"exit_code":code}),
-                )?;
+                    ))
+                    .await?;
                 let mut outcome = Outcome::failure(e);
                 outcome.exit_code = code;
                 outcome.failure_text = process.diagnostic_tail();
@@ -843,11 +920,13 @@ pub async fn run(
                 },
                 _ => "contract",
             };
-            let _ = store.event(
-                &record.id,
-                "native_user_replay_refused_v1",
-                &json!({"version":1,"reason":reason}),
-            );
+            let _ = process
+                .observing(store.event(
+                    &record.id,
+                    "native_user_replay_refused_v1",
+                    &json!({"version":1,"reason":reason}),
+                ))
+                .await;
             return Err(error);
         }
         if v.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification")
@@ -855,7 +934,9 @@ pub async fn run(
             || (v.get("type").and_then(Value::as_str) == Some("stream_event")
                 && v.pointer("/event/type").and_then(Value::as_str) == Some("message_start"))
         {
-            store.worker_turn(&record.id, false, crate::domain::now())?;
+            process
+                .observing(store.worker_turn(&record.id, false, crate::domain::now()))
+                .await?;
         }
         // Capture every observed result before identity/shape validation can reject it.
         let result_scope = if v.get("type").and_then(Value::as_str) == Some("result") {
@@ -887,7 +968,9 @@ pub async fn run(
             let mut metadata = native_result_metadata(result_frame_index, &v, ignored);
             metadata["correlation"] = json!(scope.label());
             metadata["correlation_evidence"] = correlation_evidence;
-            store.event(&record.id, "native_result_frame_v1", &metadata)?;
+            process
+                .observing(store.event(&record.id, "native_result_frame_v1", &metadata))
+                .await?;
             Some(scope)
         } else {
             None
@@ -912,16 +995,20 @@ pub async fn run(
             // Legacy fresh launches can rebind after initialization. Explicit
             // and resumed runs keep one identity across every idle/wake boundary.
             if session.as_deref() != Some(s) {
-                store.runtime_session(&record.id, s)?;
+                process
+                    .observing(store.runtime_session(&record.id, s))
+                    .await?;
                 session = Some(s.into());
             }
         }
         if record.request.profile == "research" && v["type"] == "system" && v["subtype"] == "init" {
-            let _ = store.event(
-                &record.id,
-                "native_init_inventory_v1",
-                &native_init_inventory(&v),
-            );
+            let _ = process
+                .observing(store.event(
+                    &record.id,
+                    "native_init_inventory_v1",
+                    &native_init_inventory(&v),
+                ))
+                .await;
         }
         // Only top-level protocol frames feed the native signal state.
         signals.observe(&v);
@@ -930,12 +1017,14 @@ pub async fn run(
                 let event = &v["event"];
                 match event.get("type").and_then(Value::as_str) {
                     Some("message_start") => {
-                        flush_assistant(
-                            store,
-                            &record.id,
-                            &mut assistant_redactor,
-                            message_id.as_deref(),
-                        )?;
+                        process
+                            .observing(flush_assistant(
+                                store,
+                                &record.id,
+                                &mut assistant_redactor,
+                                message_id.as_deref(),
+                            ))
+                            .await?;
                         assistant_redactor = process.stream_redactor();
                         // A real message boundary: adopt the native message id
                         // as this message's durable identity, or mint one
@@ -966,15 +1055,16 @@ pub async fn run(
                         if let (Some(id), Some(name)) = (native_id, name.as_ref()) {
                             tool_names.insert(id.to_owned(), name.clone());
                         }
-                        crate::journal_with_error(
-                            store,
-                            &record.id,
-                            "tool_call",
-                            "",
-                            name.as_deref(),
-                            native_id,
-                            None,
-                        )?;
+                        process
+                            .observing(store.journal_with_error(
+                                &record.id,
+                                "tool_call",
+                                "",
+                                name.as_deref(),
+                                native_id,
+                                None,
+                            ))
+                            .await?;
                     }
                     Some("content_block_delta")
                         if event.pointer("/delta/type").and_then(Value::as_str)
@@ -989,14 +1079,15 @@ pub async fn run(
                             emitted.push_str(text);
                             let safe = assistant_redactor.feed(text);
                             if !safe.is_empty() {
-                                journal(
-                                    store,
-                                    &record.id,
-                                    "assistant",
-                                    &safe,
-                                    None,
-                                    message_id.as_deref(),
-                                )?;
+                                process
+                                    .observing(store.journal(
+                                        &record.id,
+                                        "assistant",
+                                        &safe,
+                                        None,
+                                        message_id.as_deref(),
+                                    ))
+                                    .await?;
                             }
                         }
                     }
@@ -1025,20 +1116,23 @@ pub async fn run(
                                 {
                                     tool_names.insert(id.to_owned(), process.redact(name));
                                 }
-                                crate::journal_with_error(
-                                    store,
-                                    &record.id,
-                                    "tool_call",
-                                    &process.redact(&serde_json::to_string(
-                                        block.get("input").unwrap_or(&Value::Null),
-                                    )?),
-                                    block.get("name").and_then(Value::as_str),
-                                    block
-                                        .get("id")
-                                        .and_then(Value::as_str)
-                                        .filter(|id| !id.is_empty()),
-                                    None,
-                                )?;
+                                process
+                                    .observing(
+                                        store.journal_with_error(
+                                            &record.id,
+                                            "tool_call",
+                                            &process.redact(&serde_json::to_string(
+                                                block.get("input").unwrap_or(&Value::Null),
+                                            )?),
+                                            block.get("name").and_then(Value::as_str),
+                                            block
+                                                .get("id")
+                                                .and_then(Value::as_str)
+                                                .filter(|id| !id.is_empty()),
+                                            None,
+                                        ),
+                                    )
+                                    .await?;
                             }
                             _ => {}
                         }
@@ -1068,31 +1162,35 @@ pub async fn run(
                         if let Some(tail) = text.strip_prefix(&emitted) {
                             let safe = assistant_redactor.feed(tail);
                             if !safe.is_empty() {
-                                journal(
-                                    store,
-                                    &record.id,
-                                    "assistant",
-                                    &safe,
-                                    None,
-                                    identity.as_deref(),
-                                )?;
+                                process
+                                    .observing(store.journal(
+                                        &record.id,
+                                        "assistant",
+                                        &safe,
+                                        None,
+                                        identity.as_deref(),
+                                    ))
+                                    .await?;
                             }
                         }
-                        flush_assistant(
-                            store,
-                            &record.id,
-                            &mut assistant_redactor,
-                            identity.as_deref(),
-                        )?;
+                        process
+                            .observing(flush_assistant(
+                                store,
+                                &record.id,
+                                &mut assistant_redactor,
+                                identity.as_deref(),
+                            ))
+                            .await?;
                     } else {
-                        journal(
-                            store,
-                            &record.id,
-                            "assistant",
-                            &process.redact(&text),
-                            None,
-                            identity.as_deref(),
-                        )?;
+                        process
+                            .observing(store.journal(
+                                &record.id,
+                                "assistant",
+                                &process.redact(&text),
+                                None,
+                                identity.as_deref(),
+                            ))
+                            .await?;
                     }
                     saw_delta = false;
                     emitted.clear();
@@ -1119,26 +1217,30 @@ pub async fn run(
                                 .is_some_and(|name| name == "mcp__agent_run_worker__finish")
                                 && block.get("is_error").and_then(Value::as_bool) != Some(true)
                             {
-                                crate::worker_finish::receipt(process, store, record, &text)?;
+                                crate::worker_finish::receipt(process, store, record, &text)
+                                    .await?;
                             }
-                            crate::journal_with_error(
-                                store,
-                                &record.id,
-                                "tool_result",
-                                &process.redact(&text),
-                                block["tool_use_id"]
-                                    .as_str()
-                                    .and_then(|id| tool_names.get(id))
-                                    .map(String::as_str),
-                                block
-                                    .get("tool_use_id")
-                                    .and_then(Value::as_str)
-                                    .filter(|id| !id.is_empty()),
-                                block
-                                    .get("is_error")
-                                    .and_then(Value::as_bool)
-                                    .map(|error| (error, "claude.is_error")),
-                            )?;
+                            process
+                                .observing(
+                                    store.journal_with_error(
+                                        &record.id,
+                                        "tool_result",
+                                        &process.redact(&text),
+                                        block["tool_use_id"]
+                                            .as_str()
+                                            .and_then(|id| tool_names.get(id))
+                                            .map(String::as_str),
+                                        block
+                                            .get("tool_use_id")
+                                            .and_then(Value::as_str)
+                                            .filter(|id| !id.is_empty()),
+                                        block
+                                            .get("is_error")
+                                            .and_then(Value::as_bool)
+                                            .map(|error| (error, "claude.is_error")),
+                                    ),
+                                )
+                                .await?;
                         }
                     }
                 }
@@ -1182,7 +1284,9 @@ pub async fn run(
                     return Ok(result);
                 }
                 if record.request.explicit_finish && outcome.status == Status::Succeeded {
-                    store.worker_turn(&record.id, true, crate::domain::now())?;
+                    process
+                        .observing(store.worker_turn(&record.id, true, crate::domain::now()))
+                        .await?;
                     continue;
                 }
                 if record.resume_of_runtime_session_id.is_some()

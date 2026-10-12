@@ -1,18 +1,27 @@
-//! Short-lived, thread-local SQLite connections. Never hold a transaction across await.
+//! Read-only SQLite access and guarded writer units. Never hold a transaction across await.
 pub mod accounts;
 /// Atomic durable admission, replay, and active-capacity reservation.
 pub mod admission;
+/// Capacity sample persistence units of the sole writer.
+pub mod capacity;
 /// Durable delivery outbox rows, binding, expiry, and evidence verdicts.
 pub mod delivery;
 /// Read-only diagnostic and active-context snapshots.
 pub mod diagnostics;
+/// Fenced raw store access for tests (feature `test-fixtures` only).
+#[cfg(feature = "test-fixtures")]
+pub mod fixture;
 /// Bounded, content-free incident phases independent of expirable history.
 pub mod incidents;
 /// Durable append-only journal operations and bounded transcript spooling.
 pub mod journal;
 /// Resume-parent proof and one-child lineage admission helpers.
 pub mod lineage;
+/// Managed service generation, lease, gate and probe units of the sole writer.
+pub mod managed_services;
 pub mod migrations;
+/// Closed storage operation inventory, envelopes and authority matrix.
+pub mod ops;
 pub mod pool_admission;
 /// Exact-attempt enrollment of active independent workers into one pool.
 pub mod pool_enrollment;
@@ -26,12 +35,16 @@ pub mod projections;
 pub mod provider_admission;
 /// Account-bound quota observation persistence and the exhaustion latch.
 pub mod quota;
+/// Proof-gated reconciliation units of the sole writer.
+pub mod reconcile;
 /// Bounded fourteen-day history expiry and SQLite space reclamation.
 pub mod retention;
 /// Python-compatible normalization and repair of cumulative run usage rows.
 pub mod run_stats;
 /// Durable physical storage-layout registry for shared runtime assets.
 pub mod runtime_storage;
+/// Supervisor bootstrap, ownership and service-executor identity units.
+mod supervisor_units;
 /// Atomic terminal lifecycle transitions and their durable completion notices.
 pub mod terminal;
 /// Indexed bounded transcript blocks and native tool evidence views.
@@ -39,16 +52,16 @@ pub mod transcript;
 /// Authenticated, bounded worker reports and their durable outbox rows.
 pub mod worker;
 pub mod worker_finish;
+/// Writer lease, fences, nested write scopes and read-only handles.
+pub mod writer;
 use agent_run_domain::{
     Error, Result,
     catalog::{AccountId, PhysicalQuotaKey},
     domain::{self, AgentId, Outcome, StartRequest, Status, now},
     error::{PersistenceOperation, invalid},
 };
-use agent_run_platform::{fs, verify::Proof};
-use rusqlite::{
-    Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior, params,
-};
+use agent_run_platform::verify::Proof;
+use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -88,8 +101,9 @@ pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// During a rollout that queue routinely outlasts `BUSY_TIMEOUT`, and an
 /// upgrade is the one write nobody can replay, so waiting beats failing.
 pub(crate) const MIGRATION_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
-pub struct Store {
-    pub conn: Connection,
+pub struct Store<'connection> {
+    /// The owned connection or the library connection borrowed for one SQL job.
+    pub conn: sqlite_access::ConnectionRef<'connection>,
     pub home: PathBuf,
     /// The attempt this handle writes for, once a supervisor binds it:
     /// events, transcript messages and runtime-session records then carry
@@ -224,7 +238,7 @@ impl Record {
 const ATTEMPT_OF: &str = "CASE WHEN ?2 IS NOT NULL THEN (SELECT id FROM attempts WHERE id=?2 AND agent_id=?1) \
      ELSE (SELECT id FROM attempts WHERE agent_id=?1 AND ownership_active=1) END";
 pub(crate) fn tx_event(
-    tx: &Transaction<'_>,
+    tx: &rusqlite::Connection,
     id: &AgentId,
     kind: &str,
     from: Option<Status>,
@@ -311,7 +325,7 @@ pub(crate) fn session_matches_reference(
 
 /// Refreshes mutable turn/liveness fields on one existing identity without changing its row id.
 pub(crate) fn touch_session_reference(
-    tx: &Transaction<'_>,
+    tx: &rusqlite::Connection,
     session_id: &str,
     reference: &domain::OrchestratorRef,
     at: f64,
@@ -329,7 +343,7 @@ pub(crate) fn touch_session_reference(
 /// Finds or creates a session inside a caller-owned transaction.
 /// New rows use canonical transports; exact existing legacy alias rows remain immutable.
 pub(crate) fn session_for_reference(
-    tx: &Transaction<'_>,
+    tx: &rusqlite::Connection,
     reference: &domain::OrchestratorRef,
     at: f64,
 ) -> Result<String> {
@@ -372,29 +386,35 @@ fn decode_context_components(key: &str) -> Option<BTreeMap<String, String>> {
         .collect()
 }
 
-impl Store {
+impl Store<'_> {
     /// Returns the canonical durable database path so another thread can open
     /// its own SQLite connection without violating connection affinity.
     pub fn path(&self) -> PathBuf {
         self.home.join("state.db")
     }
 
+    /// Test-only raw schema initialization; production callers require an offline guard.
+    /// Creates the private fixture directory and applies the numbered migration chain.
+    #[cfg(feature = "test-fixtures")]
     pub fn initialize(home: &Path) -> Result<Self> {
-        fs::private_dir(home)?;
+        agent_run_platform::fs::private_dir(home)?;
         Self::connect(home, true)
     }
-    /// Open the existing thread-affine store. SQLite failures carry a closed
-    /// open-boundary label and monotonic elapsed time; migrations never replay.
+    /// Open an existing WAL-aware read-only store without creation or migration.
+    /// SQLite failures retain their closed open-boundary label; all mutations
+    /// require the resident queue or an explicit offline authority instead.
     pub fn open(home: &Path) -> Result<Self> {
         let started = std::time::Instant::now();
-        Self::connect(home, false).map_err(|error| match error {
-            error @ Error::Sql(_) => Error::persistence(
-                agent_run_domain::error::PersistenceOperation::StoreOpen,
-                started.elapsed(),
-                error,
-            ),
-            other => other,
-        })
+        crate::writer::StoreReader::open(home)
+            .map(|reader| reader.into_inner())
+            .map_err(|error| match error {
+                error @ Error::Sql(_) => Error::persistence(
+                    agent_run_domain::error::PersistenceOperation::StoreOpen,
+                    started.elapsed(),
+                    error,
+                ),
+                other => other,
+            })
     }
     /// Opens a thread-affine connection for `home`, migrating existing content
     /// and initializing a new schema when `create` is true. The connection
@@ -514,7 +534,7 @@ impl Store {
             }
         }
         Ok(Self {
-            conn,
+            conn: conn.into(),
             home: home.to_path_buf(),
             attempt: None,
         })
@@ -608,9 +628,7 @@ impl Store {
         if !at.is_finite() || at < 0.0 {
             return Err(invalid("binding time must be finite and nonnegative"));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let agent = tx
             .query_row(
                 "SELECT * FROM agents WHERE id=?",
@@ -672,9 +690,7 @@ impl Store {
         if !at.is_finite() || at < 0.0 {
             return Err(invalid("context time must be finite and nonnegative"));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let session_id = session_for_reference(&tx, reference, at)?;
         let stored: BTreeMap<String, String> = tx
             .query_row(
@@ -716,9 +732,7 @@ impl Store {
         if !at.is_finite() || at < 0.0 {
             return Err(invalid("context time must be finite and nonnegative"));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let changed = tx.execute(
             "INSERT INTO context_receipts(orchestrator_session_id,context_key,injected_at) VALUES(?,?,?) ON CONFLICT(orchestrator_session_id) DO UPDATE SET context_key=excluded.context_key,injected_at=excluded.injected_at WHERE context_receipts.context_key<>excluded.context_key",
             params![session_id, context_key, at],
@@ -741,9 +755,7 @@ impl Store {
         if !at.is_finite() || at < 0.0 {
             return Err(invalid("context time must be finite and nonnegative"));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let session_id = session_for_reference(&tx, reference, at)?;
         let changed = tx.execute(
             "INSERT INTO context_receipts(orchestrator_session_id,context_key,injected_at) VALUES(?,?,?) ON CONFLICT(orchestrator_session_id) DO UPDATE SET context_key=excluded.context_key,injected_at=excluded.injected_at WHERE context_receipts.context_key<>excluded.context_key",
@@ -791,9 +803,7 @@ impl Store {
         if !deadline_seconds.is_finite() || deadline_seconds <= 0.0 {
             return Err(invalid("startup deadline must be positive and finite"));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let current: Option<(String, Option<String>, Option<f64>)> = tx
             .query_row(
                 "SELECT status,startup_owner_pid_identity,startup_owner_birth_time FROM agents WHERE id=?",
@@ -830,7 +840,7 @@ impl Store {
     /// A successful call replaces that deadline with `at + deadline_seconds`; elapsed time
     /// alone is never reconciliation proof.
     pub fn begin_supervisor_handoff(
-        &mut self,
+        &self,
         id: &AgentId,
         owner_identity: &str,
         at: f64,
@@ -843,9 +853,7 @@ impl Store {
         if !deadline_seconds.is_finite() || deadline_seconds <= 0.0 {
             return Err(invalid("startup deadline must be positive and finite"));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let row: Option<StartupHandoff> = tx
             .query_row(
                 "SELECT status,startup_owner_pid_identity,startup_deadline_at,supervisor_pid,process_group_id,supervisor_identity FROM agents WHERE id=?",
@@ -897,9 +905,7 @@ impl Store {
                 "supervisor birth time must be finite and nonnegative",
             ));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let current: Option<SupervisorOwnership> = tx
             .query_row("SELECT status,supervisor_pid,supervisor_identity,process_group_id,supervisor_birth_time FROM agents WHERE id=?", [id.as_str()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
             .optional()?;
@@ -948,9 +954,7 @@ impl Store {
         Ok(())
     }
     pub fn running(&mut self, id: &AgentId, pgid: i32) -> Result<()> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let s: String =
             tx.query_row("SELECT status FROM agents WHERE id=?", [id.as_str()], |r| {
                 r.get(0)
@@ -1007,7 +1011,7 @@ impl Store {
     ///
     /// Collectors must write every relevant quota fact and call this once
     /// before committing that same transaction, preserving snapshot atomicity.
-    pub fn advance_quota_capacity_revision(tx: &Transaction<'_>) -> Result<i64> {
+    pub fn advance_quota_capacity_revision(tx: &rusqlite::Connection) -> Result<i64> {
         let changed = tx.execute(
             "UPDATE quota_capacity_revision SET revision=revision+1,updated_at=? \
              WHERE id=1 AND revision<9223372036854775807",
@@ -1083,9 +1087,7 @@ impl Store {
             agent_run_domain::error::PersistenceOperation::RuntimeSession,
             || {
                 domain::external_id("runtime_session_id", session)?;
-                let tx = self
-                    .conn
-                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let tx = crate::writer::WriteTx::begin(&self.conn)?;
                 tx.execute(
                     "UPDATE agents SET runtime_session_id=? WHERE id=?",
                     params![session, id.as_str()],
@@ -1214,9 +1216,7 @@ impl Store {
         if !["cancel", "steer", "pool"].contains(&kind) {
             return Err(invalid("unknown command kind"));
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let row = tx
             .query_row(
                 "SELECT * FROM agents WHERE id=?",

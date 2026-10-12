@@ -52,7 +52,7 @@ impl Home {
         );
         std::fs::write(path.join("config.toml"), text).unwrap();
         let config = Config::load(&path).unwrap();
-        Store::initialize(&path).unwrap();
+        agent_run_store::fixture::initialize(&path).unwrap();
         Self { temp, path, config }
     }
     pub fn request(&self) -> StartRequest {
@@ -60,8 +60,9 @@ impl Home {
         request.validate().unwrap();
         request
     }
-    pub fn store(&self) -> Store {
-        Store::open(&self.path).unwrap()
+    /// Open an owned fixture connection independent of this helper's borrow; fail the test on I/O/schema errors.
+    pub fn store(&self) -> Store<'static> {
+        agent_run_store::fixture::open(&self.path).unwrap()
     }
 }
 
@@ -210,3 +211,4 @@ pub fn curated_shape_small(pack_bytes: u64) -> CuratedShape {
         pack_bytes,
     }
 }
+pub mod writer;

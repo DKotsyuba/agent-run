@@ -367,7 +367,7 @@ fn copy_golden_database(destination: &Path) {
 fn python_test_run_stats_golden_v16_rows_are_read_without_shape_drift() {
     let home = tempfile::tempdir().unwrap();
     copy_golden_database(home.path());
-    let store = Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::initialize(home.path()).unwrap();
     let id: AgentId = "ag-20260101-000005-0000000005".parse().unwrap();
     let row = statistics(&store, &id);
     assert_eq!(row["runtime"], "codex");

@@ -16,18 +16,25 @@ use std::{
 /// Mirrors `test_state_db.py::test_fresh_init_and_reopen_apply_schema_pragmas_and_private_modes`.
 ///
 /// Initialization/reopen retain the current inventory, including schema26
-/// enrollment and schema27 independent incident evidence, plus the durable WAL
-/// and private-mode safety settings.
+/// enrollment, schema27 independent incident evidence and the schema30 writer
+/// receipt, producer and authority tables, plus the durable WAL and
+/// private-mode safety settings.
 #[test]
 fn schema_initialization_and_reopen() {
     let h = common::Home::new();
     let a = h.store().health().unwrap();
     assert_eq!(a["ok"], true);
     assert_eq!(a["schema_version"], agent_run_store::VERSION);
-    assert_eq!(a["tables"], 36);
+    assert_eq!(a["tables"], 39);
     assert_eq!(h.store().health().unwrap()["integrity"], "ok");
     let store = h.store();
-    for name in ["worker_lifecycle", "worker_native_wakes"] {
+    for name in [
+        "worker_lifecycle",
+        "worker_native_wakes",
+        "operation_receipts",
+        "writer_producers",
+        "writer_authority",
+    ] {
         assert!(
             store
                 .conn
@@ -180,7 +187,7 @@ fn event_write_from_a_non_owner_thread_lands_durably() {
     let path = h.path.clone();
     let worker_id = id.clone();
     thread::spawn(move || {
-        Store::open(&path)
+        agent_run_store::fixture::open(&path)
             .unwrap()
             .event(&worker_id, "worker_event", &json!({"from":"worker"}))
             .unwrap();
@@ -204,7 +211,7 @@ fn message_and_session_from_a_non_owner_thread_land_durably() {
     let path = h.path.clone();
     let worker_id = id.clone();
     thread::spawn(move || {
-        let mut store = Store::open(&path).unwrap();
+        let mut store = agent_run_store::fixture::open(&path).unwrap();
         store
             .runtime_session(&worker_id, "runtime-session-1")
             .unwrap();
@@ -247,7 +254,7 @@ fn concurrent_event_writes_from_two_threads_all_land_without_error() {
             let errors = Arc::clone(&errors);
             thread::spawn(move || {
                 barrier.wait();
-                if let Err(error) = Store::open(&path).and_then(|store| {
+                if let Err(error) = agent_run_store::fixture::open(&path).and_then(|store| {
                     store.event(
                         &worker_id,
                         &format!("concurrent_event_{index}"),
@@ -425,7 +432,7 @@ fn legacy_database_version_is_migrated_on_open() {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/baseline/db/historical-v15.sqlite");
     std::fs::copy(fixture, h.path.join("state.db")).unwrap();
-    let store = Store::open(&h.path).unwrap();
+    let store = agent_run_store::fixture::initialize(&h.path).unwrap();
     assert_eq!(
         store.health().unwrap()["schema_version"],
         agent_run_store::VERSION
@@ -573,7 +580,7 @@ fn open_refuses_v1_tables_with_corrupt_column_shapes() {
     }
     corrupt.pragma_update(None, "user_version", 1).unwrap();
     drop(corrupt);
-    let error = Store::open(&home)
+    let error = agent_run_store::fixture::initialize(&home)
         .err()
         .expect("corrupt column shapes must be refused")
         .to_string();

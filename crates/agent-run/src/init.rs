@@ -1,6 +1,6 @@
 //! Private home initialization compatible with the Python command.
 
-use crate::{Result, config::Config, fs, state::Store};
+use crate::{Result, config::Config, fs, offline};
 use agent_run_domain::error::invalid;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -22,6 +22,9 @@ pub fn initialize(home: &Path) -> Result<Value> {
         return Err(invalid("agent-run home must be a directory"));
     }
     fs::private_dir(home)?;
+    // The exclusive offline authority comes BEFORE any configuration write: a
+    // live or busy home is refused with every file byte-for-byte unchanged.
+    let mut session = offline::acquire(home)?;
     let config = home.join("config.toml");
     if std::fs::symlink_metadata(&config).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(invalid("config.toml must not be a symlink"));
@@ -47,8 +50,9 @@ pub fn initialize(home: &Path) -> Result<Value> {
             ));
         }
     }
-    let store = Store::initialize(home)?;
-    drop(store);
+    // The only way to create or complete the schema is the exclusive offline
+    // authority: no broker, writer or other offline tool may hold the home.
+    session.guard.initialize()?;
     Ok(json!({"home": path(home), "config": path(&config), "state": path(&home.join("state.db"))}))
 }
 

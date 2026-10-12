@@ -4,6 +4,15 @@ A required ownership checkpoint is not a best-effort metric. Native frames may
 advance only after newly captured PID/token/birth identities are durable. A
 storage failure must not become process-death evidence or a successful result.
 
+The failure and slice-based correction below describe versions 0.25.0–0.25.1.
+Version 0.26 routes online mutations through the resident broker's sole
+tokio-rusqlite writer; supervisors keep read-only connections and submit typed
+operations with atomic durable receipts. The writer's acquire allowance is
+250 ms, and producer retries retain the exact operation and original deadline.
+Unknown commits require receipt resolution, never replay of a native action.
+The ownership and recovery-evidence requirements below remain in force.
+See [the current database architecture](architecture.md#durable-state).
+
 ## Failure path and correction
 
 In the 0.25.0 implementation, `supervisor::ownership_writer` used two synchronous

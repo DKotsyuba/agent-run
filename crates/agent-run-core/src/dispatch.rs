@@ -1,11 +1,23 @@
 //! One tool inventory and strict argument decoder for every public transport.
 use crate::{
     Result, agent_identity,
+    broker_writer::BROKER_BUDGET,
     domain::{AgentId, OrchestratorRef},
     error::invalid,
     service::{Query, Service},
 };
 pub use agent_run_domain::tools::{is_tool, tool, tools_json};
+use agent_run_domain::{
+    storage::WriteAuthority,
+    worker::{WorkerCatalogProof, known_pool_catalog},
+};
+use agent_run_store::{
+    ops::{
+        AcceptWorkerFinish, NotifyOrchestrator, PoolOutcome, PoolWrite, PoolWriteSpec,
+        RegisterWorkerCatalog,
+    },
+    writer::{CatalogPreflight, StoreReader},
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -107,32 +119,24 @@ struct Wait {
 /// socket, MCP, and CLI transports can independently render their protocols.
 pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
     match name {
-        agent_run_domain::worker::CATALOG_METHOD => {
-            let proof: agent_run_domain::worker::WorkerCatalogProof = args(raw)?;
-            let home = service.home.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::state::Store::open(&home)?
-                    .register_worker_catalog(&proof, crate::domain::now())?;
-                Ok(json!({"registered":true}))
-            })
-            .await
-            .map_err(|_| crate::Error::Runtime("worker catalog proof failed".into()))?
-        }
+        agent_run_domain::worker::CATALOG_METHOD => register_catalog(service, args(raw)?).await,
         agent_run_domain::worker::METHOD => {
             let call: agent_run_domain::worker::WorkerCall = args(raw)?;
-            let home = service.home.clone();
-            tokio::task::spawn_blocking(move || {
-                let receipt = crate::state::Store::open(&home)?.notify_orchestrator(
-                    &call.run_id,
-                    &call.attempt_id,
-                    &call.token,
-                    &call.input,
-                    crate::domain::now(),
-                )?;
-                Ok(serde_json::to_value(receipt)?)
-            })
-            .await
-            .map_err(|_| crate::Error::Runtime("worker notification failed".into()))?
+            let receipt = service
+                .lane("workers")?
+                .local_as(
+                    worker_authority(&call.run_id, &call.attempt_id),
+                    NotifyOrchestrator {
+                        execution: call.run_id,
+                        attempt: call.attempt_id,
+                        token: call.token,
+                        input: call.input,
+                        at: crate::domain::now(),
+                    },
+                    BROKER_BUDGET,
+                )
+                .await?;
+            Ok(serde_json::to_value(receipt)?)
         }
         agent_run_domain::worker::TOOL_METHOD => {
             let call: agent_run_domain::worker::WorkerToolCall = args(raw)?;
@@ -164,12 +168,12 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
         "cancel" => {
             let a: Id = args(raw)?;
             let row = service.resolve_run(&a.agent_id, a.run_id.as_ref())?;
-            agent_identity::result(&row, service.cancel(&row.id)?)
+            agent_identity::result(&row, service.cancel(&row.id).await?)
         }
         "steer" => {
             let a: Steer = args(raw)?;
             let row = service.resolve_run(&a.agent_id, a.run_id.as_ref())?;
-            agent_identity::result(&row, service.steer(&row.id, &a.text)?)
+            agent_identity::result(&row, service.steer(&row.id, &a.text).await?)
         }
         "answer" => {
             let a: Id = args(raw)?;
@@ -187,10 +191,9 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
         }
         "pool_post" => {
             let request: agent_run_domain::pool::PoolPost = args(raw)?;
-            let service = service.clone();
-            tokio::task::spawn_blocking(move || service.pool_post(request))
-                .await
-                .map_err(|_| crate::Error::Runtime("pool post failed".into()))??
+            service
+                .pool_post(request)
+                .await?
                 .map_err(agent_run_domain::pool::PoolDenial::into_error)
         }
         "pool_replace" => service
@@ -247,11 +250,10 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
                 return Err(invalid("timeout_seconds must be a positive finite number"));
             }
             let row = match a.sequence {
-                Some(sequence) => agent_identity::resolve_sequence(
-                    &crate::state::Store::open(&service.home)?,
-                    &a.agent_id,
-                    sequence,
-                )?,
+                Some(sequence) => {
+                    let reader = StoreReader::open(&service.home)?;
+                    agent_identity::resolve_sequence(&reader, &a.agent_id, sequence)?
+                }
                 None => service.resolve_run(&a.agent_id, a.run_id.as_ref())?,
             };
             let mut result =
@@ -296,18 +298,20 @@ async fn worker_tool_call(
         WorkerTool::Finish => {
             let input: agent_run_domain::worker::FinishRequest = serde_json::from_value(call.input)
                 .map_err(|_| invalid("invalid finish arguments"))?;
-            let home = service.home.clone();
-            let receipt = tokio::task::spawn_blocking(move || {
-                crate::state::Store::open(&home)?.accept_worker_finish(
-                    &call.run_id,
-                    &call.attempt_id,
-                    &call.token,
-                    &input,
-                    crate::domain::now(),
+            let receipt = service
+                .lane("workers")?
+                .local_as(
+                    worker_authority(&call.run_id, &call.attempt_id),
+                    AcceptWorkerFinish {
+                        execution: call.run_id,
+                        attempt: call.attempt_id,
+                        token: call.token,
+                        input,
+                        at: crate::domain::now(),
+                    },
+                    BROKER_BUDGET,
                 )
-            })
-            .await
-            .map_err(|_| crate::Error::Runtime("worker finish failed".into()))??;
+                .await?;
             Ok(serde_json::to_value(receipt)?)
         }
         WorkerTool::SaveReport => {
@@ -315,70 +319,76 @@ async fn worker_tool_call(
                 serde_json::from_value(call.input.clone())
                     .map_err(|_| invalid("invalid save_report arguments"))?;
             let home = service.home.clone();
+            let run_id = call.run_id.clone();
             let receipt = tokio::task::spawn_blocking(move || {
-                crate::research_reports::save(&crate::state::Store::open(&home)?, &call, &input)
+                let reader = StoreReader::open(&home)?;
+                crate::research_reports::save(&reader, &call, &input)
             })
             .await
             .map_err(|_| crate::Error::Runtime("research report write failed".into()))??;
-            Ok(serde_json::to_value(receipt)?)
+            let value = serde_json::to_value(&receipt)?;
+            service
+                .lane("workers")?
+                .event(&run_id, "research_report_saved", value.clone())
+                .await?;
+            Ok(value)
         }
         WorkerTool::Notify => {
             let input: agent_run_domain::worker::NotifyRequest = serde_json::from_value(call.input)
                 .map_err(|_| invalid("unknown, missing, or incorrectly typed report argument"))?;
-            let home = service.home.clone();
-            let (run_id, attempt_id, token) = (
-                call.run_id.clone(),
-                call.attempt_id.clone(),
-                call.token.clone(),
-            );
-            let receipt = tokio::task::spawn_blocking(move || {
-                crate::state::Store::open(&home)?.notify_orchestrator(
-                    &run_id,
-                    &attempt_id,
-                    &token,
-                    &input,
-                    crate::domain::now(),
+            let receipt = service
+                .lane("workers")?
+                .local_as(
+                    worker_authority(&call.run_id, &call.attempt_id),
+                    NotifyOrchestrator {
+                        execution: call.run_id,
+                        attempt: call.attempt_id,
+                        token: call.token,
+                        input,
+                        at: crate::domain::now(),
+                    },
+                    BROKER_BUDGET,
                 )
-            })
-            .await
-            .map_err(|_| crate::Error::Runtime("worker notification failed".into()))??;
+                .await?;
             Ok(serde_json::to_value(receipt)?)
         }
         WorkerTool::PoolPost | WorkerTool::PoolPropose | WorkerTool::PoolVote => {
             let write = match tool {
-                WorkerTool::PoolPost => agent_run_store::pool_log::PoolWrite::Message(
+                WorkerTool::PoolPost => PoolWriteSpec::Message(
                     serde_json::from_value::<PoolMessage>(call.input)
                         .map_err(|_| invalid("invalid pool_post arguments"))?,
                 ),
-                WorkerTool::PoolPropose => agent_run_store::pool_log::PoolWrite::Proposal(
+                WorkerTool::PoolPropose => PoolWriteSpec::Proposal(
                     serde_json::from_value::<PoolPropose>(call.input)
                         .map_err(|_| invalid("invalid pool_propose arguments"))?,
                 ),
-                _ => agent_run_store::pool_log::PoolWrite::Vote(
+                _ => PoolWriteSpec::Vote(
                     serde_json::from_value::<PoolVote>(call.input)
                         .map_err(|_| invalid("invalid pool_vote arguments"))?,
                 ),
             };
-            let home = service.home.clone();
-            let (run_id, attempt_id, token) = (
-                call.run_id.clone(),
-                call.attempt_id.clone(),
-                call.token.clone(),
-            );
-            let outcome = tokio::task::spawn_blocking(move || {
-                crate::state::Store::open(&home)?.pool_write(&run_id, &attempt_id, &token, write)
-            })
-            .await
-            .map_err(|_| crate::Error::Runtime("worker pool write failed".into()))??;
+            let outcome = service
+                .lane("workers")?
+                .local_as(
+                    worker_authority(&call.run_id, &call.attempt_id),
+                    PoolWrite {
+                        execution: call.run_id,
+                        attempt: call.attempt_id,
+                        token: call.token,
+                        write,
+                    },
+                    BROKER_BUDGET,
+                )
+                .await?;
             match outcome {
-                Ok(receipt) => Ok(json!({
+                PoolOutcome::Done(receipt) => Ok(json!({
                     "pool_id": receipt.pool_id,
                     "seq": receipt.seq,
                     "duplicate": receipt.duplicate,
                     "recorded": true,
                     "note": "recorded durably and readable through pool_read; not pushed or read by anyone",
                 })),
-                Err(reason) => denial(reason),
+                PoolOutcome::Denied(reason) => denial(reason),
             }
         }
         WorkerTool::PoolRead => {
@@ -406,7 +416,7 @@ async fn worker_tool_call(
                 );
                 let probe_after = after_seq;
                 let ready = tokio::task::spawn_blocking(move || {
-                    crate::state::Store::open(&home)?.pool_has_entries_after(
+                    StoreReader::open(&home)?.pool_has_entries_after(
                         &run_id,
                         &attempt_id,
                         &token,
@@ -433,7 +443,7 @@ async fn worker_tool_call(
                 call.token.clone(),
             );
             let page = tokio::task::spawn_blocking(move || {
-                crate::state::Store::open(&home)?.pool_read(
+                StoreReader::open(&home)?.pool_read(
                     &run_id,
                     &attempt_id,
                     &token,
@@ -448,6 +458,53 @@ async fn worker_tool_call(
                 Ok(page) => Ok(page),
                 Err(reason) => denial(reason),
             }
+        }
+    }
+}
+
+/// Worker authority of one authenticated tool call (rows 44-47 accept no other).
+fn worker_authority(run: &AgentId, attempt: &str) -> WriteAuthority {
+    WriteAuthority::Worker {
+        execution: run.clone(),
+        attempt: attempt.to_owned(),
+    }
+}
+
+/// Registers one worker's pool catalog proof.
+///
+/// A read-only preflight answers the unauthenticated, conflicting and
+/// already-registered cases with local values; only a first registration
+/// reaches the writer, so a repeat never writes and never fabricates a receipt.
+async fn register_catalog(service: &Service, proof: WorkerCatalogProof) -> Result<Value> {
+    if !known_pool_catalog(proof.version, &proof.digest) {
+        return Err(crate::Error::Unsupported(
+            "worker pool catalog is not supported".into(),
+        ));
+    }
+    let at = crate::domain::now();
+    let home = service.home.clone();
+    let probe = proof.clone();
+    let preflight = tokio::task::spawn_blocking(move || {
+        StoreReader::open(&home)?.worker_catalog_preflight(&probe, at)
+    })
+    .await
+    .map_err(|_| crate::Error::Runtime("worker catalog proof failed".into()))??;
+    match preflight {
+        CatalogPreflight::Unauthenticated => {
+            Err(crate::Error::Validation("invalid worker capability".into()))
+        }
+        CatalogPreflight::Conflict => Err(crate::Error::Conflict),
+        CatalogPreflight::AlreadyRegistered => Ok(json!({"registered":true})),
+        CatalogPreflight::NeedsWrite => {
+            service
+                .lane("workers")?
+                .local_as(
+                    worker_authority(&proof.run_id, &proof.attempt_id),
+                    RegisterWorkerCatalog { proof, at },
+                    BROKER_BUDGET,
+                )
+                .await?;
+            Ok(json!({"registered":true}))
         }
     }
 }

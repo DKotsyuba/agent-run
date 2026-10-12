@@ -114,7 +114,12 @@ fn assert_check(report: &Value, name: &str, status: &str) {
 /// checks, lists no accounts and refuses agent work or schema-1 bootstrapping.
 #[test]
 fn fresh_init_is_an_empty_v2_catalog() {
-    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let temp = tempfile::tempdir_in(
+        std::env::var_os("AGENT_RUN_TEST_TMP")
+            .or_else(|| std::env::var_os("TMPDIR"))
+            .expect("project test temporary directory must be supplied"),
+    )
+    .unwrap();
     let home = temp.path().canonicalize().unwrap().join("home");
     let (ok, init) = run(&home, &["init"]);
     assert!(ok, "{init}");
@@ -195,7 +200,12 @@ fn fresh_init_is_an_empty_v2_catalog() {
 /// doctor proves its own canary while preserving the missing-role failure.
 #[test]
 fn login_resolves_provider_harness_and_bound_account() {
-    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let temp = tempfile::tempdir_in(
+        std::env::var_os("AGENT_RUN_TEST_TMP")
+            .or_else(|| std::env::var_os("TMPDIR"))
+            .expect("project test temporary directory must be supplied"),
+    )
+    .unwrap();
     let home = temp.path().canonicalize().unwrap();
     let log = home.join("calls.log");
     fake(&home.join("fake-codex"), &log);

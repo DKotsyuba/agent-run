@@ -111,7 +111,11 @@ impl Home {
     fn new() -> Self {
         let temp = tempfile::Builder::new()
             .prefix("ar-mig-")
-            .tempdir_in("/tmp")
+            .tempdir_in(
+                std::env::var_os("AGENT_RUN_TEST_TMP")
+                    .or_else(|| std::env::var_os("TMPDIR"))
+                    .expect("project test temporary directory must be supplied"),
+            )
             .unwrap();
         let root = temp.path().canonicalize().unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -247,7 +251,7 @@ fn v2_target_config_migration_preserves_accounts_and_history() {
         fs::read(&target).unwrap()
     );
     assert_eq!(history(&home.root), before_history);
-    let accounts = agent_run::state::Store::open(&home.root)
+    let accounts = agent_run_store::fixture::open(&home.root)
         .unwrap()
         .list_accounts()
         .unwrap();
@@ -570,8 +574,13 @@ fn planning_and_refusals_never_touch_the_old_pair() {
         unchanged(reason);
     }
     let (ok, running) = home.apply("mapping.toml", false);
+    // The fixture's running agent records a legacy owner identity that cannot be
+    // proven gone, so the offline session refuses before the migration's own
+    // active-agent check (covered by the resumed-pair test below).
     assert!(
-        !ok && running.to_string().contains("active agents"),
+        !ok && running
+            .to_string()
+            .contains("recorded startup owner identity is malformed"),
         "{running}"
     );
     unchanged("active agent");
@@ -887,7 +896,12 @@ impl Paused {
 
     /// Starts `args` and waits (at most 30 s) until it reaches `step`.
     fn spawn(home: &Home, step: &str, args: &[&str]) -> Self {
-        let control = tempfile::tempdir_in("/tmp").unwrap();
+        let control = tempfile::tempdir_in(
+            std::env::var_os("AGENT_RUN_TEST_TMP")
+                .or_else(|| std::env::var_os("TMPDIR"))
+                .expect("project test temporary directory must be supplied"),
+        )
+        .unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_agent-run"))
             .arg("--home")
             .arg(&home.root)

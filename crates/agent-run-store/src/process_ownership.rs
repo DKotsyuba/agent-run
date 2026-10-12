@@ -7,7 +7,7 @@ use agent_run_domain::{
     error::{PersistenceOperation, invalid},
 };
 use agent_run_platform::process::{Identity, OwnedProcess, OwnershipSnapshot};
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, params};
 
 /// Validates attempt, service and temporary readiness-probe ownership; identifiers are SQL parameters.
 fn validate_owner(kind: &str, id: &str) -> Result<()> {
@@ -17,7 +17,7 @@ fn validate_owner(kind: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
-impl Store {
+impl Store<'_> {
     /// Adds captured members atomically without changing an existing root or stealing another owner's PID/token.
     ///
     /// `kind` is attempt, service or probe, `id` names an existing durable owner, and
@@ -39,16 +39,13 @@ impl Store {
             return Err(invalid("process ownership snapshot exceeds two MiB"));
         }
         let started = std::time::Instant::now();
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| {
-                Error::persistence(
-                    PersistenceOperation::OwnershipAcquire,
-                    started.elapsed(),
-                    error.into(),
-                )
-            })?;
+        let tx = crate::writer::WriteTx::begin(&self.conn).map_err(|error| {
+            Error::persistence(
+                PersistenceOperation::OwnershipAcquire,
+                started.elapsed(),
+                error,
+            )
+        })?;
         // Statements remain one atomic mutation; any error drops/rolls back the
         // transaction before an async caller can observe it. Only acquire retries.
         let written = (|| -> Result<()> {
@@ -111,7 +108,7 @@ impl Store {
             Error::persistence(
                 PersistenceOperation::OwnershipCommit,
                 started.elapsed(),
-                error.into(),
+                error,
             )
         })?;
         Ok(())

@@ -11,7 +11,7 @@ use serde_json::json;
 use std::collections::BTreeSet;
 
 /// Persist deterministic fresh routes for context-rendering tests.
-fn routes(home: &common::Home, entries: &[(&str, f64)]) {
+async fn routes(home: &common::Home, entries: &[(&str, f64)]) {
     for (index, (runtime, remaining)) in entries.iter().enumerate() {
         let mut config = std::fs::read_to_string(home.path.join("config.toml")).expect("config");
         let section = format!("[runtimes.{}]", toml::Value::String((*runtime).into()));
@@ -62,6 +62,7 @@ fn routes(home: &common::Home, entries: &[(&str, f64)]) {
             },
             1_000,
         )
+        .await
         .expect("fresh context route");
     }
 }
@@ -103,9 +104,11 @@ fn active_agent(home: &common::Home, reference: &OrchestratorRef) {
 }
 
 /// Mirrors `tests/test_bind_hook.py::BindHookTests::test_bound_agent_gets_exactly_one_notice_and_a_rebind_never_resurrects_it`.
-#[test]
-fn python_bind_hook_is_idempotent_and_activates_one_delivery() {
+#[tokio::test]
+async fn python_bind_hook_is_idempotent_and_activates_one_delivery() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let (agent_id, _) = home
         .store()
         .admit(&home.request(), &home.config, &json!({}), None)
@@ -115,12 +118,14 @@ fn python_bind_hook_is_idempotent_and_activates_one_delivery() {
         "hook_event_name":"PostToolUse",
         "tool_response":{"content":[{"text":json!({"agent_id":agent_id.to_string()}).to_string()}]}
     });
-    let first = bind::run_hook(&mut home.store(), &payload, "codex_queue", Some(5.0))
+    let first = bind::run_hook(&home.path, &payload, "codex_queue", Some(5.0))
+        .await
         .expect("raw post-tool hook binds");
     home.store()
         .finish(&agent_id, &Outcome::failure("fixture"), None, None)
         .expect("bound terminal receipt");
-    let second = bind::run_hook(&mut home.store(), &payload, "codex_queue", Some(6.0))
+    let second = bind::run_hook(&home.path, &payload, "codex_queue", Some(6.0))
+        .await
         .expect("same target is idempotent");
     assert_eq!(first.session_id, second.session_id);
     assert!(first.message().contains("is bound"));
@@ -135,20 +140,23 @@ fn python_bind_hook_is_idempotent_and_activates_one_delivery() {
         .expect("one late delivery receipt");
     assert_eq!(delivery, "pending");
     let conflict = bind::run_hook(
-        &mut home.store(),
+        &home.path,
         &json!({"agent_id":agent_id,"transport":"codex_queue","external_session_id":"other"}),
         "codex_queue",
         Some(7.0),
     )
+    .await
     .expect_err("different session is refused loudly");
     assert!(conflict.to_string().contains("NOT confirmed"));
     assert!(conflict.to_string().contains("immutable"));
 }
 
 /// Mirrors `tests/test_bind_hook.py::BindHookTests::test_unbound_terminal_agent_never_gets_a_notice_row`.
-#[test]
-fn unbound_terminal_agent_never_gets_a_notice_row() {
+#[tokio::test]
+async fn unbound_terminal_agent_never_gets_a_notice_row() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let (agent_id, _) = home
         .store()
         .admit(&home.request(), &home.config, &json!({}), None)
@@ -176,16 +184,22 @@ fn unbound_terminal_agent_never_gets_a_notice_row() {
 }
 
 /// Mirrors Python `test_context_hook.py::test_first_prompt_creates_receipt_dedups_and_reuses_later_binding`.
-#[test]
-fn python_context_hook_is_bounded_changed_only_and_session_scoped() {
+#[tokio::test]
+async fn python_context_hook_is_bounded_changed_only_and_session_scoped() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let reference = OrchestratorRef {
         transport: "codex_queue".into(),
         external_session_id: "session-1".into(),
         external_turn_id: Some("turn-1".into()),
     };
-    let first = context::build(&home.path, &reference, Some(1000.0)).expect("first context");
-    let second = context::build(&home.path, &reference, Some(1001.0)).expect("dedup context");
+    let first = context::build(&home.path, &reference, Some(1000.0))
+        .await
+        .expect("first context");
+    let second = context::build(&home.path, &reference, Some(1001.0))
+        .await
+        .expect("dedup context");
     assert!(first.injected);
     assert!(
         first
@@ -202,8 +216,8 @@ fn python_context_hook_is_bounded_changed_only_and_session_scoped() {
 }
 
 /// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_route_identity_is_json_safe_and_aliases_collapse_per_route`.
-#[test]
-fn python_context_hook_rejects_conflicting_raw_agent_ids() {
+#[tokio::test]
+async fn python_context_hook_rejects_conflicting_raw_agent_ids() {
     let error = bind::normalize(
         &json!({"session_id":"session-1","tool_response":[{"agent_id":"ag-20260916-120000-0123456789"},{"agent_id":"ag-20260916-120001-0123456789"}]}),
         true,
@@ -214,16 +228,19 @@ fn python_context_hook_rejects_conflicting_raw_agent_ids() {
 }
 
 /// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_active_appearance_keeps_the_same_priority_budget`.
-#[test]
-fn python_context_active_appearance_keeps_priority_allocation_fixed() {
+#[tokio::test]
+async fn python_context_active_appearance_keeps_priority_allocation_fixed() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let reference = OrchestratorRef {
         transport: "codex_queue".into(),
         external_session_id: "session-1".into(),
         external_turn_id: Some("turn-1".into()),
     };
-    routes(&home, &[("alpha", 90.0)]);
+    routes(&home, &[("alpha", 90.0)]).await;
     let first = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .await
         .expect("priority context");
     let first_priority: String = home
         .store()
@@ -234,6 +251,7 @@ fn python_context_active_appearance_keeps_priority_allocation_fixed() {
         .expect("priority receipt");
     active_agent(&home, &reference);
     let second = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .await
         .expect("active context");
     let second_key: String = home
         .store()
@@ -254,9 +272,11 @@ fn python_context_active_appearance_keeps_priority_allocation_fixed() {
 }
 
 /// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_malformed_component_payloads_are_legacy_not_crashes`.
-#[test]
-fn python_context_malformed_component_receipts_are_replaced_safely() {
+#[tokio::test]
+async fn python_context_malformed_component_receipts_are_replaced_safely() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let reference = OrchestratorRef {
         transport: "codex_queue".into(),
         external_session_id: "session-1".into(),
@@ -313,49 +333,59 @@ fn python_context_malformed_component_receipts_are_replaced_safely() {
 }
 
 /// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_changed_only_priority_resends_after_returning_to_an_order`.
-#[test]
-fn python_context_priority_order_changes_are_a_b_a_and_then_silent() {
+#[tokio::test]
+async fn python_context_priority_order_changes_are_a_b_a_and_then_silent() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let reference = OrchestratorRef {
         transport: "codex_queue".into(),
         external_session_id: "session-1".into(),
         external_turn_id: None,
     };
-    routes(&home, &[("alpha", 90.0), ("beta", 50.0)]);
+    routes(&home, &[("alpha", 90.0), ("beta", 50.0)]).await;
     let first = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .await
         .expect("first context");
     assert!(first.injected, "first={:?}", first);
-    routes(&home, &[("beta", 90.0), ("alpha", 50.0)]);
+    routes(&home, &[("beta", 90.0), ("alpha", 50.0)]).await;
     let second = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .await
         .expect("second context");
     assert!(second.injected && second.text.contains("beta"));
-    routes(&home, &[("alpha", 90.0), ("beta", 50.0)]);
+    routes(&home, &[("alpha", 90.0), ("beta", 50.0)]).await;
     let third = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .await
         .expect("third context");
     assert!(third.injected && third.text.contains("alpha"));
     let silent = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .await
         .expect("silent context");
     assert!(!silent.injected && silent.text.is_empty());
 }
 
 /// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_active_only_change_resends_the_active_block_without_priorities`.
-#[test]
-fn python_context_active_only_change_omits_priority_block() {
+#[tokio::test]
+async fn python_context_active_only_change_omits_priority_block() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let reference = OrchestratorRef {
         transport: "codex_queue".into(),
         external_session_id: "session-1".into(),
         external_turn_id: None,
     };
-    routes(&home, &[("alpha", 90.0)]);
+    routes(&home, &[("alpha", 90.0)]).await;
     active_agent(&home, &reference);
     let first = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .await
         .expect("first context");
     let second = context::build(
         &home.path,
         &reference,
         Some(agent_run_core::domain::now() + 1.0),
     )
+    .await
     .expect("unchanged context");
     assert!(first.injected);
     assert!(!second.injected);
@@ -365,6 +395,7 @@ fn python_context_active_only_change_omits_priority_block() {
         &reference,
         Some(agent_run_core::domain::now() + 2.0),
     )
+    .await
     .expect("tight active context");
     assert!(third.injected);
     assert!(third.text.contains("Active agents"));
@@ -372,17 +403,20 @@ fn python_context_active_only_change_omits_priority_block() {
 }
 
 /// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_zero_budget_writes_no_receipt_and_restored_budget_delivers`.
-#[test]
-fn python_context_zero_budget_writes_no_receipt_then_restores_delivery() {
+#[tokio::test]
+async fn python_context_zero_budget_writes_no_receipt_then_restores_delivery() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let reference = OrchestratorRef {
         transport: "codex_queue".into(),
         external_session_id: "never-bound".into(),
         external_turn_id: None,
     };
-    routes(&home, &[("alpha", 90.0)]);
+    routes(&home, &[("alpha", 90.0)]).await;
     budget(&home, 0);
     let empty = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .await
         .expect("zero-budget context");
     assert_eq!((empty.text, empty.injected), (String::new(), false));
     assert!(empty.orchestrator_session_id.is_none());
@@ -397,23 +431,27 @@ fn python_context_zero_budget_writes_no_receipt_then_restores_delivery() {
     );
     budget(&home, 2_500);
     let restored = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .await
         .expect("restored context");
     assert!(restored.injected);
     assert!(restored.text.contains("Runtime priorities"));
 }
 
 /// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_tight_budget_clips_priority_and_growth_delivers_the_full_summary`.
-#[test]
-fn python_context_tight_budget_hides_then_reveals_priority_lines() {
+#[tokio::test]
+async fn python_context_tight_budget_hides_then_reveals_priority_lines() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let reference = OrchestratorRef {
         transport: "codex_queue".into(),
         external_session_id: "session-1".into(),
         external_turn_id: None,
     };
-    routes(&home, &[("alpha", 90.0), ("beta", 50.0), ("gamma", 10.0)]);
+    routes(&home, &[("alpha", 90.0), ("beta", 50.0), ("gamma", 10.0)]).await;
     budget(&home, 1_000);
     let clipped = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .await
         .expect("clipped context");
     assert!(clipped.injected);
     assert!(clipped.text.contains("More routes omitted"));
@@ -421,23 +459,27 @@ fn python_context_tight_budget_hides_then_reveals_priority_lines() {
     assert!(!clipped.text.contains("beta"));
     budget(&home, 2500);
     let grown = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .await
         .expect("grown context");
     assert!(grown.injected && grown.text.contains("beta"));
     assert!(!grown.text.contains("More routes omitted"));
 }
 
 /// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_legacy_digest_receipt_is_replaced_in_place_and_components_preserved`.
-#[test]
-fn python_context_legacy_receipt_migrates_in_place_and_preserves_components() {
+#[tokio::test]
+async fn python_context_legacy_receipt_migrates_in_place_and_preserves_components() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let reference = OrchestratorRef {
         transport: "codex_queue".into(),
         external_session_id: "session-1".into(),
         external_turn_id: None,
     };
-    routes(&home, &[("alpha", 90.0)]);
+    routes(&home, &[("alpha", 90.0)]).await;
     active_agent(&home, &reference);
     let first = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .await
         .expect("first context");
     let session = first.orchestrator_session_id.expect("session");
     let store = home.store();
@@ -448,7 +490,9 @@ fn python_context_legacy_receipt_migrates_in_place_and_preserves_components() {
             ["a".repeat(64), session.clone()],
         )
         .expect("legacy receipt");
-    let migrated = context::build(&home.path, &reference, Some(1001.0)).expect("migration");
+    let migrated = context::build(&home.path, &reference, Some(1001.0))
+        .await
+        .expect("migration");
     assert!(migrated.injected);
     let key: String = store
         .conn
@@ -467,9 +511,11 @@ fn python_context_legacy_receipt_migrates_in_place_and_preserves_components() {
 }
 
 /// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_sessions_and_transports_keep_independent_receipts`.
-#[test]
-fn python_context_receipts_are_independent_per_transport_and_session() {
+#[tokio::test]
+async fn python_context_receipts_are_independent_per_transport_and_session() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let first = OrchestratorRef {
         transport: "codex_queue".into(),
         external_session_id: "session-1".into(),
@@ -483,10 +529,16 @@ fn python_context_receipts_are_independent_per_transport_and_session() {
         external_session_id: "session-2".into(),
         ..first.clone()
     };
-    routes(&home, &[("alpha", 90.0)]);
-    let a = context::build(&home.path, &first, Some(agent_run_core::domain::now())).unwrap();
-    let b = context::build(&home.path, &transport, Some(agent_run_core::domain::now())).unwrap();
-    let c = context::build(&home.path, &second, Some(agent_run_core::domain::now())).unwrap();
+    routes(&home, &[("alpha", 90.0)]).await;
+    let a = context::build(&home.path, &first, Some(agent_run_core::domain::now()))
+        .await
+        .unwrap();
+    let b = context::build(&home.path, &transport, Some(agent_run_core::domain::now()))
+        .await
+        .unwrap();
+    let c = context::build(&home.path, &second, Some(agent_run_core::domain::now()))
+        .await
+        .unwrap();
     assert_eq!(
         [
             a.orchestrator_session_id,
@@ -510,16 +562,19 @@ fn python_context_receipts_are_independent_per_transport_and_session() {
 }
 
 /// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_concurrent_identical_component_receipts_change_exactly_once`.
-#[test]
-fn python_context_concurrent_identical_receipt_changes_have_one_winner() {
+#[tokio::test]
+async fn python_context_concurrent_identical_receipt_changes_have_one_winner() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let reference = OrchestratorRef {
         transport: "codex_queue".into(),
         external_session_id: "session-1".into(),
         external_turn_id: None,
     };
-    let first =
-        context::build(&home.path, &reference, Some(agent_run_core::domain::now())).unwrap();
+    let first = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .await
+        .unwrap();
     let path = home.path.clone();
     let workers = 4;
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(workers));
@@ -529,7 +584,7 @@ fn python_context_concurrent_identical_receipt_changes_have_one_winner() {
             let path = path.clone();
             let reference = reference.clone();
             std::thread::spawn(move || {
-                let mut store = agent_run_core::state::Store::open(&path).unwrap();
+                let mut store = agent_run_store::fixture::open(&path).unwrap();
                 barrier.wait();
                 store
                     .record_context_components_for_ref(
@@ -554,23 +609,28 @@ fn python_context_concurrent_identical_receipt_changes_have_one_winner() {
 }
 
 /// Mirrors `tests/test_priority_context_regressions.py::HookContextCliTests::test_hook_context_delivers_changes_then_an_empty_payload`.
-#[test]
-fn python_context_hook_cli_delivers_once_then_on_change() {
+#[tokio::test]
+async fn python_context_hook_cli_delivers_once_then_on_change() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let reference = OrchestratorRef {
         transport: "codex_queue".into(),
         external_session_id: "external-cli-1".into(),
         external_turn_id: None,
     };
-    routes(&home, &[("alpha", 90.0)]);
-    let first =
-        context::build(&home.path, &reference, Some(agent_run_core::domain::now())).unwrap();
-    let second =
-        context::build(&home.path, &reference, Some(agent_run_core::domain::now())).unwrap();
+    routes(&home, &[("alpha", 90.0)]).await;
+    let first = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .await
+        .unwrap();
+    let second = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .await
+        .unwrap();
     assert!(first.injected && !second.injected && second.text.is_empty());
-    routes(&home, &[("beta", 50.0)]);
-    let third =
-        context::build(&home.path, &reference, Some(agent_run_core::domain::now())).unwrap();
+    routes(&home, &[("beta", 50.0)]).await;
+    let third = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
+        .await
+        .unwrap();
     assert!(third.injected && third.text.contains("beta"));
 }
 
@@ -605,8 +665,8 @@ fn active_agent_row(home: &common::Home, task: &str, request_id: &str) -> AgentI
 /// an orchestrator reference belongs; Rust's signature makes both unrepresentable,
 /// so the same "only the declared contract is accepted" rule is asserted at the
 /// payload boundary that does accept untyped input.
-#[test]
-fn bind_rejects_arguments_that_are_not_the_declared_contract() {
+#[tokio::test]
+async fn bind_rejects_arguments_that_are_not_the_declared_contract() {
     let listed = json!([["agent_id", "ag-20260916-120000-0123456789"]]);
     assert!(
         bind::normalize(&listed, true, "codex_queue").is_err(),
@@ -641,15 +701,19 @@ fn bind_rejects_arguments_that_are_not_the_declared_contract() {
 /// An orchestrator-backed start binds before the agent finishes, so exactly one
 /// notice is created by the terminal commit; repeating the identical bind later
 /// must not duplicate that row or drag an already delivered notice back.
-#[test]
-fn bound_agent_gets_exactly_one_notice_and_a_rebind_never_resurrects_it() {
+#[tokio::test]
+async fn bound_agent_gets_exactly_one_notice_and_a_rebind_never_resurrects_it() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let (agent_id, _) = home
         .store()
         .admit(&home.request(), &home.config, &json!({}), None)
         .unwrap();
     let mut store = home.store();
-    let first = bind::bind(&mut store, agent_id.clone(), reference(), 1.0).unwrap();
+    let first = bind::bind(&home.path, agent_id.clone(), reference(), 1.0)
+        .await
+        .unwrap();
     store
         .finish(&agent_id, &Outcome::failure("fixture"), None, None)
         .unwrap();
@@ -674,7 +738,9 @@ fn bound_agent_gets_exactly_one_notice_and_a_rebind_never_resurrects_it() {
             [agent_id.as_str()],
         )
         .unwrap();
-    let repeated = bind::bind(&mut store, agent_id.clone(), reference(), 7.0).unwrap();
+    let repeated = bind::bind(&home.path, agent_id.clone(), reference(), 7.0)
+        .await
+        .unwrap();
     assert_eq!(repeated.session_id, first.session_id);
     assert_eq!(
         notices(&store),
@@ -687,9 +753,11 @@ fn bound_agent_gets_exactly_one_notice_and_a_rebind_never_resurrects_it() {
 ///
 /// Binding a live agent only routes its future completion: it must neither
 /// disturb the run nor manufacture a notice before there is a terminal result.
-#[test]
-fn unbound_running_agent_keeps_running_without_a_delivery() {
+#[tokio::test]
+async fn unbound_running_agent_keeps_running_without_a_delivery() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let (agent_id, _) = home
         .store()
         .admit(&home.request(), &home.config, &json!({}), None)
@@ -700,7 +768,9 @@ fn unbound_running_agent_keeps_running_without_a_delivery() {
         store.delivery_status(&agent_id).unwrap()["state"],
         "not_created"
     );
-    bind::bind(&mut store, agent_id.clone(), reference(), 5.0).unwrap();
+    bind::bind(&home.path, agent_id.clone(), reference(), 5.0)
+        .await
+        .unwrap();
     assert_eq!(store.get(&agent_id).unwrap().status, Status::Running);
     assert_eq!(
         store.delivery_status(&agent_id).unwrap()["state"],
@@ -714,11 +784,15 @@ fn unbound_running_agent_keeps_running_without_a_delivery() {
 /// The active block stays inside its own reservation, and its receipt key tracks
 /// agent state rather than elapsed time, so a quiet turn repeats nothing while a
 /// terminal transition still changes the key without re-injecting stale text.
-#[test]
-fn context_bounds_and_dedup_key_is_stable_until_agent_state_changes() {
+#[tokio::test]
+async fn context_bounds_and_dedup_key_is_stable_until_agent_state_changes() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let agent_id = active_agent_row(&home, &format!("summary {}", "x".repeat(100)), "req-bounds");
-    let first = context::build(&home.path, &reference(), Some(1000.0)).expect("first context");
+    let first = context::build(&home.path, &reference(), Some(1000.0))
+        .await
+        .expect("first context");
     assert!(first.orchestrator_session_id.is_some());
     assert!(first.injected);
     assert!(first.text.contains("Active agents (1)"));
@@ -728,7 +802,9 @@ fn context_bounds_and_dedup_key_is_stable_until_agent_state_changes() {
     assert!(active_block.contains("summary"));
     assert!(active_block.contains("do not start replacements for existing ids"));
 
-    let second = context::build(&home.path, &reference(), Some(1030.0)).expect("quiet turn");
+    let second = context::build(&home.path, &reference(), Some(1030.0))
+        .await
+        .expect("quiet turn");
     assert!(!second.injected);
     assert!(second.text.is_empty());
     assert_eq!(second.context_key, first.context_key);
@@ -736,7 +812,9 @@ fn context_bounds_and_dedup_key_is_stable_until_agent_state_changes() {
     home.store()
         .finish(&agent_id, &Outcome::failure("fixture"), None, None)
         .unwrap();
-    let third = context::build(&home.path, &reference(), Some(1041.0)).expect("terminal turn");
+    let third = context::build(&home.path, &reference(), Some(1041.0))
+        .await
+        .expect("terminal turn");
     assert!(!third.injected);
     assert_ne!(third.context_key, first.context_key);
     assert!(!third.text.contains("Active agents"));
@@ -747,9 +825,11 @@ fn context_bounds_and_dedup_key_is_stable_until_agent_state_changes() {
 /// A crowded session is summarized, not truncated at the host: the block names a
 /// bounded number of agents, reports the remainder, and still fits both the hard
 /// limit and the active reservation.
-#[test]
-fn context_budget_is_never_exceeded_with_many_active_agents() {
+#[tokio::test]
+async fn context_budget_is_never_exceeded_with_many_active_agents() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     // The crowd itself is the fixture, so the admission ceiling must not be the
     // thing under test: raise it above the twelve agents this contract needs.
     let path = home.path.join("config.toml");
@@ -758,7 +838,9 @@ fn context_budget_is_never_exceeded_with_many_active_agents() {
     for index in 0..12 {
         active_agent_row(&home, &format!("task {index}"), &format!("req-{index}"));
     }
-    let result = context::build(&home.path, &reference(), Some(2000.0)).expect("crowded context");
+    let result = context::build(&home.path, &reference(), Some(2000.0))
+        .await
+        .expect("crowded context");
     assert!(result.text.contains("Active agents (12)"));
     assert!(result.text.contains("more"));
     assert!(result.text.chars().count() <= context::CONTEXT_HARD_LIMIT_CHARS);
@@ -769,26 +851,34 @@ fn context_budget_is_never_exceeded_with_many_active_agents() {
 
 /// Historical deadline events no longer change active hints; observed silence
 /// still clears immediately when a fresh transcript message arrives.
-#[test]
-fn context_ignores_deadline_warnings_and_tracks_latest_message_time() {
+#[tokio::test]
+async fn context_ignores_deadline_warnings_and_tracks_latest_message_time() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let agent_id = active_agent_row(&home, "summary task", "req-silence");
     let mut store = home.store();
     store.running(&agent_id, std::process::id() as i32).unwrap();
     let started = now();
 
-    let first = context::build(&home.path, &reference(), Some(started + 1.0)).expect("first");
+    let first = context::build(&home.path, &reference(), Some(started + 1.0))
+        .await
+        .expect("first");
     assert!(first.injected);
 
     store
         .event(&agent_id, "deadline_warning", &json!({}))
         .unwrap();
-    let warned = context::build(&home.path, &reference(), Some(started + 2.0)).expect("warned");
+    let warned = context::build(&home.path, &reference(), Some(started + 2.0))
+        .await
+        .expect("warned");
     assert!(!warned.injected);
     assert_eq!(warned.context_key, first.context_key);
     assert!(!warned.text.contains(" warn"));
 
-    let silent = context::build(&home.path, &reference(), Some(started + 120.0)).expect("silent");
+    let silent = context::build(&home.path, &reference(), Some(started + 120.0))
+        .await
+        .expect("silent");
     assert!(silent.injected);
     assert!(silent.text.contains(" silent"));
 
@@ -796,7 +886,9 @@ fn context_ignores_deadline_warnings_and_tracks_latest_message_time() {
         .message(&agent_id, "assistant", "progress", None, None)
         .unwrap();
     let spoke = now();
-    let recovered = context::build(&home.path, &reference(), Some(spoke + 1.0)).expect("recovered");
+    let recovered = context::build(&home.path, &reference(), Some(spoke + 1.0))
+        .await
+        .expect("recovered");
     assert!(recovered.injected);
     assert!(
         !recovered.text.contains(" silent"),
@@ -809,14 +901,16 @@ fn context_ignores_deadline_warnings_and_tracks_latest_message_time() {
 /// member tip atomically and activates the pool's waiting common notice once;
 /// a conflicting member binding changes nothing; other pool replies and a lone
 /// member binding never bind the pool.
-#[test]
-fn start_pool_receipt_binds_the_whole_pool_atomically() {
+#[tokio::test]
+async fn start_pool_receipt_binds_the_whole_pool_atomically() {
     let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
     let config = agent_run_config::config::Config::load(&home.path).unwrap();
     let mut request = home.request();
     request.workdir = home.path.clone();
     request.validate().unwrap();
-    let mut store = agent_run_core::state::Store::open(&home.path).unwrap();
+    let mut store = agent_run_store::fixture::open(&home.path).unwrap();
     let members: Vec<AgentId> = (0..2)
         .map(|_| store.admit(&request, &config, &json!({}), None).unwrap().0)
         .collect();
@@ -860,11 +954,12 @@ fn start_pool_receipt_binds_the_whole_pool_atomically() {
     let structured = json!({"structuredContent": {"pool_id": pool}});
     assert!(
         bind::run_hook_bound(
-            &mut store,
+            &home.path,
             &receipt(structured.clone()),
             "claude_uds",
             Some(2.0)
         )
+        .await
         .is_err()
     );
     let bound: i64 = store
@@ -893,8 +988,9 @@ fn start_pool_receipt_binds_the_whole_pool_atomically() {
             [members[1].as_str()],
         )
         .unwrap();
-    let done =
-        bind::run_hook_bound(&mut store, &receipt(structured), "claude_uds", Some(3.0)).unwrap();
+    let done = bind::run_hook_bound(&home.path, &receipt(structured), "claude_uds", Some(3.0))
+        .await
+        .unwrap();
     assert!(matches!(&done, bind::HookBound::Pool(p) if p.pool_id == pool));
     assert!(done.message().contains("all its members are bound"));
     let sessions: i64 = store

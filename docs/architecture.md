@@ -21,6 +21,7 @@ Unix socket API ───┘                              └─> detached super
 | `agent-run-domain` | public requests, responses, tools, errors, states |
 | `agent-run-config` | strict config, profiles, role plans, snapshots |
 | `agent-run-store` | SQLite schema, migrations, events, projections |
+| `sqlite-access` | Reusable bounded tokio-rusqlite queue, read-only handles, leases and SQL scopes |
 | `agent-run-adapters` | Codex, Claude, and GLM preparation and protocols |
 | `agent-run-core` | service, supervisor, lifecycle, delivery, capacity, doctor |
 | `agent-run-platform` | native launch, process identity, safe files, snapshots |
@@ -59,9 +60,10 @@ session leader, then requires three bounded bootstrap steps:
 2. ownership and native birth identity are committed;
 3. the child reports READY.
 
-Only then does `start` return ownership to the caller. The supervisor opens its
-own store connection, materializes the runtime, starts the engine, journals its
-stream, seals an answer, records terminal evidence, and performs cleanup.
+Only then does `start` return ownership to the caller. The supervisor opens a
+read-only store and an authenticated typed writer connection. It materializes
+the runtime, starts the engine, submits observed stream/ownership evidence to
+the resident writer, seals an answer, records terminal evidence, and performs cleanup.
 
 Both provider and legacy supervisors checkpoint root and descendant identities.
 Legacy success requires confirmed descendant cleanup, rather than an empty group
@@ -69,12 +71,14 @@ alone. Recovery uses an attempt-matching snapshot even if a crash occurred befor
 the agent group field was updated, and persists newly captured members before
 recording an unresolved cleanup. PID/token/birth fences still guard every signal.
 
-Ownership persistence gates native progress. A competing WAL writer may delay
-only an authenticated, idempotent snapshot whose BEGIN IMMEDIATE refused with
-SQLITE_BUSY before any mutation. The unchanged ordinary five-second store
-allowance spans short synchronous slices and transaction-free async waits; its
-clock survives cancelled reads. Writes, commits, SQLITE_LOCKED and arbitrary
-observer failures never replay. Empty command polls and held native wakes remain
+Ownership persistence gates native progress. Online mutations share one bounded
+resident queue and one SQLite writer connection. A foreign WAL writer receives
+a bounded 250 ms acquire wait; authenticated producer lanes may resubmit the
+same operation identity and original deadline after a known pre-mutation refusal.
+An operation and its durable receipt commit atomically. An uncertain commit is
+resolved from its original receipt, never by repeating a model, tool or native
+action. Process observation remains responsive while waiting for SQL. Empty
+command polls and held native wakes remain
 read-only. Before final database writes, each supervisor retains private
 per-attempt cleanup/identity evidence and any sealed candidate separately from
 SQLite. This receipt cannot prove terminal success or authorize signalling;
@@ -125,11 +129,22 @@ require existing canonical directories.
 
 SQLite is the source of truth for agents, events, messages, answers, native
 session lineage, deliveries, cleanup evidence, capacity, and statistics. The
-current schema is version 26. Numbered migrations live in `sql/migrations/`
+current schema is version 30. Numbered migrations live in `sql/migrations/`
 and apply transactionally after a pre-version backup. The step to 17 is paired
 with the schema-2 config: ordinary commands and the broker refuse an older
 database with `migration_required` until `agent-run config migrate` runs. A
 binary refuses a database newer than its supported schema.
+
+The resident broker owns the sole cooperative writer lease. `sqlite-access`
+runs finite SQL callbacks on tokio-rusqlite's thread; accepted job/byte credits
+survive caller cancellation and drain retains the lease until actual closure.
+Typed application operations own authority, ordering, receipts and process
+identity checks. Remote callers cannot submit SQL or closures. `Store::open`
+is read-only and never migrates; initialization and schema upgrades require
+an exclusive offline guard with broker exclusion and proven quiescence.
+No online direct-write fallback exists. History maintenance advances a volatile
+keyset cursor between bounded pages, rechecking complete durable evidence inside
+the writer before deletion. See [the reusable crate](../crates/sqlite-access/README.md).
 
 Schema 25 lays the foundation for cooperative pools (a small roster of
 ordinary executions sharing one goal) with `pools`, `pool_members` and

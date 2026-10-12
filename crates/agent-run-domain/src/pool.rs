@@ -328,7 +328,7 @@ fn validate_criteria(criteria: &[AcceptanceCriterion]) -> Result<()> {
 
 /// A typed refusal of a private pool write or read, carried across the worker
 /// wire as one stable code plus a bounded message instead of prose matching.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PoolDenial {
     /// The authenticated run's lineage holds no current (unreplaced) seat.
     NotPoolMember,

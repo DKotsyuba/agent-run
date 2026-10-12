@@ -347,7 +347,11 @@ impl Pass {
 /// own nonblocking publish lock, so a busy publisher never delays the rest of
 /// retention. Callers should rerun after one second while work remains and
 /// hourly when idle; database expiry keeps its own independent schedule.
-pub fn sweep(home: &Path, now: f64, store: &mut Store) -> Result<usize> {
+pub async fn sweep_on<B: crate::runtime_storage::LayoutBackend>(
+    home: &Path,
+    now: f64,
+    store: &mut B,
+) -> Result<usize> {
     if !now.is_finite() || now < LOG_SECONDS {
         return Err(invalid("filesystem retention requires a finite Unix time"));
     }
@@ -358,12 +362,12 @@ pub fn sweep(home: &Path, now: f64, store: &mut Store) -> Result<usize> {
             "filesystem retention requires an owned home directory",
         ));
     }
-    let mut proof = store.storage_protection_snapshot()?;
+    let mut proof = store.reader().storage_protection_snapshot()?;
     let config = current_config(home, &root)
         .ok_or_else(|| invalid("current configuration cannot prove filesystem retention safety"))?;
     collect_config_paths(&config, &mut proof);
     let mut pass = Pass::new(home, &root)?;
-    run_directories(home, &root, now, &proof, store, &mut pass);
+    run_directories(home, &root, now, &proof, store.reader(), &mut pass);
     standalone_backups(home, &root, now, &proof, &mut pass);
     migration_snapshots(home, &root, now, &proof, &mut pass);
     config_profile_backups(home, &root, now, &config, &proof, &mut pass);
@@ -372,7 +376,8 @@ pub fn sweep(home: &Path, now: f64, store: &mut Store) -> Result<usize> {
     // Shared-store collection reports its own backlog and never fails the
     // retention pass: a busy publish lock or incomplete evidence simply
     // retries on the next cycle, while everything above still makes progress.
-    let collected = crate::storage_gc::sweep(store, home, crate::storage_gc::Mode::Apply)
+    let collected = crate::storage_gc::sweep_on(store, home, crate::storage_gc::Mode::Apply)
+        .await
         .map(|outcome| (outcome.removed(), outcome.backlog()))
         .unwrap_or((0, true));
     pass.removed += collected.0;
@@ -1222,6 +1227,11 @@ fn drain(dir: &fs::Dir, preserve_complete: bool, depth: usize, pass: &mut Pass) 
     empty
 }
 
+/// [`sweep_on`] over a raw store held under the caller's offline authority.
+pub fn sweep(home: &Path, now: f64, store: &mut Store) -> Result<usize> {
+    crate::runtime_storage::ready(sweep_on(home, now, store))
+}
+
 #[cfg(test)]
 /// Retention and socket probes use private fixtures and never launch a model process.
 mod tests {
@@ -1234,8 +1244,8 @@ mod tests {
     #[test]
     fn count_collection_rechecks_admission_after_protection_capture() {
         let home = tempfile::tempdir().unwrap();
-        Store::initialize(home.path()).unwrap();
-        let store = Store::open(home.path()).unwrap();
+        agent_run_store::fixture::initialize(home.path()).unwrap();
+        let store = agent_run_store::fixture::open(home.path()).unwrap();
         let at = 2_000_000_000.0;
         for index in 0..100 {
             let id = format!("ag-20330518-040000-{index:010x}");
@@ -1287,8 +1297,8 @@ mod tests {
         let queued = std::os::unix::net::UnixStream::connect(&path).unwrap();
         assert!(!matches!(probe_socket(&path), Ok(false)));
         let root = fs::Dir::open(home.path()).unwrap();
-        Store::initialize(home.path()).unwrap();
-        let store = Store::open(home.path()).unwrap();
+        agent_run_store::fixture::initialize(home.path()).unwrap();
+        let store = agent_run_store::fixture::open(home.path()).unwrap();
         let proof = store.storage_protection_snapshot().unwrap();
         let mut pass = Pass::new(home.path(), &root).unwrap();
         stale_sockets(home.path(), &root, &proof, &mut pass);

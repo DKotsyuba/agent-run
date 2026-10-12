@@ -55,12 +55,15 @@ async fn ownership_failure_is_typed_and_control_acceptance_stays_uncertain() {
     let mut fixture = Fixture(Process::spawn(&engine("printf '{}\\n'")).unwrap());
     let initial = fixture
         .0
-        .observe_ownership(|_| {
-            Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "SOURCE_SECRET",
-            )))
-        })
+        .observe_ownership(Box::new(|_| {
+            Box::pin(async {
+                Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "SOURCE_SECRET",
+                )))
+            })
+        }))
+        .await
         .unwrap_err();
     assert!(matches!(
         initial,
@@ -94,7 +97,8 @@ async fn ownership_failure_is_typed_and_control_acceptance_stays_uncertain() {
     }
     let final_error = fixture
         .0
-        .checkpoint_ownership_at(OwnershipStage::Final)
+        .checkpoint_ownership_ready(OwnershipStage::Final)
+        .await
         .unwrap_err();
     assert!(matches!(
         final_error,

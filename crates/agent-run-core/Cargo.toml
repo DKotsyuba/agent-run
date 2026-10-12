@@ -7,6 +7,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+sqlite-access = { path = "../sqlite-access" }
 agent-run-adapters = { path = "../agent-run-adapters" }
 agent-run-config = { path = "../agent-run-config" }
 agent-run-domain = { path = "../agent-run-domain" }
@@ -28,9 +29,11 @@ uuid.workspace = true
 
 [features]
 # Exposes deterministic test seams (never enabled in production builds).
-test-fixtures = []
+test-fixtures = ["agent-run-store/test-fixtures"]
 
 [dev-dependencies]
+# Fenced raw store access for test fixtures; never part of a production build.
+agent-run-store = { path = "../agent-run-store", features = ["test-fixtures"] }
 tempfile.workspace = true
 toml.workspace = true
 

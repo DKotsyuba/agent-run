@@ -1,4 +1,5 @@
 //! Offline mixed-pool contract proofs; no engine/provider is launched.
+mod common;
 use agent_run_core::service::Service;
 use agent_run_domain::{
     catalog::{AccountRecord, AccountStatus},
@@ -6,7 +7,7 @@ use agent_run_domain::{
     pool::{PoolMessage, PoolPropose, PoolStartRequest},
     worker::WorkerCatalogProof,
 };
-use agent_run_store::{Store, pool_log::PoolWrite};
+use agent_run_store::pool_log::PoolWrite;
 use rusqlite::params;
 use serde_json::{Value, json};
 use std::{fs, path::PathBuf};
@@ -29,14 +30,14 @@ struct Fixture {
 impl Fixture {
     /// Admits one independent execution, then models verified local ownership
     /// and an actual-catalog registration for storage-level boundary tests.
-    fn new(binding: Option<OrchestratorRef>, cap: usize) -> Self {
+    async fn new(binding: Option<OrchestratorRef>, cap: usize) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
-        Store::initialize(&root).unwrap();
+        agent_run_store::fixture::initialize(&root).unwrap();
         fs::create_dir_all(root.join("profiles")).unwrap();
         fs::write(root.join("profiles/review.md"),"+++\nrevision=\"1\"\nwrite=false\nnetwork=false\nallow_external_read_roots=false\nskills=[]\nmcp=[]\nrequired_constraints=[]\n+++\nReview.\n").unwrap();
         fs::write(root.join("config.toml"),format!("schema_version=2\n[core]\nmax_active_agents={cap}\n[harnesses.codex]\nbinary=\"/usr/bin/true\"\nhome=\"{}\"\n[harnesses.claude-code]\nbinary=\"/usr/bin/true\"\nhome=\"{}\"\n[providers.codex]\nharness=\"codex\"\nconnection={{kind=\"native\"}}\nauth_family=\"openai\"\nlimits_source=\"none\"\n[[providers.codex.models]]\nid=\"m\"\n[[providers.codex.bindings]]\nlabel=\"test\"\naccount=\"acct\"\n",root.join("codex").display(),root.join("claude").display())).unwrap();
-        let mut store = Store::open(&root).unwrap();
+        let mut store = agent_run_store::fixture::open(&root).unwrap();
         store
             .register_account(&AccountRecord {
                 account_id: "acct".parse().unwrap(),
@@ -46,9 +47,10 @@ impl Fixture {
             })
             .unwrap();
         agent_run_config::provider_config::ProviderConfig::load(&root).unwrap();
-        let service = Service::new(root.clone());
+        let writer = common::writer::Harness::start(&root);
+        let service = Service::new(root.clone()).with_writer(writer.broker());
         let request=serde_json::from_value(json!({"provider":"codex","model":"m","profile":"review","task":"Keep current independent work.","workdir":root,"display_name":"existing","orchestrator":binding})).unwrap();
-        let admitted = service.admit_provider(request).unwrap();
+        let admitted = service.admit_provider(request).await.unwrap();
         let agent: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
         let attempt: String = store
             .conn
@@ -110,7 +112,7 @@ impl Fixture {
 
     /// Captures immutable execution/session/grant/account/reservation facts.
     fn snapshot(&self) -> Value {
-        let store = Store::open(&self.root).unwrap();
+        let store = agent_run_store::fixture::open(&self.root).unwrap();
         let row = store.get(&self.agent).unwrap();
         let account: Option<String> = store
             .conn
@@ -142,7 +144,7 @@ impl Fixture {
 
     /// Reads the opaque challenge for this fixture member from the isolated store.
     fn challenge(&self) -> String {
-        Store::open(&self.root)
+        agent_run_store::fixture::open(&self.root)
             .unwrap()
             .conn
             .query_row(
@@ -156,17 +158,17 @@ impl Fixture {
 
 /// Mixed admission preserves every existing execution fact and marks only new
 /// tasks for launch; duplicate replay survives later terminal state.
-#[test]
-fn mixed_preserves_existing_and_replays_after_exit() {
-    let f = Fixture::new(None, 8);
+#[tokio::test]
+async fn mixed_preserves_existing_and_replays_after_exit() {
+    let f = Fixture::new(None, 8).await;
     let before = f.snapshot();
     let request = f.request("mixed", 1, None);
-    let pool = f.service.admit_pool(request.clone()).unwrap();
+    let pool = f.service.admit_pool(request.clone()).await.unwrap();
     assert_eq!(pool["members"][0]["agent_id"], json!(f.agent));
     assert_eq!(pool["members"][0]["existing"], true);
     assert_eq!(pool["members"][0]["enrollment"]["state"], "pending");
     assert_eq!(before, f.snapshot());
-    let mut store = Store::open(&f.root).unwrap();
+    let mut store = agent_run_store::fixture::open(&f.root).unwrap();
     assert_eq!(
         store
             .conn
@@ -201,12 +203,12 @@ fn mixed_preserves_existing_and_replays_after_exit() {
             params![agent_run_core::domain::now(), f.agent.as_str()],
         )
         .unwrap();
-    let replay = f.service.admit_pool(request.clone()).unwrap();
+    let replay = f.service.admit_pool(request.clone()).await.unwrap();
     assert_eq!(replay["created"], false);
     assert_eq!(replay["pool_id"], pool["pool_id"]);
     let mut conflict = request;
     conflict.goal = "Different goal".into();
-    assert!(f.service.admit_pool(conflict).is_err());
+    assert!(f.service.admit_pool(conflict).await.is_err());
     assert!(
         store
             .settle_pool(&serde_json::from_value(pool["pool_id"].clone()).unwrap())
@@ -217,17 +219,18 @@ fn mixed_preserves_existing_and_replays_after_exit() {
 
 /// Existing capacity is counted once: a later new-member cap failure rolls
 /// back the entire batch without changing the independent worker.
-#[test]
-fn mixed_atomic_cap_failure_rolls_back() {
-    let f = Fixture::new(None, 2);
+#[tokio::test]
+async fn mixed_atomic_cap_failure_rolls_back() {
+    let f = Fixture::new(None, 2).await;
     let before = f.snapshot();
     assert!(
         f.service
             .admit_pool(f.request("rollback", 2, None))
+            .await
             .is_err()
     );
     assert_eq!(before, f.snapshot());
-    let store = Store::open(&f.root).unwrap();
+    let store = agent_run_store::fixture::open(&f.root).unwrap();
     assert_eq!(
         store
             .conn
@@ -257,11 +260,15 @@ fn mixed_atomic_cap_failure_rolls_back() {
 
 /// ACK requires the exact current capability/challenge, records one summary
 /// and becomes idempotent; unacknowledged proposals/settlement are refused.
-#[test]
-fn ack_wrong_missing_replayed_and_expired_are_closed() {
-    let f = Fixture::new(None, 8);
-    let pool = f.service.admit_pool(f.request("ack", 1, None)).unwrap();
-    let mut store = Store::open(&f.root).unwrap();
+#[tokio::test]
+async fn ack_wrong_missing_replayed_and_expired_are_closed() {
+    let f = Fixture::new(None, 8).await;
+    let pool = f
+        .service
+        .admit_pool(f.request("ack", 1, None))
+        .await
+        .unwrap();
+    let mut store = agent_run_store::fixture::open(&f.root).unwrap();
     let propose = PoolWrite::Proposal(PoolPropose {
         request_id: "p".into(),
         message: "ready".into(),
@@ -331,40 +338,43 @@ fn ack_wrong_missing_replayed_and_expired_are_closed() {
 
 /// Binding inference avoids extra manual hook steps; explicit incompatible
 /// binding refuses without altering the existing destination.
-#[test]
-fn binding_inference_and_unbound_explicit_are_consistent() {
+#[tokio::test]
+async fn binding_inference_and_unbound_explicit_are_consistent() {
     let bound = OrchestratorRef {
         transport: "codex_queue".into(),
         external_session_id: "chat".into(),
         external_turn_id: Some("turn".into()),
     };
-    let f = Fixture::new(Some(bound.clone()), 8);
+    let f = Fixture::new(Some(bound.clone()), 8).await;
     let pool = f
         .service
         .admit_pool(f.request("inferred", 1, None))
+        .await
         .unwrap();
     assert_eq!(pool["bound"], true);
-    let f = Fixture::new(None, 8);
+    let f = Fixture::new(None, 8).await;
     let pool = f
         .service
         .admit_pool(f.request("explicit", 1, Some(bound.clone())))
+        .await
         .unwrap();
     assert_eq!(pool["bound"], true);
     assert!(
-        Store::open(&f.root)
+        agent_run_store::fixture::open(&f.root)
             .unwrap()
             .get(&f.agent)
             .unwrap()
             .orchestrator_session_id
             .is_some()
     );
-    let f = Fixture::new(None, 8);
+    let f = Fixture::new(None, 8).await;
     let pool = f
         .service
         .admit_pool(f.request("auto-hook", 1, None))
+        .await
         .unwrap();
     assert_eq!(pool["bound"], false);
-    let mut store = Store::open(&f.root).unwrap();
+    let mut store = agent_run_store::fixture::open(&f.root).unwrap();
     store
         .bind_pool(
             &serde_json::from_value(pool["pool_id"].clone()).unwrap(),
@@ -385,7 +395,7 @@ fn binding_inference_and_unbound_explicit_are_consistent() {
             .unwrap()
             .is_none()
     );
-    let f = Fixture::new(Some(bound), 8);
+    let f = Fixture::new(Some(bound), 8).await;
     let different = OrchestratorRef {
         transport: "codex_queue".into(),
         external_session_id: "other".into(),
@@ -394,23 +404,37 @@ fn binding_inference_and_unbound_explicit_are_consistent() {
     assert!(
         f.service
             .admit_pool(f.request("wrong-bind", 1, Some(different)))
+            .await
             .is_err()
     );
 }
 
 /// Unknown actual catalog proof, historical independence, terminal workers,
 /// and prior membership cannot be silently assumed attachable.
-#[test]
-fn unsupported_terminal_and_prior_pool_are_refused() {
-    let f = Fixture::new(None, 8);
-    let store = Store::open(&f.root).unwrap();
+#[tokio::test]
+async fn unsupported_terminal_and_prior_pool_are_refused() {
+    let f = Fixture::new(None, 8).await;
+    let store = agent_run_store::fixture::open(&f.root).unwrap();
     store.conn.execute("UPDATE worker_capabilities SET pool_catalog_digest=NULL,pool_catalog_version=NULL WHERE attempt_id=?",[&f.attempt]).unwrap();
-    assert!(f.service.admit_pool(f.request("unknown", 1, None)).is_err());
-    let f = Fixture::new(None, 8);
-    f.service.admit_pool(f.request("first", 1, None)).unwrap();
-    assert!(f.service.admit_pool(f.request("second", 1, None)).is_err());
-    let f = Fixture::new(None, 8);
-    Store::open(&f.root)
+    assert!(
+        f.service
+            .admit_pool(f.request("unknown", 1, None))
+            .await
+            .is_err()
+    );
+    let f = Fixture::new(None, 8).await;
+    f.service
+        .admit_pool(f.request("first", 1, None))
+        .await
+        .unwrap();
+    assert!(
+        f.service
+            .admit_pool(f.request("second", 1, None))
+            .await
+            .is_err()
+    );
+    let f = Fixture::new(None, 8).await;
+    agent_run_store::fixture::open(&f.root)
         .unwrap()
         .conn
         .execute(
@@ -421,16 +445,17 @@ fn unsupported_terminal_and_prior_pool_are_refused() {
     assert!(
         f.service
             .admit_pool(f.request("terminal", 1, None))
+            .await
             .is_err()
     );
 }
 
 /// An arbitrarily old still-owned worker can join and acknowledge. Authentication
 /// remains pinned to its exact attempt/token/challenge; no lifetime is renewed.
-#[test]
-fn old_active_worker_can_join_and_ack_without_expiry() {
-    let f = Fixture::new(None, 8);
-    let mut store = Store::open(&f.root).unwrap();
+#[tokio::test]
+async fn old_active_worker_can_join_and_ack_without_expiry() {
+    let f = Fixture::new(None, 8).await;
+    let mut store = agent_run_store::fixture::open(&f.root).unwrap();
     store
         .conn
         .execute(
@@ -439,7 +464,11 @@ fn old_active_worker_can_join_and_ack_without_expiry() {
         )
         .unwrap();
     let before = f.snapshot();
-    let pool = f.service.admit_pool(f.request("aged", 1, None)).unwrap();
+    let pool = f
+        .service
+        .admit_pool(f.request("aged", 1, None))
+        .await
+        .unwrap();
     assert_eq!(f.snapshot(), before);
     let id = serde_json::from_value(pool["pool_id"].clone()).unwrap();
     store.reconcile_pool_enrollments(&id).unwrap();
@@ -471,14 +500,15 @@ fn old_active_worker_can_join_and_ack_without_expiry() {
 
 /// A replacement attempt on the same execution cannot use the old enrollment
 /// challenge, and the previous token loses authority immediately.
-#[test]
-fn new_attempt_cannot_ack_old_pinned_enrollment() {
-    let f = Fixture::new(None, 8);
+#[tokio::test]
+async fn new_attempt_cannot_ack_old_pinned_enrollment() {
+    let f = Fixture::new(None, 8).await;
     f.service
         .admit_pool(f.request("attempt-race", 1, None))
+        .await
         .unwrap();
     let challenge = f.challenge();
-    let mut store = Store::open(&f.root).unwrap();
+    let mut store = agent_run_store::fixture::open(&f.root).unwrap();
     let at = agent_run_core::domain::now();
     store
         .conn
@@ -509,10 +539,10 @@ fn new_attempt_cannot_ack_old_pinned_enrollment() {
 
 /// Actual catalog registration permits owned STARTING and keeps the first
 /// observed proof timestamp on legitimate identical retries.
-#[test]
-fn catalog_starting_registration_is_idempotent_and_unknown_is_not_upgraded() {
-    let f = Fixture::new(None, 8);
-    let mut store = Store::open(&f.root).unwrap();
+#[tokio::test]
+async fn catalog_starting_registration_is_idempotent_and_unknown_is_not_upgraded() {
+    let f = Fixture::new(None, 8).await;
+    let mut store = agent_run_store::fixture::open(&f.root).unwrap();
     store
         .conn
         .execute(
@@ -567,16 +597,16 @@ fn catalog_starting_registration_is_idempotent_and_unknown_is_not_upgraded() {
 
 /// The exact preflight attempt is rechecked under the write transaction:
 /// a concurrent exit rolls back the whole all-existing batch without membership.
-#[test]
-fn atomic_existing_exit_race_leaves_every_worker_independent() {
+#[tokio::test]
+async fn atomic_existing_exit_race_leaves_every_worker_independent() {
     use agent_run_store::pool_admission::{
         PoolAdmissionInput, PoolAdmissionSource, PoolMemberAdmission,
     };
-    let f = Fixture::new(None, 8);
+    let f = Fixture::new(None, 8).await;
     let request=serde_json::from_value(json!({"provider":"codex","model":"m","profile":"review","task":"other independent","workdir":f.root,"display_name":"other"})).unwrap();
-    let admitted = f.service.admit_provider(request).unwrap();
+    let admitted = f.service.admit_provider(request).await.unwrap();
     let other: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
-    let mut store = Store::open(&f.root).unwrap();
+    let mut store = agent_run_store::fixture::open(&f.root).unwrap();
     let attempt: String = store
         .conn
         .query_row(
@@ -676,14 +706,15 @@ fn atomic_existing_exit_race_leaves_every_worker_independent() {
 
 /// Active enrollment/ACK references fence retention and history deletion until
 /// the overlay is removed by eligible pool GC; lifetime membership remains set.
-#[test]
-fn enrollment_references_and_lifetime_marker_survive_history_gc() {
-    let f = Fixture::new(None, 8);
+#[tokio::test]
+async fn enrollment_references_and_lifetime_marker_survive_history_gc() {
+    let f = Fixture::new(None, 8).await;
     let pool = f
         .service
         .admit_pool(f.request("retention", 1, None))
+        .await
         .unwrap();
-    let mut store = Store::open(&f.root).unwrap();
+    let mut store = agent_run_store::fixture::open(&f.root).unwrap();
     let ack = PoolWrite::Message(PoolMessage {
         request_id: f.challenge(),
         message: "Current summary".into(),
@@ -764,16 +795,20 @@ fn enrollment_references_and_lifetime_marker_survive_history_gc() {
 
 /// A transport rejection leaves a retryable active challenge and queues one
 /// attention; later authenticated ACK resolves the queued attention safely.
-#[test]
-fn active_join_failure_is_visible_retryable_and_attention_is_idempotent() {
+#[tokio::test]
+async fn active_join_failure_is_visible_retryable_and_attention_is_idempotent() {
     let binding = OrchestratorRef {
         transport: "codex_queue".into(),
         external_session_id: "chat".into(),
         external_turn_id: None,
     };
-    let f = Fixture::new(Some(binding), 8);
-    let pool = f.service.admit_pool(f.request("recover", 1, None)).unwrap();
-    let mut store = Store::open(&f.root).unwrap();
+    let f = Fixture::new(Some(binding), 8).await;
+    let pool = f
+        .service
+        .admit_pool(f.request("recover", 1, None))
+        .await
+        .unwrap();
+    let mut store = agent_run_store::fixture::open(&f.root).unwrap();
     store.conn.execute("UPDATE commands SET state='completed',result_json='{\"accepted\":false}' WHERE agent_id=? AND kind='steer'",[f.agent.as_str()]).unwrap();
     let id = serde_json::from_value(pool["pool_id"].clone()).unwrap();
     store.reconcile_pool_enrollments(&id).unwrap();
@@ -818,11 +853,12 @@ fn active_join_failure_is_visible_retryable_and_attention_is_idempotent() {
 
 /// Reserved ACK receipts remain pinned after JOINED, while ordinary messages
 /// from a legitimate later attempt/run retain existing lineage semantics.
-#[test]
-fn joined_ack_cannot_replay_from_new_attempt_or_resumed_run() {
-    let f = Fixture::new(None, 8);
+#[tokio::test]
+async fn joined_ack_cannot_replay_from_new_attempt_or_resumed_run() {
+    let f = Fixture::new(None, 8).await;
     f.service
         .admit_pool(f.request("joined-replay", 1, None))
+        .await
         .unwrap();
     let key = f.challenge();
     let ack = || {
@@ -831,7 +867,7 @@ fn joined_ack_cannot_replay_from_new_attempt_or_resumed_run() {
             message: "Current summary".into(),
         })
     };
-    let mut store = Store::open(&f.root).unwrap();
+    let mut store = agent_run_store::fixture::open(&f.root).unwrap();
     let original = store
         .pool_write(&f.agent, &f.attempt, &f.token, ack())
         .unwrap()
@@ -934,19 +970,25 @@ fn joined_ack_cannot_replay_from_new_attempt_or_resumed_run() {
 
 /// The central membership trigger also covers real replacement admission and
 /// keeps both roots permanently marked after pool history is collected.
-#[test]
-fn replacement_members_keep_lifetime_marker_after_pool_gc() {
-    let f = Fixture::new(None, 8);
+#[tokio::test]
+async fn replacement_members_keep_lifetime_marker_after_pool_gc() {
+    let f = Fixture::new(None, 8).await;
     let pool = f
         .service
         .admit_pool(f.request("replacement-marker", 1, None))
+        .await
         .unwrap();
-    let store = Store::open(&f.root).unwrap();
+    let store = agent_run_store::fixture::open(&f.root).unwrap();
     let at = agent_run_core::domain::now();
     store.conn.execute("UPDATE agents SET status='failed',finished_at=?,supervisor_pid=NULL,supervisor_identity=NULL,supervisor_birth_time=NULL WHERE id=?",params![at,f.agent.as_str()]).unwrap();
     store.conn.execute("UPDATE attempts SET state='failed',finished_at=?,ownership_active=0,phase='cleanup_complete',cleanup_proof_json='{}' WHERE id=?",params![at,f.attempt]).unwrap();
     let request=serde_json::from_value(json!({"pool_id":pool["pool_id"],"agent_id":f.agent,"request_id":"replace","start":{"provider":"codex","model":"m","profile":"review","task":"Replacement bounded work","workdir":f.root,"display_name":"replacement"}})).unwrap();
-    let replacement = f.service.admit_pool_replacement(request).unwrap().unwrap();
+    let replacement = f
+        .service
+        .admit_pool_replacement(request)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         store
             .conn
@@ -996,14 +1038,15 @@ fn replacement_members_keep_lifetime_marker_after_pool_gc() {
 
 /// An already queued individual terminal error communicates the failed join;
 /// enrollment remains visible without creating a duplicate attention notice.
-#[test]
-fn terminal_error_notice_suppresses_duplicate_join_attention() {
-    let f = Fixture::new(None, 8);
+#[tokio::test]
+async fn terminal_error_notice_suppresses_duplicate_join_attention() {
+    let f = Fixture::new(None, 8).await;
     let pool = f
         .service
         .admit_pool(f.request("suppressed", 1, None))
+        .await
         .unwrap();
-    let mut store = Store::open(&f.root).unwrap();
+    let mut store = agent_run_store::fixture::open(&f.root).unwrap();
     let at = agent_run_core::domain::now();
     store
         .conn
@@ -1054,15 +1097,16 @@ fn terminal_error_notice_suppresses_duplicate_join_attention() {
 
 /// Delivery GC clears the transient link without resetting the permanent
 /// issued marker or creating another attention for the same pinned enrollment.
-#[test]
-fn attention_delivery_gc_does_not_reissue_join_notice() {
-    let f = Fixture::new(None, 8);
+#[tokio::test]
+async fn attention_delivery_gc_does_not_reissue_join_notice() {
+    let f = Fixture::new(None, 8).await;
     let pool = f
         .service
         .admit_pool(f.request("attention-gc", 1, None))
+        .await
         .unwrap();
     let id = serde_json::from_value(pool["pool_id"].clone()).unwrap();
-    let mut store = Store::open(&f.root).unwrap();
+    let mut store = agent_run_store::fixture::open(&f.root).unwrap();
     store.conn.execute("UPDATE commands SET state='completed',result_json='{\"accepted\":false}' WHERE agent_id=? AND kind='steer'",[f.agent.as_str()]).unwrap();
     store.reconcile_pool_enrollments(&id).unwrap();
     let delivery: String = store
@@ -1122,8 +1166,8 @@ fn attention_delivery_gc_does_not_reissue_join_notice() {
 /// Holds another WAL writer and uses a zero busy budget as a strict proof that
 /// an unchanged settlement path never asks SQLite for a writer reservation.
 fn assert_settlement_uses_only_reads(f: &Fixture, pool: &Value) {
-    let mut store = Store::open(&f.root).unwrap();
-    let mut writer = Store::open(&f.root).unwrap();
+    let mut store = agent_run_store::fixture::open(&f.root).unwrap();
+    let mut writer = agent_run_store::fixture::open(&f.root).unwrap();
     assert_eq!(
         store
             .conn
@@ -1147,21 +1191,22 @@ fn assert_settlement_uses_only_reads(f: &Fixture, pool: &Value) {
 
 /// New-only pools and healthy pending enrollment do not acquire a per-tick
 /// writer lock; a previously recorded identical join failure is read-only too.
-#[test]
-fn unchanged_pool_settlement_does_not_reserve_wal_writer() {
-    let f = Fixture::new(None, 8);
+#[tokio::test]
+async fn unchanged_pool_settlement_does_not_reserve_wal_writer() {
+    let f = Fixture::new(None, 8).await;
     let mut request = f.request("pure-new-wal", 2, None);
     request.members.remove(0);
-    let pool = f.service.admit_pool(request).unwrap();
+    let pool = f.service.admit_pool(request).await.unwrap();
     assert_settlement_uses_only_reads(&f, &pool);
 
-    let f = Fixture::new(None, 8);
+    let f = Fixture::new(None, 8).await;
     let pool = f
         .service
         .admit_pool(f.request("pending-wal", 1, None))
+        .await
         .unwrap();
     assert_settlement_uses_only_reads(&f, &pool);
-    let mut store = Store::open(&f.root).unwrap();
+    let mut store = agent_run_store::fixture::open(&f.root).unwrap();
     store.conn.execute("UPDATE commands SET state='completed',result_json='{\"accepted\":false}' WHERE agent_id=? AND kind='steer'",[f.agent.as_str()]).unwrap();
     store
         .reconcile_pool_enrollments(&serde_json::from_value(pool["pool_id"].clone()).unwrap())

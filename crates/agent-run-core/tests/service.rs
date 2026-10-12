@@ -181,7 +181,8 @@ async fn list_has_bounded_explicit_pagination() {
 #[tokio::test]
 async fn python_test_service_opencode_start_has_migration_guidance() {
     let home = common::Home::new();
-    let service = Service::new(home.path.clone());
+    let writer = common::writer::Harness::start(&home.path);
+    let service = Service::new(home.path.clone()).with_writer(writer.broker());
     let mut request = home.request();
     request.runtime = "opencode".into();
     let error = service.start(request).await.unwrap_err();
@@ -199,7 +200,8 @@ async fn python_test_service_opencode_start_has_migration_guidance() {
 #[tokio::test]
 async fn start_replays_historical_alias_fingerprint_and_session_row() {
     let home = common::Home::new();
-    let service = Service::new(home.path.clone());
+    let writer = common::writer::Harness::start(&home.path);
+    let service = Service::new(home.path.clone()).with_writer(writer.broker());
     let mut original = home.request();
     original.request_id = Some("old-codex-request".into());
     original.orchestrator = Some(OrchestratorRef {
@@ -857,7 +859,7 @@ async fn list_wakes_on_journal_progress_via_message_revision() {
         let home = home.path.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let store = agent_run_core::state::Store::open(&home).unwrap();
+            let store = agent_run_store::fixture::open(&home).unwrap();
             store
                 .message(&id, "assistant", "progress", None, None)
                 .unwrap();

@@ -13,7 +13,7 @@ use agent_run_domain::{
 use rusqlite::OptionalExtension;
 use std::{
     fs,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::fd::{AsRawFd, FromRawFd},
     path::Path,
     process::Stdio,
     time::Duration,
@@ -31,7 +31,7 @@ fn isolated_sync_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::
     let mut command = std::process::Command::new(program);
     command.env_remove("AGENT_RUN_HOME");
     for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("AGENT_RUN_WORKER_") {
+        if name.to_string_lossy().starts_with("AGENT_RUN_") {
             command.env_remove(name);
         }
     }
@@ -46,65 +46,25 @@ fn isolated_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 #[path = "provider_initial/sqlite_busy.rs"]
 mod sqlite_busy;
 
-/// Duplicates one inert test descriptor above the supervisor bootstrap range.
-fn bootstrap_fd() -> OwnedFd {
-    let file = fs::File::options()
-        .read(true)
-        .write(true)
-        .open("/dev/null")
-        .unwrap();
-    // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor owned by this test.
-    let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
-    assert!(fd >= 0);
-    // SAFETY: the successful fcntl result has one owner.
-    unsafe { OwnedFd::from_raw_fd(fd) }
-}
+#[path = "support/test_broker.rs"]
+mod test_broker;
 
-/// Starts the ordinary agent-run supervisor executable with its three
-/// inherited bootstrap descriptors and one synthetic environment token.
-/// Parent runtime home/worker bindings are removed from the child before the
-/// explicit disposable home and fixture credential are installed.
-fn supervisor(home: &Path, id: &AgentId) -> tokio::process::Child {
-    use std::os::unix::process::CommandExt;
-
-    let ready = bootstrap_fd();
-    let identity = bootstrap_fd();
-    let error = bootstrap_fd();
-    let sources = [ready.as_raw_fd(), identity.as_raw_fd(), error.as_raw_fd()];
-    let mut command = isolated_command(env!("CARGO_BIN_EXE_agent-run"));
-    command
-        .arg("--home")
-        .arg(home)
-        .args([
-            "_supervisor",
-            "--ready-fd",
-            "3",
-            "--identity-fd",
-            "4",
-            "--error-fd",
-            "5",
-            id.as_str(),
-        ])
-        .env("HOME", home)
-        .env("FAKE_TOKEN", "synthetic-token")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    // SAFETY: setsid and dup2 are async-signal-safe and use test-owned fds.
-    unsafe {
-        command.as_std_mut().pre_exec(move || {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            for (source, target) in sources.into_iter().zip([3, 4, 5]) {
-                if libc::dup2(source, target) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            Ok(())
-        });
-    }
-    command.kill_on_drop(true).spawn().unwrap()
+/// Starts the ordinary agent-run supervisor executable under an in-process
+/// writer broker, authenticated with a launch capability, with one synthetic
+/// environment token. Parent runtime home/worker bindings are removed from the
+/// child before the explicit disposable home and fixture credential are
+/// installed.
+async fn supervisor(home: &Path, id: &AgentId) -> test_broker::Supervised {
+    test_broker::spawn_supervisor_with_env(
+        env!("CARGO_BIN_EXE_agent-run"),
+        home,
+        id,
+        &[
+            ("HOME", home.as_os_str()),
+            ("FAKE_TOKEN", std::ffi::OsStr::new("synthetic-token")),
+        ],
+    )
+    .await
 }
 
 /// Creates a disposable schema-v2 home with one arbitrary Claude Messages
@@ -118,7 +78,7 @@ struct ServiceProcesses(std::path::PathBuf);
 impl Drop for ServiceProcesses {
     /// Reads exact recorded identities and terminates only this disposable home's captured processes.
     fn drop(&mut self) {
-        let Ok(store) = Store::open(&self.0) else {
+        let Ok(store) = agent_run_store::fixture::open(&self.0) else {
             return;
         };
         let owners: Vec<(String, String)> = store
@@ -160,22 +120,25 @@ readiness={command="/usr/bin/true"}
         &[],
     );
     let _cleanup = ServiceProcesses(home.clone());
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let mut ids = Vec::new();
     for index in 0..2 {
         let mut request = request(&home);
         request.request_id = Some(format!("shared-service-{index}"));
         let admitted = service
             .admit_provider_trusted(request, candidates(committed(&home)))
+            .await
             .unwrap();
         assert_eq!(admitted["created"], true);
         ids.push(serde_json::from_value::<AgentId>(admitted["agent_id"].clone()).unwrap());
     }
-    let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into()).unwrap();
+    let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into())
+        .unwrap()
+        .with_writer(test_broker::broker_for(&home).await.lane("services"));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     loop {
         manager.tick().await.unwrap();
-        let ready: i64 = Store::open(&home)
+        let ready: i64 = agent_run_store::fixture::open(&home)
             .unwrap()
             .conn
             .query_row(
@@ -193,7 +156,7 @@ readiness={command="/usr/bin/true"}
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let generation: String = store
         .conn
         .query_row("SELECT id FROM managed_service_generations", [], |row| {
@@ -217,9 +180,11 @@ readiness={command="/usr/bin/true"}
     assert_eq!(count, 1);
     drop(store);
     drop(manager);
-    let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into()).unwrap();
+    let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into())
+        .unwrap()
+        .with_writer(test_broker::broker_for(&home).await.lane("services"));
     manager.tick().await.unwrap();
-    let restored = Store::open(&home)
+    let restored = agent_run_store::fixture::open(&home)
         .unwrap()
         .remembered_processes("service", &generation)
         .unwrap()
@@ -240,10 +205,11 @@ readiness={command="/usr/bin/true"}
     changed.request_id = Some("changed-service-revision".into());
     let admitted = service
         .admit_provider_trusted(changed, candidates(committed(&home)))
+        .await
         .unwrap();
     let changed_id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     manager.tick().await.unwrap();
-    let mut blocked = supervisor(&home, &changed_id);
+    let mut blocked = supervisor(&home, &changed_id).await;
     assert!(
         !tokio::time::timeout(Duration::from_secs(5), blocked.wait())
             .await
@@ -252,7 +218,11 @@ readiness={command="/usr/bin/true"}
             .success()
     );
     assert_eq!(
-        Store::open(&home).unwrap().get(&changed_id).unwrap().status,
+        agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&changed_id)
+            .unwrap()
+            .status,
         Status::Failed
     );
     tokio::time::sleep(Duration::from_millis(1200)).await;
@@ -261,10 +231,10 @@ readiness={command="/usr/bin/true"}
         agent_run::process::observe(Some(root.pid), Some(&root.token), Some(root.birth)),
         agent_run::process::ProcessState::Alive
     );
-    let mut supervisors = ids
-        .iter()
-        .map(|id| supervisor(&home, id))
-        .collect::<Vec<_>>();
+    let mut supervisors = Vec::new();
+    for id in &ids {
+        supervisors.push(supervisor(&home, id).await);
+    }
     for child in &mut supervisors {
         assert!(
             tokio::time::timeout(Duration::from_secs(10), child.wait())
@@ -276,12 +246,16 @@ readiness={command="/usr/bin/true"}
     }
     for id in &ids {
         assert_eq!(
-            Store::open(&home).unwrap().get(id).unwrap().status,
+            agent_run_store::fixture::open(&home)
+                .unwrap()
+                .get(id)
+                .unwrap()
+                .status,
             Status::Succeeded
         );
     }
     manager.tick().await.unwrap();
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let (state, idle): (String, Option<f64>) = store
         .conn
         .query_row(
@@ -299,7 +273,7 @@ readiness={command="/usr/bin/true"}
         agent_run::process::observe(Some(root.pid), Some(&root.token), Some(root.birth)),
         agent_run::process::ProcessState::Dead | agent_run::process::ProcessState::Reused
     ));
-    let state: String = Store::open(&home)
+    let state: String = agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .query_row(
@@ -329,13 +303,16 @@ readiness={command="/usr/bin/false",timeout_seconds=1}
         &[],
     );
     let _cleanup = ServiceProcesses(home.clone());
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let admitted = service
         .admit_provider_trusted(request(&home), candidates(committed(&home)))
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
-    let mut child = supervisor(&home, &id);
-    let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into()).unwrap();
+    let mut child = supervisor(&home, &id).await;
+    let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into())
+        .unwrap()
+        .with_writer(test_broker::broker_for(&home).await.lane("services"));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     loop {
         manager.tick().await.unwrap();
@@ -349,7 +326,7 @@ readiness={command="/usr/bin/false",timeout_seconds=1}
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     assert_eq!(store.get(&id).unwrap().status, Status::Failed);
     let (process, active): (Option<String>, bool) = store
         .conn
@@ -427,7 +404,10 @@ readiness={command="/usr/bin/true"}
         .unwrap();
     let id: AgentId = serde_json::from_value(submitted["agent_id"].clone()).unwrap();
     loop {
-        let row = Store::open(&home).unwrap().get(&id).unwrap();
+        let row = agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap();
         if row.status.terminal() {
             assert_eq!(row.status, Status::Succeeded, "{:?}", row.failure_kind);
             break;
@@ -443,7 +423,7 @@ readiness={command="/usr/bin/true"}
         .unwrap();
     assert_eq!(answer["content"], "fixture final answer\n");
     loop {
-        let stopped: bool = Store::open(&home)
+        let stopped: bool = agent_run_store::fixture::open(&home)
             .unwrap()
             .conn
             .query_row(
@@ -462,7 +442,7 @@ readiness={command="/usr/bin/true"}
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(
-        Store::open(&home)
+        agent_run_store::fixture::open(&home)
             .unwrap()
             .conn
             .query_row("SELECT COUNT(*) FROM managed_service_probes", [], |row| row
@@ -521,7 +501,7 @@ readiness={command="/bin/sh",args=["-c","printf started > probe-started; exec /b
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let encoded: String = Store::open(&home)
+    let encoded: String = agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .query_row(
@@ -550,7 +530,7 @@ readiness={command="/bin/sh",args=["-c","printf started > probe-started; exec /b
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     loop {
-        let store = Store::open(&home).unwrap();
+        let store = agent_run_store::fixture::open(&home).unwrap();
         let active: i64 = store
             .conn
             .query_row(
@@ -569,7 +549,7 @@ readiness={command="/bin/sh",args=["-c","printf started > probe-started; exec /b
         drop(store);
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     assert_eq!(
         store
             .conn
@@ -680,17 +660,20 @@ async fn managed_services_real_codegraph_qualification() {
         },
     );
     fs::write(home.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let request = request(&home);
     let accepted = service
         .admit_provider_trusted(request, candidates(committed(&home)))
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(accepted["agent_id"].clone()).unwrap();
-    let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into()).unwrap();
+    let mut manager = Manager::new(&home, env!("CARGO_BIN_EXE_agent-run").into())
+        .unwrap()
+        .with_writer(test_broker::broker_for(&home).await.lane("services"));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
     let root = loop {
         manager.tick().await.unwrap();
-        let store = Store::open(&home).unwrap();
+        let store = agent_run_store::fixture::open(&home).unwrap();
         let (state, root): (String, Option<String>) = store
             .conn
             .query_row(
@@ -753,7 +736,7 @@ async fn managed_services_real_codegraph_qualification() {
                 .success()
         );
     }
-    let mut child = supervisor(&home, &id);
+    let mut child = supervisor(&home, &id).await;
     assert!(
         tokio::time::timeout(Duration::from_secs(10), child.wait())
             .await
@@ -762,7 +745,11 @@ async fn managed_services_real_codegraph_qualification() {
             .success()
     );
     assert_eq!(
-        Store::open(&home).unwrap().get(&id).unwrap().status,
+        agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .status,
         Status::Succeeded
     );
     manager.tick().await.unwrap();
@@ -773,7 +760,7 @@ async fn managed_services_real_codegraph_qualification() {
         agent_run::process::ProcessState::Dead | agent_run::process::ProcessState::Reused
     ));
     assert_eq!(
-        Store::open(&home)
+        agent_run_store::fixture::open(&home)
             .unwrap()
             .conn
             .query_row(
@@ -790,7 +777,8 @@ async fn managed_services_real_codegraph_qualification() {
 /// providers, or core caps) and more enabled fake-token accounts.
 fn home_with(extra: &str, accounts: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
     home_in(
-        std::env::var_os("AGENT_RUN_TEST_TMP").unwrap_or_else(|| "/tmp".into()),
+        std::env::var_os("AGENT_RUN_TEST_TMP")
+            .unwrap_or_else(|| std::env::temp_dir().into_os_string()),
         extra,
         accounts,
     )
@@ -811,7 +799,7 @@ fn home_in(
         .unwrap();
     let root = temp.path().canonicalize().unwrap();
     agent_run::fs::private_dir(&root).unwrap();
-    Store::initialize(&root).unwrap();
+    agent_run_store::fixture::initialize(&root).unwrap();
     fs::create_dir_all(root.join("profiles")).unwrap();
     fs::write(root.join("profiles/review.md"),
         "+++\nrevision = \"1\"\nwrite = false\nnetwork = false\nallow_external_read_roots = false\nskills = []\nmcp = []\nrequired_constraints = []\n+++\nReview safely.\n").unwrap();
@@ -843,7 +831,7 @@ account = "acct-work"
         ),
     )
     .unwrap();
-    let mut store = Store::open(&root).unwrap();
+    let mut store = agent_run_store::fixture::open(&root).unwrap();
     for (index, id) in std::iter::once("acct-work")
         .chain(accounts.iter().copied())
         .enumerate()
@@ -879,7 +867,7 @@ fn request(home: &Path) -> ProviderStartRequest {
 /// Returns the committed quota capacity revision; account registration in
 /// the fixture home has already advanced it.
 fn committed(home: &Path) -> i64 {
-    Store::open(home)
+    agent_run_store::fixture::open(home)
         .unwrap()
         .quota_capacity_revision()
         .unwrap()
@@ -934,14 +922,15 @@ async fn claude_result_selection_requires_correlated_task_completion() {
         ("fixture:unknown-result", Some("ambiguous_result"), 1, 1),
     ] {
         let (_temp, home) = home();
-        let service = Service::new(home.clone());
+        let service = fixture_service(home.clone()).await;
         let mut requested = request(&home);
         requested.task = task.into();
         let admitted = service
             .admit_provider_trusted(requested, candidates(committed(&home)))
+            .await
             .unwrap();
         let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
-        let mut store = Store::open(&home).unwrap();
+        let mut store = agent_run_store::fixture::open(&home).unwrap();
         if matches!(
             task,
             "fixture:steer-grouped" | "fixture:steer-two-results" | "fixture:legacy-after-steer"
@@ -976,7 +965,7 @@ async fn claude_result_selection_requires_correlated_task_completion() {
         }
         drop(store);
         run_to_end(&home, &id).await;
-        let store = Store::open(&home).unwrap();
+        let store = agent_run_store::fixture::open(&home).unwrap();
         let row = store.get(&id).unwrap();
         assert_eq!(
             row.status,
@@ -1048,15 +1037,16 @@ async fn claude_result_selection_requires_correlated_task_completion() {
 #[tokio::test]
 async fn provider_start_completes_one_owned_fake_engine_attempt() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let request = request(&home);
     let admitted = service
         .admit_provider_trusted(request.clone(), candidates(committed(&home)))
+        .await
         .unwrap();
     assert_eq!(admitted["created"], true);
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     let attempt = admitted["attempt_id"].as_str().unwrap().to_owned();
-    let stored_identity = Store::open(&home)
+    let stored_identity = agent_run_store::fixture::open(&home)
         .unwrap()
         .get(&id)
         .unwrap()
@@ -1066,13 +1056,13 @@ async fn provider_start_completes_one_owned_fake_engine_attempt() {
     assert!(!stored_identity.contains("synthetic-token"));
     assert!(!stored_identity.contains("env:FAKE_TOKEN"));
     fs::write(home.join("config.toml"), "schema_version=2\n").unwrap();
-    let mut child = supervisor(&home, &id);
+    let mut child = supervisor(&home, &id).await;
     let exit = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .unwrap()
         .unwrap();
     assert!(exit.success(), "supervisor exit: {exit}");
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let row = store.get(&id).unwrap();
     assert_eq!(row.status, Status::Succeeded);
     assert_eq!(
@@ -1133,6 +1123,7 @@ async fn provider_start_completes_one_owned_fake_engine_attempt() {
     assert_eq!(deliveries, 1);
     let replay = service
         .admit_provider_trusted(request, candidates(committed(&home)))
+        .await
         .unwrap();
     assert_eq!(replay["created"], false);
     assert_eq!(replay["agent_id"], admitted["agent_id"]);
@@ -1144,17 +1135,18 @@ async fn provider_start_completes_one_owned_fake_engine_attempt() {
 async fn result_then_hang_waits_for_explicit_cancellation() {
     let (_temp, home) = home();
     let _processes = ServiceProcesses(home.clone());
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let mut request = request(&home);
     request.task = "fixture:result-then-hang".into();
     let admitted = service
         .admit_provider_trusted(request, candidates(committed(&home)))
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
-    let mut child = supervisor(&home, &id);
+    let mut child = supervisor(&home, &id).await;
     let started = std::time::Instant::now();
     loop {
-        let count: i64 = Store::open(&home).unwrap().conn.query_row(
+        let count: i64 = agent_run_store::fixture::open(&home).unwrap().conn.query_row(
             "SELECT COUNT(*) FROM messages WHERE agent_id=? AND role='assistant' AND content LIKE '%fixture partial%'",
             [id.as_str()], |r| r.get(0),
         ).unwrap();
@@ -1164,7 +1156,7 @@ async fn result_then_hang_waits_for_explicit_cancellation() {
         assert!(started.elapsed() < Duration::from_secs(10));
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    Store::open(&home)
+    agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .execute(
@@ -1178,11 +1170,15 @@ async fn result_then_hang_waits_for_explicit_cancellation() {
             .is_err()
     );
     assert_eq!(
-        Store::open(&home).unwrap().get(&id).unwrap().status,
+        agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .status,
         Status::Running
     );
     assert_eq!(service.answer(&id).unwrap()["available"], false);
-    service.cancel(&id).unwrap();
+    service.cancel(&id).await.unwrap();
     assert!(
         tokio::time::timeout(Duration::from_secs(20), child.wait())
             .await
@@ -1190,7 +1186,7 @@ async fn result_then_hang_waits_for_explicit_cancellation() {
             .unwrap()
             .success()
     );
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     assert_eq!(store.get(&id).unwrap().status, Status::Cancelled);
     assert!(
         store
@@ -1209,21 +1205,24 @@ async fn result_then_hang_waits_for_explicit_cancellation() {
 #[tokio::test]
 async fn provider_auto_start_uses_trusted_candidate_and_completes() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let mut request = request(&home);
     request.account = None;
     request.request_id = Some("provider-auto".into());
     let mut selected = candidates(committed(&home));
     selected.intent = SelectionIntent::Auto;
-    let admitted = service.admit_provider_trusted(request, selected).unwrap();
+    let admitted = service
+        .admit_provider_trusted(request, selected)
+        .await
+        .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     assert_eq!(
         store.get(&id).unwrap().identity.unwrap()["authority"]["role_payload"]["auth"]["mode"],
         "global"
     );
     assert_eq!(store.provider_attempt(&id).unwrap().1.as_str(), "acct-work");
-    let mut child = supervisor(&home, &id);
+    let mut child = supervisor(&home, &id).await;
     assert!(
         tokio::time::timeout(Duration::from_secs(20), child.wait())
             .await
@@ -1232,7 +1231,11 @@ async fn provider_auto_start_uses_trusted_candidate_and_completes() {
             .success()
     );
     assert_eq!(
-        Store::open(&home).unwrap().get(&id).unwrap().status,
+        agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .status,
         Status::Succeeded
     );
 }
@@ -1242,22 +1245,23 @@ async fn provider_auto_start_uses_trusted_candidate_and_completes() {
 #[tokio::test]
 async fn provider_cancel_before_spawn_releases_only_its_attempt() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let admitted = service
         .admit_provider_trusted(request(&home), candidates(committed(&home)))
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
-    Store::open(&home)
+    agent_run_store::fixture::open(&home)
         .unwrap()
         .enqueue(&id, "cancel", &serde_json::json!({}))
         .unwrap();
-    let mut child = supervisor(&home, &id);
+    let mut child = supervisor(&home, &id).await;
     let exit = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .unwrap()
         .unwrap();
     assert!(exit.success());
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     assert_eq!(store.get(&id).unwrap().status, Status::Cancelled);
     let (active, proof, process): (i64, Option<String>, Option<String>) = store.conn.query_row(
         "SELECT ownership_active,cleanup_proof_json,process_identity FROM attempts WHERE agent_id=?",
@@ -1274,12 +1278,13 @@ async fn provider_cancel_before_spawn_releases_only_its_attempt() {
 #[tokio::test]
 async fn provider_supervisor_refuses_tampered_role_authority() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let admitted = service
         .admit_provider_trusted(request(&home), candidates(committed(&home)))
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let mut identity = store.get(&id).unwrap().identity.unwrap();
     identity["authority"]["role_payload"]["grants"]["network"] = serde_json::json!(true);
     store
@@ -1289,12 +1294,12 @@ async fn provider_supervisor_refuses_tampered_role_authority() {
             rusqlite::params![identity.to_string(), id.as_str()],
         )
         .unwrap();
-    let mut child = supervisor(&home, &id);
+    let mut child = supervisor(&home, &id).await;
     let _ = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .unwrap()
         .unwrap();
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     assert_eq!(store.get(&id).unwrap().status, Status::Failed);
     let (active, proof, process): (i64, Option<String>, Option<String>) = store
         .conn
@@ -1314,12 +1319,13 @@ async fn provider_supervisor_refuses_tampered_role_authority() {
 #[tokio::test]
 async fn provider_supervisor_refuses_tampered_config_snapshot() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let admitted = service
         .admit_provider_trusted(request(&home), candidates(committed(&home)))
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let mut identity = store.get(&id).unwrap().identity.unwrap();
     identity["provider_config"]["providers"]["glm-user"]["models"][0]["native_model"] =
         serde_json::json!("different-native-model");
@@ -1330,12 +1336,12 @@ async fn provider_supervisor_refuses_tampered_config_snapshot() {
             rusqlite::params![identity.to_string(), id.as_str()],
         )
         .unwrap();
-    let mut child = supervisor(&home, &id);
+    let mut child = supervisor(&home, &id).await;
     let _ = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .unwrap()
         .unwrap();
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     assert_eq!(store.get(&id).unwrap().status, Status::Failed);
     let (active, process): (i64, Option<String>) = store
         .conn
@@ -1366,18 +1372,19 @@ async fn provider_binary_disappearing_after_admission_never_spawns() {
         ),
     )
     .unwrap();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let admitted = service
         .admit_provider_trusted(request(&home), candidates(committed(&home)))
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     fs::remove_file(&missing).unwrap();
-    let mut child = supervisor(&home, &id);
+    let mut child = supervisor(&home, &id).await;
     let _ = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .unwrap()
         .unwrap();
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     assert_eq!(store.get(&id).unwrap().status, Status::Failed);
     let (active, proof, process): (i64, Option<String>, Option<String>) = store
         .conn
@@ -1400,7 +1407,10 @@ async fn provider_binary_disappearing_after_admission_never_spawns() {
 async fn provider_supervisor_spawn_refusal_ends_the_run_durably() {
     let (_temp, home) = home();
     fs::write(home.join("fixture-supervisor-spawn-error"), "").unwrap();
-    let service = Service::new(home.clone());
+    let broker = test_broker::broker_for(&home).await;
+    let service = fixture_service(home.clone())
+        .await
+        .with_writer(broker.writer());
     let result = service
         .start_provider_trusted(request(&home), candidates(committed(&home)))
         .await
@@ -1413,7 +1423,7 @@ async fn provider_supervisor_spawn_refusal_ends_the_run_durably() {
     assert_eq!(typed.attempt_id.as_deref(), result["attempt_id"].as_str());
     assert!(typed.attempt_id.is_some());
     let id: AgentId = serde_json::from_value(result["agent_id"].clone()).unwrap();
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let row = store.get(&id).unwrap();
     assert_eq!(row.status, Status::Failed);
     assert_eq!(row.failure_kind.as_deref(), Some("supervisor_spawn_failed"));
@@ -1483,7 +1493,7 @@ fn request_for(
 /// Returns the admitted attempt's selected global account.
 fn selected(home: &Path, admitted: &serde_json::Value) -> String {
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
-    Store::open(home)
+    agent_run_store::fixture::open(home)
         .unwrap()
         .provider_attempt(&id)
         .unwrap()
@@ -1494,7 +1504,7 @@ fn selected(home: &Path, admitted: &serde_json::Value) -> String {
 
 /// Counts `(agents, attempts)` rows, proving what was (not) admitted.
 fn rows(home: &Path) -> (i64, i64) {
-    let store = Store::open(home).unwrap();
+    let store = agent_run_store::fixture::open(home).unwrap();
     let count = |table: &str| {
         store
             .conn
@@ -1508,7 +1518,7 @@ fn rows(home: &Path) -> (i64, i64) {
 
 /// Advances the committed quota revision, as a concurrent collector would.
 fn bump_revision(home: &Path) -> agent_run_domain::Result<()> {
-    let mut store = Store::open(home)?;
+    let mut store = agent_run_store::fixture::open(home)?;
     let tx = store.conn.transaction()?;
     Store::advance_quota_capacity_revision(&tx)?;
     tx.commit()?;
@@ -1520,12 +1530,12 @@ fn bump_revision(home: &Path) -> agent_run_domain::Result<()> {
 #[tokio::test]
 async fn provider_ordinary_admission_ranks_itself_and_completes() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
-    let admitted = service.admit_provider(request(&home)).unwrap();
+    let service = fixture_service(home.clone()).await;
+    let admitted = service.admit_provider(request(&home)).await.unwrap();
     assert_eq!(admitted["created"], true);
     assert_eq!(selected(&home, &admitted), "acct-work");
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
-    let mut child = supervisor(&home, &id);
+    let mut child = supervisor(&home, &id).await;
     assert!(
         tokio::time::timeout(Duration::from_secs(20), child.wait())
             .await
@@ -1534,7 +1544,11 @@ async fn provider_ordinary_admission_ranks_itself_and_completes() {
             .success()
     );
     assert_eq!(
-        Store::open(&home).unwrap().get(&id).unwrap().status,
+        agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .status,
         Status::Succeeded
     );
 }
@@ -1544,18 +1558,18 @@ async fn provider_ordinary_admission_ranks_itself_and_completes() {
 #[tokio::test]
 async fn provider_replay_precedes_changed_config_and_quota() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let mut original = request_for(&home, "glm-user", "replay-1", None);
     original.orchestrator = Some(OrchestratorRef {
         transport: "codex".into(),
         external_session_id: "legacy-provider-session".into(),
         external_turn_id: None,
     });
-    let admitted = service.admit_provider(original.clone()).unwrap();
+    let admitted = service.admit_provider(original.clone()).await.unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     let legacy_fingerprint =
         agent_run_domain::canonical::sha256_hex(&serde_json::to_value(&original).unwrap(), true);
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let mut identity = store.get(&id).unwrap().identity.unwrap();
     identity["replay_request_sha256"] = serde_json::json!(legacy_fingerprint);
     store
@@ -1573,7 +1587,7 @@ async fn provider_replay_precedes_changed_config_and_quota() {
         )
         .unwrap();
     bump_revision(&home).unwrap();
-    Store::open(&home)
+    agent_run_store::fixture::open(&home)
         .unwrap()
         .disable_account(&"acct-work".parse().unwrap())
         .unwrap();
@@ -1582,6 +1596,7 @@ async fn provider_replay_precedes_changed_config_and_quota() {
         .admit_provider_observed(original.clone(), &mut |_| {
             panic!("replay must not rank or submit")
         })
+        .await
         .unwrap();
     assert_eq!(replay["created"], false);
     assert_eq!(replay["agent_id"], admitted["agent_id"]);
@@ -1591,6 +1606,7 @@ async fn provider_replay_precedes_changed_config_and_quota() {
         .admit_provider_observed(canonical_retry, &mut |_| {
             panic!("legacy namespace replay must not rank or submit")
         })
+        .await
         .unwrap();
     assert_eq!(replay["created"], false);
     assert_eq!(replay["agent_id"], admitted["agent_id"]);
@@ -1612,6 +1628,7 @@ async fn provider_replay_precedes_changed_config_and_quota() {
         .admit_provider_observed(original.clone(), &mut |_| {
             panic!("historical replay must not rank or submit")
         })
+        .await
         .unwrap();
     assert_eq!(old_replay["agent_id"], admitted["agent_id"]);
     assert_eq!(old_replay["created"], false);
@@ -1633,13 +1650,13 @@ async fn provider_replay_precedes_changed_config_and_quota() {
         )
         .unwrap();
     assert!(matches!(
-        service.admit_provider(original.clone()),
+        service.admit_provider(original.clone()).await,
         Err(agent_run_domain::Error::Conflict)
     ));
     let mut conflicting = original;
     conflicting.task = "fixture:other".into();
     assert!(matches!(
-        service.admit_provider(conflicting),
+        service.admit_provider(conflicting).await,
         Err(agent_run_domain::Error::Conflict)
     ));
     assert_eq!(rows(&home), (1, 1));
@@ -1651,7 +1668,7 @@ async fn provider_replay_precedes_changed_config_and_quota() {
 #[tokio::test]
 async fn provider_stale_selection_recomputes_at_most_three_times() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let mut seen = Vec::new();
     let admitted = service
         .admit_provider_observed(
@@ -1664,6 +1681,7 @@ async fn provider_stale_selection_recomputes_at_most_three_times() {
                 Ok(())
             },
         )
+        .await
         .unwrap();
     assert_eq!(admitted["created"], true);
     assert_eq!(seen, [0, 1]);
@@ -1677,6 +1695,7 @@ async fn provider_stale_selection_recomputes_at_most_three_times() {
                 bump_revision(&home)
             },
         )
+        .await
         .unwrap_err();
     assert_eq!(seen, [0, 1, 2, 3]);
     assert!(matches!(
@@ -1695,21 +1714,29 @@ async fn provider_stale_selection_recomputes_at_most_three_times() {
 #[tokio::test]
 async fn provider_pin_and_disable_race_never_fall_through() {
     let (_temp, home) = home_with(TWO_ACCOUNTS, &["acct-alt"]);
-    let service = Service::new(home.clone());
-    let raced = service.admit_provider_observed(
-        request_for(&home, "glm-user", "race", Some("work")),
-        &mut |_| Store::open(&home)?.disable_account(&"acct-work".parse().unwrap()),
-    );
+    let service = fixture_service(home.clone()).await;
+    let raced = service
+        .admit_provider_observed(
+            request_for(&home, "glm-user", "race", Some("work")),
+            &mut |_| {
+                agent_run_store::fixture::open(&home)?
+                    .disable_account(&"acct-work".parse().unwrap())
+            },
+        )
+        .await;
     let code = |result: agent_run_domain::Result<serde_json::Value>| {
         result.unwrap_err().machine_code().as_str()
     };
     assert_eq!(code(raced), "no_eligible_account");
     assert_eq!(rows(&home), (0, 0));
-    let pinned = service.admit_provider(request_for(&home, "glm-user", "pinned", Some("work")));
+    let pinned = service
+        .admit_provider(request_for(&home, "glm-user", "pinned", Some("work")))
+        .await;
     assert_eq!(code(pinned), "no_eligible_account");
     assert_eq!(rows(&home), (0, 0), "a pin never falls over to acct-alt");
     let auto = service
         .admit_provider(request_for(&home, "glm-user", "auto", None))
+        .await
         .unwrap();
     assert_eq!(selected(&home, &auto), "acct-alt");
 }
@@ -1719,13 +1746,15 @@ async fn provider_pin_and_disable_race_never_fall_through() {
 #[tokio::test]
 async fn provider_equal_ranks_balance_load_across_aliases() {
     let (_temp, home) = home_with(TWO_ACCOUNTS, &["acct-alt"]);
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let alias = service
         .admit_provider(request_for(&home, "glm-alias", "alias", Some("shared")))
+        .await
         .unwrap();
     assert_eq!(selected(&home, &alias), "acct-work");
     let first = service
         .admit_provider(request_for(&home, "glm-user", "auto-1", None))
+        .await
         .unwrap();
     assert_eq!(
         selected(&home, &first),
@@ -1734,10 +1763,12 @@ async fn provider_equal_ranks_balance_load_across_aliases() {
     );
     let second = service
         .admit_provider(request_for(&home, "glm-user", "auto-2", None))
+        .await
         .unwrap();
     assert_eq!(selected(&home, &second), "acct-alt", "equal load: lower id");
     let third = service
         .admit_provider(request_for(&home, "glm-user", "auto-3", None))
+        .await
         .unwrap();
     assert_eq!(selected(&home, &third), "acct-work", "lower load wins");
 }
@@ -1747,12 +1778,18 @@ async fn provider_equal_ranks_balance_load_across_aliases() {
 #[tokio::test]
 async fn provider_concurrent_admissions_respect_replay_and_caps() {
     let (_temp, home) = home_with("[core]\nmax_active_agents = 2\n", &[]);
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let same = request_for(&home, "glm-user", "same", None);
     let outcomes: Vec<_> = (0..6)
         .map(|_| {
             let (service, request) = (service.clone(), same.clone());
-            std::thread::spawn(move || service.admit_provider(request))
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(service.admit_provider(request))
+            })
         })
         .collect::<Vec<_>>()
         .into_iter()
@@ -1771,7 +1808,13 @@ async fn provider_concurrent_admissions_respect_replay_and_caps() {
                 service.clone(),
                 request_for(&home, "glm-user", &format!("cap-{n}"), None),
             );
-            std::thread::spawn(move || service.admit_provider(request))
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(service.admit_provider(request))
+            })
         })
         .collect::<Vec<_>>()
         .into_iter()
@@ -1793,17 +1836,17 @@ async fn provider_concurrent_admissions_respect_replay_and_caps() {
 #[tokio::test]
 async fn provider_harness_options_are_validated_and_carried() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let mut fast = request_for(&home, "glm-user", "fast", None);
     fast.fast = true;
-    let refused = service.admit_provider(fast).unwrap_err();
+    let refused = service.admit_provider(fast).await.unwrap_err();
     assert_eq!(refused.machine_code().as_str(), "ValidationError");
     assert_eq!(rows(&home), (0, 0));
     let mut schema = request_for(&home, "glm-user", "schema", None);
     schema.output_schema = serde_json::json!({"type": "object"}).as_object().cloned();
-    let admitted = service.admit_provider(schema).unwrap();
+    let admitted = service.admit_provider(schema).await.unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
-    let mut child = supervisor(&home, &id);
+    let mut child = supervisor(&home, &id).await;
     assert!(
         tokio::time::timeout(Duration::from_secs(20), child.wait())
             .await
@@ -1812,7 +1855,11 @@ async fn provider_harness_options_are_validated_and_carried() {
             .success()
     );
     assert_eq!(
-        Store::open(&home).unwrap().get(&id).unwrap().status,
+        agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .status,
         Status::Succeeded
     );
 }
@@ -1822,7 +1869,7 @@ async fn provider_harness_options_are_validated_and_carried() {
 #[tokio::test]
 async fn provider_effort_is_validated_before_admission() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     completed_parent(&home, &service, "bounded-parent").await;
     edit_config(&home, |config| {
         let offering = &mut config["providers"]["glm-user"]["models"][0];
@@ -1833,12 +1880,12 @@ async fn provider_effort_is_validated_before_admission() {
     });
     let mut low = request_for(&home, "glm-user", "effort-low", None);
     low.effort = Some("low".into());
-    let refused = service.admit_provider(low).unwrap_err();
+    let refused = service.admit_provider(low).await.unwrap_err();
     assert_eq!(refused.machine_code().as_str(), "ValidationError");
     assert_eq!(rows(&home), (1, 1), "refused requests write nothing");
     let mut high = request_for(&home, "glm-user", "effort-high", None);
     high.effort = Some("high".into());
-    service.admit_provider(high).unwrap();
+    service.admit_provider(high).await.unwrap();
     assert_eq!(rows(&home).0, 2);
 
     edit_config(&home, |config| {
@@ -1852,9 +1899,13 @@ async fn provider_effort_is_validated_before_admission() {
     });
     let defaulted = service
         .admit_provider(request_for(&home, "glm-user", "effort-default", None))
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(defaulted["agent_id"].clone()).unwrap();
-    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     let frozen = agent_run::service::ProviderLaunchIdentity::read(&row).unwrap();
     assert_eq!(frozen.provider_request.effort, None);
     assert_eq!(row.request.effort.as_deref(), Some("medium"));
@@ -1887,13 +1938,17 @@ async fn provider_resume_checks_frozen_default_effort() {
             toml::from_str::<toml::Value>("effort = \"medium\"").unwrap(),
         );
     });
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let admitted = service
         .admit_provider(request_for(&home, "glm-user", "default-parent", None))
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     run_to_end(&home, &id).await;
-    let parent = Store::open(&home).unwrap().get(&id).unwrap();
+    let parent = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     assert_eq!(parent.request.effort.as_deref(), Some("medium"));
     let session = parent.runtime_session_id.as_deref().unwrap();
     let runtime_home = std::path::PathBuf::from(
@@ -1919,13 +1974,15 @@ async fn provider_resume_checks_frozen_default_effort() {
             toml::from_str::<toml::Value>("effort = \"high\"").unwrap(),
         );
     });
-    let refused = service.admit_provider_resume(
-        &parent,
-        "fixture:answer".into(),
-        Some("default-effort-revoked".into()),
-        None,
-        None,
-    );
+    let refused = service
+        .admit_provider_resume(
+            &parent,
+            "fixture:answer".into(),
+            Some("default-effort-revoked".into()),
+            None,
+            None,
+        )
+        .await;
     assert!(refused.is_err(), "resume ignored frozen effective effort");
 }
 
@@ -1936,7 +1993,7 @@ async fn provider_resume_checks_frozen_default_effort() {
 /// failure text and exit code. Task, identity and environment fields are never
 /// printed, and diagnostics preserve the original timeout and failure.
 async fn run_to_end(home: &Path, id: &AgentId) {
-    let mut child = supervisor(home, id);
+    let mut child = supervisor(home, id).await;
     let exit = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .unwrap()
@@ -1944,7 +2001,9 @@ async fn run_to_end(home: &Path, id: &AgentId) {
     if exit.success() {
         return;
     }
-    let row = Store::open(home).ok().and_then(|store| store.get(id).ok());
+    let row = agent_run_store::fixture::open(home)
+        .ok()
+        .and_then(|store| store.get(id).ok());
     let row = row
         .map(|row| {
             let failure_text = row
@@ -1957,12 +2016,29 @@ async fn run_to_end(home: &Path, id: &AgentId) {
             )
         })
         .unwrap_or_else(|| "row unreadable".into());
-    panic!("supervisor exit: {exit}; {row}");
+    // The supervisor's own log carries closed classes only (no task, identity
+    // or credential text).
+    let log: String = std::fs::read_dir(home.join("logs"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("supervisor")
+        })
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .collect::<String>()
+        .chars()
+        .take(1024)
+        .collect();
+    panic!("supervisor exit: {exit}; {row}; log={log:?}");
 }
 
 /// Returns the parsed adapter state of `id`'s latest attempt.
 fn attempt_state(home: &Path, id: &AgentId) -> serde_json::Value {
-    let text: String = Store::open(home)
+    let text: String = agent_run_store::fixture::open(home)
         .unwrap()
         .conn
         .query_row(
@@ -1991,13 +2067,17 @@ fn transcript(runtime_home: &Path, session: &str, body: &str) {
 #[tokio::test]
 async fn provider_resume_continues_the_proven_native_session() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let admitted = service
         .admit_provider_trusted(request(&home), candidates(committed(&home)))
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     run_to_end(&home, &id).await;
-    let parent = Store::open(&home).unwrap().get(&id).unwrap();
+    let parent = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     assert_eq!(parent.status, Status::Succeeded);
     let session = parent.runtime_session_id.clone().unwrap();
     let runtime_home = std::path::PathBuf::from(
@@ -2009,17 +2089,22 @@ async fn provider_resume_continues_the_proven_native_session() {
         serde_json::json!({"transport":"codex_queue","external_session_id":"test-session"}),
     )
     .unwrap();
-    let resume = |request_id: &str| {
-        service.admit_provider_resume(
-            &Store::open(&home).unwrap().get(&id).unwrap(),
-            "fixture:answer".into(),
-            Some(request_id.into()),
-            None,
-            Some(orchestrator.clone()),
-        )
+    let resume = async |request_id: &str| {
+        service
+            .admit_provider_resume(
+                &agent_run_store::fixture::open(&home)
+                    .unwrap()
+                    .get(&id)
+                    .unwrap(),
+                "fixture:answer".into(),
+                Some(request_id.into()),
+                None,
+                Some(orchestrator.clone()),
+            )
+            .await
     };
     let children = || -> i64 {
-        Store::open(&home)
+        agent_run_store::fixture::open(&home)
             .unwrap()
             .conn
             .query_row(
@@ -2046,14 +2131,14 @@ async fn provider_resume_continues_the_proven_native_session() {
         .map(|line| format!("{line}\n"))
         .collect();
     fs::write(&history, kept).unwrap();
-    let refused = resume("resume-1").unwrap_err().to_string();
+    let refused = resume("resume-1").await.unwrap_err().to_string();
     assert!(refused.contains("changed since it was sealed"), "{refused}");
     fs::write(&history, &sealed).unwrap();
     // A parent without a recorded seal fails closed; the history present on
     // disk is never adopted as a new baseline.
     let recorded = serde_json::to_string(&state).unwrap();
     let set_state = |value: &str| {
-        Store::open(&home)
+        agent_run_store::fixture::open(&home)
             .unwrap()
             .conn
             .execute(
@@ -2063,7 +2148,7 @@ async fn provider_resume_continues_the_proven_native_session() {
             .unwrap();
     };
     set_state("{}");
-    let refused = resume("resume-1").unwrap_err().to_string();
+    let refused = resume("resume-1").await.unwrap_err().to_string();
     assert!(
         refused.contains("recorded no native history seal"),
         "{refused}"
@@ -2071,10 +2156,13 @@ async fn provider_resume_continues_the_proven_native_session() {
     set_state(&recorded);
     assert_eq!(children(), 0, "a refusal admits nothing");
 
-    let child = resume("resume-1").unwrap();
+    let child = resume("resume-1").await.unwrap();
     assert_eq!(child["created"], true, "{child}");
     let child_id: AgentId = serde_json::from_value(child["agent_id"].clone()).unwrap();
-    let row = Store::open(&home).unwrap().get(&child_id).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&child_id)
+        .unwrap();
     assert_eq!(row.parent_agent_id.as_ref(), Some(&id));
     assert_eq!(row.root_agent_id, id);
     assert_eq!(row.sequence, 2);
@@ -2097,18 +2185,21 @@ async fn provider_resume_continues_the_proven_native_session() {
         parent_identity["authority"]["role_payload"],
         child_identity["authority"]["role_payload"]
     );
-    let replay = resume("resume-1").unwrap();
+    let replay = resume("resume-1").await.unwrap();
     assert_eq!(replay["created"], false);
     assert_eq!(replay["agent_id"], child["agent_id"]);
-    let second = resume("resume-2").unwrap_err().to_string();
+    let second = resume("resume-2").await.unwrap_err().to_string();
     assert!(second.contains("already been resumed"), "{second}");
     assert_eq!(children(), 1);
 
     run_to_end(&home, &child_id).await;
-    let row = Store::open(&home).unwrap().get(&child_id).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&child_id)
+        .unwrap();
     assert_eq!(row.status, Status::Succeeded, "{:?}", row.failure_text);
     assert_eq!(row.runtime_session_id.as_deref(), Some(session.as_str()));
-    let (selected, cleanup): (String, Option<String>) = Store::open(&home)
+    let (selected, cleanup): (String, Option<String>) = agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .query_row(
@@ -2121,7 +2212,7 @@ async fn provider_resume_continues_the_proven_native_session() {
     assert!(cleanup.is_some());
     // After the child ran (and appended to the native history), a second
     // resume of the parent is refused as already resumed.
-    let again = resume("resume-4").unwrap_err().to_string();
+    let again = resume("resume-4").await.unwrap_err().to_string();
     assert!(again.contains("already been resumed"), "{again}");
     // The child's own attempt sealed the continued history (both turns).
     assert_eq!(
@@ -2130,22 +2221,26 @@ async fn provider_resume_continues_the_proven_native_session() {
     );
 
     // The pinned account is disabled: resume refuses instead of switching.
-    Store::open(&home)
+    agent_run_store::fixture::open(&home)
         .unwrap()
         .disable_account(&"acct-work".parse().unwrap())
         .unwrap();
     let pinned = service
         .admit_provider_resume(
-            &Store::open(&home).unwrap().get(&child_id).unwrap(),
+            &agent_run_store::fixture::open(&home)
+                .unwrap()
+                .get(&child_id)
+                .unwrap(),
             "fixture:answer".into(),
             Some("resume-3".into()),
             None,
             Some(orchestrator.clone()),
         )
+        .await
         .unwrap_err()
         .to_string();
     assert!(!pinned.contains("continuation_unavailable"), "{pinned}");
-    let grandchildren: i64 = Store::open(&home)
+    let grandchildren: i64 = agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .query_row(
@@ -2162,16 +2257,20 @@ async fn provider_resume_continues_the_proven_native_session() {
 #[tokio::test]
 async fn provider_resume_honors_new_model_restrictions() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let original = request(&home);
     let provider = original.provider.to_string();
     let model = original.model.clone();
     let admitted = service
         .admit_provider_trusted(original, candidates(committed(&home)))
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     run_to_end(&home, &id).await;
-    let parent = Store::open(&home).unwrap().get(&id).unwrap();
+    let parent = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     let session = parent.runtime_session_id.as_deref().unwrap();
     let runtime_home = std::path::PathBuf::from(
         parent.identity.as_ref().unwrap()["runtime_home"]
@@ -2198,13 +2297,15 @@ async fn provider_resume_honors_new_model_restrictions() {
         )]),
     );
     fs::write(path, toml::to_string(&config).unwrap()).unwrap();
-    let resumed = service.admit_provider_resume(
-        &parent,
-        "fixture:answer".into(),
-        Some("revoked-resume".into()),
-        None,
-        None,
-    );
+    let resumed = service
+        .admit_provider_resume(
+            &parent,
+            "fixture:answer".into(),
+            Some("revoked-resume".into()),
+            None,
+            None,
+        )
+        .await;
     assert!(
         resumed.is_err(),
         "resume ignored current model restrictions"
@@ -2217,21 +2318,30 @@ async fn provider_resume_honors_new_model_restrictions() {
 #[tokio::test]
 async fn concurrent_provider_resumes_admit_one_child() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let admitted = service
         .admit_provider_trusted(request(&home), candidates(committed(&home)))
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     run_to_end(&home, &id).await;
-    let parent = Store::open(&home).unwrap().get(&id).unwrap();
+    let parent = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     let results: Vec<bool> = (0..2)
         .map(|index| {
             let (home, barrier, parent) = (home.clone(), barrier.clone(), parent.clone());
             std::thread::spawn(move || {
-                let service = Service::new(home);
-                barrier.wait();
-                service
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async move {
+                        let service = fixture_service(home).await;
+                        barrier.wait();
+                        service
                     .admit_provider_resume(
                         &parent,
                         "fixture:answer".into(),
@@ -2244,7 +2354,9 @@ async fn concurrent_provider_resumes_admit_one_child() {
                             .unwrap(),
                         ),
                     )
+                    .await
                     .is_ok()
+                    })
             })
         })
         .collect::<Vec<_>>()
@@ -2252,7 +2364,7 @@ async fn concurrent_provider_resumes_admit_one_child() {
         .map(|handle| handle.join().unwrap())
         .collect();
     assert_eq!(results.iter().filter(|ok| **ok).count(), 1, "{results:?}");
-    let children: i64 = Store::open(&home)
+    let children: i64 = agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .query_row(
@@ -2268,12 +2380,13 @@ async fn concurrent_provider_resumes_admit_one_child() {
 async fn completed_parent(home: &Path, service: &Service, request_id: &str) -> AgentId {
     let mut request = request(home);
     request.request_id = Some(request_id.into());
-    let revision = Store::open(home)
+    let revision = agent_run_store::fixture::open(home)
         .unwrap()
         .quota_capacity_revision()
         .unwrap();
     let admitted = service
         .admit_provider_trusted(request, candidates(revision))
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     run_to_end(home, &id).await;
@@ -2295,10 +2408,15 @@ fn edit_config(home: &Path, edit: impl FnOnce(&mut toml::Value)) {
 #[tokio::test]
 async fn provider_resume_enforces_current_alias_role_and_cap() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let id = completed_parent(&home, &service, "policy-parent").await;
-    let parent = || Store::open(&home).unwrap().get(&id).unwrap();
-    let resume = |request_id: &str| {
+    let parent = || {
+        agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+    };
+    let resume = async |request_id: &str| {
         service
             .admit_provider_resume(
                 &parent(),
@@ -2307,6 +2425,7 @@ async fn provider_resume_enforces_current_alias_role_and_cap() {
                 None,
                 None,
             )
+            .await
             .map_err(|error| error.to_string())
     };
     let original = fs::read_to_string(home.join("config.toml")).unwrap();
@@ -2316,7 +2435,7 @@ async fn provider_resume_enforces_current_alias_role_and_cap() {
             .unwrap()
             .insert("native_model".into(), "other-native".into());
     });
-    let alias = resume("alias").unwrap_err();
+    let alias = resume("alias").await.unwrap_err();
     assert!(alias.contains("native model alias"), "{alias}");
     fs::write(home.join("config.toml"), &original).unwrap();
 
@@ -2330,7 +2449,7 @@ async fn provider_resume_enforces_current_alias_role_and_cap() {
         ),
     )
     .unwrap();
-    let grants = resume("grants").unwrap_err();
+    let grants = resume("grants").await.unwrap_err();
     assert!(
         grants.contains("role grants") || grants.contains("harness policy"),
         "{grants}"
@@ -2345,16 +2464,17 @@ async fn provider_resume_enforces_current_alias_role_and_cap() {
     });
     let mut busy = request(&home);
     busy.request_id = Some("occupies-the-cap".into());
-    let revision = Store::open(&home)
+    let revision = agent_run_store::fixture::open(&home)
         .unwrap()
         .quota_capacity_revision()
         .unwrap();
     service
         .admit_provider_trusted(busy, candidates(revision))
+        .await
         .unwrap();
-    let capped = resume("capped").unwrap_err();
+    let capped = resume("capped").await.unwrap_err();
     assert!(capped.to_lowercase().contains("capacity"), "{capped}");
-    let children: i64 = Store::open(&home)
+    let children: i64 = agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .query_row(
@@ -2374,30 +2494,35 @@ async fn provider_resume_enforces_mcp_caps_and_keeps_frozen_global_selection() {
         "\n[mcp.shared]\ntransport='stdio'\ncommand='/bin/true'\nglobal=true\n",
         &[],
     );
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let id = completed_parent(&home, &service, "mcp-parent").await;
-    let parent = Store::open(&home).unwrap().get(&id).unwrap();
+    let parent = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     assert_eq!(
         parent.status,
         Status::Succeeded,
         "{:?}",
         parent.failure_text
     );
-    let view = Store::open(&home)
+    let view = agent_run_store::fixture::open(&home)
         .unwrap()
         .agent_view_at(&id, agent_run_core::domain::now())
         .unwrap();
     assert_eq!(view.mcp.len(), 1);
     assert_eq!(view.mcp[0].source, "global");
     assert_eq!(view.mcp[0].allowed_tools, None);
-    let resume = |key: &str| {
-        service.admit_provider_resume(
-            &parent,
-            "fixture:answer".into(),
-            Some(key.into()),
-            None,
-            None,
-        )
+    let resume = async |key: &str| {
+        service
+            .admit_provider_resume(
+                &parent,
+                "fixture:answer".into(),
+                Some(key.into()),
+                None,
+                None,
+            )
+            .await
     };
     let original = fs::read_to_string(home.join("config.toml")).unwrap();
     edit_config(&home, |config| {
@@ -2408,6 +2533,7 @@ async fn provider_resume_enforces_mcp_caps_and_keeps_frozen_global_selection() {
     });
     assert!(
         resume("catalog-revoked")
+            .await
             .unwrap_err()
             .to_string()
             .contains("role grants")
@@ -2422,6 +2548,7 @@ async fn provider_resume_enforces_mcp_caps_and_keeps_frozen_global_selection() {
     .unwrap();
     assert!(
         resume("profile-revoked")
+            .await
             .unwrap_err()
             .to_string()
             .contains("role grants")
@@ -2433,15 +2560,21 @@ async fn provider_resume_enforces_mcp_caps_and_keeps_frozen_global_selection() {
         format!("{original}\n[mcp.later]\ntransport='stdio'\ncommand='/bin/true'\nglobal=true\n"),
     )
     .unwrap();
-    let resumed = resume("new-global-does-not-widen").unwrap();
+    let resumed = resume("new-global-does-not-widen").await.unwrap();
     let child: AgentId = serde_json::from_value(resumed["agent_id"].clone()).unwrap();
-    let row = Store::open(&home).unwrap().get(&child).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&child)
+        .unwrap();
     assert_eq!(
         row.identity.as_ref().unwrap()["authority"]["role_payload"],
         parent.identity.as_ref().unwrap()["authority"]["role_payload"]
     );
     run_to_end(&home, &child).await;
-    let row = Store::open(&home).unwrap().get(&child).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&child)
+        .unwrap();
     assert_eq!(row.status, Status::Succeeded, "{:?}", row.failure_text);
 }
 
@@ -2451,7 +2584,7 @@ async fn provider_resume_enforces_mcp_caps_and_keeps_frozen_global_selection() {
 #[tokio::test]
 async fn cancelled_resume_never_spawns_or_touches_history() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let id = completed_parent(&home, &service, "cancel-parent").await;
     let seal = attempt_state(&home, &id)["native_history"]["seal"].clone();
     let history = std::path::Path::new(seal["root"].as_str().unwrap())
@@ -2459,19 +2592,26 @@ async fn cancelled_resume_never_spawns_or_touches_history() {
     let before = fs::read(&history).unwrap();
     let child = service
         .admit_provider_resume(
-            &Store::open(&home).unwrap().get(&id).unwrap(),
+            &agent_run_store::fixture::open(&home)
+                .unwrap()
+                .get(&id)
+                .unwrap(),
             "fixture:answer".into(),
             Some("cancelled-child".into()),
             None,
             None,
         )
+        .await
         .unwrap();
     let child: AgentId = serde_json::from_value(child["agent_id"].clone()).unwrap();
-    service.cancel(&child).unwrap();
+    service.cancel(&child).await.unwrap();
     run_to_end(&home, &child).await;
-    let row = Store::open(&home).unwrap().get(&child).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&child)
+        .unwrap();
     assert_eq!(row.status, Status::Cancelled);
-    let (process, active, proof): (Option<String>, i64, String) = Store::open(&home)
+    let (process, active, proof): (Option<String>, i64, String) = agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .query_row(
@@ -2504,7 +2644,7 @@ async fn resume_selector_keeps_the_parent_account_until_it_is_unavailable() {
     use agent_run_store::provider_admission::ProviderResume;
     let extra = "[[providers.glm-user.bindings]]\nlabel = \"alt\"\naccount = \"acct-alt\"\n";
     let (_temp, home) = home_with(extra, &["acct-alt"]);
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let work: AccountId = "acct-work".parse().unwrap();
     let alt: AccountId = "acct-alt".parse().unwrap();
     let set = |intent: SelectionIntent, accounts: &[(&AccountId, u32)]| QuotaCandidateSet {
@@ -2523,7 +2663,7 @@ async fn resume_selector_keeps_the_parent_account_until_it_is_unavailable() {
                 quota_known: true,
             })
             .collect(),
-        capacity_revision: Store::open(&home)
+        capacity_revision: agent_run_store::fixture::open(&home)
             .unwrap()
             .quota_capacity_revision()
             .unwrap(),
@@ -2554,7 +2694,10 @@ async fn resume_selector_keeps_the_parent_account_until_it_is_unavailable() {
     ];
     for (name, intent, accounts, pinned, expected) in cases {
         let id = completed_parent(&home, &service, &format!("{name}-parent")).await;
-        let parent = Store::open(&home).unwrap().get(&id).unwrap();
+        let parent = agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap();
         let mut identity = parent.identity.clone().unwrap();
         let mut request: ProviderStartRequest =
             serde_json::from_value(identity["provider_request"].clone()).unwrap();
@@ -2573,23 +2716,30 @@ async fn resume_selector_keeps_the_parent_account_until_it_is_unavailable() {
         let config: agent_run_config::provider_config::ProviderConfig =
             serde_json::from_value(identity["provider_config"].clone()).unwrap();
         let catalog = config
-            .resolve_catalog(Store::open(&home).unwrap().list_accounts().unwrap())
+            .resolve_catalog(
+                agent_run_store::fixture::open(&home)
+                    .unwrap()
+                    .list_accounts()
+                    .unwrap(),
+            )
             .unwrap();
-        let result = Store::open(&home).unwrap().admit_provider_resume(
-            &request,
-            &effective,
-            &catalog,
-            &authority,
-            &set(intent, &accounts),
-            &identity,
-            8,
-            None,
-            pinned,
-            ProviderResume {
-                parent: &id,
-                prefer: &work,
-            },
-        );
+        let result = agent_run_store::fixture::open(&home)
+            .unwrap()
+            .admit_provider_resume(
+                &request,
+                &effective,
+                &catalog,
+                &authority,
+                &set(intent, &accounts),
+                &identity,
+                8,
+                None,
+                pinned,
+                ProviderResume {
+                    parent: &id,
+                    prefer: &work,
+                },
+            );
         match expected {
             Some(account) => assert_eq!(&result.unwrap().account_id, account, "{name}"),
             None => assert!(result.is_err(), "{name}: a pinned resume never switches"),
@@ -2604,7 +2754,7 @@ async fn resume_selector_keeps_the_parent_account_until_it_is_unavailable() {
 #[tokio::test]
 async fn handoff_refuses_a_seal_for_another_history_root() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let id = completed_parent(&home, &service, "root-parent").await;
     let mut state = attempt_state(&home, &id);
     let seal = state["native_history"]["seal"].clone();
@@ -2615,7 +2765,7 @@ async fn handoff_refuses_a_seal_for_another_history_root() {
     fs::copy(planned.join(&relative), other.join(&relative)).unwrap();
     let other = other.canonicalize().unwrap();
     state["native_history"]["seal"]["root"] = other.to_string_lossy().into_owned().into();
-    Store::open(&home)
+    agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .execute(
@@ -2629,19 +2779,26 @@ async fn handoff_refuses_a_seal_for_another_history_root() {
     );
     let child = service
         .admit_provider_resume(
-            &Store::open(&home).unwrap().get(&id).unwrap(),
+            &agent_run_store::fixture::open(&home)
+                .unwrap()
+                .get(&id)
+                .unwrap(),
             "fixture:answer".into(),
             Some("root-child".into()),
             None,
             None,
         )
+        .await
         .unwrap();
     let child: AgentId = serde_json::from_value(child["agent_id"].clone()).unwrap();
-    let mut supervisor = supervisor(&home, &child);
+    let mut supervisor = supervisor(&home, &child).await;
     let _ = tokio::time::timeout(Duration::from_secs(20), supervisor.wait())
         .await
         .unwrap();
-    let row = Store::open(&home).unwrap().get(&child).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&child)
+        .unwrap();
     assert!(
         row.status.terminal() && row.status != Status::Succeeded,
         "{:?}",
@@ -2655,7 +2812,7 @@ async fn handoff_refuses_a_seal_for_another_history_root() {
         "{:?}",
         row.failure_text
     );
-    let process: Option<String> = Store::open(&home)
+    let process: Option<String> = agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .query_row(
@@ -2680,9 +2837,9 @@ async fn handoff_refuses_a_seal_for_another_history_root() {
 #[tokio::test]
 async fn supervisor_records_are_bound_to_their_attempt() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let id = completed_parent(&home, &service, "bound-parent").await;
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let attempt: String = store
         .conn
         .query_row(
@@ -2720,25 +2877,26 @@ async fn supervisor_records_are_bound_to_their_attempt() {
 #[tokio::test]
 async fn quota_signals_cross_the_boundary_typed_and_attempt_bound() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
-    let run = |task: &'static str, request_id: &'static str| {
+    let service = fixture_service(home.clone()).await;
+    let run = async |task: &'static str, request_id: &'static str| {
         let mut request = request(&home);
         request.task = task.into();
         request.request_id = Some(request_id.into());
-        let revision = Store::open(&home)
+        let revision = agent_run_store::fixture::open(&home)
             .unwrap()
             .quota_capacity_revision()
             .unwrap();
         let admitted = service
             .admit_provider_trusted(request, candidates(revision))
+            .await
             .unwrap();
         serde_json::from_value::<AgentId>(admitted["agent_id"].clone()).unwrap()
     };
-    let quota = run("fixture:quota", "quota-1");
+    let quota = run("fixture:quota", "quota-1").await;
     run_to_end(&home, &quota).await;
-    let quoted = run("fixture:quota-text", "quota-2");
+    let quoted = run("fixture:quota-text", "quota-2").await;
     run_to_end(&home, &quoted).await;
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let failures = |id: &AgentId| -> Vec<(Option<String>, String)> {
         store
             .conn
@@ -2778,7 +2936,7 @@ async fn quota_signals_cross_the_boundary_typed_and_attempt_bound() {
 #[tokio::test]
 async fn superseded_quota_rejections_do_not_classify_the_failure() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     for (task, request_id, expected) in [
         ("fixture:quota-then-allowed", "sup-1", None),
         ("fixture:quota-then-auth", "sup-2", Some("auth")),
@@ -2787,16 +2945,17 @@ async fn superseded_quota_rejections_do_not_classify_the_failure() {
         let mut request = request(&home);
         request.task = task.into();
         request.request_id = Some(request_id.into());
-        let revision = Store::open(&home)
+        let revision = agent_run_store::fixture::open(&home)
             .unwrap()
             .quota_capacity_revision()
             .unwrap();
         let admitted = service
             .admit_provider_trusted(request, candidates(revision))
+            .await
             .unwrap();
         let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
         run_to_end(&home, &id).await;
-        let store = Store::open(&home).unwrap();
+        let store = agent_run_store::fixture::open(&home).unwrap();
         assert_eq!(store.get(&id).unwrap().status, Status::Failed, "{task}");
         let class: Option<String> = store
             .conn
@@ -2830,7 +2989,7 @@ fn codex_home_with(auth: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
         ));
     }
     let (temp, home) = home_in(env!("CARGO_TARGET_TMPDIR"), &extra, &[]);
-    let mut store = Store::open(&home).unwrap();
+    let mut store = agent_run_store::fixture::open(&home).unwrap();
     for (label, content) in labels.into_iter().zip(auth.iter().copied()) {
         let account = format!("acct-cx-{label}");
         let account = account.as_str();
@@ -2851,8 +3010,8 @@ fn codex_home_with(auth: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
 
 /// Start/pool admission and real Codex launch use the same grant compiler:
 /// unsupported external read roots are rejected before rows/reservations exist.
-#[test]
-fn provider_preflight_reuses_native_grant_before_durable_admission() {
+#[tokio::test]
+async fn provider_preflight_reuses_native_grant_before_durable_admission() {
     let (_temp, home) = codex_home_with(&["healthy"]);
     let external = tempfile::tempdir().unwrap();
     fs::write(home.join("profiles/implement.md"),
@@ -2863,8 +3022,8 @@ fn provider_preflight_reuses_native_grant_before_durable_admission() {
         "request_id":"preflight-bad",
     }))
     .unwrap();
-    let service = Service::new(home.clone());
-    let error = service.admit_provider(bad.clone()).unwrap_err();
+    let service = fixture_service(home.clone()).await;
+    let error = service.admit_provider(bad.clone()).await.unwrap_err();
     assert!(matches!(error, agent_run_domain::Error::Validation(_)));
     assert!(
         error
@@ -2906,6 +3065,7 @@ fn provider_preflight_reuses_native_grant_before_durable_admission() {
         .remove("request_id");
     let error = service
         .admit_pool(serde_json::from_value(pool).unwrap())
+        .await
         .unwrap_err();
     assert!(
         error
@@ -2918,14 +3078,14 @@ fn provider_preflight_reuses_native_grant_before_durable_admission() {
     let mut good = bad;
     good.read_roots.clear();
     good.request_id = Some("preflight-good".into());
-    assert!(service.admit_provider(good).is_ok());
+    assert!(service.admit_provider(good).await.is_ok());
     assert_eq!(rows(&home), (1, 1));
 }
 
 /// A configured non-executable native binary is refused in the same call;
 /// no harness/model is spawned and no durable agent or attempt is admitted.
-#[test]
-fn provider_preflight_refuses_nonexecutable_binary_without_rows() {
+#[tokio::test]
+async fn provider_preflight_refuses_nonexecutable_binary_without_rows() {
     let (_temp, home) = home();
     let binary = home.join("non-executable");
     fs::write(&binary, "fixture").unwrap();
@@ -2935,8 +3095,10 @@ fn provider_preflight_refuses_nonexecutable_binary_without_rows() {
         config["harnesses"]["claude-code"]["binary"] =
             toml::Value::String(binary.display().to_string())
     });
-    let error = Service::new(home.clone())
+    let error = fixture_service(home.clone())
+        .await
         .admit_provider_trusted(request(&home), candidates(committed(&home)))
+        .await
         .unwrap_err();
     assert!(
         error
@@ -2948,8 +3110,8 @@ fn provider_preflight_refuses_nonexecutable_binary_without_rows() {
 
 /// Auto and pinned starts reject incompatible credential-reference shape
 /// before durable admission, through the same check actual launches consume.
-#[test]
-fn provider_preflight_reuses_launch_credential_contract_without_reading_secrets() {
+#[tokio::test]
+async fn provider_preflight_reuses_launch_credential_contract_without_reading_secrets() {
     let (_temp, home) = home();
     edit_config(&home, |config| {
         config["providers"]["glm-user"]["connection"] = toml::Value::Table(
@@ -2959,7 +3121,7 @@ fn provider_preflight_reuses_launch_credential_contract_without_reading_secrets(
         );
     });
     let (config, _) = agent_run_config::provider_config::ProviderConfig::load(&home).unwrap();
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let catalog = config
         .resolve_catalog(store.list_accounts().unwrap())
         .unwrap();
@@ -2975,8 +3137,10 @@ fn provider_preflight_reuses_launch_credential_contract_without_reading_secrets(
         if !pinned {
             request.account = None;
         }
-        let error = Service::new(home.clone())
+        let error = fixture_service(home.clone())
+            .await
             .admit_provider(request)
+            .await
             .unwrap_err();
         assert_eq!(error.to_string(), actual.to_string());
         assert_eq!(error.public().kind, "ValidationError");
@@ -2989,15 +3153,16 @@ fn provider_preflight_reuses_launch_credential_contract_without_reading_secrets(
 #[tokio::test]
 async fn provider_execution_error_persists_content_free_cause() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let mut requested = request(&home);
     requested.task = "fixture:invalid-result-error-type".into();
     let admitted = service
         .admit_provider_trusted(requested, candidates(committed(&home)))
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     run_to_end(&home, &id).await;
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let row = store.get(&id).unwrap();
     assert_eq!(row.status, Status::Failed);
     assert_eq!(
@@ -3032,7 +3197,7 @@ async fn provider_execution_error_persists_content_free_cause() {
     );
 }
 
-/// Admits one ranked `codex-user` run (optionally pinned) and runs its
+/// Admits one ranked `codex-user` run (optionally pinned).await and runs its
 /// supervisor to the end.
 async fn codex_run(home: &Path, request_id: &str, account: Option<&str>) -> AgentId {
     let mut request: ProviderStartRequest = serde_json::from_value(serde_json::json!({
@@ -3042,8 +3207,10 @@ async fn codex_run(home: &Path, request_id: &str, account: Option<&str>) -> Agen
     }))
     .unwrap();
     request.validate().unwrap();
-    let admitted = Service::new(home.to_path_buf())
+    let admitted = fixture_service(home.to_path_buf())
+        .await
         .admit_provider(request)
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     run_to_end(home, &id).await;
@@ -3073,13 +3240,16 @@ async fn codex_global_fast_mode_start_and_resume_policy() {
         &format!("binary = \"{}\"", wrapper.display()),
     );
     fs::write(&path, &text).unwrap();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let raw = request_for(&home, "codex-user", "global-fast-parent", Some("a"));
     assert!(!raw.fast);
-    let admitted = service.admit_provider(raw.clone()).unwrap();
+    let admitted = service.admit_provider(raw.clone()).await.unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     run_to_end(&home, &id).await;
-    let parent = Store::open(&home).unwrap().get(&id).unwrap();
+    let parent = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     assert_eq!(
         parent.status,
         Status::Succeeded,
@@ -3108,9 +3278,13 @@ async fn codex_global_fast_mode_start_and_resume_policy() {
             None,
             None,
         )
+        .await
         .unwrap();
     let child_id: AgentId = serde_json::from_value(child["agent_id"].clone()).unwrap();
-    let row = Store::open(&home).unwrap().get(&child_id).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&child_id)
+        .unwrap();
     assert!(row.request.fast);
     assert_eq!(
         row.identity.as_ref().unwrap()["provider_request"]["fast"],
@@ -3137,11 +3311,15 @@ async fn codex_global_fast_mode_start_and_resume_policy() {
                 None,
                 None
             )
+            .await
             .unwrap()["created"],
         false
     );
     run_to_end(&home, &child_id).await;
-    let child_row = Store::open(&home).unwrap().get(&child_id).unwrap();
+    let child_row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&child_id)
+        .unwrap();
     assert_eq!(
         child_row.status,
         Status::Succeeded,
@@ -3154,15 +3332,21 @@ async fn codex_global_fast_mode_start_and_resume_policy() {
         "{args}"
     );
     let new_raw = request_for(&home, "codex-user", "global-fast-new", Some("a"));
-    let new = service.admit_provider(new_raw.clone()).unwrap();
+    let new = service.admit_provider(new_raw.clone()).await.unwrap();
     let new_id: AgentId = serde_json::from_value(new["agent_id"].clone()).unwrap();
-    let new_row = Store::open(&home).unwrap().get(&new_id).unwrap();
+    let new_row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&new_id)
+        .unwrap();
     assert!(new_row.request.fast);
     assert_eq!(
         new_row.identity.as_ref().unwrap()["provider_request"]["fast"],
         false
     );
-    assert_eq!(service.admit_provider(new_raw).unwrap()["created"], false);
+    assert_eq!(
+        service.admit_provider(new_raw).await.unwrap()["created"],
+        false
+    );
     run_to_end(&home, &new_id).await;
     fs::write(&path, &text).unwrap();
     let standard = service
@@ -3173,10 +3357,11 @@ async fn codex_global_fast_mode_start_and_resume_policy() {
             None,
             None,
         )
+        .await
         .unwrap();
     let standard_id: AgentId = serde_json::from_value(standard["agent_id"].clone()).unwrap();
     assert!(
-        !Store::open(&home)
+        !agent_run_store::fixture::open(&home)
             .unwrap()
             .get(&standard_id)
             .unwrap()
@@ -3186,15 +3371,22 @@ async fn codex_global_fast_mode_start_and_resume_policy() {
     run_to_end(&home, &standard_id).await;
     let mut explicit = request_for(&home, "codex-user", "explicit-fast-still-works", Some("a"));
     explicit.fast = true;
-    let admitted = service.admit_provider(explicit).unwrap();
+    let admitted = service.admit_provider(explicit).await.unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
-    assert!(Store::open(&home).unwrap().get(&id).unwrap().request.fast);
+    assert!(
+        agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .request
+            .fast
+    );
     run_to_end(&home, &id).await;
 }
 
 /// Pool admission applies one Codex harness Fast policy across provider/model aliases and accounts.
-#[test]
-fn codex_global_fast_mode_pool_members_and_aliases() {
+#[tokio::test]
+async fn codex_global_fast_mode_pool_members_and_aliases() {
     let (_temp, home) = codex_home_with(&["healthy", "healthy"]);
     let path = home.join("config.toml");
     let text = fs::read_to_string(&path)
@@ -3214,10 +3406,10 @@ fn codex_global_fast_mode_pool_members_and_aliases() {
             "members":[{"role":"first","start":first},{"role":"second","start":second}],
         }))
         .unwrap();
-    let service = Service::new(home.clone());
-    let admitted = service.admit_pool(request.clone()).unwrap();
-    assert_eq!(service.admit_pool(request).unwrap()["created"], false);
-    let store = Store::open(&home).unwrap();
+    let service = fixture_service(home.clone()).await;
+    let admitted = service.admit_pool(request.clone()).await.unwrap();
+    assert_eq!(service.admit_pool(request).await.unwrap()["created"], false);
+    let store = agent_run_store::fixture::open(&home).unwrap();
     for member in admitted["members"].as_array().unwrap() {
         let id: AgentId = serde_json::from_value(member["agent_id"].clone()).unwrap();
         let row = store.get(&id).unwrap();
@@ -3236,9 +3428,17 @@ fn codex_global_fast_mode_pool_members_and_aliases() {
             "fast-does-not-affect-claude",
             Some("work"),
         ))
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(claude["agent_id"].clone()).unwrap();
-    assert!(!Store::open(&home).unwrap().get(&id).unwrap().request.fast);
+    assert!(
+        !agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .request
+            .fast
+    );
 }
 
 /// Offline Codex start/resume runs prove normalized names and replay conflicts,
@@ -3247,25 +3447,28 @@ fn codex_global_fast_mode_pool_members_and_aliases() {
 #[tokio::test]
 async fn codex_resume_usage_and_display_names_are_durable() {
     let (_temp, home) = codex_home_with(&["healthy"]);
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let mut request = request_for(&home, "codex-user", "metadata-parent", Some("a"));
     request.task = "fixture:usage".into();
     request.display_name = Some("  工程師 / review  ".into());
-    let admitted = service.admit_provider(request.clone()).unwrap();
+    let admitted = service.admit_provider(request.clone()).await.unwrap();
     let parent_id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     assert_eq!(admitted["agent"]["name"], "工程師 / review");
     request.display_name = Some("工程師 / review".into());
     assert_eq!(
-        service.admit_provider(request.clone()).unwrap()["created"],
+        service.admit_provider(request.clone()).await.unwrap()["created"],
         false
     );
     request.display_name = Some("Another label".into());
     assert!(matches!(
-        service.admit_provider(request),
+        service.admit_provider(request).await,
         Err(agent_run::Error::Conflict)
     ));
     run_to_end(&home, &parent_id).await;
-    let parent = Store::open(&home).unwrap().get(&parent_id).unwrap();
+    let parent = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&parent_id)
+        .unwrap();
     assert_eq!(
         parent.status,
         Status::Succeeded,
@@ -3280,6 +3483,7 @@ async fn codex_resume_usage_and_display_names_are_durable() {
             None,
             None,
         )
+        .await
         .unwrap();
     let child_id: AgentId = serde_json::from_value(child["agent_id"].clone()).unwrap();
     assert_eq!(child["agent"]["name"], "工程師 / review");
@@ -3292,21 +3496,24 @@ async fn codex_resume_usage_and_display_names_are_durable() {
                 Some("工程師 / review".into()),
                 None
             )
+            .await
             .unwrap()["created"],
         false
     );
     assert!(matches!(
-        service.admit_provider_resume(
-            &parent,
-            "fixture:usage".into(),
-            Some("metadata-child".into()),
-            Some("Changed".into()),
-            None
-        ),
+        service
+            .admit_provider_resume(
+                &parent,
+                "fixture:usage".into(),
+                Some("metadata-child".into()),
+                Some("Changed".into()),
+                None
+            )
+            .await,
         Err(agent_run::Error::Conflict)
     ));
     run_to_end(&home, &child_id).await;
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     assert_eq!(store.get(&child_id).unwrap().status, Status::Succeeded);
     let baseline = store
         .last_event(&child_id, "resume_usage_baseline")
@@ -3324,7 +3531,27 @@ async fn codex_resume_usage_and_display_names_are_durable() {
             .unwrap()
     );
     assert_eq!(baseline["tokenUsage"]["total"]["inputTokens"], 100);
-    let usage = store.usage_view(&child_id).unwrap().unwrap();
+    let usage = match store
+        .usage_view(&child_id)
+        .expect("usage projection query succeeds")
+    {
+        Some(usage) => usage,
+        None => {
+            let unavailable = store
+                .last_event(&child_id, "run_stats_unavailable_v1")
+                .expect("closed stats diagnostic query succeeds");
+            let terminal = store
+                .get(&child_id)
+                .expect("terminal execution remains readable");
+            let retained = _temp.keep();
+            panic!(
+                "usage projection missing after actual supervisor exit; status={:?}, failure_kind={:?}, run_stats_unavailable_v1={unavailable:?}, fixture={}",
+                terminal.status,
+                terminal.failure_kind,
+                retained.display()
+            );
+        }
+    };
     assert_eq!(usage.input_tokens, Some(100));
     assert_eq!(usage.output_tokens, Some(20));
     assert_eq!(usage.num_turns, None);
@@ -3363,19 +3590,24 @@ async fn codex_resume_usage_and_display_names_are_durable() {
             Some("Мария: follow-up".into()),
             None,
         )
+        .await
         .unwrap();
     assert_eq!(renamed["agent"]["name"], "Мария: follow-up");
     let renamed_id: AgentId = serde_json::from_value(renamed["agent_id"].clone()).unwrap();
     run_to_end(&home, &renamed_id).await;
     assert_eq!(
-        Store::open(&home).unwrap().get(&renamed_id).unwrap().status,
+        agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&renamed_id)
+            .unwrap()
+            .status,
         Status::Succeeded
     );
 }
 
 /// (number, account, state, ownership, finished) of every attempt, in order.
 fn attempts(home: &Path, id: &AgentId) -> Vec<(u32, String, String, i64, bool)> {
-    Store::open(home)
+    agent_run_store::fixture::open(home)
         .unwrap()
         .conn
         .prepare("SELECT number,selected_account_id,state,ownership_active,finished_at IS NOT NULL FROM attempts WHERE agent_id=? ORDER BY number")
@@ -3388,7 +3620,7 @@ fn attempts(home: &Path, id: &AgentId) -> Vec<(u32, String, String, i64, bool)> 
 
 /// One count query for `id`.
 fn count(home: &Path, sql: &str, id: &AgentId) -> i64 {
-    Store::open(home)
+    agent_run_store::fixture::open(home)
         .unwrap()
         .conn
         .query_row(sql, [id.as_str()], |row| row.get(0))
@@ -3431,7 +3663,7 @@ fn rollout_inputs(row: &agent_run::state::Record) -> Vec<String> {
 async fn early_quota_rejection_with_meta_only_history_never_switches() {
     let (_temp, home) = codex_home(["exhausted early", "ok"]);
     let id = codex_run(&home, "early-1", None).await;
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let row = store.get(&id).unwrap();
     assert_eq!(row.status, Status::Failed, "{:?}", row.failure_text);
     assert_eq!(row.failure_kind.as_deref(), Some("quota_exhausted"));
@@ -3472,7 +3704,10 @@ async fn early_quota_rejection_with_meta_only_history_never_switches() {
 async fn rewritten_history_after_a_switch_never_reaches_a_third_account() {
     let (_temp, home) = codex_home_with(&["exhausted", "exhausted rewrite", "ok"]);
     let id = codex_run(&home, "rewrite-1", None).await;
-    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     assert_eq!(row.status, Status::Failed, "{:?}", row.failure_text);
     assert_eq!(row.failure_kind.as_deref(), Some("quota_exhausted"));
     assert!(
@@ -3510,7 +3745,10 @@ async fn rewritten_history_after_a_switch_never_reaches_a_third_account() {
 async fn intact_history_carries_the_task_proof_through_two_switches() {
     let (_temp, home) = codex_home_with(&["exhausted", "exhausted", "ok"]);
     let id = codex_run(&home, "chain-1", None).await;
-    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     assert_eq!(row.status, Status::Succeeded, "{:?}", row.failure_text);
     assert_eq!(attempts(&home, &id).len(), 3);
 }
@@ -3524,23 +3762,34 @@ async fn inherited_identical_text_cannot_prove_an_explicit_child_task() {
     let (_temp, home) = codex_home(["ok", "ok"]);
     let parent = codex_run(&home, "parent-1", None).await;
     assert_eq!(
-        Store::open(&home).unwrap().get(&parent).unwrap().status,
+        agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&parent)
+            .unwrap()
+            .status,
         Status::Succeeded
     );
     fs::write(home.join("accounts/codex/a/auth.json"), "exhausted early").unwrap();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let child = service
         .admit_provider_resume(
-            &Store::open(&home).unwrap().get(&parent).unwrap(),
+            &agent_run_store::fixture::open(&home)
+                .unwrap()
+                .get(&parent)
+                .unwrap(),
             "fixture:original-task".into(),
             Some("child-1".into()),
             None,
             None,
         )
+        .await
         .unwrap();
     let child: AgentId = serde_json::from_value(child["agent_id"].clone()).unwrap();
     run_to_end(&home, &child).await;
-    let row = Store::open(&home).unwrap().get(&child).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&child)
+        .unwrap();
     assert_eq!(row.status, Status::Failed, "{:?}", row.failure_text);
     assert!(
         row.failure_text
@@ -3567,7 +3816,7 @@ async fn inherited_identical_text_cannot_prove_an_explicit_child_task() {
 async fn exhausted_account_switches_within_the_same_logical_run() {
     let (_temp, home) = codex_home(["exhausted", "ok"]);
     let id = codex_run(&home, "switch-1", None).await;
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let row = store.get(&id).unwrap();
     assert_eq!(
         row.status,
@@ -3590,7 +3839,7 @@ async fn exhausted_account_switches_within_the_same_logical_run() {
     );
     assert_eq!((attempts[1].1.as_str(), attempts[1].3), ("acct-cx-b", 0));
     assert_eq!(
-        Service::new(home.clone()).answer(&id).unwrap()["content"],
+        fixture_service(home.clone()).await.answer(&id).unwrap()["content"],
         format!("fixture  \u{1b}[31mcodex answer on {thread}")
     );
     // The original task is journaled once; the switch sends only the control.
@@ -3700,13 +3949,16 @@ async fn exhausted_runs_stop_with_the_exact_blocker() {
     ] {
         let (_temp, home) = codex_home(auth);
         if let Some(account) = disable {
-            Store::open(&home)
+            agent_run_store::fixture::open(&home)
                 .unwrap()
                 .disable_account(&account.parse().unwrap())
                 .unwrap();
         }
         let id = codex_run(&home, "stop-1", pin).await;
-        let row = Store::open(&home).unwrap().get(&id).unwrap();
+        let row = agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap();
         assert_eq!(row.status, Status::Failed, "{blocker}");
         assert_eq!(
             row.failure_kind.as_deref(),
@@ -3758,12 +4010,12 @@ async fn cancel_during_the_exhausted_attempt_prevents_the_switch() {
     }))
     .unwrap();
     request.validate().unwrap();
-    let service = Service::new(home.clone());
-    let admitted = service.admit_provider(request).unwrap();
+    let service = fixture_service(home.clone()).await;
+    let admitted = service.admit_provider(request).await.unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
-    let mut child = supervisor(&home, &id);
+    let mut child = supervisor(&home, &id).await;
     let runtime_home = || {
-        Store::open(&home)
+        agent_run_store::fixture::open(&home)
             .unwrap()
             .get(&id)
             .unwrap()
@@ -3781,13 +4033,16 @@ async fn cancel_during_the_exhausted_attempt_prevents_the_switch() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let root = held.expect("attempt A reached the barrier");
-    service.cancel(&id).unwrap();
+    service.cancel(&id).await.unwrap();
     fs::write(root.join("fixture-release"), "").unwrap();
     tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .unwrap()
         .unwrap();
-    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     assert_eq!(row.status, Status::Cancelled, "{:?}", row.failure_text);
     assert_eq!(
         attempts(&home, &id).len(),
@@ -3810,21 +4065,24 @@ async fn cancel_during_the_exhausted_attempt_prevents_the_switch() {
 async fn claude_exhaustion_never_switches_accounts() {
     let extra = "[[providers.glm-user.bindings]]\nlabel = \"alt\"\naccount = \"acct-alt\"\n";
     let (_temp, home) = home_with(extra, &["acct-alt"]);
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let mut request = request(&home);
     request.task = "fixture:quota".into();
     request.account = None;
     request.request_id = Some("claude-stop".into());
-    let revision = Store::open(&home)
+    let revision = agent_run_store::fixture::open(&home)
         .unwrap()
         .quota_capacity_revision()
         .unwrap();
     let mut set = candidates(revision);
     set.intent = SelectionIntent::Auto;
-    let admitted = service.admit_provider_trusted(request, set).unwrap();
+    let admitted = service.admit_provider_trusted(request, set).await.unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     run_to_end(&home, &id).await;
-    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     assert_eq!(row.failure_kind.as_deref(), Some("quota_exhausted"));
     assert!(
         row.failure_text
@@ -3852,13 +4110,13 @@ async fn crash_after_the_switch_reconciles_without_a_duplicate() {
     }))
     .unwrap();
     request.validate().unwrap();
-    let service = Service::new(home.clone());
-    let admitted = service.admit_provider(request).unwrap();
+    let service = fixture_service(home.clone()).await;
+    let admitted = service.admit_provider(request).await.unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
-    let mut child = supervisor(&home, &id);
+    let mut child = supervisor(&home, &id).await;
     let mut held = None;
     for _ in 0..400 {
-        let root = Store::open(&home)
+        let root = agent_run_store::fixture::open(&home)
             .unwrap()
             .get(&id)
             .unwrap()
@@ -3876,21 +4134,24 @@ async fn crash_after_the_switch_reconciles_without_a_duplicate() {
     child.kill().await.unwrap();
     let _ = child.wait().await;
     assert_eq!(attempts(&home, &id).len(), 2);
-    let reconciled = service.reconcile().unwrap();
+    let reconciled = service.reconcile().await.unwrap();
     assert!(reconciled >= 1, "the orphaned run was reconciled");
-    let pid = Store::open(&home)
+    let pid = agent_run_store::fixture::open(&home)
         .unwrap()
         .get(&id)
         .unwrap()
         .process_group_id
         .unwrap();
     assert_eq!(
-        service.reconcile().unwrap(),
+        service.reconcile().await.unwrap(),
         0,
         "a second periodic pass is a no-op"
     );
     fs::write(root.join("fixture-release"), "").unwrap();
-    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     assert!(
         row.status.terminal() && row.status != Status::Succeeded,
         "{:?}",
@@ -3912,7 +4173,7 @@ async fn crash_after_the_switch_reconciles_without_a_duplicate() {
         ("lost", 0),
         "{attempts:?}"
     );
-    let proof: String = Store::open(&home)
+    let proof: String = agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .query_row(
@@ -3927,7 +4188,7 @@ async fn crash_after_the_switch_reconciles_without_a_duplicate() {
     // SAFETY: signal 0 only probes the recorded (now expected gone) group.
     let probe = unsafe { libc::kill(-pid, 0) };
     assert_eq!(probe, -1, "B's process group is gone");
-    let event_attempt: u32 = Store::open(&home)
+    let event_attempt: u32 = agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .query_row(
@@ -3957,14 +4218,16 @@ async fn held_codex_run(home: &Path, during: impl FnOnce(&Path)) -> AgentId {
     }))
     .unwrap();
     request.validate().unwrap();
-    let admitted = Service::new(home.to_path_buf())
+    let admitted = fixture_service(home.to_path_buf())
+        .await
         .admit_provider(request)
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
-    let mut child = supervisor(home, &id);
+    let mut child = supervisor(home, &id).await;
     let mut held = None;
     for _ in 0..400 {
-        let root = Store::open(home)
+        let root = agent_run_store::fixture::open(home)
             .unwrap()
             .get(&id)
             .unwrap()
@@ -4007,7 +4270,10 @@ async fn switch_honors_current_policy_and_history_evidence() {
         });
     })
     .await;
-    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     assert!(
         row.failure_text
             .as_deref()
@@ -4034,7 +4300,10 @@ async fn switch_honors_current_policy_and_history_evidence() {
         .unwrap();
     })
     .await;
-    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     assert_eq!(row.failure_kind.as_deref(), Some("quota_exhausted"));
     assert!(
         row.failure_text
@@ -4053,9 +4322,9 @@ async fn switch_honors_current_policy_and_history_evidence() {
 #[tokio::test]
 async fn reconcile_closes_a_never_spawned_owned_attempt() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let id = completed_parent(&home, &service, "never-parent").await;
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     store
         .conn
         .execute(
@@ -4068,8 +4337,8 @@ async fn reconcile_closes_a_never_spawned_owned_attempt() {
         .conn
         .execute("UPDATE agents SET status='lost' WHERE id=?", [id.as_str()])
         .unwrap();
-    service.reconcile().unwrap();
-    let (owned, proof): (i64, String) = Store::open(&home)
+    service.reconcile().await.unwrap();
+    let (owned, proof): (i64, String) = agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .query_row(
@@ -4084,7 +4353,7 @@ async fn reconcile_closes_a_never_spawned_owned_attempt() {
 }
 
 /// Admits one automatic `codex-user` execution without starting its supervisor.
-fn codex_admit(home: &Path, request_id: &str) -> AgentId {
+async fn codex_admit(home: &Path, request_id: &str) -> AgentId {
     let mut request: ProviderStartRequest = serde_json::from_value(serde_json::json!({
         "provider":"codex-user","model":"fixture","profile":"review","explicit_finish":false,
         "task":"fixture:original-task","workdir":home,"request_id":request_id,
@@ -4092,8 +4361,10 @@ fn codex_admit(home: &Path, request_id: &str) -> AgentId {
     }))
     .unwrap();
     request.validate().unwrap();
-    let admitted = Service::new(home.to_path_buf())
+    let admitted = fixture_service(home.to_path_buf())
+        .await
         .admit_provider(request)
+        .await
         .unwrap();
     serde_json::from_value(admitted["agent_id"].clone()).unwrap()
 }
@@ -4104,8 +4375,8 @@ fn codex_admit(home: &Path, request_id: &str) -> AgentId {
 async fn switched_engine_has_no_execution_lifetime() {
     let (_temp, home) = codex_home(["exhausted-slow", "ok-hold"]);
     let _processes = ServiceProcesses(home.clone());
-    let id = codex_admit(&home, "unlimited-switch");
-    let mut child = supervisor(&home, &id);
+    let id = codex_admit(&home, "unlimited-switch").await;
+    let mut child = supervisor(&home, &id).await;
     let started = std::time::Instant::now();
     loop {
         if count(
@@ -4119,7 +4390,7 @@ async fn switched_engine_has_no_execution_lifetime() {
         assert!(started.elapsed() < Duration::from_secs(15));
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    Store::open(&home)
+    agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .execute(
@@ -4133,10 +4404,18 @@ async fn switched_engine_has_no_execution_lifetime() {
             .is_err()
     );
     assert_eq!(
-        Store::open(&home).unwrap().get(&id).unwrap().status,
+        agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .status,
         Status::Running
     );
-    Service::new(home.clone()).cancel(&id).unwrap();
+    fixture_service(home.clone())
+        .await
+        .cancel(&id)
+        .await
+        .unwrap();
     assert!(
         tokio::time::timeout(Duration::from_secs(20), child.wait())
             .await
@@ -4144,7 +4423,7 @@ async fn switched_engine_has_no_execution_lifetime() {
             .unwrap()
             .success()
     );
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     assert_eq!(store.get(&id).unwrap().status, Status::Cancelled);
     let attempts = attempts(&home, &id);
     assert_eq!(attempts.len(), 2);
@@ -4175,14 +4454,17 @@ async fn old_execution_can_switch_after_quota_exhaustion() {
     let (_temp, home) = codex_home(["exhausted-hold", "ok"]);
     let aged = home.clone();
     let id = held_codex_run(&home, move |_| {
-        Store::open(&aged)
+        agent_run_store::fixture::open(&aged)
             .unwrap()
             .conn
             .execute("UPDATE agents SET created_at=created_at-7776000", [])
             .unwrap();
     })
     .await;
-    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     assert_eq!(row.status, Status::Succeeded, "{:?}", row.failure_text);
     let attempts = attempts(&home, &id);
     assert_eq!(attempts.len(), 2);
@@ -4198,9 +4480,9 @@ async fn old_execution_can_switch_after_quota_exhaustion() {
 async fn handoff_after_allocation_honours_cancel_and_revocation() {
     for case in ["cancel", "revoke", "policy", "connection", "unbind"] {
         let (_temp, home) = codex_home(["exhausted", "ok"]);
-        let id = codex_admit(&home, "handoff-1");
+        let id = codex_admit(&home, "handoff-1").await;
         fs::write(home.join("fixture-pause-spawn-2"), "").unwrap();
-        let mut child = supervisor(&home, &id);
+        let mut child = supervisor(&home, &id).await;
         for _ in 0..400 {
             if home.join("fixture-paused-spawn-2").exists() {
                 break;
@@ -4213,9 +4495,13 @@ async fn handoff_after_allocation_honours_cancel_and_revocation() {
         );
         match case {
             "cancel" => {
-                Service::new(home.clone()).cancel(&id).unwrap();
+                fixture_service(home.clone())
+                    .await
+                    .cancel(&id)
+                    .await
+                    .unwrap();
             }
-            "revoke" => Store::open(&home)
+            "revoke" => agent_run_store::fixture::open(&home)
                 .unwrap()
                 .disable_account(&"acct-cx-b".parse().unwrap())
                 .unwrap(),
@@ -4251,8 +4537,11 @@ async fn handoff_after_allocation_honours_cancel_and_revocation() {
             .await
             .unwrap()
             .unwrap();
-        let row = Store::open(&home).unwrap().get(&id).unwrap();
-        let (process, proof, owned): (Option<String>, String, i64) = Store::open(&home)
+        let row = agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap();
+        let (process, proof, owned): (Option<String>, String, i64) = agent_run_store::fixture::open(&home)
             .unwrap()
             .conn
             .query_row(
@@ -4333,19 +4622,20 @@ async fn mapped_claude_windows_feed_the_exhaustion_latch() {
             collector.insert("exhaustion_windows".into(), toml::Value::Table(windows));
             provider.insert("collector".into(), toml::Value::Table(collector));
         });
-        let service = Service::new(home.clone());
+        let service = fixture_service(home.clone()).await;
         let mut request = request(&home);
         request.task = task.into();
-        let revision = Store::open(&home)
+        let revision = agent_run_store::fixture::open(&home)
             .unwrap()
             .quota_capacity_revision()
             .unwrap();
         let admitted = service
             .admit_provider_trusted(request, candidates(revision))
+            .await
             .unwrap();
         let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
         run_to_end(&home, &id).await;
-        let store = Store::open(&home).unwrap();
+        let store = agent_run_store::fixture::open(&home).unwrap();
         let rows: Vec<(String, String, String)> = store
             .conn
             .prepare("SELECT quota_key,window_id,source FROM quota_exhaustion")
@@ -4434,13 +4724,15 @@ fn read_until(pipe: &mut std::process::ChildStdout, needle: &str) -> String {
 /// going; a second viewer then follows the same logical id to the end and
 /// shows B's streamed answer exactly once, whitespace kept and the terminal
 /// escape removed.
-#[tokio::test]
+/// Two runtime threads keep the actual fixture writer socket serving while the
+/// viewer's deliberately blocking pipe reader waits for live transcript data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn follow_viewer_spans_attempts_and_survives_interrupt() {
     let (_temp, home) = codex_home(["exhausted", "ok-hold"]);
-    let id = codex_admit(&home, "viewer-1");
-    let mut child = supervisor(&home, &id);
+    let id = codex_admit(&home, "viewer-1").await;
+    let mut child = supervisor(&home, &id).await;
     let root = loop {
-        let root = Store::open(&home)
+        let root = agent_run_store::fixture::open(&home)
             .unwrap()
             .get(&id)
             .unwrap()
@@ -4473,7 +4765,11 @@ async fn follow_viewer_spans_attempts_and_survives_interrupt() {
         "viewer exited on interrupt"
     );
     assert_eq!(
-        Store::open(&home).unwrap().get(&id).unwrap().status,
+        agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .status,
         Status::Running
     );
     let mut second = viewer(&home);
@@ -4485,7 +4781,11 @@ async fn follow_viewer_spans_attempts_and_survives_interrupt() {
         .unwrap();
     let _ = second.wait();
     assert_eq!(
-        Store::open(&home).unwrap().get(&id).unwrap().status,
+        agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .status,
         Status::Succeeded
     );
     assert_eq!(output.matches("answer on").count(), 1, "{output:?}");
@@ -4508,13 +4808,13 @@ async fn follow_viewer_spans_attempts_and_survives_interrupt() {
 #[tokio::test]
 async fn reconcile_keeps_unprovable_cleanup_owned_with_a_typed_blocker() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let id = completed_parent(&home, &service, "unresolved-parent").await;
     // A real pid that has exited and been reaped: provably not our leader.
     let mut gone = isolated_sync_command("/usr/bin/true").spawn().unwrap();
     let pid = gone.id() as i32;
     gone.wait().unwrap();
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     store
         .conn
         .execute(
@@ -4530,9 +4830,9 @@ async fn reconcile_keeps_unprovable_cleanup_owned_with_a_typed_blocker() {
             rusqlite::params![pid, id.as_str()],
         )
         .unwrap();
-    service.reconcile().unwrap();
-    service.reconcile().unwrap();
-    let store = Store::open(&home).unwrap();
+    service.reconcile().await.unwrap();
+    service.reconcile().await.unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let owned: i64 = store
         .conn
         .query_row(
@@ -4563,8 +4863,8 @@ async fn reconcile_keeps_unprovable_cleanup_owned_with_a_typed_blocker() {
 async fn cleanup_error_stays_owned_until_recovery_proves_members_gone() {
     let (_temp, home) = codex_home(["exhausted", "ok"]);
     fs::write(home.join("fixture-cleanup-error-1"), "").unwrap();
-    let id = codex_admit(&home, "cleanup-error");
-    let mut child = supervisor(&home, &id);
+    let id = codex_admit(&home, "cleanup-error").await;
+    let mut child = supervisor(&home, &id).await;
     let exit = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .unwrap()
@@ -4579,10 +4879,13 @@ async fn cleanup_error_stays_owned_until_recovery_proves_members_gone() {
         before[0].3, 1,
         "the failed supervisor must retain ownership"
     );
-    let service = Service::new(home.clone());
-    service.reconcile().unwrap();
-    service.reconcile().unwrap();
-    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    let service = fixture_service(home.clone()).await;
+    service.reconcile().await.unwrap();
+    service.reconcile().await.unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     assert_eq!(row.status, Status::Lost, "{:?}", row.failure_text);
     let supervisor_log: String = fs::read_dir(home.join("logs"))
         .unwrap()
@@ -4602,7 +4905,7 @@ async fn cleanup_error_stays_owned_until_recovery_proves_members_gone() {
         attempts[0].3, 0,
         "freshly verified recovery releases ownership"
     );
-    let proof: String = Store::open(&home)
+    let proof: String = agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .query_row(
@@ -4664,13 +4967,15 @@ fn record_round(
         256,
     )
     .unwrap();
-    agent_run::state::quota::record_quota_snapshot(home, runtime, &snapshot, retention, at)
+    agent_run_store::fixture::open(home)
+        .unwrap()
+        .record_quota_snapshot(runtime, &snapshot, retention, at)
         .unwrap();
 }
 
 /// Summary of trusted candidates: (account, physical keys) in rank order.
 fn ranked(home: &Path, provider: &str, model: &str) -> Vec<(String, Vec<String>, bool)> {
-    let store = Store::open(home).unwrap();
+    let store = agent_run_store::fixture::open(home).unwrap();
     let (config, _) = agent_run_config::provider_config::ProviderConfig::load(home).unwrap();
     let catalog = config
         .resolve_catalog(store.list_accounts().unwrap())
@@ -4778,7 +5083,7 @@ async fn collector_pool_membership_governs_ranking_views_and_admission() {
     );
 
     // Public views read the same membership.
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let order = service
         .capacity_order(serde_json::from_value(serde_json::json!({})).unwrap())
         .unwrap();
@@ -4794,9 +5099,9 @@ async fn collector_pool_membership_governs_ranking_views_and_admission() {
     let mut request = request(&home);
     request.account = None;
     request.request_id = Some("membership-admit".into());
-    let admitted = service.admit_provider(request).unwrap();
+    let admitted = service.admit_provider(request).await.unwrap();
     let attempt = admitted["attempt_id"].as_str().unwrap().to_owned();
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let keys: Vec<String> = store
         .conn
         .prepare("SELECT quota_key FROM attempt_quota_keys WHERE attempt_id=?")
@@ -4902,7 +5207,9 @@ async fn codex_source_buckets_govern_bound_models() {
             256,
         )
         .unwrap();
-        agent_run::state::quota::record_quota_snapshot(&home, "codex-user", &snapshot, 100, at)
+        agent_run_store::fixture::open(&home)
+            .unwrap()
+            .record_quota_snapshot("codex-user", &snapshot, 100, at)
             .unwrap();
     }
     assert_eq!(
@@ -4972,12 +5279,12 @@ async fn latched_window_membership_survives_pruning_and_stale_rows() {
         vec!["acct-b".to_owned()],
         "latched five_hour still governs fixture"
     );
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let mut request = request(&home);
     request.account = None;
     request.request_id = Some("window-prune".into());
-    let admitted = service.admit_provider(request).unwrap();
-    let chosen: String = Store::open(&home)
+    let admitted = service.admit_provider(request).await.unwrap();
+    let chosen: String = agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .query_row(
@@ -5039,7 +5346,8 @@ async fn narrow_window_exhaustion_is_not_carried_into_other_models() {
         .expect("acct-work serves other");
     assert!(work.2, "acct-work is known-usable for other: {other:?}");
     assert!(!candidate_accounts(&home, "fixture").contains(&"acct-work".to_owned()));
-    let models = Service::new(home.clone())
+    let models = fixture_service(home.clone())
+        .await
         .models(
             serde_json::from_value(serde_json::json!({"provider":"glm-user","model":"other"}))
                 .unwrap(),
@@ -5074,15 +5382,20 @@ async fn private_launch_creates_the_store_before_the_first_publication() {
         !home.join("shared-assets").exists(),
         "nothing is shared before the first launch"
     );
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let first = request(&home);
     let admitted = service
         .admit_provider_trusted(first, candidates(committed(&home)))
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     run_to_end(&home, &id).await;
     assert_eq!(
-        Store::open(&home).unwrap().get(&id).unwrap().status,
+        agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .status,
         Status::Succeeded
     );
     assert!(
@@ -5095,10 +5408,14 @@ async fn private_launch_creates_the_store_before_the_first_publication() {
     let second = request_for(&home, "glm-user", "provider-2", Some("work"));
     let admitted = service
         .admit_provider_trusted(second, candidates(committed(&home)))
+        .await
         .unwrap();
     let second_id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     run_to_end(&home, &second_id).await;
-    let second_row = Store::open(&home).unwrap().get(&second_id).unwrap();
+    let second_row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&second_id)
+        .unwrap();
     assert_eq!(second_row.status, Status::Succeeded);
 
     // A resume prepares the retained home it shares with its parent.
@@ -5114,11 +5431,16 @@ async fn private_launch_creates_the_store_before_the_first_publication() {
             None,
             Some(orchestrator),
         )
+        .await
         .unwrap();
     let resumed_id: AgentId = serde_json::from_value(resumed["agent_id"].clone()).unwrap();
     run_to_end(&home, &resumed_id).await;
     assert_eq!(
-        Store::open(&home).unwrap().get(&resumed_id).unwrap().status,
+        agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&resumed_id)
+            .unwrap()
+            .status,
         Status::Succeeded
     );
 }
@@ -5139,7 +5461,10 @@ async fn managed_codex_home_consolidates_through_its_registry_mapping() {
     )
     .unwrap();
     let id = codex_run(&home, "managed-1", None).await;
-    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     assert_eq!(row.status, Status::Succeeded, "{:?}", row.failure_text);
     let runtime_home = std::path::PathBuf::from(
         row.identity.as_ref().unwrap()["runtime_home"]
@@ -5175,6 +5500,7 @@ async fn managed_codex_home_consolidates_through_its_registry_mapping() {
         "{\"schema_version\":1,\"remote_plugin_id\":\"offline-plugin\"}\n",
     )
     .unwrap();
+    test_broker::stop_broker(&home).await;
     let result = agent_run::storage_admin::compact(&home, true).expect("offline consolidation");
     let native = result["native"].as_array().unwrap();
     assert!(
@@ -5192,7 +5518,11 @@ async fn managed_codex_home_consolidates_through_its_registry_mapping() {
         "name = \"offline\"\n"
     );
     assert_eq!(
-        Store::open(&home).unwrap().get(&id).unwrap().answer_sha256,
+        agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .answer_sha256,
         row.answer_sha256
     );
 }
@@ -5217,16 +5547,23 @@ async fn managed_claude_home_launches_the_native_binary_directly() {
         "# demo\nManaged skill.\n",
     )
     .unwrap();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let admitted = service
         .admit_provider_trusted(request(&home), candidates(committed(&home)))
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
     run_to_end(&home, &id).await;
     assert_eq!(
-        Store::open(&home).unwrap().get(&id).unwrap().status,
+        agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .status,
         Status::Succeeded
     );
+    drop(service);
+    test_broker::stop_broker(&home).await;
     let mut command = isolated_command(env!("CARGO_BIN_EXE_agent-run"));
     command
         .arg("--home")
@@ -5262,7 +5599,10 @@ async fn repeat_compact_consolidates_caches_of_an_already_shared_home() {
     )
     .unwrap();
     let id = codex_run(&home, "repeat-1", None).await;
-    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     assert_eq!(row.status, Status::Succeeded, "{:?}", row.failure_text);
     let runtime_home = std::path::PathBuf::from(
         row.identity.as_ref().unwrap()["runtime_home"]
@@ -5283,6 +5623,7 @@ async fn repeat_compact_consolidates_caches_of_an_already_shared_home() {
     )
     .unwrap();
 
+    test_broker::stop_broker(&home).await;
     let result = agent_run::storage_admin::compact(&home, true).expect("apply");
     let canonical = runtime_home.canonicalize().unwrap();
     let native = result["native"].as_array().expect("native");
@@ -5306,19 +5647,22 @@ async fn repeat_compact_consolidates_caches_of_an_already_shared_home() {
 
 /// Provider and nested pool inputs reject every retired lifetime parameter;
 /// current admitted requests have no replacement budget, deadline or margin.
-#[test]
-fn provider_input_has_no_execution_lifetime() {
+#[tokio::test]
+async fn provider_input_has_no_execution_lifetime() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     for value in [serde_json::json!(600), serde_json::json!(null)] {
         let mut raw = serde_json::to_value(request(&home)).unwrap();
         raw["timeout_seconds"] = value;
         assert!(serde_json::from_value::<ProviderStartRequest>(raw).is_err());
     }
     assert_eq!(rows(&home), (0, 0));
-    let admitted = service.admit_provider(request(&home)).unwrap();
+    let admitted = service.admit_provider(request(&home)).await.unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
-    let row = Store::open(&home).unwrap().get(&id).unwrap();
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     assert!(
         serde_json::to_value(row.request)
             .unwrap()
@@ -5334,14 +5678,19 @@ fn provider_input_has_no_execution_lifetime() {
 
 /// Frozen history verifies original request/config digests before discarding
 /// retired clocks in memory. Even a tampered discarded field must fail integrity.
-#[test]
-fn historical_provider_identity_verifies_retired_policy_before_projection() {
+#[tokio::test]
+async fn historical_provider_identity_verifies_retired_policy_before_projection() {
     let (_temp, home) = home();
-    let admitted = Service::new(home.clone())
+    let admitted = fixture_service(home.clone())
+        .await
         .admit_provider(request(&home))
+        .await
         .unwrap();
     let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
-    let mut row = Store::open(&home).unwrap().get(&id).unwrap();
+    let mut row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
     let mut original = row.identity.take().unwrap();
     original["provider_request"]["timeout_seconds"] = serde_json::json!(120.0);
     original["replay_request_sha256"] = serde_json::json!(agent_run_domain::canonical::sha256_hex(
@@ -5390,11 +5739,14 @@ fn historical_provider_identity_verifies_retired_policy_before_projection() {
 #[tokio::test]
 async fn provider_resumes_repeatedly_without_execution_lifetime() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let root = completed_parent(&home, &service, "unlimited-parent").await;
     let mut parent = root.clone();
     for n in 1..=32 {
-        let row = Store::open(&home).unwrap().get(&parent).unwrap();
+        let row = agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&parent)
+            .unwrap();
         let request_key = format!("unlimited-child-{n}");
         let admitted = service
             .admit_provider_resume(
@@ -5404,10 +5756,14 @@ async fn provider_resumes_repeatedly_without_execution_lifetime() {
                 None,
                 None,
             )
+            .await
             .unwrap();
         let next: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
         run_to_end(&home, &next).await;
-        let next_row = Store::open(&home).unwrap().get(&next).unwrap();
+        let next_row = agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&next)
+            .unwrap();
         assert_eq!(next_row.root_agent_id, root);
         assert_eq!(next_row.sequence, n + 1);
         assert_eq!(next_row.status, Status::Succeeded);
@@ -5419,6 +5775,7 @@ async fn provider_resumes_repeatedly_without_execution_lifetime() {
         );
         let retry = service
             .admit_provider_resume(&row, "fixture:answer".into(), Some(request_key), None, None)
+            .await
             .unwrap();
         assert_eq!(retry["created"], false);
         assert_eq!(retry["agent_id"], serde_json::json!(next));
@@ -5450,7 +5807,7 @@ fn pool_request(
 
 /// Counts rows of one table.
 fn table_rows(home: &Path, table: &str) -> i64 {
-    Store::open(home)
+    agent_run_store::fixture::open(home)
         .unwrap()
         .conn
         .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -5467,7 +5824,7 @@ fn table_rows(home: &Path, table: &str) -> i64 {
 #[tokio::test]
 async fn pool_admission_commits_identities_tasks_and_replays() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let members = [
         ("reviewer", "fixture:answer one", Some("work")),
         ("tester", "fixture:answer two", Some("work")),
@@ -5476,6 +5833,7 @@ async fn pool_admission_commits_identities_tasks_and_replays() {
     let before = committed(&home);
     let admitted = service
         .admit_pool_trusted(request.clone(), candidates(before))
+        .await
         .unwrap();
     assert_eq!(admitted["created"], true);
     assert_eq!(admitted["bound"], true);
@@ -5492,7 +5850,7 @@ async fn pool_admission_commits_identities_tasks_and_replays() {
         .iter()
         .map(|m| serde_json::from_value(m["agent_id"].clone()).unwrap())
         .collect();
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let mut sessions = std::collections::BTreeSet::new();
     for (index, id) in ids.iter().enumerate() {
         let row = store.get(id).unwrap();
@@ -5522,6 +5880,7 @@ async fn pool_admission_commits_identities_tasks_and_replays() {
 
     let replay = service
         .admit_pool_trusted(request.clone(), candidates(committed(&home)))
+        .await
         .unwrap();
     assert_eq!(replay["created"], false);
     assert_eq!(replay["pool_id"], admitted["pool_id"]);
@@ -5533,7 +5892,9 @@ async fn pool_admission_commits_identities_tasks_and_replays() {
     let mut changed = request;
     changed.goal = "something else".into();
     assert!(matches!(
-        service.admit_pool_trusted(changed, candidates(committed(&home))),
+        service
+            .admit_pool_trusted(changed, candidates(committed(&home)))
+            .await,
         Err(agent_run_domain::Error::Conflict)
     ));
 }
@@ -5543,7 +5904,7 @@ async fn pool_admission_commits_identities_tasks_and_replays() {
 #[tokio::test]
 async fn pool_concurrent_identical_requests_create_one_pool() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let request = pool_request(
         &home,
         "same",
@@ -5553,7 +5914,13 @@ async fn pool_concurrent_identical_requests_create_one_pool() {
     let outcomes: Vec<_> = (0..6)
         .map(|_| {
             let (service, request) = (service.clone(), request.clone());
-            std::thread::spawn(move || service.admit_pool(request))
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(service.admit_pool(request))
+            })
         })
         .collect::<Vec<_>>()
         .into_iter()
@@ -5575,7 +5942,7 @@ async fn pool_concurrent_identical_requests_create_one_pool() {
 #[tokio::test]
 async fn pool_admission_rolls_back_every_row_on_cap_or_invalid_member() {
     let (_temp, home) = home_with("[core]\nmax_active_agents = 1\n", &[]);
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let before = committed(&home);
     let pool = pool_request(
         &home,
@@ -5584,7 +5951,7 @@ async fn pool_admission_rolls_back_every_row_on_cap_or_invalid_member() {
         &[("a", "t1", Some("work")), ("b", "t2", Some("work"))],
     );
     assert!(matches!(
-        service.admit_pool_trusted(pool, candidates(before)),
+        service.admit_pool_trusted(pool, candidates(before)).await,
         Err(agent_run_domain::Error::Capacity)
     ));
     for table in [
@@ -5605,7 +5972,12 @@ async fn pool_admission_rolls_back_every_row_on_cap_or_invalid_member() {
         &[("a", "t1", Some("work")), ("b", "t2", Some("work"))],
     );
     bad.members[1].start_mut().unwrap().model = "nope".into();
-    assert!(service.admit_pool_trusted(bad, candidates(before)).is_err());
+    assert!(
+        service
+            .admit_pool_trusted(bad, candidates(before))
+            .await
+            .is_err()
+    );
     assert_eq!(table_rows(&home, "agents"), 0);
 }
 
@@ -5614,21 +5986,21 @@ async fn pool_admission_rolls_back_every_row_on_cap_or_invalid_member() {
 #[tokio::test]
 async fn pool_batch_selection_sees_earlier_reservations() {
     let (_temp, home) = home_with(TWO_ACCOUNTS, &["acct-alt"]);
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let pool = pool_request(
         &home,
         "spread",
         false,
         &[("a", "t1", None), ("b", "t2", None)],
     );
-    let admitted = service.admit_pool(pool).unwrap();
+    let admitted = service.admit_pool(pool).await.unwrap();
     let accounts: Vec<String> = admitted["members"]
         .as_array()
         .unwrap()
         .iter()
         .map(|member| {
             let id: AgentId = serde_json::from_value(member["agent_id"].clone()).unwrap();
-            Store::open(&home)
+            agent_run_store::fixture::open(&home)
                 .unwrap()
                 .provider_attempt(&id)
                 .unwrap()
@@ -5645,7 +6017,7 @@ async fn pool_batch_selection_sees_earlier_reservations() {
 #[tokio::test]
 async fn pool_first_child_receives_full_context_with_all_ids_committed() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let pool = pool_request(
         &home,
         "observe",
@@ -5657,6 +6029,7 @@ async fn pool_first_child_receives_full_context_with_all_ids_committed() {
     );
     let admitted = service
         .admit_pool_trusted(pool, candidates(committed(&home)))
+        .await
         .unwrap();
     let ids: Vec<AgentId> = admitted["members"]
         .as_array()
@@ -5665,7 +6038,7 @@ async fn pool_first_child_receives_full_context_with_all_ids_committed() {
         .map(|m| serde_json::from_value(m["agent_id"].clone()).unwrap())
         .collect();
     run_to_end(&home, &ids[0]).await;
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let first = store.get(&ids[0]).unwrap();
     assert_eq!(
         first.status,
@@ -5691,7 +6064,7 @@ async fn pool_first_child_receives_full_context_with_all_ids_committed() {
 async fn pool_spawn_failure_keeps_the_pool_and_reaches_every_member() {
     let (_temp, home) = home();
     fs::write(home.join("fixture-supervisor-spawn-error"), "").unwrap();
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let pool = pool_request(
         &home,
         "refused",
@@ -5717,7 +6090,7 @@ async fn pool_spawn_failure_keeps_the_pool_and_reaches_every_member() {
 /// Ends `id` terminally with released ownership and verified cleanup proof,
 /// as a finished supervisor would leave it.
 fn retire(home: &Path, id: &AgentId) {
-    let store = Store::open(home).unwrap();
+    let store = agent_run_store::fixture::open(home).unwrap();
     store
         .conn
         .execute(
@@ -5735,7 +6108,7 @@ fn retire(home: &Path, id: &AgentId) {
 }
 
 /// Admits a two-member pool on `glm-user` and returns its identity and members.
-fn admitted_pool(
+async fn admitted_pool(
     service: &Service,
     home: &Path,
     pins: [Option<&str>; 2],
@@ -5753,9 +6126,10 @@ fn admitted_pool(
     let admitted = if trusted {
         service
             .admit_pool_trusted(request, candidates(committed(home)))
+            .await
             .unwrap()
     } else {
-        service.admit_pool(request).unwrap()
+        service.admit_pool(request).await.unwrap()
     };
     (
         serde_json::from_value(admitted["pool_id"].clone()).unwrap(),
@@ -5786,15 +6160,18 @@ fn replace_request(
 #[tokio::test]
 async fn pool_operator_post_and_status_through_the_service() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
-    let (pool, ids) = admitted_pool(&service, &home, [Some("work"), Some("work")], true);
+    let service = fixture_service(home.clone()).await;
+    let (pool, ids) = admitted_pool(&service, &home, [Some("work"), Some("work")], true).await;
     let post: agent_run_domain::pool::PoolPost = serde_json::from_value(serde_json::json!({
         "pool_id": pool, "request_id": "op-1", "message": "focus on the failing test"
     }))
     .unwrap();
-    let first = service.pool_post(post.clone()).unwrap().unwrap();
+    let first = service.pool_post(post.clone()).await.unwrap().unwrap();
     assert_eq!(first["created"], true);
-    assert_eq!(service.pool_post(post).unwrap().unwrap()["created"], false);
+    assert_eq!(
+        service.pool_post(post).await.unwrap().unwrap()["created"],
+        false
+    );
     let status = service
         .pool_status(serde_json::from_value(serde_json::json!({"pool_id": pool})).unwrap())
         .unwrap()
@@ -5834,11 +6211,11 @@ async fn pool_operator_post_and_status_through_the_service() {
 #[tokio::test]
 async fn pool_replace_requires_cleanup_then_replaces_atomically() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
-    let (pool, ids) = admitted_pool(&service, &home, [Some("work"), Some("work")], true);
+    let service = fixture_service(home.clone()).await;
+    let (pool, ids) = admitted_pool(&service, &home, [Some("work"), Some("work")], true).await;
     // A ready vote from the peer counts until the roster changes.
     {
-        let store = Store::open(&home).unwrap();
+        let store = agent_run_store::fixture::open(&home).unwrap();
         let attempt: String = store
             .conn
             .query_row(
@@ -5874,13 +6251,16 @@ async fn pool_replace_requires_cleanup_then_replaces_atomically() {
     };
     assert_eq!(status_of()["members"][1]["why"], "valid");
     let request = replace_request(&pool, &ids[0], "rep-1", None);
-    let busy =
-        |request| service.admit_pool_replacement_trusted(request, candidates(committed(&home)));
+    let busy = async |request| {
+        service
+            .admit_pool_replacement_trusted(request, candidates(committed(&home)))
+            .await
+    };
     assert_eq!(
-        busy(request.clone()).unwrap().unwrap_err(),
+        busy(request.clone()).await.unwrap().unwrap_err(),
         agent_run_domain::pool::PoolDenial::MemberBusy
     );
-    Store::open(&home)
+    agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .execute(
@@ -5889,13 +6269,13 @@ async fn pool_replace_requires_cleanup_then_replaces_atomically() {
         )
         .unwrap();
     assert_eq!(
-        busy(request.clone()).unwrap().unwrap_err(),
+        busy(request.clone()).await.unwrap().unwrap_err(),
         agent_run_domain::pool::PoolDenial::MemberBusy,
         "terminal without cleanup proof is still busy"
     );
     retire(&home, &ids[0]);
     let before = committed(&home);
-    let replaced = busy(request).unwrap().unwrap();
+    let replaced = busy(request).await.unwrap().unwrap();
     assert!(replaced.created && replaced.roster_revision == 2);
     assert_eq!(committed(&home), before + 1, "revision advances once");
     assert_ne!(replaced.new.agent_id, ids[0]);
@@ -5903,7 +6283,7 @@ async fn pool_replace_requires_cleanup_then_replaces_atomically() {
         (replaced.new.slot, replaced.new.name.as_str()),
         (1, "lead 1")
     );
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let successor: Option<String> = store
         .conn
         .query_row(
@@ -5972,20 +6352,24 @@ async fn pool_replace_requires_cleanup_then_replaces_atomically() {
 #[tokio::test]
 async fn pool_replace_replays_the_same_new_identity() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
-    let (pool, ids) = admitted_pool(&service, &home, [Some("work"), Some("work")], true);
+    let service = fixture_service(home.clone()).await;
+    let (pool, ids) = admitted_pool(&service, &home, [Some("work"), Some("work")], true).await;
     retire(&home, &ids[0]);
     let first_request = replace_request(&pool, &ids[0], "rep-1", None);
-    let go =
-        |request| service.admit_pool_replacement_trusted(request, candidates(committed(&home)));
-    let first = go(first_request.clone()).unwrap().unwrap();
+    let go = async |request| {
+        service
+            .admit_pool_replacement_trusted(request, candidates(committed(&home)))
+            .await
+    };
+    let first = go(first_request.clone()).await.unwrap().unwrap();
     retire(&home, &ids[1]);
     let second = go(replace_request(&pool, &ids[1], "rep-2", None))
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(second.roster_revision, 3);
     let agents = rows(&home).0;
-    let replay = go(first_request).unwrap().unwrap();
+    let replay = go(first_request).await.unwrap().unwrap();
     assert!(!replay.created);
     assert_eq!(replay.new.agent_id, first.new.agent_id);
     assert_eq!(replay.old.agent_id, ids[0]);
@@ -5994,13 +6378,14 @@ async fn pool_replace_replays_the_same_new_identity() {
     assert_eq!(
         go(replace_request(&pool, &ids[0], "rep-1", Some(serde_json::json!({
             "provider":"glm-user","model":"fixture","profile":"review","explicit_finish":false,"task":"other","workdir":home
-        }))))
+        })))).await
         .unwrap()
         .unwrap_err(),
         agent_run_domain::pool::PoolDenial::Conflict
     );
     assert_eq!(
         go(replace_request(&pool, &ids[0], "rep-3", None))
+            .await
             .unwrap()
             .unwrap_err(),
         agent_run_domain::pool::PoolDenial::MemberNotCurrent
@@ -6009,6 +6394,7 @@ async fn pool_replace_replays_the_same_new_identity() {
         "pool-20260101-000000-0000000000".parse().unwrap();
     assert_eq!(
         go(replace_request(&unknown, &ids[0], "rep-4", None))
+            .await
             .unwrap()
             .unwrap_err(),
         agent_run_domain::pool::PoolDenial::PoolNotFound
@@ -6020,8 +6406,8 @@ async fn pool_replace_replays_the_same_new_identity() {
 #[tokio::test]
 async fn pool_replace_rolls_back_everything_on_capacity() {
     let (_temp, home) = home_with("[core]\nmax_active_agents = 2\n", &[]);
-    let service = Service::new(home.clone());
-    let (pool, ids) = admitted_pool(&service, &home, [Some("work"), Some("work")], true);
+    let service = fixture_service(home.clone()).await;
+    let (pool, ids) = admitted_pool(&service, &home, [Some("work"), Some("work")], true).await;
     retire(&home, &ids[0]);
     // Refill the freed slot so the replacement has no capacity.
     service
@@ -6029,6 +6415,7 @@ async fn pool_replace_rolls_back_everything_on_capacity() {
             request_for(&home, "glm-user", "filler", Some("work")),
             candidates(committed(&home)),
         )
+        .await
         .unwrap();
     let (agents, members, entries, before) = (
         rows(&home),
@@ -6041,6 +6428,7 @@ async fn pool_replace_rolls_back_everything_on_capacity() {
             replace_request(&pool, &ids[0], "cap", None),
             candidates(before),
         )
+        .await
         .unwrap_err();
     assert!(matches!(error, agent_run_domain::Error::Capacity));
     assert_eq!(
@@ -6052,7 +6440,7 @@ async fn pool_replace_rolls_back_everything_on_capacity() {
         ),
         (agents, members, entries, before)
     );
-    let revision: i64 = Store::open(&home)
+    let revision: i64 = agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .query_row("SELECT roster_revision FROM pools", [], |r| r.get(0))
@@ -6066,9 +6454,9 @@ async fn pool_replace_rolls_back_everything_on_capacity() {
 #[tokio::test]
 async fn pool_replace_reuses_the_original_spec_without_pinning_the_old_account() {
     let (_temp, home) = home_with(TWO_ACCOUNTS, &["acct-alt"]);
-    let service = Service::new(home.clone());
-    let (pool, ids) = admitted_pool(&service, &home, [None, None], false);
-    let old_identity = Store::open(&home)
+    let service = fixture_service(home.clone()).await;
+    let (pool, ids) = admitted_pool(&service, &home, [None, None], false).await;
+    let old_identity = agent_run_store::fixture::open(&home)
         .unwrap()
         .get(&ids[0])
         .unwrap()
@@ -6078,9 +6466,10 @@ async fn pool_replace_reuses_the_original_spec_without_pinning_the_old_account()
     retire(&home, &ids[0]);
     let reused = service
         .admit_pool_replacement(replace_request(&pool, &ids[0], "reuse", None))
+        .await
         .unwrap()
         .unwrap();
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let identity = store.get(&reused.new.agent_id).unwrap().identity.unwrap();
     assert!(
         identity["provider_request"]["account"].is_null(),
@@ -6109,7 +6498,7 @@ async fn pool_replace_reuses_the_original_spec_without_pinning_the_old_account()
                 "provider":"glm-user","model":"fixture","profile":"review","explicit_finish":false,
                 "task":"fixture:answer fresh","workdir":home,"account":"work","display_name":"Renamed"
             })),
-        ))
+        )).await
         .unwrap()
         .unwrap();
     assert_eq!(explicit.new.name, "Renamed");
@@ -6124,12 +6513,12 @@ async fn pool_replace_reuses_the_original_spec_without_pinning_the_old_account()
 #[tokio::test]
 async fn pool_replace_races_never_create_parallel_members() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
-    let (pool, ids) = admitted_pool(&service, &home, [Some("work"), Some("work")], true);
+    let service = fixture_service(home.clone()).await;
+    let (pool, ids) = admitted_pool(&service, &home, [Some("work"), Some("work")], true).await;
     retire(&home, &ids[0]);
     {
         // A resumed child under the same seat makes its tip active again.
-        let store = Store::open(&home).unwrap();
+        let store = agent_run_store::fixture::open(&home).unwrap();
         store
             .conn
             .execute(
@@ -6145,11 +6534,12 @@ async fn pool_replace_races_never_create_parallel_members() {
                 replace_request(&pool, &ids[0], "busy", None),
                 candidates(committed(&home))
             )
+            .await
             .unwrap()
             .unwrap_err(),
         agent_run_domain::pool::PoolDenial::MemberBusy
     );
-    Store::open(&home)
+    agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .execute(
@@ -6165,7 +6555,13 @@ async fn pool_replace_races_never_create_parallel_members() {
                 committed(&home),
             );
             let candidates = candidates(revision);
-            std::thread::spawn(move || service.admit_pool_replacement_trusted(request, candidates))
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(service.admit_pool_replacement_trusted(request, candidates))
+            })
         })
         .collect::<Vec<_>>()
         .into_iter()
@@ -6179,7 +6575,7 @@ async fn pool_replace_races_never_create_parallel_members() {
         1,
         "{outcomes:?}"
     );
-    let current: i64 = Store::open(&home)
+    let current: i64 = agent_run_store::fixture::open(&home)
         .unwrap()
         .conn
         .query_row(
@@ -6196,8 +6592,8 @@ async fn pool_replace_races_never_create_parallel_members() {
 #[tokio::test]
 async fn pool_replacement_child_receives_roster_and_catch_up() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
-    let (pool, ids) = admitted_pool(&service, &home, [Some("work"), Some("work")], true);
+    let service = fixture_service(home.clone()).await;
+    let (pool, ids) = admitted_pool(&service, &home, [Some("work"), Some("work")], true).await;
     retire(&home, &ids[0]);
     let replaced = service
         .admit_pool_replacement_trusted(
@@ -6211,11 +6607,11 @@ async fn pool_replacement_child_receives_roster_and_catch_up() {
                 })),
             ),
             candidates(committed(&home)),
-        )
+        ).await
         .unwrap()
         .unwrap();
     run_to_end(&home, &replaced.new.agent_id).await;
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     assert_eq!(
         store.get(&replaced.new.agent_id).unwrap().status,
         Status::Succeeded
@@ -6242,14 +6638,14 @@ async fn pool_replacement_child_receives_roster_and_catch_up() {
 #[tokio::test]
 async fn pool_replacement_inherits_the_actual_shared_binding() {
     let (_temp, home) = home();
-    let service = Service::new(home.clone());
-    let (pool, ids) = admitted_pool(&service, &home, [Some("work"), Some("work")], true);
+    let service = fixture_service(home.clone()).await;
+    let (pool, ids) = admitted_pool(&service, &home, [Some("work"), Some("work")], true).await;
     let reference = agent_run_domain::domain::OrchestratorRef {
         transport: "claude_uds".into(),
         external_session_id: "late-chat".into(),
         external_turn_id: None,
     };
-    let session = Store::open(&home)
+    let session = agent_run_store::fixture::open(&home)
         .unwrap()
         .bind_pool(&pool, &reference, 5.0)
         .unwrap();
@@ -6259,9 +6655,10 @@ async fn pool_replacement_inherits_the_actual_shared_binding() {
             replace_request(&pool, &ids[0], "bound-later", None),
             candidates(committed(&home)),
         )
+        .await
         .unwrap()
         .unwrap();
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let row = store.get(&replaced.new.agent_id).unwrap();
     assert_eq!(
         row.orchestrator_session_id.as_deref(),
@@ -6291,7 +6688,7 @@ async fn pool_replacement_inherits_the_actual_shared_binding() {
 #[tokio::test]
 async fn pool_composed_task_survives_native_history_failover_and_resume() {
     let (_temp, home) = codex_home_with(&["exhausted", "ok"]);
-    let service = Service::new(home.clone());
+    let service = fixture_service(home.clone()).await;
     let request: agent_run_domain::pool::PoolStartRequest =
         serde_json::from_value(serde_json::json!({
             "request_id": "native-pool",
@@ -6305,7 +6702,7 @@ async fn pool_composed_task_survives_native_history_failover_and_resume() {
             ]
         }))
         .unwrap();
-    let admitted = service.admit_pool(request).unwrap();
+    let admitted = service.admit_pool(request).await.unwrap();
     let ids: Vec<AgentId> = admitted["members"]
         .as_array()
         .unwrap()
@@ -6313,7 +6710,12 @@ async fn pool_composed_task_survives_native_history_failover_and_resume() {
         .map(|m| serde_json::from_value(m["agent_id"].clone()).unwrap())
         .collect();
     let lead = &ids[0];
-    let composed = Store::open(&home).unwrap().get(lead).unwrap().request.task;
+    let composed = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(lead)
+        .unwrap()
+        .request
+        .task;
     for marker in [
         "POOL-GOAL-MARKER",
         "POOL-CRITERION-MARKER",
@@ -6323,7 +6725,7 @@ async fn pool_composed_task_survives_native_history_failover_and_resume() {
         assert!(composed.contains(marker), "admitted task lacks {marker}");
     }
     // The stored request, frozen identity and replay hash agree on the composed text.
-    let identity = Store::open(&home)
+    let identity = agent_run_store::fixture::open(&home)
         .unwrap()
         .get(lead)
         .unwrap()
@@ -6335,7 +6737,7 @@ async fn pool_composed_task_survives_native_history_failover_and_resume() {
         agent_run_domain::canonical::sha256_hex(&identity["provider_request"], true)
     );
     run_to_end(&home, lead).await;
-    let store = Store::open(&home).unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
     let row = store.get(lead).unwrap();
     assert_eq!(row.status, Status::Succeeded, "{:?}", row.failure_text);
     let switched = attempts(&home, lead);
@@ -6345,7 +6747,7 @@ async fn pool_composed_task_survives_native_history_failover_and_resume() {
         "the first account exhausted and the same logical run switched"
     );
     let proven = |home: &Path, id: &AgentId, number: u32| -> serde_json::Value {
-        let state: String = Store::open(home)
+        let state: String = agent_run_store::fixture::open(home)
             .unwrap()
             .conn
             .query_row(
@@ -6392,10 +6794,14 @@ async fn pool_composed_task_survives_native_history_failover_and_resume() {
             None,
             None,
         )
+        .await
         .unwrap();
     let child: AgentId = serde_json::from_value(child["agent_id"].clone()).unwrap();
     run_to_end(&home, &child).await;
-    let child_row = Store::open(&home).unwrap().get(&child).unwrap();
+    let child_row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&child)
+        .unwrap();
     assert_eq!(
         child_row.status,
         Status::Succeeded,
@@ -6420,10 +6826,19 @@ async fn pool_composed_task_survives_native_history_failover_and_resume() {
     let last = after.last().unwrap();
     assert!(last.contains("POOL-RESUME-TASK-MARKER") && !last.contains("POOL-GOAL-MARKER"));
     // The parent's frozen composed request is untouched by the resume.
-    let parent = Store::open(&home).unwrap().get(lead).unwrap();
+    let parent = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(lead)
+        .unwrap();
     assert_eq!(parent.request.task, composed);
     assert_eq!(
         parent.identity.unwrap()["provider_request"]["task"],
         composed.as_str()
     );
+}
+
+/// Attach the actual shared fixture broker, preserving sole-writer admission and authority.
+async fn fixture_service(home: std::path::PathBuf) -> Service {
+    let broker = test_broker::broker_for(&home).await;
+    Service::new(home).with_writer(broker.writer())
 }

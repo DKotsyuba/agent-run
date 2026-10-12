@@ -246,6 +246,31 @@ fn main() {
         println!("agent-run offline fixture 1.0");
         return;
     }
+    // Startup-fork mode (test only): before reading any input the engine forks
+    // one detached descendant and exits without a result shortly after, as an
+    // engine whose children appear at startup would. It models a primary that
+    // exits while the supervisor's first durable writes are still pending.
+    if std::path::Path::new("fixture-fork-at-start").exists() {
+        use std::os::unix::process::CommandExt;
+
+        let exe = std::env::current_exe().expect("fixture exe path");
+        // The descendant leaves the engine's process group (so only a refresh
+        // made while this engine is alive can find it) and holds no pipe of the
+        // engine.
+        #[allow(clippy::zombie_processes)]
+        let child = std::process::Command::new(exe)
+            .arg("--child-sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("fixture descendant spawn");
+        std::fs::write("escaped.pid", child.id().to_string()).expect("fixture escaped pid");
+        std::thread::sleep(Duration::from_millis(600));
+        return;
+    }
     let session = argument(&args, "--resume")
         .or_else(|| argument(&args, "--session-id"))
         .unwrap_or_else(|| "fixture-session".into());

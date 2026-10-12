@@ -21,7 +21,7 @@ use agent_run_domain::{
     domain::{AgentId, OrchestratorRef, now},
     pool::PoolId,
 };
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 /// Most UTF-8 bytes of the frozen common notice text.
@@ -30,7 +30,7 @@ pub const NOTICE_BYTES: usize = 4096;
 const EVENT_BYTES: usize = 256 * 1024;
 
 /// A committed pool completion, new or already recorded.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PoolCompletion {
     /// Pool identity.
     pub pool_id: PoolId,
@@ -238,7 +238,7 @@ fn evaluate(tx: &Connection, pool_id: &PoolId) -> Result<Evaluation> {
 ///
 /// Returns `None` while any condition is missing: nothing is written and the
 /// pool stays open (derived draining or agreed-but-running are not states).
-fn settle_in_tx(tx: &Transaction<'_>, pool_id: &PoolId) -> Result<Option<PoolCompletion>> {
+fn settle_in_tx(tx: &rusqlite::Connection, pool_id: &PoolId) -> Result<Option<PoolCompletion>> {
     let pool = pool_id.as_str();
     let ready = match evaluate(tx, pool_id)? {
         Evaluation::Missing | Evaluation::NotReady => return Ok(None),
@@ -310,7 +310,7 @@ fn settle_in_tx(tx: &Transaction<'_>, pool_id: &PoolId) -> Result<Option<PoolCom
     }))
 }
 
-impl Store {
+impl Store<'_> {
     /// Completes `pool_id` when every condition holds, in one immediate
     /// transaction after read-only preflight. Pending enrollment acquires a
     /// writer only for changed join state/attention; ordinary unchanged pools
@@ -326,9 +326,7 @@ impl Store {
             Evaluation::Completed(done) => return Ok(Some(done)),
             Evaluation::Ready(_) => {}
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let result = settle_in_tx(&tx, pool_id)?;
         tx.commit()?;
         Ok(result)
@@ -400,9 +398,7 @@ impl Store {
         at: f64,
     ) -> Result<String> {
         reference.validate()?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         let current: Option<Option<String>> = tx
             .query_row(
                 "SELECT orchestrator_session_id FROM pools WHERE id=?",

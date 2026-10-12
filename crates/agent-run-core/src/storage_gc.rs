@@ -281,7 +281,11 @@ impl Names {
 /// consulted or updated, so a preview cannot report a synchronized plan it
 /// did not actually prove — an unprovable preview reports `lock_busy` or
 /// `incomplete` instead.
-pub fn sweep(store: &mut Store, app_home: &Path, mode: Mode) -> Result<Outcome> {
+pub async fn sweep_on<B: crate::runtime_storage::LayoutBackend>(
+    store: &mut B,
+    app_home: &Path,
+    mode: Mode,
+) -> Result<Outcome> {
     let mut outcome = Outcome::default();
     let root = crate::runtime_storage::store_root(app_home)?;
     let store_dir = match fs::Dir::open(&root) {
@@ -300,7 +304,7 @@ pub fn sweep(store: &mut Store, app_home: &Path, mode: Mode) -> Result<Outcome> 
     // Evidence first, under the lock. Evidence that cannot be collected
     // completely — a corrupt registry row, an oversized snapshot, an
     // unreadable configuration — retains every candidate; the caller retries.
-    let mut protected: Vec<PathBuf> = match store.storage_protection_snapshot() {
+    let mut protected: Vec<PathBuf> = match store.reader().storage_protection_snapshot() {
         Ok(proof) => proof.protected_paths().map(Path::to_path_buf).collect(),
         Err(_) => {
             outcome.incomplete = true;
@@ -319,7 +323,7 @@ pub fn sweep(store: &mut Store, app_home: &Path, mode: Mode) -> Result<Outcome> 
             return Ok(outcome);
         }
     }
-    let mut references = match registered_references(store, &protected, mode, &mut outcome) {
+    let mut references = match registered_references(store, &protected, mode, &mut outcome).await {
         Ok(references) => references,
         Err(_) => {
             outcome.incomplete = true;
@@ -418,8 +422,8 @@ struct References {
 /// partial evidence. Rows are removed only in [`Mode::Apply`]; the store's own
 /// removal additionally refuses while any agent identity still binds the
 /// home, which is authoritative.
-fn registered_references(
-    store: &mut Store,
+async fn registered_references<B: crate::runtime_storage::LayoutBackend>(
+    store: &mut B,
     protected: &[PathBuf],
     mode: Mode,
     outcome: &mut Outcome,
@@ -437,7 +441,9 @@ fn registered_references(
     let mut after: Option<String> = None;
     let mut pages = 0;
     loop {
-        let (page, more) = store.runtime_storage_layouts_page(after.as_deref(), ROWS_PER_PASS)?;
+        let (page, more) = store
+            .reader()
+            .runtime_storage_layouts_page(after.as_deref(), ROWS_PER_PASS)?;
         pages += 1;
         for record in page {
             after = Some(record.runtime_home.clone());
@@ -523,7 +529,7 @@ fn registered_references(
     }
     if mode == Mode::Apply {
         for home in &removable {
-            if store.remove_runtime_storage_layout(home).unwrap_or(false) {
+            if store.remove(home).await.unwrap_or(false) {
                 outcome.rows_removed += 1;
             }
         }
@@ -1274,4 +1280,19 @@ fn drain(directory: &fs::Dir, unlinks: &mut usize) -> Result<bool> {
         *unlinks -= 1;
     }
     Ok(true)
+}
+
+/// [`sweep_on`] over a raw store held under the caller's offline authority.
+pub fn sweep(store: &mut Store, app_home: &Path, mode: Mode) -> Result<Outcome> {
+    crate::runtime_storage::ready(sweep_on(store, app_home, mode))
+}
+
+/// A preview pass over a read-only view: counts what a collecting pass would
+/// remove without any write authority (see [`Mode::Preview`]).
+pub fn preview(store: &Store, app_home: &Path) -> Result<Outcome> {
+    crate::runtime_storage::ready(sweep_on(
+        &mut crate::runtime_storage::ReadOnlyLayout(store),
+        app_home,
+        Mode::Preview,
+    ))
 }

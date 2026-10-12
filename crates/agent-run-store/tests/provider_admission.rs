@@ -19,8 +19,8 @@ use std::{
 /// Opens one initialized disposable store with four fake account references.
 fn home() -> tempfile::TempDir {
     let home = tempfile::tempdir().unwrap();
-    Store::initialize(home.path()).unwrap();
-    let mut store = Store::open(home.path()).unwrap();
+    agent_run_store::fixture::initialize(home.path()).unwrap();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
     for (id, name) in [
         ("acct-a", "FAKE_A"),
         ("acct-b", "FAKE_B"),
@@ -145,7 +145,7 @@ fn identity(request: &ProviderStartRequest, authority: &ResolvedLaunchAuthority)
 #[test]
 fn stale_replay_and_ranked_reservation_are_atomic() {
     let home = home();
-    let mut store = Store::open(home.path()).unwrap();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
     let catalog = catalog(&store);
     let request = provider_request(home.path(), "req-one");
     let effective = request.storage_projection();
@@ -207,6 +207,16 @@ fn stale_replay_and_ranked_reservation_are_atomic() {
         [admitted.agent_id.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
     ).unwrap();
     assert_eq!(facts, ("auto".into(), "acct-a::tokens".into(), 1));
+    // Once the spawn has begun, the attempt cannot release without a
+    // cleanup proof (only a never-spawned prepared attempt gets one at the
+    // terminal commit).
+    store
+        .conn
+        .execute(
+            "UPDATE attempts SET phase='spawning' WHERE id=?",
+            [&admitted.attempt_id],
+        )
+        .unwrap();
     assert!(
         store
             .finish(&admitted.agent_id, &Outcome::failure("test"), None, None)
@@ -291,7 +301,7 @@ fn stale_replay_and_ranked_reservation_are_atomic() {
 #[test]
 fn filters_invalid_candidates_before_rank_tie_break() {
     let home = home();
-    let mut store = Store::open(home.path()).unwrap();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
     let catalog = catalog(&store);
     let request = provider_request(home.path(), "filtered");
     let authority = authority(&catalog, home.path());
@@ -325,7 +335,7 @@ fn filters_invalid_candidates_before_rank_tie_break() {
 #[test]
 fn harness_cap_covers_provider_aliases() {
     let home = home();
-    let mut store = Store::open(home.path()).unwrap();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
     let catalog = catalog(&store);
     let first = provider_request(home.path(), "first");
     let first_authority = authority(&catalog, home.path());
@@ -371,7 +381,7 @@ fn harness_cap_covers_provider_aliases() {
 #[test]
 fn concurrent_provider_admissions_share_one_committed_revision() {
     let home = home();
-    let catalog = catalog(&Store::open(home.path()).unwrap());
+    let catalog = catalog(&agent_run_store::fixture::open(home.path()).unwrap());
     let authority = authority(&catalog, home.path());
     let barrier = Arc::new(Barrier::new(2));
     let mut workers = Vec::new();
@@ -381,7 +391,7 @@ fn concurrent_provider_admissions_share_one_committed_revision() {
         let authority = authority.clone();
         let barrier = Arc::clone(&barrier);
         workers.push(std::thread::spawn(move || {
-            let mut store = Store::open(&path).unwrap();
+            let mut store = agent_run_store::fixture::open(&path).unwrap();
             let request = provider_request(&path, suffix);
             let revision = store.quota_capacity_revision().unwrap();
             barrier.wait();
@@ -419,7 +429,7 @@ fn concurrent_provider_admissions_share_one_committed_revision() {
             .count(),
         1
     );
-    let store = Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
     assert_eq!(
         store
             .conn
@@ -436,8 +446,8 @@ fn cleaned_run(
     home: &Path,
     request_id: &str,
     seal: bool,
-) -> (Store, agent_run_domain::domain::AgentId) {
-    let mut store = Store::open(home).unwrap();
+) -> (Store<'static>, agent_run_domain::domain::AgentId) {
+    let mut store = agent_run_store::fixture::open(home).unwrap();
     let catalog = catalog(&store);
     let request = provider_request(home, request_id);
     let authority = authority(&catalog, home);
@@ -655,7 +665,7 @@ fn concurrent_allocators_admit_one_next_attempt() {
         .map(|_| {
             let (path, id, barrier) = (path.clone(), id.clone(), barrier.clone());
             std::thread::spawn(move || {
-                let mut store = Store::open(&path).unwrap();
+                let mut store = agent_run_store::fixture::open(&path).unwrap();
                 let catalog = catalog(&store);
                 barrier.wait();
                 store
@@ -668,7 +678,7 @@ fn concurrent_allocators_admit_one_next_attempt() {
         .map(|handle| handle.join().unwrap())
         .sum();
     assert_eq!(wins, 1);
-    let store = Store::open(&path).unwrap();
+    let store = agent_run_store::fixture::open(&path).unwrap();
     assert_eq!(ownership(&store, &id), (1, 0, 2));
 }
 
@@ -694,7 +704,7 @@ fn late_records_keep_their_originating_attempt() {
     let next = store
         .allocate_next_attempt(&id, &catalog, &candidates(revision, &[("acct-b", 0)]))
         .unwrap();
-    let mut late = Store::open(home.path()).unwrap();
+    let mut late = agent_run_store::fixture::open(home.path()).unwrap();
     late.bind_attempt(&first);
     late.event(&id, "process_cleanup", &json!({"late":true}))
         .unwrap();
@@ -702,7 +712,7 @@ fn late_records_keep_their_originating_attempt() {
         .unwrap();
     store.event(&id, "unbound", &json!({})).unwrap();
     let (_, other) = cleaned_run(home.path(), "late-2", true);
-    let mut foreign = Store::open(home.path()).unwrap();
+    let mut foreign = agent_run_store::fixture::open(home.path()).unwrap();
     foreign.bind_attempt(&first);
     foreign.event(&other, "foreign", &json!({})).unwrap();
     let attempt_of = |sql: &str, agent: &str| -> Option<String> {
@@ -751,7 +761,7 @@ fn late_records_keep_their_originating_attempt() {
 fn prepared_storage_layout_gates_provider_resume_only() {
     use agent_run_store::provider_admission::ProviderResume;
     let home = home();
-    let mut store = Store::open(home.path()).unwrap();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
     let catalog = catalog(&store);
     let request = provider_request(home.path(), "layout-parent");
     let authority = authority(&catalog, home.path());

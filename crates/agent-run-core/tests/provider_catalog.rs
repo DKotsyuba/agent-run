@@ -2,6 +2,7 @@
 //! through the real service and dispatch: exact filters, privacy, revision
 //! consistency, read-only semantics, and live recommendation edits.
 
+mod common;
 use agent_run_core::{dispatch, service::Service};
 use agent_run_domain::{
     CapacityOrderQuery, ModelsQuery,
@@ -64,14 +65,14 @@ account = "acct-glm"
 fn home() -> tempfile::TempDir {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
-    agent_run_store::Store::initialize(root).unwrap();
+    agent_run_store::fixture::initialize(root).unwrap();
     fs::create_dir_all(root.join("profiles")).unwrap();
     fs::write(root.join("profiles/review.md"),
         "+++\nrevision = \"r1\"\nwrite = false\nnetwork = false\nallow_external_read_roots = false\nskills = []\nmcp = []\nrequired_constraints = []\n+++\nReview.\n").unwrap();
     fs::write(root.join("profiles/code.md"),
         "+++\nrevision = \"c1\"\nwrite = true\nnetwork = false\nallow_external_read_roots = false\nskills = []\nmcp = []\nrequired_constraints = []\n+++\nCode.\n").unwrap();
     write_config(root, "native subscription");
-    let mut store = agent_run_store::Store::open(root).unwrap();
+    let mut store = agent_run_store::fixture::open(root).unwrap();
     for (id, family, reference) in [
         ("acct-codex", "openai", "named:codex:secret-codex"),
         ("acct-glm", "anthropic", "keychain:secret-glm:ref"),
@@ -99,7 +100,7 @@ fn home() -> tempfile::TempDir {
 
 /// Counts every durable row a read must never touch.
 fn footprint(root: &Path) -> Vec<i64> {
-    let store = agent_run_store::Store::open(root).unwrap();
+    let store = agent_run_store::fixture::open(root).unwrap();
     [
         "agents",
         "attempts",
@@ -186,7 +187,8 @@ async fn catalog_is_revisioned_ordered_and_account_free() {
 async fn research_catalog_matches_actual_static_admission() {
     let temp = home();
     let root = temp.path().canonicalize().unwrap();
-    let service = Service::new(root.clone());
+    let writer = common::writer::Harness::start(&root);
+    let service = Service::new(root.clone()).with_writer(writer.broker());
     let body = |constraints: &str| {
         format!(
             "+++\nrevision=\"research-test\"\nwrite=false\nnetwork=true\nallow_external_read_roots=false\nskills=[]\nmcp=[]\nrequired_constraints={constraints}\n+++\nSearch and save reports.\n"
@@ -203,7 +205,7 @@ async fn research_catalog_matches_actual_static_admission() {
     let request = || {
         serde_json::from_value(json!({"provider":"codex","model":"gpt-main","profile":"research","task":"Search with sources","workdir":root})).unwrap()
     };
-    assert!(service.admit_provider(request()).is_err());
+    assert!(service.admit_provider(request()).await.is_err());
     fs::write(
         root.join("profiles/research.md"),
         body("[\"research_tools_only\"]"),
@@ -217,7 +219,7 @@ async fn research_catalog_matches_actual_static_admission() {
         .replace("/bin/true", "/usr/bin/true");
     fs::write(root.join("config.toml"), config).unwrap();
     let before = footprint(&root);
-    service.admit_provider(request()).unwrap();
+    service.admit_provider(request()).await.unwrap();
     assert_eq!(footprint(&root)[0], before[0] + 1, "research is admitted");
 }
 
@@ -299,7 +301,7 @@ async fn recommendation_edits_are_reflected_by_revision() {
 #[tokio::test]
 async fn schema_one_filters_are_unsupported() {
     let temp = tempfile::tempdir().unwrap();
-    agent_run_store::Store::initialize(temp.path()).unwrap();
+    agent_run_store::fixture::initialize(temp.path()).unwrap();
     fs::write(temp.path().join("config.toml"), "schema_version = 1\n").unwrap();
     let service = Service::new(temp.path().to_path_buf());
     let error = service
@@ -325,7 +327,7 @@ async fn schema_one_filters_are_unsupported() {
 /// Inserts one account-bound sample on `lane` with explicit freshness.
 fn sample(root: &Path, provider: &str, account: &str, lane: &str, remaining: f64, valid: f64) {
     let at = agent_run_core::domain::now();
-    agent_run_store::Store::open(root)
+    agent_run_store::fixture::open(root)
         .unwrap()
         .conn
         .execute(
@@ -391,7 +393,7 @@ account = "acct-b"
         ),
     )
     .unwrap();
-    let mut store = agent_run_store::Store::open(root).unwrap();
+    let mut store = agent_run_store::fixture::open(root).unwrap();
     for (id, reference) in [
         ("acct-a", "keychain:fake-a:ref"),
         ("acct-b", "keychain:fake-b:ref"),
@@ -467,7 +469,7 @@ async fn quota_standing_reports_freshness_and_exhaustion() {
     let temp = ranking_home();
     let root = temp.path();
     // b-open's only sample expires; a-locked gets an active exhaustion latch.
-    agent_run_store::Store::open(root)
+    agent_run_store::fixture::open(root)
         .unwrap()
         .conn
         .execute(
@@ -476,7 +478,7 @@ async fn quota_standing_reports_freshness_and_exhaustion() {
         )
         .unwrap();
     let reset = agent_run_core::domain::now() + 7200.0;
-    agent_run_store::Store::open(root)
+    agent_run_store::fixture::open(root)
         .unwrap()
         .conn
         .execute(
@@ -582,7 +584,7 @@ async fn delegation_guide_renders_guidance_order_and_privacy() {
 async fn delegation_guide_reports_stale_and_exhausted_standings() {
     let temp = ranking_home();
     let root = temp.path();
-    agent_run_store::Store::open(root)
+    agent_run_store::fixture::open(root)
         .unwrap()
         .conn
         .execute(
@@ -591,7 +593,7 @@ async fn delegation_guide_reports_stale_and_exhausted_standings() {
         )
         .unwrap();
     let reset = agent_run_core::domain::now() + 7200.0;
-    agent_run_store::Store::open(root)
+    agent_run_store::fixture::open(root)
         .unwrap()
         .conn
         .execute(
@@ -625,7 +627,7 @@ async fn delegation_guide_reports_stale_and_exhausted_standings() {
 #[tokio::test]
 async fn delegation_guide_is_strict_schema2_and_states_empty_catalogs() {
     let legacy = tempfile::tempdir().unwrap();
-    agent_run_store::Store::initialize(legacy.path()).unwrap();
+    agent_run_store::fixture::initialize(legacy.path()).unwrap();
     fs::write(legacy.path().join("config.toml"), "schema_version = 1\n").unwrap();
     let service = Service::new(legacy.path().to_path_buf());
     assert_eq!(
@@ -643,7 +645,7 @@ async fn delegation_guide_is_strict_schema2_and_states_empty_catalogs() {
         assert_eq!(error.machine_code().as_str(), "ValidationError", "{bad}");
     }
     let empty = tempfile::tempdir().unwrap();
-    agent_run_store::Store::initialize(empty.path()).unwrap();
+    agent_run_store::fixture::initialize(empty.path()).unwrap();
     fs::write(empty.path().join("config.toml"), "schema_version = 2\n").unwrap();
     let text = Service::new(empty.path().to_path_buf())
         .delegation_guide()
@@ -726,7 +728,7 @@ fn diagnostic_windows_and_ranking_share_one_committed_snapshot() {
     let at = agent_run_core::domain::now();
     let value = agent_run_core::capacity::provider_catalog::diagnostics_observed(
         root, &config, &revision, &mut || {
-            let mut store = agent_run_store::Store::open(root).unwrap();
+            let mut store = agent_run_store::fixture::open(root).unwrap();
             store.disable_account(&"acct-glm".parse().unwrap()).unwrap();
             store.conn.execute(
                 "UPDATE capacity_samples SET remaining_percent=0, valid_until=?1 WHERE account_id='acct-glm'",
@@ -760,7 +762,7 @@ fn diagnostic_standing_uses_all_windows_and_keeps_stale_facts() {
     let temp = home();
     let root = temp.path();
     let at = agent_run_core::domain::now();
-    let store = agent_run_store::Store::open(root).unwrap();
+    let store = agent_run_store::fixture::open(root).unwrap();
     store
         .conn
         .execute("UPDATE capacity_samples SET remaining_percent=100", [])
@@ -846,7 +848,7 @@ fn registry_and_quota_come_from_one_committed_read() {
         &revision,
         &ModelsQuery::default(),
         &mut || {
-            let mut store = agent_run_store::Store::open(root).unwrap();
+            let mut store = agent_run_store::fixture::open(root).unwrap();
             // Disabling advances the capacity revision in its own
             // transaction; no separate collector round is needed.
             store.disable_account(&"acct-glm".parse().unwrap()).unwrap();
@@ -968,7 +970,7 @@ async fn source_switch_with_carried_latch_stays_scoped_through_admission() {
         ),
     )
     .unwrap();
-    agent_run_store::Store::open(root)
+    agent_run_store::fixture::open(root)
         .unwrap()
         .conn
         .execute("DELETE FROM capacity_samples", [])
@@ -985,11 +987,15 @@ async fn source_switch_with_carried_latch_stays_scoped_through_admission() {
             "models":[model],"remaining_percent":remaining,"reset_at":now + 3600.0,
             "observed_at":observed}]});
         let snapshot = normalize_collector_output(&account, &scope, &raw, now, 256, 256).unwrap();
-        agent_run_store::quota::record_quota_snapshot(root, "g", &snapshot, 100, now).unwrap();
+        agent_run_store::fixture::open(root)
+            .unwrap()
+            .record_quota_snapshot("g", &snapshot, 100, now)
+            .unwrap();
     };
     round("s1", "m-a", 0.0, now - 5.0);
     round("s2", "m-b", 50.0, now - 1.0);
-    let service = Service::new(root.to_path_buf());
+    let writer = common::writer::Harness::start(root);
+    let service = Service::new(root.to_path_buf()).with_writer(writer.broker());
     let status = |model: &str| {
         let order = service
             .capacity_order(CapacityOrderQuery {
@@ -1008,9 +1014,15 @@ async fn source_switch_with_carried_latch_stays_scoped_through_admission() {
             "task":"task","workdir":root,"request_id":id}))
         .unwrap()
     };
-    let refused = service.admit_provider(request("m-a", "adm-a")).unwrap_err();
+    let refused = service
+        .admit_provider(request("m-a", "adm-a"))
+        .await
+        .unwrap_err();
     assert_eq!(refused.public().kind, "quota_exhausted", "{refused:?}");
-    service.admit_provider(request("m-b", "adm-b")).unwrap();
+    service
+        .admit_provider(request("m-b", "adm-b"))
+        .await
+        .unwrap();
 }
 
 /// Retention `1` source switch: `s1` exhausted `m-a` on `primary/five_hour`;
@@ -1033,7 +1045,7 @@ async fn cross_source_latch_survives_small_retention_and_releases_only_on_covera
             ),
         )
         .unwrap();
-        agent_run_store::Store::open(root)
+        agent_run_store::fixture::open(root)
             .unwrap()
             .conn
             .execute("DELETE FROM capacity_samples", [])
@@ -1052,12 +1064,15 @@ async fn cross_source_latch_survives_small_retention_and_releases_only_on_covera
                 "observed_at":observed,"valid_until":valid}]});
                 let snapshot =
                     normalize_collector_output(&account, &scope, &raw, now, 256, 256).unwrap();
-                agent_run_store::quota::record_quota_snapshot(root, "g", &snapshot, 1, now)
+                agent_run_store::fixture::open(root)
+                    .unwrap()
+                    .record_quota_snapshot("g", &snapshot, 1, now)
                     .unwrap();
             };
         round("s1", &["m-a"], Some(0.0), now - 5.0, now + 3600.0);
         round("s2", &["m-b"], second, now - 1.0, now + 600.0);
-        let service = Service::new(root.to_path_buf());
+        let writer = common::writer::Harness::start(root);
+        let service = Service::new(root.to_path_buf()).with_writer(writer.broker());
         let status = |model: &str| {
             let order = service
                 .capacity_order(CapacityOrderQuery {
@@ -1070,7 +1085,7 @@ async fn cross_source_latch_survives_small_retention_and_releases_only_on_covera
                 .to_owned()
         };
         let latches = || -> Vec<String> {
-            let store = agent_run_store::Store::open(root).unwrap();
+            let store = agent_run_store::fixture::open(root).unwrap();
             let mut statement = store
                 .conn
                 .prepare("SELECT source||'/'||window_id FROM quota_exhaustion ORDER BY source")
@@ -1088,13 +1103,19 @@ async fn cross_source_latch_survives_small_retention_and_releases_only_on_covera
                 "task":"task","workdir":root,"request_id":id}))
             .unwrap()
         };
-        let refused = service.admit_provider(request("m-a", "adm-a")).unwrap_err();
+        let refused = service
+            .admit_provider(request("m-a", "adm-a"))
+            .await
+            .unwrap_err();
         assert_eq!(
             refused.public().kind,
             "quota_exhausted",
             "{second:?}: {refused:?}"
         );
-        service.admit_provider(request("m-b", "adm-b")).unwrap();
+        service
+            .admit_provider(request("m-b", "adm-b"))
+            .await
+            .unwrap();
         // A stale s2 positive covering m-a (validity already expired) keeps
         // the latch; a fresh one releases it.
         round("s2", &["m-a", "m-b"], Some(40.0), now - 1.0, now - 0.5);

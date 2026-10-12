@@ -57,6 +57,219 @@ pub enum StorageFault {
     AfterCommit,
 }
 
+/// Where the registry rows of a layout switch are persisted.
+///
+/// The filesystem switch is identical everywhere; only the two registry
+/// mutations (prepare and commit) differ. An offline operator tool or a test
+/// fixture writes through its raw [`state::Store`]; a supervisor submits the
+/// same two units as typed operations to the resident writer through
+/// [`crate::persist::Persist`]. Reads always use the raw store view.
+#[allow(async_fn_in_trait)]
+pub trait LayoutBackend {
+    /// Read view of the registry (committed state of the store).
+    fn reader(&self) -> &state::Store<'_>;
+
+    /// Prepares the registry row of `layout_json` (token-bound, idempotent for
+    /// the same layout) and returns it.
+    async fn prepare(
+        &mut self,
+        layout_json: &str,
+        owner: Option<&AgentId>,
+    ) -> Result<state::runtime_storage::RuntimeStorageLayoutRecord>;
+
+    /// Commits a prepared row after the converted home verified.
+    async fn commit(
+        &mut self,
+        runtime_home: &str,
+        operation_token: &str,
+        layout_sha256: &str,
+    ) -> Result<()>;
+
+    /// Removes a row whose home is conclusively gone (the store itself refuses
+    /// while any identity still binds it). `Ok(false)` means nothing was removed.
+    async fn remove(&mut self, runtime_home: &str) -> Result<bool>;
+}
+
+impl LayoutBackend for state::Store<'_> {
+    /// The raw store is its own read view.
+    fn reader(&self) -> &state::Store<'_> {
+        self
+    }
+
+    /// Direct registry prepare under the caller's offline authority.
+    async fn prepare(
+        &mut self,
+        layout_json: &str,
+        owner: Option<&AgentId>,
+    ) -> Result<state::runtime_storage::RuntimeStorageLayoutRecord> {
+        self.prepare_runtime_storage_layout(layout_json, owner)
+    }
+
+    /// Direct registry commit under the caller's offline authority.
+    async fn commit(
+        &mut self,
+        runtime_home: &str,
+        operation_token: &str,
+        layout_sha256: &str,
+    ) -> Result<()> {
+        self.commit_runtime_storage_layout(runtime_home, operation_token, layout_sha256)
+            .map(drop)
+    }
+
+    /// Direct registry removal under the caller's offline authority.
+    async fn remove(&mut self, runtime_home: &str) -> Result<bool> {
+        self.remove_runtime_storage_layout(runtime_home)
+    }
+}
+
+impl LayoutBackend for crate::persist::Persist {
+    /// Reads go through the supervisor's read-only handle.
+    fn reader(&self) -> &state::Store<'_> {
+        self
+    }
+
+    /// Prepares through the writer, then reads the committed row back.
+    async fn prepare(
+        &mut self,
+        layout_json: &str,
+        owner: Option<&AgentId>,
+    ) -> Result<state::runtime_storage::RuntimeStorageLayoutRecord> {
+        let receipt = self
+            .prepare_runtime_layout(state::ops::PrepareRuntimeLayout {
+                layout_json: layout_json.to_owned(),
+                owner: owner.cloned(),
+            })
+            .await?;
+        self.runtime_storage_layout(&receipt.runtime_home)?
+            .ok_or_else(|| Error::Runtime("prepared storage layout row is missing".into()))
+    }
+
+    /// Commits through the writer.
+    async fn commit(
+        &mut self,
+        runtime_home: &str,
+        operation_token: &str,
+        layout_sha256: &str,
+    ) -> Result<()> {
+        self.commit_runtime_layout(state::ops::CommitRuntimeLayout {
+            runtime_home: runtime_home.to_owned(),
+            operation_token: operation_token.to_owned(),
+            layout_sha256: layout_sha256.to_owned(),
+        })
+        .await
+        .map(drop)
+    }
+
+    /// A supervisor never removes registry rows: that is a broker maintenance
+    /// unit, so the request is refused as unsupported.
+    async fn remove(&mut self, _runtime_home: &str) -> Result<bool> {
+        Err(Error::Unsupported(
+            "a supervisor does not remove storage layout rows".into(),
+        ))
+    }
+}
+
+/// The resident broker's view of the registry: reads through a read-only
+/// handle, mutations as ordered operations of one broker lane. Used by the
+/// broker's retention sweep, which is the only online remover of layout rows.
+pub struct BrokerLayout {
+    /// Ordered broker lane submitting the registry mutations.
+    pub lane: crate::broker_writer::BrokerLane,
+    /// Read-only handle for every registry read; owned so the whole view can
+    /// move between threads with its task.
+    pub reader: state::writer::StoreReader,
+}
+
+impl LayoutBackend for BrokerLayout {
+    /// Reads go through the read-only handle.
+    fn reader(&self) -> &state::Store<'_> {
+        &self.reader
+    }
+
+    /// Prepares through the broker lane, then reads the committed row back.
+    async fn prepare(
+        &mut self,
+        layout_json: &str,
+        owner: Option<&AgentId>,
+    ) -> Result<state::runtime_storage::RuntimeStorageLayoutRecord> {
+        let receipt = self
+            .lane
+            .remote(
+                state::ops::PrepareRuntimeLayout {
+                    layout_json: layout_json.to_owned(),
+                    owner: owner.cloned(),
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await?;
+        self.reader
+            .runtime_storage_layout(&receipt.runtime_home)?
+            .ok_or_else(|| Error::Runtime("prepared storage layout row is missing".into()))
+    }
+
+    /// Commits through the broker lane.
+    async fn commit(
+        &mut self,
+        runtime_home: &str,
+        operation_token: &str,
+        layout_sha256: &str,
+    ) -> Result<()> {
+        self.lane
+            .remote(
+                state::ops::CommitRuntimeLayout {
+                    runtime_home: runtime_home.to_owned(),
+                    operation_token: operation_token.to_owned(),
+                    layout_sha256: layout_sha256.to_owned(),
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await
+            .map(drop)
+    }
+
+    /// Removes through the broker lane (broker-only maintenance operation).
+    async fn remove(&mut self, runtime_home: &str) -> Result<bool> {
+        self.lane
+            .local(
+                state::ops::RemoveRuntimeLayout {
+                    runtime_home: runtime_home.to_owned(),
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await
+    }
+}
+
+/// A read-only registry view that refuses every mutation; used by previews so
+/// they can share the one traversal without any write authority.
+pub struct ReadOnlyLayout<'a>(pub &'a state::Store<'a>);
+
+impl LayoutBackend for ReadOnlyLayout<'_> {
+    /// The wrapped read view.
+    fn reader(&self) -> &state::Store<'_> {
+        self.0
+    }
+
+    /// Refused: a preview never prepares rows.
+    async fn prepare(
+        &mut self,
+        _layout_json: &str,
+        _owner: Option<&AgentId>,
+    ) -> Result<state::runtime_storage::RuntimeStorageLayoutRecord> {
+        Err(Error::Unsupported("read-only storage view".into()))
+    }
+
+    /// Refused: a preview never commits rows.
+    async fn commit(&mut self, _: &str, _: &str, _: &str) -> Result<()> {
+        Err(Error::Unsupported("read-only storage view".into()))
+    }
+
+    /// Refused: a preview never removes rows.
+    async fn remove(&mut self, _runtime_home: &str) -> Result<bool> {
+        Err(Error::Unsupported("read-only storage view".into()))
+    }
+}
+
 /// Returns the shared-store root below `app_home` without mutating anything.
 ///
 /// `app_home` must be an existing absolute canonical real directory; the
@@ -313,8 +526,8 @@ fn validate_plugin_parents(
 /// An existing committed row binding the same digest is idempotent; a
 /// prepared row is an explicit refusal directing the caller to `recover`.
 /// Index bytes, native history and authority digests are never rewritten.
-pub fn anchor(
-    store: &mut state::Store,
+pub async fn anchor_on<B: LayoutBackend>(
+    store: &mut B,
     app_home: &Path,
     runtime_home: &Path,
     expected: &str,
@@ -323,7 +536,7 @@ pub fn anchor(
     store_root(app_home)?;
     let canonical = canonical_home(runtime_home)?;
     let key = canonical.to_string_lossy().into_owned();
-    if let Some(record) = store.runtime_storage_layout(&key)? {
+    if let Some(record) = store.reader().runtime_storage_layout(&key)? {
         return match record.state {
             state::runtime_storage::LayoutState::Committed if record.index_sha256 == expected => {
                 Ok(())
@@ -350,7 +563,7 @@ pub fn anchor(
         roots: BTreeMap::new(),
     };
     layout.validate()?;
-    install(store, app_home, &layout, owner)
+    install_on(store, app_home, &layout, owner).await
 }
 
 /// Installs one planned layout: imports every tree, swaps each private root
@@ -371,23 +584,23 @@ pub fn anchor(
 /// roots under a token-bound in-home backup, bridge-verifies, commits, and
 /// only then deletes proven backups. On any failure the row stays `prepared`
 /// and `recover` completes the switch without re-downloading anything.
-pub fn install(
-    store: &mut state::Store,
+pub async fn install_on<B: LayoutBackend>(
+    store: &mut B,
     app_home: &Path,
     layout: &state::runtime_storage::RuntimeStorageLayout,
     owner: Option<&AgentId>,
 ) -> Result<()> {
-    install_with_fault(store, app_home, layout, owner, None)
+    install_with_fault_on(store, app_home, layout, owner, None).await
 }
 
 /// Test seam over [`install`] firing `fault` at one [`StorageFault`] crash
 /// point; no production caller passes `Some`.
-pub fn install_with_fault(
-    store: &mut state::Store,
+pub async fn install_with_fault_on<B: LayoutBackend>(
+    store: &mut B,
     app_home: &Path,
     layout: &state::runtime_storage::RuntimeStorageLayout,
     owner: Option<&AgentId>,
-    fault: Option<&dyn Fn(StorageFault) -> Result<()>>,
+    fault: Option<&(dyn Fn(StorageFault) -> Result<()> + Sync)>,
 ) -> Result<()> {
     layout.validate()?;
     let bytes = layout.canonical_bytes()?;
@@ -395,20 +608,23 @@ pub fn install_with_fault(
     let digest = fs::sha256(layout_json.as_bytes());
     let home_path = Path::new(&layout.runtime_home).to_path_buf();
     let root = store_root(app_home)?;
-    match store.runtime_storage_layout(&layout.runtime_home)? {
+    match store
+        .reader()
+        .runtime_storage_layout(&layout.runtime_home)?
+    {
         Some(record) => {
             if record.layout_sha256 != digest {
                 return Err(Error::Conflict);
             }
             match record.state {
                 state::runtime_storage::LayoutState::Committed => {
-                    verify(store, app_home, &home_path, &layout.index_sha256)?;
+                    verify(store.reader(), app_home, &home_path, &layout.index_sha256)?;
                     let refs = references(layout);
                     discard_backups(&home_path, &refs, &record.operation_token)?;
                     Ok(())
                 }
                 state::runtime_storage::LayoutState::Prepared => {
-                    recover_prepared(store, app_home, &record)
+                    recover_prepared(store, app_home, &record).await
                 }
             }
         }
@@ -427,9 +643,9 @@ pub fn install_with_fault(
             fs::private_dir(&root)?;
             let record = {
                 let _guard = SharedStoreLock::acquire(&root)?;
-                store.prepare_runtime_storage_layout(&layout_json, owner)?
+                store.prepare(&layout_json, owner).await?
             };
-            switch_home(store, app_home, &record, &revision, fault)
+            switch_home(store, app_home, &record, &revision, fault).await
         }
     }
 }
@@ -438,12 +654,12 @@ pub fn install_with_fault(
 /// forward, bridge verification, commit, and proven backup cleanup. The
 /// registry row is the only authority — every path and reference is derived
 /// from its validated layout and operation token.
-fn switch_home(
-    store: &mut state::Store,
+async fn switch_home<B: LayoutBackend>(
+    store: &mut B,
     app_home: &Path,
     record: &state::runtime_storage::RuntimeStorageLayoutRecord,
     revision: &str,
-    fault: Option<&dyn Fn(StorageFault) -> Result<()>>,
+    fault: Option<&(dyn Fn(StorageFault) -> Result<()> + Sync)>,
 ) -> Result<()> {
     let fire = |point: StorageFault| -> Result<()> {
         match fault {
@@ -586,11 +802,13 @@ fn switch_home(
         return Err(invalid("converted runtime home failed shared verification"));
     }
     fire(StorageFault::AfterLink)?;
-    store.commit_runtime_storage_layout(
-        &layout.runtime_home,
-        &record.operation_token,
-        &record.layout_sha256,
-    )?;
+    store
+        .commit(
+            &layout.runtime_home,
+            &record.operation_token,
+            &record.layout_sha256,
+        )
+        .await?;
     fire(StorageFault::AfterCommit)?;
     discard_backups(&home_path, &refs, &record.operation_token)
 }
@@ -651,14 +869,20 @@ pub fn verify(
 /// unknown or changed stays in place with an explicit failure. Recovery never
 /// guesses from age, never rewrites the frozen index, and never re-downloads:
 /// imports are idempotent reuses of pinned or existing objects.
-pub fn recover(store: &mut state::Store, app_home: &Path, runtime_home: &Path) -> Result<()> {
+pub async fn recover_on<B: LayoutBackend>(
+    store: &mut B,
+    app_home: &Path,
+    runtime_home: &Path,
+) -> Result<()> {
     let canonical = canonical_home(runtime_home)?;
     let key = canonical.to_string_lossy().into_owned();
-    let Some(record) = store.runtime_storage_layout(&key)? else {
+    let Some(record) = store.reader().runtime_storage_layout(&key)? else {
         return Ok(());
     };
     match record.state {
-        state::runtime_storage::LayoutState::Prepared => recover_prepared(store, app_home, &record),
+        state::runtime_storage::LayoutState::Prepared => {
+            recover_prepared(store, app_home, &record).await
+        }
         state::runtime_storage::LayoutState::Committed => {
             let home_path = Path::new(&record.runtime_home).to_path_buf();
             discard_backups(
@@ -672,15 +896,15 @@ pub fn recover(store: &mut state::Store, app_home: &Path, runtime_home: &Path) -
 
 /// Completes one prepared row, deriving the revision from the home's own
 /// untouched index bytes.
-fn recover_prepared(
-    store: &mut state::Store,
+async fn recover_prepared<B: LayoutBackend>(
+    store: &mut B,
     app_home: &Path,
     record: &state::runtime_storage::RuntimeStorageLayoutRecord,
 ) -> Result<()> {
     let layout = record.layout();
     let home_path = Path::new(&layout.runtime_home).to_path_buf();
     let (revision, _) = index_document(&home_path, &layout.index_sha256)?;
-    switch_home(store, app_home, record, &revision, None)
+    switch_home(store, app_home, record, &revision, None).await
 }
 
 /// Removes the operation backup for every root of one record, but only after
@@ -787,4 +1011,55 @@ fn remove_owned_tree(directory: &fs::Dir) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Drives a future whose awaits all complete immediately (every operation of
+/// the raw-store [`LayoutBackend`] is synchronous) and returns its output.
+///
+/// # Panics
+/// If the future actually suspends, which cannot happen for the raw store.
+pub(crate) fn ready<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match future.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(value) => value,
+        std::task::Poll::Pending => unreachable!("a raw-store layout operation never suspends"),
+    }
+}
+
+/// [`anchor_on`] over a raw store held under the caller's offline authority.
+pub fn anchor(
+    store: &mut state::Store,
+    app_home: &Path,
+    runtime_home: &Path,
+    expected: &str,
+    owner: Option<&AgentId>,
+) -> Result<()> {
+    ready(anchor_on(store, app_home, runtime_home, expected, owner))
+}
+
+/// [`install_on`] over a raw store held under the caller's offline authority.
+pub fn install(
+    store: &mut state::Store,
+    app_home: &Path,
+    layout: &state::runtime_storage::RuntimeStorageLayout,
+    owner: Option<&AgentId>,
+) -> Result<()> {
+    ready(install_on(store, app_home, layout, owner))
+}
+
+/// [`install_with_fault_on`] over a raw store (test seam; see [`StorageFault`]).
+pub fn install_with_fault(
+    store: &mut state::Store,
+    app_home: &Path,
+    layout: &state::runtime_storage::RuntimeStorageLayout,
+    owner: Option<&AgentId>,
+    fault: Option<&(dyn Fn(StorageFault) -> Result<()> + Sync)>,
+) -> Result<()> {
+    ready(install_with_fault_on(store, app_home, layout, owner, fault))
+}
+
+/// [`recover_on`] over a raw store held under the caller's offline authority.
+pub fn recover(store: &mut state::Store, app_home: &Path, runtime_home: &Path) -> Result<()> {
+    ready(recover_on(store, app_home, runtime_home))
 }

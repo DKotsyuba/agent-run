@@ -72,7 +72,11 @@ async fn cli_and_mcp_resume_keep_one_intent_after_lost_acknowledgement() {
         for supplied in [None, Some("caller-owned-resume-key")] {
             let home = tempfile::Builder::new()
                 .prefix("ar-retry-")
-                .tempdir_in("/tmp")
+                .tempdir_in(
+                    std::env::var_os("AGENT_RUN_TEST_TMP")
+                        .or_else(|| std::env::var_os("TMPDIR"))
+                        .expect("project test temporary directory must be supplied"),
+                )
                 .unwrap();
             let listener = UnixListener::bind(home.path().join("api.sock")).unwrap();
             let server = lost_reply(listener, supplied);

@@ -3,7 +3,6 @@
 use agent_run::{
     domain::{AgentId, Status},
     service::Service,
-    state::Store,
     transport::socket,
 };
 use serde_json::{Value, json};
@@ -24,7 +23,10 @@ impl Harness {
         let temp = tempfile::Builder::new()
             .prefix("ar-")
             // Short base keeps the Unix socket path under the platform limit.
-            .tempdir_in(std::env::var_os("AGENT_RUN_TEST_TMP").unwrap_or_else(|| "/tmp".into()))
+            .tempdir_in(
+                std::env::var_os("AGENT_RUN_TEST_TMP")
+                    .unwrap_or_else(|| std::env::temp_dir().into_os_string()),
+            )
             .unwrap();
         let home = temp.path().canonicalize().unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_agent-run"))
@@ -139,7 +141,10 @@ impl Harness {
         let deadline = Instant::now() + Duration::from_secs(20);
         let service = Service::new(self.home.clone());
         loop {
-            let row = Store::open(&self.home).unwrap().get(id).unwrap();
+            let row = agent_run_store::fixture::open(&self.home)
+                .unwrap()
+                .get(id)
+                .unwrap();
             if row.status.terminal() {
                 return service.answer(id).unwrap();
             }
@@ -152,18 +157,29 @@ impl Drop for Harness {
     fn drop(&mut self) {
         // Request cancellation while the temporary state still exists. Never
         // blindly signal a persisted PID, which could have been reused.
-        if let Ok(store) = Store::open(&self.home)
+        if let Ok(store) = agent_run_store::fixture::open(&self.home)
             && let Ok((rows, _)) = store.list(true, 0, 1000, None)
         {
-            let service = Service::new(self.home.clone());
             for row in rows {
-                let _ = service.cancel(&row.id);
+                // The independent fixture broker remains alive to consume and record cancellation.
+                let mut cancel = Command::new(env!("CARGO_BIN_EXE_agent-run"));
+                cancel
+                    .arg("--home")
+                    .arg(&self.home)
+                    .args(["cancel", row.id.as_str()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                for (name, _) in std::env::vars_os() {
+                    if name.to_string_lossy().starts_with("AGENT_RUN_") {
+                        cancel.env_remove(name);
+                    }
+                }
+                let _ = cancel.status();
             }
         }
-        self.stop_broker();
         let deadline = Instant::now() + Duration::from_secs(8);
         while Instant::now() < deadline {
-            let active = Store::open(&self.home)
+            let active = agent_run_store::fixture::open(&self.home)
                 .and_then(|s| s.list(true, 0, 1000, None))
                 .map(|(_, n)| n)
                 .unwrap_or(0);
@@ -172,6 +188,7 @@ impl Drop for Harness {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+        self.stop_broker();
         let _ = &self.temp;
     }
 }
@@ -195,7 +212,10 @@ async fn worker_mcp_queues_a_report_without_ending_the_run() {
     let id: AgentId = serde_json::from_value(result["agent_id"].clone()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while !h.home.join("worker-receipt.json").exists() {
-        let row = Store::open(&h.home).unwrap().get(&id).unwrap();
+        let row = agent_run_store::fixture::open(&h.home)
+            .unwrap()
+            .get(&id)
+            .unwrap();
         assert!(
             !row.status.terminal(),
             "worker exited before reporting: {:?}",
@@ -204,7 +224,7 @@ async fn worker_mcp_queues_a_report_without_ending_the_run() {
         assert!(Instant::now() < deadline, "missing worker receipt");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let store = Store::open(&h.home).unwrap();
+    let store = agent_run_store::fixture::open(&h.home).unwrap();
     assert_eq!(store.get(&id).unwrap().status, Status::Running);
     let (count, message): (i64, String) = store
         .conn
@@ -239,11 +259,14 @@ async fn cli_exit_and_broker_restart_do_not_cancel_admitted_job() {
     let mut h = Harness::new();
     h.start_broker().await;
     let id = h.submit_cli("fixture:slow");
+    // The supervisor owns the job and writes only through the resident writer:
+    // while no broker runs its writes wait within their original deadlines, and
+    // the job is never cancelled. The restarted broker serves them.
     h.stop_broker();
+    h.start_broker().await;
     let answer = h.terminal(&id).await;
     assert_eq!(answer["status"], "succeeded");
     assert_eq!(answer["content"], "fixture final answer\n");
-    h.start_broker().await;
     let result = socket::client(&h.home, "answer", json!({"agent_id":id}))
         .await
         .unwrap();
@@ -256,7 +279,13 @@ async fn cancellation_stops_a_hanging_engine_and_records_terminal_state() {
     let id = h.submit_cli("fixture:hang");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if Store::open(&h.home).unwrap().get(&id).unwrap().status == Status::Running {
+        if agent_run_store::fixture::open(&h.home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .status
+            == Status::Running
+        {
             break;
         }
         assert!(Instant::now() < deadline);
@@ -387,7 +416,7 @@ async fn agents_follow_binary_tracks_the_real_lifecycle_without_duplicates() {
     // A store event that changes no displayed fact must not re-emit a page:
     // the wake rebuilds the page with fresh observation timestamps only.
     let settled = {
-        let store = Store::open(&harness.home).unwrap();
+        let store = agent_run_store::fixture::open(&harness.home).unwrap();
         store
             .event(&id, "fixture_follow_probe", &serde_json::json!({}))
             .unwrap();
@@ -411,7 +440,11 @@ async fn agents_follow_binary_tracks_the_real_lifecycle_without_duplicates() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(
-        Store::open(&harness.home).unwrap().get(&id).unwrap().status,
+        agent_run_store::fixture::open(&harness.home)
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .status,
         Status::Running,
         "the viewer never cancels the agent"
     );
@@ -522,7 +555,7 @@ async fn scripted_pool_completes_with_one_correlated_common_notice() {
         "orchestrator": {"transport":"codex","external_session_id":"fixture-pool-thread"},
         "members": [member("lead","fixture:pool-script lead"), member("peer","fixture:pool-script peer")]
     });
-    let before: (i64, i64) = Store::open(&h.home)
+    let before: (i64, i64) = agent_run_store::fixture::open(&h.home)
         .unwrap()
         .conn
         .query_row(
@@ -540,7 +573,7 @@ async fn scripted_pool_completes_with_one_correlated_common_notice() {
         error.machine_code(),
         agent_run_domain::error::MachineCode::ValidationError
     );
-    let after: (i64, i64) = Store::open(&h.home)
+    let after: (i64, i64) = agent_run_store::fixture::open(&h.home)
         .unwrap()
         .conn
         .query_row(
@@ -557,7 +590,7 @@ async fn scripted_pool_completes_with_one_correlated_common_notice() {
         .await
         .unwrap();
     assert_eq!(started["bound"], true);
-    let stored_transport: String = Store::open(&h.home)
+    let stored_transport: String = agent_run_store::fixture::open(&h.home)
         .unwrap()
         .conn
         .query_row(
@@ -578,7 +611,7 @@ async fn scripted_pool_completes_with_one_correlated_common_notice() {
     let old_namespace =
         agent_run_domain::canonical::sha256_hex(&json!(["codex", "fixture-pool-thread"]), true);
     let old_sha = agent_run_domain::canonical::sha256_hex(&historical_value, true);
-    Store::open(&h.home)
+    agent_run_store::fixture::open(&h.home)
         .unwrap()
         .conn
         .execute(
@@ -601,7 +634,10 @@ async fn scripted_pool_completes_with_one_correlated_common_notice() {
         .collect();
     for id in &ids {
         let answer = h.terminal(id).await;
-        let row = Store::open(&h.home).unwrap().get(id).unwrap();
+        let row = agent_run_store::fixture::open(&h.home)
+            .unwrap()
+            .get(id)
+            .unwrap();
         assert_eq!(
             answer["status"], "succeeded",
             "{:?} {:?}",
@@ -634,7 +670,7 @@ async fn scripted_pool_completes_with_one_correlated_common_notice() {
     assert!(request.get("agent_id").is_none() && request.get("run_id").is_none());
     let deadline = Instant::now() + Duration::from_secs(15);
     let store = loop {
-        let store = Store::open(&h.home).unwrap();
+        let store = agent_run_store::fixture::open(&h.home).unwrap();
         let state: String = store
             .conn
             .query_row(

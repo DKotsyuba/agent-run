@@ -2,18 +2,22 @@
 use crate::{
     Error, Result,
     adapters::{self, io::Process, materialize},
+    broker_writer::{BROKER_BUDGET, BrokerLane},
     commands,
     config::Adapter,
     domain::{self, AgentId, Outcome, Status},
     error::invalid,
-    fs, launch, process,
+    fs, launch,
+    persist::{self, Persist},
+    process,
     service::{LaunchIdentity, ProviderLaunchIdentity},
     state::Store,
     verify,
 };
 use agent_run_config::role_plan::ResolvedRolePlan;
 use agent_run_domain::catalog::{AccountId, HarnessId};
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use agent_run_store::{ops, writer::StoreReader};
+use rusqlite::OptionalExtension;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::{
@@ -22,49 +26,49 @@ use std::{
     time::Duration,
 };
 
-std::thread_local! {
-    /// One synchronous SQLite busy sequence on this supervisor thread. A zero
-    /// callback count starts a new sequence; no transaction crosses an await.
-    static JOURNAL_BUSY_STARTED: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
-    /// Per-statement ownership deadline on this synchronous thread; absent for
-    /// ordinary journal writes and cleared before returning from a checkpoint.
-    static OWNERSHIP_BUSY_UNTIL: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
-}
+/// Longest the supervisor waits for the launcher to release its capability
+/// after the READY gate opened.
+const CAPABILITY_WAIT: Duration = Duration::from_secs(10);
 
-/// Uses short two-millisecond busy sleeps for a supervisor's hot native journal.
-/// `prior_calls` is SQLite's zero-based invocation count for this synchronous
-/// busy sequence. Reuses the ordinary store's monotonic five-second allowance,
-/// then refuses with the original SQLite error; never retries permanent errors.
-/// Short sleeps let final writes compete with dense frame writers instead of
-/// missing many free slots during SQLite's escalating hundred-millisecond sleeps.
-/// Ownership statements reuse this handler with their already-bounded absolute
-/// deadline, avoiding SQLite's coarse escalating sleeps under runner contention.
-/// The connection remains thread-affine; no state or transaction crosses await.
-fn journal_busy(prior_calls: i32) -> bool {
-    JOURNAL_BUSY_STARTED.with(|started| {
-        if prior_calls == 0 {
-            started.set(Some(std::time::Instant::now()));
-        }
-        let deadline = OWNERSHIP_BUSY_UNTIL
-            .with(std::cell::Cell::get)
-            .or_else(|| started.get().map(|at| at + agent_run_store::BUSY_TIMEOUT));
-        let Some(deadline) = deadline else {
-            return false;
-        };
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
-            return false;
-        }
-        std::thread::sleep(left.min(Duration::from_millis(2)));
-        std::time::Instant::now() < deadline
-    })
+/// A fresh launch capability: 32 random bytes as 64 lowercase hex characters.
+/// Only its SHA-256 is ever stored; the secret travels over a private pipe.
+fn new_capability() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
 }
 
 /// Start one detached `_supervisor` session leader and return after its READY.
 ///
-/// Spawning is `posix_spawn(POSIX_SPAWN_SETSID)`-first (`launch.rs`). A failed
-/// READY read does not cancel the already admitted durable job.
-pub async fn launch(home: &Path, id: &AgentId) -> Result<()> {
+/// The launch is split so no step blocks the async runtime on storage: the
+/// capability hash is committed through the broker's writer first
+/// (`RecordSupervisorLaunch`), the child is spawned holding its first gate
+/// (it cannot authenticate to the writer without the secret), the spawned
+/// process's identity evidence is committed and AWAITED
+/// (`RecordStartupOwner`), and only then is the secret written to the child's
+/// private pipe. Any failure after the spawn abandons the child with verified
+/// cleanup. A failed READY read does not cancel the already admitted durable job.
+///
+/// The launch runs as an owned task: cancelling or timing out the caller never
+/// drops it between steps, so a spawned child is always either completed,
+/// reaped or abandoned by the task itself. An internal `LaunchGuard` covers the one
+/// remaining edge, the runtime shutting the task down mid-launch.
+///
+/// Spawning is `posix_spawn(POSIX_SPAWN_SETSID)`-first (`launch.rs`).
+pub async fn launch(home: &Path, id: &AgentId, lane: &BrokerLane) -> Result<()> {
+    launch_program(&std::env::current_exe()?, home, id, lane).await
+}
+
+/// [`launch()`] of an explicit supervisor executable (a test drives the real
+/// `agent-run` binary instead of its own test harness).
+pub async fn launch_program(
+    program: &Path,
+    home: &Path,
+    id: &AgentId,
+    lane: &BrokerLane,
+) -> Result<()> {
     // Test-only: `<home>/fixture-supervisor-spawn-error` makes the OS-level
     // spawn refusal observable without a real exhausted process table.
     #[cfg(feature = "test-fixtures")]
@@ -73,58 +77,167 @@ pub async fn launch(home: &Path, id: &AgentId) -> Result<()> {
             "injected supervisor spawn refusal",
         )));
     }
-    let program = std::env::current_exe()?;
-    let (home, id) = (home.to_path_buf(), id.clone());
-    let launched = tokio::task::spawn_blocking(move || {
-        let args = [
-            OsStr::new("--home"),
-            home.as_os_str(),
-            OsStr::new("_supervisor"),
-            OsStr::new(id.as_str()),
-        ];
-        launch::launch_detached(&program, &args, launch::Timeouts::default(), |pid, backend| {
-            // Durable before any proof, so reconciliation can observe this child.
-            let mut evidence = process::inspect(pid)
-                .ok()
-                .and_then(|p| serde_json::to_value(p).ok())
-                .unwrap_or_else(|| json!({"pid": pid}));
-            evidence["spawn_backend"] = json!(backend);
-            let store = Store::open(&home).map_err(|e| e.to_string())?;
-            store
-                .conn
-                .execute(
-                    "UPDATE agents SET startup_owner_pid_identity=? WHERE id=? AND supervisor_pid IS NULL",
-                    rusqlite::params![evidence.to_string(), id.as_str()],
-                )
-                .map(drop)
-                .map_err(|e| e.to_string())
-        })
-    })
-    .await
-    .map_err(|e| Error::Runtime(format!("supervisor launch task failed: {e}")))?;
-    match launched {
-        Ok(launched) => {
-            // Exact-PID reaper; the committed owner record stands even if it cannot start.
-            let _ = launch::spawn_reaper(launched.pid);
-            Ok(())
-        }
-        Err(launch::LaunchError::Spawn(error)) => Err(Error::Io(error)),
-        // A child that died before its PID proof owns nothing: fail like a failed spawn.
-        Err(error @ launch::LaunchError::Bootstrap(_)) => {
-            Err(Error::Io(std::io::Error::other(error.to_string())))
-        }
-        Err(error) => Err(Error::Runtime(error.to_string())),
+    let (program, home, id, lane) = (
+        program.to_path_buf(),
+        home.to_path_buf(),
+        id.clone(),
+        lane.clone(),
+    );
+    tokio::spawn(async move { launch_owned(&program, &home, &id, &lane).await })
+        .await
+        .map_err(|e| Error::Runtime(format!("supervisor launch task failed: {e}")))?
+}
+
+/// Owns a spawned, not yet authenticated supervisor: unless it is taken back
+/// by [`Self::take`], dropping it abandons the child with verified cleanup on
+/// a helper thread (the child holds no capability, so it can do nothing
+/// durable meanwhile).
+struct LaunchGuard {
+    /// The launch to clean up; `None` once taken.
+    started: Option<launch::StartedLaunch>,
+    /// Deadlines of the cleanup.
+    timeouts: launch::Timeouts,
+}
+
+impl LaunchGuard {
+    /// Takes the launch back from the guard.
+    fn take(&mut self) -> launch::StartedLaunch {
+        self.started.take().expect("launch is held until taken")
+    }
+
+    /// The held launch.
+    fn held(&mut self) -> &mut launch::StartedLaunch {
+        self.started.as_mut().expect("launch is held until taken")
     }
 }
-/// Child side: prove session identity, commit ownership and heartbeat, then report READY.
+
+impl Drop for LaunchGuard {
+    /// Abandons a launch dropped before it completed.
+    fn drop(&mut self) {
+        if let Some(started) = self.started.take() {
+            let timeouts = self.timeouts;
+            std::thread::spawn(move || {
+                let _ = started.abandon(timeouts, "supervisor launch was cancelled".into());
+            });
+        }
+    }
+}
+
+/// The body of [`launch_program`], run as an owned task.
+async fn launch_owned(program: &Path, home: &Path, id: &AgentId, lane: &BrokerLane) -> Result<()> {
+    let program = program.to_path_buf();
+    let secret = new_capability();
+    lane.local(
+        ops::RecordSupervisorLaunch {
+            execution: id.clone(),
+            capability_sha256: fs::sha256(secret.as_bytes()),
+        },
+        BROKER_BUDGET,
+    )
+    .await?;
+    let timeouts = launch::Timeouts::default();
+    let (spawn_home, spawn_id) = (home.to_path_buf(), id.clone());
+    // The blocking spawn hands its result over a channel; when the receiver is
+    // already gone the thread abandons the child itself.
+    let (handoff, spawned) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        let args = [
+            OsStr::new("--home"),
+            spawn_home.as_os_str(),
+            OsStr::new("_supervisor"),
+            OsStr::new(spawn_id.as_str()),
+        ];
+        let result = launch::spawn_launch(&program, &args, timeouts, true);
+        if let Err(Ok(started)) = handoff.send(result) {
+            let _ = started.abandon(timeouts, "supervisor launch was cancelled".into());
+        }
+    });
+    let started = spawned
+        .await
+        .map_err(|e| Error::Runtime(format!("supervisor launch task failed: {e}")))?
+        .map_err(launch_error)?;
+    let mut guard = LaunchGuard {
+        started: Some(started),
+        timeouts,
+    };
+    let (pid, backend) = (guard.held().pid, guard.held().backend);
+    // Durable before any proof or capability, so reconciliation can observe this child.
+    let mut evidence = process::inspect(pid)
+        .ok()
+        .and_then(|p| serde_json::to_value(p).ok())
+        .unwrap_or_else(|| json!({"pid": pid}));
+    evidence["spawn_backend"] = json!(backend);
+    let recorded = lane
+        .local(
+            ops::RecordStartupOwner {
+                execution: id.clone(),
+                identity: evidence,
+            },
+            BROKER_BUDGET,
+        )
+        .await;
+    if let Err(error) = recorded {
+        let message = format!("supervisor startup evidence was not recorded: {error}");
+        return Err(abandon(guard.take(), timeouts, message).await);
+    }
+    if let Err(error) = guard.held().release_capability(secret.as_bytes()) {
+        let message = format!("supervisor capability was not released: {error}");
+        return Err(abandon(guard.take(), timeouts, message).await);
+    }
+    let started = guard.take();
+    // The exact-PID reaper starts inside the blocking task, before its result
+    // can be dropped; the committed owner record stands even if it cannot start.
+    let (handoff, launched) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        let result = started.complete(timeouts);
+        if let Ok(done) = &result {
+            let _ = launch::spawn_reaper(done.pid);
+        }
+        let _ = handoff.send(result);
+    });
+    launched
+        .await
+        .map_err(|e| Error::Runtime(format!("supervisor launch task failed: {e}")))?
+        .map(drop)
+        .map_err(launch_error)
+}
+
+/// Cleans up a spawned but unauthenticated supervisor off the async runtime.
+async fn abandon(
+    started: launch::StartedLaunch,
+    timeouts: launch::Timeouts,
+    message: String,
+) -> Error {
+    match tokio::task::spawn_blocking(move || started.abandon(timeouts, message)).await {
+        Ok(error) => launch_error(error),
+        Err(error) => Error::Runtime(format!("supervisor cleanup task failed: {error}")),
+    }
+}
+
+/// Maps a platform launch failure to the product error classes.
+fn launch_error(error: launch::LaunchError) -> Error {
+    match error {
+        launch::LaunchError::Spawn(error) => Error::Io(error),
+        // A child that died before its PID proof owns nothing: fail like a failed spawn.
+        error @ launch::LaunchError::Bootstrap(_) => {
+            Error::Io(std::io::Error::other(error.to_string()))
+        }
+        error => Error::Runtime(error.to_string()),
+    }
+}
+/// Child side: prove session identity, authenticate to the writer with the
+/// private launch capability, commit ownership and report READY.
 ///
-/// `fds` are the inherited ready, identity and error descriptors.  The first
-/// heartbeat makes the complete ownership record eligible for later recovery.
-/// Native journal writes use short busy sleeps within the unchanged ordinary
-/// store allowance, preserving typed SQLite failures and durable transactions.
-/// Execution errors are logged by fixed public class without persisting task
-/// text or credentials, including errors whose owned process prevents finish.
-pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
+/// `fds` are the inherited ready, identity and error descriptors and
+/// `capability_fd` the private pipe holding the launch capability. The secret
+/// is read once, kept only in memory and in the writer hello, and its pipe is
+/// closed (and was never inherited by any harness). Ownership is one awaited
+/// `RecordSupervisorOwner` operation; the first heartbeat makes the complete
+/// ownership record eligible for later recovery. Native journal rows are
+/// coalesced into bounded batches. Execution errors are logged by fixed public
+/// class without persisting task text or credentials, including errors whose
+/// owned process prevents finish.
+pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3], capability_fd: i32) -> Result<()> {
     crate::logging::configure(home, "supervisor");
     let [ready_fd, identity_fd, error_fd] = fds;
     if let Err(error) = launch::report_identity(identity_fd, error_fd) {
@@ -136,18 +249,11 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
         let _ = launch::report_ready(ready_fd, Err(&message));
         return Err(error.into());
     }
-    let owned = (|| {
-        let mut store = Store::open(home)?;
-        store.conn.busy_handler(Some(journal_busy))?;
-        let owner = process::inspect(std::process::id() as i32)?;
-        record_owner(&mut store, id, &owner)?;
-        Ok::<_, Error>(store)
-    })();
     // A disconnected READY reader cannot undo an already committed owner.
-    let mut store = match owned {
-        Ok(store) => {
+    let mut persist = match bootstrap(home, id, capability_fd).await {
+        Ok(persist) => {
             let _ = launch::report_ready(ready_fd, Ok(()));
-            store
+            persist
         }
         Err(error) => {
             let message = error_text(&error);
@@ -155,127 +261,151 @@ pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3]) -> Result<()> {
             return Err(error);
         }
     };
-    match execute(home, id, &mut store).await {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            // Final checkpoint failures can return before an engine result is
-            // committed; their closed diagnostic must survive that path too.
-            let metadata = execution_error_metadata(&error);
-            // A database outage must not erase the operation's safe failure facts.
-            let directory = home.join("agents").join(id.as_str());
-            let _ = fs::Dir::open(&directory).and_then(|dir| {
-                dir.write(
-                    Path::new("execution-failure.json"),
-                    &fs::canonical_json(&metadata)?,
-                    0o600,
-                )
-            });
-            let _ = store.event(id, "execution_failure_v1", &metadata);
-            if let Some(logger) = crate::logging::configured() {
-                logger.log(
-                    crate::logging::Level::Error,
-                    &format!(
-                        "supervisor execution failed agent_id={} class={} cause={}",
-                        id,
-                        error.public().kind,
-                        metadata
-                    ),
-                );
-            }
-            let row = store.get(id)?;
-            if !row.status.terminal() {
-                if let Ok((attempt, _)) = store.provider_attempt(id)
-                    && !crate::lifecycle::reconcile::cleanup_mcp_discovery(&store, &attempt)?
-                {
-                    return Err(error);
-                }
-                if row
-                    .identity
-                    .as_ref()
-                    .is_some_and(|value| value["provider_identity_version"] == 2)
-                    && !store.provider_never_spawned(id)?
-                {
-                    return Err(error);
-                }
-                let mut outcome = Outcome::failure(preparation_failure_kind(&error));
-                outcome.failure_text = Some(error.public().message);
-                if store.cancel_pending(id)? {
-                    outcome.status = Status::Cancelled;
-                }
-                store.finish(id, &outcome, None, None)?;
-                commands::complete_terminal(&mut store, id)?;
-            }
-            Err(error)
-        }
+    match execute(home, id, &mut persist).await {
+        Ok(()) => persist.flush().await,
+        Err(error) => finish_failed_run(home, id, &mut persist, error).await,
     }
 }
 
-/// Opens one private ownership writer for an admitted attempt. The returned
-/// callback persists only authenticated process snapshots, reuses its connection,
-/// and retries only pre-transaction SQLITE_BUSY at most twice per slice. Required initial persistence
-/// splits the connection's existing busy allowance (normally five seconds)
-/// across those attempts, before any native task is released. Later checkpoints
-/// keep the 250 ms synchronous slice; Process gates progress across safe acquire
-/// retries within the unchanged ordinary store allowance, retaining its clock
-/// across select cancellation. These operation bounds never limit an
-/// execution's lifetime. Permanent errors retain their typed phase/cause;
-/// successful callbacks never leave a transaction or statement across an await.
-fn ownership_writer(
-    home: &Path,
-    attempt: String,
-) -> Result<
-    impl FnMut(&agent_run_platform::process::OwnershipSnapshot) -> Result<()> + Send + 'static,
-> {
-    let mut writer = Store::open(home).map_err(|error| {
-        Error::ownership_checkpoint(agent_run_domain::OwnershipStage::Initial, error)
-    })?;
-    let startup_budget = Duration::from_millis(
-        writer
-            .conn
-            .pragma_query_value(None, "busy_timeout", |row| row.get::<_, u64>(0))
-            .map_err(|error| {
-                Error::ownership_checkpoint(agent_run_domain::OwnershipStage::Initial, error.into())
-            })?,
+/// Reads the capability, authenticates to the writer and commits ownership.
+///
+/// # Errors
+/// An unreadable or malformed capability, an unreachable or refusing writer, or
+/// a rejected owner record (the execution is no longer an unowned `starting`
+/// or `cancelling` one).
+async fn bootstrap(home: &Path, id: &AgentId, capability_fd: i32) -> Result<Persist> {
+    let secret = tokio::task::spawn_blocking(move || {
+        launch::read_capability(capability_fd, CAPABILITY_WAIT)
+    })
+    .await
+    .map_err(|e| Error::Runtime(format!("capability task failed: {e}")))?
+    .map_err(Error::Io)?;
+    let capability = String::from_utf8(secret)
+        .ok()
+        .filter(|text| {
+            text.len() == 64
+                && text
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+        .ok_or_else(|| invalid("launch capability is malformed"))?;
+    let logical = StoreReader::open_with(home, Duration::from_millis(250))?
+        .get(id)?
+        .root_agent_id;
+    let producer = persist::Producer::connect(
+        &home.join("writer.sock"),
+        persist::supervisor_hello(&logical, id, capability),
+        persist::supervisor_producer_id(id),
     );
-    writer.conn.busy_handler(Some(journal_busy))?;
-    let mut initial = true;
-    Ok(
-        move |snapshot: &agent_run_platform::process::OwnershipSnapshot| {
-            let (budget, lock_wait) = if initial {
-                (startup_budget, startup_budget / 2)
-            } else {
-                (Duration::from_millis(250), Duration::from_millis(100))
-            };
-            let started = std::time::Instant::now();
-            let until = started + budget;
-            for retry in 0..2 {
-                let left = until.saturating_duration_since(std::time::Instant::now());
-                if left.is_zero() {
-                    return Err(Error::Runtime(
-                        "ownership persistence operation allowance exhausted".into(),
-                    ));
-                }
-                let statement_until = std::time::Instant::now() + left.min(lock_wait);
-                OWNERSHIP_BUSY_UNTIL
-                    .with(|deadline| deadline.set(Some(statement_until.min(until))));
-                let persisted = writer.remember_processes("attempt", &attempt, snapshot);
-                OWNERSHIP_BUSY_UNTIL.with(|deadline| deadline.set(None));
-                match persisted {
-                    Ok(()) => {
-                        initial = false;
-                        return Ok(());
-                    }
-                    Err(error) => {
-                        let transient = error.retryable_ownership_acquire();
-                        if retry == 1 || !transient || std::time::Instant::now() >= until {
-                            return Err(error.persistence_totals(started.elapsed(), retry + 1));
-                        }
-                    }
-                }
-            }
-            unreachable!("both bounded attempts return or retry")
+    let mut persist = Persist::open(home, id, producer)?;
+    let owner = process::inspect(std::process::id() as i32)?;
+    persist.record_owner(&owner, None).await?;
+    Ok(persist)
+}
+
+/// Records and logs a failed run and, when nothing owned still needs recovery,
+/// finishes it with a preparation-failure terminal outcome.
+async fn finish_failed_run(
+    home: &Path,
+    id: &AgentId,
+    store: &mut Persist,
+    error: Error,
+) -> Result<()> {
+    // Final checkpoint failures can return before an engine result is
+    // committed; their closed diagnostic must survive that path too.
+    let metadata = execution_error_metadata(&error);
+    // A database outage must not erase the operation's safe failure facts.
+    let directory = home.join("agents").join(id.as_str());
+    let _ = fs::Dir::open(&directory).and_then(|dir| {
+        dir.write(
+            Path::new("execution-failure.json"),
+            &fs::canonical_json(&metadata)?,
+            0o600,
+        )
+    });
+    let _ = store
+        .event_durable(id, "execution_failure_v1", &metadata)
+        .await;
+    if let Some(logger) = crate::logging::configured() {
+        logger.log(
+            crate::logging::Level::Error,
+            &format!(
+                "supervisor execution failed agent_id={} class={} cause={}",
+                id,
+                error.public().kind,
+                metadata
+            ),
+        );
+    }
+    let row = store.get(id)?;
+    if !row.status.terminal() {
+        if let Ok((attempt, _)) = store.provider_attempt(id)
+            && !crate::lifecycle::reconcile::cleanup_mcp_discovery(store, &attempt)?
+        {
+            return Err(error);
+        }
+        if row
+            .identity
+            .as_ref()
+            .is_some_and(|value| value["provider_identity_version"] == 2)
+            && !persist::attempt_never_spawned(&store.conn, id)?
+        {
+            return Err(error);
+        }
+        let mut outcome = Outcome::failure(preparation_failure_kind(&error));
+        outcome.failure_text = Some(error.public().message);
+        if store.cancel_pending(id)? {
+            outcome.status = Status::Cancelled;
+        }
+        store.finish(id, &outcome, None, None).await?;
+        store.complete_terminal(id).await?;
+    }
+    Err(error)
+}
+
+/// The ownership sink of one attempt: every call claims its submission position
+/// in the supervisor's ordered lane at once and returns the owned future of
+/// that one `RememberProcesses` operation. The write is awaited by the process
+/// observer while the primary and its descendants keep being observed, is never
+/// restarted by cancellation, and never limits an execution's lifetime.
+fn ownership_sink(producer: &persist::Producer, attempt: String) -> adapters::io::OwnershipSink {
+    let producer = producer.clone();
+    Box::new(move |snapshot| {
+        persist::ownership_future(
+            &producer,
+            attempt.clone(),
+            snapshot,
+            persist::CRITICAL_BUDGET,
+        )
+    })
+}
+
+/// The owned future persisting one discovery-child ownership snapshot as an
+/// `mcp_discovery_ownership` journal event of `attempt`. Like
+/// [`ownership_sink`], the submission position is claimed when it is built and
+/// dropping the future never withdraws the operation.
+fn discovery_ownership(
+    producer: &persist::Producer,
+    agent: &AgentId,
+    attempt: &str,
+    snapshot: process::OwnershipSnapshot,
+) -> adapters::io::PersistFuture {
+    let data = match serde_json::to_value(&snapshot) {
+        Ok(data) => data,
+        Err(error) => return Box::pin(async move { Err(Error::from(error)) }),
+    };
+    let pending = producer.submit(
+        ops::AppendJournal {
+            execution: agent.clone(),
+            fragments: vec![ops::JournalFragment::Event {
+                kind: "mcp_discovery_ownership".to_owned(),
+                data,
+                attempt: Some(attempt.to_owned()),
+            }],
         },
-    )
+        persist::CRITICAL_BUDGET,
+    );
+    Box::pin(async move { persist::into_result::<Vec<i64>>(pending.await).map(drop) })
 }
 
 /// Preserve exact owned identities, observed cleanup and an optional sealed
@@ -334,7 +464,7 @@ fn retain_cleanup_evidence(
 /// Returns closed, content-free categories for an execution error. Original
 /// messages, SQL text, paths, JSON contents and credential/environment values
 /// never enter diagnostics. Native numeric errno/SQLite codes remain nullable.
-fn execution_error_metadata(error: &Error) -> serde_json::Value {
+pub(crate) fn execution_error_metadata(error: &Error) -> serde_json::Value {
     let mut data = json!({"version":1,"stage":"engine_execution","class":error.public().kind});
     match error {
         Error::OwnershipCheckpoint { stage, source } => {
@@ -351,9 +481,13 @@ fn execution_error_metadata(error: &Error) -> serde_json::Value {
             operation,
             elapsed_ms,
             attempts,
+            phase,
             source,
         } => {
             data = execution_error_metadata(source);
+            // The closed writer phase (acquire, statement, commit, ...) is a
+            // separate axis from the ownership stage and survives unchanged.
+            data["phase"] = json!(phase);
             data["stage"] = json!(match operation {
                 agent_run_domain::error::PersistenceOperation::TerminalCommit
                 | agent_run_domain::error::PersistenceOperation::CleanupWrite => "final",
@@ -384,7 +518,11 @@ fn execution_error_metadata(error: &Error) -> serde_json::Value {
 /// Logging precedes best-effort event persistence; either sink may be unavailable.
 /// Diagnostic failure never replaces the original failure. The returned failure
 /// has no answer; existing identity/cleanup verification still applies.
-fn failed_execution(store: &Store, id: &AgentId, error: &Error) -> adapters::EngineResult {
+async fn failed_execution(
+    store: &mut Persist,
+    id: &AgentId,
+    error: &Error,
+) -> adapters::EngineResult {
     let metadata = execution_error_metadata(error);
     if let Some(logger) = crate::logging::configured() {
         logger.log(
@@ -392,7 +530,10 @@ fn failed_execution(store: &Store, id: &AgentId, error: &Error) -> adapters::Eng
             &format!("execution_failure {metadata}"),
         );
     }
-    if store.event(id, "execution_failure_v1", &metadata).is_err()
+    if store
+        .event_durable(id, "execution_failure_v1", &metadata)
+        .await
+        .is_err()
         && let Some(logger) = crate::logging::configured()
     {
         logger.log(
@@ -400,6 +541,13 @@ fn failed_execution(store: &Store, id: &AgentId, error: &Error) -> adapters::Eng
             "execution_failure_diagnostic_not_persisted",
         );
     }
+    failed_result(error)
+}
+
+/// The failed engine result for `error`: a closed failure kind, the closed
+/// diagnostic as text and no answer. Pure; persists nothing.
+fn failed_result(error: &Error) -> adapters::EngineResult {
+    let metadata = execution_error_metadata(error);
     let mut outcome = Outcome::failure(match error {
         Error::Integrity(_) | Error::AnswerIntegrity(_) => "runtime_integrity_failed",
         Error::Validation(_) => "runtime_contract_rejected",
@@ -455,41 +603,8 @@ fn preparation_failure_kind(error: &Error) -> &'static str {
     }
 }
 
-/// Atomically bind the supervising process and its first recovery heartbeat.
-///
-/// `owner` is the inspected current supervisor, whose PID/token/birth values
-/// become immutable ownership evidence.  The row must still be an unowned
-/// `starting` admission or this returns `Conflict`; no partial owner row is
-/// committed if the accompanying event cannot be appended.
-fn record_owner(store: &mut Store, id: &AgentId, owner: &process::Identity) -> Result<()> {
-    let tx = store
-        .conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let heartbeat = domain::now();
-    let changed = tx.execute(
-        "UPDATE agents SET supervisor_pid=?,supervisor_identity=?,supervisor_birth_time=?,heartbeat_at=? \
-         WHERE id=? AND status IN ('starting','cancelling') AND supervisor_pid IS NULL",
-        params![owner.pid, owner.token, owner.birth, heartbeat, id.as_str()],
-    )?;
-    if changed != 1 {
-        return Err(Error::Conflict);
-    }
-    tx.execute(
-        "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) \
-         VALUES(?,(SELECT id FROM attempts WHERE agent_id=? AND ownership_active=1),?,?,?)",
-        params![
-            id.as_str(),
-            id.as_str(),
-            heartbeat,
-            "supervisor_ready",
-            json!({"pid":owner.pid}).to_string()
-        ],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
 /// Run one admitted agent through preparation, supervision, cleanup, and terminal storage.
-async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
+async fn execute(home: &Path, id: &AgentId, store: &mut Persist) -> Result<()> {
     let first = store.get(id)?;
     if first
         .identity
@@ -499,7 +614,7 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
         return execute_provider(home, id, store).await;
     }
     if store.cancel_pending(id)? {
-        return cancelled_before_spawn(id, store);
+        return cancelled_before_spawn(id, store).await;
     }
     let mut row = store.get(id)?;
     let mut identity = LaunchIdentity::read(&row)?;
@@ -507,7 +622,9 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
     adapters::validate(&row.request, &runtime, &identity.profile)?;
     let agent_dir = home.join("agents").join(id.as_str());
     fs::private_dir(&agent_dir)?;
-    store.event(id, "phase", &json!({"phase":"preparing"}))?;
+    store
+        .event(id, "phase", &json!({"phase":"preparing"}))
+        .await?;
     let runtime_home = if let Some(path) = &identity.runtime_home {
         path.clone()
     } else {
@@ -543,9 +660,9 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
         .snapshot_sha256
         .as_deref()
         .ok_or_else(|| invalid("materialization proof missing"))?;
-    store.update_identity(id, &serde_json::to_value(&identity)?, revision)?;
+    seal_identity(store, id, &runtime_home, revision, None, revision).await?;
     if store.cancel_pending(id)? {
-        return cancelled_before_spawn(id, store);
+        return cancelled_before_spawn(id, store).await;
     }
     row = store.get(id)?;
     let plan = match runtime.kind()? {
@@ -567,28 +684,40 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
             &snapshot,
         )?,
     };
-    store.event(id, "phase", &json!({"phase":"spawning"}))?;
+    store
+        .event(id, "phase", &json!({"phase":"spawning"}))
+        .await?;
     let mut process = Process::spawn(&plan)?;
     // From this point EVERY path must clean up before returning, including a
     // database failure immediately after spawning the engine.
     let execution = async {
-        store.running(id, process.owner.pid)?;
+        // The spawned engine is observed (exit, descendants, escalation) while
+        // every durable write below is pending, from the first one onward.
+        let pid = process.owner.pid;
+        process
+            .observing(async {
+                fixture_hold(home, "legacy-process").await;
+                store.running(id, pid).await
+            })
+            .await?;
         let attempt = format!("{id}:1");
         let leader = process
             .owner
             .leader
-            .as_ref()
+            .clone()
             .ok_or_else(|| Error::Runtime("legacy leader identity unavailable".into()))?;
-        store.conn.execute(
-            "UPDATE attempts SET ownership_active=1,phase='spawning',process_identity=?,process_birth_time=? WHERE id=?",
-            rusqlite::params![leader.token, leader.birth, attempt],
-        )?;
-        let ownership_home = home.to_owned();
-        process.observe_ownership_with_retry(
-            ownership_writer(&ownership_home, attempt)?,
-            agent_run_store::BUSY_TIMEOUT,
-        )?;
-        crate::journal(store, id, "user", &row.request.task, None, None)?;
+        process
+            .observing(async {
+                fixture_hold(home, "legacy-anchor").await;
+                store.anchor_legacy_attempt(&attempt, &leader).await
+            })
+            .await?;
+        process
+            .observe_ownership(ownership_sink(store.producer(), attempt))
+            .await?;
+        process
+            .observing(store.journal(id, "user", &row.request.task, None, None))
+            .await?;
         match runtime.kind()? {
             Adapter::Codex => {
                 crate::codex::run(
@@ -619,15 +748,19 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
         .checkpoint_ownership_ready(agent_run_domain::OwnershipStage::Final)
         .await
     {
-        let _ = store.event(
-            id,
-            "ownership_checkpoint_failure_v1",
-            &execution_error_metadata(&error),
-        );
+        let _ = store
+            .event(
+                id,
+                "ownership_checkpoint_failure_v1",
+                &execution_error_metadata(&error),
+            )
+            .await;
         return execution.and(Err(error));
     }
     let cleanup = cleanup?;
-    store.event(id, "process_cleanup", &serde_json::to_value(&cleanup)?)?;
+    store
+        .event(id, "process_cleanup", &serde_json::to_value(&cleanup)?)
+        .await?;
     if cleanup.confirmed {
         let attempt = format!("{id}:1");
         // Runs that failed before recording ownership have nothing to release.
@@ -637,13 +770,13 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
             |row| row.get(0),
         )?;
         if owned {
-            store.provider_cleanup(id, &attempt, &cleanup)?;
+            store.provider_cleanup(id, &attempt, &cleanup).await?;
         }
     }
     let cancelled = store.cancel_pending(id)?;
     let mut result = match execution {
         Ok(result) => result,
-        Err(error) => failed_execution(store, id, &error),
+        Err(error) => failed_execution(store, id, &error).await,
     };
     // Codex reports its semantic turn outcome before app-server shutdown. Its
     // deliberate post-result SIGTERM does not turn a verified completed turn
@@ -671,8 +804,10 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
         domain::now(),
         verify::DEFAULT_SILENCE_THRESHOLD_SECONDS,
     )?;
-    store.finish(id, &outcome, proof.as_ref(), result.usage.as_ref())?;
-    commands::complete_terminal(store, id)?;
+    store
+        .finish(id, &outcome, proof.as_ref(), result.usage.as_ref())
+        .await?;
+    commands::complete_terminal_persisted(store, id).await?;
     Ok(())
 }
 
@@ -697,8 +832,8 @@ pub fn managed_scope() -> String {
 /// pins its references before importing, switches roots behind a token-bound
 /// in-home backup, proves the unchanged original index, commits, and removes
 /// only backups proven to still hold the replaced assets.
-fn install_shared_assets(
-    store: &mut Store,
+async fn install_shared_assets<B: crate::runtime_storage::LayoutBackend>(
+    store: &mut B,
     app_home: &Path,
     runtime_home: &Path,
     expected: &str,
@@ -707,12 +842,12 @@ fn install_shared_assets(
 ) -> Result<()> {
     let scope = managed_scope();
     let Some(layout) =
-        crate::runtime_storage::plan(store, app_home, runtime_home, expected, &scope)?
+        crate::runtime_storage::plan(store.reader(), app_home, runtime_home, expected, &scope)?
     else {
         return Ok(());
     };
     shared_publication_root(app_home, codex_grant)?;
-    crate::runtime_storage::install(store, app_home, &layout, Some(owner))
+    crate::runtime_storage::install_on(store, app_home, &layout, Some(owner)).await
 }
 
 /// Validates the shared store and returns its canonical root as the witness
@@ -828,8 +963,8 @@ pub enum Relocation {
 /// identity, a launch that no longer plans, an invalid store root, or an
 /// unverifiable Codex grant surfaces as [`Relocation::Skipped`] with
 /// the reason and the bytes still held privately; the home itself is untouched.
-pub fn relocate_retained_home(
-    store: &mut Store,
+pub async fn relocate_retained_home_on<B: crate::runtime_storage::LayoutBackend>(
+    store: &mut B,
     app_home: &Path,
     agent: &AgentId,
 ) -> Result<Relocation> {
@@ -840,10 +975,11 @@ pub fn relocate_retained_home(
     // A row this build cannot even read — a legacy or damaged record — is a
     // reported skip, never a forced switch or a hard failure of the whole
     // compaction pass.
-    let row = match store.get(agent) {
+    let row = match store.reader().get(agent) {
         Ok(row) => row,
         Err(error) => {
             let home = store
+                .reader()
                 .retained_runtime_homes(None, 1)
                 .ok()
                 .and_then(|(page, _)| {
@@ -868,11 +1004,11 @@ pub fn relocate_retained_home(
         return Ok(Relocation::AlreadyShared);
     };
     let config = identity.provider_config.clone();
-    let catalog = match config.resolve_catalog(store.list_accounts()?) {
+    let catalog = match config.resolve_catalog(store.reader().list_accounts()?) {
         Ok(catalog) => catalog,
         Err(error) => return Ok(skip(Some(&runtime_home), error.to_string())),
     };
-    let account = match store.recorded_account(agent) {
+    let account = match store.reader().recorded_account(agent) {
         Ok(account) => account,
         Err(error) => return Ok(skip(Some(&runtime_home), error.to_string())),
     };
@@ -923,7 +1059,9 @@ pub fn relocate_retained_home(
         identity.authority.assets_sha256.as_str(),
         agent,
         codex_grant.as_ref(),
-    ) {
+    )
+    .await
+    {
         Ok(()) => Ok(Relocation::Installed),
         Err(error) => Ok(skip(Some(&runtime_home), error.to_string())),
     }
@@ -937,23 +1075,27 @@ pub fn relocate_retained_home(
 /// attempt the account, and the caller holds the offline locks with every
 /// holder terminal. An unverifiable home is a reported skip with its reason
 /// and preserved byte count, never a forced consolidation.
-pub fn consolidate_retained_native(
-    store: &mut Store,
+pub async fn consolidate_retained_native_on<B: crate::runtime_storage::LayoutBackend>(
+    store: &mut B,
     app_home: &Path,
     agent: &AgentId,
 ) -> std::result::Result<serde_json::Value, String> {
-    let row = store.get(agent).map_err(|error| error.to_string())?;
+    let row = store
+        .reader()
+        .get(agent)
+        .map_err(|error| error.to_string())?;
     let identity = ProviderLaunchIdentity::read(&row).map_err(|error| error.to_string())?;
     let Some(runtime_home) = identity.runtime_home.clone() else {
         return Err("recorded identity has no sealed runtime home".into());
     };
     let account = store
+        .reader()
         .recorded_account(agent)
         .map_err(|error| error.to_string())?;
     // Native caches publish only into the root validated exactly as a managed
     // relocation validates it, replayed from the recorded frozen authority.
     let witness = native_publication_root(
-        store,
+        store.reader(),
         app_home,
         &identity,
         &account,
@@ -961,7 +1103,7 @@ pub fn consolidate_retained_native(
         &row.request,
     )
     .map_err(|error| error.to_string())?;
-    let report = crate::runtime_cache::consolidate(
+    let report = crate::runtime_cache::consolidate_on(
         store,
         agent,
         &identity,
@@ -970,6 +1112,7 @@ pub fn consolidate_retained_native(
         &runtime_home,
         &witness,
     )
+    .await
     .map_err(|error| error.to_string())?;
     serde_json::to_value(&report).map_err(|error| error.to_string())
 }
@@ -1098,8 +1241,8 @@ fn shared_launch_assets(
 /// recovery is provably-owner-checked and idempotent, and the verification
 /// after it fails closed on anything still wrong. A private home keeps the
 /// original strict verifier.
-fn verify_sealed_home(
-    store: &mut Store,
+async fn verify_sealed_home<B: crate::runtime_storage::LayoutBackend>(
+    store: &mut B,
     app_home: &Path,
     runtime_home: &Path,
     expected: &str,
@@ -1110,12 +1253,12 @@ fn verify_sealed_home(
         .to_string_lossy()
         .into_owned();
     if matches!(
-        store.runtime_storage_layout(&key),
+        store.reader().runtime_storage_layout(&key),
         Ok(Some(record)) if record.state == agent_run_store::runtime_storage::LayoutState::Prepared
     ) {
-        crate::runtime_storage::recover(store, app_home, runtime_home)?;
+        crate::runtime_storage::recover_on(store, app_home, runtime_home).await?;
     }
-    crate::runtime_storage::verify(store, app_home, runtime_home, expected)?;
+    crate::runtime_storage::verify(store.reader(), app_home, runtime_home, expected)?;
     Ok(())
 }
 
@@ -1125,12 +1268,12 @@ fn verify_sealed_home(
 /// Checkpoints root and descendant identities through cleanup, and injects an attempt-bound
 /// worker capability. Preparation, execution, cleanup and durable-store failures propagate;
 /// an unconfirmed cleanup keeps ownership reserved for recovery.
-async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Result<()> {
+async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Result<()> {
     if store.cancel_pending(id)? {
-        if !store.provider_never_spawned(id)? {
+        if !persist::attempt_never_spawned(&store.conn, id)? {
             return Err(invalid("provider attempt was already spawning"));
         }
-        return cancelled_before_spawn(id, store);
+        return cancelled_before_spawn(id, store).await;
     }
     let mut row = store.get(id)?;
     let mut identity = ProviderLaunchIdentity::read(&row)?;
@@ -1145,7 +1288,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         let (attempt_id, account) = store.provider_attempt(id)?;
         // Everything this supervisor journals originates from this attempt,
         // including final and cleanup records written after ownership ends.
-        store.bind_attempt(&attempt_id);
+        store.repin(&attempt_id).await?;
         let harness = config
             .harnesses
             .get(&identity.authority.harness)
@@ -1156,7 +1299,9 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             .unwrap_or_else(|| harness.home.join("runs").join(id.as_str()));
         let agent_dir = home.join("agents").join(id.as_str());
         fs::private_dir(&agent_dir)?;
-        store.event(id, "phase", &json!({"phase":"preparing"}))?;
+        store
+            .event(id, "phase", &json!({"phase":"preparing"}))
+            .await?;
         // Native caches precede every child of this attempt: recover this home's own interrupted native operations, then thaw
         // every frozen remote plugin parent, because the native store
         // rewrites those in place and a frozen parent must be private again
@@ -1178,11 +1323,15 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             identity.authority.assets_sha256 = digest.clone();
             identity.snapshot_sha256 = Some(digest.as_str().into());
             identity.runtime_home = Some(runtime_home.clone());
-            store.update_identity(
+            seal_identity(
+                store,
                 id,
-                &serde_json::to_value(&identity)?,
+                &runtime_home,
+                digest.as_str(),
+                Some(digest.as_str()),
                 &format!("snapshot:v2:{}", digest.as_str()),
-            )?;
+            )
+            .await?;
             // The sealed home, identity and index digest are durable; only
             // now may its managed trees move into the shared store, after the
             // store root and Codex grant are validated, so the next attempt and any resume verify the
@@ -1222,14 +1371,16 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 digest.as_str(),
                 id,
                 codex_grant.as_ref(),
-            )?;
+            )
+            .await?;
         } else {
             verify_sealed_home(
                 store,
                 home,
                 &runtime_home,
                 identity.authority.assets_sha256.as_str(),
-            )?;
+            )
+            .await?;
         }
         // The trusted store namespace is ensured before every harness launch
         // and a Codex grant must keep it outside its writable roots. There is
@@ -1239,10 +1390,10 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         // refused above.
         let shared_assets = launch_shared_assets(store, home, &runtime_home)?;
         if store.cancel_pending(id)? {
-            if !store.provider_never_spawned(id)? {
+            if !persist::attempt_never_spawned(&store.conn, id)? {
                 return Err(invalid("provider attempt was already spawning"));
             }
-            return cancelled_before_spawn(id, store);
+            return cancelled_before_spawn(id, store).await;
         }
         row = store.get(id)?;
         let catalog = config.resolve_catalog(store.list_accounts()?)?;
@@ -1305,8 +1456,12 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                 uuid::Uuid::new_v4().simple(),
                 uuid::Uuid::new_v4().simple()
             );
-            store.issue_worker_capability(id, &attempt_id, &token, domain::now())?;
-            store.begin_worker_lifecycle(id, &attempt_id, domain::now())?;
+            store
+                .issue_worker_capability(id, &attempt_id, &token, domain::now())
+                .await?;
+            store
+                .begin_worker_lifecycle(id, &attempt_id, domain::now())
+                .await?;
             planned.launch.environment.insert(
                 agent_run_domain::worker::FINISH_ENV.into(),
                 if row.request.explicit_finish {
@@ -1370,7 +1525,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         // store guards applicability (parent session, runtime and model) and
         // keeps every measurement null when no comparable baseline exists.
         if identity.authority.harness == HarnessId::Codex {
-            store.record_resume_usage_baseline(id)?;
+            store.record_resume_usage_baseline(id).await?;
         }
         #[cfg(feature = "test-fixtures")]
         fixture_barrier(home, &attempt_id, store, "spawn")?;
@@ -1380,88 +1535,105 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         if continuing.is_some()
             && let Some(blocker) = handoff_blocker(home, store, &account, &identity)?
         {
-            if !store.provider_never_spawned(id)? {
+            if !persist::attempt_never_spawned(&store.conn, id)? {
                 return Err(invalid("provider attempt was already spawning"));
             }
-            store.event(id, "failover_blocked", &json!({"reason":blocker}))?;
+            store
+                .event(id, "failover_blocked", &json!({"reason":blocker}))
+                .await?;
             let mut outcome = Outcome::failure("quota_exhausted");
             outcome.failure_text = Some(format!("failover_blocked: {blocker}"));
-            store.finish(id, &outcome, None, None)?;
-            return commands::complete_terminal(store, id);
+            store.finish(id, &outcome, None, None).await?;
+            return commands::complete_terminal_persisted(store, id).await;
         }
         if !config.services.is_empty() {
-            store.event(id, "phase", &json!({"phase":"warming_services"}))?;
+            store
+                .event(id, "phase", &json!({"phase":"warming_services"}))
+                .await?;
         }
         let service_gate = crate::managed_services::wait_for_gate(home, id).await;
         service_gate?;
         if identity.authority.harness == HarnessId::ClaudeCode && !store.cancel_pending(id)? {
-            let ownership_home = home.to_owned();
+            // Discovery children are owned by this attempt: each snapshot is one
+            // journal event submitted through the same ordered lane, so the
+            // rows buffered so far are written first.
+            store.flush().await?;
+            let producer = store.producer().clone();
             let ownership_agent = id.clone();
             let ownership_attempt = attempt_id.clone();
             let discovery =
                 adapters::mcp_catalog::apply_claude_tool_filters(&mut planned, move |snapshot| {
-                    let mut store = Store::open(&ownership_home)?;
-                    store.bind_attempt(&ownership_attempt);
-                    store.event(
-                        &ownership_agent,
-                        "mcp_discovery_ownership",
-                        &serde_json::to_value(snapshot)?,
-                    )
+                    discovery_ownership(&producer, &ownership_agent, &ownership_attempt, snapshot)
                 });
             discovery.await?;
         }
         // The spawn claim itself refuses while a cancel is pending, so an
         // accepted cancel can never race past this boundary.
-        if !store.provider_spawning(id, &attempt_id)? {
-            if !store.provider_never_spawned(id)? {
+        if !store.provider_spawning(id, &attempt_id).await? {
+            if !persist::attempt_never_spawned(&store.conn, id)? {
                 return Err(invalid("provider attempt was already spawning"));
             }
-            return cancelled_before_spawn(id, store);
+            return cancelled_before_spawn(id, store).await;
         }
-        store.event(id, "phase", &json!({"phase":"spawning"}))?;
+        store
+            .event(id, "phase", &json!({"phase":"spawning"}))
+            .await?;
         // Process::spawn yields Io only when the OS refused Command::spawn,
         // before a child exists; other failures retain ownership for recovery.
         let mut process = match Process::spawn(&planned.launch) {
             Ok(process) => process,
             Err(error @ Error::Io(_)) => {
-                store.provider_spawn_failed(id, &attempt_id)?;
+                store.provider_spawn_failed(id, &attempt_id).await?;
                 return Err(error);
             }
             Err(error) => return Err(error),
         };
         let switched = continuing.is_some();
         let execution = async {
+            // The spawned engine is observed (exit, descendants, escalation)
+            // while every durable write below is pending, from the first one
+            // onward; its ownership is persisted as soon as the attempt anchor
+            // is durable.
             let leader = process
                 .owner
                 .leader
-                .as_ref()
+                .clone()
                 .ok_or_else(|| Error::Runtime("provider leader identity unavailable".into()))?;
-            store.provider_process(id, &attempt_id, leader)?;
-            let ownership_home = home.to_owned();
-            let ownership_attempt = attempt_id.clone();
-            process.observe_ownership_with_retry(
-                ownership_writer(&ownership_home, ownership_attempt)?,
-                agent_run_store::BUSY_TIMEOUT,
-            )?;
+            process
+                .observing(async {
+                    fixture_hold(home, "provider-process").await;
+                    store.provider_process(id, &attempt_id, &leader).await
+                })
+                .await?;
+            process
+                .observe_ownership(ownership_sink(store.producer(), attempt_id.clone()))
+                .await?;
             if switched {
                 // The logical run is already running; its original start
                 // time is kept. No user entry is journaled.
-                store.provider_rerunning(id, &attempt_id, process.owner.pid)?;
-                store.event(
-                    id,
-                    "continuation_control",
-                    &json!({"session":resume_session,"account":account}),
-                )?;
+                process
+                    .observing(store.provider_rerunning(id, &attempt_id, process.owner.pid))
+                    .await?;
+                process
+                    .observing(store.event(
+                        id,
+                        "continuation_control",
+                        &json!({"session":resume_session,"account":account}),
+                    ))
+                    .await?;
             } else {
-                store.running(id, process.owner.pid)?;
-                crate::journal(
-                    store,
-                    id,
-                    "user",
-                    &identity.provider_request.task,
-                    None,
-                    None,
-                )?;
+                process
+                    .observing(store.running(id, process.owner.pid))
+                    .await?;
+                process
+                    .observing(store.journal(
+                        id,
+                        "user",
+                        &identity.provider_request.task,
+                        None,
+                        None,
+                    ))
+                    .await?;
             }
             let mut native_row = row.clone();
             native_row.request.task = task.to_owned();
@@ -1505,11 +1677,13 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             .checkpoint_ownership_ready(agent_run_domain::OwnershipStage::Final)
             .await;
         if let Err(error) = checkpoint {
-            let _ = store.event(
-                id,
-                "ownership_checkpoint_failure_v1",
-                &execution_error_metadata(&error),
-            );
+            let _ = store
+                .event(
+                    id,
+                    "ownership_checkpoint_failure_v1",
+                    &execution_error_metadata(&error),
+                )
+                .await;
             // Cleanup diagnostics cannot replace an earlier engine failure.
             // A valid result still fails when its final checkpoint is missing.
             return execution.and(Err(error));
@@ -1518,29 +1692,35 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         let cleanup = injected_cleanup_error(home, &attempt_id, store, cleanup)?;
         match &cleanup {
             Ok(proof) if !proof.confirmed => {
-                store.event(
-                    id,
-                    "process_cleanup_unverified",
-                    &serde_json::to_value(proof)?,
-                )?;
+                store
+                    .event(
+                        id,
+                        "process_cleanup_unverified",
+                        &serde_json::to_value(proof)?,
+                    )
+                    .await?;
             }
             Err(error) => {
-                store.event(
-                    id,
-                    "process_cleanup_unavailable",
-                    &json!({"class":error.public().kind}),
-                )?;
+                store
+                    .event(
+                        id,
+                        "process_cleanup_unavailable",
+                        &json!({"class":error.public().kind}),
+                    )
+                    .await?;
             }
             _ => {}
         }
         let cleanup = cleanup?;
-        store.provider_cleanup(id, &attempt_id, &cleanup)?;
-        store.event(id, "process_cleanup", &serde_json::to_value(&cleanup)?)?;
+        store.provider_cleanup(id, &attempt_id, &cleanup).await?;
+        store
+            .event(id, "process_cleanup", &serde_json::to_value(&cleanup)?)
+            .await?;
         let cleanup_recorded = std::time::Instant::now();
         let cancelled = store.cancel_pending(id)?;
         let mut result = match execution {
             Ok(result) => result,
-            Err(error) => failed_execution(store, id, &error),
+            Err(error) => failed_execution(store, id, &error).await,
         };
         #[cfg(feature = "test-fixtures")]
         inject_native_failure(&mut result, &attempt_id, store, id)?;
@@ -1571,31 +1751,36 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
             data["model"] = json!(identity.authority.model);
             if let Some((lane, window)) = latch_mapping(&identity, failure) {
                 let reset = data["resets_at"].as_f64();
-                store.latch_native_exhaustion(
-                    &account,
-                    identity.authority.provider.as_str(),
-                    &lane,
-                    &window,
-                    "native-quota-exhaustion",
-                    &governed_lanes(&identity, &account),
-                    domain::now(),
-                    reset,
-                )?;
+                store
+                    .latch_native_exhaustion(ops::LatchNativeExhaustion {
+                        execution: id.clone(),
+                        account: account.clone(),
+                        runtime: identity.authority.provider.as_str().to_owned(),
+                        lane: lane.clone(),
+                        window: window.clone(),
+                        source: "native-quota-exhaustion".to_owned(),
+                        models: governed_lanes(&identity, &account),
+                        observed_at: domain::now(),
+                        reset_at: reset,
+                    })
+                    .await?;
                 data["latched"] = json!({"lane":lane,"window":window});
             }
-            store.event(id, "native_failure", &data)?;
+            store.event(id, "native_failure", &data).await?;
             state["native_failure"] = data;
         }
-        store.provider_history(id, &attempt_id, &state)?;
+        store
+            .provider_history(id, &attempt_id, history_metadata(&state))
+            .await?;
         let history_recorded = std::time::Instant::now();
         if quota
             && !cancelled
             && result.outcome.status == Status::Failed
             && store.worker_finish_intent(id, false)?.is_none()
         {
-            match failover(home, id, store, &identity) {
+            match failover(home, id, store, &identity).await {
                 Ok(next) => {
-                    store.event(id, "account_switched", &next)?;
+                    store.event(id, "account_switched", &next).await?;
                     let session = store
                         .get(id)?
                         .runtime_session_id
@@ -1604,7 +1789,9 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
                     continue;
                 }
                 Err(blocker) => {
-                    store.event(id, "failover_blocked", &json!({"reason":blocker}))?;
+                    store
+                        .event(id, "failover_blocked", &json!({"reason":blocker}))
+                        .await?;
                     result.outcome.failure_kind = Some("quota_exhausted".into());
                     result.outcome.failure_text = Some(format!("failover_blocked: {blocker}"));
                 }
@@ -1642,18 +1829,22 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Store) -> Resul
         // frozen authority under exclusive home/broker ownership; no work is
         // scheduled after terminal state and the private cache remains intact.
         if cleanup.confirmed && identity.authority.harness == HarnessId::Codex {
-            let _ = store.event(
-                id,
-                "native_cache_consolidation_deferred",
-                &json!({"reason": "offline_compaction"}),
-            );
+            let _ = store
+                .event(
+                    id,
+                    "native_cache_consolidation_deferred",
+                    &json!({"reason": "offline_compaction"}),
+                )
+                .await;
         }
         let terminal_started = std::time::Instant::now();
-        store.finish(id, &outcome, proof.as_ref(), result.usage.as_ref())?;
+        store
+            .finish(id, &outcome, proof.as_ref(), result.usage.as_ref())
+            .await?;
         if let Some(logger) = crate::logging::configured() {
             logger.log(crate::logging::Level::Info, &format!("terminal_stage_ms agent_id={} cleanup_record={} history_capture={} history_record={} answer_seal={} verdict={} terminal_write={} total={}", id, cleanup_recorded.duration_since(cleanup_ended).as_millis(), history_captured.duration_since(history_started).as_millis(), history_recorded.duration_since(history_captured).as_millis(), answer_sealed.duration_since(answer_started).as_millis(), verdict_recorded.duration_since(answer_sealed).as_millis(), terminal_started.elapsed().as_millis(), cleanup_ended.elapsed().as_millis()));
         }
-        commands::complete_terminal(store, id)?;
+        commands::complete_terminal_persisted(store, id).await?;
         return Ok(());
     }
 }
@@ -1675,10 +1866,10 @@ pub const CONTINUATION_CONTROL: &str = "The previous turn stopped because the ac
 /// (frozen scope ∩ current bindings, never an account tried before) through
 /// the atomic store allocation, with bounded stale-revision recomputes.
 /// Returns the `account_switched` event data, or the typed blocker.
-fn failover(
+async fn failover(
     home: &Path,
     id: &AgentId,
-    store: &mut Store,
+    store: &mut Persist,
     identity: &ProviderLaunchIdentity,
 ) -> std::result::Result<serde_json::Value, String> {
     let authority = &identity.authority;
@@ -1735,7 +1926,15 @@ fn failover(
             &hard,
         )
         .map_err(|_| "no_eligible_account".to_owned())?;
-        match store.allocate_next_attempt(id, &frozen, &candidates) {
+        let catalog = serde_json::to_value(&frozen).map_err(|error| error.to_string())?;
+        let allocation = store
+            .allocate_next_attempt(ops::AllocateNextAttempt {
+                execution: id.clone(),
+                catalog,
+                candidates,
+            })
+            .await;
+        match allocation {
             Ok(next) => {
                 return Ok(json!({"previous":next.released,"attempt":next.attempt_id,
                     "number":next.number,"account":next.account_id}));
@@ -1784,6 +1983,29 @@ fn inject_native_failure(
     }
     Ok(())
 }
+/// The typed continuation metadata of a history state value: the sealed history,
+/// or its bounded unavailable reason (1..512 bytes), and the typed native failure.
+fn history_metadata(state: &serde_json::Value) -> ops::ProviderHistoryMetadata {
+    let unavailable = state
+        .get("native_history_unavailable")
+        .and_then(serde_json::Value::as_str)
+        .map(|reason| {
+            let mut end = reason.len().min(512);
+            while !reason.is_char_boundary(end) {
+                end -= 1;
+            }
+            match &reason[..end] {
+                "" => "native history is unavailable".to_owned(),
+                bounded => bounded.to_owned(),
+            }
+        });
+    ops::ProviderHistoryMetadata {
+        native_history: state.get("native_history").cloned(),
+        native_history_unavailable: unavailable,
+        native_failure: state.get("native_failure").cloned(),
+    }
+}
+
 /// Seals the finished attempt's native history at its cleanup boundary, in
 /// the storage root the attempt's own environment named (`CODEX_HOME`, or
 /// `CLAUDE_CONFIG_DIR` falling back to `$HOME/.claude`). Returns the adapter
@@ -2028,6 +2250,30 @@ fn current_bindings(
         .unwrap_or_default()
 }
 
+/// Test-only: while `<home>/fixture-hold-<phase>` exists, the first durable
+/// write after the engine was spawned stays pending (it announces
+/// `fixture-held-<phase>` and waits, without blocking the executor, up to
+/// twenty seconds for `fixture-release-<phase>`). It models a held writer so a
+/// test can prove the engine keeps being observed meanwhile. Absent in
+/// production.
+#[cfg(feature = "test-fixtures")]
+async fn fixture_hold(home: &Path, phase: &str) {
+    if !home.join(format!("fixture-hold-{phase}")).exists() {
+        return;
+    }
+    let _ = std::fs::write(home.join(format!("fixture-held-{phase}")), "");
+    for _ in 0..400 {
+        if home.join(format!("fixture-release-{phase}")).exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Production build: no write is ever held.
+#[cfg(not(feature = "test-fixtures"))]
+async fn fixture_hold(_home: &Path, _phase: &str) {}
+
 /// Test-only finite barrier for the internal spawn or terminal phase. For
 /// attempt number n, an existing fixture-pause-PHASE-n marker makes the driver
 /// observe fixture-paused-PHASE-n then release fixture-resume-PHASE-n. No SQLite
@@ -2085,16 +2331,67 @@ fn injected_cleanup_error(
     }
     Ok(cleanup)
 }
-fn cancelled_before_spawn(id: &AgentId, store: &mut Store) -> Result<()> {
+/// Terminal outcome for a cancel observed before any native spawn.
+async fn cancelled_before_spawn(id: &AgentId, store: &mut Persist) -> Result<()> {
     let mut outcome = Outcome::failure("cancelled_before_spawn");
     outcome.status = Status::Cancelled;
-    store.finish(id, &outcome, None, None)?;
-    commands::complete_terminal(store, id)
+    store.finish(id, &outcome, None, None).await?;
+    commands::complete_terminal_persisted(store, id).await
+}
+
+/// Seals the frozen identity of a `starting` execution with its runtime home and
+/// snapshot digests (a revision compare-and-swap patch; every other frozen
+/// identity byte, including legacy identities of any size, stays untouched).
+async fn seal_identity(
+    store: &mut Persist,
+    id: &AgentId,
+    runtime_home: &Path,
+    snapshot_sha256: &str,
+    assets_sha256: Option<&str>,
+    new_revision: &str,
+) -> Result<()> {
+    let expected: Option<String> = store.conn.query_row(
+        "SELECT config_revision FROM agents WHERE id=?",
+        [id.as_str()],
+        |row| row.get(0),
+    )?;
+    let expected = expected.ok_or_else(|| invalid("execution has no recorded config revision"))?;
+    store
+        .update_identity(
+            id,
+            &expected,
+            new_revision,
+            &runtime_home.to_string_lossy(),
+            snapshot_sha256,
+            assets_sha256,
+        )
+        .await
+}
+
+/// [`relocate_retained_home_on`] over a raw store held under the caller's
+/// offline authority.
+pub fn relocate_retained_home(
+    store: &mut Store,
+    app_home: &Path,
+    agent: &AgentId,
+) -> Result<Relocation> {
+    crate::runtime_storage::ready(relocate_retained_home_on(store, app_home, agent))
+}
+
+/// [`consolidate_retained_native_on`] over a raw store held under the caller's
+/// offline authority.
+pub fn consolidate_retained_native(
+    store: &mut Store,
+    app_home: &Path,
+    agent: &AgentId,
+) -> std::result::Result<serde_json::Value, String> {
+    crate::runtime_storage::ready(consolidate_retained_native_on(store, app_home, agent))
 }
 
 #[cfg(test)]
+/// Closed-diagnostic and failed-result tests (private constructors only).
 mod tests {
-    use super::{AgentId, Status, Store, execution_error_metadata, failed_execution};
+    use super::{Status, execution_error_metadata, failed_result};
 
     /// Safe execution causes contain only closed labels and numeric codes.
     /// A failed diagnostic insertion cannot erase the original failed outcome.
@@ -2113,15 +2410,11 @@ mod tests {
             Error::Runtime("SOURCE_SECRET".into()),
             Error::Json(serde_json::from_str::<serde_json::Value>("{SOURCE_SECRET").unwrap_err()),
         ];
-        let home = tempfile::tempdir().unwrap();
-        Store::initialize(home.path()).unwrap();
-        let store = Store::open(home.path()).unwrap();
-        let id: AgentId = "ag-20260101-000000-0123456789".parse().unwrap();
         for error in &errors {
             let data = execution_error_metadata(error);
             assert!(data.to_string().len() < 4096);
             assert!(!data.to_string().contains("SOURCE_SECRET"));
-            let result = failed_execution(&store, &id, error);
+            let result = failed_result(error);
             assert_eq!(result.outcome.status, Status::Failed);
             assert!(result.answer.is_none());
             assert!(
@@ -2166,10 +2459,7 @@ mod tests {
             assert_eq!(data["sqlite_extended_code"], 5);
             assert!(!data.to_string().contains("SOURCE_SECRET"));
             assert!(!error.public().message.contains("SOURCE_SECRET"));
-            let home = tempfile::tempdir().unwrap();
-            let store = Store::initialize(home.path()).unwrap();
-            let id: AgentId = "ag-20260101-000000-0123456789".parse().unwrap();
-            let result = failed_execution(&store, &id, &error);
+            let result = failed_result(&error);
             assert_eq!(
                 result.outcome.failure_kind.as_deref(),
                 Some("runtime_ownership_checkpoint_failed")
@@ -2185,472 +2475,43 @@ mod tests {
         }
     }
 
-    /// A real held WAL writer is retried within the unchanged ordinary allowance,
-    /// then committed once. An expired synchronous busy sequence refuses rather
-    /// than extending its clock; these synthetic databases contain no native job.
+    /// The closed writer phase and the additive `writer_apply` operation label
+    /// survive into the closed diagnostic next to the ownership stage, together
+    /// with the SQLite numeric codes, wait and attempt counts and no source text.
     #[test]
-    fn journal_busy_waits_for_a_real_writer_and_refuses_expired_sequences() {
-        let home = tempfile::tempdir().unwrap();
-        let store = Store::initialize(home.path()).unwrap();
-        store.conn.busy_handler(Some(super::journal_busy)).unwrap();
-        let (ready, waiting) = std::sync::mpsc::sync_channel(0);
-        let path = home.path().to_path_buf();
-        let held = std::thread::spawn(move || {
-            let lock = Store::open(&path).unwrap();
-            lock.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-            ready.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(120));
-            lock.conn.execute_batch("ROLLBACK").unwrap();
-        });
-        waiting
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap();
-        store
-            .conn
-            .execute_batch("CREATE TABLE busy_fixture(value INTEGER)")
-            .unwrap();
-        held.join().unwrap();
-        super::JOURNAL_BUSY_STARTED.with(|at| {
-            at.set(Some(
-                std::time::Instant::now() - agent_run_store::BUSY_TIMEOUT,
-            ))
-        });
-        assert!(
-            !super::journal_busy(1),
-            "expired write allowance must preserve SQLite refusal"
-        );
-    }
-
-    /// A real held SQLite writer cannot consume the default multi-second wait
-    /// for each ownership snapshot. Inert evidence is never signalled; after
-    /// release a permanent missing-owner refusal is returned without retrying.
-    #[test]
-    fn ownership_writer_bounds_contention_and_keeps_permanent_refusal() {
-        let home = tempfile::tempdir().unwrap();
-        let lock = Store::initialize(home.path()).unwrap();
-        let id = "ag-20260101-000000-0000000098";
-        lock.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision) VALUES (?,'mock','fixture','review','t','t','/tmp','{}','starting',1,'cfg')",[id]).unwrap();
-        let attempt = format!("{id}:1");
-        lock.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES (?,?,1,'starting','{}',1,1)",rusqlite::params![attempt,id]).unwrap();
-        let mut write = super::ownership_writer(home.path(), attempt).unwrap();
-        let root = agent_run_platform::process::Identity {
-            pid: 10,
-            ppid: 2,
-            group: 10,
-            birth: 123.0,
-            token: "fixture-root".into(),
-            zombie: false,
-        };
-        let snapshot = agent_run_platform::process::OwnershipSnapshot {
-            leader: root.clone(),
-            members: vec![root],
-            descendants_observed: true,
-        };
-        write(&snapshot).unwrap();
-        lock.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-        let before = std::time::Instant::now();
-        let error = write(&snapshot).unwrap_err();
-        assert!(
-            before.elapsed() < std::time::Duration::from_secs(1),
-            "ownership write exceeded its bounded contention allowance"
-        );
-        assert!(error.retryable_ownership_acquire());
-        lock.conn.execute_batch("ROLLBACK").unwrap();
-        let mut missing = super::ownership_writer(home.path(), "missing-attempt".into()).unwrap();
-        assert!(matches!(missing(&snapshot), Err(Error::Validation(_))));
-    }
-
-    /// An already-expired ownership statement stops immediately; clearing its
-    /// synchronous override restores the ordinary journal allowance on this thread.
-    #[test]
-    fn ownership_busy_deadline_does_not_leak_into_journal() {
-        super::OWNERSHIP_BUSY_UNTIL.with(|deadline| {
-            deadline.set(Some(
-                std::time::Instant::now() - std::time::Duration::from_millis(1),
-            ));
-        });
-        assert!(!super::journal_busy(0));
-        super::OWNERSHIP_BUSY_UNTIL.with(|deadline| deadline.set(None));
-        assert!(super::journal_busy(0));
-        super::JOURNAL_BUSY_STARTED.with(|started| started.set(None));
-    }
-
-    /// Initial required ownership may wait beyond one control tick before any
-    /// native task is released. After the root is durable, busy stream snapshots
-    /// retain the short control budget; neither stage signals these inert IDs.
-    #[test]
-    fn initial_root_waits_for_writer_and_stream_checkpoints_stay_short() {
-        let home = tempfile::tempdir().unwrap();
-        let store = Store::initialize(home.path()).unwrap();
-        let id = "ag-20260101-000000-0000000099";
-        store.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision) VALUES (?,'mock','fixture','review','t','t','/tmp','{}','starting',1,'cfg')",[id]).unwrap();
-        let attempt = format!("{id}:1");
-        store.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES (?,?,1,'starting','{}',1,1)",rusqlite::params![attempt,id]).unwrap();
-        let mut write = super::ownership_writer(home.path(), attempt.clone()).unwrap();
-        let (ready, waiting) = std::sync::mpsc::sync_channel(0);
-        let path = home.path().to_path_buf();
-        let held = std::thread::spawn(move || {
-            let lock = Store::open(&path).unwrap();
-            lock.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-            ready.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(1100));
-            lock.conn.execute_batch("ROLLBACK").unwrap();
-        });
-        waiting
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap();
-        let root = agent_run_platform::process::Identity {
-            pid: 10,
-            ppid: 2,
-            group: 10,
-            birth: 123.0,
-            token: "fixture-root".into(),
-            zombie: false,
-        };
-        let snapshot = agent_run_platform::process::OwnershipSnapshot {
-            leader: root.clone(),
-            members: vec![root],
-            descendants_observed: true,
-        };
-        let result = write(&snapshot);
-        held.join().unwrap();
-        result
-            .expect("required initial persistence survives contention longer than a control tick");
-        assert!(
-            store
-                .remembered_processes("attempt", &attempt)
-                .unwrap()
-                .is_some()
-        );
-        store.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-        let before = std::time::Instant::now();
-        assert!(write(&snapshot).unwrap_err().retryable_ownership_acquire());
-        assert!(
-            before.elapsed() < std::time::Duration::from_millis(400),
-            "stream checkpoint exceeded its short control allowance"
-        );
-        store.conn.execute_batch("ROLLBACK").unwrap();
-    }
-
-    /// A real, finite synthetic shell adds a child while another connection owns
-    /// the WAL writer for 450ms. No model/tool is replayed: the same next frame
-    /// must wait for mandatory ownership and then expose one native result.
-    #[tokio::test]
-    async fn streaming_snapshot_survives_transient_writer_without_native_replay() {
-        use agent_run_adapters::{
-            LaunchPlan,
-            io::{Event, Process},
-        };
-        let home = tempfile::tempdir().unwrap();
-        let store = Store::initialize(home.path()).unwrap();
-        let id = "ag-20260101-000000-0000000097";
-        store.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision) VALUES (?,'mock','fixture','review','t','t','/tmp','{}','starting',1,'cfg')",[id]).unwrap();
-        let attempt = format!("{id}:1");
-        store.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES (?,?,1,'running','{}',1,1)",rusqlite::params![attempt,id]).unwrap();
-        let plan = LaunchPlan {
-            binary: "/bin/sh".into(),
-            args: vec!["-c".into(), r#"read launch; /bin/sleep 2 & child=$!; printf '%s' "$child" > child.pid; printf '%s
-' '{"type":"result","session_id":"synthetic","result":"ONE_NATIVE_RESULT"}'; wait "$child""#.into()],
-            cwd: home.path().into(), environment: Default::default(), initial_input: None,
-        };
-        let mut process = Process::spawn(&plan).unwrap();
-        process
-            .observe_ownership_with_retry(
-                super::ownership_writer(home.path(), attempt.clone()).unwrap(),
-                agent_run_store::BUSY_TIMEOUT,
-            )
-            .unwrap();
-        process.text("launch\n").await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while !home.path().join("child.pid").exists() {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-        process.owner.refresh();
-        assert!(process.owner.snapshot().unwrap().members.len() >= 2);
-        let (ready, waiting) = std::sync::mpsc::sync_channel(0);
-        let path = home.path().to_path_buf();
-        let held = std::thread::spawn(move || {
-            let lock = Store::open(&path).unwrap();
-            lock.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-            ready.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(450));
-            lock.conn.execute_batch("ROLLBACK").unwrap();
-        });
-        waiting
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap();
-        let event = process.next().await;
-        let cleanup = process
-            .owner
-            .cleanup(std::time::Duration::from_secs(2))
-            .await
-            .unwrap();
-        process.reap().await;
-        held.join().unwrap();
-        assert!(cleanup.confirmed && cleanup.group_gone && cleanup.descendants_gone == Some(true));
-        if let Event::OwnershipFailure(ref error) = event {
-            eprintln!(
-                "pre-fix checkpoint diagnostic: {}",
-                super::execution_error_metadata(error)
-            );
+    fn writer_phase_and_operation_survive_into_the_diagnostic() {
+        use agent_run_domain::{error::PersistenceOperation, storage::RejectStage};
+        for phase in [
+            RejectStage::Acquire,
+            RejectStage::Statement,
+            RejectStage::Commit,
+        ] {
+            let error = Error::Persistence {
+                operation: PersistenceOperation::WriterApply,
+                elapsed_ms: 17,
+                attempts: 3,
+                phase: Some(phase),
+                source: Box::new(Error::Sql(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(5),
+                    Some("SOURCE_SECRET".into()),
+                ))),
+            };
+            let data = execution_error_metadata(&error);
+            assert_eq!(data["operation"], "writer_apply");
+            assert_eq!(data["phase"], serde_json::json!(phase));
+            assert_eq!(data["wait_ms"], 17);
+            assert_eq!(data["attempts"], 3);
+            assert_eq!(data["sqlite_extended_code"], 5);
+            assert!(!data.to_string().contains("SOURCE_SECRET"));
+            // Never a retry-eligible ownership acquire, whatever the phase.
+            assert!(!error.retryable_ownership_acquire());
         }
-        assert!(
-            matches!(event,Event::Json(ref value) if value["result"]=="ONE_NATIVE_RESULT"),
-            "transient WAL writer aborted the native stream: {event:?}"
+        let legacy = Error::persistence(
+            PersistenceOperation::TerminalCommit,
+            std::time::Duration::from_millis(2),
+            Error::Runtime("x".into()),
         );
-        let persisted = store
-            .remembered_processes("attempt", &attempt)
-            .unwrap()
-            .unwrap();
-        assert!(persisted.snapshot().unwrap().members.len() >= 2);
-    }
-
-    /// A real, finite synthetic shell adds a child while another connection owns
-    /// the WAL writer beyond the finite allowance. No model/tool is replayed: the same next frame
-    /// must wait for mandatory ownership and then expose one native result.
-    #[tokio::test]
-    async fn streaming_snapshot_exhaustion_retains_cleanup_and_closed_diagnostic() {
-        use agent_run_adapters::{
-            LaunchPlan,
-            io::{Event, Process},
-        };
-        let home = tempfile::tempdir().unwrap();
-        let store = Store::initialize(home.path()).unwrap();
-        let id = "ag-20260101-000000-0000000097";
-        store.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision) VALUES (?,'mock','fixture','review','t','t','/tmp','{}','starting',1,'cfg')",[id]).unwrap();
-        let attempt = format!("{id}:1");
-        store.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES (?,?,1,'running','{}',1,1)",rusqlite::params![attempt,id]).unwrap();
-        let plan = LaunchPlan {
-            binary: "/bin/sh".into(),
-            args: vec!["-c".into(), r#"read launch; /bin/sleep 15 & child=$!; printf '%s' "$child" > child.pid; printf '%s
-' '{"type":"result","session_id":"synthetic","result":"ONE_NATIVE_RESULT"}'; wait "$child""#.into()],
-            cwd: home.path().into(), environment: Default::default(), initial_input: None,
-        };
-        let mut process = Process::spawn(&plan).unwrap();
-        process
-            .observe_ownership_with_retry(
-                super::ownership_writer(home.path(), attempt.clone()).unwrap(),
-                std::time::Duration::from_millis(600),
-            )
-            .unwrap();
-        process.text("launch\n").await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while !home.path().join("child.pid").exists() {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-        process.owner.refresh();
-        assert!(process.owner.snapshot().unwrap().members.len() >= 2);
-        let (ready, waiting) = std::sync::mpsc::sync_channel(0);
-        let path = home.path().to_path_buf();
-        let held = std::thread::spawn(move || {
-            let lock = Store::open(&path).unwrap();
-            lock.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-            ready.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(1800));
-            lock.conn.execute_batch("ROLLBACK").unwrap();
-        });
-        waiting
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap();
-        // Cancelling the read cannot renew its ownership allowance. Resume
-        // after expiry while the writer still holds the lock: no native frame
-        // or new BEGIN may pass the pending mandatory checkpoint.
-        let first =
-            tokio::time::timeout(std::time::Duration::from_millis(210), process.next()).await;
-        assert!(
-            first.is_err(),
-            "fixture did not cancel a pending persistence read"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
-        let event = process.next().await;
-        let cleanup = process
-            .owner
-            .cleanup(std::time::Duration::from_secs(2))
-            .await
-            .unwrap();
-        let directory = home.path().join("agents").join(id);
-        agent_run_platform::fs::private_dir(&directory).unwrap();
-        let failed = Err(Error::Runtime("synthetic_failure".into()));
-        super::retain_cleanup_evidence(
-            &directory,
-            &attempt,
-            &process,
-            &Ok(cleanup.clone()),
-            &failed,
-            None,
-        )
-        .unwrap();
-        let receipt: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(directory.join(format!("recovery.{attempt}.json"))).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(receipt["cleanup"]["confirmed"], true);
-        assert_eq!(
-            receipt["ownership"]["members"].as_array().unwrap().len(),
-            process.owner.snapshot().unwrap().members.len()
-        );
-        assert_eq!(receipt["terminal_commit"], "not_proven_by_receipt");
-        // Optional candidate I/O cannot discard the observed cleanup proof.
-        let refused_dir = directory.join("candidate-refusal");
-        agent_run_platform::fs::private_dir(&refused_dir).unwrap();
-        let occupied = refused_dir.join(format!("recovery.{attempt}.answer.md"));
-        std::fs::create_dir(&occupied).unwrap();
-        let victim = occupied.join("victim");
-        std::fs::write(&victim, "unchanged").unwrap();
-        let candidate = Ok(agent_run_adapters::EngineResult {
-            outcome: agent_run_domain::domain::Outcome::failure("fixture_incomplete"),
-            answer: Some("synthetic candidate".into()),
-            usage: None,
-            native_failure: None,
-        });
-        assert!(
-            super::retain_cleanup_evidence(
-                &refused_dir,
-                &attempt,
-                &process,
-                &Ok(cleanup.clone()),
-                &candidate,
-                None
-            )
-            .is_err()
-        );
-        let retained: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(refused_dir.join(format!("recovery.{attempt}.json"))).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(retained["cleanup"]["confirmed"], true);
-        assert!(retained["candidate"].is_null());
-        assert!(retained["candidate_diagnostic"]["class"].is_string());
-        assert_eq!(std::fs::read_to_string(victim).unwrap(), "unchanged");
-
-        process.reap().await;
-        held.join().unwrap();
-        assert!(cleanup.confirmed && cleanup.group_gone && cleanup.descendants_gone == Some(true));
-        let Event::OwnershipFailure(error) = event else {
-            panic!("long lock released a native frame without required ownership");
-        };
-        let data = super::execution_error_metadata(&error);
-        assert_eq!(data["operation"], "ownership_acquire");
-        assert_eq!(data["stage"], "streaming");
-        assert_eq!(data["sqlite_extended_code"], 5);
-        assert!(data["wait_ms"].as_u64().unwrap() >= 600);
-        assert!(data["wait_ms"].as_u64().unwrap() < 1000);
-        assert!(data["attempts"].as_u64().unwrap() >= 4);
-        assert!(store.conn.is_autocommit());
-        assert_eq!(
-            super::failed_execution(&store, &id.parse().unwrap(), &error)
-                .outcome
-                .status,
-            Status::Failed
-        );
-        assert_eq!(
-            store
-                .conn
-                .query_row(
-                    "SELECT count(*) FROM process_members WHERE owner_id=?",
-                    [&attempt],
-                    |row| row.get::<_, u64>(0)
-                )
-                .unwrap(),
-            1
-        );
-    }
-
-    /// Pending persistence still observes primary exit and preserves the existing
-    /// two-second descendant escalation. This finite shell tree ignores TERM;
-    /// a four-second writer outage must not keep those captured processes alive.
-    #[tokio::test]
-    async fn busy_ownership_wait_preserves_primary_exit_escalation() {
-        use agent_run_adapters::{LaunchPlan, io::Process};
-        let home = tempfile::tempdir().unwrap();
-        let store = Store::initialize(home.path()).unwrap();
-        let id = "ag-20260101-000000-0000000096";
-        store.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision) VALUES (?,'mock','fixture','review','t','t','/tmp','{}','starting',1,'cfg')",[id]).unwrap();
-        let attempt = format!("{id}:1");
-        store.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES (?,?,1,'running','{}',1,1)",rusqlite::params![attempt,id]).unwrap();
-        let plan = LaunchPlan { binary: "/bin/sh".into(),
-            args: vec!["-c".into(), r#"read launch; /bin/sh -c 'trap "" TERM; printf ready > ignoring; /bin/sleep 8' & printf '%s' "$!" > child.pid; read exit"#.into()],
-            cwd: home.path().into(), environment: Default::default(), initial_input: None };
-        let mut process = Process::spawn(&plan).unwrap();
-        process
-            .observe_ownership_with_retry(
-                super::ownership_writer(home.path(), attempt).unwrap(),
-                agent_run_store::BUSY_TIMEOUT,
-            )
-            .unwrap();
-        process.text("launch\n").await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while !home.path().join("ignoring").exists() {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        process.owner.refresh();
-        let pid: i32 = std::fs::read_to_string(home.path().join("child.pid"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        let identity = process
-            .owner
-            .snapshot()
-            .unwrap()
-            .members
-            .into_iter()
-            .find(|member| member.pid == pid)
-            .unwrap();
-        let (ready, waiting) = std::sync::mpsc::sync_channel(0);
-        let path = home.path().to_path_buf();
-        let held = std::thread::spawn(move || {
-            let lock = Store::open(&path).unwrap();
-            lock.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-            ready.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_secs(4));
-            lock.conn.execute_batch("ROLLBACK").unwrap();
-        });
-        waiting
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap();
-        process.text("exit\n").await.unwrap();
-        let gone = tokio::spawn(async move {
-            tokio::time::timeout(std::time::Duration::from_millis(3300), async {
-                loop {
-                    if matches!(
-                        agent_run_platform::process::observe(
-                            Some(identity.pid),
-                            Some(&identity.token),
-                            Some(identity.birth)
-                        ),
-                        agent_run_platform::process::ProcessState::Dead
-                            | agent_run_platform::process::ProcessState::Reused
-                    ) {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-            })
-            .await
-        });
-        let _ = process.next().await;
-        let cleanup = process
-            .owner
-            .cleanup(std::time::Duration::from_secs(2))
-            .await
-            .unwrap();
-        process.reap().await;
-        held.join().unwrap();
-        assert!(
-            gone.await.unwrap().is_ok(),
-            "database wait delayed descendant escalation"
-        );
-        assert!(cleanup.confirmed);
+        assert!(execution_error_metadata(&legacy)["phase"].is_null());
     }
 
     /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_blank_startup_error_uses_exception_type_in_ready_failure`.

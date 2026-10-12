@@ -10,12 +10,8 @@ use crate::{
     state::Store,
 };
 use agent_run_config::{config::Delivery, provider_config::ProviderConfig};
-use agent_run_domain::{
-    domain::OrchestratorRef,
-    worker::{WorkerMessageKind, WorkerNotice},
-};
+use agent_run_domain::worker::WorkerNotice;
 use fs2::FileExt;
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{fs::File, path::Path};
@@ -432,17 +428,6 @@ fn dispatcher_lock(home: &Path) -> Result<Option<DispatcherLock>> {
     }
 }
 
-/// Expires terminal deliveries that were never bound during the documented binding window.
-fn expire_unbound(tx: &rusqlite::Transaction<'_>, time: f64) -> Result<()> {
-    tx.execute(
-        "UPDATE deliveries SET state='expired',lease_owner=NULL,lease_until=NULL,next_attempt_at=NULL \
-         WHERE state='waiting_binding' AND id NOT IN (SELECT completion_delivery_id FROM pools WHERE completion_delivery_id IS NOT NULL) AND agent_id IN (SELECT id FROM agents WHERE status IN ('succeeded','failed','timed_out','cancelled','lost')) \
-         AND terminal_event_seq IN (SELECT seq FROM events WHERE at<=?)",
-        [time - 3600.0],
-    )?;
-    Ok(())
-}
-
 /// Loads the delivery policy from either supported config schema.
 ///
 /// Called only before a delivery is leased: a missing or malformed config then
@@ -465,242 +450,95 @@ fn delivery_policy(home: &Path) -> Result<Delivery> {
 /// Claims one due delivery and returns its canonical adapter name when a known
 /// legacy transport alias was persisted. Unknown transports remain unchanged so
 /// dispatch records the safe `unsupported_transport` classifier.
-fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
-    let mut store = Store::open(home)?;
-    let tx = store
-        .conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let time = now();
-    expire_unbound(&tx, time)?;
-    let found = tx
-        .query_row(
-            "SELECT id,agent_id,orchestrator_session_id,attempts FROM deliveries \
-         WHERE (state IN ('pending','retry_wait') AND COALESCE(next_attempt_at,0)<=?) \
-            OR (state='sending' AND lease_until<=?) \
-         ORDER BY COALESCE(next_attempt_at,lease_until,0),id LIMIT 1",
-            params![time, time],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, u32>(3)?,
-                ))
-            },
-        )
-        .optional()?;
-    let Some((delivery_id, agent_id, session_id, attempts)) = found else {
-        tx.commit()?;
+async fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
+    let at = now();
+    if !pending(home, at).await? {
         return Ok(None);
-    };
-    let (transport, session): (String, String) = tx.query_row(
-        "SELECT transport,external_session_id FROM orchestrator_sessions WHERE id=?",
-        [session_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    let transport = match OrchestratorRef::canonical_transport_name(&transport) {
-        Ok(canonical) => canonical.to_owned(),
-        Err(_) => transport,
-    };
+    }
+    // Configuration and relay filesystem inspection precede queue/transaction.
     let policy = delivery_policy(home)?;
-    let is_attention:bool=tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM events e JOIN deliveries d ON d.terminal_event_seq=e.seq WHERE d.id=? AND e.kind='pool_join_needs_action')",
-        [&delivery_id],|r|r.get(0))?;
-    if transport == "codex_queue" && is_attention && !relay::has_attention_peer(home) {
-        // Known unsupported capability is not a send attempt. Defer within the
-        // existing notice deadline/backoff, advancing the queue so others run.
-        tx.execute("UPDATE deliveries SET state='retry_wait',next_attempt_at=?,last_error='relay_v5_required' WHERE id=?",
-            params![time+policy.retry_base_seconds.max(1.0).min(policy.retry_cap_seconds),delivery_id])?;
-        tx.commit()?;
+    let attention_peer = relay::has_attention_peer(home);
+    let claimed = crate::persist::operator_producer(home)
+        .call(
+            agent_run_store::ops::ClaimDelivery {
+                owner: owner.to_owned(),
+                at,
+                attention_peer,
+                policy: policy_spec(&policy),
+            },
+            crate::broker_writer::BROKER_BUDGET,
+        )
+        .await?;
+    let Some(mut claimed) = claimed else {
         return Ok(None);
-    }
-    if transport == "claude_uds" && attempts > 0 {
-        // Evidence for exactly the current attempt count decides. Missing
-        // evidence (a dispatcher that crashed around the write, e.g. an
-        // expired `sending` lease) is an unknown outcome and is treated as
-        // possibly sent; only explicit known-unsent evidence stays retryable.
-        let last: Option<String> = tx
-            .query_row(
-                "SELECT json_extract(evidence_json,'$.classifier') FROM delivery_attempt_evidence \
-                 WHERE delivery_id=? AND attempt=?",
-                params![delivery_id, attempts],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-        let classifier = match last.as_deref() {
-            Some(known @ ("uds_unconfirmed" | "uds_ambiguous")) => Some(known),
-            None => Some("uds_unconfirmed"),
-            Some(_) => None,
-        };
-        if let Some(classifier) = classifier {
-            tx.execute(
-                "UPDATE deliveries SET state='failed',lease_owner=NULL,lease_until=NULL,\
-                 next_attempt_at=NULL,last_error=?,ambiguous_result=1 WHERE id=?",
-                params![classifier, delivery_id],
-            )?;
-            tx.commit()?;
-            return Ok(None);
-        }
-    }
-    let worker: Option<(String, String)> = tx
-        .query_row(
-            "SELECT kind,message FROM worker_notifications WHERE delivery_id=?",
-            [&delivery_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let (runtime, model, request_json, status, kind): (
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-    ) = tx.query_row(
-        "SELECT runtime,model,request_json,status,failure_kind FROM agents WHERE id=?",
-        [&agent_id],
-        |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        },
-    )?;
-    let bounded =
-        |value: String| (!value.trim().is_empty() && value.chars().count() <= 128).then_some(value);
-    let effort = serde_json::from_str::<Value>(&request_json)
-        .ok()
-        .and_then(|value| value.get("effort")?.as_str().map(str::to_owned))
-        .and_then(bounded);
-    let root: String = tx.query_row(
-        "SELECT CASE WHEN root_agent_id='' THEN id ELSE root_agent_id END FROM agents WHERE id=?",
-        [&agent_id],
-        |row| row.get(0),
-    )?;
-    // A pool's one common completion is anchored on a member's row but is not
-    // that member's lifecycle notice: its frozen text lives in the immutable
-    // completion event and names no run, attempt or session.
-    let pool: Option<(String, String)> = tx
-        .query_row(
-            "SELECT p.id,json_extract(e.data_json,'$.notice') FROM pools p \
-             JOIN deliveries d ON d.id=p.completion_delivery_id \
-             JOIN events e ON e.seq=d.terminal_event_seq WHERE p.completion_delivery_id=?",
-            [&delivery_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let attention:Option<(String,String)>=tx.query_row(
-        "SELECT json_extract(e.data_json,'$.pool_id'),json_extract(e.data_json,'$.notice') FROM deliveries d JOIN events e ON e.seq=d.terminal_event_seq WHERE d.id=? AND e.kind='pool_join_needs_action'",
-        [&delivery_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-    // A malformed stored payload must end only its own row, never poison the outbox.
-    let payload = (|| -> Result<Payload> {
-        Ok(if let Some((pool_id, message)) = attention {
-            let notice = agent_run_domain::pool::PoolNotice {
-                notification_id: delivery_id.clone(),
-                pool_id: pool_id.parse()?,
-                message,
-            };
-            notice.validate()?;
-            Payload::PoolAttention(notice)
-        } else if let Some((pool_id, message)) = pool {
-            let notice = agent_run_domain::pool::PoolNotice {
-                notification_id: delivery_id.clone(),
-                pool_id: pool_id.parse()?,
-                message,
-            };
-            notice.validate()?;
-            Payload::Pool(notice)
-        } else if let Some((kind, message)) = worker {
-            let kind = match kind.as_str() {
-                "notice" => WorkerMessageKind::Notice,
-                "risk" => WorkerMessageKind::Risk,
-                "question" => WorkerMessageKind::Question,
-                "blocker" => WorkerMessageKind::Blocker,
-                _ => return Err(invalid("invalid stored worker kind")),
-            };
-            // A pool member's report carries its immutable linked pool entry: the
-            // orchestrator then sees the same stamped sender, direction and
-            // stable identity as peers, from the one shared renderer. The stored
-            // worker message stays raw for idempotent replay.
-            let message = match tx
-                .query_row(
-                    "SELECT seq,author_kind,author_agent_id,author_name,author_role,direction,kind,\
-                 severity,proposal_seq,roster_revision,decision,body \
-                 FROM pool_entries WHERE delivery_id=?",
-                    [&delivery_id],
-                    agent_run_store::pool_log::entry_view,
-                )
-                .optional()?
-            {
-                Some(entry) => pool_decorated(&agent_run_domain::pool::render_entry(&entry)?),
-                None => message,
-            };
-            let notice = WorkerNotice {
-                notification_id: delivery_id.clone(),
-                agent_id: root.parse()?,
-                run_id: agent_id.parse()?,
-                kind,
-                message,
-            };
-            notice.validate()?;
-            Payload::Worker(notice)
-        } else {
-            let notice = Notice {
-                notification_id: delivery_id.clone(),
-                agent_id: root.parse()?,
-                run_id: Some(agent_id.parse()?),
-                status: status.parse()?,
-                runtime: bounded(runtime),
-                model: bounded(model),
-                effort,
-                failure_kind: if matches!(status.as_str(), "failed" | "timed_out" | "lost") {
-                    kind.and_then(bounded)
-                } else {
-                    None
-                },
-            };
-            notice.validate()?;
-            Payload::Completion(notice)
-        })
-    })();
-    let payload = match payload {
-        Ok(payload) => payload,
-        Err(agent_run_domain::Error::Validation(_) | agent_run_domain::Error::Integrity(_)) => {
-            tx.execute(
-                "UPDATE deliveries SET state='failed',lease_owner=NULL,lease_until=NULL,\
-                 next_attempt_at=NULL,last_error='invalid_payload' WHERE id=?",
-                [&delivery_id],
-            )?;
-            tx.commit()?;
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
     };
-    let attempt = attempts
-        .checked_add(1)
-        .ok_or_else(|| invalid("delivery attempt counter overflow"))?;
-    let updated = tx.execute(
-        "UPDATE deliveries SET state='sending',attempts=?,lease_owner=?,lease_until=?,next_attempt_at=NULL \
-         WHERE id=? AND ((state IN ('pending','retry_wait') AND COALESCE(next_attempt_at,0)<=?) OR (state='sending' AND lease_until<=?))",
-        params![attempt, owner, time + LEASE_SECONDS, delivery_id, time, time],
-    )?;
-    if updated != 1 {
-        tx.commit()?;
-        return Ok(None);
-    }
-    tx.commit()?;
+    let payload = &mut claimed["payload"];
+    let notice = payload["notice"].take();
+    let payload = match payload["kind"].as_str() {
+        Some("completion") => Payload::Completion(serde_json::from_value(notice)?),
+        Some("worker") => {
+            let mut notice: WorkerNotice = serde_json::from_value(notice)?;
+            if let Some(entry) = claimed["payload"]["pool_entry"].as_str() {
+                notice.message = pool_decorated(entry);
+            }
+            Payload::Worker(notice)
+        }
+        Some("pool") => Payload::Pool(pool_notice(&notice)?),
+        Some("pool_attention") => Payload::PoolAttention(pool_notice(&notice)?),
+        _ => return Err(invalid("invalid claimed delivery payload")),
+    };
     Ok(Some(Claim {
-        delivery_id,
-        lease_owner: owner.into(),
-        attempt,
-        transport,
-        session,
+        delivery_id: required(&claimed, "delivery_id")?,
+        lease_owner: required(&claimed, "lease_owner")?,
+        attempt: claimed["attempt"]
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| invalid("invalid claimed attempt"))?,
+        transport: required(&claimed, "transport")?,
+        session: required(&claimed, "session")?,
         payload,
         policy,
     }))
+}
+
+/// Read-only schedule hint before a filesystem lease; the writer rechecks eligibility.
+/// An empty hint defers any newly arriving notice until the next dispatch tick.
+async fn pending(home: &Path, at: f64) -> Result<bool> {
+    let reader_home = home.to_owned();
+    tokio::task::spawn_blocking(move || {
+        agent_run_store::writer::StoreReader::open(&reader_home)?.delivery_pending(at)
+    })
+    .await
+    .map_err(|_| invalid("delivery preflight task failed"))?
+}
+
+/// Decode one trusted string field from the bounded writer claim result.
+fn required(value: &Value, field: &str) -> Result<String> {
+    value[field]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| invalid("invalid claimed delivery field"))
+}
+
+/// Decode and validate the package-owned pool notice fields, excluding other JSON.
+fn pool_notice(value: &Value) -> Result<agent_run_domain::pool::PoolNotice> {
+    let notice = agent_run_domain::pool::PoolNotice {
+        notification_id: required(value, "notification_id")?,
+        pool_id: required(value, "pool_id")?.parse()?,
+        message: required(value, "message")?,
+    };
+    notice.validate()?;
+    Ok(notice)
+}
+
+/// Copy validated delivery policy for SQL; never load files in a transaction.
+fn policy_spec(policy: &Delivery) -> agent_run_store::ops::DeliveryPolicySpec {
+    agent_run_store::ops::DeliveryPolicySpec {
+        retry_base_seconds: policy.retry_base_seconds,
+        retry_cap_seconds: policy.retry_cap_seconds,
+        max_attempts: policy.max_attempts,
+        lease_seconds: LEASE_SECONDS,
+    }
 }
 
 /// Persists one owned result and its immutable queue evidence in the same
@@ -718,59 +556,33 @@ fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
 /// here, so a config change after sending cannot discard an acknowledgement.
 /// Evidence is committed only while this attempt still owns its live lease;
 /// cancellation or ownership loss still takes precedence.
-fn complete(home: &Path, claim: &Claim, evidence: &Evidence) -> Result<()> {
-    let delivery = &claim.policy;
-    let mut store = Store::open(home)?;
-    let tx = store
-        .conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let time = now();
-    let owns: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM deliveries WHERE id=? AND state='sending' AND lease_owner=? AND attempts=? AND lease_until>?)",
-        params![claim.delivery_id, claim.lease_owner, claim.attempt, time], |row| row.get(0),
-    )?;
-    if !owns {
-        tx.commit()?;
-        return Ok(());
-    }
-    let accepted = evidence.accepted();
-    let ambiguous = evidence.ambiguous();
-    let exhausted = delivery.max_attempts > 0 && claim.attempt >= delivery.max_attempts;
-    let possibly_sent = claim.transport == "claude_uds"
-        && matches!(
-            evidence.classifier.as_str(),
-            "uds_unconfirmed" | "uds_ambiguous"
-        );
-    let failed =
-        !accepted && (exhausted || possibly_sent || evidence.classifier == "unsupported_transport");
-    let state = if accepted {
-        "delivered"
-    } else if failed {
-        "failed"
-    } else {
-        "retry_wait"
-    };
-    let next_attempt = if state == "retry_wait" {
-        Some(
-            time + (delivery.retry_base_seconds
-                * 2f64.powi((claim.attempt.saturating_sub(1)).min(20) as i32))
-            .min(delivery.retry_cap_seconds),
+async fn complete(home: &Path, claim: &Claim, evidence: &Evidence) -> Result<()> {
+    let recorded = matches!(claim.transport.as_str(), "codex_queue" | "claude_uds")
+        .then(|| {
+            evidence
+                .persisted()
+                .and_then(|value| serde_json::to_value(value).map_err(Into::into))
+        })
+        .transpose()?;
+    crate::persist::operator_producer(home)
+        .call(
+            agent_run_store::ops::CompleteDelivery {
+                completion: agent_run_store::ops::DeliveryCompletion {
+                    delivery_id: claim.delivery_id.clone(),
+                    owner: claim.lease_owner.clone(),
+                    attempt: claim.attempt,
+                    transport: claim.transport.clone(),
+                    accepted: evidence.accepted(),
+                    ambiguous: evidence.ambiguous(),
+                    classifier: evidence.classifier.clone(),
+                    evidence: recorded,
+                    policy: policy_spec(&claim.policy),
+                    at: now(),
+                },
+            },
+            crate::broker_writer::BROKER_BUDGET,
         )
-    } else {
-        None
-    };
-    if matches!(claim.transport.as_str(), "codex_queue" | "claude_uds") {
-        let persisted = evidence.persisted()?;
-        tx.execute(
-            "INSERT OR IGNORE INTO delivery_attempt_evidence(delivery_id,attempt,recorded_at,evidence_json) VALUES(?,?,?,?)",
-            params![claim.delivery_id, claim.attempt, time, serde_json::to_string(&persisted)?],
-        )?;
-    }
-    tx.execute(
-        "UPDATE deliveries SET state=?,lease_owner=NULL,lease_until=NULL,next_attempt_at=?,last_error=?,ambiguous_result=MAX(ambiguous_result,?) WHERE id=?",
-        params![state, next_attempt, if accepted { None } else { Some(evidence.classifier.as_str()) }, ambiguous, claim.delivery_id],
-    )?;
-    tx.commit()?;
+        .await?;
     Ok(())
 }
 
@@ -781,7 +593,7 @@ async fn dispatch_one(home: &Path) -> Result<Option<(String, bool)>> {
         std::process::id(),
         uuid::Uuid::new_v4().simple()
     );
-    let Some(claim) = claim(home, &owner)? else {
+    let Some(claim) = claim(home, &owner).await? else {
         return Ok(None);
     };
     let started = std::time::Instant::now();
@@ -813,7 +625,7 @@ async fn dispatch_one(home: &Path) -> Result<Option<(String, bool)>> {
         _ => Evidence::new("unsupported_transport", false, false),
     };
     evidence.duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-    complete(home, &claim, &evidence)?;
+    complete(home, &claim, &evidence).await?;
     let result = Store::open(home)?.conn.query_row(
         "SELECT state,ambiguous_result FROM deliveries WHERE id=?",
         [&claim.delivery_id],
@@ -824,6 +636,9 @@ async fn dispatch_one(home: &Path) -> Result<Option<(String, bool)>> {
 
 /// Claims and attempts one completion delivery without draining the backlog.
 pub async fn dispatch_once(home: &Path) -> Result<usize> {
+    if !pending(home, now()).await? {
+        return Ok(0);
+    }
     let Some(_lock) = dispatcher_lock(home)? else {
         return Ok(0);
     };
@@ -834,6 +649,9 @@ pub async fn dispatch_once(home: &Path) -> Result<usize> {
 pub async fn dispatch_with_batch(home: &Path, max_batch: usize) -> Result<DispatchResult> {
     if max_batch == 0 {
         return Err(invalid("max_batch must be at least 1"));
+    }
+    if !pending(home, now()).await? {
+        return Ok(DispatchResult::default());
     }
     let Some(_lock) = dispatcher_lock(home)? else {
         return Ok(DispatchResult {
@@ -896,7 +714,7 @@ fn pool_decorated(rendered: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{Payload, claim, dispatcher_lock};
-    use crate::{domain::now, state::Store};
+    use crate::domain::now;
     use rusqlite::params;
     use std::io::Write;
     use std::os::fd::AsRawFd;
@@ -904,10 +722,10 @@ mod tests {
     use std::process::{Command, Stdio};
 
     /// A resumed notice exposes stable identity without moving its delivery lease.
-    #[test]
-    fn resumed_notice_keeps_exact_run_and_stable_agent() {
+    #[tokio::test]
+    async fn resumed_notice_keeps_exact_run_and_stable_agent() {
         let home = tempfile::tempdir().unwrap();
-        let store = Store::initialize(home.path()).unwrap();
+        let store = agent_run_store::fixture::initialize(home.path()).unwrap();
         // Claiming captures the delivery policy, so the home needs a valid config.
         std::fs::write(home.path().join("config.toml"), "schema_version = 2\n").unwrap();
         let root = "ag-20260925-000000-0000000001";
@@ -931,7 +749,9 @@ mod tests {
                 [child],
             )
             .unwrap();
-        let claimed = claim(home.path(), "test-owner").unwrap().unwrap();
+        let writer = crate::writer_test_harness::Harness::start(home.path());
+        let _socket = writer.serve_unix(home.path());
+        let claimed = claim(home.path(), "test-owner").await.unwrap().unwrap();
         let Payload::Completion(notice) = claimed.payload else {
             panic!("expected completion")
         };

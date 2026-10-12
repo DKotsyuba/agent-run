@@ -1,7 +1,7 @@
 //! Atomic persistence of historical capacity scopes.
 //! External collection failure and account deduplication are exercised by quota_collectors.
+mod common;
 use agent_run_core::capacity;
-use agent_run_store::Store;
 
 /// Creates one valid quota slice for atomic persistence tests.
 fn slice(runtime: &str, scope: &str, remaining: f64) -> capacity::Slice {
@@ -43,13 +43,16 @@ fn slice(runtime: &str, scope: &str, remaining: f64) -> capacity::Slice {
 }
 
 /// Mirrors `tests/test_capacity_outcomes.py::CapacityOutcomeRegressionTests::test_middle_persistence_failure_keeps_neighboring_scopes_durable`
-#[test]
-fn test_middle_persistence_failure_keeps_neighboring_scopes_durable() {
+#[tokio::test]
+async fn test_middle_persistence_failure_keeps_neighboring_scopes_durable() {
     let scratch = tempfile::tempdir().expect("scratch root");
-    Store::initialize(scratch.path()).expect("capacity store initializes");
+    agent_run_store::fixture::initialize(scratch.path()).expect("capacity store initializes");
+    let writer = common::writer::Harness::start(scratch.path());
+    let _socket = writer.serve_unix(scratch.path());
     capacity::persist(scratch.path(), &slice("codex", "middle", 20.0), 1000)
+        .await
         .expect("seed middle scope");
-    let store = Store::open(scratch.path()).expect("capacity store opens");
+    let store = agent_run_store::fixture::open(scratch.path()).expect("capacity store opens");
     store
         .conn
         .execute_batch(
@@ -60,16 +63,24 @@ fn test_middle_persistence_failure_keeps_neighboring_scopes_durable() {
     drop(store);
 
     assert_eq!(
-        capacity::persist(scratch.path(), &slice("codex", "first", 10.0), 1000).unwrap(),
+        capacity::persist(scratch.path(), &slice("codex", "first", 10.0), 1000)
+            .await
+            .unwrap(),
         1
     );
-    assert!(capacity::persist(scratch.path(), &slice("codex", "middle", 25.0), 1000).is_err());
+    assert!(
+        capacity::persist(scratch.path(), &slice("codex", "middle", 25.0), 1000)
+            .await
+            .is_err()
+    );
     assert_eq!(
-        capacity::persist(scratch.path(), &slice("codex", "last", 30.0), 1000).unwrap(),
+        capacity::persist(scratch.path(), &slice("codex", "last", 30.0), 1000)
+            .await
+            .unwrap(),
         1
     );
 
-    let store = Store::open(scratch.path()).expect("capacity store reopens");
+    let store = agent_run_store::fixture::open(scratch.path()).expect("capacity store reopens");
     let mut statement = store
         .conn
         .prepare("SELECT remaining_percent FROM capacity_samples ORDER BY remaining_percent")

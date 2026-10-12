@@ -1,5 +1,10 @@
 //! Orchestration layer coordinating configuration, persistence, and engines.
+/// Unit tests reuse the same canonical-import writer harness as integration tests.
+#[cfg(test)]
+extern crate self as agent_run_core;
 pub mod agent_identity;
+/// In-process producer lanes of the resident broker.
+pub mod broker_writer;
 pub mod capacity;
 pub mod codex;
 /// Durable command result handling shared by supervisor and engine runners.
@@ -20,6 +25,8 @@ pub mod managed_services;
 pub mod native_cache;
 /// Freeze/thaw lifecycle for native Codex directory caches in retained homes.
 pub mod native_tree_cache;
+/// Persistence facade of processes other than the resident broker.
+pub mod persist;
 /// Authenticated workdir-confined report writes for restricted research.
 mod research_reports;
 /// Native cache lifecycle glue shared by the supervisor and operator surfaces.
@@ -27,11 +34,25 @@ pub mod runtime_cache;
 /// Filesystem relocation of sealed managed trees into the shared store.
 pub mod runtime_storage;
 pub mod service;
+/// Client lanes of the private writer socket.
+pub mod storage_client;
 /// Reference-aware collection of the shared managed-asset store.
 pub mod storage_gc;
+/// Binary framing of the private writer socket.
+pub mod storage_wire;
 pub mod stream;
 pub mod supervisor;
 pub mod worker_finish;
+/// The single resident writer service and its submission handle.
+pub mod writer;
+/// Connection and frame-assembly admission of the private writer socket.
+pub mod writer_limits;
+/// Server side of one writer-socket connection.
+pub mod writer_server;
+/// One shared fixture writer transport for all in-crate unit tests.
+#[cfg(test)]
+#[path = "../tests/common/writer.rs"]
+mod writer_test_harness;
 
 pub use agent_run_adapters as adapters;
 pub use agent_run_config::{config, policy, profiles};

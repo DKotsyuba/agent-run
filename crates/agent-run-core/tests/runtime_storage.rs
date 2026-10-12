@@ -5,7 +5,7 @@
 use agent_run_core::{
     adapters::materialize,
     runtime_storage::{self, StorageFault},
-    state::{Store, runtime_storage::LayoutState},
+    state::runtime_storage::LayoutState,
 };
 use agent_run_platform::{
     fs,
@@ -273,7 +273,7 @@ fn plan_install_verify_round_trip_preserves_original_bytes() {
     let root = TempDir::new().expect("fixture root");
     let sealed = seal(root.path(), "home", "a", b"payload-bytes\n");
     let app = app(root.path());
-    let mut store = Store::initialize(&app.home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app.home).expect("store");
     let scope = fs::sha256(b"coordinator-scope");
     let store_root = runtime_storage::store_root(&app.home).expect("derived store root");
     assert_eq!(
@@ -338,7 +338,7 @@ fn duplicate_install_and_recover_are_idempotent() {
     let root = TempDir::new().expect("fixture root");
     let sealed = seal(root.path(), "home", "a", b"payload-bytes\n");
     let app = app(root.path());
-    let mut store = Store::initialize(&app.home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app.home).expect("store");
     let scope = fs::sha256(b"coordinator-scope");
     let layout = runtime_storage::plan(
         &store,
@@ -373,7 +373,7 @@ fn interrupted_installs_roll_forward_through_recovery() {
         let root = TempDir::new().expect("fixture root");
         let sealed = seal(root.path(), "home", "a", b"payload-bytes\n");
         let app = app(root.path());
-        let mut store = Store::initialize(&app.home).expect("store");
+        let mut store = agent_run_store::fixture::initialize(&app.home).expect("store");
         let scope = fs::sha256(b"coordinator-scope");
         let layout = runtime_storage::plan(
             &store,
@@ -450,7 +450,7 @@ fn tampered_backup_and_foreign_link_are_refused_without_loss() {
     let root = TempDir::new().expect("fixture root");
     let sealed = seal(root.path(), "home", "a", b"payload-bytes\n");
     let app = app(root.path());
-    let mut store = Store::initialize(&app.home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app.home).expect("store");
     let scope = fs::sha256(b"coordinator-scope");
     let layout = runtime_storage::plan(
         &store,
@@ -504,7 +504,7 @@ fn holders_block_install_and_prepared_rows_refuse_replacement() {
     let root = TempDir::new().expect("fixture root");
     let sealed = seal(root.path(), "home", "a", b"payload-bytes\n");
     let app = app(root.path());
-    let mut store = Store::initialize(&app.home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app.home).expect("store");
     let canonical = sealed.home.canonicalize().unwrap();
     store
         .conn
@@ -581,7 +581,7 @@ fn two_homes_share_one_payload_inode_after_replacement() {
     let first = seal(root.path(), "first", "same", b"shared payload\n");
     let second = seal(root.path(), "second", "same", b"shared payload\n");
     let app = app(root.path());
-    let mut store = Store::initialize(&app.home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app.home).expect("store");
     let scope = fs::sha256(b"coordinator-scope");
     let store_root = runtime_storage::store_root(&app.home).unwrap();
     let mut references = Vec::new();
@@ -630,7 +630,7 @@ fn plugin_parent_mount_keeps_real_version_discoverable() {
     let root = TempDir::new().expect("fixture root");
     let sealed = seal_plugin(root.path(), "probe", b"plugin payload\n");
     let app = app(root.path());
-    let mut store = Store::initialize(&app.home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app.home).expect("store");
     let scope = fs::sha256(b"coordinator-scope");
     let store_root = runtime_storage::store_root(&app.home).unwrap();
     let layout = runtime_storage::plan(
@@ -719,7 +719,7 @@ fn interrupted_plugin_installs_roll_forward_through_recovery() {
         let root = TempDir::new().expect("fixture root");
         let sealed = seal_plugin(root.path(), "probe", b"plugin payload\n");
         let app = app(root.path());
-        let mut store = Store::initialize(&app.home).expect("store");
+        let mut store = agent_run_store::fixture::initialize(&app.home).expect("store");
         let scope = fs::sha256(b"coordinator-scope");
         let layout = runtime_storage::plan(
             &store,
@@ -774,7 +774,7 @@ fn plugin_parent_siblings_refuse_planning_without_loss() {
         let root = TempDir::new().expect("fixture root");
         let sealed = seal_probe_with_parent_extra(root.path(), "probe", second_version);
         let app = app(root.path());
-        let store = Store::initialize(&app.home).expect("store");
+        let store = agent_run_store::fixture::initialize(&app.home).expect("store");
         let scope = fs::sha256(b"coordinator-scope");
         let planned = runtime_storage::plan(
             &store,
@@ -878,7 +878,7 @@ fn tampered_plugin_backup_and_foreign_parent_link_are_refused() {
     let root = TempDir::new().expect("fixture root");
     let sealed = seal_plugin(root.path(), "probe", b"plugin payload\n");
     let app = app(root.path());
-    let mut store = Store::initialize(&app.home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app.home).expect("store");
     let scope = fs::sha256(b"coordinator-scope");
     let layout = runtime_storage::plan(
         &store,
@@ -975,7 +975,7 @@ fn native_codex_discovers_coordinator_parent_mount() {
     let root = TempDir::new().expect("fixture root");
     let sealed = seal_plugin(root.path(), "probe", b"plugin payload\n");
     let app = app(root.path());
-    let mut store = Store::initialize(&app.home).expect("store");
+    let mut store = agent_run_store::fixture::initialize(&app.home).expect("store");
     let layout = runtime_storage::plan(
         &store,
         &app.home,

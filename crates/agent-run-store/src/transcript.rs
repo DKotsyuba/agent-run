@@ -112,7 +112,7 @@ fn neighbor(
     ).optional()?)
 }
 
-impl Store {
+impl Store<'_> {
     /// Counts unique observed native tool IDs of this exact execution. Only
     /// versioned native observers establish coverage; old/unobserved attempts
     /// and missing call IDs remain unknown. Duplicate fragments/completions do

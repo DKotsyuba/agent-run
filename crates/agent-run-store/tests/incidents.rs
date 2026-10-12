@@ -132,18 +132,34 @@ fn ledger_failure_preserves_source_and_does_not_undo_terminal_state() {
 }
 
 /// Ledger ageing and overflow are independent of ordinary history eligibility;
-/// the numerical cap never removes an agent, transcript or ownership record.
+/// the numerical cap never removes an agent, transcript or ownership record,
+/// and neither evicts rows of an execution whose source still exists.
 #[test]
 fn ledger_age_and_record_cap_are_independent() {
     let home = common::Home::new();
     let mut store = home.store();
     let id = failed(&home, &mut store, NOW);
     incidents::capture(&store.conn, id.as_str(), NOW).unwrap();
-    assert!(incidents::prune_pending(&store.conn, NOW + incidents::HISTORY_SECONDS + 1.0).unwrap());
-    assert!(incidents::prune(&store.conn, NOW + incidents::HISTORY_SECONDS + 1.0).unwrap() > 0);
+    let kept = incidents::summary(&store.conn).unwrap()["records"]
+        .as_i64()
+        .unwrap();
+    let later = NOW + incidents::HISTORY_SECONDS + 1.0;
+    assert!(incidents::prune_pending(&store.conn, later).unwrap());
+    assert_eq!(incidents::prune(&store.conn, later).unwrap(), 0);
+    store
+        .conn
+        .execute(
+            "INSERT INTO incident_ledger VALUES('ag-gone','terminal',?,'{}')",
+            [NOW],
+        )
+        .unwrap();
+    assert_eq!(incidents::prune(&store.conn, later).unwrap(), 1);
     assert!(store.get(&id).is_ok());
     store.conn.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10005) INSERT INTO incident_ledger(execution_id,phase,occurred_at,details_json) SELECT printf('ag-%d',x),'terminal',?,'{}' FROM n",[NOW]).unwrap();
     incidents::prune(&store.conn, NOW).unwrap();
-    assert_eq!(incidents::summary(&store.conn).unwrap()["records"], 10000);
+    assert_eq!(
+        incidents::summary(&store.conn).unwrap()["records"],
+        10000 + kept
+    );
     assert!(store.get(&id).is_ok());
 }

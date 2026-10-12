@@ -15,6 +15,9 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::Deserialize;
 use serde_json::json;
 
+/// Online recovery uses read/OS preparation followed by typed queued mutations.
+pub mod queued;
+
 /// A captured row that can be rechecked after its process probe completes.
 #[derive(Debug, Clone)]
 struct Candidate {
@@ -858,7 +861,7 @@ mod tests {
     #[test]
     fn unresolved_cleanup_probe_uses_owner_index() {
         let home = tempfile::tempdir().unwrap();
-        let store = agent_run_store::Store::initialize(home.path()).unwrap();
+        let store = agent_run_store::fixture::initialize(home.path()).unwrap();
         let mut statement = store
             .conn
             .prepare(&format!("EXPLAIN QUERY PLAN {UNRESOLVED_EVENT_EXISTS_SQL}"))

@@ -1521,7 +1521,7 @@ async fn test_transcript_text_pipe_receives_fragments_before_the_agent_finishes(
     };
     request.validate().unwrap();
     let config = agent_run::config::Config::load(&home).unwrap();
-    let mut store = agent_run::state::Store::open(&home).unwrap();
+    let mut store = agent_run_store::fixture::open(&home).unwrap();
     let (id, created) = store
         .admit(&request, &config, &serde_json::json!({}), None)
         .unwrap();
@@ -1564,7 +1564,7 @@ async fn test_transcript_text_pipe_receives_fragments_before_the_agent_finishes(
         err
     });
     // Producer side: journal the first fragment while the agent is running.
-    agent_run::state::Store::open(&home)
+    agent_run_store::fixture::open(&home)
         .unwrap()
         .message(&id, "assistant", "Hello", None, Some("m1"))
         .unwrap();
@@ -1585,11 +1585,11 @@ async fn test_transcript_text_pipe_receives_fragments_before_the_agent_finishes(
     // holds the fragment alone — no newline, no reflow, no truncation.
     std::thread::sleep(std::time::Duration::from_millis(300));
     assert_eq!(*pipe.lock().unwrap(), b"Hello".to_vec());
-    agent_run::state::Store::open(&home)
+    agent_run_store::fixture::open(&home)
         .unwrap()
         .message(&id, "assistant", " world", None, Some("m1"))
         .unwrap();
-    agent_run::state::Store::open(&home)
+    agent_run_store::fixture::open(&home)
         .unwrap()
         .finish(
             &id,

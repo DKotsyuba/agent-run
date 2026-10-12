@@ -11,9 +11,9 @@ use serde_json::json;
 const TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 /// Create one owned running attempt, optionally with the frozen callback mode.
-fn running(explicit: bool) -> (tempfile::TempDir, Store, AgentId) {
+fn running(explicit: bool) -> (tempfile::TempDir, Store<'static>, AgentId) {
     let home = tempfile::tempdir().unwrap();
-    let mut store = Store::initialize(home.path()).unwrap();
+    let mut store = agent_run_store::fixture::initialize(home.path()).unwrap();
     let run: AgentId = "ag-20261010-000000-0123456789".parse().unwrap();
     store.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) VALUES(?,'codex','fixture','review','task','task','/tmp',?,'running',100,'fixture',?)",
         rusqlite::params![run.as_str(),json!({"runtime":"codex","model":"fixture","profile":"review","task":"task","workdir":"/tmp","explicit_finish":explicit}).to_string(),run.as_str()]).unwrap();
@@ -87,7 +87,7 @@ fn finish_persists_and_idle_never_expires() {
         "closing"
     );
     drop(store);
-    let store = Store::open(home.path()).unwrap();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
     assert_eq!(
         store.worker_finish_intent(&run, false).unwrap(),
         Some(report())
@@ -181,7 +181,9 @@ fn callback_authority_and_validation_are_closed() {
     }
 }
 
-/// Migration from an exact historical schema leaves legacy request JSON intact
+/// Migration from an exact historical schema 28 (the current schema with the
+/// schema-29 lifecycle tables and the schema-30 writer tables and columns
+/// removed) through every later migration leaves legacy request JSON intact
 /// and adds no implicit lifecycle/finish state to preexisting attempts.
 #[test]
 fn migration_28_to_29_preserves_legacy_requests() {
@@ -197,18 +199,23 @@ fn migration_28_to_29_preserves_legacy_requests() {
     store
         .conn
         .execute_batch(
-            "DROP TABLE worker_native_wakes; DROP TABLE worker_lifecycle; PRAGMA user_version=28;",
+            "DROP TABLE worker_native_wakes; DROP TABLE worker_lifecycle; \
+             DROP TABLE operation_receipts; DROP TABLE writer_producers; DROP TABLE writer_authority; \
+             ALTER TABLE agents DROP COLUMN supervisor_capability_sha256; \
+             ALTER TABLE managed_service_generations DROP COLUMN exec_capability_sha256; \
+             DROP INDEX idx_events_agent_kind_seq; \
+             PRAGMA user_version=28;",
         )
         .unwrap();
     drop(store);
     agent_run_store::migrations::migrate(&home.path().join("state.db")).unwrap();
-    store = Store::open(home.path()).unwrap();
+    store = agent_run_store::fixture::open(home.path()).unwrap();
     assert_eq!(
         store
             .conn
             .pragma_query_value::<i64, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        29
+        agent_run_store::VERSION
     );
     assert_eq!(
         store

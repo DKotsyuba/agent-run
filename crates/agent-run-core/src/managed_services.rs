@@ -1,5 +1,6 @@
 //! Resident-broker ownership, warmup and expiry of explicitly configured foreground services.
 
+use crate::broker_writer::{BROKER_BUDGET, BrokerLane};
 use crate::{
     Error, Result,
     domain::{AgentId, now},
@@ -9,8 +10,11 @@ use crate::{
 };
 use agent_run_config::services::ManagedService;
 use agent_run_domain::error::invalid;
+use agent_run_store::ops;
 use fs2::FileExt;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::OptionalExtension;
+#[cfg(test)]
+use rusqlite::params;
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -98,7 +102,7 @@ fn observe(identity: &Identity) -> ProcessState {
 fn environment(definition: &ManagedService) -> Result<BTreeMap<String, String>> {
     let mut values = BTreeMap::new();
     for name in [
-        "HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME",
+        "HOME", "PATH", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME",
     ] {
         if let Ok(value) = std::env::var(name) {
             values.insert(name.to_owned(), value);
@@ -112,6 +116,21 @@ fn environment(definition: &ManagedService) -> Result<BTreeMap<String, String>> 
         );
     }
     Ok(values)
+}
+
+/// Generate an executor capability from two OS-random UUIDs; never log it.
+fn fresh_capability() -> Vec<u8> {
+    [
+        uuid::Uuid::new_v4().as_bytes().as_slice(),
+        uuid::Uuid::new_v4().as_bytes().as_slice(),
+    ]
+    .concat()
+}
+
+/// SHA-256 of raw capability bytes, matching the private writer handshake.
+fn capability_digest(secret: &[u8]) -> String {
+    let hex: String = secret.iter().map(|byte| format!("{byte:02x}")).collect();
+    crate::fs::sha256(hex.as_bytes())
 }
 
 /// Single resident manager per home; drops child handles without killing services held by running agents.
@@ -128,6 +147,10 @@ pub struct Manager {
     qualified: BTreeSet<String>,
     /// Home-wide writer lease, including brokers bound to a non-default socket.
     _lock: File,
+    /// Explicit broker-local producer for all service mutations.
+    writer: Option<BrokerLane>,
+    /// Per-generation executor secrets held in memory and sent only by private pipe.
+    capabilities: BTreeMap<String, Vec<u8>>,
 }
 
 impl Drop for Manager {
@@ -165,7 +188,39 @@ impl Manager {
             children: BTreeMap::new(),
             qualified: BTreeSet::new(),
             _lock: lock,
+            writer: None,
+            capabilities: BTreeMap::new(),
         })
+    }
+
+    /// Attach the sole resident writer; there is no local SQL fallback.
+    pub fn with_writer(mut self, writer: BrokerLane) -> Self {
+        self.writer = Some(writer);
+        self
+    }
+
+    /// Obtain the already-attached broker lane, refusing an unbound manager.
+    fn lane(&self) -> Result<BrokerLane> {
+        self.writer.clone().ok_or(Error::BrokerUnavailable)
+    }
+
+    /// Persist an already captured ownership snapshot through the sole writer.
+    async fn remember(
+        &self,
+        kind: &str,
+        id: &str,
+        snapshot: &process::OwnershipSnapshot,
+    ) -> Result<()> {
+        self.lane()?
+            .remote(
+                ops::RememberProcesses {
+                    kind: kind.to_owned(),
+                    owner: id.to_owned(),
+                    snapshot: snapshot.clone(),
+                },
+                BROKER_BUDGET,
+            )
+            .await
     }
 
     /// Reaps direct children, releases finished leases, prepares durable admissions and checks warm services.
@@ -174,8 +229,8 @@ impl Manager {
         self.children
             .retain(|_, child| !matches!(child.try_wait(), Ok(Some(_))));
         self.recover_probes().await?;
-        self.release_finished()?;
-        self.prepare_pending()?;
+        self.release_finished().await?;
+        self.prepare_pending().await?;
         for generation in generations(&self.home)? {
             self.observe_generation(generation).await?;
         }
@@ -206,7 +261,7 @@ impl Manager {
                 None => true,
             };
             if confirmed {
-                forget_probe(&self.home, &id)?;
+                forget_probe(&self.lane()?, &id).await?;
             }
         }
         Ok(())
@@ -214,16 +269,18 @@ impl Manager {
 
     /// Ends leases only after logical completion and resolution of all attempt ownership.
     /// Records actual release time so delayed cleanup cannot consume the service's idle grace.
-    fn release_finished(&self) -> Result<()> {
-        let store = Store::open(&self.home)?;
-        let at = now();
-        store.conn.execute("UPDATE managed_service_leases SET released_at=?1 WHERE released_at IS NULL AND EXISTS(SELECT 1 FROM agents a WHERE a.id=managed_service_leases.agent_id AND a.status IN ('succeeded','failed','cancelled','lost','timed_out')) AND NOT EXISTS(SELECT 1 FROM attempts t WHERE t.agent_id=managed_service_leases.agent_id AND t.ownership_active=1)", [at])?;
-        store.conn.execute("UPDATE managed_service_generations SET idle_since=COALESCE((SELECT MAX(released_at) FROM managed_service_leases WHERE generation_id=managed_service_generations.id),?1) WHERE state!='stopped' AND idle_since IS NULL AND NOT EXISTS(SELECT 1 FROM managed_service_leases l WHERE l.generation_id=managed_service_generations.id AND l.released_at IS NULL)", [at])?;
-        Ok(())
+    async fn release_finished(&self) -> Result<()> {
+        self.lane()?
+            .local(
+                ops::ReleaseFinishedServiceLeases { at: now() },
+                BROKER_BUDGET,
+            )
+            .await
+            .map(drop)
     }
 
     /// Resolves each pending agent's frozen definitions and acquires leases before publishing its ready gate.
-    fn prepare_pending(&mut self) -> Result<()> {
+    async fn prepare_pending(&mut self) -> Result<()> {
         let ids: Vec<String> = {
             let store = Store::open(&self.home)?;
             let mut query = store.conn.prepare("SELECT g.agent_id FROM agent_service_gates g JOIN agents a ON a.id=g.agent_id WHERE g.state='pending' AND a.status IN ('created','starting','running','cancelling') ORDER BY a.created_at,a.id")?;
@@ -238,20 +295,26 @@ impl Manager {
             let identity = match ProviderLaunchIdentity::read(&row) {
                 Ok(identity) => identity,
                 Err(_) => {
-                    self.fail_gate(&id, "service_authority_invalid")?;
+                    self.fail_gate(&id, "service_authority_invalid").await?;
                     continue;
                 }
             };
             let mut complete = true;
             for (name, definition) in &identity.provider_config.services {
-                match self.ensure_generation(name, definition) {
+                match self.ensure_generation(name, definition).await {
                     Ok(Some(generation)) => {
-                        let store = Store::open(&self.home)?;
-                        store.conn.execute("INSERT INTO managed_service_leases(generation_id,agent_id,acquired_at) VALUES (?,?,?) ON CONFLICT DO NOTHING", params![generation,id,now()])?;
-                        store.conn.execute(
-                            "UPDATE managed_service_generations SET idle_since=NULL WHERE id=? AND idle_since IS NOT NULL",
-                            [&generation],
-                        )?;
+                        self.lane()?
+                            .local(
+                                ops::PrepareServiceGate {
+                                    execution: agent.clone(),
+                                    step: ops::GateStep::Lease {
+                                        generation: generation.clone(),
+                                    },
+                                    at: now(),
+                                },
+                                BROKER_BUDGET,
+                            )
+                            .await?;
                         complete &= self.qualified.contains(&generation);
                     }
                     Ok(None) => {
@@ -260,20 +323,31 @@ impl Manager {
                     }
                     Err(_) => {
                         complete = false;
-                        self.fail_gate(&id, "service_unavailable")?;
+                        self.fail_gate(&id, "service_unavailable").await?;
                         break;
                     }
                 }
             }
             if complete {
-                Store::open(&self.home)?.conn.execute("UPDATE agent_service_gates SET state='ready' WHERE agent_id=?1 AND state='pending' AND (SELECT COUNT(*) FROM managed_service_leases WHERE agent_id=?1 AND released_at IS NULL)=?2 AND NOT EXISTS(SELECT 1 FROM managed_service_leases l JOIN managed_service_generations g ON g.id=l.generation_id WHERE l.agent_id=?1 AND l.released_at IS NULL AND g.state!='ready')", params![id, identity.provider_config.services.len() as i64])?;
+                self.lane()?
+                    .local(
+                        ops::PrepareServiceGate {
+                            execution: agent.clone(),
+                            step: ops::GateStep::Ready {
+                                expected_leases: identity.provider_config.services.len() as u32,
+                            },
+                            at: now(),
+                        },
+                        BROKER_BUDGET,
+                    )
+                    .await?;
             }
         }
         Ok(())
     }
 
     /// Reuses an identical generation or reserves one for preflight/bootstrap; never replaces an occupied revision.
-    fn ensure_generation(
+    async fn ensure_generation(
         &mut self,
         name: &str,
         definition: &ManagedService,
@@ -287,10 +361,16 @@ impl Manager {
                 if self.held(&current.id)? {
                     return Err(invalid("service revision is held by active agents"));
                 }
-                Store::open(&self.home)?.conn.execute(
-                    "UPDATE managed_service_generations SET state='stopping' WHERE id=?",
-                    [&current.id],
-                )?;
+                self.lane()?
+                    .local(
+                        ops::EnsureServiceGeneration {
+                            action: ops::GenerationAction::Retire {
+                                generation: current.id.clone(),
+                            },
+                        },
+                        BROKER_BUDGET,
+                    )
+                    .await?;
                 return Ok(None);
             }
             if !matches!(current.state.as_str(), "starting" | "ready") {
@@ -305,17 +385,46 @@ impl Manager {
         } else {
             "managed"
         };
-        Store::open(&self.home)?.conn.execute("INSERT INTO managed_service_generations(id,service_id,revision,definition_json,state,broker_identity_json,created_at,ownership) VALUES (?,?,?,?,'starting',?,?,?)", params![id,name,revision,serde_json::to_string(definition)?,serde_json::to_string(&self.owner)?,now(),ownership])?;
+        let secret = fresh_capability();
+        let digest = capability_digest(&secret);
+        self.lane()?
+            .local(
+                ops::EnsureServiceGeneration {
+                    action: ops::GenerationAction::Create {
+                        generation: id.clone(),
+                        service: name.to_owned(),
+                        revision,
+                        definition_json: serde_json::to_string(definition)?,
+                        broker_identity_json: serde_json::to_string(&self.owner)?,
+                        ownership: ownership.to_owned(),
+                        exec_capability_sha256: Some(digest),
+                        at: now(),
+                    },
+                },
+                BROKER_BUDGET,
+            )
+            .await?;
+        self.capabilities.insert(id.clone(), secret);
         if !definition.reuse_existing {
-            self.spawn_generation(&id, definition)?;
+            self.spawn_generation(&id, definition).await?;
         }
         Ok(Some(id))
     }
 
     /// Starts the owned bootstrap only after durable admission; spawn failures retire this generation.
-    fn spawn_generation(&mut self, id: &str, definition: &ManagedService) -> Result<()> {
+    async fn spawn_generation(&mut self, id: &str, definition: &ManagedService) -> Result<()> {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
         let environment = environment(definition)?;
-        let child = Command::new(&self.executable)
+        let secret = self
+            .capabilities
+            .get(id)
+            .cloned()
+            .ok_or_else(|| invalid("service executor capability unavailable"))?;
+        let (cap_r, cap_w) = crate::launch::cloexec_pipe()?;
+        let read_fd = cap_r.as_raw_fd();
+        let mut command = Command::new(&self.executable);
+        command
             .arg("--home")
             .arg(&self.home)
             .arg("_service-exec")
@@ -326,22 +435,54 @@ impl Manager {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .process_group(0)
-            .spawn();
-        match child {
-            Ok(child) => {
-                let owned = OwnedProcess::capture(child.id() as i32);
-                self.children.insert(id.to_owned(), child);
-                if let Some(snapshot) = owned.snapshot() {
-                    Store::open(&self.home)?.remember_processes("service", id, &snapshot)?;
+            .process_group(0);
+        // SAFETY: child hook only duplicates/marks/closes preopened descriptors;
+        // no allocation, environment access, locks or Rust callbacks run after fork.
+        unsafe {
+            command.pre_exec(move || {
+                if read_fd != crate::launch::CAPABILITY_FD
+                    && libc::dup2(read_fd, crate::launch::CAPABILITY_FD) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
                 }
-            }
+                if libc::fcntl(crate::launch::CAPABILITY_FD, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if read_fd != crate::launch::CAPABILITY_FD {
+                    libc::close(read_fd);
+                }
+                Ok(())
+            });
+        }
+        let child = match command.spawn() {
+            Ok(child) => child,
             Err(_) => {
-                Store::open(&self.home)?.conn.execute("UPDATE managed_service_generations SET state='stopped',failure_kind='service_spawn_failed',cleanup_json='{\"never_spawned\":true,\"confirmed\":true}' WHERE id=?", [&id])?;
-                Store::open(&self.home)?.conn.execute("UPDATE agent_service_gates SET state='failed',failure_kind='service_spawn_failed' WHERE state='pending' AND agent_id IN (SELECT agent_id FROM managed_service_leases WHERE generation_id=? AND released_at IS NULL)", [id])?;
+                self.lane()?
+                    .local(
+                        ops::FailServiceSpawn {
+                            generation: id.to_owned(),
+                        },
+                        BROKER_BUDGET,
+                    )
+                    .await?;
                 return Err(invalid("service bootstrap could not be spawned"));
             }
+        };
+        drop(cap_r);
+        let mut owned = OwnedProcess::capture(child.id() as i32);
+        self.children.insert(id.to_owned(), child);
+        let snapshot = owned
+            .snapshot()
+            .ok_or_else(|| invalid("service bootstrap root unavailable"))?;
+        if let Err(error) =
+            observe_storage(&mut owned, self.remember("service", id, &snapshot)).await
+        {
+            drop(cap_w);
+            let _ = owned.cleanup(Duration::from_millis(100)).await;
+            return Err(error);
         }
+        // No native service command may execute before durable ownership ACK.
+        File::from(cap_w).write_all(&secret)?;
         Ok(())
     }
 
@@ -351,18 +492,31 @@ impl Manager {
     }
 
     /// Records a bounded static failure code without command arguments, probe output or credentials.
-    fn fail_gate(&self, agent: &str, reason: &str) -> Result<()> {
-        Store::open(&self.home)?.conn.execute("UPDATE agent_service_gates SET state='failed',failure_kind=? WHERE agent_id=? AND state='pending'", params![reason,agent])?;
-        Ok(())
+    async fn fail_gate(&self, agent: &str, reason: &str) -> Result<()> {
+        self.lane()?
+            .local(
+                ops::FailServiceGate {
+                    execution: agent.parse()?,
+                    reason: reason.to_owned(),
+                },
+                BROKER_BUDGET,
+            )
+            .await
     }
 
     /// Marks a generation unhealthy and refuses pending admissions; active agents retain their leases.
-    fn unhealthy(&mut self, generation: &str, reason: &str) -> Result<()> {
+    async fn unhealthy(&mut self, generation: &str, reason: &str) -> Result<()> {
         self.qualified.remove(generation);
-        let store = Store::open(&self.home)?;
-        store.conn.execute("UPDATE managed_service_generations SET state='unhealthy',failure_kind=?,checked_at=? WHERE id=?", params![reason,now(),generation])?;
-        store.conn.execute("UPDATE agent_service_gates SET state='failed',failure_kind=? WHERE state='pending' AND agent_id IN (SELECT agent_id FROM managed_service_leases WHERE generation_id=? AND released_at IS NULL)", params![reason,generation])?;
-        Ok(())
+        self.lane()?
+            .local(
+                ops::MarkServiceUnhealthy {
+                    generation: generation.to_owned(),
+                    reason: reason.to_owned(),
+                    at: now(),
+                },
+                BROKER_BUDGET,
+            )
+            .await
     }
 
     /// Checks root identity, startup/health and idle expiry, restoring only previously captured members.
@@ -370,7 +524,7 @@ impl Manager {
         if generation.ownership == Ownership::External {
             return self.observe_external(generation).await;
         }
-        let mut store = Store::open(&self.home)?;
+        let store = Store::open(&self.home)?;
         let held = self.held(&generation.id)?;
         let mut owned = store.remembered_processes("service", &generation.id)?;
         if let Some(root) = &generation.root
@@ -384,13 +538,14 @@ impl Manager {
                         || root.group != saved.group
                 })
         {
-            self.unhealthy(&generation.id, "service_identity_mismatch")?;
+            self.unhealthy(&generation.id, "service_identity_mismatch")
+                .await?;
             return Ok(());
         }
         if let Some(owned) = owned.as_mut() {
             owned.refresh();
             if let Some(snapshot) = owned.snapshot() {
-                store.remember_processes("service", &generation.id, &snapshot)?;
+                self.remember("service", &generation.id, &snapshot).await?;
             }
         }
         drop(store);
@@ -413,7 +568,8 @@ impl Manager {
             }
             if now() - generation.created_at >= generation.definition.startup_timeout_seconds as f64
             {
-                self.unhealthy(&generation.id, "service_bootstrap_timeout")?;
+                self.unhealthy(&generation.id, "service_bootstrap_timeout")
+                    .await?;
             }
             return Ok(());
         };
@@ -430,39 +586,49 @@ impl Manager {
                     ))
                     .await;
                 if let Some(snapshot) = owned.snapshot() {
-                    Store::open(&self.home)?.remember_processes(
-                        "service",
-                        &generation.id,
-                        &snapshot,
-                    )?;
+                    self.remember("service", &generation.id, &snapshot).await?;
                 }
                 if let Ok(proof) = cleanup {
                     cleaned = proof.confirmed;
-                    Store::open(&self.home)?.conn.execute(
-                        "UPDATE managed_service_generations SET cleanup_json=? WHERE id=?",
-                        params![serde_json::to_string(&proof)?, generation.id],
-                    )?;
+                    self.lane()?
+                        .local(
+                            ops::ObserveServiceGeneration {
+                                generation: generation.id.clone(),
+                                observation: ops::GenerationObservation::Cleanup {
+                                    proof: serde_json::to_value(&proof)?,
+                                },
+                            },
+                            BROKER_BUDGET,
+                        )
+                        .await?;
                 }
             }
             // Another launcher may have won between preflight and exec. Only a
             // fully cleaned, never-ready bootstrap may fall back to external use.
             if cleaned && generation.state == "starting" && generation.definition.reuse_existing {
-                match probe(&self.home, &generation, true).await {
+                match probe(&self.home, &generation, true, &self.lane()?).await {
                     Ok(true) => {
-                        Store::open(&self.home)?.conn.execute(
-                            "UPDATE managed_service_generations SET ownership='external' WHERE id=?",
-                            [&generation.id],
-                        )?;
-                        return self.ready(&generation.id, now());
+                        self.lane()?
+                            .local(
+                                ops::ObserveServiceGeneration {
+                                    generation: generation.id.clone(),
+                                    observation: ops::GenerationObservation::AdoptExternal,
+                                },
+                                BROKER_BUDGET,
+                            )
+                            .await?;
+                        return self.ready(&generation.id, now()).await;
                     }
                     Ok(false) => {}
                     Err(_) => {
-                        self.unhealthy(&generation.id, "service_probe_unavailable")?;
+                        self.unhealthy(&generation.id, "service_probe_unavailable")
+                            .await?;
                         return Ok(());
                     }
                 }
             }
-            self.unhealthy(&generation.id, "service_process_unavailable")?;
+            self.unhealthy(&generation.id, "service_process_unavailable")
+                .await?;
             return Ok(());
         }
         if matches!(generation.state.as_str(), "unhealthy" | "unknown") {
@@ -471,7 +637,8 @@ impl Manager {
         if generation.state == "starting"
             && now() - generation.created_at >= generation.definition.startup_timeout_seconds as f64
         {
-            self.unhealthy(&generation.id, "service_readiness_timeout")?;
+            self.unhealthy(&generation.id, "service_readiness_timeout")
+                .await?;
             return Ok(());
         }
         if self.qualified.contains(&generation.id)
@@ -481,31 +648,46 @@ impl Manager {
         {
             return Ok(());
         }
-        let healthy = match probe(&self.home, &generation, false).await {
+        let healthy = match probe(&self.home, &generation, false, &self.lane()?).await {
             Ok(healthy) => healthy,
             Err(_) => {
-                self.unhealthy(&generation.id, "service_probe_unavailable")?;
+                self.unhealthy(&generation.id, "service_probe_unavailable")
+                    .await?;
                 return Ok(());
             }
         };
         let at = now();
-        Store::open(&self.home)?.conn.execute(
-            "UPDATE managed_service_generations SET checked_at=? WHERE id=?",
-            params![at, generation.id],
-        )?;
+        self.lane()?
+            .local(
+                ops::ObserveServiceGeneration {
+                    generation: generation.id.clone(),
+                    observation: ops::GenerationObservation::Checked { at },
+                },
+                BROKER_BUDGET,
+            )
+            .await?;
         if healthy && observe(root) == ProcessState::Alive {
-            self.ready(&generation.id, at)?;
+            self.ready(&generation.id, at).await?;
         } else if generation.state == "ready"
             || at - generation.created_at >= generation.definition.startup_timeout_seconds as f64
         {
-            self.unhealthy(&generation.id, "service_readiness_failed")?;
+            self.unhealthy(&generation.id, "service_readiness_failed")
+                .await?;
         }
         Ok(())
     }
 
     /// Marks an application-qualified generation ready; process authority is unchanged.
-    fn ready(&mut self, id: &str, at: f64) -> Result<()> {
-        Store::open(&self.home)?.conn.execute("UPDATE managed_service_generations SET state='ready',ready_at=COALESCE(ready_at,?1),checked_at=?1,failure_kind=NULL WHERE id=?2 AND state IN ('starting','ready')", params![at,id])?;
+    async fn ready(&mut self, id: &str, at: f64) -> Result<()> {
+        self.lane()?
+            .local(
+                ops::MarkServiceReady {
+                    generation: id.to_owned(),
+                    at,
+                },
+                BROKER_BUDGET,
+            )
+            .await?;
         self.qualified.insert(id.to_owned());
         Ok(())
     }
@@ -539,29 +721,43 @@ impl Manager {
         {
             return Ok(());
         }
-        let healthy = match probe(&self.home, &generation, true).await {
+        let healthy = match probe(&self.home, &generation, true, &self.lane()?).await {
             Ok(healthy) => healthy,
             Err(_) => {
-                self.unhealthy(&generation.id, "service_probe_unavailable")?;
+                self.unhealthy(&generation.id, "service_probe_unavailable")
+                    .await?;
                 return Ok(());
             }
         };
         if healthy {
-            self.ready(&generation.id, now())?;
+            self.ready(&generation.id, now()).await?;
         } else if generation.state == "starting" && generation.root.is_none() {
             if now() - generation.created_at >= generation.definition.startup_timeout_seconds as f64
             {
-                return self.unhealthy(&generation.id, "service_readiness_timeout");
+                return self
+                    .unhealthy(&generation.id, "service_readiness_timeout")
+                    .await;
             }
             // Persist owned mode before allowing the child to exec. A broker
             // crash here retains the ordinary bootstrap recovery contract.
-            Store::open(&self.home)?.conn.execute(
-                "UPDATE managed_service_generations SET ownership='managed',broker_identity_json=? WHERE id=? AND state='starting'",
-                params![serde_json::to_string(&self.owner)?,generation.id],
-            )?;
-            self.spawn_generation(&generation.id, &generation.definition)?;
+            let secret = fresh_capability();
+            let digest = capability_digest(&secret);
+            self.lane()?
+                .local(
+                    ops::ObserveExternalService {
+                        generation: generation.id.clone(),
+                        broker_identity_json: serde_json::to_string(&self.owner)?,
+                        exec_capability_sha256: Some(digest),
+                    },
+                    BROKER_BUDGET,
+                )
+                .await?;
+            self.capabilities.insert(generation.id.clone(), secret);
+            self.spawn_generation(&generation.id, &generation.definition)
+                .await?;
         } else {
-            self.unhealthy(&generation.id, "service_readiness_failed")?;
+            self.unhealthy(&generation.id, "service_readiness_failed")
+                .await?;
         }
         Ok(())
     }
@@ -570,12 +766,18 @@ impl Manager {
     /// External generations only release leases; prior bootstrap cleanup evidence is retained.
     async fn stop(&mut self, generation: &Generation, owned: Option<OwnedProcess>) -> Result<()> {
         self.qualified.remove(&generation.id);
-        let store = Store::open(&self.home)?;
-        store.conn.execute(
-            "UPDATE managed_service_generations SET state='stopping' WHERE id=?",
-            [&generation.id],
-        )?;
-        drop(store);
+        if generation.state != "unknown" {
+            self.lane()?
+                .local(
+                    ops::StopServiceGeneration {
+                        generation: generation.id.clone(),
+                        finalize: None,
+                        at: now(),
+                    },
+                    BROKER_BUDGET,
+                )
+                .await?;
+        }
         let mut proof = if generation.ownership == Ownership::External {
             let prior: Option<String> = Store::open(&self.home)?.conn.query_row(
                 "SELECT cleanup_json FROM managed_service_generations WHERE id=?",
@@ -599,11 +801,7 @@ impl Manager {
                 ))
                 .await;
             if let Some(snapshot) = owned.snapshot() {
-                Store::open(&self.home)?.remember_processes(
-                    "service",
-                    &generation.id,
-                    &snapshot,
-                )?;
+                self.remember("service", &generation.id, &snapshot).await?;
             }
             serde_json::to_value(cleanup?)?
         } else if generation.root.is_none()
@@ -626,25 +824,29 @@ impl Manager {
             proof["confirmed"] = serde_json::json!(false);
         }
         proof["probes_gone"] = serde_json::json!(!probes);
-        let confirmed = proof["confirmed"] == true;
-        store.conn.execute(
-            "UPDATE managed_service_generations SET state=?,cleanup_json=? WHERE id=?",
-            params![
-                if confirmed { "stopped" } else { "unknown" },
-                proof.to_string(),
-                generation.id
-            ],
-        )?;
-        if confirmed {
-            store.conn.execute("UPDATE managed_service_leases SET released_at=? WHERE generation_id=? AND released_at IS NULL", params![now(),generation.id])?;
-        }
+        drop(store);
+        self.lane()?
+            .local(
+                ops::StopServiceGeneration {
+                    generation: generation.id.clone(),
+                    finalize: Some(proof),
+                    at: now(),
+                },
+                BROKER_BUDGET,
+            )
+            .await?;
         Ok(())
     }
 }
 
 /// Executes one bounded probe in its own owned group; cancellation also cleans its descendants.
 /// External mode omits the owned PID and cannot confer ownership of the checked service.
-async fn probe(home: &Path, generation: &Generation, external: bool) -> Result<bool> {
+async fn probe(
+    _home: &Path,
+    generation: &Generation,
+    external: bool,
+    lane: &BrokerLane,
+) -> Result<bool> {
     use tokio::io::AsyncWriteExt;
     /// Makes interrupted broker maintenance release this probe's captured child tree.
     struct Probe(OwnedProcess);
@@ -691,21 +893,26 @@ async fn probe(home: &Path, generation: &Generation, external: bool) -> Result<b
         child.id().ok_or_else(|| invalid("probe pid unavailable"))? as i32,
     ));
     let id = uuid::Uuid::new_v4().to_string();
-    {
-        let mut store = Store::open(home)?;
-        store.conn.execute(
-            "INSERT INTO managed_service_probes(id,generation_id,created_at) VALUES (?,?,?)",
-            params![id, generation.id, now()],
-        )?;
-        store.remember_processes(
-            "probe",
-            &id,
-            &owned
-                .0
-                .snapshot()
-                .ok_or_else(|| invalid("probe root is unavailable"))?,
-        )?;
-    }
+    let snapshot = owned
+        .0
+        .snapshot()
+        .ok_or_else(|| invalid("probe root is unavailable"))?;
+    observe_storage(
+        &mut owned.0,
+        lane.local(
+            ops::RecoverServiceProbes {
+                action: ops::ServiceProbeAction::Record {
+                    probe: id.clone(),
+                    generation: generation.id.clone(),
+                    snapshot,
+                    at: now(),
+                },
+            },
+            BROKER_BUDGET,
+        ),
+    )
+    .await?;
+
     let mut input = child
         .stdin
         .take()
@@ -729,48 +936,86 @@ async fn probe(home: &Path, generation: &Generation, external: bool) -> Result<b
                 let previous = owned.0.capture_revision();
                 owned.0.refresh();
                 if previous != owned.0.capture_revision() {
-                    Store::open(home)?.remember_processes("probe", &id, &owned.0.snapshot().ok_or_else(|| invalid("probe root is unavailable"))?)?;
+                    remember_observed(lane, "probe", &id, &mut owned.0).await?;
                 }
             },
         }
     };
     let cleanup = owned.0.cleanup(Duration::from_millis(100)).await;
-    Store::open(home)?.remember_processes(
-        "probe",
-        &id,
-        &owned
-            .0
-            .snapshot()
-            .ok_or_else(|| invalid("probe root is unavailable"))?,
-    )?;
+    remember_observed(lane, "probe", &id, &mut owned.0).await?;
     let cleanup = cleanup?;
     let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
     if cleanup.confirmed {
-        forget_probe(home, &id)?;
+        forget_probe(lane, &id).await?;
     }
     Ok(success && cleanup.confirmed)
 }
 
+/// Refresh captured process identities while an asynchronous storage ACK is pending.
+/// No PID is signalled here; mandatory write completion still gates progress.
+async fn observe_storage<F: std::future::Future>(owned: &mut OwnedProcess, future: F) -> F::Output {
+    tokio::pin!(future);
+    let mut poll = tokio::time::interval(Duration::from_millis(100));
+    loop {
+        tokio::select! {
+            output = &mut future => { owned.refresh(); return output; },
+            _ = poll.tick() => { owned.refresh(); },
+        }
+    }
+}
+
+/// Persist all observed ownership changes while process observation stays live.
+async fn remember_observed(
+    lane: &BrokerLane,
+    kind: &str,
+    id: &str,
+    owned: &mut OwnedProcess,
+) -> Result<()> {
+    loop {
+        let revision = owned.capture_revision();
+        let snapshot = owned
+            .snapshot()
+            .ok_or_else(|| invalid("owned root unavailable"))?;
+        observe_storage(
+            owned,
+            lane.remote(
+                ops::RememberProcesses {
+                    kind: kind.to_owned(),
+                    owner: id.to_owned(),
+                    snapshot,
+                },
+                BROKER_BUDGET,
+            ),
+        )
+        .await?;
+        owned.refresh();
+        if revision == owned.capture_revision() {
+            return Ok(());
+        }
+    }
+}
+
 /// Removes a confirmed finished transient probe without accumulating per-health-check history.
-fn forget_probe(home: &Path, id: &str) -> Result<()> {
-    let mut store = Store::open(home)?;
-    let tx = store.conn.transaction()?;
-    tx.execute(
-        "DELETE FROM process_members WHERE owner_kind='probe' AND owner_id=?",
-        [id],
-    )?;
-    tx.execute(
-        "DELETE FROM process_ownership WHERE owner_kind='probe' AND owner_id=?",
-        [id],
-    )?;
-    tx.execute("DELETE FROM managed_service_probes WHERE id=?", [id])?;
-    tx.commit()?;
-    Ok(())
+async fn forget_probe(lane: &BrokerLane, id: &str) -> Result<()> {
+    lane.local(
+        ops::RecoverServiceProbes {
+            action: ops::ServiceProbeAction::Forget {
+                probe: id.to_owned(),
+            },
+        },
+        BROKER_BUDGET,
+    )
+    .await
 }
 
 /// Internal child-side bootstrap: persist the exact foreground identity before exec can create descendants.
 /// A late bootstrap cannot execute after its originating broker disappeared or the generation was retired.
-pub fn bootstrap(home: &Path, id: &str) -> Result<()> {
+pub async fn bootstrap(home: &Path, id: &str) -> Result<()> {
+    let secret = tokio::task::spawn_blocking(|| {
+        crate::launch::read_capability(crate::launch::CAPABILITY_FD, Duration::from_secs(30))
+    })
+    .await
+    .map_err(|_| invalid("service capability reader stopped"))??;
     let generation = generations(home)?
         .into_iter()
         .find(|g| g.id == id)
@@ -789,13 +1034,44 @@ pub fn bootstrap(home: &Path, id: &str) -> Result<()> {
     let snapshot = OwnedProcess::capture(me.pid)
         .snapshot()
         .ok_or_else(|| invalid("service bootstrap identity unavailable"))?;
-    let mut store = Store::open(home)?;
-    store.remember_processes("service", id, &snapshot)?;
-    let claimed = store.conn.execute("UPDATE managed_service_generations SET process_identity_json=? WHERE id=? AND state='starting' AND process_identity_json IS NULL", params![serde_json::to_string(&me)?,id])?;
-    if claimed != 1 {
+    let producer = crate::persist::Producer::connect(
+        &home.join("writer.sock"),
+        crate::storage_client::Hello {
+            protocol: agent_run_domain::storage::WRITE_PROTOCOL,
+            role: "service_exec".into(),
+            logical: None,
+            execution: None,
+            attempt: None,
+            generation: Some(id.to_owned()),
+            capability_hex: Some(secret.iter().map(|byte| format!("{byte:02x}")).collect()),
+        },
+        agent_run_domain::storage::ProducerId {
+            kind: agent_run_domain::storage::ProducerKind::ServiceExec,
+            scope: Some(id.to_owned()),
+            instance: uuid::Uuid::new_v4().simple().to_string(),
+        },
+    );
+    producer
+        .call(
+            ops::BootstrapServiceProcess {
+                generation: id.to_owned(),
+                snapshot,
+            },
+            BROKER_BUDGET,
+        )
+        .await?;
+    let claimed = producer
+        .call(
+            ops::ClaimServiceProcessIdentity {
+                generation: id.to_owned(),
+                identity: me.clone(),
+            },
+            BROKER_BUDGET,
+        )
+        .await?;
+    if !claimed {
         return Err(invalid("service bootstrap generation changed"));
     }
-    drop(store);
     let error = Command::new(&generation.definition.command)
         .args(&generation.definition.args)
         .current_dir(&generation.definition.cwd)
@@ -901,10 +1177,10 @@ mod tests {
     }
 
     /// An old logical finish cannot consume the idle grace while process ownership remains unresolved.
-    #[test]
-    fn idle_grace_starts_when_final_ownership_is_released() {
+    #[tokio::test]
+    async fn idle_grace_starts_when_final_ownership_is_released() {
         let home = tempfile::tempdir().unwrap();
-        let store = Store::initialize(home.path()).unwrap();
+        let store = agent_run_store::fixture::initialize(home.path()).unwrap();
         let old = now() - 7200.0;
         store.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,finished_at,config_revision) VALUES ('agent','fixture','fixture','review','fixture','fixture','/tmp','{}','lost',?1,?1,'fixture')", [old]).unwrap();
         store.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES ('attempt','agent',1,'lost','{}',?,1)", [old]).unwrap();
@@ -916,8 +1192,11 @@ mod tests {
                 [old],
             )
             .unwrap();
-        let manager = Manager::new(home.path(), std::env::current_exe().unwrap()).unwrap();
-        manager.release_finished().unwrap();
+        let writer = crate::writer_test_harness::Harness::start(home.path());
+        let manager = Manager::new(home.path(), std::env::current_exe().unwrap())
+            .unwrap()
+            .with_writer(writer.broker().lane("services"));
+        manager.release_finished().await.unwrap();
         let held: bool = store
             .conn
             .query_row(
@@ -932,7 +1211,7 @@ mod tests {
             .execute("UPDATE attempts SET ownership_active=0", [])
             .unwrap();
         let before_release = now();
-        manager.release_finished().unwrap();
+        manager.release_finished().await.unwrap();
         let released: f64 = store
             .conn
             .query_row(
@@ -954,7 +1233,7 @@ mod tests {
             "idle grace was backdated to logical completion"
         );
         assert_eq!(idle, released);
-        manager.release_finished().unwrap();
+        manager.release_finished().await.unwrap();
         let unchanged: f64 = store
             .conn
             .query_row(

@@ -5,12 +5,12 @@ use agent_run_domain::{
     domain::{AgentId, OrchestratorRef, Status, now},
     error::invalid,
 };
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 /// Immutable preflight facts pinned again by the pool's immediate admission transaction.
 /// No bearer capability or native session content is exposed in public responses.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, serde::Serialize)]
 pub struct ExistingMember {
     /// Stable lineage root requested by the operator.
     pub agent_id: AgentId,
@@ -229,7 +229,7 @@ pub(crate) fn ack_allowed(
 
 /// Commits awareness only after the reserved authenticated summary entry exists.
 /// The caller owns the transaction, so entry, ACK state and peer fanout are atomic.
-pub(crate) fn acknowledge(tx: &Transaction<'_>, root: &AgentId, seq: u64) -> Result<()> {
+pub(crate) fn acknowledge(tx: &rusqlite::Connection, root: &AgentId, seq: u64) -> Result<()> {
     let changed=tx.execute("UPDATE pool_enrollments SET state='joined',ack_seq=?,ack_at=?,failure_reason=NULL WHERE agent_id=? AND state<>'joined'",
         params![seq,now(),root.as_str()])?;
     if changed != 1 {
@@ -310,7 +310,7 @@ fn enrollment_changes(
     Ok(changed)
 }
 
-impl Store {
+impl Store<'_> {
     /// Converges only changed attachment state/attention under an immediate
     /// transaction after a read-only preflight. Empty pools, healthy pending and
     /// identical failures never reserve the per-tick writer lock. Every decision
@@ -322,9 +322,7 @@ impl Store {
         if enrollment_changes(&self.conn, pool)?.is_empty() {
             return Ok(());
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
         for (root, reason) in enrollment_changes(&tx, pool)? {
             let (run, attempt): (String, String) = tx.query_row(
                 "SELECT run_id,attempt_id FROM pool_enrollments WHERE agent_id=?",

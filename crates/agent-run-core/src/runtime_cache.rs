@@ -280,8 +280,8 @@ fn plugin_parents(runtime_home: &Path) -> Result<Vec<String>> {
 /// `witness` must equal the app home's store root as returned by
 /// [`crate::supervisor::shared_publication_root`]; any other root is refused
 /// before the store is touched.
-pub fn consolidate(
-    store: &mut Store,
+pub async fn consolidate_on<B: crate::runtime_storage::LayoutBackend>(
+    store: &mut B,
     id: &AgentId,
     identity: &ProviderLaunchIdentity,
     account: &AccountId,
@@ -312,13 +312,14 @@ pub fn consolidate(
     crate::native_tree_cache::recover(&root, runtime_home)?;
     // The anchor precedes any publication: from here on the registry names
     // this physical home, whatever its agent rows later become.
-    crate::runtime_storage::anchor(
+    crate::runtime_storage::anchor_on(
         store,
         app_home,
         runtime_home,
         identity.authority.assets_sha256.as_str(),
         Some(id),
-    )?;
+    )
+    .await?;
     let scope = native_domain(identity, account)?;
     let mut roots = vec![SYSTEM_SKILLS.to_owned()];
     roots.extend(curated_roots(runtime_home)?);
@@ -413,4 +414,25 @@ pub fn holds_shared_links(app_home: &Path, runtime_home: &Path) -> Result<bool> 
         }
     }
     Ok(false)
+}
+
+/// [`consolidate_on`] over a raw store held under the caller's offline authority.
+pub fn consolidate(
+    store: &mut Store,
+    id: &AgentId,
+    identity: &ProviderLaunchIdentity,
+    account: &AccountId,
+    app_home: &Path,
+    runtime_home: &Path,
+    witness: &Path,
+) -> Result<CacheConsolidation> {
+    crate::runtime_storage::ready(consolidate_on(
+        store,
+        id,
+        identity,
+        account,
+        app_home,
+        runtime_home,
+        witness,
+    ))
 }

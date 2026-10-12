@@ -29,7 +29,7 @@ fn home() -> Home {
     let path = temp.path().canonicalize().expect("canonical home");
     fs::private_dir(&path).expect("private home");
     stdfs::write(path.join("config.toml"), "schema_version = 2\n").expect("config");
-    Store::initialize(&path).expect("store");
+    agent_run_store::fixture::initialize(&path).expect("store");
     Home { _temp: temp, path }
 }
 
@@ -73,6 +73,8 @@ fn retained(store: &Store, id: &str, runtime_home: &Path, digest: &str, status: 
 
 /// Digest of every regular file below one path, for change detection.
 fn tree_digest(path: &Path) -> String {
+    /// Appends the path and, for a regular file, the content digest of every
+    /// entry below `dir` in sorted order.
     fn walk(dir: &Path, out: &mut String) {
         let mut names: Vec<_> = stdfs::read_dir(dir)
             .expect("read dir")
@@ -82,6 +84,14 @@ fn tree_digest(path: &Path) -> String {
         names.sort();
         for child in names {
             let metadata = stdfs::symlink_metadata(&child).expect("metadata");
+            // A read-only connection to a WAL database leaves the shared-memory
+            // index and an empty log behind; they hold no state, so only a
+            // non-empty log counts as a change.
+            let name = child.file_name().and_then(|name| name.to_str());
+            if name == Some("state.db-shm") || (name == Some("state.db-wal") && metadata.len() == 0)
+            {
+                continue;
+            }
             out.push_str(&child.to_string_lossy());
             if metadata.is_dir() {
                 walk(&child, out);
@@ -130,7 +140,7 @@ fn dry_run_is_read_only_and_reports_both_size_bases() {
     let fixture = home();
     let root = fixture._temp.path();
     let (runtime, digest, _index, _history) = seal(root, "legacy", b"private-bytes\n");
-    let store = Store::open(&fixture.path).expect("store");
+    let store = agent_run_store::fixture::open(&fixture.path).expect("store");
     retained(
         &store,
         "ag-20260101-000000-0000000001",
@@ -203,7 +213,7 @@ fn apply_refuses_busy_broker_and_active_agents() {
     let fixture = home();
     let root = fixture._temp.path();
     let (runtime, digest, _index, _history) = seal(root, "legacy", b"private-bytes\n");
-    let store = Store::open(&fixture.path).expect("store");
+    let store = agent_run_store::fixture::open(&fixture.path).expect("store");
     retained(
         &store,
         "ag-20260101-000000-0000000001",
@@ -218,7 +228,7 @@ fn apply_refuses_busy_broker_and_active_agents() {
     assert!(error.to_string().contains("broker"), "{error}");
     drop(lock);
 
-    let store = Store::open(&fixture.path).expect("store");
+    let store = agent_run_store::fixture::open(&fixture.path).expect("store");
     retained(
         &store,
         "ag-20260101-000000-0000000002",
@@ -241,7 +251,7 @@ fn unverifiable_home_is_skipped_and_preserved() {
     let fixture = home();
     let root = fixture._temp.path();
     let (runtime, digest, index, history) = seal(root, "legacy", b"precious-bytes\n");
-    let store = Store::open(&fixture.path).expect("store");
+    let store = agent_run_store::fixture::open(&fixture.path).expect("store");
     retained(
         &store,
         "ag-20260101-000000-0000000001",
@@ -297,7 +307,7 @@ fn interrupted_relocation_recovers_forward_and_stays_idempotent() {
     let fixture = home();
     let root = fixture._temp.path();
     let (runtime, digest, index, history) = seal(root, "legacy", b"recoverable-bytes\n");
-    let mut store = Store::open(&fixture.path).expect("store");
+    let mut store = agent_run_store::fixture::open(&fixture.path).expect("store");
     retained(
         &store,
         "ag-20260101-000000-0000000001",
@@ -339,7 +349,7 @@ fn interrupted_relocation_recovers_forward_and_stays_idempotent() {
     let again = storage_admin::recover(&fixture.path).expect("recover again");
     assert_eq!(again["recovered"], 0);
     assert_eq!(again["refused"], 0);
-    let store = Store::open(&fixture.path).expect("store");
+    let store = agent_run_store::fixture::open(&fixture.path).expect("store");
     runtime_storage::verify(&store, &fixture.path, &runtime, &digest).expect("bridge verify");
     let status = storage_admin::status(&fixture.path).expect("status");
     assert_eq!(status["homes"]["entries"][0]["state"], "shared");
@@ -355,7 +365,7 @@ fn foreign_prepared_home_is_refused_not_guessed() {
     let fixture = home();
     let root = fixture._temp.path();
     let (runtime, digest, _index, _history) = seal(root, "legacy", b"foreign-bytes\n");
-    let mut store = Store::open(&fixture.path).expect("store");
+    let mut store = agent_run_store::fixture::open(&fixture.path).expect("store");
     retained(
         &store,
         "ag-20260101-000000-0000000001",
@@ -399,7 +409,7 @@ fn foreign_prepared_home_is_refused_not_guessed() {
         reason.contains("foreign"),
         "the refusal states its reason: {reason}"
     );
-    let store = Store::open(&fixture.path).expect("store");
+    let store = agent_run_store::fixture::open(&fixture.path).expect("store");
     let state = store
         .runtime_storage_layout(&layout.runtime_home)
         .expect("row")
@@ -458,7 +468,7 @@ fn resumed_lineage_is_eligible_and_relocates_once() {
     let fixture = home();
     let root = fixture._temp.path();
     let (runtime, digest, index, history) = seal(root, "lineage", b"lineage-bytes\n");
-    let store = Store::open(&fixture.path).expect("store");
+    let store = agent_run_store::fixture::open(&fixture.path).expect("store");
     let home = runtime.canonicalize().expect("canonical home");
     retained_at(
         &store,
@@ -534,7 +544,7 @@ fn committed(fixture: &Home, name: &str, holders: &[(&str, &str)]) -> PathBuf {
     let root = fixture._temp.path();
     let (runtime, digest, _index, _history) = seal(root, name, format!("{name}\n").as_bytes());
     let runtime = runtime.canonicalize().expect("canonical home");
-    let mut store = Store::open(&fixture.path).expect("store");
+    let mut store = agent_run_store::fixture::open(&fixture.path).expect("store");
     let layout = runtime_storage::plan(
         &store,
         &fixture.path,
@@ -577,7 +587,7 @@ fn repeat_compact_selects_idle_shared_homes_and_keeps_protections() {
     let malformed = committed(&fixture, "malformed", &[("not-an-agent-id", "succeeded")]);
     let (unreadable, digest, _index, _history) =
         seal(fixture._temp.path(), "unreadable", b"unreadable\n");
-    let store = Store::open(&fixture.path).expect("store");
+    let store = agent_run_store::fixture::open(&fixture.path).expect("store");
     retained(
         &store,
         "ag-20260104-000000-0000000004",
@@ -614,7 +624,7 @@ fn repeat_compact_selects_idle_shared_homes_and_keeps_protections() {
 
     // A lost holder is not active, so offline work may proceed — the home
     // must still be excluded from every mutation.
-    let store = Store::open(&fixture.path).expect("store");
+    let store = agent_run_store::fixture::open(&fixture.path).expect("store");
     store
         .conn
         .execute(
