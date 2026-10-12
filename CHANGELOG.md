@@ -4,6 +4,22 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.26.0
+
+- fix(storage)!: route online writes through one bounded resident writer with
+  atomic durable receipts; require exclusive offline authority for schema-30
+  migration and keep normal store opening read-only
+- feat(storage): extract reusable tokio-rusqlite connection execution, bounded
+  admission, cancellation-safe drain, writer leases and transaction scopes
+  into the independent sqlite-access crate
+- fix(runtime): preserve process observation during persistence, move statistics
+  and diagnostics outside terminal transactions, and make deferred failures
+  visible without repeating native actions
+- fix(storage): preserve floating statistics and canonical payload digests across
+  JSON transport; release completed offline locks despite inherited descriptors
+- test(storage): cover contention, outage, replay, ownership, cleanup, migration
+  and resume; verify concurrent producers and independent crate packaging
+
 ## 0.25.1
 
 - fix(supervisor): preserve mandatory process ownership across transient SQLite
