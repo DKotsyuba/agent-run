@@ -285,14 +285,16 @@ async fn busy_over_budget_is_truthful_and_not_replayed() {
     db.close().await.unwrap();
 }
 
-/// Readers observe committed WAL-only rows, refuse writes and never create missing databases.
+/// Readers use a canonical private parent, observe committed WAL-only rows, refuse writes,
+/// never create missing databases, and still reject a Unix leaf symlink.
 #[tokio::test]
 async fn reader_observes_wal_without_write_authority() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("state.db");
+    let home = dir.path().canonicalize().unwrap();
+    let path = home.join("state.db");
     let writer = Connection::open(&path).unwrap();
     writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE items(id INTEGER); INSERT INTO items VALUES(42)").unwrap();
-    assert!(dir.path().join("state.db-wal").metadata().unwrap().len() > 0);
+    assert!(home.join("state.db-wal").metadata().unwrap().len() > 0);
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();
     let db = Database::reader(&path, Duration::from_millis(50), Limits::default()).unwrap();
     let value: i64 = db
@@ -310,9 +312,16 @@ async fn reader_observes_wal_without_write_authority() {
     ));
     db.close().await.unwrap();
     writer.execute_batch("ROLLBACK").unwrap();
-    let missing = dir.path().join("missing.db");
+    let missing = home.join("missing.db");
     assert!(Database::reader(&missing, Duration::ZERO, Limits::default()).is_err());
     assert!(!missing.exists());
+    #[cfg(unix)]
+    {
+        let link = home.join("reader-symlink.db");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(Database::reader(&link, Duration::ZERO, Limits::default()).is_err());
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+    }
 }
 
 /// Construction refuses inconsistent capacities and preexisting transactions before accepting SQL.
