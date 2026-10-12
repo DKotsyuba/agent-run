@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.26.1
+
 - fix(storage)!: deliver the schema-30 bounded resident writer, atomic operation
   receipts and reusable tokio-rusqlite execution through sqlite-access
 - test(pool): observe persisted native identity and atomically published complete
