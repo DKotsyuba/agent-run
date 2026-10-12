@@ -117,6 +117,35 @@ async fn stop(task: tokio::task::JoinHandle<agent_run::Result<()>>) {
     let _ = task.await;
 }
 
+/// Proves both broker sockets and the writer lease have drained after task abort.
+/// Accepted SQL outlives its caller, so cancellation alone is not restart authority.
+/// Only occupied-lock conflicts are retried within the existing five-second drain
+/// allowance; other errors fail immediately. No database writes or signalling occur.
+async fn wait_for_broker_quiescence(home: &Path) {
+    use agent_run_store::writer::{BrokerExclusion, WriterLease};
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let api = home.join("api.sock");
+    let writer = home.join("writer.sock");
+    loop {
+        let probe = BrokerExclusion::acquire(home, &[&api, &writer]).and_then(|exclusion| {
+            WriterLease::acquire_online(home).map(|lease| (exclusion, lease))
+        });
+        match probe {
+            Ok(guards) => {
+                drop(guards);
+                return;
+            }
+            Err(agent_run::Error::Conflict) => {}
+            Err(error) => panic!("broker quiescence failed: {error}"),
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "broker writer did not drain"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// Admits one nonterminal fixture row for wait and long-poll requests.
 fn admitted(home: &tempfile::TempDir) -> agent_run::domain::AgentId {
     let config = agent_run::config::Config::load(home.path()).unwrap();
@@ -192,6 +221,7 @@ async fn python_list_long_poll_does_not_block_an_immediate_read() {
 async fn python_old_owner_cannot_remove_a_replacement_socket() {
     let (home, path, first) = broker().await;
     stop(first).await;
+    wait_for_broker_quiescence(home.path()).await;
     let replacement = tokio::spawn({
         let home = home.path().to_owned();
         let path = path.clone();
