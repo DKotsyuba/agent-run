@@ -94,6 +94,7 @@ pub fn implemented(kind: OpKindRef) -> bool {
             | K::RecordQuotaSnapshot
             | K::ClaimDelivery
             | K::CompleteDelivery
+            | K::PrepareBridgeDelivery
             | K::ReconcileReapedAgent
             | K::ReleaseOrphanedAttempt
             | K::MarkLost
@@ -128,9 +129,10 @@ pub(crate) fn remote_facts(op: &RemoteOp) -> Facts {
     let exec = |id: &AgentId| (Some(id.clone()), None, None);
     let attempt = |id: &AgentId, attempt: &str| (Some(id.clone()), Some(attempt.to_owned()), None);
     match op {
-        R::ClaimDelivery(_) | R::CompleteDelivery(_) | R::PruneCapacitySamples(_) => {
-            (None, None, None)
-        }
+        R::ClaimDelivery(_)
+        | R::CompleteDelivery(_)
+        | R::PrepareBridgeDelivery(_)
+        | R::PruneCapacitySamples(_) => (None, None, None),
         R::ClaimStartup(op) => exec(&op.execution),
         R::RecordSupervisorOwner(op) => exec(&op.execution),
         R::UpdateIdentity(op) => exec(&op.execution),
@@ -389,6 +391,7 @@ pub(crate) fn run_remote(store: &mut Store, op: RemoteOp) -> Result<Value> {
         R::DisableAccount(op) => out(store.disable_account(&op.account)?),
         R::ClaimDelivery(op) => out(store.claim_delivery_lease(&op)?),
         R::CompleteDelivery(op) => out(store.complete_delivery_attempt(&op.completion)?),
+        R::PrepareBridgeDelivery(op) => out(store.prepare_bridge_delivery(&op)?),
         R::PruneCapacitySamples(op) => out(store.prune_capacity_samples(op.retention)?),
 
         R::CancelDelivery(op) => out(store.cancel_delivery(&op.delivery_id)?),

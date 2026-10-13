@@ -139,6 +139,15 @@ CREATE TABLE deliveries (
   UNIQUE (agent_id, terminal_event_seq)
 );
 
+-- Frozen Bridge publication ownership, independent of native delivery proof.
+CREATE TABLE bridge_delivery_intents (
+  delivery_id TEXT PRIMARY KEY REFERENCES deliveries(id) ON DELETE CASCADE,
+  intent_json TEXT CHECK(intent_json IS NULL OR json_valid(intent_json)),
+  custody_receipt_json TEXT CHECK(custody_receipt_json IS NULL OR json_valid(custody_receipt_json)),
+  custody_state TEXT NOT NULL DEFAULT 'pending'
+    CHECK(custody_state IN ('pending','custody_accepted','outcome_unknown'))
+);
+
 CREATE TABLE delivery_attempt_evidence (
   delivery_id TEXT NOT NULL REFERENCES deliveries(id) ON DELETE CASCADE,
   attempt INTEGER NOT NULL CHECK (attempt > 0),
@@ -695,4 +704,4 @@ ALTER TABLE agents ADD COLUMN supervisor_capability_sha256 TEXT
 ALTER TABLE managed_service_generations ADD COLUMN exec_capability_sha256 TEXT
   CHECK (exec_capability_sha256 IS NULL OR length(exec_capability_sha256) = 64);
 
-PRAGMA user_version = 30;
+PRAGMA user_version = 31;

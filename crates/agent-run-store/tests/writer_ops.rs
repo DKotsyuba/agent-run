@@ -48,20 +48,20 @@ fn cancel_envelope(kind: &str) -> WriteEnvelope {
     .unwrap()
 }
 
-/// The inventory has exactly rows 1..=91 with stable, unique wire ids and
+/// The inventory has exactly rows 1..=92 with stable, unique wire ids and
 /// unique snake-case names, and rows 6, 49 and 79 are internal-only.
 #[test]
 fn inventory_is_closed_with_stable_unique_ids() {
     let all = OpKindRef::all();
-    assert_eq!(all.len(), 91);
+    assert_eq!(all.len(), 92);
     for (index, kind) in all.iter().enumerate() {
         assert_eq!(kind.wire_id() as usize, index + 1);
         assert_eq!(OpKindRef::from_wire_id(kind.wire_id()), Some(*kind));
     }
     assert_eq!(OpKindRef::from_wire_id(0), None);
-    assert_eq!(OpKindRef::from_wire_id(92), None);
+    assert_eq!(OpKindRef::from_wire_id(93), None);
     let names: BTreeSet<_> = all.iter().map(|kind| kind.name()).collect();
-    assert_eq!(names.len(), 91);
+    assert_eq!(names.len(), 92);
     assert!(
         names
             .iter()
@@ -73,7 +73,7 @@ fn inventory_is_closed_with_stable_unique_ids() {
         .map(|kind| kind.wire_id())
         .collect();
     assert_eq!(internal, vec![6, 49, 79]);
-    assert_eq!(all.iter().filter(|kind| kind.is_remote()).count(), 48);
+    assert_eq!(all.iter().filter(|kind| kind.is_remote()).count(), 49);
 }
 
 /// The static matrix confines worker rows to Worker, broker rows to Broker
@@ -99,6 +99,7 @@ fn authority_matrix_confines_roles() {
     assert!(!OpKindRef::AdmitStart.permits(&cli));
     assert!(OpKindRef::ClaimDelivery.permits(&cli));
     assert!(OpKindRef::CompleteDelivery.permits(&cli));
+    assert!(OpKindRef::PrepareBridgeDelivery.permits(&cli));
     assert!(!OpKindRef::PruneCapacitySamples.permits(&cli));
     let collector = WriteAuthority::Collector {
         uid: 1,
@@ -118,6 +119,7 @@ fn authority_matrix_confines_roles() {
     for role in [&worker, &collector, &supervisor] {
         assert!(!OpKindRef::ClaimDelivery.permits(role));
         assert!(!OpKindRef::CompleteDelivery.permits(role));
+        assert!(!OpKindRef::PrepareBridgeDelivery.permits(role));
     }
     assert!(OpKindRef::PruneCapacitySamples.permits(&collector));
     assert!(!OpKindRef::ClaimCommand.permits(&WriteAuthority::Broker));

@@ -916,6 +916,9 @@ pub struct ClaimDelivery {
     pub policy: DeliveryPolicySpec,
     /// Whether an attention-capable relay peer was advertised (prepared fs scan).
     pub attention_peer: bool,
+    /// Select Bridge for never-attempted notices atomically with their first lease.
+    #[serde(default)]
+    pub bridge_enabled: bool,
 }
 
 /// Dispatch completion facts of row 53.
@@ -937,6 +940,9 @@ pub struct DeliveryCompletion {
     pub classifier: String,
     /// Persisted bounded evidence.
     pub evidence: Option<Value>,
+    /// Validated Bridge custody receipt, separate from native delivery evidence.
+    #[serde(default)]
+    pub bridge_receipt: Option<Value>,
     /// Prepared policy.
     pub policy: DeliveryPolicySpec,
     /// Completion time.
@@ -948,6 +954,22 @@ pub struct DeliveryCompletion {
 pub struct CompleteDelivery {
     /// Completion facts.
     pub completion: DeliveryCompletion,
+}
+
+/// 92 — freeze Bridge ownership and exact publication before any socket write.
+/// The claim already froze Bridge ownership; only its live lease can freeze content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrepareBridgeDelivery {
+    /// Existing outbox notification identity.
+    pub delivery_id: String,
+    /// Live dispatcher lease owner; other owners cannot transfer this intent.
+    pub owner: String,
+    /// Current owned attempt; crashes before intent preparation never select a new owner.
+    pub attempt: u32,
+    /// Immutable destination/content/IDs without any credential or caller authority.
+    pub intent: agent_run_domain::bridge::BridgeIntent,
+    /// Wall-clock time used only to verify that the lease remains live.
+    pub at: f64,
 }
 
 /// 54 — fail a delivery under its lease (broker).

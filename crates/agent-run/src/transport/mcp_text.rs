@@ -1716,6 +1716,8 @@ fn validate_pool_page(value: &Value) -> Result<()> {
                 | "cancelled"
                 | "expired"
                 | "unknown"
+                | "custody_accepted"
+                | "outcome_unknown"
         )
     ) {
         return Err(shape_error());

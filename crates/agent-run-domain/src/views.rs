@@ -88,6 +88,7 @@ pub struct DeliveryView {
     /// Delivery notification id, when a notice was created.
     pub notification_id: Option<String>,
     /// Durable delivery state name.
+    /// Bridge uses `custody_accepted` or `outcome_unknown`; neither proves native visibility.
     pub state: String,
     /// Number of owned queue attempts.
     pub attempts: u32,

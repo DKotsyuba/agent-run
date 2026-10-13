@@ -140,20 +140,76 @@ impl Default for Capacity {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+/// Retry policy and optional external delivery owner; credentials stay outside TOML.
 pub struct Delivery {
+    /// Positive initial local retry delay in seconds.
     pub retry_base_seconds: f64,
+    /// Positive retry-delay ceiling, at least the base delay.
     pub retry_cap_seconds: f64,
+    /// Maximum local publication attempts; zero imposes no attempt allowance.
     pub max_attempts: u32,
+    /// Historical optional queue executable path retained for config compatibility.
     pub codex_queue_bin: Option<PathBuf>,
+    /// Optional Bridge delivery owner for never-attempted external notices.
+    /// Existing attempted notices retain their original transport and evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bridge: Option<BridgeDelivery>,
 }
 impl Default for Delivery {
+    /// Preserve existing retry behavior and legacy delivery until Bridge is configured.
     fn default() -> Self {
         Self {
             retry_base_seconds: 2.,
             retry_cap_seconds: 60.,
             max_attempts: 0,
             codex_queue_bin: None,
+            bridge: None,
         }
+    }
+}
+
+/// Trusted deployment configuration for delivery-only Bridge publication.
+/// This creates no credential, native caller identity or job admission authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeDelivery {
+    /// Absolute protected native endpoint used for authenticated capabilities.
+    pub registration_socket: PathBuf,
+    /// Absolute protected core endpoint used for publication and status.
+    pub core_socket: PathBuf,
+    /// Absolute owner-only regular credential file; its contents are never logged.
+    pub token_file: PathBuf,
+    /// Trusted Bridge host component, never inferred from a caller or working directory.
+    pub host_id: String,
+    /// Explicit Codex store namespace; absent means Codex destinations are unsupported.
+    pub codex_store: Option<String>,
+    /// Explicit Claude Code store namespace; absent means Claude destinations are unsupported.
+    pub claude_store: Option<String>,
+}
+
+impl BridgeDelivery {
+    /// Validate explicit absolute deployment paths and address components without I/O.
+    /// Empty, control-bearing or oversized components and missing namespaces refuse;
+    /// this neither reads a credential nor grants recipient/native capabilities.
+    pub fn validate(&self) -> Result<()> {
+        if [
+            &self.registration_socket,
+            &self.core_socket,
+            &self.token_file,
+        ]
+        .iter()
+        .any(|path| !path.is_absolute())
+            || self.codex_store.is_none() && self.claude_store.is_none()
+            || std::iter::once(&self.host_id)
+                .chain(self.codex_store.iter())
+                .chain(self.claude_store.iter())
+                .any(|part| {
+                    part.trim().is_empty() || part.len() > 256 || part.chars().any(char::is_control)
+                })
+        {
+            return Err(invalid("invalid delivery.bridge deployment configuration"));
+        }
+        Ok(())
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -485,6 +541,9 @@ impl Config {
             .filter(|r| r.enabled)
             .ok_or_else(|| invalid("runtime is not enabled"))
     }
+    /// Validate configuration bounds and expand existing optional paths relative to
+    /// `home`. Bridge paths must already be absolute; no credential or socket is opened.
+    /// Invalid schemas, bounds, selectors, unknown paths or Bridge fields refuse.
     pub fn validate(&mut self, home: &Path) -> Result<()> {
         if self.schema_version != 1 {
             return Err(invalid("unsupported config schema_version"));
@@ -514,6 +573,9 @@ impl Config {
         }
         if let Some(p) = &mut self.delivery.codex_queue_bin {
             expand(p)?;
+        }
+        if let Some(bridge) = &self.delivery.bridge {
+            bridge.validate()?;
         }
         for (catalog, suffix) in [
             (&mut self.profiles, "profiles"),

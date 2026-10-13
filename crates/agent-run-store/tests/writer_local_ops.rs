@@ -524,6 +524,7 @@ fn delivery_claim_and_completion_follow_the_lease() {
             at: 100.0,
             policy: policy(),
             attention_peer: false,
+            bridge_enabled: false,
         }))
         .result;
     assert_eq!(claim["delivery_id"], "ntf_test");
@@ -541,6 +542,7 @@ fn delivery_claim_and_completion_follow_the_lease() {
                 ambiguous: false,
                 classifier: "queue_accepted".into(),
                 evidence: None,
+                bridge_receipt: None,
                 policy: policy(),
                 at: 101.0,
             },

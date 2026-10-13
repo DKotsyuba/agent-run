@@ -18,6 +18,468 @@ use std::{
 
 mod common;
 
+/// Synthetic authenticated delivery-only capability response; no native qualification.
+fn bridge_capabilities(allowed: bool) -> bridge_sdk::bridge_protocol::Capabilities {
+    use bridge_sdk::bridge_protocol::*;
+    Capabilities {
+        api_version: 1,
+        supported_versions: vec![1],
+        operations: vec!["capabilities".into(), "publish".into(), "status".into()],
+        evidence_variants: vec![],
+        native_contracts: vec![],
+        modes: vec![Mode::Message],
+        policies: vec![PolicyKind::KeepAll],
+        reply_policies: vec![ReplyPolicy::SelfActor],
+        limits: Limits {
+            registration_request_bytes: 524288,
+            core_request_bytes: 524288,
+            response_bytes: 524288,
+            payload_bytes: 65536,
+            metadata_entries: 16,
+            rendered_manifest_bytes: 98304,
+            open_routes: 0,
+            assertions: 0,
+        },
+        grant: ProducerConstraints {
+            allowed_modes: vec![Mode::Message],
+            allowed_policies: vec![PolicyKind::KeepAll],
+            allowed_kinds: vec!["*".into()],
+            reply_policies: vec![ReplyPolicy::SelfActor],
+            direct_address: allowed,
+            native_scopes: vec![],
+        },
+        features: Features {
+            consume_assertion: false,
+            delivery_scopes: false,
+            host_observations: false,
+        },
+        retention: Retention {
+            durable_keys: true,
+            closed_tombstones: true,
+            credential_independent_identity: true,
+        },
+    }
+}
+
+/// Exact synthetic custody for one frozen address publication, with no native acceptance.
+fn bridge_receipt(
+    params: &bridge_sdk::bridge_protocol::PublishParams,
+) -> bridge_sdk::bridge_protocol::EventReceipt {
+    use bridge_sdk::bridge_protocol::*;
+    let Destination::Address { address } = &params.destination else {
+        panic!("delivery-only address expected")
+    };
+    EventReceipt {
+        producer: "agent-run".into(),
+        event_id: params.event_id.clone(),
+        intent_hash: publication_intent_fingerprint(params).unwrap(),
+        envelope_hash: "a".repeat(64),
+        accepted_at_ms: 10,
+        acceptance_seq: 1,
+        destination: FrozenDestination {
+            address: address.clone(),
+            route_key: None,
+            caller_scope: None,
+            destination_scope: None,
+        },
+    }
+}
+
+/// Owner-authorized opt-in native control through the actual outbox/SDK adapter.
+/// Uses a fresh disposable home, an explicit protected config and recipient;
+/// retains only private intent/receipt artifacts, launches no provider engine,
+/// and never reads or changes a production Agent Run home. Ordinary CI skips it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires an owner-authorized temporary Bridge grant and independent native receiver ACK"]
+async fn bridge_live_outbox_probe() {
+    use agent_run_config::config::BridgeDelivery;
+    use bridge_sdk::bridge_protocol::{Host, NativeAddress};
+    let config_path = std::env::var_os("AGENT_RUN_BRIDGE_LIVE_CONFIG")
+        .expect("explicit protected probe configuration required");
+    let config: BridgeDelivery =
+        toml::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+    config.validate().unwrap();
+    let address = NativeAddress::parse(
+        &std::env::var("AGENT_RUN_BRIDGE_LIVE_RECIPIENT")
+            .expect("explicit native test recipient required"),
+    )
+    .unwrap();
+    assert_eq!(address.host, config.host_id);
+    let (transport, store) = match address.harness {
+        Host::Codex => ("codex_queue", config.codex_store.as_ref()),
+        Host::ClaudeCode => ("claude_uds", config.claude_store.as_ref()),
+    };
+    assert_eq!(store, Some(&address.store));
+    let home = common::Home::new();
+    let marker = format!("ARBRIDGE_LIVE_{}", uuid::Uuid::new_v4().simple());
+    let completion = format!("ntf_{marker}_completion");
+    delivery(&home.path, &completion, transport, "pending");
+    let original = std::fs::read_to_string(home.path.join("config.toml")).unwrap();
+    std::fs::write(
+        home.path.join("config.toml"),
+        format!(
+            "{original}\n[delivery.bridge]\n{}",
+            toml::to_string(&config).unwrap()
+        ),
+    )
+    .unwrap();
+    {
+        let connection = fixture_connection(home.path.join("state.db")).unwrap();
+        connection
+            .execute(
+                "UPDATE orchestrator_sessions SET external_session_id=? WHERE id='sess'",
+                [&address.session],
+            )
+            .unwrap();
+        connection.execute("UPDATE agents SET runtime='synthetic-bridge-probe',model='control',task='synthetic transport control'", []).unwrap();
+        let agent = "ag-20260825-120000-0123456789";
+        connection.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at) VALUES('probe-attempt',?,1,'finished','{}',?)", params![agent, now()]).unwrap();
+        let worker = format!("ntf_{marker}_worker");
+        connection.execute("INSERT INTO deliveries(id,agent_id,orchestrator_session_id,state,next_attempt_at) VALUES(?,?,'sess','pending',?)", params![worker, agent, now() - 1.0]).unwrap();
+        connection.execute("INSERT INTO worker_notifications(delivery_id,agent_id,attempt_id,request_id,kind,message,created_at) VALUES(?,?,'probe-attempt',?,'notice',?,?)", params![worker, agent, marker, format!("Synthetic native delivery control {marker}; ACK only, no task approval."), now()]).unwrap();
+        let pool_id = format!(
+            "pool-20261013-000000-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..10]
+        );
+        for (suffix, event_kind) in [
+            ("pool", "pool_completed"),
+            ("attention", "pool_join_needs_action"),
+        ] {
+            let id = format!("ntf_{marker}_{suffix}");
+            connection.execute("INSERT INTO events(agent_id,at,kind,data_json) VALUES(?,?,?,?)", params![agent, now(), event_kind,
+                json!({"pool_id":pool_id,"notice":format!("Synthetic native delivery control {marker}_{suffix}; ACK only, no task approval.")}).to_string()]).unwrap();
+            let event = connection.last_insert_rowid();
+            connection.execute("INSERT INTO deliveries(id,agent_id,orchestrator_session_id,terminal_event_seq,state,next_attempt_at) VALUES(?,?,'sess',?,'pending',?)", params![id, agent, event, now() - 1.0]).unwrap();
+            if suffix == "pool" {
+                connection.execute("INSERT INTO pools(id,request_namespace,request_id,request_sha256,orchestrator_session_id,goal,acceptance_json,state,roster_revision,completed_at,completion_delivery_id,created_at) VALUES(?,'synthetic-probe',?,?,'sess','synthetic transport control','[]','completed',1,?,?,?)", params![pool_id, marker, "a".repeat(64), now(), id, now()]).unwrap();
+            }
+        }
+    }
+    let result = dispatch_with_batch(&home.path, 4).await.unwrap();
+    assert_eq!(
+        result.transferred, 4,
+        "all four probe intentions need exact custody"
+    );
+    assert_eq!(
+        result.delivered, 0,
+        "custody must not invent native receipt"
+    );
+    let connection = fixture_connection(home.path.join("state.db")).unwrap();
+    let mut statement = connection.prepare("SELECT intent_json,custody_receipt_json FROM bridge_delivery_intents ORDER BY delivery_id").unwrap();
+    let facts: Vec<Value> = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).unwrap()
+        .map(|row| { let (intent, receipt) = row.unwrap(); let intent: agent_run_domain::bridge::BridgeIntent = serde_json::from_str(&intent).unwrap();
+            let receipt: Value = serde_json::from_str(&receipt).unwrap(); json!({"event_id":intent.event_id,"kind":intent.kind,"intent_hash":intent.intent_hash,"receipt":receipt}) }).collect();
+    std::fs::write(
+        home.path.join("live-custody.json"),
+        serde_json::to_vec_pretty(&json!({"marker":marker,"events":facts})).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        dispatch_with_batch(&home.path, 4).await.unwrap().claimed,
+        0,
+        "released intents cannot publish again"
+    );
+    // Fixture-only acknowledgement-loss injection: real recovery must read the
+    // same four authoritative custody receipts without another publication.
+    connection.execute("UPDATE bridge_delivery_intents SET custody_state='outcome_unknown',custody_receipt_json=NULL", []).unwrap();
+    connection.execute("UPDATE deliveries SET state='retry_wait',next_attempt_at=?,lease_owner=NULL,lease_until=NULL", [now() - 1.0]).unwrap();
+    let recovered = dispatch_with_batch(&home.path, 4).await.unwrap();
+    assert_eq!(recovered.transferred, 4);
+    assert_eq!(recovered.delivered, 0);
+    assert_eq!(dispatch_with_batch(&home.path, 4).await.unwrap().claimed, 0);
+    std::fs::write(
+        home.path.join("live-recovery.json"),
+        serde_json::to_vec_pretty(&json!({"same_events_recovered":4,"new_publications":0}))
+            .unwrap(),
+    )
+    .unwrap();
+    drop(statement);
+    drop(connection);
+    let retained = home.temp.keep();
+    println!("probe sender retained at {}", retained.display());
+}
+
+/// Lost custody acknowledgements survive a refusal and configuration change,
+/// then recover the identical event. Local custody is never native delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_delivery_lost_ack_keeps_single_owner_and_frozen_intent() {
+    use bridge_sdk::bridge_protocol::*;
+    use std::{
+        os::unix::fs::PermissionsExt,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicU8, Ordering},
+        },
+    };
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::UnixListener,
+    };
+    let home = common::Home::new();
+    let socket = home.path.join("bridge.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let token = home.path.join("bridge-token");
+    std::fs::write(&token, "synthetic-only-producer-credential").unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let configuration = || {
+        format!(
+            "{}\n[delivery.bridge]\nregistration_socket={:?}\ncore_socket={:?}\ntoken_file={:?}\nhost_id='local'\ncodex_store='codex-main'\n",
+            std::fs::read_to_string(home.path.join("config.toml")).unwrap(),
+            socket,
+            socket,
+            token
+        )
+    };
+    let configured = configuration();
+    std::fs::write(home.path.join("config.toml"), &configured).unwrap();
+    delivery(&home.path, "ntf_bridge", "codex_queue", "pending");
+    let publications = Arc::new(Mutex::new(Vec::<(String, PublishParams)>::new()));
+    let allowed = Arc::new(AtomicBool::new(true));
+    let visible = Arc::new(AtomicBool::new(true));
+    let corrupt_receipt = Arc::new(AtomicU8::new(0));
+    let observed = publications.clone();
+    let grant = allowed.clone();
+    let history = visible.clone();
+    let corruption = corrupt_receipt.clone();
+    let service = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let request = decode_request(line.trim_end().as_bytes()).unwrap();
+            let result = match &request.operation {
+                Operation::Capabilities(_) => {
+                    OperationResult::Capabilities(bridge_capabilities(grant.load(Ordering::SeqCst)))
+                }
+                Operation::Publish(params) => {
+                    let attempts = {
+                        let mut stored = observed.lock().unwrap();
+                        if let Some((id, old)) = stored.first() {
+                            assert_eq!(id, &request.request_id);
+                            assert_eq!(old, params);
+                        }
+                        stored.push((request.request_id.clone(), params.clone()));
+                        stored.len()
+                    };
+                    if attempts <= 2 {
+                        continue;
+                    } // Accept once, deliberately lose both SDK acknowledgements.
+                    OperationResult::Publish(PublishResult {
+                        replayed: true,
+                        receipt: bridge_receipt(params),
+                    })
+                }
+                Operation::Status(_) => OperationResult::Status(StatusResult::Event {
+                    event: history.load(Ordering::SeqCst).then(|| EventStatus {
+                        receipt: {
+                            let mut receipt = bridge_receipt(&observed.lock().unwrap()[0].1);
+                            match corruption.load(Ordering::SeqCst) {
+                                1 => receipt.producer = "other-producer".into(),
+                                2 => receipt.intent_hash = "b".repeat(64),
+                                _ => {}
+                            }
+                            receipt
+                        },
+                        custody_state: CustodyState::Pending,
+                        delivery: DeliveryStatus {
+                            delivery: DeliveryState::Unhanded,
+                            attempt_state: None,
+                            effective_mode: None,
+                            note: None,
+                            attempts_made: 0,
+                            attempt: None,
+                            tiers: vec![],
+                            incident: None,
+                            hold_reason: None,
+                            blocked_by: None,
+                        },
+                    }),
+                }),
+                _ => panic!("fixture received unexpected operation"),
+            };
+            let mut response = encode_response(&Response::ok(&request.request_id, result)).unwrap();
+            response.push(b'\n');
+            reader.get_mut().write_all(&response).await.unwrap();
+        }
+    });
+    let first = dispatch_with_batch(&home.path, 1).await.unwrap();
+    assert_eq!(first.ambiguous, 1);
+    assert_eq!(first.delivered, 0);
+    assert_eq!(first.transferred, 0);
+    let state = || {
+        agent_run_store::delivery::public_state_on(
+            &fixture_connection(home.path.join("state.db")).unwrap(),
+            "ntf_bridge",
+            "retry_wait",
+        )
+        .unwrap()
+    };
+    assert_eq!(state(), "outcome_unknown");
+    assert_eq!(publications.lock().unwrap().len(), 2);
+    // No visible historical record cannot erase possible committed custody or permit republishing.
+    allowed.store(false, Ordering::SeqCst);
+    visible.store(false, Ordering::SeqCst);
+    make_due(&home.path, "ntf_bridge");
+    let refused = dispatch_with_batch(&home.path, 1).await.unwrap();
+    assert_eq!(refused.ambiguous, 1);
+    assert_eq!(state(), "outcome_unknown");
+    assert_eq!(publications.lock().unwrap().len(), 2);
+    // Another deployment/publisher must not even receive a connection for the old unknown intent.
+    let other_socket = home.path.join("other.sock");
+    let other_listener = UnixListener::bind(&other_socket).unwrap();
+    std::fs::write(
+        home.path.join("config.toml"),
+        configured.replace(socket.to_str().unwrap(), other_socket.to_str().unwrap()),
+    )
+    .unwrap();
+    make_due(&home.path, "ntf_bridge");
+    let held = dispatch_with_batch(&home.path, 1).await.unwrap();
+    assert_eq!(held.ambiguous, 1);
+    assert_eq!(state(), "outcome_unknown");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), other_listener.accept())
+            .await
+            .is_err()
+    );
+    assert_eq!(publications.lock().unwrap().len(), 2);
+    // A same-event status with foreign producer or changed intent hash cannot release custody.
+    std::fs::write(home.path.join("config.toml"), &configured).unwrap();
+    visible.store(true, Ordering::SeqCst);
+    for defect in [1, 2] {
+        corrupt_receipt.store(defect, Ordering::SeqCst);
+        make_due(&home.path, "ntf_bridge");
+        let rejected = dispatch_with_batch(&home.path, 1).await.unwrap();
+        assert_eq!(rejected.transferred, 0);
+        assert_eq!(state(), "outcome_unknown");
+        assert_eq!(publications.lock().unwrap().len(), 2);
+    }
+    corrupt_receipt.store(0, Ordering::SeqCst);
+    // Same-owner history survives both new-policy tightening and a trusted same-publisher key rotation.
+    std::fs::write(&token, "synthetic-rotated-same-publisher-credential").unwrap();
+    std::fs::write(
+        home.path.join("config.toml"),
+        configured.replace("codex-main", "changed-store"),
+    )
+    .unwrap();
+    make_due(&home.path, "ntf_bridge");
+    let restored = dispatch_with_batch(&home.path, 1).await.unwrap();
+    assert_eq!(restored.transferred, 1);
+    assert_eq!(restored.delivered, 0);
+    assert_eq!(state(), "custody_accepted");
+    assert_eq!(publications.lock().unwrap().len(), 2);
+    assert_eq!(
+        publications.lock().unwrap()[0].1.destination,
+        Destination::Address {
+            address: "local/codex/codex-main/thread".into()
+        }
+    );
+    assert_eq!(dispatch_with_batch(&home.path, 1).await.unwrap().claimed, 0);
+    let connection = fixture_connection(home.path.join("state.db")).unwrap();
+    let receipt: String = connection.query_row("SELECT custody_receipt_json FROM bridge_delivery_intents WHERE delivery_id='ntf_bridge'", [], |row| row.get(0)).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&receipt).unwrap()["acceptance_seq"],
+        1
+    );
+    let diagnostic = connection.query_row("SELECT evidence_json FROM delivery_attempt_evidence WHERE delivery_id='ntf_bridge' ORDER BY attempt DESC LIMIT 1", [], |row| row.get::<_, String>(0)).unwrap();
+    assert!(!diagnostic.contains("synthetic-only-producer-credential"));
+    assert!(!diagnostic.contains("agent-run/completion"));
+    assert!(!diagnostic.contains("codex-main/thread"));
+    service.abort();
+    let _ = service.await;
+}
+
+/// Existing attempted native effects never become a new Bridge publication.
+#[tokio::test]
+async fn bridge_cutover_retains_attempted_legacy_owner() {
+    let home = common::Home::new();
+    let text = std::fs::read_to_string(home.path.join("config.toml")).unwrap();
+    std::fs::write(home.path.join("config.toml"), format!("{text}\n[delivery.bridge]\nregistration_socket='/not-used/a.sock'\ncore_socket='/not-used/c.sock'\ntoken_file='/not-used/token'\nhost_id='local'\ncodex_store='codex-main'\n")).unwrap();
+    delivery(&home.path, "ntf_old", "codex_queue", "retry_wait");
+    let connection = fixture_connection(home.path.join("state.db")).unwrap();
+    connection
+        .execute("UPDATE deliveries SET attempts=1 WHERE id='ntf_old'", [])
+        .unwrap();
+    let outcome = dispatch_with_batch(&home.path, 1).await.unwrap();
+    assert_eq!(outcome.transferred, 0);
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM bridge_delivery_intents", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT last_error FROM deliveries WHERE id='ntf_old'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "relay_ambiguous"
+    );
+}
+
+/// A first-lease crash before payload preparation retains Bridge ownership on
+/// both harnesses, even when the current configuration no longer enables Bridge.
+#[tokio::test]
+async fn bridge_lease_crash_before_prepare_cannot_fall_back_to_native() {
+    for transport in ["codex_queue", "claude_uds"] {
+        let home = common::Home::new();
+        delivery(&home.path, "ntf_crash", transport, "pending");
+        let mut store = home.store();
+        let claimed = store
+            .claim_delivery_lease(&agent_run_store::ops::ClaimDelivery {
+                owner: "crashed-owner".into(),
+                at: now(),
+                attention_peer: false,
+                bridge_enabled: true,
+                policy: agent_run_store::ops::DeliveryPolicySpec {
+                    retry_base_seconds: 2.0,
+                    retry_cap_seconds: 60.0,
+                    max_attempts: 0,
+                    lease_seconds: 30.0,
+                },
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed["bridge_owned"], true);
+        assert!(claimed["bridge_intent"].is_null());
+        store
+            .conn
+            .execute(
+                "UPDATE deliveries SET lease_until=? WHERE id='ntf_crash'",
+                [now() - 1.0],
+            )
+            .unwrap();
+        drop(store);
+        let dispatched = dispatch_with_batch(&home.path, 1).await.unwrap();
+        assert_eq!(dispatched.delivered, 0);
+        assert_eq!(dispatched.retried, 1);
+        let connection = fixture_connection(home.path.join("state.db")).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT last_error FROM deliveries WHERE id='ntf_crash'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "bridge_unconfigured"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM bridge_delivery_intents", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+    }
+}
+
 /// An isolated child copy of this test binary that is killed and reaped on
 /// drop, so a parent panic, timeout, or cancelled case can never leave it
 /// running. The child receives a fresh private fixture home and the

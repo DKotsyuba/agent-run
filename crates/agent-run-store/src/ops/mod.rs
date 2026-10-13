@@ -217,6 +217,7 @@ inventory! {
     89 CommitRuntimeLayout "commit_runtime_layout" R N n;
     90 RemoveRuntimeLayout "remove_runtime_layout" L B n;
     91 CaptureIncident "capture_incident" L B n;
+    92 PrepareBridgeDelivery "prepare_bridge_delivery" R N n;
 }
 
 /// Seals one payload and binds it to its inventory row and typed output.
@@ -286,6 +287,7 @@ op! {
     BindPool => String;
     ClaimDelivery => Option<Value>;
     CompleteDelivery => String;
+    PrepareBridgeDelivery => agent_run_domain::bridge::BridgeIntent;
     FailDelivery => ();
     RetryDelivery => f64;
     CancelDelivery => bool;
@@ -398,6 +400,7 @@ op_enum! {
         BindPool,
         ClaimDelivery,
         CompleteDelivery,
+        PrepareBridgeDelivery,
         PruneCapacitySamples,
         CancelDelivery,
         BootstrapServiceProcess,
@@ -565,6 +568,7 @@ impl OpKindRef {
             }
             Self::ClaimDelivery
             | Self::CompleteDelivery
+            | Self::PrepareBridgeDelivery
             | Self::EnqueueCommand
             | Self::BindPool
             | Self::CancelDelivery

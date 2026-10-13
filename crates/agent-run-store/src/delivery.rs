@@ -509,6 +509,40 @@ pub(crate) fn latest_on(conn: &Connection, delivery_id: &str) -> Result<Option<V
 }
 
 impl Store<'_> {
+    /// Freeze content under an already selected Bridge owner's live lease.
+    /// An identical stored intention is returned; changes conflict. No native I/O
+    /// occurs; possible-I/O uncertainty is fenced before returning. Neither a
+    /// historical lease nor another owner can prepare it.
+    pub fn prepare_bridge_delivery(
+        &mut self,
+        op: &crate::ops::PrepareBridgeDelivery,
+    ) -> Result<agent_run_domain::bridge::BridgeIntent> {
+        if !op.at.is_finite() || op.intent.message.len() > 65536 {
+            return Err(invalid("invalid Bridge publication intention"));
+        }
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
+        let stored: Option<Option<String>> = tx.query_row(
+            "SELECT b.intent_json FROM bridge_delivery_intents b JOIN deliveries d ON d.id=b.delivery_id WHERE d.id=? AND d.state='sending' AND d.lease_owner=? AND d.attempts=? AND d.lease_until>?",
+            params![op.delivery_id, op.owner, op.attempt, op.at], |row| row.get(0),
+        ).optional()?;
+        let Some(stored) = stored else {
+            return Err(invalid("Bridge publication lease is not owned"));
+        };
+        if let Some(stored) = stored {
+            let existing: agent_run_domain::bridge::BridgeIntent = serde_json::from_str(&stored)?;
+            if existing != op.intent {
+                return Err(crate::Error::Conflict);
+            }
+        } else {
+            tx.execute("UPDATE bridge_delivery_intents SET intent_json=? WHERE delivery_id=? AND intent_json IS NULL",
+                params![serde_json::to_string(&op.intent)?, op.delivery_id])?;
+        }
+        // Fence possible socket I/O durably before it starts; a crash or cancelled
+        // lease cannot later turn a missing acknowledgement into "never sent".
+        tx.execute("UPDATE bridge_delivery_intents SET custody_state='outcome_unknown' WHERE delivery_id=? AND custody_state!='custody_accepted'", [&op.delivery_id])?;
+        tx.commit()?;
+        Ok(op.intent.clone())
+    }
     /// Cancels a nonterminal completion delivery and reports whether it changed state.
     ///
     /// The caller supplies one nonblank durable delivery identifier. Delivered and
@@ -783,12 +817,18 @@ impl Store<'_> {
             agent_run_domain::domain::OrchestratorRef::canonical_transport_name(&transport)
                 .map(str::to_owned)
                 .unwrap_or(transport);
+        let existing_bridge: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bridge_delivery_intents WHERE delivery_id=?)",
+            [&delivery_id],
+            |row| row.get(0),
+        )?;
+        let bridge_owner = existing_bridge || attempts == 0 && op.bridge_enabled;
         let attention: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM events e JOIN deliveries d ON d.terminal_event_seq=e.seq WHERE d.id=? AND e.kind='pool_join_needs_action')",
             [&delivery_id],
             |row| row.get(0),
         )?;
-        if transport == "codex_queue" && attention && !op.attention_peer {
+        if transport == "codex_queue" && attention && !op.attention_peer && !bridge_owner {
             tx.execute(
                 "UPDATE deliveries SET state='retry_wait',next_attempt_at=?,last_error='relay_v5_required' WHERE id=?",
                 params![
@@ -799,7 +839,10 @@ impl Store<'_> {
             tx.commit()?;
             return Ok(None);
         }
-        if transport == "claude_uds" && attempts > 0 {
+        if !existing_bridge
+            && attempts > 0
+            && (transport == "claude_uds" || op.bridge_enabled && transport == "codex_queue")
+        {
             let last: Option<String> = tx
                 .query_row(
                     "SELECT json_extract(evidence_json,'$.classifier') FROM delivery_attempt_evidence WHERE delivery_id=? AND attempt=?",
@@ -809,8 +852,14 @@ impl Store<'_> {
                 .optional()?
                 .flatten();
             let classifier = match last.as_deref() {
-                Some(known @ ("uds_unconfirmed" | "uds_ambiguous")) => Some(known),
-                None => Some("uds_unconfirmed"),
+                Some(known @ ("uds_unconfirmed" | "uds_ambiguous" | "relay_ambiguous")) => {
+                    Some(known)
+                }
+                None => Some(if transport == "claude_uds" {
+                    "uds_unconfirmed"
+                } else {
+                    "relay_ambiguous"
+                }),
                 Some(_) => None,
             };
             if let Some(classifier) = classifier {
@@ -837,11 +886,29 @@ impl Store<'_> {
         let attempt = attempts
             .checked_add(1)
             .ok_or_else(|| invalid("delivery attempt counter overflow"))?;
+        if attempts == 0 && op.bridge_enabled {
+            tx.execute(
+                "INSERT OR IGNORE INTO bridge_delivery_intents(delivery_id) VALUES(?)",
+                [&delivery_id],
+            )?;
+        }
+        let bridge: Option<(Option<String>, String)> = tx
+            .query_row(
+                "SELECT intent_json,custody_state FROM bridge_delivery_intents WHERE delivery_id=?",
+                [&delivery_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
         let updated = tx.execute(
             "UPDATE deliveries SET state='sending',attempts=?,lease_owner=?,lease_until=?,next_attempt_at=NULL \
              WHERE id=? AND ((state IN ('pending','retry_wait') AND COALESCE(next_attempt_at,0)<=?5) OR (state='sending' AND lease_until<=?5))",
             params![attempt, op.owner, time + lease, delivery_id, time],
         )?;
+        let bridge_intent = bridge
+            .as_ref()
+            .and_then(|(intent, _)| intent.as_deref())
+            .map(serde_json::from_str::<Value>)
+            .transpose()?;
         tx.commit()?;
         Ok((updated == 1).then(|| {
             json!({
@@ -851,6 +918,9 @@ impl Store<'_> {
                 "transport": transport,
                 "session": session,
                 "payload": payload,
+                "bridge_owned": bridge.is_some(),
+                "bridge_intent": bridge_intent,
+                "bridge_unknown": bridge.as_ref().is_some_and(|(_, state)| state == "outcome_unknown"),
             })
         }))
     }
@@ -886,7 +956,15 @@ impl Store<'_> {
                 "uds_unconfirmed" | "uds_ambiguous"
             );
         let failed = !done.accepted
-            && (exhausted || possibly_sent || done.classifier == "unsupported_transport");
+            && (exhausted
+                || possibly_sent
+                || matches!(
+                    done.classifier.as_str(),
+                    "unsupported_transport"
+                        | "bridge_unsupported"
+                        | "bridge_invalid"
+                        | "bridge_refused"
+                ));
         let state = if done.accepted {
             "delivered"
         } else if failed {
@@ -900,8 +978,10 @@ impl Store<'_> {
                     * 2f64.powi(done.attempt.saturating_sub(1).min(20) as i32))
                 .min(policy.retry_cap_seconds)
         });
-        if matches!(done.transport.as_str(), "codex_queue" | "claude_uds")
-            && let Some(evidence) = &done.evidence
+        if matches!(
+            done.transport.as_str(),
+            "codex_queue" | "claude_uds" | "bridge"
+        ) && let Some(evidence) = &done.evidence
         {
             let text = serde_json::to_string(evidence)?;
             if text.len() > MAX_EVIDENCE_BYTES {
@@ -911,6 +991,41 @@ impl Store<'_> {
                 "INSERT OR IGNORE INTO delivery_attempt_evidence(delivery_id,attempt,recorded_at,evidence_json) VALUES(?,?,?,?)",
                 params![done.delivery_id, done.attempt, done.at, text],
             )?;
+        }
+        if done.transport == "bridge" {
+            if done.accepted {
+                let receipt = done
+                    .bridge_receipt
+                    .as_ref()
+                    .ok_or_else(|| invalid("Bridge custody receipt missing"))?;
+                let intent: String = tx.query_row(
+                    "SELECT intent_json FROM bridge_delivery_intents WHERE delivery_id=?",
+                    [&done.delivery_id],
+                    |row| row.get(0),
+                )?;
+                let intent: agent_run_domain::bridge::BridgeIntent = serde_json::from_str(&intent)?;
+                if receipt["event_id"].as_str() != Some(intent.event_id.as_str())
+                    || receipt["destination"]["address"].as_str() != Some(intent.address.as_str())
+                    || receipt["intent_hash"].as_str() != Some(intent.intent_hash.as_str())
+                    || receipt["producer"].as_str() != Some(intent.owner.producer.as_str())
+                    || !receipt["destination"]["route_key"].is_null()
+                    || !receipt["destination"]["caller_scope"].is_null()
+                    || !receipt["destination"]["destination_scope"].is_null()
+                    || receipt["acceptance_seq"]
+                        .as_u64()
+                        .is_none_or(|seq| seq == 0)
+                {
+                    return Err(invalid(
+                        "Bridge custody receipt does not match frozen intention",
+                    ));
+                }
+                tx.execute("UPDATE bridge_delivery_intents SET custody_state='custody_accepted',custody_receipt_json=? WHERE delivery_id=?",
+                    params![serde_json::to_string(receipt)?, done.delivery_id])?;
+            } else if done.ambiguous {
+                tx.execute("UPDATE bridge_delivery_intents SET custody_state='outcome_unknown' WHERE delivery_id=? AND custody_state!='custody_accepted'", [&done.delivery_id])?;
+            } else {
+                tx.execute("UPDATE bridge_delivery_intents SET custody_state='pending' WHERE delivery_id=? AND custody_state!='custody_accepted'", [&done.delivery_id])?;
+            }
         }
         tx.execute(
             "UPDATE deliveries SET state=?,lease_owner=NULL,lease_until=NULL,next_attempt_at=?,last_error=?,ambiguous_result=MAX(ambiguous_result,?) WHERE id=?",
@@ -925,4 +1040,27 @@ impl Store<'_> {
         tx.commit()?;
         Ok(state.to_owned())
     }
+}
+
+/// Project local publication progress without claiming native delivery.
+/// Pending Bridge ownership keeps the local schedule state; custody and uncertainty
+/// override it. Historical native rows remain unchanged; cancellation cannot
+/// erase a possibly committed Bridge effect.
+pub fn public_state_on(
+    conn: &rusqlite::Connection,
+    delivery_id: &str,
+    local_state: &str,
+) -> Result<String> {
+    let state: Option<String> = conn
+        .query_row(
+            "SELECT custody_state FROM bridge_delivery_intents WHERE delivery_id=?",
+            [delivery_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(match state.as_deref() {
+        Some("custody_accepted") => "custody_accepted".into(),
+        Some("outcome_unknown") => "outcome_unknown".into(),
+        _ => local_state.to_owned(),
+    })
 }

@@ -1445,6 +1445,7 @@ impl Store<'_> {
         ) = d
         {
             let evidence=self.conn.query_row("SELECT evidence_json FROM delivery_attempt_evidence WHERE delivery_id=? ORDER BY attempt DESC LIMIT 1",[&did],|r|r.get::<_,String>(0)).optional()?;
+            let state = delivery::public_state_on(&self.conn, &did, &state)?;
             (
                 Some(did),
                 state,
@@ -1571,6 +1572,15 @@ fn safe_evidence(raw: &Value) -> Option<Value> {
         "uds_receipt_refused",
         "unsupported_transport",
         "delivery_expired",
+        "bridge_custody_accepted",
+        "bridge_outcome_unknown",
+        "bridge_unconfigured",
+        "bridge_unavailable",
+        "bridge_forbidden",
+        "bridge_unsupported",
+        "bridge_invalid",
+        "bridge_refused",
+        "bridge_owner_changed",
     ]
     .contains(&classifier)
     {
