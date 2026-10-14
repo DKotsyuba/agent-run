@@ -337,13 +337,14 @@ mod tests {
             message: "reviewed".into(),
         };
         let home = tempfile::tempdir().unwrap();
-        agent_run_platform::fs::private_dir(home.path()).unwrap();
-        let token = home.path().join("token");
+        let directory = home.path().canonicalize().unwrap();
+        agent_run_platform::fs::private_dir(&directory).unwrap();
+        let token = directory.join("token");
         std::fs::write(&token, "synthetic-private-producer-credential").unwrap();
         std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
         let config = BridgeDelivery {
-            registration_socket: home.path().join("a.sock"),
-            core_socket: home.path().join("c.sock"),
+            registration_socket: directory.join("a.sock"),
+            core_socket: directory.join("c.sock"),
             token_file: token,
             host_id: "host/part".into(),
             codex_store: Some("store%name".into()),
@@ -415,13 +416,14 @@ mod tests {
     #[test]
     fn credential_reader_refuses_unprotected_and_symlinked_files() {
         let home = tempfile::tempdir().unwrap();
-        agent_run_platform::fs::private_dir(home.path()).unwrap();
-        let token = home.path().join("token");
+        let directory = home.path().canonicalize().unwrap();
+        agent_run_platform::fs::private_dir(&directory).unwrap();
+        let token = directory.join("token");
         std::fs::write(&token, "synthetic-private-producer-credential").unwrap();
         std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
         let config = BridgeDelivery {
-            registration_socket: home.path().join("a.sock"),
-            core_socket: home.path().join("c.sock"),
+            registration_socket: directory.join("a.sock"),
+            core_socket: directory.join("c.sock"),
             token_file: token.clone(),
             host_id: "local".into(),
             codex_store: Some("codex-main".into()),
@@ -431,7 +433,7 @@ mod tests {
         std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o644)).unwrap();
         let error = client(&config).unwrap_err();
         assert!(!format!("{error:?}").contains("synthetic-private-producer-credential"));
-        std::fs::rename(&token, home.path().join("real-token")).unwrap();
+        std::fs::rename(&token, directory.join("real-token")).unwrap();
         std::os::unix::fs::symlink("real-token", &token).unwrap();
         assert!(client(&config).is_err());
     }
