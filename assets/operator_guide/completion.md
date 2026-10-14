@@ -37,32 +37,32 @@ its exact execution; they never guess the latest run. CLI `start --wait` uses
 the same receipt. Invalid or missing receipts cannot bind a newer execution.
 
 Legacy execution selectors remain accepted for existing clients but are hidden
-from discovery and help. Private v4 delivery envelopes retain execution IDs for
+from discovery and help. Frozen notice payloads retain execution IDs for
 validation; rendered completion and worker notices show only the stable ID.
 Older exact-ID hook payloads retain their original binding behavior.
 
-Reconnect MCP clients together with the broker upgrade so the renderer and
-binding hook agree on the receipt format. Schema 29 adds explicit-completion
-state; the stable-ID contract continues to retain separate execution records.
+Reconnect MCP clients with the broker upgrade so binding and rendering agree.
 
-## Delivery transport and receiver policy
+## Bridge delivery and receiver policy
 
-Explicit orchestrator references accept `codex_queue` and `claude_uds`, or
-their aliases `codex` and `claude`. New session rows use canonical names;
-historical bindings retain their row identity and accept equivalent aliases
-for the same exact external chat. Unknown names fail validation before admission.
+Bridge is the sole sender. Configure `delivery.bridge` with protected sockets,
+a dedicated token and explicit host/store namespaces. Bindings accept
+`codex_queue`/`claude_uds` or `codex`/`claude`, solely as destination identifiers.
+New rows use canonical names; equivalent aliases reuse the exact historical
+binding. Unknown names fail before admission.
 
-Binding identifies the destination; it does not override the receiver's inbound
-message policy. Claude Code can hold peer messages in `bypassPermissions` mode
-when no explicit `crossSessionInbound` policy is configured. Agent Run does not
-change that policy or assert a fabricated sender permission mode. The operator
-must review the receiver's inbound policy when messages remain held.
+Binding proves a destination, not a configured or available notification route.
+Without Bridge configuration, notices stay durable with `bridge_unconfigured`,
+retrying no more often than once per 60 seconds without exhaustion. Domain
+outcomes and running work remain intact. MCP runs directly without a Node frontend.
+Bridge owns native dispatch, inbound policy and recipient holds.
 
-Claude Code may queue an immediately accepted message without returning a
-correlated receipt. `uds_unconfirmed` therefore means that receipt was absent,
-not proof that the chat never received the message. Agent Run does not blindly
-resend a possibly accepted notice. Verify the recipient's actual conversation
-before manually retrying or treating delivery as complete.
+`custody_accepted` proves publication custody, not native acceptance, model visibility,
+task success or cleanup. `outcome_unknown` permits only status reconciliation of the
+original frozen event and owner; missing history never authorizes republishing.
+Previously attempted native rows are never sent through Bridge. Historical
+accepted facts remain readable; unresolved attempts are held with
+`legacy_delivery_held`, retaining immutable evidence for explicit review.
 
 ## Cooperative pools
 
@@ -79,7 +79,7 @@ its current-work summary with the exact broker-issued ACK `request_id`. Queueing
 Claude writes and Codex transport acceptance do not prove awareness. Pending seats
 cannot vote or complete the pool. Ended or unconfirmed joins show `needs_action`;
 recover an active worker using existing context/steer and the same challenge. Executions have no lifetime limit. A distinct broker attention uses the existing outbox;
-Codex requires v5 support, while ordinary v4 notices continue. No join action
+All external notice kinds use the same Bridge Message/KeepAll route. No join action
 restarts or cancels the original work. Members talk through private
 pool tools they receive automatically; you can `pool_post` guidance (stamped as
 from you, never changing goal or grants), read `pool`, and `pool_replace` a

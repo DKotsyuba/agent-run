@@ -48,20 +48,29 @@ fn cancel_envelope(kind: &str) -> WriteEnvelope {
     .unwrap()
 }
 
-/// The inventory has exactly rows 1..=92 with stable, unique wire ids and
+/// The inventory has 89 active rows with retired ids 54, 55 and 58 with stable, unique wire ids and
 /// unique snake-case names, and rows 6, 49 and 79 are internal-only.
 #[test]
 fn inventory_is_closed_with_stable_unique_ids() {
     let all = OpKindRef::all();
-    assert_eq!(all.len(), 92);
+    assert_eq!(all.len(), 89);
     for (index, kind) in all.iter().enumerate() {
-        assert_eq!(kind.wire_id() as usize, index + 1);
+        assert_eq!(
+            kind.wire_id() as usize,
+            (1..=92)
+                .filter(|id| ![54, 55, 58].contains(id))
+                .nth(index)
+                .unwrap()
+        );
         assert_eq!(OpKindRef::from_wire_id(kind.wire_id()), Some(*kind));
     }
     assert_eq!(OpKindRef::from_wire_id(0), None);
     assert_eq!(OpKindRef::from_wire_id(93), None);
+    for retired in [54, 55, 58] {
+        assert_eq!(OpKindRef::from_wire_id(retired), None);
+    }
     let names: BTreeSet<_> = all.iter().map(|kind| kind.name()).collect();
-    assert_eq!(names.len(), 92);
+    assert_eq!(names.len(), 89);
     assert!(
         names
             .iter()

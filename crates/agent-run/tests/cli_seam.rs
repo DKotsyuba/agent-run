@@ -952,70 +952,49 @@ async fn modern_discover_advertises_2026_07_28() {
     assert!(result["cacheScope"].is_string(), "{reply}");
 }
 
-/// Proves production MCP startup replaces its process image with the configured frontend.
+/// Host-supplied legacy carrier variables cannot launch a Node frontend or alter MCP protocol.
 #[test]
-fn test_mcp_exec_preserves_pid_and_passes_exact_arguments() {
-    let temp = tempdir().unwrap();
-    let frontend = temp.path().join("frontend");
-    let pid_file = temp.path().join("pid");
-    let args_file = temp.path().join("args");
-    let pipe = temp.path().join("native.sock");
+fn mcp_ignores_removed_native_carrier_capabilities() {
+    use std::io::Write as _;
+    let home = tempdir().unwrap();
+    let marker = home.path().join("frontend-ran");
+    let frontend = home.path().join("frontend");
     fs::write(
         &frontend,
-        "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$PID_FILE\"\nprintf '%s\\n' \"$@\" > \"$ARGS_FILE\"\n",
+        format!("#!/bin/sh\ntouch {:?}\nexit 99\n", marker),
     )
     .unwrap();
     fs::set_permissions(&frontend, fs::Permissions::from_mode(0o755)).unwrap();
     let mut process = Command::new(env!("CARGO_BIN_EXE_agent-run"))
-        .args(["--home", temp.path().to_str().unwrap(), "mcp"])
-        .env("CODEX_MCP_NODE_PATH", &frontend)
-        .env("CODEX_APP_TOOLS_PIPE_PATH", &pipe)
-        .env("PID_FILE", &pid_file)
-        .env("ARGS_FILE", &args_file)
-        .spawn()
-        .unwrap();
-    let launched_pid = process.id();
-    assert!(process.wait().unwrap().success());
-    assert_eq!(
-        fs::read_to_string(pid_file).unwrap().trim(),
-        launched_pid.to_string()
-    );
-    let arguments = fs::read_to_string(args_file).unwrap();
-    assert!(arguments.starts_with("-e\n"));
-    assert!(arguments.ends_with(&format!("--home\n{}\nmcp\n", temp.path().display())));
-}
-
-/// Runs production MCP startup with an unusable optional frontend and verifies raw MCP protocol.
-fn assert_direct_mcp_fallback(frontend: &std::path::Path, home: &std::path::Path) {
-    use std::io::Write as _;
-
-    let pipe = home.join("unreachable-native.sock");
-    let mut process = Command::new(env!("CARGO_BIN_EXE_agent-run"))
-        .args(["--home", home.to_str().unwrap(), "mcp"])
+        .args(["--home", home.path().to_str().unwrap(), "mcp"])
         .env("CODEX_MCP_NODE_PATH", frontend)
-        .env("CODEX_APP_TOOLS_PIPE_PATH", &pipe)
+        .env("CODEX_APP_TOOLS_PIPE_PATH", home.path().join("unused.sock"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let initialize = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}});
-    let tools = json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}});
     let mut input = process.stdin.take().unwrap();
-    writeln!(input, "{initialize}").unwrap();
-    writeln!(input, "{tools}").unwrap();
+    writeln!(input, "{}", json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}})).unwrap();
+    writeln!(
+        input,
+        "{}",
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})
+    )
+    .unwrap();
     drop(input);
     let output = process.wait_with_output().unwrap();
     assert!(
         output.status.success(),
-        "fallback MCP failed: {}",
+        "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let responses = String::from_utf8(output.stdout).unwrap();
-    let responses = responses
+    assert!(!marker.exists(), "removed frontend was executed");
+    let responses: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
         .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .collect::<Vec<_>>();
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
     assert_eq!(responses.len(), 2);
     assert_eq!(responses[0]["id"], 1);
     assert_eq!(responses[1]["id"], 2);
@@ -1025,34 +1004,7 @@ fn assert_direct_mcp_fallback(frontend: &std::path::Path, home: &std::path::Path
             .unwrap()
             .is_empty()
     );
-    assert_eq!(
-        String::from_utf8(output.stderr).unwrap(),
-        "agent-run: Desktop MCP frontend unavailable; continuing without relay delivery\n"
-    );
-}
-
-/// Proves malformed, missing, non-executable, and failed frontends preserve direct MCP service.
-#[test]
-fn test_mcp_unusable_frontends_fall_back_to_direct_protocol() {
-    let temp = tempdir().unwrap();
-    assert_direct_mcp_fallback(std::path::Path::new("relative-node"), temp.path());
-
-    let missing = temp.path().join("missing-node");
-    assert_direct_mcp_fallback(&missing, temp.path());
-
-    let non_executable = temp.path().join("non-executable-node");
-    fs::write(&non_executable, "#!/bin/sh\nexit 0\n").unwrap();
-    fs::set_permissions(&non_executable, fs::Permissions::from_mode(0o644)).unwrap();
-    assert_direct_mcp_fallback(&non_executable, temp.path());
-
-    let invalid_executable = temp.path().join("invalid-executable-node");
-    fs::write(
-        &invalid_executable,
-        "#!/definitely/missing/agent-run-interpreter\n",
-    )
-    .unwrap();
-    fs::set_permissions(&invalid_executable, fs::Permissions::from_mode(0o755)).unwrap();
-    assert_direct_mcp_fallback(&invalid_executable, temp.path());
+    assert!(output.stderr.is_empty());
 }
 
 /// Creates dependencies whose human-readable transcript chunks are

@@ -2437,6 +2437,14 @@ fn common_notice_projection_tracks_live_delivery_without_changing_frozen_status(
     let cases = [
         ("waiting_binding", None, 0, false, None, None),
         (
+            "failed",
+            Some("pool-session-private"),
+            3,
+            true,
+            Some("legacy_delivery_held"),
+            Some("uds_unconfirmed"),
+        ),
+        (
             "delivered",
             Some("pool-session-private"),
             1,
@@ -2517,7 +2525,11 @@ fn common_notice_projection_tracks_live_delivery_without_changing_frozen_status(
         assert_eq!(delivery["ambiguous"], ambiguous);
         assert_eq!(
             delivery["last_classification"],
-            classifier.map_or(Value::Null, Value::from)
+            if last_error == Some("legacy_delivery_held") {
+                json!("legacy_delivery_held")
+            } else {
+                classifier.map_or(Value::Null, Value::from)
+            }
         );
         assert_eq!(
             delivery["last_attempt"]["classifier"],

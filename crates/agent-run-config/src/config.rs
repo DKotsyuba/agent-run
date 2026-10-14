@@ -75,9 +75,9 @@ pub struct Config {
     pub runtimes: BTreeMap<String, Runtime>,
 }
 
-/// Projects an immutable serialized configuration to current concurrency policy.
-/// Only retired execution-allowance/warning keys in its `core` object are
-/// discarded. The caller verifies the original snapshot before projection;
+/// Projects verified historical configuration to current execution and Bridge-only policy.
+/// Retired execution/warning keys and the obsolete queue executable are discarded.
+/// The caller verifies the original snapshot before projection;
 /// unknown fields remain available for strict decoding to reject. No bytes,
 /// paths, grants or credentials are rewritten, and no live config is accepted
 /// through this compatibility projection without explicit migration.
@@ -94,6 +94,12 @@ pub fn historical_config(mut document: serde_json::Value) -> serde_json::Value {
         ] {
             core.remove(key);
         }
+    }
+    if let Some(delivery) = document
+        .get_mut("delivery")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        delivery.remove("codex_queue_bin");
     }
     document
 }
@@ -140,29 +146,25 @@ impl Default for Capacity {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-/// Retry policy and optional external delivery owner; credentials stay outside TOML.
+/// Bridge publication retry policy and optional deployment configuration; credentials stay outside TOML.
 pub struct Delivery {
     /// Positive initial local retry delay in seconds.
     pub retry_base_seconds: f64,
     /// Positive retry-delay ceiling, at least the base delay.
     pub retry_cap_seconds: f64,
-    /// Maximum local publication attempts; zero imposes no attempt allowance.
+    /// Budgeted publication attempts; zero is unlimited and unconfigured holds do not count.
     pub max_attempts: u32,
-    /// Historical optional queue executable path retained for config compatibility.
-    pub codex_queue_bin: Option<PathBuf>,
-    /// Optional Bridge delivery owner for never-attempted external notices.
-    /// Existing attempted notices retain their original transport and evidence.
+    /// Bridge deployment; absent configuration retains new notices with bridge_unconfigured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bridge: Option<BridgeDelivery>,
 }
 impl Default for Delivery {
-    /// Preserve existing retry behavior and legacy delivery until Bridge is configured.
+    /// Default to Bridge-only delivery; absent deployment configuration holds notices without sending.
     fn default() -> Self {
         Self {
             retry_base_seconds: 2.,
             retry_cap_seconds: 60.,
             max_attempts: 0,
-            codex_queue_bin: None,
             bridge: None,
         }
     }
@@ -570,9 +572,6 @@ impl Config {
         )?;
         if self.delivery.retry_cap_seconds < self.delivery.retry_base_seconds {
             return Err(invalid("retry cap is below base"));
-        }
-        if let Some(p) = &mut self.delivery.codex_queue_bin {
-            expand(p)?;
         }
         if let Some(bridge) = &self.delivery.bridge {
             bridge.validate()?;

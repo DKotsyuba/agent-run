@@ -12,6 +12,7 @@ dependencies = [
  "agent-run-domain",
  "agent-run-platform",
  "agent-run-store",
+ "bridge-sdk",
  "clap",
  "fs2",
  "libc",

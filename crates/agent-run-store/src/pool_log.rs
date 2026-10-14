@@ -690,6 +690,7 @@ fn pool_delivery_view(conn: &Connection, pool_id: &str) -> Result<Value> {
         "bridge_invalid",
         "bridge_refused",
         "bridge_owner_changed",
+        "legacy_delivery_held",
     ];
     let (pool_session, delivery_id): (Option<String>, Option<String>) = conn.query_row(
         "SELECT orchestrator_session_id,completion_delivery_id FROM pools WHERE id=?",
@@ -737,14 +738,19 @@ fn pool_delivery_view(conn: &Connection, pool_id: &str) -> Result<Value> {
             .and_then(Value::as_str)
             .is_some_and(|classifier| CLASSIFIERS.contains(&classifier))
     });
-    let last_classification = evidence
-        .as_ref()
-        .and_then(|value| value.get("classifier"))
-        .and_then(Value::as_str)
+    let last_classification = last_error
+        .as_deref()
+        .filter(|value| *value == "legacy_delivery_held")
         .or_else(|| {
-            last_error
-                .as_deref()
-                .filter(|classifier| CLASSIFIERS.contains(classifier))
+            evidence
+                .as_ref()
+                .and_then(|value| value.get("classifier"))
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    last_error
+                        .as_deref()
+                        .filter(|classifier| CLASSIFIERS.contains(classifier))
+                })
         });
     Ok(json!({
         "bound": session.is_some(),

@@ -644,10 +644,7 @@ fn python_delivery_launchd_renders_a_durable_bounded_sweeper() {
     let home = resolved_home(&temp);
     fs::write(
         home.join("config.toml"),
-        format!(
-            "schema_version = 1\n[delivery]\nretry_base_seconds = 2.1\ncodex_queue_bin = {}\n",
-            toml::Value::String(home.join("queue").display().to_string())
-        ),
+        "schema_version = 1\n[delivery]\nretry_base_seconds = 2.1\n",
     )
     .expect("delivery config writes");
     let binary = home.join("agent-run");

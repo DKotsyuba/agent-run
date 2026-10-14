@@ -83,10 +83,7 @@ pub fn implemented(kind: OpKindRef) -> bool {
             | K::PoolWrite
             | K::PoolOperatorPost
             | K::SettlePool
-            | K::FailDelivery
-            | K::RetryDelivery
             | K::ExpireUnboundDeliveries
-            | K::PersistDeliveryVerdict
             | K::PruneIncidentLedger
             | K::PruneReceipts
             | K::PersistCapacitySamples
@@ -610,33 +607,9 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
                 json!({ "settled": store.settle_open_pools(limit, seed)? })
             }
         }),
-        L::FailDelivery(op) => out(store.fail_delivery(
-            &op.delivery_id,
-            &op.owner,
-            &op.error,
-            op.at,
-            op.ambiguous,
-            op.evidence.as_ref(),
-        )?),
-        L::RetryDelivery(op) => out(store.retry_delivery(
-            &op.delivery_id,
-            &op.owner,
-            &op.error,
-            op.at,
-            op.ambiguous,
-            op.evidence.as_ref(),
-            op.base_delay,
-            op.max_delay,
-        )?),
         L::ExpireUnboundDeliveries(op) => {
             out(store.expire_unbound_batch(op.at, Some(EXPIRY_BATCH))?)
         }
-        L::PersistDeliveryVerdict(op) => out(store.persist_delivery_verdict(
-            &op.delivery_id,
-            &op.owner,
-            &op.state,
-            &op.evidence,
-        )?),
         L::PruneIncidentLedger(op) => out(crate::incidents::prune(&store.conn, op.at)?),
         L::PruneReceipts(op) => out(super::apply::prune_receipts(&store.conn, &op)?),
 

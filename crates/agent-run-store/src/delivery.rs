@@ -4,11 +4,7 @@
 //! verdicts within SQLite transactions owned by the calling [`Store`].
 
 use crate::Store;
-use agent_run_domain::{
-    Result,
-    domain::{AgentId, now},
-    error::invalid,
-};
+use agent_run_domain::{Result, domain::AgentId, error::invalid};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value, json};
 
@@ -237,254 +233,6 @@ fn safe_evidence(raw: &Value) -> Result<Value> {
     Ok(value)
 }
 
-/// Validates a nonblank delivery operation string and returns it unchanged.
-fn required_text(name: &str, value: &str) -> Result<()> {
-    if value.trim().is_empty() {
-        return Err(invalid(format!("{name} must be nonblank")));
-    }
-    Ok(())
-}
-
-/// Validates one finite nonnegative timestamp used by deterministic callers.
-fn checked_time(name: &str, value: f64) -> Result<()> {
-    if !value.is_finite() || value < 0.0 {
-        return Err(invalid(format!("{name} must be finite and nonnegative")));
-    }
-    Ok(())
-}
-
-/// Claims the oldest due delivery or reclaims one expired sending lease.
-pub(crate) fn claim(
-    store: &mut Store,
-    owner: &str,
-    at: f64,
-    lease_seconds: f64,
-) -> Result<Option<Value>> {
-    required_text("lease owner", owner)?;
-    checked_time("claim time", at)?;
-    if !lease_seconds.is_finite() || lease_seconds <= 0.0 {
-        return Err(invalid("lease_seconds must be positive and finite"));
-    }
-    let tx = crate::writer::WriteTx::begin(&store.conn)?;
-    let id: Option<String> = tx
-        .query_row(
-            "SELECT id FROM deliveries WHERE ((state IN ('pending','retry_wait') AND COALESCE(next_attempt_at,0)<=?) OR (state='sending' AND lease_until<=?)) ORDER BY COALESCE(next_attempt_at,lease_until,0),id LIMIT 1",
-            params![at, at],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(id) = id else {
-        tx.commit()?;
-        return Ok(None);
-    };
-    let updated = tx.execute(
-        "UPDATE deliveries SET state='sending',attempts=attempts+1,lease_owner=?,lease_until=?,next_attempt_at=NULL WHERE id=? AND ((state IN ('pending','retry_wait') AND COALESCE(next_attempt_at,0)<=?) OR (state='sending' AND lease_until<=?))",
-        params![owner, at + lease_seconds, id, at, at],
-    )?;
-    if updated != 1 {
-        tx.commit()?;
-        return Ok(None);
-    }
-    let row = tx.query_row(
-        "SELECT d.id,d.attempts,d.orchestrator_session_id,d.agent_id,a.status AS agent_status,s.transport,s.external_session_id,s.external_turn_id FROM deliveries d JOIN agents a ON a.id=d.agent_id JOIN orchestrator_sessions s ON s.id=d.orchestrator_session_id WHERE d.id=?",
-        [&id],
-        |row| {
-            Ok(json!({
-                "id": row.get::<_, String>(0)?,
-                "attempts": row.get::<_, u32>(1)?,
-                "orchestrator_session_id": row.get::<_, Option<String>>(2)?,
-                "agent_id": row.get::<_, String>(3)?,
-                "agent_status": row.get::<_, String>(4)?,
-                "transport": row.get::<_, String>(5)?,
-                "external_session_id": row.get::<_, String>(6)?,
-                "external_turn_id": row.get::<_, Option<String>>(7)?,
-            }))
-        },
-    )?;
-    tx.commit()?;
-    Ok(Some(row))
-}
-
-/// Persists evidence for the caller's live attempt and returns its attempt number.
-fn owned_attempt(
-    tx: &rusqlite::Connection,
-    delivery_id: &str,
-    owner: &str,
-    at: f64,
-    evidence: Option<&Value>,
-) -> Result<u32> {
-    let attempt: Option<u32> = tx
-        .query_row(
-            "SELECT attempts FROM deliveries WHERE id=? AND state='sending' AND lease_owner=? AND lease_until>?",
-            params![delivery_id, owner, at],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(attempt) = attempt else {
-        return Err(invalid("delivery lease is not owned by caller"));
-    };
-    if let Some(evidence) = evidence {
-        let evidence = safe_evidence(evidence)?;
-        tx.execute(
-            "INSERT INTO delivery_attempt_evidence(delivery_id,attempt,recorded_at,evidence_json) VALUES(?,?,?,?)",
-            params![delivery_id, attempt, at, serde_json::to_string(&evidence)?],
-        )?;
-    }
-    Ok(attempt)
-}
-
-/// Finishes a live delivery claim while preserving the strongest prior ambiguity flag.
-#[allow(clippy::too_many_arguments)] // Mirrors the explicit Python delivery-finalization contract.
-fn finish_claim(
-    tx: &rusqlite::Connection,
-    delivery_id: &str,
-    owner: &str,
-    state: &str,
-    at: f64,
-    error: Option<&str>,
-    ambiguous: bool,
-    next_attempt_at: Option<f64>,
-    remote_message_id: Option<&str>,
-) -> Result<()> {
-    let changed = tx.execute(
-        "UPDATE deliveries SET state=?,remote_message_id=COALESCE(?,remote_message_id),last_error=COALESCE(?,last_error),ambiguous_result=MAX(ambiguous_result,?),next_attempt_at=?,lease_owner=NULL,lease_until=NULL WHERE id=? AND state='sending' AND lease_owner=? AND lease_until>?",
-        params![state, remote_message_id, error, ambiguous, next_attempt_at, delivery_id, owner, at],
-    )?;
-    if changed != 1 {
-        return Err(invalid("delivery lease is not owned by caller"));
-    }
-    Ok(())
-}
-
-/// Best-effort incident capture after a legacy (autocommit) delivery
-/// update. Inside the sole writer's transaction nothing is captured here:
-/// the caller follows up with the separate incident capture operation, so
-/// no capture work or discarded SQL failure runs in the writer transaction.
-fn legacy_capture(store: &Store, agent: &str, at: f64) {
-    if store.conn.is_autocommit() {
-        let _ = crate::incidents::capture(&store.conn, agent, at);
-    }
-}
-
-/// Completes one live delivery claim and optionally records immutable evidence.
-pub(crate) fn complete(
-    store: &mut Store,
-    delivery_id: &str,
-    owner: &str,
-    at: f64,
-    remote_message_id: Option<&str>,
-    ambiguous: bool,
-    evidence: Option<&Value>,
-) -> Result<()> {
-    required_text("delivery_id", delivery_id)?;
-    required_text("lease owner", owner)?;
-    checked_time("completion time", at)?;
-    let tx = crate::writer::WriteTx::begin(&store.conn)?;
-    owned_attempt(&tx, delivery_id, owner, at, evidence)?;
-    let incident_agent: String = tx.query_row(
-        "SELECT agent_id FROM deliveries WHERE id=?",
-        [delivery_id],
-        |row| row.get(0),
-    )?;
-    finish_claim(
-        &tx,
-        delivery_id,
-        owner,
-        "delivered",
-        at,
-        None,
-        ambiguous,
-        None,
-        remote_message_id,
-    )?;
-    tx.commit()?;
-    legacy_capture(store, &incident_agent, at);
-    Ok(())
-}
-
-/// Marks one live delivery claim permanently failed and optionally records evidence.
-pub(crate) fn fail(
-    store: &mut Store,
-    delivery_id: &str,
-    owner: &str,
-    error: &str,
-    at: f64,
-    ambiguous: bool,
-    evidence: Option<&Value>,
-) -> Result<()> {
-    required_text("delivery_id", delivery_id)?;
-    required_text("lease owner", owner)?;
-    required_text("delivery error", error)?;
-    checked_time("failure time", at)?;
-    let tx = crate::writer::WriteTx::begin(&store.conn)?;
-    owned_attempt(&tx, delivery_id, owner, at, evidence)?;
-    let incident_agent: String = tx.query_row(
-        "SELECT agent_id FROM deliveries WHERE id=?",
-        [delivery_id],
-        |row| row.get(0),
-    )?;
-    finish_claim(
-        &tx,
-        delivery_id,
-        owner,
-        "failed",
-        at,
-        Some(error),
-        ambiguous,
-        None,
-        None,
-    )?;
-    tx.commit()?;
-    legacy_capture(store, &incident_agent, at);
-    Ok(())
-}
-
-/// Schedules an exponential-backoff retry for one live delivery claim.
-#[allow(clippy::too_many_arguments)] // Mirrors the explicit Python retry contract.
-pub(crate) fn retry(
-    store: &mut Store,
-    delivery_id: &str,
-    owner: &str,
-    error: &str,
-    at: f64,
-    ambiguous: bool,
-    evidence: Option<&Value>,
-    base_delay: f64,
-    max_delay: f64,
-) -> Result<f64> {
-    required_text("delivery_id", delivery_id)?;
-    required_text("lease owner", owner)?;
-    required_text("delivery error", error)?;
-    checked_time("retry time", at)?;
-    if !base_delay.is_finite() || base_delay <= 0.0 || !max_delay.is_finite() || max_delay <= 0.0 {
-        return Err(invalid("retry delays must be positive and finite"));
-    }
-    let tx = crate::writer::WriteTx::begin(&store.conn)?;
-    let attempts = owned_attempt(&tx, delivery_id, owner, at, evidence)?;
-    let exponent = attempts.saturating_sub(1).min(20);
-    let delay = (base_delay * 2_f64.powi(exponent as i32)).min(max_delay);
-    let next = at + delay;
-    let incident_agent: String = tx.query_row(
-        "SELECT agent_id FROM deliveries WHERE id=?",
-        [delivery_id],
-        |row| row.get(0),
-    )?;
-    finish_claim(
-        &tx,
-        delivery_id,
-        owner,
-        "retry_wait",
-        at,
-        Some(error),
-        ambiguous,
-        Some(next),
-        None,
-    )?;
-    tx.commit()?;
-    legacy_capture(store, &incident_agent, at);
-    Ok(next)
-}
-
 /// Returns the latest validated evidence document for one delivery.
 pub(crate) fn latest(store: &Store, delivery_id: &str) -> Result<Option<Value>> {
     latest_on(&store.conn, delivery_id)
@@ -492,7 +240,9 @@ pub(crate) fn latest(store: &Store, delivery_id: &str) -> Result<Option<Value>> 
 
 /// Reads and sanitizes the latest delivery evidence through an existing database snapshot.
 pub(crate) fn latest_on(conn: &Connection, delivery_id: &str) -> Result<Option<Value>> {
-    required_text("delivery_id", delivery_id)?;
+    if delivery_id.trim().is_empty() {
+        return Err(invalid("delivery_id must be nonblank"));
+    }
     let raw: Option<String> = conn
         .query_row(
             "SELECT evidence_json FROM delivery_attempt_evidence WHERE delivery_id=? ORDER BY attempt DESC LIMIT 1",
@@ -591,45 +341,6 @@ impl Store<'_> {
         }
         tx.commit()?;
         Ok(ids)
-    }
-
-    /// Commits an owned delivery verdict with exactly one bounded immutable evidence row.
-    pub fn persist_delivery_verdict(
-        &mut self,
-        delivery_id: &str,
-        owner: &str,
-        state: &str,
-        evidence: &Value,
-    ) -> Result<()> {
-        if !["delivered", "retry_wait", "failed"].contains(&state) {
-            return Err(invalid("invalid delivery verdict state"));
-        }
-        let evidence = safe_evidence(evidence)?;
-        let tx = crate::writer::WriteTx::begin(&self.conn)?;
-        let at = now();
-        let attempt: Option<(u32, String)> = tx.query_row(
-            "SELECT d.attempts,o.transport FROM deliveries d JOIN orchestrator_sessions o ON o.id=d.orchestrator_session_id WHERE d.id=? AND d.state='sending' AND d.lease_owner=? AND d.lease_until>?",
-            params![delivery_id, owner, at],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).optional()?;
-        let Some((attempt, transport)) = attempt else {
-            return Err(invalid("delivery lease is not owned by caller"));
-        };
-        if transport != "codex_queue" {
-            return Err(invalid(
-                "delivery attempt evidence is only retained for codex_queue",
-            ));
-        }
-        tx.execute(
-            "INSERT INTO delivery_attempt_evidence(delivery_id,attempt,recorded_at,evidence_json) VALUES(?,?,?,?)",
-            params![delivery_id, attempt, at, serde_json::to_string(&evidence)?],
-        )?;
-        tx.execute(
-            "UPDATE deliveries SET state=?,lease_owner=NULL,lease_until=NULL,next_attempt_at=NULL WHERE id=? AND state='sending' AND lease_owner=? AND attempts=?",
-            params![state, delivery_id, owner, attempt],
-        )?;
-        tx.commit()?;
-        Ok(())
     }
 }
 
@@ -767,12 +478,10 @@ fn claim_payload(tx: &Connection, delivery_id: &str, agent_id: &str) -> Result<V
 }
 
 impl Store<'_> {
-    /// Leases the oldest due delivery for `op.owner` (row 52), expiring
-    /// unbound notices first. A known unsupported relay capability defers
-    /// the row; a Claude notice whose previous attempt may have been sent
-    /// ends failed-ambiguous without a new send; a malformed stored payload
-    /// ends only its own row. Returns the lease and validated payload facts,
-    /// or `None` when nothing was leased.
+    /// Lease the oldest due Bridge publication for `op.owner`, expiring unbound terminal notices.
+    /// Every unattempted row selects Bridge before I/O, even without deployment configuration.
+    /// Attempted historical native rows end held with `legacy_delivery_held` and retained evidence;
+    /// malformed payloads quarantine only their own row. Returns owned facts or no lease.
     pub fn claim_delivery_lease(
         &mut self,
         op: &crate::ops::ClaimDelivery,
@@ -822,54 +531,14 @@ impl Store<'_> {
             [&delivery_id],
             |row| row.get(0),
         )?;
-        let bridge_owner = existing_bridge || attempts == 0 && op.bridge_enabled;
-        let attention: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM events e JOIN deliveries d ON d.terminal_event_seq=e.seq WHERE d.id=? AND e.kind='pool_join_needs_action')",
-            [&delivery_id],
-            |row| row.get(0),
-        )?;
-        if transport == "codex_queue" && attention && !op.attention_peer && !bridge_owner {
+        if !existing_bridge && attempts > 0 {
+            // Historical writes have no Bridge idempotency proof. Never replay any attempted native row.
             tx.execute(
-                "UPDATE deliveries SET state='retry_wait',next_attempt_at=?,last_error='relay_v5_required' WHERE id=?",
-                params![
-                    time + policy.retry_base_seconds.max(1.0).min(policy.retry_cap_seconds),
-                    delivery_id
-                ],
+                "UPDATE deliveries SET state='failed',lease_owner=NULL,lease_until=NULL,next_attempt_at=NULL,last_error='legacy_delivery_held',ambiguous_result=1 WHERE id=?",
+                [&delivery_id],
             )?;
             tx.commit()?;
             return Ok(None);
-        }
-        if !existing_bridge
-            && attempts > 0
-            && (transport == "claude_uds" || op.bridge_enabled && transport == "codex_queue")
-        {
-            let last: Option<String> = tx
-                .query_row(
-                    "SELECT json_extract(evidence_json,'$.classifier') FROM delivery_attempt_evidence WHERE delivery_id=? AND attempt=?",
-                    params![delivery_id, attempts],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .flatten();
-            let classifier = match last.as_deref() {
-                Some(known @ ("uds_unconfirmed" | "uds_ambiguous" | "relay_ambiguous")) => {
-                    Some(known)
-                }
-                None => Some(if transport == "claude_uds" {
-                    "uds_unconfirmed"
-                } else {
-                    "relay_ambiguous"
-                }),
-                Some(_) => None,
-            };
-            if let Some(classifier) = classifier {
-                tx.execute(
-                    "UPDATE deliveries SET state='failed',lease_owner=NULL,lease_until=NULL,next_attempt_at=NULL,last_error=?,ambiguous_result=1 WHERE id=?",
-                    params![classifier, delivery_id],
-                )?;
-                tx.commit()?;
-                return Ok(None);
-            }
         }
         let payload = match claim_payload(&tx, &delivery_id, &agent_id) {
             Ok(payload) => payload,
@@ -886,7 +555,7 @@ impl Store<'_> {
         let attempt = attempts
             .checked_add(1)
             .ok_or_else(|| invalid("delivery attempt counter overflow"))?;
-        if attempts == 0 && op.bridge_enabled {
+        if !existing_bridge {
             tx.execute(
                 "INSERT OR IGNORE INTO bridge_delivery_intents(delivery_id) VALUES(?)",
                 [&delivery_id],
@@ -925,18 +594,22 @@ impl Store<'_> {
         }))
     }
 
-    /// Records one attempt outcome under its live lease (row 53): accepted
-    /// delivers; an exhausted attempt budget, a possibly-sent Claude
-    /// observation or an unsupported transport fails; anything else waits
-    /// for a bounded exponential retry. Queue evidence is stored once per
-    /// attempt. Returns the new state, or `not_owned` when the lease was lost
-    /// (no change).
+    /// Commit Bridge custody or schedule a bounded retry under the exact live lease.
+    /// Refuses native verdicts and validates the full custody receipt before releasing publication.
+    /// Missing configuration is held with at least 60 seconds between retries, without exhaustion.
+    /// Returns the local state or `not_owned` without changes after cancellation/lease loss.
     pub fn complete_delivery_attempt(
         &mut self,
         done: &crate::ops::DeliveryCompletion,
     ) -> Result<String> {
         let policy = &done.policy;
-        if !done.at.is_finite() || done.classifier.is_empty() || done.classifier.len() > 64 {
+        if !done.at.is_finite()
+            || done.transport != "bridge"
+            || !done.classifier.starts_with("bridge_")
+            || done.classifier.len() > 64
+            || done.accepted != (done.classifier == "bridge_custody_accepted")
+            || done.ambiguous != (done.classifier == "bridge_outcome_unknown")
+        {
             return Err(invalid("invalid delivery completion"));
         }
         let tx = crate::writer::WriteTx::begin(&self.conn)?;
@@ -949,21 +622,23 @@ impl Store<'_> {
             tx.commit()?;
             return Ok("not_owned".into());
         }
-        let exhausted = policy.max_attempts > 0 && done.attempt >= policy.max_attempts;
-        let possibly_sent = done.transport == "claude_uds"
-            && matches!(
-                done.classifier.as_str(),
-                "uds_unconfirmed" | "uds_ambiguous"
-            );
+        let unconfigured = done.classifier == "bridge_unconfigured";
+        // Lease incarnation never resets; unconfigured holds consume neither failure budget nor backoff.
+        let holds: u32 = tx.query_row(
+            "SELECT COUNT(*) FROM delivery_attempt_evidence WHERE delivery_id=? AND attempt<? AND json_extract(evidence_json,'$.classifier')='bridge_unconfigured'",
+            params![done.delivery_id, done.attempt], |row| row.get(0),
+        )?;
+        let budget_attempt = done.attempt.saturating_sub(holds).max(1);
+        // Possible custody always remains eligible for same-owner, status-only reconciliation.
+        let exhausted = !unconfigured
+            && !done.ambiguous
+            && policy.max_attempts > 0
+            && budget_attempt >= policy.max_attempts;
         let failed = !done.accepted
             && (exhausted
-                || possibly_sent
                 || matches!(
                     done.classifier.as_str(),
-                    "unsupported_transport"
-                        | "bridge_unsupported"
-                        | "bridge_invalid"
-                        | "bridge_refused"
+                    "bridge_unsupported" | "bridge_invalid" | "bridge_refused"
                 ));
         let state = if done.accepted {
             "delivered"
@@ -973,17 +648,16 @@ impl Store<'_> {
             "retry_wait"
         };
         let next_attempt = (state == "retry_wait").then(|| {
+            if unconfigured {
+                return done.at + policy.retry_cap_seconds.max(60.0);
+            }
             done.at
                 + (policy.retry_base_seconds
-                    * 2f64.powi(done.attempt.saturating_sub(1).min(20) as i32))
+                    * 2f64.powi(budget_attempt.saturating_sub(1).min(20) as i32))
                 .min(policy.retry_cap_seconds)
         });
-        if matches!(
-            done.transport.as_str(),
-            "codex_queue" | "claude_uds" | "bridge"
-        ) && let Some(evidence) = &done.evidence
-        {
-            let text = serde_json::to_string(evidence)?;
+        if let Some(evidence) = &done.evidence {
+            let text = serde_json::to_string(&safe_evidence(evidence)?)?;
             if text.len() > MAX_EVIDENCE_BYTES {
                 return Err(invalid("delivery evidence exceeds its byte bound"));
             }

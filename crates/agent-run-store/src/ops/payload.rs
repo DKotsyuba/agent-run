@@ -914,11 +914,6 @@ pub struct ClaimDelivery {
     pub at: f64,
     /// Prepared policy.
     pub policy: DeliveryPolicySpec,
-    /// Whether an attention-capable relay peer was advertised (prepared fs scan).
-    pub attention_peer: bool,
-    /// Select Bridge for never-attempted notices atomically with their first lease.
-    #[serde(default)]
-    pub bridge_enabled: bool,
 }
 
 /// Dispatch completion facts of row 53.
@@ -972,44 +967,6 @@ pub struct PrepareBridgeDelivery {
     pub at: f64,
 }
 
-/// 54 — fail a delivery under its lease (broker).
-#[derive(Debug, Clone, Serialize)]
-pub struct FailDelivery {
-    /// Delivery id.
-    pub delivery_id: String,
-    /// Lease owner.
-    pub owner: String,
-    /// Closed error label.
-    pub error: String,
-    /// Time.
-    pub at: f64,
-    /// Ambiguous outcome.
-    pub ambiguous: bool,
-    /// Evidence.
-    pub evidence: Option<Value>,
-}
-
-/// 55 — schedule a retry under its lease (broker).
-#[derive(Debug, Clone, Serialize)]
-pub struct RetryDelivery {
-    /// Delivery id.
-    pub delivery_id: String,
-    /// Lease owner.
-    pub owner: String,
-    /// Closed error label.
-    pub error: String,
-    /// Time.
-    pub at: f64,
-    /// Ambiguous outcome.
-    pub ambiguous: bool,
-    /// Evidence.
-    pub evidence: Option<Value>,
-    /// Base delay seconds.
-    pub base_delay: f64,
-    /// Maximum delay seconds.
-    pub max_delay: f64,
-}
-
 /// 56 — cancel one delivery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelDelivery {
@@ -1022,19 +979,6 @@ pub struct CancelDelivery {
 pub struct ExpireUnboundDeliveries {
     /// Time.
     pub at: f64,
-}
-
-/// 58 — persist a delivery verdict.
-#[derive(Debug, Clone, Serialize)]
-pub struct PersistDeliveryVerdict {
-    /// Delivery id.
-    pub delivery_id: String,
-    /// Lease owner.
-    pub owner: String,
-    /// Verdict state.
-    pub state: String,
-    /// Evidence.
-    pub evidence: Value,
 }
 
 /// 59 — advance a reconciliation cursor (broker).

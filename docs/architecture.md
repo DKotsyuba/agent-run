@@ -166,8 +166,7 @@ pinned attempt before idempotent lookup; native transport receipts never imply
 awareness. Unjoined seats cannot vote or settle. Their overlay is retained with
 active pool history and removed before eligible entry/member GC. Failure queues
 one broker-authored attention through the existing outbox, suppressed by an
-already queued individual error. Codex attention requires v5 support and defers
-before a send attempt on older peers without blocking ordinary v4 notices.
+already queued individual error. All external notices use the same Bridge route.
 
 All current workers carry a fixed private
 worker catalog — `notify_orchestrator`, `pool_post`, `pool_read`,
@@ -229,9 +228,9 @@ the frozen record: a member resumed later does not change it or mint another
 notice, and the closed pool refuses further writes and replacements.
 
 The notice is a broker conclusion for the whole pool, delivered over the
-existing outbox as a typed pool payload (the Desktop relay's `pool_completion`
-operation, rendered by the frontend's fixed template, and the Claude inbox as
-text). It names the stable pool ID, goal, accepted result and roster, never a
+existing outbox as a frozen pool payload rendered by Agent Run and published
+through Bridge with kind `agent-run.pool-completion`.
+It names the stable pool ID, goal, accepted result and roster, never a
 run, attempt or session identity; a result longer than the 4096-byte bound is
 shortened with an explicit marker naming the full proposal entry in the pool
 log. An unbound pool still completes: its notice stays `waiting_binding`
@@ -272,27 +271,26 @@ Idle compaction returns unused SQLite pages to disk. See
 
 ## Completion delivery
 
-Bound runs create durable delivery rows. When Desktop supplies both capability
-paths, `agent-run mcp` replaces its process image with that exact signed Node
-executable. The frontend owns the private typed v1-v4 relay and native-tools
-pipe, then starts the same Rust MCP command with both capability variables
-removed. It renders only the embedded completion-notice contract and can call
-only the namespaced `send_message_to_thread` tool; the Rust child owns MCP stdio
-but cannot contact native host tools. Without both capabilities, the Rust MCP
-runs directly. Claude uses its configured local UDS transport. Unbound callers
-retrieve completion through `wait`, `answer`, or `list_agents`.
+Bound terminal runs create durable notice rows. Agent Bridge is the sole external
+sender for completion, worker reports, pool completion and pool attention. The
+pinned SDK publishes Address/Message/KeepAll without expiry or caller-registration
+authority. MCP runs directly; Agent Run has no native message frontend, Claude
+inbox sender, relay inventory/probe or fallback process.
 
-Desktop tool calls identify their caller with `callerSource: "codex"` in the
-native host envelope. A correlated JSON-RPC invalid-parameters rejection is a
-known refusal, while disconnects after sending, uncorrelated replies and generic
-execution errors remain ambiguous. The frontend code lives in its MCP process;
-after updating it, reconnect the Agent Run MCP client as well as the broker.
+The first lease always selects Bridge, even without deployment configuration.
+Existing authenticated binding and explicit host/store mapping provide the address.
+Unconfigured notices retain their domain outcome and retry at least 60 seconds apart
+without exhausting the attempt allowance. Previously attempted native rows never
+gain Bridge ownership or new event IDs. Accepted historical facts remain readable;
+unresolved native attempts end held with `legacy_delivery_held` and retained evidence.
 
-The frontend passes its PID to its Rust MCP child through a private environment
-marker. The child observes its own parent relationship every 250 milliseconds
-and exits if that relationship ends, even when inherited stdin stays open.
-This also covers frontend SIGKILL, which cannot run JavaScript cleanup handlers.
-The resident broker and its admitted detached jobs have independent ownership.
+Before possible I/O, the sole writer freezes IDs, destination, complete normalized
+publication and producer/service/credential association. Verified custody releases
+only local publication. Unknown custody permits same-owner status-only recovery;
+absent history never permits fresh publication. Receipts must match the producer,
+event, full publication hash and direct destination. Endpoint or credential-file
+changes cannot re-home a frozen publication. Bridge owns native dispatch and holds;
+native acceptance, model visibility, answer proof and cleanup remain separate facts.
 
 Delivery attempts are leased, bounded, and retried with backoff. Persisted
 diagnostics contain safe classifications and redacted tails, never task or

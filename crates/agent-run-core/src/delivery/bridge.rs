@@ -280,9 +280,6 @@ fn observation(
         }
     };
     let mut evidence = Evidence::new(classifier, accepted, unknown);
-    evidence.executable = "agent-bridge".into();
-    evidence.argv_shape = vec!["producer-v1".into(), "publish".into()];
-    evidence.message_id_present = false; // Custody has no native message identifier.
     if owner_changed {
         evidence.error_class = Some("owner_changed".into());
     }
@@ -394,7 +391,6 @@ mod tests {
                 policy: Default::default(),
                 bridge_intent: None,
                 bridge_unknown: false,
-                bridge_owned: true,
             };
             let frozen = intent(&claim, &config).unwrap();
             assert_eq!(frozen.kind, kind);

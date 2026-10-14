@@ -15,9 +15,9 @@ use agent_run_store::{
     ops::{
         AdmitStart, AdmitStartOutput, AppendJournal, CapacitySampleRow, ClaimDelivery,
         CompleteDelivery, DeliveryCompletion, DeliveryPolicySpec, EnsureServiceGeneration,
-        ExpectedOwnership, ExpireUnboundDeliveries, FailDelivery, GateStep, GenerationAction,
-        JournalFragment, LocalEnvelope, LocalOp, MarkLost, MarkServiceReady, MarkServiceUnhealthy,
-        OrphanOutcome, PersistCapacitySamples, PersistRecoveryObservation, PrepareServiceGate,
+        ExpectedOwnership, ExpireUnboundDeliveries, GateStep, GenerationAction, JournalFragment,
+        LocalEnvelope, LocalOp, MarkLost, MarkServiceReady, MarkServiceUnhealthy, OrphanOutcome,
+        PersistCapacitySamples, PersistRecoveryObservation, PrepareServiceGate,
         PruneCapacitySamples, PruneHistoryBatch, PruneIncidentLedger, PruneReceipts,
         ReconcileReapedAgent, RecoveryRecorded, ReleaseOrphanedAttempt, RemoteOp,
         StopServiceGeneration, WriteEnvelope,
@@ -523,8 +523,6 @@ fn delivery_claim_and_completion_follow_the_lease() {
             owner: "owner-1".into(),
             at: 100.0,
             policy: policy(),
-            attention_peer: false,
-            bridge_enabled: false,
         }))
         .result;
     assert_eq!(claim["delivery_id"], "ntf_test");
@@ -537,10 +535,10 @@ fn delivery_claim_and_completion_follow_the_lease() {
                 delivery_id: "ntf_test".into(),
                 owner: owner.into(),
                 attempt: 1,
-                transport: "codex_queue".into(),
-                accepted: true,
+                transport: "bridge".into(),
+                accepted: false,
                 ambiguous: false,
-                classifier: "queue_accepted".into(),
+                classifier: "bridge_refused".into(),
                 evidence: None,
                 bridge_receipt: None,
                 policy: policy(),
@@ -552,12 +550,9 @@ fn delivery_claim_and_completion_follow_the_lease() {
         f.commit_remote(complete("intruder")).result,
         json!("not_owned")
     );
+    assert_eq!(f.commit_remote(complete("owner-1")).result, json!("failed"));
     assert_eq!(
-        f.commit_remote(complete("owner-1")).result,
-        json!("delivered")
-    );
-    assert_eq!(
-        f.count("SELECT COUNT(*) FROM deliveries WHERE state='delivered' AND lease_owner IS NULL"),
+        f.count("SELECT COUNT(*) FROM deliveries WHERE state='failed' AND lease_owner IS NULL"),
         1
     );
 }
@@ -941,13 +936,24 @@ fn writer_delivery_failure_captures_no_inline_incident() {
          VALUES('ntf_fail',?,'s',(SELECT MAX(seq) FROM events),'sending',1,'owner',1.0e12)",
         [id.as_str()],
     );
-    f.commit_local(LocalOp::from(FailDelivery {
-        delivery_id: "ntf_fail".into(),
-        owner: "owner".into(),
-        error: "transport_failed".into(),
-        at: 10.0,
-        ambiguous: false,
-        evidence: None,
+    f.sql(
+        "INSERT INTO bridge_delivery_intents(delivery_id) VALUES('ntf_fail')",
+        [],
+    );
+    f.commit_remote(RemoteOp::from(CompleteDelivery {
+        completion: DeliveryCompletion {
+            delivery_id: "ntf_fail".into(),
+            owner: "owner".into(),
+            attempt: 1,
+            transport: "bridge".into(),
+            accepted: false,
+            ambiguous: false,
+            classifier: "bridge_refused".into(),
+            at: 10.0,
+            evidence: None,
+            bridge_receipt: None,
+            policy: policy(),
+        },
     }));
     assert_eq!(
         f.count("SELECT COUNT(*) FROM deliveries WHERE state='failed'"),
