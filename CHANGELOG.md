@@ -4,6 +4,26 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.27.0
+
+- feat(delivery)!: use Agent Bridge as the sole sender for completion notices,
+  worker reports, pool completion and pool attention; remove native Codex relay,
+  Claude inbox delivery and the Desktop message frontend
+- feat(storage): migrate to schema 31 for frozen Bridge publication ownership,
+  matching custody receipts and same-owner status-only recovery after uncertain
+  effects; preserve historical native evidence without replay or fallback
+- fix(delivery): keep unconfigured notices durable without spending publication
+  retry allowance or resetting lease fencing; retain unknown-custody recovery
+  after the publication allowance is exhausted
+- test(delivery): verify all four message kinds, cancellation, lease recovery,
+  immutable history, producer/hash/endpoint controls and native Codex delivery
+  without duplicate publication or native attempts
+
+External delivery now requires a dedicated protected `delivery.bridge` producer
+configuration. The retired `codex_queue_bin` setting is rejected by live config;
+use paired configuration/store migration and reconnect clients before cutover.
+Bridge custody remains separate from native visibility, task success and cleanup.
+
 ## 0.26.1
 
 - fix(storage)!: deliver the schema-30 bounded resident writer, atomic operation
