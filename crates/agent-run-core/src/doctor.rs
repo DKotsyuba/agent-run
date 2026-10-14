@@ -943,6 +943,24 @@ fn add(
 /// a successfully parsed/validated Bridge credential-file reference; invalid
 /// references and other token fields remain findings. No credential is read.
 fn plaintext_secrets(path: &Path, findings: &mut Vec<Finding>) {
+    /// Parser-owned source location of the actual credential reference, ignoring unrelated config.
+    #[derive(serde::Deserialize)]
+    struct ReferenceLocation {
+        /// Optional deployment policy; absence provides no exemption.
+        delivery: Option<DeliveryLocation>,
+    }
+    /// Projection of the delivery table used only for the parser's original byte span.
+    #[derive(serde::Deserialize)]
+    struct DeliveryLocation {
+        /// Optional Bridge table; other delivery settings are not exemptions.
+        bridge: Option<BridgeLocation>,
+    }
+    /// Projection of the actual typed credential reference in the parsed Bridge table.
+    #[derive(serde::Deserialize)]
+    struct BridgeLocation {
+        /// Original value span; never inferred from header-like text inside strings.
+        token_file: Option<toml::Spanned<String>>,
+    }
     let Ok(text) = fs::read_to_string(path) else {
         return;
     };
@@ -953,18 +971,19 @@ fn plaintext_secrets(path: &Path, findings: &mut Vec<Finding>) {
             let bridge: agent_run_config::config::BridgeDelivery = bridge.try_into().ok()?;
             bridge.validate().ok()?;
             Some(bridge.token_file)
-        });
-    let mut table = "";
-    for (index, line) in text.lines().take(10_000).enumerate() {
-        let header = line.split('#').next().unwrap_or_default().trim();
-        if header.starts_with('[') {
-            table = header;
-        }
+        })
+        .and_then(|_| toml::from_str::<ReferenceLocation>(&text).ok())
+        .and_then(|document| Some(document.delivery?.bridge?.token_file?.span()));
+    let mut byte_offset = 0;
+    for (index, line) in text.split_inclusive('\n').take(10_000).enumerate() {
+        let start = byte_offset;
+        byte_offset += line.len();
         let key = line
             .split_once('=')
             .map(|(key, _)| key.trim().to_ascii_lowercase());
-        if bridge_reference.is_some()
-            && table == "[delivery.bridge]"
+        if bridge_reference
+            .as_ref()
+            .is_some_and(|span| span.start >= start && span.end <= byte_offset)
             && key.as_deref() == Some("token_file")
         {
             continue;
@@ -1961,6 +1980,19 @@ mod tests {
             super::plaintext_secrets(&config, &mut invalid);
             assert_eq!(invalid.len(), 1, "invalid reference was hidden: {field}");
         }
+    }
+    /// A valid multiline environment value cannot impersonate the parsed Bridge field's source location.
+    #[test]
+    fn multiline_header_cannot_hide_unrelated_secret_assignment() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("config.toml");
+        std::fs::write(&config, "[delivery.bridge]\nregistration_socket='/protected/a.sock'\ncore_socket='/protected/c.sock'\nhost_id='local'\ncodex_store='codex-main'\ntoken_file='/protected/producer-key'\n[environments.test.variables]\nCOMMAND=\"\"\"\n[delivery.bridge]\ntoken_file='synthetic-inline-secret'\n\"\"\"\n").unwrap();
+        let text = std::fs::read_to_string(&config).unwrap();
+        let _: toml::Value = toml::from_str(&text).unwrap();
+        let mut findings = Vec::new();
+        super::plaintext_secrets(&config, &mut findings);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].component, "config:10");
     }
     /// Verified releases expose only bounded public metadata; corrupt releases,
     /// missing required tools and absent optional bridges keep distinct outcomes.
