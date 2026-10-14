@@ -664,6 +664,8 @@ fn pool_delivery_view(conn: &Connection, pool_id: &str) -> Result<Value> {
         "failed",
         "cancelled",
         "expired",
+        "custody_accepted",
+        "outcome_unknown",
     ];
     const CLASSIFIERS: &[&str] = &[
         "relay_accepted",
@@ -679,6 +681,16 @@ fn pool_delivery_view(conn: &Connection, pool_id: &str) -> Result<Value> {
         "uds_rejected",
         "uds_unavailable",
         "unsupported_transport",
+        "bridge_custody_accepted",
+        "bridge_outcome_unknown",
+        "bridge_unconfigured",
+        "bridge_unavailable",
+        "bridge_forbidden",
+        "bridge_unsupported",
+        "bridge_invalid",
+        "bridge_refused",
+        "bridge_owner_changed",
+        "legacy_delivery_held",
     ];
     let (pool_session, delivery_id): (Option<String>, Option<String>) = conn.query_row(
         "SELECT orchestrator_session_id,completion_delivery_id FROM pools WHERE id=?",
@@ -718,6 +730,7 @@ fn pool_delivery_view(conn: &Connection, pool_id: &str) -> Result<Value> {
         )
         .optional()?
         .ok_or_else(|| Error::Integrity("pool completion delivery is missing".into()))?;
+    let state = crate::delivery::public_state_on(conn, &delivery_id, &state)?;
     let attempt = crate::delivery::latest_on(conn, &delivery_id)?;
     let evidence = attempt.filter(|value| {
         value
@@ -725,14 +738,19 @@ fn pool_delivery_view(conn: &Connection, pool_id: &str) -> Result<Value> {
             .and_then(Value::as_str)
             .is_some_and(|classifier| CLASSIFIERS.contains(&classifier))
     });
-    let last_classification = evidence
-        .as_ref()
-        .and_then(|value| value.get("classifier"))
-        .and_then(Value::as_str)
+    let last_classification = last_error
+        .as_deref()
+        .filter(|value| *value == "legacy_delivery_held")
         .or_else(|| {
-            last_error
-                .as_deref()
-                .filter(|classifier| CLASSIFIERS.contains(classifier))
+            evidence
+                .as_ref()
+                .and_then(|value| value.get("classifier"))
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    last_error
+                        .as_deref()
+                        .filter(|classifier| CLASSIFIERS.contains(classifier))
+                })
         });
     Ok(json!({
         "bound": session.is_some(),

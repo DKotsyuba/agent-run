@@ -80,7 +80,7 @@ impl Harness {
         });
         NativeSocket { task, path }
     }
-    /// Starts the writer over the EXISTING schema-30 store of `home`.
+    /// Starts the writer over the existing current-schema store of `home`.
     pub fn start(home: &Path) -> Self {
         Self::start_with(home, WriterConfig::default())
     }

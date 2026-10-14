@@ -1,6 +1,5 @@
-//! Durable, at-least-once completion delivery without task or credential content.
-pub mod claude;
-pub mod relay;
+//! Durable external-notice outbox; Bridge custody and native delivery stay distinct.
+mod bridge;
 
 use crate::{
     Result,
@@ -48,35 +47,13 @@ pub struct Notice {
 /// Backward-compatible public name for the completion notice.
 pub type CompletionNotice = Notice;
 
-/// A validated acknowledgement returned by a delivery transport.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Receipt {
-    /// Optional remote identifier; the identifier itself is never trusted for routing.
-    pub remote_message_id: Option<String>,
-    /// Whether delivery reached an ambiguous transport boundary.
-    pub ambiguous: bool,
-}
-
-impl Receipt {
-    /// Validates an optional remote identifier and builds one receipt.
-    pub fn new(remote_message_id: Option<&str>, ambiguous: bool) -> Result<Self> {
-        if remote_message_id.is_some_and(|id| id.is_empty() || id.len() > 512) {
-            return Err(invalid("invalid remote message id"));
-        }
-        Ok(Self {
-            remote_message_id: remote_message_id.map(str::to_owned),
-            ambiguous,
-        })
-    }
-}
-
 /// Immutable, secret-safe facts recorded for one owned delivery attempt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Evidence {
     /// Allowlisted result classifier, not a host response body.
     pub classifier: String,
-    /// Queue executable label, never an argv value or filesystem path.
+    /// Fixed producer label; historical transport labels remain readable without execution.
     pub executable: String,
     /// Fixed argv roles only; never supplied argument values.
     pub argv_shape: Vec<String>,
@@ -105,12 +82,12 @@ pub struct Evidence {
 }
 
 impl Evidence {
-    /// Creates a no-output relay observation suitable for an in-process transport.
+    /// Creates a bounded, no-output Bridge observation without native acceptance claims.
     pub(crate) fn new(classifier: &str, accepted: bool, ambiguous: bool) -> Self {
         Self {
             classifier: classifier.into(),
-            executable: "desktop-relay".into(),
-            argv_shape: vec!["relay".into()],
+            executable: "agent-bridge".into(),
+            argv_shape: vec!["producer-v1".into(), "publish".into()],
             duration_ms: 0,
             returncode: None,
             spawn_errno: None,
@@ -132,24 +109,18 @@ impl Evidence {
             stderr_bytes: 0,
             stdout_truncated: false,
             stderr_truncated: false,
-            message_id_present: accepted,
+            message_id_present: false,
         }
     }
 
-    /// Returns whether this observation is an accepted remote acknowledgement.
+    /// Returns whether Bridge confirmed publication custody, without native-delivery proof.
     fn accepted(&self) -> bool {
-        matches!(
-            self.classifier.as_str(),
-            "relay_accepted" | "uds_receipt_held" | "uds_receipt_delivered" | "delivered"
-        )
+        self.classifier == "bridge_custody_accepted"
     }
 
-    /// Returns whether this observation can have reached the peer without acknowledgement.
+    /// Returns whether Bridge custody may have committed without an acknowledgement.
     fn ambiguous(&self) -> bool {
-        matches!(
-            self.classifier.as_str(),
-            "relay_ambiguous" | "uds_ambiguous" | "uds_unconfirmed"
-        )
+        self.classifier == "bridge_outcome_unknown"
     }
 
     /// Produces the only representation allowed into SQLite, redacting and bounding tails first.
@@ -350,15 +321,25 @@ impl Notice {
 
 /// A claimed delivery and the private lease token that permits exactly one terminal update.
 struct Claim {
+    /// Existing outbox row identity; never replaced across retries.
     delivery_id: String,
+    /// Ephemeral owner permitted to complete this live lease only.
     lease_owner: String,
+    /// Monotonic local publication/transport attempt counter.
     attempt: u32,
+    /// Historical binding transport used to resolve the known destination.
     transport: String,
+    /// Bound native session ID; never inferred from cwd or process identity.
     session: String,
+    /// Frozen domain notice facts selected under the lease.
     payload: Payload,
     /// Retry policy captured before the lease was taken, so a config change
     /// during the send can never decide the outcome of an acknowledged attempt.
     policy: Delivery,
+    /// Previously frozen Bridge ownership/content, independent of current configuration.
+    bridge_intent: Option<agent_run_domain::bridge::BridgeIntent>,
+    /// Sticky possible custody effect; a later refusal cannot erase it.
+    bridge_unknown: bool,
 }
 
 /// The one trusted delivery shape selected from the durable outbox row.
@@ -378,8 +359,10 @@ enum Payload {
 pub struct DispatchResult {
     /// Number of notices claimed by this drain.
     pub claimed: usize,
-    /// Number of claims completed successfully.
+    /// Native-success counter retained for clients; Bridge-only dispatch leaves it zero.
     pub delivered: usize,
+    /// Local publication intentions released after verified Bridge custody only.
+    pub transferred: usize,
     /// Number of claims left scheduled for retry.
     pub retried: usize,
     /// Number of claims made terminally failed.
@@ -439,31 +422,19 @@ fn delivery_policy(home: &Path) -> Result<Delivery> {
     })
 }
 
-/// Atomically selects and leases one due bound delivery for this dispatcher identity.
-///
-/// A queued Claude notice whose previous attempt was possibly sent
-/// (`uds_unconfirmed` or `uds_ambiguous`, a `retry_wait` row written before the
-/// at-most-once policy, or no evidence for the current attempt after a
-/// dispatcher crash, such as an expired `sending` lease) is ended failed-ambiguous without a new
-/// send and this claim returns `None`; the finished row leaves the schedule,
-/// so the next dispatch tick makes progress.
-/// Claims one due delivery and returns its canonical adapter name when a known
-/// legacy transport alias was persisted. Unknown transports remain unchanged so
-/// dispatch records the safe `unsupported_transport` classifier.
+/// Lease one valid Bridge-owned notice; historical attempted native rows are held without replay.
+/// Configuration is read before the writer claim; malformed config leaves the outbox untouched.
 async fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
     let at = now();
     if !pending(home, at).await? {
         return Ok(None);
     }
-    // Configuration and relay filesystem inspection precede queue/transaction.
     let policy = delivery_policy(home)?;
-    let attention_peer = relay::has_attention_peer(home);
     let claimed = crate::persist::operator_producer(home)
         .call(
             agent_run_store::ops::ClaimDelivery {
                 owner: owner.to_owned(),
                 at,
-                attention_peer,
                 policy: policy_spec(&policy),
             },
             crate::broker_writer::BROKER_BUDGET,
@@ -498,6 +469,11 @@ async fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
         session: required(&claimed, "session")?,
         payload,
         policy,
+        bridge_intent: claimed["bridge_intent"]
+            .as_object()
+            .map(|_| serde_json::from_value(claimed["bridge_intent"].clone()))
+            .transpose()?,
+        bridge_unknown: claimed["bridge_unknown"].as_bool().unwrap_or(false),
     }))
 }
 
@@ -541,29 +517,15 @@ fn policy_spec(policy: &Delivery) -> agent_run_store::ops::DeliveryPolicySpec {
     }
 }
 
-/// Persists one owned result and its immutable queue evidence in the same
-/// transaction, using the delivery policy from either supported config schema.
-///
-/// A Claude inbox attempt is never accepted on write alone (see
-/// [`claude::send`]); its uncertain observations (`uds_unconfirmed` or
-/// `uds_ambiguous`) follow a send that may already have reached the session,
-/// and the native inbox sends no receipt for an immediately accepted message,
-/// so exactly-once cannot be proved. They end terminally `failed` with the
-/// ambiguous flag at once (at-most-once) instead of retrying into duplicates;
-/// known-unsent outcomes (session gone, unavailable, rejected) still retry.
-///
-/// The retry policy is the one captured in `claim`; no configuration is read
-/// here, so a config change after sending cannot discard an acknowledgement.
-/// Evidence is committed only while this attempt still owns its live lease;
-/// cancellation or ownership loss still takes precedence.
-async fn complete(home: &Path, claim: &Claim, evidence: &Evidence) -> Result<()> {
-    let recorded = matches!(claim.transport.as_str(), "codex_queue" | "claude_uds")
-        .then(|| {
-            evidence
-                .persisted()
-                .and_then(|value| serde_json::to_value(value).map_err(Into::into))
-        })
-        .transpose()?;
+/// Commit one Bridge custody observation under the live lease with its captured retry policy.
+/// Custody releases publication only; unknown effects retain their frozen owner and identity.
+/// No configuration is read after sending, and cancellation or lease loss wins over a late receipt.
+async fn complete(
+    home: &Path,
+    claim: &Claim,
+    evidence: &Evidence,
+    bridge_receipt: Option<Value>,
+) -> Result<()> {
     crate::persist::operator_producer(home)
         .call(
             agent_run_store::ops::CompleteDelivery {
@@ -571,11 +533,12 @@ async fn complete(home: &Path, claim: &Claim, evidence: &Evidence) -> Result<()>
                     delivery_id: claim.delivery_id.clone(),
                     owner: claim.lease_owner.clone(),
                     attempt: claim.attempt,
-                    transport: claim.transport.clone(),
+                    transport: "bridge".into(),
                     accepted: evidence.accepted(),
                     ambiguous: evidence.ambiguous(),
                     classifier: evidence.classifier.clone(),
-                    evidence: recorded,
+                    evidence: Some(serde_json::to_value(evidence.persisted()?)?),
+                    bridge_receipt,
                     policy: policy_spec(&claim.policy),
                     at: now(),
                 },
@@ -597,41 +560,59 @@ async fn dispatch_one(home: &Path) -> Result<Option<(String, bool)>> {
         return Ok(None);
     };
     let started = std::time::Instant::now();
-    let mut evidence = match (claim.transport.as_str(), &claim.payload) {
-        ("codex_queue", Payload::Completion(notice)) => {
-            relay::send(home, &claim.session, notice).await
+    let intent = if let Some(intent) = &claim.bridge_intent {
+        Ok(intent.clone())
+    } else if let Some(config) = &claim.policy.bridge {
+        bridge::intent(&claim, config)
+    } else {
+        Err(invalid("Bridge owner remains unconfigured"))
+    };
+    let (mut evidence, bridge_receipt) = match intent {
+        Ok(intent) => {
+            let intent = crate::persist::operator_producer(home)
+                .call(
+                    agent_run_store::ops::PrepareBridgeDelivery {
+                        delivery_id: claim.delivery_id.clone(),
+                        owner: claim.lease_owner.clone(),
+                        attempt: claim.attempt,
+                        intent,
+                        at: now(),
+                    },
+                    crate::broker_writer::BROKER_BUDGET,
+                )
+                .await?;
+            bridge::send(claim.policy.bridge.clone(), intent, claim.bridge_unknown).await
         }
-        ("codex_queue", Payload::Worker(notice)) => {
-            relay::send_worker(home, &claim.session, notice).await
-        }
-        ("claude_uds", Payload::Completion(notice)) => {
-            claude::send(&claude_registry(), &claim.session, notice).await
-        }
-        ("claude_uds", Payload::Worker(notice)) => {
-            claude::send_worker(&claude_registry(), &claim.session, notice).await
-        }
-        ("codex_queue", Payload::PoolAttention(notice)) => {
-            relay::send_pool_attention(home, &claim.session, notice).await
-        }
-        ("claude_uds", Payload::PoolAttention(notice)) => {
-            claude::send_pool_attention(&claude_registry(), &claim.session, notice).await
-        }
-        ("codex_queue", Payload::Pool(notice)) => {
-            relay::send_pool(home, &claim.session, notice).await
-        }
-        ("claude_uds", Payload::Pool(notice)) => {
-            claude::send_pool(&claude_registry(), &claim.session, notice).await
-        }
-        _ => Evidence::new("unsupported_transport", false, false),
+        Err(error) => (
+            Evidence::new(
+                if claim.bridge_unknown {
+                    "bridge_outcome_unknown"
+                } else if claim.policy.bridge.is_none()
+                    || matches!(error, crate::Error::Validation(ref message) if message == "protected Bridge producer credential unavailable")
+                {
+                    "bridge_unconfigured"
+                } else {
+                    "bridge_unsupported"
+                },
+                false,
+                claim.bridge_unknown,
+            ),
+            None,
+        ),
     };
     evidence.duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-    complete(home, &claim, &evidence).await?;
+    complete(home, &claim, &evidence, bridge_receipt).await?;
     let result = Store::open(home)?.conn.query_row(
         "SELECT state,ambiguous_result FROM deliveries WHERE id=?",
         [&claim.delivery_id],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
     )?;
-    Ok(Some(result))
+    let state = agent_run_store::delivery::public_state_on(
+        &Store::open(home)?.conn,
+        &claim.delivery_id,
+        &result.0,
+    )?;
+    Ok(Some((state, result.1)))
 }
 
 /// Claims and attempts one completion delivery without draining the backlog.
@@ -668,6 +649,8 @@ pub async fn dispatch_with_batch(home: &Path, max_batch: usize) -> Result<Dispat
         result.ambiguous += ambiguous as usize;
         match state.as_str() {
             "delivered" => result.delivered += 1,
+            "custody_accepted" => result.transferred += 1,
+            "outcome_unknown" => result.retried += 1,
             "retry_wait" => result.retried += 1,
             "failed" => result.failed += 1,
             _ => result.claim_lost += 1,
@@ -679,17 +662,6 @@ pub async fn dispatch_with_batch(home: &Path, max_batch: usize) -> Result<Dispat
 /// Drains the due delivery outbox using the default bounded batch size.
 pub async fn dispatch(home: &Path) -> Result<DispatchResult> {
     dispatch_with_batch(home, DEFAULT_MAX_BATCH).await
-}
-
-/// Resolves the Claude session registry, permitting a process-scoped test override.
-fn claude_registry() -> std::path::PathBuf {
-    std::env::var_os("AGENT_RUN_CLAUDE_SESSION_REGISTRY")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|home| std::path::PathBuf::from(home).join(".claude/sessions"))
-        })
-        .unwrap_or_default()
 }
 
 /// Fits a rendered pool entry into the worker notice's fixed 2048-byte bound

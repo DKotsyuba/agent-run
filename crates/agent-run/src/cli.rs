@@ -1510,9 +1510,6 @@ pub async fn run(cli: Cli) -> Result<i32> {
     ) {
         crate::migrate::require_current_store(&home)?;
     }
-    if matches!(&cli.command, Command::Mcp) {
-        transport::mcp::exec_desktop_frontend(&home)?;
-    }
     let component = match &cli.command {
         Command::Mcp => "mcp",
         Command::Api { .. } => "api",

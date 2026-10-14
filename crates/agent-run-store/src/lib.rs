@@ -1445,6 +1445,7 @@ impl Store<'_> {
         ) = d
         {
             let evidence=self.conn.query_row("SELECT evidence_json FROM delivery_attempt_evidence WHERE delivery_id=? ORDER BY attempt DESC LIMIT 1",[&did],|r|r.get::<_,String>(0)).optional()?;
+            let state = delivery::public_state_on(&self.conn, &did, &state)?;
             (
                 Some(did),
                 state,
@@ -1460,76 +1461,6 @@ impl Store<'_> {
         };
         Ok(
             json!({"agent_id":id,"bound":row.orchestrator_session_id.is_some(),"orchestrator_session_id":row.orchestrator_session_id,"notification_id":notification_id,"state":state,"attempts":attempts,"ambiguous":ambiguous,"last_error":last_error,"last_attempt":last_attempt}),
-        )
-    }
-
-    /// Claims the oldest due outbox row or an expired sending lease.
-    pub fn claim_delivery(
-        &mut self,
-        owner: &str,
-        at: f64,
-        lease_seconds: f64,
-    ) -> Result<Option<Value>> {
-        delivery::claim(self, owner, at, lease_seconds)
-    }
-
-    /// Completes one owned outbox row and optionally stores its attempt evidence.
-    pub fn complete_delivery(
-        &mut self,
-        delivery_id: &str,
-        owner: &str,
-        at: f64,
-        remote_message_id: Option<&str>,
-        ambiguous: bool,
-        evidence: Option<&Value>,
-    ) -> Result<()> {
-        delivery::complete(
-            self,
-            delivery_id,
-            owner,
-            at,
-            remote_message_id,
-            ambiguous,
-            evidence,
-        )
-    }
-
-    /// Permanently fails one owned outbox row and optionally stores its evidence.
-    pub fn fail_delivery(
-        &mut self,
-        delivery_id: &str,
-        owner: &str,
-        error: &str,
-        at: f64,
-        ambiguous: bool,
-        evidence: Option<&Value>,
-    ) -> Result<()> {
-        delivery::fail(self, delivery_id, owner, error, at, ambiguous, evidence)
-    }
-
-    /// Schedules one owned outbox retry with bounded exponential backoff.
-    #[allow(clippy::too_many_arguments)] // Mirrors the explicit Python retry contract.
-    pub fn retry_delivery(
-        &mut self,
-        delivery_id: &str,
-        owner: &str,
-        error: &str,
-        at: f64,
-        ambiguous: bool,
-        evidence: Option<&Value>,
-        base_delay: f64,
-        max_delay: f64,
-    ) -> Result<f64> {
-        delivery::retry(
-            self,
-            delivery_id,
-            owner,
-            error,
-            at,
-            ambiguous,
-            evidence,
-            base_delay,
-            max_delay,
         )
     }
 
@@ -1571,6 +1502,15 @@ fn safe_evidence(raw: &Value) -> Option<Value> {
         "uds_receipt_refused",
         "unsupported_transport",
         "delivery_expired",
+        "bridge_custody_accepted",
+        "bridge_outcome_unknown",
+        "bridge_unconfigured",
+        "bridge_unavailable",
+        "bridge_forbidden",
+        "bridge_unsupported",
+        "bridge_invalid",
+        "bridge_refused",
+        "bridge_owner_changed",
     ]
     .contains(&classifier)
     {

@@ -152,7 +152,6 @@ fn config_to_value(cfg: &Config) -> Value {
             "retry_base_seconds": cfg.delivery.retry_base_seconds,
             "retry_cap_seconds": cfg.delivery.retry_cap_seconds,
             "max_attempts": cfg.delivery.max_attempts,
-            "codex_queue_bin": cfg.delivery.codex_queue_bin,
         },
         "profiles": {"directory": cfg.profiles.directory},
         "skills_directory": cfg.skills.directory,
@@ -231,7 +230,6 @@ fn normalize_expected_config_paths(expected: &mut Value, home: &std::path::Path)
 
     for pointer in [
         "/capacity/codexbar_binary",
-        "/delivery/codex_queue_bin",
         "/profiles/directory",
         "/skills_directory",
     ] {

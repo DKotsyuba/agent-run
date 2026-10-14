@@ -480,71 +480,12 @@ async fn agents_follow_binary_tracks_the_real_lifecycle_without_duplicates() {
 
 /// A finite real-broker pool run accepts the `codex` alias, persists its
 /// canonical transport, and delivers exactly one common notice through the
-/// bound fake Desktop relay after both private-catalog members finish.
+/// bound synthetic Bridge service after both private-catalog members finish.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scripted_pool_completes_with_one_correlated_common_notice() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut h = Harness::new();
+    let bridge = bridge_fixture::start(&h.home, false);
     h.start_broker().await;
-    let listener = tokio::net::UnixListener::bind(h.home.join("ar-cdx-v4-pool.sock")).unwrap();
-    // Successful members use the pool's common notice; the finite relay records
-    // that notice and any unrelated delivery frames. The task is aborted by the
-    // guard on every exit path.
-    struct Relay(tokio::task::JoinHandle<()>);
-    impl Drop for Relay {
-        fn drop(&mut self) {
-            self.0.abort();
-        }
-    }
-    let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
-    let sink = received.clone();
-    let probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let probe_count = probes.clone();
-    let relay = Relay(tokio::spawn(async move {
-        loop {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            // The broker's own filesystem housekeeping probes every relay
-            // socket at the home root with a bare connect-and-close
-            // (`housekeeping::probe_socket`, reclaiming only refused sockets).
-            // That is legitimate: count it and keep serving, never die on it.
-            let Ok(length) = stream.read_u32_le().await else {
-                probe_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                continue;
-            };
-            // Same frame bound as the real relay; anything else is dropped.
-            if length == 0 || length > 8192 {
-                continue;
-            }
-            let mut data = vec![0; length as usize];
-            if stream.read_exact(&mut data).await.is_err() {
-                continue;
-            }
-            let Ok(frame) = serde_json::from_slice::<Value>(&data) else {
-                continue;
-            };
-            sink.lock().unwrap().push(frame);
-            let reply = br#"{"outcome":"accepted"}"#;
-            if stream.write_u32_le(reply.len() as u32).await.is_ok() {
-                let _ = stream.write_all(reply).await;
-            }
-        }
-    }));
-    // Deterministic regression: one owned empty connection before any real
-    // notice. A relay that unwraps the missing frame dies here, the counter
-    // never moves, and this wait fails instead of the run losing every notice.
-    drop(
-        tokio::net::UnixStream::connect(h.home.join("ar-cdx-v4-pool.sock"))
-            .await
-            .unwrap(),
-    );
-    let probe_deadline = Instant::now() + Duration::from_secs(5);
-    while probes.load(std::sync::atomic::Ordering::SeqCst) < 1 {
-        assert!(
-            Instant::now() < probe_deadline && !relay.0.is_finished(),
-            "the fake relay did not survive a connect-and-close liveness probe"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
     let member = |role: &str, task: &str| {
         json!({"role": role, "start": {
             "provider":"mock","model":"fixture","profile":"review","task":task,"explicit_finish":false,
@@ -644,30 +585,33 @@ async fn scripted_pool_completes_with_one_correlated_common_notice() {
             row.failure_kind, row.failure_text
         );
     }
-    // No successful member notices and exactly one common notice, acknowledged.
-    let relay_deadline = Instant::now() + Duration::from_secs(30);
+    // No successful member notices and exactly one common publication accepted into Bridge custody.
+    let delivery_deadline = Instant::now() + Duration::from_secs(30);
     let request = loop {
-        let seen = received.lock().unwrap().clone();
+        let seen = bridge.published.lock().unwrap().clone();
         let pool_notices: Vec<_> = seen
             .iter()
-            .filter(|r| r["op"] == "pool_completion")
+            .filter(|r| r.kind == "agent-run.pool-completion")
             .collect();
-        let member_notices = seen.iter().filter(|r| r["op"] == "completion").count();
+        let member_notices = seen
+            .iter()
+            .filter(|r| r.kind == "agent-run.completion")
+            .count();
         if pool_notices.len() == 1 && member_notices == 0 {
             break pool_notices[0].clone();
         }
         assert!(
-            pool_notices.len() <= 1 && member_notices == 0 && Instant::now() < relay_deadline,
-            "relay saw {} pool and {member_notices} successful member notices",
+            pool_notices.len() <= 1 && member_notices == 0 && Instant::now() < delivery_deadline,
+            "Bridge saw {} pool and {member_notices} successful member notices",
             pool_notices.len()
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    assert_eq!(request["op"], "pool_completion");
-    assert_eq!(request["pool_id"], pool_id.as_str());
-    let message = request["message"].as_str().unwrap();
+    assert_eq!(request.kind, "agent-run.pool-completion");
+    let message = request.payload.as_str();
+    assert!(message.contains(pool_id.as_str()));
     assert!(message.contains("commit abc123") && message.contains("ship the fixture result"));
-    assert!(request.get("agent_id").is_none() && request.get("run_id").is_none());
+    assert!(!message.contains("run_id"));
     let deadline = Instant::now() + Duration::from_secs(15);
     let store = loop {
         let store = agent_run_store::fixture::open(&h.home).unwrap();
@@ -716,3 +660,6 @@ async fn scripted_pool_completes_with_one_correlated_common_notice() {
         .is_err()
     );
 }
+
+#[path = "../../agent-run-core/tests/common/bridge.rs"]
+mod bridge_fixture;

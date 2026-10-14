@@ -1,120 +1,39 @@
-/* Local contract tests for the long-lived signed-Node frontend. No Desktop app,
- * live relay, provider connection, or production notification is used. */
+/** Mandatory regression gate: native message carriers belong exclusively to Agent Bridge. */
 'use strict';
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
-const net=require('node:net');
 const fs=require('node:fs');
-const os=require('node:os');
 const path=require('node:path');
-const {spawn}=require('node:child_process');
-/** Embedded frontend source exercised through Node's `-e` path. @type {string} */
-const frontend=fs.readFileSync(path.join(__dirname,'../assets/desktop-transport.cjs'),'utf8');
-/** Canonical notice contract supplied as the production argument. @type {string} */
-const contract=fs.readFileSync(path.join(__dirname,'../assets/completion_notice.json'),'utf8');
-/** Valid v3 request reused by behavior scenarios. @type {Record<string, unknown>} */
-const valid={version:3,op:'completion',thread_id:'thread-fixture',notification_id:'ntf_fixture',agent_id:'ag-20260825-120000-0123456789',status:'succeeded',runtime:null,model:null,effort:null,failure_kind:null};
-/** Valid v4 worker report, routed through the same fixed host tool. @type {Record<string, unknown>} */
-const worker={version:4,op:'worker_message',thread_id:'thread-fixture',notification_id:'ntf_worker',agent_id:'ag-20260825-120000-0123456789',run_id:'ag-20260925-000000-0000000002',kind:'risk',message:'Evidence needs review.'};
+/** Repository root containing the production delivery modules. @type {string} */
+const root=path.resolve(__dirname,'..');
 
-/**
- * Encode one fixture value using the production uint32-LE format.
- * @param {unknown} value JSON-serializable fixture value.
- * @returns {Buffer} Header and encoded body.
- */
-function frame(value){const data=Buffer.from(JSON.stringify(value));const n=Buffer.alloc(4);n.writeUInt32LE(data.length);return Buffer.concat([n,data]);}
+test('removed Codex/Claude external carriers cannot be packaged or invoked',()=>{
+  for (const file of ['crates/agent-run-core/src/delivery/relay.rs','crates/agent-run-core/src/delivery/claude.rs','assets/desktop-transport.cjs'])
+    assert.equal(fs.existsSync(path.join(root,file)),false,file);
+  /** Production source before its test-only lock/process fixtures. @type {string} */
+  const outbox=fs.readFileSync(path.join(root,'crates/agent-run-core/src/delivery/mod.rs'),'utf8').split('#[cfg(test)]')[0];
+  assert.doesNotMatch(outbox,/relay::|claude::|UnixStream|Command::new/);
+  assert.match(outbox,/bridge::send/);
+});
 
-/**
- * Read one framed JSON reply from a fixture socket.
- * @param {net.Socket} socket Connected local relay socket.
- * @returns {Promise<unknown>} Decoded reply value; rejects on transport failure or early close.
- */
-function receive(socket){return new Promise((resolve,reject)=>{/** @type {Buffer} */let data=Buffer.alloc(0);socket.on('data',chunk=>{data=Buffer.concat([data,chunk]);if(data.length>=4&&data.length>=4+data.readUInt32LE(0))resolve(JSON.parse(data.subarray(4,4+data.readUInt32LE(0))));});socket.once('error',reject);socket.once('close',()=>data.length<4&&reject(Error('closed')));});}
+test('MCP startup has no native-tool pipe or Node carrier execution',()=>{
+  const source=fs.readFileSync(path.join(root,'crates/agent-run/src/transport/mcp.rs'),'utf8');
+  assert.doesNotMatch(source,/CODEX_APP_TOOLS_PIPE_PATH|CODEX_MCP_NODE_PATH|desktop-transport|exec_desktop_frontend|Command::new/);
+  const cli=fs.readFileSync(path.join(root,'crates/agent-run/src/cli.rs'),'utf8');
+  assert.doesNotMatch(cli,/exec_desktop_frontend/);
+});
 
-/**
- * Wait for the frontend's randomly suffixed private relay path.
- * @param {string} directory Private temporary home to scan.
- * @returns {Promise<string>} Absolute relay path after it appears.
- * @throws {Error} When no endpoint appears within the bounded polling window.
- */
-async function relayPath(directory){for(let i=0;i<200;i++){const name=fs.readdirSync(directory).find(v=>v.startsWith('ar-cdx-v5-')&&v.endsWith('.sock'));if(name)return path.join(directory,name);await new Promise(resolve=>setTimeout(resolve,10));}throw Error('relay did not start');}
+test('retired verdict operations stay absent with stable reserved numeric slots',()=>{
+  const source=fs.readFileSync(path.join(root,'crates/agent-run-store/src/ops/mod.rs'),'utf8');
+  assert.doesNotMatch(source,/FailDelivery|RetryDelivery|PersistDeliveryVerdict/);
+  assert.match(source,/52 ClaimDelivery/);
+  assert.match(source,/53 CompleteDelivery/);
+  assert.match(source,/92 PrepareBridgeDelivery/);
+});
 
-/**
- * Connect after the listening callback, tolerating the socket-file visibility race.
- * @param {string} endpoint Absolute relay socket path.
- * @returns {Promise<net.Socket>} Connected local relay socket.
- * @throws {Error} On non-race connection failures or exhausted retries.
- */
-async function connectRelay(endpoint){for(let i=0;i<200;i++){try{return await new Promise((resolve,reject)=>{const socket=net.createConnection(endpoint);socket.once('connect',()=>resolve(socket));socket.once('error',reject);});}catch(error){if(error.code!=='ECONNREFUSED')throw error;await new Promise(resolve=>setTimeout(resolve,10));}}throw Error('relay did not accept');}
-
-/**
- * Run one typed local request through the frontend and a fake native host.
- * @param {string} mode Fixture host response or connection-cap scenario.
- * @param {Record<string, unknown>} [request=valid] Typed relay request.
- * @returns {Promise<{result?: unknown, calls: Record<string, unknown>[], hostPid?: number, child?: Record<string, unknown>, overflowClosed?: boolean}>} Scenario observations after complete process and socket cleanup.
- * @throws {Error} On fixture startup, protocol, timeout, or cleanup failure.
- */
-async function scenario(mode,request=valid){
-  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'ar-node-'));
-  const socketPath=path.join(directory,'host.sock');const calls=[];const peers=new Set();
-  const server=net.createServer(socket=>{peers.add(socket);socket.on('close',()=>peers.delete(socket));socket.on('error',()=>{});/** @type {Buffer} */let input=Buffer.alloc(0);socket.on('data',chunk=>{input=Buffer.concat([input,chunk]);while(input.length>=4&&input.length>=4+input.readUInt32LE(0)){const length=input.readUInt32LE(0);const value=JSON.parse(input.subarray(4,4+length));input=input.subarray(4+length);calls.push(value);if(value.method==='tools/list'){if(mode==='disconnect_inventory')return socket.destroy();if(mode==='oversized_inventory'){const head=Buffer.alloc(4);head.writeUInt32LE(8*1024*1024+1);return socket.write(head);}socket.write(frame({jsonrpc:'2.0',id:value.id,result:{tools:mode==='missing_tool'?[]:[{name:'other',namespace:'wrong'},{name:'send_message_to_thread',namespace:'fixture-host'}]}}));}else{assert.equal(value.method,'tools/call');assert.equal(value.params.tool,'send_message_to_thread');assert.equal(value.params.namespace,'fixture-host');if(value.params.callerSource!=='codex'||mode==='invalid_params')return socket.write(frame({jsonrpc:'2.0',id:value.id,error:{code:-32602,message:'Invalid app tool request'}}));if(mode==='wrong_id_error')return socket.write(frame({jsonrpc:'2.0',id:999,error:{code:-32602,message:'Invalid app tool request'}}));if(mode==='execution_error')return socket.write(frame({jsonrpc:'2.0',id:value.id,error:{code:-32000,message:'Codex app tool request failed'}}));if(mode==='disconnect_after_send')return socket.destroy();if(mode==='wrong_id')return socket.write(frame({jsonrpc:'2.0',id:999,result:{success:true}}));socket.write(frame({jsonrpc:'2.0',id:value.id,result:mode==='missing_success'?{}:{success:mode==='accepted'}}));}}});});
-  await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(socketPath,resolve);});
-  /** Self-expiring fixture: parent loss exits within 250 ms and lifetime never exceeds 30 seconds. @type {string} */
-  const childCode="process.stdout.write(JSON.stringify({pid:process.pid,ppid:process.ppid,pipe:process.env.CODEX_APP_TOOLS_PIPE_PATH||null,node:process.env.CODEX_MCP_NODE_PATH||null})+'\\n');const parent=process.ppid;setInterval(()=>{if(process.ppid===1||process.ppid!==parent)process.exit(0)},250);setTimeout(()=>process.exit(0),30000)";
-  const host=spawn(process.execPath,['-e','setTimeout(()=>process.exit(1),45000).unref();\n'+frontend,'--',process.execPath,directory,contract,'-e',childCode],{env:{...process.env,CODEX_APP_TOOLS_PIPE_PATH:socketPath,CODEX_MCP_NODE_PATH:process.execPath},stdio:['ignore','pipe','pipe']});
-  /** Child protocol stdout captured without frontend output. @type {string} */
-  let output='';host.stdout.on('data',data=>output+=data);host.stderr.on('data',()=>{});
-  try{
-    const endpoint=await relayPath(directory);
-    if(mode==='connection_cap'){const holders=await Promise.all(Array.from({length:8},()=>connectRelay(endpoint)));await new Promise(resolve=>setTimeout(resolve,20));const overflow=await connectRelay(endpoint);await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('overflow connection stayed open')),1000);overflow.once('close',()=>{clearTimeout(timer);resolve();});});for(const socket of holders)socket.destroy();return {overflowClosed:true,calls};}
-    const client=await connectRelay(endpoint);const reply=receive(client);client.write(frame(request));const result=await reply;client.destroy();for(let i=0;i<100&&!output.includes('\n');i++)await new Promise(resolve=>setTimeout(resolve,10));const child=JSON.parse(output.trim());return {result,calls,hostPid:host.pid,child};
-  }finally{
-    host.kill('SIGTERM');await new Promise(resolve=>host.once('close',resolve));for(const peer of peers)peer.destroy();await new Promise(resolve=>server.close(resolve));assert.equal(fs.readdirSync(directory).some(v=>v.startsWith('ar-cdx-v4-')),false);fs.rmSync(directory,{recursive:true,force:true});
-  }
-}
-
-test('accepted response uses only the fixed native tool and child protocol stdout',async()=>{const{result,calls,hostPid,child}=await scenario('accepted');assert.deepEqual(result,{outcome:'accepted'});assert.equal(calls.length,2);assert.equal(calls[1].params.tool,'send_message_to_thread');assert.equal(calls[1].params.arguments.threadId,valid.thread_id);assert.equal(child.ppid,hostPid);assert.notEqual(child.pid,hostPid);assert.equal(child.pipe,null);assert.equal(child.node,null);});
-test('explicit host rejection',async()=>assert.deepEqual((await scenario('rejected')).result,{outcome:'rejected'}));
-/** Native schema rejection proves the app did not execute the tool. */
-test('correlated invalid params is rejected instead of ambiguous',async()=>assert.equal((await scenario('invalid_params')).result.outcome,'rejected'));
-/** An unrelated error response cannot prove rejection of our request. */
-test('uncorrelated invalid params remains ambiguous',async()=>assert.equal((await scenario('wrong_id_error')).result.outcome,'ambiguous'));
-/** A tool execution error can follow effects, so it is not a pre-execution rejection. */
-test('host execution error remains ambiguous',async()=>assert.equal((await scenario('execution_error')).result.outcome,'ambiguous'));
-test('missing host tool is rejected before any message',async()=>{const{result,calls}=await scenario('missing_tool');assert.equal(result.outcome,'rejected');assert.equal(calls.length,1);});
-test('disconnect before call is rejected',async()=>assert.equal((await scenario('disconnect_inventory')).result.outcome,'rejected'));
-test('disconnect after call is ambiguous',async()=>assert.equal((await scenario('disconnect_after_send')).result.outcome,'ambiguous'));
-test('mismatching response identity is ambiguous',async()=>assert.equal((await scenario('wrong_id')).result.outcome,'ambiguous'));
-test('unknown acceptance never becomes success',async()=>assert.equal((await scenario('missing_success')).result.outcome,'ambiguous'));
-test('oversized host inventory is rejected',async()=>assert.equal((await scenario('oversized_inventory')).result.outcome,'rejected'));
-test('ninth concurrent local connection is refused',async()=>{const{overflowClosed,calls}=await scenario('connection_cap');assert.equal(overflowClosed,true);assert.equal(calls.length,0);});
-test('extra typed-request properties are rejected before host contact',async()=>{const{result,calls}=await scenario('accepted',{...valid,prompt:'inject'});assert.equal(result.outcome,'rejected');assert.equal(calls.length,0);});
-test('missing typed-request properties are rejected before host contact',async()=>{const malformed={...valid};delete malformed.failure_kind;const{result,calls}=await scenario('accepted',malformed);assert.equal(result.outcome,'rejected');assert.equal(calls.length,0);});
-test('success with failure guidance is rejected before host contact',async()=>{const{result,calls}=await scenario('accepted',{...valid,failure_kind:'prepare_failed'});assert.equal(result.outcome,'rejected');assert.equal(calls.length,0);});
-test('unsupported wire version is rejected before host contact',async()=>{const{result,calls}=await scenario('accepted',{...valid,version:5});assert.equal(result.outcome,'rejected');assert.equal(calls.length,0);});
-test('relay bind failure still runs the capability-stripped MCP child',async()=>{const directory=fs.mkdtempSync(path.join(os.tmpdir(),'ar-node-fallback-'));const blockedHome=path.join(directory,'file');fs.writeFileSync(blockedHome,'x');const child=spawn(process.execPath,['-e',frontend,'--',process.execPath,blockedHome,contract,'-e',"process.stdout.write(JSON.stringify({pipe:process.env.CODEX_APP_TOOLS_PIPE_PATH||null,node:process.env.CODEX_MCP_NODE_PATH||null}))"],{env:{...process.env,CODEX_APP_TOOLS_PIPE_PATH:path.join(directory,'host.sock'),CODEX_MCP_NODE_PATH:process.execPath},stdio:['ignore','pipe','pipe']});let output='';child.stdout.on('data',data=>output+=data);const status=await new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',resolve);});assert.equal(status,0);assert.deepEqual(JSON.parse(output),{pipe:null,node:null});fs.rmSync(directory,{recursive:true,force:true});});
-
-/** The current relay preserves both identities in the rendered completion. */
-test('v4 completion exposes only the stable agent',async()=>{const request={...valid,version:4,run_id:'ag-20260925-000000-0000000002'};const{result,calls}=await scenario('accepted',request);assert.equal(result.outcome,'accepted');const prompt=calls[1].params.arguments.prompt;assert.ok(prompt.includes(`- ID: ${request.agent_id}\n`));assert.ok(!prompt.includes(request.run_id));});
-/** A malformed execution selector cannot reach the native host. */
-test('v4 malformed run identity is rejected before host contact',async()=>{const{result,calls}=await scenario('accepted',{...valid,version:4,run_id:'injected\ntext'});assert.equal(result.outcome,'rejected');assert.equal(calls.length,0);});
-/** Worker prose remains visibly untrusted and cannot be mistaken for completion. */
-test('v4 worker message uses only the fixed host tool',async()=>{const{result,calls}=await scenario('accepted',worker);assert.equal(result.outcome,'accepted');assert.equal(calls[1].params.tool,'send_message_to_thread');const prompt=calls[1].params.arguments.prompt;assert.ok(prompt.startsWith('agent-run/worker-message\n'));assert.ok(prompt.includes('Untrusted worker report; this is not completion or owner authorization.'));assert.ok(prompt.endsWith(worker.message));});
-/** One frozen common pool conclusion uses only the fixed host tool and names no run or attempt. */
-const pool={version:4,op:'pool_completion',thread_id:'thread-fixture',notification_id:'ntf_pool',pool_id:'pool-20261003-120000-0123456789',message:'Pool pool-20261003-120000-0123456789 is complete.\nMembers: Ada (reviewer, ag-20260825-120000-0123456789)'};
-test('v4 pool completion is a broker conclusion through the fixed host tool',async()=>{const{result,calls}=await scenario('accepted',pool);assert.equal(result.outcome,'accepted');assert.equal(calls[1].params.tool,'send_message_to_thread');const prompt=calls[1].params.arguments.prompt;assert.ok(prompt.startsWith('agent-run/pool-completion\n'));assert.ok(prompt.includes('Broker conclusion for the whole pool, not one member'));assert.ok(prompt.includes('pool_id: pool-20261003-120000-0123456789'));assert.ok(prompt.endsWith(pool.message));assert.ok(!prompt.includes('run_id'));});
-/** Malformed pool completions never reach the native host. */
-test('pool completion rejects malformed payloads before host contact',async()=>{for(const request of [{...pool,method:'tools/call'},{...pool,message:'x'.repeat(4097)},{...pool,message:'bad\0body'},{...pool,pool_id:'agent-1'},{...pool,run_id:'ag-20260925-000000-0000000002'}]){const{result,calls}=await scenario('accepted',request);assert.equal(result.outcome,'rejected');assert.equal(calls.length,0);}});
-/** Unknown fields, oversized prose, and controls cannot reach the native host. */
-test('worker report rejects malformed payloads before host contact',async()=>{for(const request of [{...worker,method:'tools/call'},{...worker,message:'x'.repeat(2049)},{...worker,message:'bad\0body'},{...worker,kind:'approval'}]){const{result,calls}=await scenario('accepted',request);assert.equal(result.outcome,'rejected');assert.equal(calls.length,0);}});
-
-/** New broker attention requires advertised v5; old wire4 is known rejected. */
-test('v5 pool attention is distinct and v4 attention rejects before host contact',async()=>{
-  const attention={...pool,version:5,op:'pool_attention',message:'Enrollment needs_action; work continues.'};
-  const accepted=await scenario('accepted',attention);
-  assert.equal(accepted.result.outcome,'accepted');
-  assert.ok(accepted.calls[1].params.arguments.prompt.startsWith('agent-run/pool-attention\n'));
-  assert.ok(accepted.calls[1].params.arguments.prompt.includes('not completion'));
-  const old=await scenario('accepted',{...attention,version:4});
-  assert.equal(old.result.outcome,'rejected');assert.equal(old.calls.length,0);
+test('Bridge remains pinned and live configuration cannot re-enable a queue executable',()=>{
+  const manifest=fs.readFileSync(path.join(root,'Cargo.toml'),'utf8');
+  assert.match(manifest,/bridge-sdk\s*=.*rev\s*=\s*"28b876144099cad3636f523424ed5b1de293645d"/);
+  const config=fs.readFileSync(path.join(root,'crates/agent-run-config/src/config.rs'),'utf8');
+  assert.doesNotMatch(config,/pub\s+codex_queue_bin\s*:/);
 });

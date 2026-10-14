@@ -23,10 +23,6 @@ use std::{
     ffi::OsString,
     fs::OpenOptions,
     os::unix::fs::OpenOptionsExt,
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::ffi::OsStrExt,
-    },
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
@@ -45,8 +41,6 @@ pub const LOG_SECONDS: f64 = 30.0 * 24.0 * 3600.0;
 const TREE_ROOTS_PER_PASS: usize = 16;
 /// Maximum descendant unlinks one pass performs, in addition to the bounded tree roots.
 const ENTRY_UNLINKS_PER_PASS: usize = 256;
-/// Maximum stale-socket probes one pass performs.
-const SOCKET_PROBES_PER_PASS: usize = 16;
 /// Maximum log/config backup files one pass removes.
 const FILE_REMOVALS_PER_PASS: usize = 64;
 /// Maximum remembered namespaces in one unfinished scan round.
@@ -123,8 +117,6 @@ struct Pass {
     roots: usize,
     /// Remaining file and nested-directory unlinks inside approved trees.
     unlinks: usize,
-    /// Remaining nonblocking socket probes.
-    sockets: usize,
     /// Remaining standalone file unlinks.
     files: usize,
     /// Number of entries actually removed this pass.
@@ -178,7 +170,6 @@ impl Pass {
         Ok(Self {
             roots: TREE_ROOTS_PER_PASS,
             unlinks: ENTRY_UNLINKS_PER_PASS,
-            sockets: SOCKET_PROBES_PER_PASS,
             files: FILE_REMOVALS_PER_PASS,
             removed: 0,
             scans: 1024,
@@ -372,7 +363,6 @@ pub async fn sweep_on<B: crate::runtime_storage::LayoutBackend>(
     migration_snapshots(home, &root, now, &proof, &mut pass);
     config_profile_backups(home, &root, now, &config, &proof, &mut pass);
     aged_logs(home, &root, now, &proof, &mut pass);
-    stale_sockets(home, &root, &proof, &mut pass);
     // Shared-store collection reports its own backlog and never fails the
     // retention pass: a busy publish lock or incomplete evidence simply
     // retries on the next cycle, while everything above still makes progress.
@@ -912,116 +902,6 @@ fn daily_log_created(name: &str) -> Option<f64> {
     Some(day.and_hms_opt(0, 0, 0)?.and_utc().timestamp() as f64)
 }
 
-/// Reclaims stale Desktop relay sockets at the home root.
-///
-/// A socket is stale only when a fresh nonblocking connect reports the endpoint vanished
-/// and the inode is unchanged across the probe. Refusal and other uncertain outcomes are
-/// retained because a full live backlog can refuse connections. No process identity is
-/// guessed and nothing is killed; stale filesystem sockets may therefore remain.
-fn stale_sockets(home: &Path, root: &fs::Dir, proof: &StorageProtection, pass: &mut Pass) {
-    let Some(names) = pass.list(root, "sockets") else {
-        return;
-    };
-    for name in names {
-        if pass.sockets == 0 {
-            return;
-        }
-        let Some(name) = name.to_str() else { continue };
-        if !is_relay_socket(name) {
-            continue;
-        }
-        if proof.retains("", &home.join(name)) {
-            continue;
-        }
-        let rel = Path::new(name);
-        let Ok(entry) = root.entry(Some(rel)) else {
-            continue;
-        };
-        if entry.kind != fs::EntryType::Special || !entry.socket || entry.uid != euid() {
-            continue;
-        }
-        pass.sockets -= 1;
-        // A full live backlog can also refuse immediately, so refusal is not deletion proof.
-        if !matches!(probe_socket(&home.join(name)), Ok(false)) {
-            continue;
-        }
-        // Identity must still be the probed object immediately before unlink.
-        match root.entry(Some(rel)) {
-            Ok(current)
-                if current.device == entry.device
-                    && current.inode == entry.inode
-                    && current.socket =>
-            {
-                if root.remove(rel).is_ok() {
-                    pass.removed += 1;
-                }
-            }
-            _ => continue,
-        }
-    }
-}
-
-/// Probes a Unix socket without ever waiting for a full listen backlog.
-/// Returns `false` only when the endpoint path is absent; refusal and other errors remain uncertain.
-fn probe_socket(path: &Path) -> std::io::Result<bool> {
-    let bytes = path.as_os_str().as_bytes();
-    // SAFETY: sockaddr_un is a plain C buffer; address fields are filled before connect.
-    let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
-    if bytes.len() >= address.sun_path.len() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "socket path too long",
-        ));
-    }
-    let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
-    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    #[cfg(target_os = "macos")]
-    {
-        address.sun_len = length as u8;
-    }
-    for (target, source) in address.sun_path.iter_mut().zip(bytes) {
-        *target = *source as libc::c_char;
-    }
-    // SAFETY: socket returns one owned descriptor; File closes it on every path.
-    let descriptor = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-    if descriptor < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: socket returned a valid descriptor which is uniquely owned here.
-    let socket = unsafe { std::fs::File::from_raw_fd(descriptor) };
-    // SAFETY: fcntl modifies only this newly created descriptor.
-    if unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: address is initialized and length includes the terminating NUL.
-    if unsafe {
-        libc::connect(
-            socket.as_raw_fd(),
-            (&address as *const libc::sockaddr_un).cast(),
-            length as libc::socklen_t,
-        )
-    } == 0
-    {
-        return Ok(true);
-    }
-    let error = std::io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(libc::ENOENT) => Ok(false),
-        _ => Err(error),
-    }
-}
-
-/// Recognizes Desktop relay socket names (`ar-cdx-v<version>-...sock`).
-fn is_relay_socket(name: &str) -> bool {
-    let rest = match name.strip_prefix("ar-cdx-v") {
-        Some(rest) => rest,
-        None => return false,
-    };
-    name.ends_with(".sock")
-        && rest.starts_with(|b: char| b.is_ascii_digit())
-        && name.len() > "ar-cdx-v1-.sock".len()
-}
-
 /// Opens one direct child of `root` when it is an effective-user-owned directory.
 fn open_owned(root: &fs::Dir, name: &str) -> Option<fs::Dir> {
     let rel = Path::new(name);
@@ -1233,10 +1113,9 @@ pub fn sweep(home: &Path, now: f64, store: &mut Store) -> Result<usize> {
 }
 
 #[cfg(test)]
-/// Retention and socket probes use private fixtures and never launch a model process.
+/// Retention uses private fixtures and never launch a model process.
 mod tests {
     use super::*;
-    use std::os::fd::AsRawFd;
 
     /// An admission committed after protection capture keeps its same-second
     /// tree through the real collector, even though the stale count boundary
@@ -1284,32 +1163,6 @@ mod tests {
             tree.join("live").exists(),
             "fresh admission wins over stale protection"
         );
-    }
-
-    /// A full finite backlog may refuse a probe, but cleanup must retain the live socket.
-    #[test]
-    fn full_backlog_refusal_does_not_unlink_live_socket() {
-        let home = tempfile::tempdir().unwrap();
-        let path = home.path().join("ar-cdx-v4-backlog.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        // SAFETY: listen changes only this test-owned listener's backlog.
-        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
-        let queued = std::os::unix::net::UnixStream::connect(&path).unwrap();
-        assert!(!matches!(probe_socket(&path), Ok(false)));
-        let root = fs::Dir::open(home.path()).unwrap();
-        agent_run_store::fixture::initialize(home.path()).unwrap();
-        let store = agent_run_store::fixture::open(home.path()).unwrap();
-        let proof = store.storage_protection_snapshot().unwrap();
-        let mut pass = Pass::new(home.path(), &root).unwrap();
-        stale_sockets(home.path(), &root, &proof, &mut pass);
-        assert!(
-            path.exists(),
-            "a refused probe must not unlink the listener"
-        );
-        drop(queued);
-        let accepted = listener.accept().unwrap();
-        drop(accepted);
-        std::os::unix::net::UnixStream::connect(&path).unwrap();
     }
 
     /// Evicting the least recently used stream resets only that traversal and allows progress.

@@ -612,7 +612,7 @@ fn migration_030_rebuilds_the_ledger_exactly() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("state.db");
     let before = populated_v29(&path);
-    assert_eq!(migrations::migrate(&path).unwrap(), 30);
+    assert_eq!(migrations::migrate(&path).unwrap(), 31);
     let conn = Connection::open(&path).unwrap();
     assert_eq!(ledger_rows(&conn), before);
     let objects: Vec<String> = conn
@@ -698,7 +698,7 @@ fn a_failed_030_rebuild_rolls_back() {
     assert_eq!(trigger, trigger_before);
 }
 
-/// The committed schema-30 fixture and its manifest entry carry the
+/// The committed current-schema fixture and its manifest entry carry the
 /// rebuilt ledger with the proof phase and key-guarded trigger.
 #[test]
 fn current_fixture_carries_the_rebuilt_ledger() {
@@ -709,11 +709,11 @@ fn current_fixture_carries_the_rebuilt_ledger() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|file| file["file"] == "current-v30.sqlite")
+        .find(|file| file["file"] == "current-v31.sqlite")
         .unwrap();
-    assert_eq!(entry["user_version"], 30);
+    assert_eq!(entry["user_version"], 31);
     let conn = Connection::open_with_flags(
-        root.join("current-v30.sqlite"),
+        root.join("current-v31.sqlite"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .unwrap();

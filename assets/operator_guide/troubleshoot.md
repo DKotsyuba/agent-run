@@ -64,47 +64,30 @@ cause of "the agent ran but never delivered a result back."
 
 ## Delivery attempt evidence
 
-When relay-backed Codex delivery retries or fails, inspect
+When Bridge delivery retries or fails, inspect
 `agent-run delivery status <agent-id>` and its `last_attempt`.
 `classifier`, `returncode`, `spawn_errno`, `error_class`, and `duration_ms`
-separate relay unavailability, rejection, ambiguous post-write acceptance,
-and success. `codex_queue` is only a compatibility binding name: completion
-delivery never invokes the Codex UI queue. `null` means no attempt evidence
+describe safe historical evidence. Current attempts use bounded `bridge_*`
+classifiers and never invoke a Codex queue or Claude inbox. `null` means no evidence
 has been recorded. Raw messages, session ids, argument/environment values,
 and credentials are intentionally unavailable.
 
-`claude_uds` attempts record the same evidence shape with `classifier`
-`uds_receipt_held`, `uds_receipt_delivered`, `uds_receipt_refused`,
-`uds_unconfirmed`, `uds_ambiguous`, `uds_session_gone`, `uds_rejected`, or
-`uds_unavailable`. Each send proves the inbox socket's kernel peer identity
-(the descriptor's process id as this user) before any frame is written,
-advertises an ephemeral reply socket beside the inbox socket, and correlates
-the inbox's native hold-receipt by notification id, accepting it only from
-the same proven receiver identity: `uds_receipt_held` means the inbox
-confirmed it queued the notice (the `delivered` variant means it confirmed
-handing it to the session immediately); enqueue confirmation is still not
-proof the recipient's model read the message. The inbox sends a receipt only for a message it holds for approval, later
-releases or denies, refuses by policy, expires, or drops at admission; a message
-the session accepts immediately produces none, so silence can never be reported
-delivered and exactly-once delivery cannot be proved. `uds_unconfirmed` (a
-clean write with no correlated receipt, for example on an inbox that never
-answers or when no reply socket could be bound) and `uds_ambiguous` (a write
-that failed, timed out or was reset after it began) mean the notice may already
-be in the session's queue. They are not success and are not retried: the
-notice ends `failed` with `ambiguous: true` after that single attempt
-(at-most-once), because a retry would put a duplicate in the chat. Attempts
-that provably wrote nothing (`uds_session_gone`, `uds_unavailable`,
-`uds_rejected`) still retry with backoff. A queued notice left in `retry_wait`
-by an older broker after such an outcome is ended `failed` with `ambiguous:
-true` the next time it is claimed, without a new send. If a notice looks lost,
-check the recipient Claude session's queue before resending it by hand.
+`bridge_unconfigured` holds the notice without exhausting its retry budget.
+Inspect the explicit Bridge deployment and its dedicated protected producer grant.
+`bridge_unavailable` describes a failed service exchange; `bridge_forbidden` and
+`bridge_unsupported` describe grant/contract restrictions. `bridge_owner_changed`
+holds the original endpoint and credential-file association rather than re-homing it.
 
-Desktop relay discovery requires the MCP process to have started with absolute
-`CODEX_MCP_NODE_PATH` and `CODEX_APP_TOOLS_PIPE_PATH` values. In that mode the
-MCP PID belongs to the supplied signed Node frontend, while its distinct Rust
-child has neither variable. A missing `ar-cdx-v5-*.sock` beside the agent-run
-home indicates that the frontend could not bind its private relay; MCP continues
-without relay delivery and reports the failure on stderr.
+`custody_accepted` proves publication custody only. `outcome_unknown` means an effect
+may have committed; recovery reads the original event and validates producer, full
+fingerprint and destination. Never change event IDs, replay missing history, switch
+senders or replace Bridge storage as recovery. Bridge owns native dispatch and holds.
+
+`legacy_delivery_held` marks previously attempted native delivery that cannot safely
+be replayed. Original evidence remains immutable and readable; historical relay/uds
+classifiers describe the old attempt, not a current sender. Inspect the actual
+recipient conversation before an explicit audited recovery decision. MCP clients no
+longer need a Desktop delivery frontend or native-tools environment variables.
 
 ## Orphan check
 

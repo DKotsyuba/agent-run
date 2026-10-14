@@ -914,8 +914,6 @@ pub struct ClaimDelivery {
     pub at: f64,
     /// Prepared policy.
     pub policy: DeliveryPolicySpec,
-    /// Whether an attention-capable relay peer was advertised (prepared fs scan).
-    pub attention_peer: bool,
 }
 
 /// Dispatch completion facts of row 53.
@@ -937,6 +935,9 @@ pub struct DeliveryCompletion {
     pub classifier: String,
     /// Persisted bounded evidence.
     pub evidence: Option<Value>,
+    /// Validated Bridge custody receipt, separate from native delivery evidence.
+    #[serde(default)]
+    pub bridge_receipt: Option<Value>,
     /// Prepared policy.
     pub policy: DeliveryPolicySpec,
     /// Completion time.
@@ -950,42 +951,20 @@ pub struct CompleteDelivery {
     pub completion: DeliveryCompletion,
 }
 
-/// 54 — fail a delivery under its lease (broker).
-#[derive(Debug, Clone, Serialize)]
-pub struct FailDelivery {
-    /// Delivery id.
+/// 92 — freeze Bridge ownership and exact publication before any socket write.
+/// The claim already froze Bridge ownership; only its live lease can freeze content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrepareBridgeDelivery {
+    /// Existing outbox notification identity.
     pub delivery_id: String,
-    /// Lease owner.
+    /// Live dispatcher lease owner; other owners cannot transfer this intent.
     pub owner: String,
-    /// Closed error label.
-    pub error: String,
-    /// Time.
+    /// Current owned attempt; crashes before intent preparation never select a new owner.
+    pub attempt: u32,
+    /// Immutable destination/content/IDs without any credential or caller authority.
+    pub intent: agent_run_domain::bridge::BridgeIntent,
+    /// Wall-clock time used only to verify that the lease remains live.
     pub at: f64,
-    /// Ambiguous outcome.
-    pub ambiguous: bool,
-    /// Evidence.
-    pub evidence: Option<Value>,
-}
-
-/// 55 — schedule a retry under its lease (broker).
-#[derive(Debug, Clone, Serialize)]
-pub struct RetryDelivery {
-    /// Delivery id.
-    pub delivery_id: String,
-    /// Lease owner.
-    pub owner: String,
-    /// Closed error label.
-    pub error: String,
-    /// Time.
-    pub at: f64,
-    /// Ambiguous outcome.
-    pub ambiguous: bool,
-    /// Evidence.
-    pub evidence: Option<Value>,
-    /// Base delay seconds.
-    pub base_delay: f64,
-    /// Maximum delay seconds.
-    pub max_delay: f64,
 }
 
 /// 56 — cancel one delivery.
@@ -1000,19 +979,6 @@ pub struct CancelDelivery {
 pub struct ExpireUnboundDeliveries {
     /// Time.
     pub at: f64,
-}
-
-/// 58 — persist a delivery verdict.
-#[derive(Debug, Clone, Serialize)]
-pub struct PersistDeliveryVerdict {
-    /// Delivery id.
-    pub delivery_id: String,
-    /// Lease owner.
-    pub owner: String,
-    /// Verdict state.
-    pub state: String,
-    /// Evidence.
-    pub evidence: Value,
 }
 
 /// 59 — advance a reconciliation cursor (broker).

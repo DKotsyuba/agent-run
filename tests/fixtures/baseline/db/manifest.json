@@ -975,8 +975,58 @@
       },
       "sha256": "a097f4cec007a5dbf593bf2962c102fdfba8f0b05a0324a927ddd66c2c156449",
       "user_version": 30
+    },
+    {
+      "file": "current-v31.sqlite",
+      "how_produced": "Preserved current-v30 fixture with numbered migration 031 applied via SQLite CLI; historical rows preserved.",
+      "rows": {
+        "agent_service_gates": 0,
+        "agents": 11,
+        "attempt_quota_keys": 0,
+        "attempts": 9,
+        "bridge_delivery_intents": 0,
+        "capacity_route_snapshots": 1,
+        "capacity_samples": 1,
+        "commands": 3,
+        "context_receipts": 0,
+        "deliveries": 1,
+        "delivery_attempt_evidence": 2,
+        "events": 51,
+        "incident_ledger": 0,
+        "managed_service_generations": 0,
+        "managed_service_leases": 0,
+        "managed_service_probes": 0,
+        "messages": 2,
+        "operation_receipts": 0,
+        "orchestrator_sessions": 1,
+        "pool_enrollments": 0,
+        "pool_entries": 0,
+        "pool_members": 0,
+        "pools": 0,
+        "process_members": 0,
+        "process_ownership": 0,
+        "provider_accounts": 0,
+        "quota_capacity_revision": 1,
+        "quota_exhaustion": 0,
+        "reconciliation_cursors": 1,
+        "run_stats": 2,
+        "runtime_storage_layouts": 0,
+        "worker_capabilities": 0,
+        "worker_lifecycle": 0,
+        "worker_native_wakes": 0,
+        "worker_notifications": 0,
+        "workflow_deliveries": 0,
+        "workflow_runs": 0,
+        "workflow_steps": 0,
+        "writer_authority": 0,
+        "writer_producers": 0
+      },
+      "sha256": "ce405cf1900d7243e6b2153b888656d98a0ab10b30629ed11341e1ae92029464",
+      "user_version": 31
     }
   ],
-  "schema_version": 30,
-  "unbuildable_versions": []
+  "schema_version": 31,
+  "unbuildable_versions": [
+
+  ]
 }

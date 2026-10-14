@@ -447,6 +447,7 @@ impl Store<'_> {
             });
         };
         let evidence = self.conn.query_row("SELECT evidence_json FROM delivery_attempt_evidence WHERE delivery_id=? ORDER BY attempt DESC LIMIT 1", [notification_id.as_str()], |row| row.get::<_, String>(0)).optional()?;
+        let state = crate::delivery::public_state_on(&self.conn, &notification_id, &state)?;
         Ok(DeliveryView {
             run_id: None,
             agent_id: record.id.clone(),

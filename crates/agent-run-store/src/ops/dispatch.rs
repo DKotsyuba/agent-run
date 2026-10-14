@@ -83,10 +83,7 @@ pub fn implemented(kind: OpKindRef) -> bool {
             | K::PoolWrite
             | K::PoolOperatorPost
             | K::SettlePool
-            | K::FailDelivery
-            | K::RetryDelivery
             | K::ExpireUnboundDeliveries
-            | K::PersistDeliveryVerdict
             | K::PruneIncidentLedger
             | K::PruneReceipts
             | K::PersistCapacitySamples
@@ -94,6 +91,7 @@ pub fn implemented(kind: OpKindRef) -> bool {
             | K::RecordQuotaSnapshot
             | K::ClaimDelivery
             | K::CompleteDelivery
+            | K::PrepareBridgeDelivery
             | K::ReconcileReapedAgent
             | K::ReleaseOrphanedAttempt
             | K::MarkLost
@@ -128,9 +126,10 @@ pub(crate) fn remote_facts(op: &RemoteOp) -> Facts {
     let exec = |id: &AgentId| (Some(id.clone()), None, None);
     let attempt = |id: &AgentId, attempt: &str| (Some(id.clone()), Some(attempt.to_owned()), None);
     match op {
-        R::ClaimDelivery(_) | R::CompleteDelivery(_) | R::PruneCapacitySamples(_) => {
-            (None, None, None)
-        }
+        R::ClaimDelivery(_)
+        | R::CompleteDelivery(_)
+        | R::PrepareBridgeDelivery(_)
+        | R::PruneCapacitySamples(_) => (None, None, None),
         R::ClaimStartup(op) => exec(&op.execution),
         R::RecordSupervisorOwner(op) => exec(&op.execution),
         R::UpdateIdentity(op) => exec(&op.execution),
@@ -389,6 +388,7 @@ pub(crate) fn run_remote(store: &mut Store, op: RemoteOp) -> Result<Value> {
         R::DisableAccount(op) => out(store.disable_account(&op.account)?),
         R::ClaimDelivery(op) => out(store.claim_delivery_lease(&op)?),
         R::CompleteDelivery(op) => out(store.complete_delivery_attempt(&op.completion)?),
+        R::PrepareBridgeDelivery(op) => out(store.prepare_bridge_delivery(&op)?),
         R::PruneCapacitySamples(op) => out(store.prune_capacity_samples(op.retention)?),
 
         R::CancelDelivery(op) => out(store.cancel_delivery(&op.delivery_id)?),
@@ -607,33 +607,9 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
                 json!({ "settled": store.settle_open_pools(limit, seed)? })
             }
         }),
-        L::FailDelivery(op) => out(store.fail_delivery(
-            &op.delivery_id,
-            &op.owner,
-            &op.error,
-            op.at,
-            op.ambiguous,
-            op.evidence.as_ref(),
-        )?),
-        L::RetryDelivery(op) => out(store.retry_delivery(
-            &op.delivery_id,
-            &op.owner,
-            &op.error,
-            op.at,
-            op.ambiguous,
-            op.evidence.as_ref(),
-            op.base_delay,
-            op.max_delay,
-        )?),
         L::ExpireUnboundDeliveries(op) => {
             out(store.expire_unbound_batch(op.at, Some(EXPIRY_BATCH))?)
         }
-        L::PersistDeliveryVerdict(op) => out(store.persist_delivery_verdict(
-            &op.delivery_id,
-            &op.owner,
-            &op.state,
-            &op.evidence,
-        )?),
         L::PruneIncidentLedger(op) => out(crate::incidents::prune(&store.conn, op.at)?),
         L::PruneReceipts(op) => out(super::apply::prune_receipts(&store.conn, &op)?),
 

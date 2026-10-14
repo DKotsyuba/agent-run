@@ -179,11 +179,8 @@ inventory! {
     51 BindPool "bind_pool" R N n;
     52 ClaimDelivery "claim_delivery" R N n;
     53 CompleteDelivery "complete_delivery" R N n;
-    54 FailDelivery "fail_delivery" L N n;
-    55 RetryDelivery "retry_delivery" L N n;
     56 CancelDelivery "cancel_delivery" R N n;
     57 ExpireUnboundDeliveries "expire_unbound_deliveries" L B n;
-    58 PersistDeliveryVerdict "persist_delivery_verdict" L N n;
     59 ReconcileReapedAgent "reconcile_reaped_agent" L C y;
     60 ReleaseOrphanedAttempt "release_orphaned_attempt" L C y;
     61 MarkLost "mark_lost" L C y;
@@ -217,6 +214,7 @@ inventory! {
     89 CommitRuntimeLayout "commit_runtime_layout" R N n;
     90 RemoveRuntimeLayout "remove_runtime_layout" L B n;
     91 CaptureIncident "capture_incident" L B n;
+    92 PrepareBridgeDelivery "prepare_bridge_delivery" R N n;
 }
 
 /// Seals one payload and binds it to its inventory row and typed output.
@@ -286,11 +284,9 @@ op! {
     BindPool => String;
     ClaimDelivery => Option<Value>;
     CompleteDelivery => String;
-    FailDelivery => ();
-    RetryDelivery => f64;
+    PrepareBridgeDelivery => agent_run_domain::bridge::BridgeIntent;
     CancelDelivery => bool;
     ExpireUnboundDeliveries => Vec<String>;
-    PersistDeliveryVerdict => ();
     ReconcileReapedAgent => ();
     ReleaseOrphanedAttempt => bool;
     MarkLost => bool;
@@ -398,6 +394,7 @@ op_enum! {
         BindPool,
         ClaimDelivery,
         CompleteDelivery,
+        PrepareBridgeDelivery,
         PruneCapacitySamples,
         CancelDelivery,
         BootstrapServiceProcess,
@@ -438,10 +435,7 @@ op_enum! {
         PoolOperatorPost,
         FanoutEntry,
         SettlePool,
-        FailDelivery,
-        RetryDelivery,
         ExpireUnboundDeliveries,
-        PersistDeliveryVerdict,
         ReconcileReapedAgent,
         ReleaseOrphanedAttempt,
         MarkLost,
@@ -565,6 +559,7 @@ impl OpKindRef {
             }
             Self::ClaimDelivery
             | Self::CompleteDelivery
+            | Self::PrepareBridgeDelivery
             | Self::EnqueueCommand
             | Self::BindPool
             | Self::CancelDelivery

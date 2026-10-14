@@ -1,4 +1,5 @@
 //! Validated product types and transport-safe errors.
+pub mod bridge;
 pub mod canonical;
 pub mod catalog;
 pub mod credential_ref;
