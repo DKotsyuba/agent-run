@@ -23,6 +23,8 @@ pub mod logging;
 pub mod managed_services;
 /// Single-instance storage of Codex's unindexed native metadata caches.
 pub mod native_cache;
+/// Protected native owner admission, without a separate input or delivery subsystem.
+pub mod native_owner;
 /// Freeze/thaw lifecycle for native Codex directory caches in retained homes.
 pub mod native_tree_cache;
 /// Persistence facade of processes other than the resident broker.

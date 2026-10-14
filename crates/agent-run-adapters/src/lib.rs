@@ -9,6 +9,8 @@ pub mod io;
 pub mod materialize;
 pub mod mcp_catalog;
 pub mod native_failure;
+/// Protected bounded handoff into the sole existing native owner loop.
+pub mod native_owner;
 pub mod plugins;
 pub mod provider;
 pub mod redact;

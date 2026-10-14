@@ -168,6 +168,8 @@ pub struct Process {
     pub child: Child,
     pub input: Option<ChildStdin>,
     pub owner: OwnedProcess,
+    /// Optional launch-owned reader conduit; only the core event loop may act on its requests.
+    pub native_owner: Option<crate::native_owner::Owner>,
     events: mpsc::Receiver<Event>,
     tasks: Vec<JoinHandle<()>>,
     pub backlog: VecDeque<Event>,
@@ -196,14 +198,20 @@ pub struct Process {
 }
 impl Process {
     /// Spawns the planned engine with isolated environment and line-framed pipes.
+    /// The optional protected native-owner reader is qualified before any child
+    /// exists; unsafe or partial settings fail closed. Ordinary launches clear
+    /// forged locators, and opted-in children receive only their actual endpoint
+    /// locator. The core remains the sole engine writer.
     pub fn spawn(plan: &LaunchPlan) -> Result<Self> {
-        let redactor = Redactor::from_environment(&plan.environment);
+        let mut environment = plan.environment.clone();
+        let native_owner = crate::native_owner::Owner::prepare(&mut environment)?;
+        let redactor = Redactor::from_environment(&environment);
         let mut command = Command::new(&plan.binary);
         command
             .args(&plan.args)
             .current_dir(&plan.cwd)
             .env_clear()
-            .envs(&plan.environment)
+            .envs(&environment)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -268,6 +276,7 @@ impl Process {
             child,
             input,
             owner,
+            native_owner,
             events,
             tasks: vec![reader, errors],
             backlog: VecDeque::new(),
@@ -710,7 +719,7 @@ impl Process {
     /// including replies to unsolicited requests. IDs are allocated only after
     /// unsent pressure refusal. No post-send transport/protocol failure aborts
     /// a running control; its uncertainty is returned for durable recording.
-    async fn rpc_exchange_until(
+    pub async fn rpc_exchange_until(
         &mut self,
         method: &str,
         params: Value,

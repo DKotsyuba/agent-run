@@ -611,18 +611,20 @@ pub fn plan(
         ]);
     }
     args.push("app-server".into());
+    let mut environment = agent_run_adapters::environment(
+        config,
+        runtime,
+        role,
+        home,
+        record.request.account.as_deref(),
+        app_home,
+    )?;
+    crate::native_owner::configure(&mut environment, record, role, true);
     Ok(LaunchPlan {
         binary: runtime.binary.clone(),
         args,
         cwd: record.request.workdir.clone(),
-        environment: agent_run_adapters::environment(
-            config,
-            runtime,
-            role,
-            home,
-            record.request.account.as_deref(),
-            app_home,
-        )?,
+        environment,
         initial_input: Some(format!("{}\n\n{}", role.body, record.request.task)),
     })
 }
@@ -882,6 +884,8 @@ pub async fn run(
     let mut completed: BTreeMap<String, String> = BTreeMap::new();
     let mut final_answer: Option<String> = None;
     let mut usage = None;
+    let mut native_owner = process.native_owner.take();
+    let mut native_calls = agent_run_adapters::native_owner::Calls::default();
     let mut idle = false;
     let mut closing_at: Option<tokio::time::Instant> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(200));
@@ -925,6 +929,25 @@ pub async fn run(
         }
         let event = tokio::select! {
             biased;
+            call = agent_run_adapters::native_owner::Owner::receive(&mut native_owner) => {
+                use agent_run_adapters::{native_owner::Reply,io::RpcDisposition};
+                let id=call.request.call_id.clone();
+                if let Err(reply)=native_calls.reserve(&call.request) {call.answer(reply);continue;}
+                let refusal=crate::native_owner::refusal(process,store,record,&call,Some(&tid),idle,closing_at.is_some()).unwrap_or(Some("unavailable"));
+                if let Some(reason)=refusal {let reply=Reply::unsent(&id,reason);native_calls.finish(reply.clone());call.answer(reply);continue;}
+                let old_turn=turn_id.clone();
+                let exchange=turn_input(process,&mut session,&tid,&mut turn_id,&mut idle,&call.request.text,record.request.effort.as_deref(),call.deadline).await;
+                let reply=match exchange {
+                    Ok(RpcDisposition::Replied(_)) if tokio::time::Instant::now()<call.deadline && turn_id!=old_turn && agent_run_adapters::native_owner::valid_id(&turn_id)=>Reply::accepted(&id,"codex_turn",&turn_id),
+                    Ok(RpcDisposition::Rejected{..}|RpcDisposition::UnsentPressure)=>Reply::unsent(&id,"unavailable"),
+                    _=>Reply::unknown(&id),
+                };
+                let accepted=reply.state=="accepted";let unknown=reply.state=="unknown";
+                native_calls.finish(reply.clone());call.answer(reply);
+                if unknown {native_owner.take();return Err(invalid("native owner input outcome is uncertain"));}
+                if accepted {process.observing(store.worker_turn(&record.id,false,crate::domain::now())).await?;}
+                continue;
+            }
             event = process.next() => Some(event),
             _ = tick.tick() => None,
         };
@@ -1032,6 +1055,7 @@ pub async fn run(
                             &mut idle,
                             text,
                             record.request.effort.as_deref(),
+                            tokio::time::Instant::now() + Duration::from_secs(30),
                         )
                         .await;
                         // Only a correlated native reply proves delivery in
@@ -1122,6 +1146,7 @@ pub async fn run(
                             &mut idle,
                             &text,
                             record.request.effort.as_deref(),
+                            tokio::time::Instant::now() + Duration::from_secs(30),
                         )
                         .await
                         {
@@ -1897,7 +1922,11 @@ pub async fn query(process: &mut Process, method: &str) -> Result<Value> {
 /// Wake an idle thread with turn/start; otherwise reuse the existing steer
 /// exchange. A correlated wake response must carry a fresh turn ID. Uncertain
 /// start responses fail closed instead of starting a duplicate turn. The bound
-/// covers IPC only, not worker lifetime. Callers persist accepted wake state.
+/// covers IPC only, not worker lifetime; idle starts retain the exact supplied absolute deadline. Callers persist accepted wake state.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keep native ownership/state and the original deadline explicit"
+)]
 async fn turn_input(
     process: &mut Process,
     session: &mut Session,
@@ -1906,6 +1935,7 @@ async fn turn_input(
     idle: &mut bool,
     text: &str,
     effort: Option<&str>,
+    deadline: tokio::time::Instant,
 ) -> Result<agent_run_adapters::io::RpcDisposition> {
     if !*idle {
         return turn_steer(process, thread, turn, text).await;
@@ -1915,7 +1945,7 @@ async fn turn_input(
         input["effort"] = json!(effort);
     }
     let result = process
-        .rpc_exchange("turn/start", input, Duration::from_secs(30))
+        .rpc_exchange_until("turn/start", input, deadline)
         .await?;
     match &result {
         agent_run_adapters::io::RpcDisposition::Replied(response) => {
@@ -1974,6 +2004,105 @@ mod tests {
             .is_err()
         );
     }
+    /// Actual owned RPC exchange requires a fresh correlated turn ID; stale/missing replies and EOF are never acceptance.
+    #[tokio::test]
+    async fn native_owner_codex_start_requires_fresh_reply() {
+        use super::{Process, Session, turn_input};
+        use agent_run_adapters::LaunchPlan;
+        use std::{collections::BTreeMap, time::Duration};
+        for (response, accepted) in [
+            (r#"{"id":1,"result":{"turn":{"id":"new"}}}"#, true),
+            (r#"{"id":1,"result":{"turn":{"id":"old"}}}"#, false),
+            (r#"{"id":1,"result":{"turn":{}}}"#, false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut process = Process::spawn(&LaunchPlan {
+                binary: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    format!("read rpc; printf '%s\\n' '{response}'; read unused"),
+                ],
+                cwd: temp.path().into(),
+                environment: BTreeMap::new(),
+                initial_input: None,
+            })
+            .unwrap();
+            let mut session = Session::new(false);
+            session.initialized().unwrap();
+            session.thread_started("thread").unwrap();
+            session.turn_started("old").unwrap();
+            session.turn_completed("old").unwrap();
+            let mut turn = "old".to_string();
+            let mut idle = true;
+            let result = turn_input(
+                &mut process,
+                &mut session,
+                "thread",
+                &mut turn,
+                &mut idle,
+                "manifest",
+                Some("low"),
+                tokio::time::Instant::now() + Duration::from_secs(3),
+            )
+            .await;
+            assert_eq!(result.is_ok(), accepted);
+            if accepted {
+                assert_eq!(turn, "new");
+                assert!(!idle);
+            } else {
+                assert_eq!(turn, "old");
+                assert!(idle);
+            }
+            let proof = process.owner.cleanup(Duration::from_secs(2)).await.unwrap();
+            assert!(proof.confirmed);
+            process.reap().await;
+        }
+    }
+    /// An expired original owner deadline cannot write even when native stdin is immediately ready.
+    #[tokio::test]
+    async fn native_owner_codex_expired_deadline_has_no_native_write() {
+        use super::{Process, Session, turn_input};
+        use agent_run_adapters::LaunchPlan;
+        use std::{collections::BTreeMap, time::Duration};
+        let temp = tempfile::tempdir().unwrap();
+        let mut process = Process::spawn(&LaunchPlan {
+            binary: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "read rpc; printf '%s' \"$rpc\" > effect; read unused".into(),
+            ],
+            cwd: temp.path().into(),
+            environment: BTreeMap::new(),
+            initial_input: None,
+        })
+        .unwrap();
+        let mut session = Session::new(false);
+        session.initialized().unwrap();
+        session.thread_started("thread").unwrap();
+        session.turn_started("old").unwrap();
+        session.turn_completed("old").unwrap();
+        let mut turn = "old".to_string();
+        let mut idle = true;
+        assert!(
+            turn_input(
+                &mut process,
+                &mut session,
+                "thread",
+                &mut turn,
+                &mut idle,
+                "manifest",
+                None,
+                tokio::time::Instant::now() - Duration::from_millis(1)
+            )
+            .await
+            .is_err()
+        );
+        assert!(!temp.path().join("effect").exists());
+        let proof = process.owner.cleanup(Duration::from_secs(2)).await.unwrap();
+        assert!(proof.confirmed);
+        process.reap().await;
+    }
+
     /// Only the exact pending native item may wake across a turn boundary.
     /// Foreign/missing thread, old-turn mismatch, changed kind/name, unknown
     /// ids and nonterminal status remain non-events; removal deduplicates.
