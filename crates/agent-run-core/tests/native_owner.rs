@@ -86,7 +86,8 @@ async fn phase(
     .await
     .unwrap();
 }
-/// The existing Claude writer accepts only after a real correlated replay, preserves one effect on retry and finishes/cleans the same owned actor.
+/// A transformed native task/model keeps the original logical authority: Claude
+/// accepts only after correlated replay, preserves one retry effect and cleans the same actor.
 #[tokio::test]
 async fn claude_owner_requires_replay_and_finishes_same_actor() {
     let home = common::Home::new();
@@ -110,6 +111,9 @@ async fn claude_owner_requires_replay_and_finishes_same_actor() {
         .unwrap();
     store.begin_worker_lifecycle(&id, "attempt", 100.).unwrap();
     let row = store.get(&id).unwrap();
+    let mut native_row = row.clone();
+    native_row.request.task = format!("resume boundary\n{}", row.request.task);
+    native_row.request.model = "native-model-alias".into();
     let prep = common::writer::prepare_supervisor(&mut store, &id);
     let harness = common::writer::Harness::start(&home.path);
     let mut persist = harness.supervisor(&home.path, prep, &id).await;
@@ -152,6 +156,22 @@ sleep 1
         .find(|x| x.exists())
         .unwrap();
     let mut control = home.store();
+    let mut mixed_authority = row.clone();
+    mixed_authority.sequence += 1;
+    assert!(
+        stream::run(
+            &mut process,
+            &mut persist,
+            &native_row,
+            &mixed_authority,
+            Some("must-not-be-written\n")
+        )
+        .await
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("native input and logical authority do not match")
+    );
     let driver = async {
         phase(&control, &id, "idle").await;
         let mut request = Request {
@@ -199,7 +219,13 @@ sleep 1
     };
     let result = tokio::time::timeout(Duration::from_secs(15), async {
         let (result, ()) = tokio::join!(
-            stream::run(&mut process, &mut persist, &row, Some("initial\n")),
+            stream::run(
+                &mut process,
+                &mut persist,
+                &native_row,
+                &row,
+                Some("initial\n")
+            ),
             driver
         );
         persist.flush().await.unwrap();
@@ -220,6 +246,172 @@ sleep 1
     assert!(!socket.exists());
     channel.abort();
 }
+/// Codex resolves its native model alias and input while a real owner wake uses
+/// the unchanged admitted request. The provider-free server returns a fresh turn;
+/// the fixture closes through a separately accepted finish and verified cleanup.
+#[tokio::test]
+async fn codex_owner_uses_logical_authority_with_native_model_and_task() {
+    use agent_run_core::codex;
+    let home = common::Home::new();
+    let mut req = home.request();
+    req.explicit_finish = true;
+    let (id, _) = home
+        .store()
+        .admit(&req, &home.config, &json!({}), None)
+        .unwrap();
+    let mut store = home.store();
+    store.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES('attempt',?,1,'running','{}',100,1)",[id.as_str()]).unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='running' WHERE id=?",
+            [id.as_str()],
+        )
+        .unwrap();
+    store
+        .issue_worker_capability(&id, "attempt", TOKEN, 100.)
+        .unwrap();
+    store.begin_worker_lifecycle(&id, "attempt", 100.).unwrap();
+    let row = store.get(&id).unwrap();
+    let mut native_row = row.clone();
+    native_row.request.model = "native-alias".into();
+    native_row.request.task = "native-continuation-control".into();
+    let prep = common::writer::prepare_supervisor(&mut store, &id);
+    let harness = common::writer::Harness::start(&home.path);
+    let mut persist = harness.supervisor(&home.path, prep, &id).await;
+    let (environment, channel) = owner_environment(&home.path);
+    let tools: serde_json::Map<String, Value> = agent_run_domain::worker::finish_tools_json(false)
+        .into_iter()
+        .map(|tool| (tool["name"].as_str().unwrap().into(), json!({})))
+        .collect();
+    let inventory = json!({"id":5,"result":{"data":[{"name":"agent_run_worker","runtimeStatus":"connected","tools":tools}],"nextCursor":null}});
+    let thread = json!({"id":4,"result":{"model":"native-alias","cwd":home.path,"roots":[home.path],"writableRoots":[],"sandbox":"read-only","approvalPolicy":"never","threadId":"s"}});
+    let modern_thread = json!({"id":4,"result":{"model":"native-alias","cwd":home.path,"runtimeWorkspaceRoots":[home.path],"sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"never","activePermissionProfile":{"id":":read-only"},"threadId":"s"}});
+    let script = format!(
+        r#"n=0; while IFS= read -r line; do n=$((n+1)); case "$n" in
+1) printf '%s\n' '{{"id":1,"result":{{}}}}' ;;
+3) printf '%s\n' '{{"id":2,"result":{{"data":[{{"id":"native-alias"}}]}}}}' ;;
+4) printf '%s\n' '{{"id":3,"result":{{"config":{{}}}}}}' ;;
+5) case "$line" in *'"permissions"'*) printf '%s\n' '{modern_thread}' ;; *) printf '%s\n' '{thread}' ;; esac ;;
+6) printf '%s\n' '{inventory}' ;;
+7) case "$line" in *native-continuation-control*) printf '%s\n' '{{"id":6,"result":{{"turn":{{"id":"first"}}}}}}'; printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"s","turn":{{"id":"first","status":"completed","items":[]}}}}}}' ;; *) exit 17 ;; esac ;;
+8) case "$line" in *frozen-manifest*) printf '%s\n' '{{"id":7,"result":{{"turn":{{"id":"wake"}}}}}}'; printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"s","turn":{{"id":"wake","status":"completed","items":[]}}}}}}' ;; *) exit 18 ;; esac ;;
+esac; done"#
+    );
+    let mut process = Process::spawn(&LaunchPlan {
+        binary: "/bin/sh".into(),
+        args: vec!["-c".into(), script],
+        cwd: home.path.clone(),
+        environment,
+        initial_input: None,
+    })
+    .unwrap();
+    let leader = process.owner.leader.clone().unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE attempts SET process_identity=?,process_birth_time=? WHERE id='attempt'",
+            rusqlite::params![leader.token, leader.birth],
+        )
+        .unwrap();
+    let socket = home
+        .path
+        .read_dir()
+        .unwrap()
+        .filter_map(|x| x.ok())
+        .map(|x| x.path().join("o.sock"))
+        .find(|x| x.exists())
+        .unwrap();
+    let mut control = home.store();
+    let driver = async {
+        phase(&control, &id, "idle").await;
+        let request = Request {
+            thread_id: "s".into(),
+            call_id: "codex-alias-call".into(),
+            text: "frozen-manifest".into(),
+            native_pid: leader.pid as u32,
+            native_start_time: leader.birth.floor() as u64,
+            wake_only: true,
+        };
+        let mut connection = send(&socket, &request).await;
+        let accepted = reply(&mut connection).await;
+        assert_eq!(accepted["state"], "accepted");
+        assert_eq!(accepted["protocol"], "codex_turn");
+        assert_eq!(accepted["native_id"], "wake");
+        phase(&control, &id, "idle").await;
+        control
+            .accept_worker_finish(
+                &id,
+                "attempt",
+                TOKEN,
+                &FinishRequest {
+                    summary: "FINAL".into(),
+                    status: FinishStatus::Done,
+                },
+                agent_run_domain::domain::now(),
+            )
+            .unwrap();
+        control.observe_worker_finish_receipt(&id).unwrap();
+    };
+    let runtime = serde_json::from_value(json!({"enabled":true,"adapter":"codex","binary":"/bin/sh","home":home.path,"models":["native-alias"]})).unwrap();
+    let role = serde_json::from_value(json!({"name":"review","body":"Review the fixture.","write":false,"network":false,"revision":"fixture","canonical":false,"allow_external_read_roots":false,"read_roots":[],"skills":[],"mcp":[],"mcp_tools":{},"required_constraints":[]})).unwrap();
+    let app_home = home.path.join("codex-home");
+    agent_run_platform::fs::private_dir(&app_home).unwrap();
+    let mut mixed_authority = row.clone();
+    mixed_authority.sequence += 1;
+    assert!(
+        codex::run(
+            &mut process,
+            &mut persist,
+            &native_row,
+            &mixed_authority,
+            &runtime,
+            &role,
+            &app_home
+        )
+        .await
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("native input and logical authority do not match")
+    );
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        let (result, ()) = tokio::join!(
+            async {
+                codex::run(
+                    &mut process,
+                    &mut persist,
+                    &native_row,
+                    &row,
+                    &runtime,
+                    &role,
+                    &app_home,
+                )
+                .await
+                .expect("Codex owner runner")
+            },
+            driver
+        );
+        persist.flush().await.unwrap();
+        result
+    })
+    .await
+    .unwrap();
+    assert_eq!(result.answer.as_deref(), Some("FINAL"));
+    assert_eq!(result.outcome.status, Status::Succeeded);
+    assert_eq!(
+        store.worker_lifecycle_view(&id).unwrap().unwrap()["turn_count"],
+        2
+    );
+    assert_eq!(store.get(&id).unwrap().request.model, "fixture");
+    assert_eq!(process.owner.pid, leader.pid);
+    let proof = process.owner.cleanup(Duration::from_secs(2)).await.unwrap();
+    assert!(proof.confirmed && proof.group_gone && proof.descendants_gone == Some(true));
+    process.reap().await;
+    assert!(!socket.exists());
+    channel.abort();
+}
+
 /// Real process/store admission refuses stale, mismatched, active, cancelled, closing, terminal and dead actors before any native effect.
 #[tokio::test]
 async fn owner_lifetime_and_durable_phase_refuse_before_effect() {
@@ -287,6 +479,21 @@ async fn owner_lifetime_and_durable_phase_refuse_before_effect() {
     assert_eq!(
         refusal(&process, &persist, &row, &call, Some("s"), true, false).unwrap(),
         None
+    );
+    let mut changed_request = row.clone();
+    changed_request.request.task.push_str(" changed authority");
+    assert_eq!(
+        refusal(
+            &process,
+            &persist,
+            &changed_request,
+            &call,
+            Some("s"),
+            true,
+            false
+        )
+        .unwrap(),
+        Some("actor_mismatch")
     );
     store
         .conn
@@ -536,7 +743,7 @@ async fn claude_owner_missing_replay_retires_one_effect() {
     };
     let result = tokio::time::timeout(Duration::from_secs(36), async {
         let (result, ()) = tokio::join!(
-            stream::run(&mut process, &mut persist, &row, Some("initial\n")),
+            stream::run(&mut process, &mut persist, &row, &row, Some("initial\n")),
             driver
         );
         result

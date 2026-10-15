@@ -551,12 +551,22 @@ fn result_failure_kind(subtype: &str, text: Option<&str>) -> &'static str {
 /// under one durable `raw_ref`: the native message id from `message_start` or
 /// the full event, or one producer-owned bounded fallback per message boundary
 /// when the engine omits ids, so distinct messages never merge.
+/// `record` carries native input metadata; `logical_record` preserves the exact
+/// admitted request for owner authorization. Mixed execution, sequence or frozen
+/// identity is rejected before native input, without normalizing the authority.
 pub async fn run(
     process: &mut Process,
     store: &mut Persist,
     record: &Record,
+    logical_record: &Record,
     initial_input: Option<&str>,
 ) -> Result<EngineResult> {
+    if record.id != logical_record.id
+        || record.sequence != logical_record.sequence
+        || record.identity != logical_record.identity
+    {
+        return Err(invalid("native input and logical authority do not match"));
+    }
     let mut inputs = ResultInputs::default();
     if let Some(input) = initial_input {
         if let Ok(mut frame) = serde_json::from_str::<Value>(input)
@@ -646,7 +656,7 @@ pub async fn run(
                 use agent_run_adapters::native_owner::Reply;
                 let id=call.request.call_id.clone();
                 if let Err(reply)=native_calls.reserve(&call.request) {call.answer(reply);continue;}
-                let refusal=crate::native_owner::refusal(process,store,record,&call,session.as_deref(),native_idle && native_pending.is_none(),closing_at.is_some()).unwrap_or(Some("unavailable"));
+                let refusal=crate::native_owner::refusal(process,store,logical_record,&call,session.as_deref(),native_idle && native_pending.is_none(),closing_at.is_some()).unwrap_or(Some("unavailable"));
                 if let Some(reason)=refusal {let reply=Reply::unsent(&id,reason);native_calls.finish(reply.clone());call.answer(reply);continue;}
                 let input_id=uuid::Uuid::new_v4().to_string();
                 if !send_user_text(process,&call.request.text,&input_id,call.deadline).await {

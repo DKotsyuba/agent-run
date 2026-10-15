@@ -51,7 +51,7 @@ async fn run_stream(lines: &[Value]) -> (Vec<Row>, Option<String>) {
     let harness = common::writer::Harness::start(&home.path);
     let mut persist = harness.supervisor(&home.path, prep, &id).await;
     let mut process = Process::spawn(&fake_engine(&home.path, lines)).expect("fake engine");
-    let result = stream::run(&mut process, &mut persist, &record, None)
+    let result = stream::run(&mut process, &mut persist, &record, &record, None)
         .await
         .expect("stream completes");
     persist.flush().await.unwrap();
@@ -245,7 +245,7 @@ async fn tool_results_carry_native_error_evidence() {
         json!({"type":"result","subtype":"success","is_error":false,"result":"done","usage":{}}),
     ];
     let mut process = Process::spawn(&fake_engine(&home.path, &lines)).expect("fake engine");
-    let result = stream::run(&mut process, &mut persist, &record, None)
+    let result = stream::run(&mut process, &mut persist, &record, &record, None)
         .await
         .expect("stream completes");
     persist.flush().await.unwrap();
@@ -327,7 +327,7 @@ async fn background_notification_rejects_session_rebind_with_safe_reason() {
             "message":{"role":"user","content":"PRIVATE_NOTIFICATION_TEXT"}}),
     ];
     let mut process = Process::spawn(&fake_engine(&home.path, &lines)).unwrap();
-    let result = stream::run(&mut process, &mut persist, &record, None).await;
+    let result = stream::run(&mut process, &mut persist, &record, &record, None).await;
     persist.flush().await.unwrap();
     let cleanup = process
         .owner

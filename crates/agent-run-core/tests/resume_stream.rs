@@ -64,7 +64,7 @@ async fn resume_refuses_missing_or_wrong_stream_identity() {
         }
         let mut process =
             Process::spawn(&fake_engine(&home.path, &result.to_string())).expect("fake engine");
-        let outcome = stream::run(&mut process, &mut persist, &record, None).await;
+        let outcome = stream::run(&mut process, &mut persist, &record, &record, None).await;
         persist.flush().await.unwrap();
         if identity == Some("saved") {
             let confirmed = outcome.expect("the requested session is confirmed");

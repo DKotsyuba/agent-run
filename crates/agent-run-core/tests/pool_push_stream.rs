@@ -48,7 +48,7 @@ async fn push_through(script: &str, initial: Option<&str>) -> Value {
     let mut process = Process::spawn(&plan).expect("shell engine");
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        stream::run(&mut process, &mut persist, &record, initial),
+        stream::run(&mut process, &mut persist, &record, &record, initial),
     )
     .await
     .expect("finite engine ends")

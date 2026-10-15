@@ -66,7 +66,7 @@ async fn split_claude_deltas_are_redacted_before_journaling() {
     let prep = common::writer::prepare_supervisor(&mut store, &id);
     let harness = common::writer::Harness::start(&home.path);
     let mut persist = harness.supervisor(&home.path, prep, &id).await;
-    let result = agent_run_core::stream::run(&mut process, &mut persist, &record, None)
+    let result = agent_run_core::stream::run(&mut process, &mut persist, &record, &record, None)
         .await
         .unwrap();
     persist.flush().await.unwrap();
