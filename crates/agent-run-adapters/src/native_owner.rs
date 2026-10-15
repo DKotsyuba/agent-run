@@ -794,6 +794,8 @@ mod tests {
                 .args([
                     "--exact",
                     "native_owner::tests::channel_owner_helper",
+                    // Serial libtest otherwise prefixes the helper's READY/REPLY lines.
+                    "--quiet",
                     "--nocapture",
                 ])
                 .env("AGENT_RUN_OWNER_TEST_CHANNEL", &channel)
