@@ -10,7 +10,8 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
 
-const HOOK_TRANSPORTS: [&str; 2] = ["claude_uds", "codex_queue"];
+/// Native host names accepted by the common normalized lifecycle-hook projection.
+const HOOK_TRANSPORTS: [&str; 3] = ["claude_uds", "codex_queue", "opencode"];
 
 /// One successful immutable durable-agent binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -63,7 +64,7 @@ pub async fn bind(
     })
 }
 
-/// Normalizes one Codex/Claude hook payload and binds its discovered agent.
+/// Normalize one native host hook payload and bind its discovered agent.
 ///
 /// Raw envelopes are accepted only with their expected event name and derive
 /// the session from `session_id`; normalized payloads must contain exactly the

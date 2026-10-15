@@ -238,8 +238,8 @@ fn is_unsafe_label_char(c: char) -> bool {
 
 /// Identifies one external conversation for binding and completion delivery.
 ///
-/// `transport` accepts canonical `codex_queue` and `claude_uds`, plus the
-/// `codex` and `claude` aliases; normalization stores only canonical names.
+/// `transport` accepts canonical `codex_queue`, `claude_uds` and `opencode`, plus
+/// the historical `codex` and `claude` aliases; normalization stores canonical names.
 /// Session and optional turn ids are opaque, nonblank external ids. Session
 /// identity excludes the turn so later turns remain in the same durable scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,8 +265,18 @@ impl OrchestratorRef {
         match transport {
             "codex" | "codex_queue" => Ok("codex_queue"),
             "claude" | "claude_uds" => Ok("claude_uds"),
+            "opencode" => Ok("opencode"),
             _ => Err(invalid("unsupported orchestrator transport")),
         }
+    }
+
+    /// Return the historical transport spelling for replay/session lookup, or the canonical name when no alias exists.
+    pub fn legacy_transport(&self) -> Result<&'static str> {
+        Ok(match self.canonical_transport()? {
+            "codex_queue" => "codex",
+            "claude_uds" => "claude",
+            canonical => canonical,
+        })
     }
 
     /// Replaces a known alias with its canonical name after validating all ids.
@@ -466,7 +476,11 @@ mod orchestrator_ref_tests {
     /// Known user-facing names normalize to the transport used by delivery adapters.
     #[test]
     fn known_transport_aliases_normalize() {
-        for (alias, canonical) in [("codex", "codex_queue"), ("claude", "claude_uds")] {
+        for (alias, canonical) in [
+            ("codex", "codex_queue"),
+            ("claude", "claude_uds"),
+            ("opencode", "opencode"),
+        ] {
             let mut reference = OrchestratorRef {
                 transport: alias.into(),
                 external_session_id: "session".into(),
@@ -474,6 +488,7 @@ mod orchestrator_ref_tests {
             };
             reference.normalize().unwrap();
             assert_eq!(reference.transport, canonical);
+            assert_eq!(reference.legacy_transport().unwrap(), alias);
         }
     }
 

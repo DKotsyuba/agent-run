@@ -51,6 +51,11 @@ a dedicated token and explicit host/store namespaces. Bindings accept
 New rows use canonical names; equivalent aliases reuse the exact historical
 binding. Unknown names fail before admission.
 
+OpenCode root sessions use `opencode` for normalized context and binding payloads.
+They share the same immutable session and request-replay rules. Binding alone
+does not enable native delivery: OpenCode publication additionally requires a
+Bridge SDK and deployment that support its native address.
+
 Binding proves a destination, not a configured or available notification route.
 Without Bridge configuration, notices stay durable with `bridge_unconfigured`,
 retrying no more often than once per 60 seconds without exhaustion. Domain

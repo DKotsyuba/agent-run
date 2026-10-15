@@ -50,11 +50,7 @@ fn start_replay_fingerprints(request: &StartRequest) -> Result<Vec<String>> {
         true,
     )];
     if let Some(reference) = &request.orchestrator {
-        let alias = match reference.canonical_transport()? {
-            "codex_queue" => "codex",
-            "claude_uds" => "claude",
-            _ => unreachable!(),
-        };
+        let alias = reference.legacy_transport()?;
         let mut legacy = serde_json::to_value(request)?;
         legacy["orchestrator"]["transport"] = json!(alias);
         fingerprints.push(agent_run_domain::canonical::sha256_hex(&legacy, true));
@@ -735,12 +731,7 @@ impl Service {
         };
         let mut replay_keys = vec![(namespace.clone(), sha.clone())];
         if let Some(reference) = &request.orchestrator {
-            let canonical = reference.canonical_transport()?;
-            let alias = match canonical {
-                "codex_queue" => "codex",
-                "claude_uds" => "claude",
-                _ => unreachable!(),
-            };
+            let alias = reference.legacy_transport()?;
             let mut compatible = request_value.clone();
             compatible["orchestrator"]["transport"] = json!(alias);
             replay_keys.push((

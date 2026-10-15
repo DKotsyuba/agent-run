@@ -498,7 +498,7 @@ fn hook_transport(cli: &Cli) -> &str {
 /// Mirrors `test_cli.py::test_hook_transport_is_per_runtime_and_dispatch_routes_by_the_recorded_name`.
 ///
 /// This ports the per-command transport contract: each hook defaults to the
-/// Codex queue, accepts the Claude UDS transport, and refuses any other name.
+/// Codex queue, accepts Claude UDS and OpenCode, and refuses unknown names.
 /// The test's second half -- a drained delivery reaching the transport named
 /// on the recorded session -- needs a populated durable store and is not
 /// covered here.
@@ -512,6 +512,9 @@ fn python_hook_transport_is_per_runtime() {
             Cli::try_parse_from(["agent-run", "hook", command, "--transport", "claude_uds"])
                 .expect("claude_uds parses");
         assert_eq!(hook_transport(&parsed), "claude_uds");
+        let parsed = Cli::try_parse_from(["agent-run", "hook", command, "--transport", "opencode"])
+            .expect("opencode parses");
+        assert_eq!(hook_transport(&parsed), "opencode");
         assert!(
             Cli::try_parse_from(["agent-run", "hook", command, "--transport", "slack"]).is_err(),
             "an unknown transport must be refused for hook {command}"
