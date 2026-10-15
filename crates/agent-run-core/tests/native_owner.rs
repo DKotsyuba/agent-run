@@ -20,7 +20,7 @@ use tokio::{
 const TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 /// Initial successful inference is deliberately not a logical finish.
 const TURN: &str = r#"{"type":"result","subtype":"success","is_error":false,"session_id":"s","result":"NOT_A_FINISH","usage":{}}"#;
-/// Qualify the test's actual executable/current kernel peer, keeping the channel alive until the verifier closes it.
+/// Keep the current kernel peer's protected channel alive until the verifier closes it.
 fn owner_environment(home: &Path) -> (BTreeMap<String, String>, tokio::task::JoinHandle<()>) {
     use std::os::unix::fs::PermissionsExt;
     let channel = home.join("channel.sock");
@@ -31,7 +31,6 @@ fn owner_environment(home: &Path) -> (BTreeMap<String, String>, tokio::task::Joi
             let _ = stream.read(&mut [0]).await;
         }
     });
-    let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
     (
         BTreeMap::from([
             (
@@ -40,14 +39,6 @@ fn owner_environment(home: &Path) -> (BTreeMap<String, String>, tokio::task::Joi
             ),
             (
                 native_owner::SETTINGS[1].into(),
-                exe.to_str().unwrap().into(),
-            ),
-            (
-                native_owner::SETTINGS[2].into(),
-                agent_run_platform::fs::sha256(&std::fs::read(exe).unwrap()),
-            ),
-            (
-                native_owner::SETTINGS[3].into(),
                 home.to_str().unwrap().into(),
             ),
         ]),
@@ -430,6 +421,11 @@ fn owner_configuration_preserves_restricted_and_ordinary_launches() {
             .map(|key| (key.into(), "fixture".into())),
     );
     let mut enabled = settings.clone();
+    agent_run_core::native_owner::configure(&mut enabled, &row, &role, true);
+    assert_eq!(enabled, settings);
+    for key in native_owner::RETIRED_SETTINGS {
+        enabled.insert(key.into(), "retired-setting".into());
+    }
     agent_run_core::native_owner::configure(&mut enabled, &row, &role, true);
     assert_eq!(enabled, settings);
     for constraint in [

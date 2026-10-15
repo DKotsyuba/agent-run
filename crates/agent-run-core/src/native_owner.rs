@@ -8,13 +8,16 @@ use agent_run_domain::domain::{Constraint, Status};
 use agent_run_platform::process;
 use std::collections::BTreeMap;
 
-/// Remove opt-in owner settings for one-shot, restricted, or unsupported launches without weakening their policy.
+/// Strip retired build qualifiers from every launch and remove owner settings for one-shot, restricted or unsupported launches.
 pub fn configure(
     environment: &mut BTreeMap<String, String>,
     record: &Record,
     role: &Profile,
     supported: bool,
 ) {
+    for key in native_owner::RETIRED_SETTINGS {
+        environment.remove(key);
+    }
     if !supported
         || !record.request.explicit_finish
         || role.research_tools_only()

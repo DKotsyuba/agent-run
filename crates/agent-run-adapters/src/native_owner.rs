@@ -22,11 +22,14 @@ pub const TEXT_BYTES: usize = 98304;
 /// One original owner budget, including peer checks, frame, handoff and native acceptance.
 pub const OWNER_BUDGET: Duration = Duration::from_secs(30);
 /// Private launch settings, deliberately separate from producer credentials and request authority.
-pub const SETTINGS: [&str; 4] = [
+pub const SETTINGS: [&str; 2] = [
     "BRIDGE_NATIVE_OWNER_CHANNEL",
+    "BRIDGE_NATIVE_OWNER_DIRECTORY",
+];
+/// Removed static build settings are stripped from every native child environment.
+pub const RETIRED_SETTINGS: [&str; 2] = [
     "BRIDGE_NATIVE_OWNER_DAEMON",
     "BRIDGE_NATIVE_OWNER_DAEMON_SHA256",
-    "BRIDGE_NATIVE_OWNER_DIRECTORY",
 ];
 /// The actual native harness advertises only this locator; possession grants no authority.
 pub const LOCATOR: &str = "BRIDGE_NATIVE_OWNER_SOCKET";
@@ -75,9 +78,9 @@ pub struct Reply {
     pub call_id: String,
     /// accepted, known_unsent or unknown.
     pub state: &'static str,
-    /// codex_turn or claude_input only for genuine native acknowledgement.
+    /// codex_turn, claude_input or opencode_input only for genuine native acknowledgement.
     pub protocol: Option<&'static str>,
-    /// Fresh native turn ID or actually replayed Claude input UUID, respectively.
+    /// Fresh Codex turn ID, replayed Claude UUID or durably admitted OpenCode input ID.
     pub native_id: Option<String>,
     /// Finite refusal/uncertainty code; never arbitrary diagnostic text or payload.
     pub reason: Option<&'static str>,
@@ -162,15 +165,11 @@ impl Call {
         let _ = self.reply.send(reply);
     }
 }
-/// Frozen launch trust; each connection revalidates the current daemon incarnation and build.
+/// Protected channel locator; each connection proves the current live same-user kernel peer.
 #[derive(Clone)]
 struct Trust {
     /// Protected semantic adapter channel, distinct from producer registration/core RPC.
     channel: PathBuf,
-    /// Approved daemon executable path.
-    daemon: PathBuf,
-    /// Approved immutable daemon bytes, allowing same-build restarts only.
-    digest: String,
 }
 /// Reject symlink traversal and require an existing absolute path of the expected private type.
 fn protected(path: &Path, socket: bool) -> Result<()> {
@@ -232,7 +231,6 @@ impl Trust {
     /// Authenticate against the current protected channel peer, not an obsolete launch-time PID.
     async fn verify(&self, stream: &UnixStream, deadline: Instant) -> Result<()> {
         protected(&self.channel, true)?;
-        protected(&self.daemon, false)?;
         let actual = peer(stream)?;
         let channel = timeout_at(deadline, UnixStream::connect(&self.channel))
             .await
@@ -241,15 +239,13 @@ impl Trust {
         if actual.pid != current.pid
             || actual.token != current.token
             || actual.birth != current.birth
-            || process::executable(current.pid)? != self.daemon
         {
             return Err(invalid("native owner daemon identity refused"));
         }
-        if private_fs::sha256(&std::fs::read(&self.daemon)?) != self.digest
-            || process::observe(Some(current.pid), Some(&current.token), Some(current.birth))
-                != process::ProcessState::Alive
+        if process::observe(Some(current.pid), Some(&current.token), Some(current.birth))
+            != process::ProcessState::Alive
         {
-            return Err(invalid("native owner daemon build refused"));
+            return Err(invalid("native owner daemon exited"));
         }
         Ok(())
     }
@@ -269,8 +265,12 @@ pub struct Owner {
 }
 impl Owner {
     /// Prepare an opt-in endpoint before native spawn, adding its actual locator only to the child environment.
-    /// Missing settings leave ordinary launches unchanged; partial/unsafe settings fail before a child exists.
+    /// Retired build qualifiers are removed. Missing channel/directory settings clear a forged locator;
+    /// partial or unsafe settings fail before a child exists. No executable path or digest admits a caller.
     pub fn prepare(environment: &mut BTreeMap<String, String>) -> Result<Option<Self>> {
+        for key in RETIRED_SETTINGS {
+            environment.remove(key);
+        }
         if !SETTINGS.iter().any(|key| environment.contains_key(*key)) {
             environment.remove(LOCATOR);
             return Ok(None);
@@ -284,29 +284,9 @@ impl Owner {
         };
         let trust = Trust {
             channel: PathBuf::from(value(SETTINGS[0])?),
-            daemon: PathBuf::from(value(SETTINGS[1])?),
-            digest: value(SETTINGS[2])?,
         };
         protected(&trust.channel, true)?;
-        protected(&trust.daemon, false)?;
-        {
-            use std::os::unix::fs::MetadataExt;
-            let meta = std::fs::symlink_metadata(&trust.daemon)?;
-            if !meta.is_file() || meta.mode() & 0o111 == 0 {
-                return Err(invalid("native owner daemon is not executable"));
-            }
-        }
-        if trust.daemon.canonicalize()? != trust.daemon
-            || trust.digest.len() != 64
-            || !trust
-                .digest
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            || private_fs::sha256(&std::fs::read(&trust.daemon)?) != trust.digest
-        {
-            return Err(invalid("native owner unqualified daemon build"));
-        }
-        let root = PathBuf::from(value(SETTINGS[3])?);
+        let root = PathBuf::from(value(SETTINGS[1])?);
         protected(&root, false)?;
         use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
         let meta = std::fs::symlink_metadata(&root)?;
@@ -497,7 +477,7 @@ mod tests {
         root: tempfile::TempDir,
         /// Current same-user protected-channel owner; shutdown aborts this test-only listener.
         channel: JoinHandle<()>,
-        /// Existing launch settings qualify this test executable, never a peer-supplied image.
+        /// Launch settings locate the protected live channel without an executable allowlist.
         environment: BTreeMap<String, String>,
     }
     impl Fixture {
@@ -514,15 +494,9 @@ mod tests {
                     let _ = stream.read(&mut [0]).await;
                 }
             });
-            let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
             let environment = BTreeMap::from([
                 (SETTINGS[0].into(), path.to_str().unwrap().into()),
-                (SETTINGS[1].into(), exe.to_str().unwrap().into()),
-                (
-                    SETTINGS[2].into(),
-                    private_fs::sha256(&std::fs::read(exe).unwrap()),
-                ),
-                (SETTINGS[3].into(), root.path().to_str().unwrap().into()),
+                (SETTINGS[1].into(), root.path().to_str().unwrap().into()),
             ]);
             Self {
                 root,
@@ -594,6 +568,44 @@ mod tests {
         drop(owner);
         assert!(!socket.exists());
     }
+    /// HTTP-lease launches prepare the same private owner endpoint without changing stdout or stdin lifetime semantics.
+    #[tokio::test]
+    async fn lease_launch_keeps_native_owner_endpoint() {
+        use crate::{
+            LaunchPlan,
+            io::{Event, Process},
+        };
+        let fixture = Fixture::new();
+        let mut process = Process::spawn_lease(&LaunchPlan {
+            binary: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "printf '{\"socket\":\"%s\"}\\n' \"$BRIDGE_NATIVE_OWNER_SOCKET\"; read lease"
+                    .into(),
+            ],
+            cwd: fixture.root.path().to_owned(),
+            environment: fixture.environment.clone(),
+            initial_input: None,
+        })
+        .unwrap();
+        let expected = process.native_owner.as_ref().unwrap().socket.clone();
+        let Event::Json(ready) = process.next().await else {
+            panic!("lease readiness missing");
+        };
+        assert_eq!(ready["socket"].as_str(), expected.to_str());
+        assert!(process.input.is_some());
+        assert!(
+            process
+                .owner
+                .cleanup(Duration::from_millis(50))
+                .await
+                .unwrap()
+                .confirmed
+        );
+        process.reap().await;
+        drop(process);
+        assert!(!expected.exists());
+    }
     /// Same executable/UID with another actual PID is not the current daemon and cannot enter the owner lane.
     #[tokio::test]
     async fn kernel_rejects_other_process_even_same_build() {
@@ -639,15 +651,12 @@ mod tests {
         let mut out = [0];
         assert!(matches!(stream.read(&mut out), Ok(0) | Err(_)));
     }
-    /// Unqualified image, partial settings, public parent and replaced endpoint never gain an owner effect.
+    /// Partial settings, public parent and replaced endpoint never gain an owner effect.
     #[tokio::test]
     async fn unsafe_settings_and_replaced_socket_fail_closed() {
         use std::os::unix::fs::PermissionsExt;
         let mut f = Fixture::new();
         let original = f.environment.clone();
-        f.environment.insert(SETTINGS[2].into(), "0".repeat(64));
-        assert!(Owner::prepare(&mut f.environment).is_err());
-        f.environment = original.clone();
         f.environment.remove(SETTINGS[1]);
         assert!(Owner::prepare(&mut f.environment).is_err());
         f.environment = original;
@@ -663,6 +672,11 @@ mod tests {
         let mut env = BTreeMap::from([(LOCATOR.into(), "forged-locator".into())]);
         assert!(Owner::prepare(&mut env).unwrap().is_none());
         assert!(!env.contains_key(LOCATOR));
+        for key in RETIRED_SETTINGS {
+            env.insert(key.into(), "retired-setting".into());
+        }
+        assert!(Owner::prepare(&mut env).unwrap().is_none());
+        assert!(RETIRED_SETTINGS.iter().all(|key| !env.contains_key(*key)));
     }
     /// Closed/malformed/oversized frames never hand off and do not poison the next valid connection.
     #[tokio::test]
@@ -723,7 +737,7 @@ mod tests {
     }
     /// Separate-process protected-channel server and sender; only explicit test invocations use these environment locators.
     #[test]
-    fn qualified_daemon_helper() {
+    fn channel_owner_helper() {
         use std::io::{BufRead, Read, Write};
         use std::os::unix::fs::PermissionsExt;
         let Some(path) = std::env::var_os("AGENT_RUN_OWNER_TEST_CHANNEL") else {
@@ -757,9 +771,9 @@ mod tests {
         println!("REPLY {}", std::str::from_utf8(&body).unwrap());
         accept.join().unwrap();
     }
-    /// Current channel proof admits a restarted qualified daemon, while the same original call retains its one receipt/effect.
+    /// Current channel proof admits a restarted daemon without build admission; the original call keeps one effect.
     #[tokio::test]
-    async fn same_build_daemon_restart_preserves_original_call() {
+    async fn current_channel_daemon_restart_preserves_original_call() {
         use std::os::unix::fs::PermissionsExt;
         use std::process::Stdio;
         use tokio::io::{AsyncBufReadExt, BufReader};
@@ -769,12 +783,7 @@ mod tests {
         let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
         let mut env = BTreeMap::from([
             (SETTINGS[0].into(), channel.to_str().unwrap().into()),
-            (SETTINGS[1].into(), exe.to_str().unwrap().into()),
-            (
-                SETTINGS[2].into(),
-                private_fs::sha256(&std::fs::read(&exe).unwrap()),
-            ),
-            (SETTINGS[3].into(), root.path().to_str().unwrap().into()),
+            (SETTINGS[1].into(), root.path().to_str().unwrap().into()),
         ]);
         let mut owner = None;
         let mut calls = Calls::default();
@@ -784,7 +793,7 @@ mod tests {
             let mut child = tokio::process::Command::new(&exe)
                 .args([
                     "--exact",
-                    "native_owner::tests::qualified_daemon_helper",
+                    "native_owner::tests::channel_owner_helper",
                     "--nocapture",
                 ])
                 .env("AGENT_RUN_OWNER_TEST_CHANNEL", &channel)
