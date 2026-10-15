@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.28.0
+
 - feat(opencode): add the owned OpenCode v2 runtime with explicit finish,
   same-session continuation, queued input, worker pools and native journal evidence
 - feat(bridge): wake managed native Codex, Claude and OpenCode sessions through
