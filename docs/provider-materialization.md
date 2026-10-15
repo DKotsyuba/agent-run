@@ -80,6 +80,16 @@ alias. Its compatibility-only removal points are
 `adapters::auth`, and the matching `core::supervisor` dispatch. No
 public permanent GLM launch alias is promised by the v2 path.
 
+## Native process ownership for Bridge
+
+Managed native wake requires Agent Run to own the actual harness process as its
+direct child. A launcher that spawns another process, including the npm Codex
+JavaScript shim, does not meet this boundary. Select the matching native Codex
+executable supplied by the installed package, or a launcher that replaces itself
+with that executable. Keep the same model, account, catalog and workspace policy;
+only the process launch path changes. Existing frozen runtime homes retain their
+admitted launch identity.
+
 ## Managed OpenCode Bridge lifecycle
 
 An operator may configure `[delivery.bridge.opencode_plugin]` with absolute
