@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.28.1
+
 - test(bridge): wait for the expected durable turn as well as idle before
   finishing the native-owner canary; reject an unchanged first idle explicitly
 - docs(runtime): require direct native-process ownership for managed Bridge wake
