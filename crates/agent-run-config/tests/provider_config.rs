@@ -325,3 +325,30 @@ fn frozen_collectors_keep_their_digest_without_reactivating_lua() {
         assert!(error.to_string().contains("retired"), "{error}");
     }
 }
+
+/// The optional OpenCode harness extends schema two without removing required
+/// legacy harnesses or changing provider/account identity semantics.
+#[test]
+fn opencode_is_an_optional_third_native_harness() {
+    use agent_run_domain::HarnessId;
+    let home = tempfile::tempdir().unwrap();
+    let text = format!(
+        "{}\n[harnesses.opencode]\nbinary='/bin/true'\nhome='{}'\n[providers.zen]\nharness='opencode'\nconnection={{kind='native'}}\nauth_family='opencode'\nlimits_source='none'\nbindings=[]\n[[providers.zen.models]]\nid='free'\nnative_model='opencode/big-pickle'\n",
+        document(home.path()),
+        home.path().join("opencode").display()
+    );
+    let config = ProviderConfig::parse(&text, home.path()).unwrap();
+    assert_eq!(config.harnesses.len(), 3);
+    assert!(config.harnesses.contains_key(&HarnessId::OpenCode));
+    assert_eq!(
+        config.providers[&"zen".parse().unwrap()].harness,
+        HarnessId::OpenCode
+    );
+    assert!(
+        ProviderConfig::parse(
+            &text.replace("[harnesses.opencode]", "[harnesses.unknown]"),
+            home.path()
+        )
+        .is_err()
+    );
+}

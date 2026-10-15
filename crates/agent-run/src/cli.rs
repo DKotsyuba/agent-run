@@ -1289,7 +1289,7 @@ fn native_login_command(
                 }
             }
         }
-        Adapter::Glm => {
+        Adapter::Glm | Adapter::OpenCode => {
             return Err(invalid("auth login is not supported for this runtime yet"));
         }
     }
@@ -1448,6 +1448,7 @@ fn provider_login_target(
     let kind = match provider.harness {
         HarnessId::Codex => Adapter::Codex,
         HarnessId::ClaudeCode => Adapter::Claude,
+        HarnessId::OpenCode => Adapter::OpenCode,
     };
     Ok(LoginTarget {
         binary: harness.binary.clone(),

@@ -97,7 +97,7 @@ fn one() -> PositiveFinite {
     PositiveFinite::try_from(1.0).expect("one is positive")
 }
 
-/// Parsed v2 configuration with two stable harnesses and arbitrary providers.
+/// Parsed v2 configuration with required legacy harnesses, optional OpenCode and arbitrary providers.
 ///
 /// The v1 `Config` remains the current consumer contract until its launch
 /// paths cut over. This type owns no mutable configuration cache or secrets.
@@ -131,8 +131,8 @@ pub struct ProviderConfig {
     /// Named nonsecret environment defaults.
     #[serde(default)]
     pub environments: BTreeMap<String, Environment>,
-    /// Exactly the Codex and Claude Code native harness declarations (or
-    /// none, with no providers: the explicitly empty catalog).
+    /// Codex and Claude Code declarations plus optional OpenCode; no
+    /// declarations with no providers is the explicitly empty catalog.
     #[serde(default)]
     pub harnesses: BTreeMap<HarnessId, HarnessConfig>,
     /// Arbitrary named providers, resolved against the account registry.
@@ -220,8 +220,7 @@ impl ProviderConfig {
         let empty = self.harnesses.is_empty() && self.providers.is_empty();
         if self.schema_version != 2
             || (!empty
-                && (self.harnesses.len() != 2
-                    || !self.harnesses.contains_key(&HarnessId::Codex)
+                && (!self.harnesses.contains_key(&HarnessId::Codex)
                     || !self.harnesses.contains_key(&HarnessId::ClaudeCode)
                     || self.providers.is_empty()))
         {
@@ -300,6 +299,7 @@ impl ProviderConfig {
             let adapter = match id {
                 HarnessId::Codex => config::Adapter::Codex,
                 HarnessId::ClaudeCode => config::Adapter::Claude,
+                HarnessId::OpenCode => config::Adapter::OpenCode,
             };
             config::native_settings(adapter, &harness.native_settings)?;
             if harness.workspace_network

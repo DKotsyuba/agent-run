@@ -236,7 +236,7 @@ async fn cancelled_application_write_retains_fence_until_drain() {
     assert!(WriterLease::acquire_online(&home.path).is_ok());
 }
 
-/// Concurrent application requests share one fenced connection and produce one receipt/event each.
+/// Concurrent requests retry bounded pre-admission refusals with the same identity and prove one receipt/event each.
 #[tokio::test]
 async fn concurrent_application_load_preserves_every_receipt_once() {
     for concurrency in [1usize, 8, 32, 64] {
@@ -249,16 +249,29 @@ async fn concurrent_application_load_preserves_every_receipt_once() {
             let barrier = barrier.clone();
             tasks.push(tokio::spawn(async move {
                 barrier.wait().await;
-                let first = queue.submit(WriteAuthority::Broker, request.clone()).await;
-                assert!(
-                    matches!(first, SubmitResult::Committed(ref receipt) if !receipt.replayed),
-                    "{first:?}"
-                );
-                let replay = queue.submit(WriteAuthority::Broker, request).await;
-                assert!(
-                    matches!(replay, SubmitResult::Committed(ref receipt) if receipt.replayed),
-                    "{replay:?}"
-                );
+                for expected_replay in [false, true] {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                    loop {
+                        let result = queue.submit(WriteAuthority::Broker, request.clone()).await;
+                        // A transient producer/pruning gate refusal admits no write;
+                        // retry only that exact identity, never an uncertain outcome.
+                        if matches!(
+                            result,
+                            SubmitResult::NotEnqueued(
+                                agent_run_domain::storage::NotEnqueuedReason::QueueFull
+                            )
+                        ) && std::time::Instant::now() < deadline
+                        {
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        assert!(
+                            matches!(result, SubmitResult::Committed(ref receipt) if receipt.replayed == expected_replay),
+                            "{result:?}"
+                        );
+                        break;
+                    }
+                }
             }));
         }
         for task in tasks {

@@ -44,6 +44,7 @@ fn fixture(
             Value::Null,
         ),
         Adapter::Codex => unreachable!("the Codex golden is covered by its adapter test"),
+        Adapter::OpenCode => unreachable!("OpenCode uses the schema-2 provider renderer"),
     };
     let runtime: Runtime = serde_json::from_value(json!({
         "enabled": true,
@@ -143,6 +144,7 @@ fn resolved_environment(adapter: Adapter, home: &Path) -> BTreeMap<String, Strin
             );
         }
         Adapter::Codex => unreachable!("the Codex golden is covered by its adapter test"),
+        Adapter::OpenCode => unreachable!("OpenCode uses the schema-2 provider renderer"),
     }
     environment
 }
@@ -355,6 +357,7 @@ fn compare_launch(
             "session_id": "${SESSION_ID}",
         }),
         Adapter::Codex => unreachable!("the Codex golden is covered by its adapter test"),
+        Adapter::OpenCode => unreachable!("OpenCode uses the schema-2 provider renderer"),
     };
     let mut expected_state: Value = serde_json::from_str(
         expected["adapter_state"]
