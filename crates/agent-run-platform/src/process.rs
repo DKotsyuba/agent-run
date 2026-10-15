@@ -21,6 +21,39 @@ pub enum ProcessState {
     Denied,
     NotStarted,
 }
+/// Resolve the executable of one live kernel-identified process without consulting argv or peer claims.
+/// Missing, exited, unreadable and unsupported processes return an I/O error; callers must fail closed.
+pub fn executable(pid: i32) -> std::io::Result<std::path::PathBuf> {
+    if pid <= 1 {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/exe"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut buffer = [0u8; 4096];
+        // SAFETY: buffer is writable for the exact supplied length; proc_pidpath returns its bounded C string.
+        let n = unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+        if n <= 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let length = buffer
+            .iter()
+            .position(|b| *b == 0)
+            .ok_or(std::io::ErrorKind::InvalidData)?;
+        Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+            &buffer[..length],
+        )))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
 /// Reads one Linux process identity from procfs without trusting command-name encoding.
 ///
 /// `pid` must be greater than one. The function returns the underlying procfs,
