@@ -27,6 +27,8 @@ pub mod native_cache;
 pub mod native_owner;
 /// Freeze/thaw lifecycle for native Codex directory caches in retained homes.
 pub mod native_tree_cache;
+/// Owned OpenCode v2 native runner.
+pub mod opencode;
 /// Persistence facade of processes other than the resident broker.
 pub mod persist;
 /// Authenticated workdir-confined report writes for restricted research.

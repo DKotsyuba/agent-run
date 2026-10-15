@@ -6,7 +6,9 @@
 //! for the exact session, found inside the storage root the attempt actually
 //! used, read through an anchored no-follow descriptor with a hard byte bound,
 //! structurally checked, and recorded as root, relative path, length, SHA-256
-//! and record count. A resume and the supervisor handoff then only [`verify`]
+//! and record count. OpenCode seals the private SQLite main/WAL plus settled
+//! session/message semantics; its startup rechecks semantics after checkpoints.
+//! A resume and the supervisor handoff first [`verify`]
 //! that recorded seal against the same file; they never mint a new baseline
 //! from whatever history exists later. Every failure is a typed
 //! `continuation_unavailable` refusal; the history is only read.
@@ -38,7 +40,7 @@ pub struct HistorySeal {
     /// Native session id the history belongs to.
     pub session: String,
     /// Canonical storage root the attempt used (`CODEX_HOME` or the Claude
-    /// config directory).
+    /// config directory), or the private OpenCode data root.
     pub root: PathBuf,
     /// History file path relative to `root`, without `..` or links.
     pub relative: PathBuf,
@@ -46,8 +48,32 @@ pub struct HistorySeal {
     pub bytes: u64,
     /// Lowercase SHA-256 of the exact bytes.
     pub sha256: String,
-    /// Number of complete JSON records.
+    /// Number of complete JSONL records or projected SQLite messages.
     pub records: usize,
+    /// OpenCode-only WAL presence and semantic evidence; absent in historical seals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sqlite: Option<SqliteSeal>,
+}
+
+/// Exact bytes of an authoritative native SQLite sidecar; SHM is never history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileSeal {
+    /// Bounded byte length, including zero for a present empty WAL.
+    pub bytes: u64,
+    /// SHA-256 of those exact bytes.
+    pub sha256: String,
+}
+
+/// Native SQLite continuation evidence bound by the enclosing history seal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SqliteSeal {
+    /// `None` proves the WAL was absent; `Some` proves its exact bytes.
+    pub wal: Option<FileSeal>,
+    /// Hash of the settled native session and full projected message rows.
+    /// Checked after native startup, whose checkpoint may change physical files.
+    pub semantic_sha256: String,
 }
 
 /// Builds the typed refusal for an unprovable continuation.
@@ -61,6 +87,8 @@ fn unavailable(reason: impl std::fmt::Display) -> Error {
 /// Claude Code (`projects/*/<id>.jsonl`). Call only at the attempt's cleanup
 /// boundary, once its process group is gone.
 ///
+/// OpenCode additionally binds main/WAL file presence and rejects pending
+/// inputs, compaction, revert, or unsettled projected assistant/tool state.
 /// Refuses with `continuation_unavailable` when the file is missing or
 /// ambiguous, not a regular file reachable without links, over the byte
 /// bound, truncated, not line-delimited JSON, names another session, or has
@@ -73,6 +101,7 @@ pub fn seal(harness: HarnessId, root: &Path, session: &str) -> Result<HistorySea
         .canonicalize()
         .map_err(|_| unavailable("native session storage is missing"))?;
     let matches = match harness {
+        HarnessId::OpenCode => return seal_sqlite(&root, session),
         HarnessId::Codex => find(&root, Path::new("sessions"), 4, &|name| {
             name.starts_with("rollout-") && name.ends_with(&format!("-{session}.jsonl"))
         }),
@@ -97,6 +126,7 @@ pub fn seal(harness: HarnessId, root: &Path, session: &str) -> Result<HistorySea
         bytes: bytes.len() as u64,
         sha256: fs::sha256(&bytes),
         records,
+        sqlite: None,
     })
 }
 
@@ -107,11 +137,200 @@ pub fn verify(seal: &HistorySeal, harness: HarnessId, session: &str) -> Result<(
     if seal.harness != harness || seal.session != session {
         return Err(unavailable("recorded history seal names another session"));
     }
+    if harness == HarnessId::OpenCode {
+        if seal.relative != Path::new("opencode.db") || seal.sqlite.is_none() {
+            return Err(unavailable(
+                "OpenCode database manifest is missing or foreign",
+            ));
+        }
+        let current = seal_sqlite(&seal.root, session)?;
+        return if current == *seal {
+            Ok(())
+        } else {
+            Err(unavailable("OpenCode history changed since cleanup"))
+        };
+    }
+    if seal.sqlite.is_some() {
+        return Err(unavailable("SQLite evidence belongs to another harness"));
+    }
     let bytes = read(&seal.root, &seal.relative)?;
     if bytes.len() as u64 != seal.bytes || fs::sha256(&bytes) != seal.sha256 {
         return Err(unavailable("native history changed since it was sealed"));
     }
     check(harness, &bytes, session)?;
+    Ok(())
+}
+
+/// Reads the private main database and optional WAL through anchored no-follow
+/// descriptors under a combined byte bound. No checkpoint or migration is run.
+fn sqlite_files(root: &Path) -> Result<(FileSeal, Option<FileSeal>)> {
+    let directory =
+        fs::Dir::open(root).map_err(|_| unavailable("OpenCode data root is unreadable"))?;
+    let main = directory
+        .read(Path::new("opencode.db"), MAX_HISTORY_BYTES)
+        .map_err(|_| unavailable("OpenCode database is missing, linked or oversized"))?;
+    if main.is_empty() {
+        return Err(unavailable("OpenCode database is empty"));
+    }
+    directory
+        .optional(Path::new("opencode.db-shm"), 1024 * 1024)
+        .map_err(|_| unavailable("OpenCode coordination file is linked or invalid"))?;
+    let wal = directory
+        .optional(Path::new("opencode.db-wal"), MAX_HISTORY_BYTES - main.len())
+        .map_err(|_| unavailable("OpenCode WAL is linked or oversized"))?;
+    Ok((
+        FileSeal {
+            bytes: main.len() as u64,
+            sha256: fs::sha256(&main),
+        },
+        wal.map(|bytes| FileSeal {
+            bytes: bytes.len() as u64,
+            sha256: fs::sha256(&bytes),
+        }),
+    ))
+}
+
+/// Reads a WAL-aware query-only snapshot of one settled v2.0.28 native session.
+/// Pending input, compaction, revert, unfinished assistant/tool output, missing
+/// sessions or incompatible schemas refuse. Full native JSON stays in memory;
+/// only its hash/count leave this function. No provider credentials are queried.
+fn sqlite_state(root: &Path, session: &str) -> Result<(String, usize)> {
+    let connection = sqlite_access::reader_connection(
+        &root.join("opencode.db"),
+        std::time::Duration::from_millis(100),
+    )
+    .map_err(|_| unavailable("OpenCode database cannot be read safely"))?;
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|_| unavailable("OpenCode snapshot could not begin"))?;
+    let state:String=transaction.query_row("SELECT json_object('id',id,'directory',directory,'agent',agent,'model',model,'permission',permission,'version',version,'idle',time_idle,'outcome',idle_outcome,'compacting',time_compacting,'revert',revert) FROM session_v2 WHERE id=?",[session],|row|row.get(0)).map_err(|_|unavailable("OpenCode session is missing or incompatible"))?;
+    let state: Value =
+        serde_json::from_str(&state).map_err(|_| unavailable("OpenCode session is malformed"))?;
+    if state["agent"] != "agent-run"
+        || state["version"] != "2.0.28"
+        || state["idle"].is_null()
+        || !state["compacting"].is_null()
+        || !state["revert"].is_null()
+        || !matches!(
+            state["outcome"].as_str(),
+            Some("succeeded" | "failed" | "interrupted")
+        )
+    {
+        return Err(unavailable("OpenCode session is not structurally settled"));
+    }
+    let pending:i64=transaction.query_row("SELECT (SELECT COUNT(*) FROM session_inbox WHERE session_id=?1)+(SELECT COUNT(*) FROM session_pending WHERE session_id=?1)",[session],|row|row.get(0)).map_err(|_|unavailable("OpenCode pending-input state is incompatible"))?;
+    if pending != 0 {
+        return Err(unavailable("OpenCode session has pending input"));
+    }
+    let mut statement=transaction.prepare("SELECT id,type,seq,data FROM session_message WHERE session_id=? ORDER BY seq,id LIMIT 4097").map_err(|_|unavailable("OpenCode message schema is incompatible"))?;
+    let mut cursor = statement
+        .query([session])
+        .map_err(|_| unavailable("OpenCode messages are unreadable"))?;
+    let mut messages = Vec::new();
+    let mut bytes = 0usize;
+    while let Some(row) = cursor
+        .next()
+        .map_err(|_| unavailable("OpenCode message scan failed"))?
+    {
+        let id: String = row
+            .get(0)
+            .map_err(|_| unavailable("OpenCode message id is missing"))?;
+        let kind: String = row
+            .get(1)
+            .map_err(|_| unavailable("OpenCode message type is missing"))?;
+        let sequence: i64 = row
+            .get(2)
+            .map_err(|_| unavailable("OpenCode message order is missing"))?;
+        let raw: String = row
+            .get(3)
+            .map_err(|_| unavailable("OpenCode message data is missing"))?;
+        bytes = bytes.saturating_add(raw.len());
+        if messages.len() >= 4096 || bytes > MAX_HISTORY_BYTES {
+            return Err(unavailable("OpenCode projected history exceeds bound"));
+        }
+        let data: Value =
+            serde_json::from_str(&raw).map_err(|_| unavailable("OpenCode message is malformed"))?;
+        if kind == "assistant" {
+            if data.pointer("/time/completed").is_none_or(Value::is_null) {
+                return Err(unavailable("OpenCode assistant output is unfinished"));
+            }
+            let parts = data["content"]
+                .as_array()
+                .ok_or_else(|| unavailable("OpenCode assistant content is missing"))?;
+            let mut tools = std::collections::BTreeSet::new();
+            for part in parts.iter().filter(|part| part["type"] == "tool") {
+                let id = part["id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| unavailable("OpenCode tool id is missing"))?;
+                if !tools.insert(id)
+                    || !matches!(
+                        part.pointer("/state/status").and_then(Value::as_str),
+                        Some("completed" | "error")
+                    )
+                {
+                    return Err(unavailable("OpenCode tool lifecycle is unresolved"));
+                }
+            }
+        }
+        messages.push(serde_json::json!({"id":id,"type":kind,"seq":sequence,"data":data}));
+    }
+    if messages.is_empty() {
+        return Err(unavailable("OpenCode history has no projected input"));
+    }
+    Ok((
+        fs::sha256(
+            &serde_json::to_vec(&(state, &messages))
+                .map_err(|_| unavailable("OpenCode history cannot be hashed"))?,
+        ),
+        messages.len(),
+    ))
+}
+
+/// Mints physical and semantic SQLite evidence only at verified process cleanup.
+/// A second no-follow manifest read rejects files changing during the SQL snapshot.
+fn seal_sqlite(root: &Path, session: &str) -> Result<HistorySeal> {
+    let (main, wal) = sqlite_files(root)?;
+    let (semantic_sha256, records) = sqlite_state(root, session)?;
+    if sqlite_files(root)? != (main.clone(), wal.clone()) {
+        return Err(unavailable("OpenCode database changed during sealing"));
+    }
+    Ok(HistorySeal {
+        harness: HarnessId::OpenCode,
+        session: session.into(),
+        root: root.into(),
+        relative: "opencode.db".into(),
+        bytes: main.bytes,
+        sha256: main.sha256,
+        records,
+        sqlite: Some(SqliteSeal {
+            wal,
+            semantic_sha256,
+        }),
+    })
+}
+
+/// Rechecks the same logical session after owned native startup, before input.
+/// Physical files may have checkpointed after the supervisor's pre-start verify;
+/// native session/message data, row count, root and identity must remain equal.
+pub fn verify_opencode_started(seal: &HistorySeal, root: &Path, session: &str) -> Result<()> {
+    if seal.harness != HarnessId::OpenCode
+        || seal.session != session
+        || root.canonicalize().ok().as_deref() != Some(seal.root.as_path())
+        || seal.relative != Path::new("opencode.db")
+    {
+        return Err(unavailable(
+            "OpenCode startup history belongs to another session/root",
+        ));
+    }
+    let expected = seal
+        .sqlite
+        .as_ref()
+        .ok_or_else(|| unavailable("OpenCode semantic proof is missing"))?;
+    let (hash, records) = sqlite_state(root, session)?;
+    if hash != expected.semantic_sha256 || records != seal.records {
+        return Err(unavailable("OpenCode session changed during startup"));
+    }
     Ok(())
 }
 
@@ -224,6 +443,7 @@ fn check(harness: HarnessId, bytes: &[u8], session: &str) -> Result<usize> {
     match harness {
         HarnessId::Codex => codex(&records, session)?,
         HarnessId::ClaudeCode => claude(&records, session)?,
+        HarnessId::OpenCode => return Err(unavailable("OpenCode does not use JSONL history")),
     }
     Ok(records.len())
 }
@@ -331,7 +551,7 @@ fn prove(harness: HarnessId, root: &Path, session: &str) -> Result<HistorySeal> 
 
 #[cfg(test)]
 mod tests {
-    use super::{HarnessId, prove};
+    use super::{HarnessId, HistorySeal, Path, prove, seal, verify, verify_opencode_started};
     use std::fs;
 
     /// Writes one Codex rollout for `session` with `body` records.
@@ -542,5 +762,65 @@ mod tests {
         let pending = "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"call_id\":\"c1\"}}\n";
         fs::write(&path, format!("{meta}{}{pending}", user("new-turn"))).unwrap();
         assert!(super::seal(HarnessId::Codex, temp.path(), "s1").is_err());
+    }
+    /// Creates only the native tables the version-pinned read-only proof needs.
+    /// The connection stays open so the test can exercise an authoritative WAL.
+    fn native_sqlite(root: &Path) -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open(root.join("opencode.db")).unwrap();
+        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE session_v2(id TEXT PRIMARY KEY,directory TEXT,agent TEXT,model TEXT,permission TEXT,version TEXT,time_idle INTEGER,idle_outcome TEXT,time_compacting INTEGER,revert TEXT);
+            CREATE TABLE session_message(id TEXT PRIMARY KEY,session_id TEXT,type TEXT,seq INTEGER,data TEXT);
+            CREATE TABLE session_inbox(session_id TEXT); CREATE TABLE session_pending(session_id TEXT);
+            INSERT INTO session_v2 VALUES('ses_one','/work','agent-run','{}','[]','2.0.28',5,'succeeded',NULL,NULL);
+            INSERT INTO session_message VALUES('msg_one','ses_one','user',1,'{\"text\":\"marker\"}');
+            INSERT INTO session_message VALUES('msg_two','ses_one','assistant',2,'{\"time\":{\"completed\":5},\"content\":[{\"type\":\"tool\",\"id\":\"finish\",\"state\":{\"status\":\"completed\"}}]}');").unwrap();
+        connection
+    }
+
+    /// WAL mutations, foreign sessions and symlink substitutions cannot resume;
+    /// a native checkpoint changes physical bytes but preserves post-start semantics.
+    #[test]
+    fn opencode_sqlite_proof_binds_wal_and_survives_only_semantic_startup() {
+        let root = tempfile::tempdir().unwrap();
+        let connection = native_sqlite(root.path());
+        let seal = seal(HarnessId::OpenCode, root.path(), "ses_one").unwrap();
+        assert!(seal.sqlite.as_ref().unwrap().wal.is_some());
+        verify(&seal, HarnessId::OpenCode, "ses_one").unwrap();
+        assert!(verify(&seal, HarnessId::OpenCode, "ses_other").is_err());
+        let encoded = serde_json::to_value(&seal).unwrap();
+        let decoded: HistorySeal = serde_json::from_value(encoded).unwrap();
+        assert_eq!(seal, decoded);
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        assert!(verify(&seal, HarnessId::OpenCode, "ses_one").is_err());
+        verify_opencode_started(&seal, root.path(), "ses_one").unwrap();
+        connection
+            .execute(
+                "UPDATE session_message SET data='{\"text\":\"changed\"}' WHERE id='msg_one'",
+                [],
+            )
+            .unwrap();
+        assert!(verify_opencode_started(&seal, root.path(), "ses_one").is_err());
+        drop(connection);
+        std::fs::write(root.path().join("foreign-wal"), b"unrelated").unwrap();
+        std::os::unix::fs::symlink("foreign-wal", root.path().join("opencode.db-wal")).unwrap();
+        assert!(super::seal(HarnessId::OpenCode, root.path(), "ses_one").is_err());
+    }
+
+    /// A pending input or unresolved native tool can never mint continuation evidence.
+    #[test]
+    fn opencode_history_refuses_unsettled_native_state() {
+        let root = tempfile::tempdir().unwrap();
+        let connection = native_sqlite(root.path());
+        connection
+            .execute("INSERT INTO session_pending VALUES('ses_one')", [])
+            .unwrap();
+        assert!(seal(HarnessId::OpenCode, root.path(), "ses_one").is_err());
+        connection
+            .execute("DELETE FROM session_pending", [])
+            .unwrap();
+        connection.execute("UPDATE session_message SET data='{\"time\":{\"completed\":5},\"content\":[{\"type\":\"tool\",\"id\":\"finish\",\"state\":{\"status\":\"running\"}}]}' WHERE id='msg_two'",[]).unwrap();
+        assert!(seal(HarnessId::OpenCode, root.path(), "ses_one").is_err());
     }
 }

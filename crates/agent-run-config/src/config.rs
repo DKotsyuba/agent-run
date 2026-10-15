@@ -17,6 +17,8 @@ pub enum Adapter {
     Claude,
     /// GLM's Anthropic-compatible stream runtime.
     Glm,
+    /// Owned OpenCode v2 server using the local HTTP API.
+    OpenCode,
 }
 impl Adapter {
     /// Resolves a supported current or legacy adapter identifier.
@@ -34,6 +36,7 @@ impl Adapter {
             "glm" | "agent_run.adapters.glm:ADAPTER" | "agent_run.adapters.glm.adapter:ADAPTER" => {
                 Ok(Self::Glm)
             }
+            "opencode" => Ok(Self::OpenCode),
             "qwen"
             | "agent_run.adapters.qwen:ADAPTER"
             | "agent_run.adapters.qwen.adapter:ADAPTER" => Err(invalid(
@@ -50,6 +53,7 @@ impl Adapter {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Glm => "glm",
+            Self::OpenCode => "opencode",
         }
     }
 }
@@ -802,9 +806,13 @@ const CLAUDE_RESERVED: &str = "model env environment permissions sandbox credent
 /// permissions, sandbox, hooks, and transport controls) always fail closed so
 /// an owner's native table cannot weaken the delegated capability grant.
 pub fn native_settings(kind: Adapter, settings: &BTreeMap<String, toml::Value>) -> Result<()> {
+    if kind == Adapter::OpenCode && !settings.is_empty() {
+        return Err(invalid("OpenCode native tuning is not yet supported"));
+    }
     let reserved = match kind {
         Adapter::Codex => CODEX_RESERVED,
         Adapter::Claude | Adapter::Glm => CLAUDE_RESERVED,
+        Adapter::OpenCode => "",
     };
     /// Returns whether a TOML key cannot splice another generated namespace.
     fn key(k: &str) -> bool {

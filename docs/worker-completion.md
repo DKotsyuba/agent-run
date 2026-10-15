@@ -24,6 +24,12 @@ of cleanup. Success additionally requires the exact sealed answer and verified
 owned-process cleanup. Later assistant text and native results cannot replace
 the summary. Cancellation retains its existing precedence.
 
+The model puts its complete final report only in `finish.summary`. The finish
+call is its final response: after calling it, no assistant acknowledgement,
+repeated summary or closing text is sent. An uncertain receipt permits only
+an identical tool-payload retry, without commentary. Newly resolved roles
+freeze these shared instructions; existing admitted prompts retain their bytes.
+
 If `output_schema` is set, the summary must contain JSON text whose parsed
 value matches that schema. Invalid answers stay retryable without finish intent.
 External schema references cannot read files or fetch network resources.

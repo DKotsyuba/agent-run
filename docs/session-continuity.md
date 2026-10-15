@@ -142,3 +142,18 @@ a second agent identifier. Legacy exact-ID inputs remain accepted privately.
 Reconnect MCP clients together with the broker so both use the same receipt
 contract. The database schema is unchanged. See the embedded
 [completion guide](../assets/operator_guide/completion.md).
+
+## OpenCode v2 continuation
+
+A cleanup-bound `HistorySeal` additionally records the private SQLite main
+file, exact WAL presence/bytes and settled session/message semantics. SHM is
+coordination data and is not history. Anchored no-follow reads, WAL-aware
+query-only SQL and byte/message bounds reject linked, changed, foreign or
+unfinished history. Pending input, compaction and revert cannot mint a seal.
+Historical Codex/Claude seals omit this optional field and retain their bytes.
+
+Resume verifies the physical manifest before spawn. After native startup may
+checkpoint the database, the same session and full projected-message digest
+must still match before another input is admitted. No new baseline, summary
+substitution or latest-session lookup is allowed. OpenCode stays on the parent's
+account; cross-account automatic continuation is not enabled.

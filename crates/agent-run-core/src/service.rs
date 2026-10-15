@@ -2523,6 +2523,16 @@ pub(crate) fn prepare_provider(
         .clone()
         .or_else(|| offering.params.get("effort").cloned());
     offering.permits_effort(effective_effort.as_deref())?;
+    if provider.harness == agent_run_domain::HarnessId::OpenCode {
+        adapters::opencode::model_ref(offering.native_model.as_deref().unwrap_or(&offering.id))?;
+        if !request.explicit_finish {
+            return Err(invalid("OpenCode requires explicit_finish"));
+        }
+        if effective_effort.is_some() {
+            return Err(invalid("OpenCode effort variants are not qualified"));
+        }
+    }
+
     // Harness options run through the existing launch mechanisms: fast
     // is the codex service tier, output_schema the claude answer schema.
     if request.fast && provider.harness != agent_run_domain::catalog::HarnessId::Codex {

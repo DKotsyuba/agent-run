@@ -978,3 +978,127 @@ fn custom_providers_use_sealed_settings_and_fake_credentials() {
         .is_err()
     );
 }
+
+/// OpenCode selects only the registered credential, isolates native paths and
+/// never puts a credential or the local server capability into sealed assets.
+#[test]
+fn opencode_launch_isolates_ambient_state_and_selected_credentials() {
+    use agent_run_config::role_plan::resolve_role_plan;
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap();
+    let mut config = config(&root, &fake_engine(&root));
+    let mut harness = config.harnesses[&HarnessId::Codex].clone();
+    harness.home = root.join("opencode");
+    config.harnesses.insert(HarnessId::OpenCode, harness);
+    let mut provider = config.providers[&"codex-gateway".parse().unwrap()].clone();
+    provider.harness = HarnessId::OpenCode;
+    provider.connection = agent_run_domain::ProviderConnection::Native;
+    provider.auth_family = "opencode".parse().unwrap();
+    provider.models[0].native_model = Some("opencode/big-pickle".into());
+    provider.bindings[0].account = "acct-opencode".parse().unwrap();
+    let provider_id: ProviderId = "zen".parse().unwrap();
+    config.providers = BTreeMap::from([(provider_id.clone(), provider)]);
+    let mut profile = agent_run_adapters::provider::profile(&role(&root, false));
+    profile.mcp.clear();
+    let role = resolve_role_plan(&profile, &root, &BTreeMap::new(), "global", None).unwrap();
+    let host = BTreeMap::from([
+        ("HOME".into(), root.display().to_string()),
+        ("OPENCODE_DB".into(), "/foreign.db".into()),
+        ("OPENCODE_CONFIG".into(), "/foreign.json".into()),
+        ("OPENCODE_API_KEY".into(), "foreign-secret".into()),
+        ("XDG_DATA_HOME".into(), "/foreign-data".into()),
+    ]);
+    for (name, reference) in [
+        ("public", "native:opencode"),
+        ("key", "env:FAKE_OPENCODE_KEY"),
+    ] {
+        let catalog = config
+            .resolve_catalog(vec![AccountRecord {
+                account_id: "acct-opencode".parse().unwrap(),
+                auth_family: "opencode".parse().unwrap(),
+                secret_ref: reference.parse().unwrap(),
+                status: AccountStatus::Enabled,
+            }])
+            .unwrap();
+        let home = root.join(name);
+        let (_, digest) = materialize_selected(
+            &config,
+            &catalog,
+            &provider_id,
+            "gpt",
+            &"acct-opencode".parse().unwrap(),
+            &role,
+            &root,
+            &home,
+            &root,
+        )
+        .unwrap();
+        let authority = make_authority(
+            &catalog,
+            &provider_id,
+            "gpt",
+            &role,
+            &root,
+            digest,
+            "acct-opencode",
+        );
+        let planned = plan_selected(
+            &config,
+            &catalog,
+            &authority,
+            &"acct-opencode".parse().unwrap(),
+            &home,
+            &root,
+            &host,
+            &FakeReader,
+            "task",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            planned.launch.args,
+            [
+                "serve",
+                "--stdio",
+                "--port",
+                "0",
+                "--hostname",
+                "127.0.0.1",
+                "--log-level",
+                "error"
+            ]
+        );
+        assert_eq!(
+            planned.launch.environment["OPENCODE_DB"],
+            home.join("opencode-data/opencode.db").display().to_string()
+        );
+        assert_eq!(
+            planned.launch.environment["HOME"],
+            home.display().to_string()
+        );
+        assert_eq!(
+            planned.launch.environment["OPENCODE_CONFIG_PROJECT_DISABLE"],
+            "true"
+        );
+        assert_eq!(
+            planned
+                .launch
+                .environment
+                .get("OPENCODE_API_KEY")
+                .map(String::as_str),
+            if name == "key" {
+                Some("synthetic-secret")
+            } else {
+                None
+            }
+        );
+        let native = fs::read_to_string(home.join("opencode.json")).unwrap();
+        for secret in [
+            "synthetic-secret",
+            "foreign-secret",
+            &planned.launch.environment["OPENCODE_PASSWORD"],
+        ] {
+            assert!(!native.contains(secret));
+        }
+    }
+}

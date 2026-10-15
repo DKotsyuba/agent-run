@@ -1,4 +1,4 @@
-//! Provider-aware materialization and launch planning over the two native harnesses.
+//! Provider-aware materialization and launch planning over the supported native harnesses.
 //!
 //! Admission writes one sealed, credential-free runtime home. A later attempt
 //! verifies those bytes and the frozen role before binding its own account.
@@ -86,7 +86,7 @@ pub fn runtime(config: &ProviderConfig, harness: HarnessId, model: &str) -> Resu
         .ok_or_else(|| invalid("unknown harness"))?;
     serde_json::from_value(json!({
         "enabled": true,
-        "adapter": match harness { HarnessId::Codex => "codex", HarnessId::ClaudeCode => "claude" },
+        "adapter": match harness { HarnessId::Codex => "codex", HarnessId::ClaudeCode => "claude", HarnessId::OpenCode => "opencode" },
         "binary": native.binary,
         "home": native.home,
         "models": [model],
@@ -190,7 +190,36 @@ pub fn credential_reference(
         .ok_or_else(|| invalid("unknown provider"))?;
     let lease = AttemptCredentials::from_selected(catalog, provider, model, account)?;
     let reference = CredentialRef::from_str(lease.secret().reference())?;
+    if definition.harness == HarnessId::OpenCode && matches!(reference, CredentialRef::Named { .. })
+    {
+        return Err(invalid(
+            "OpenCode requires an explicit API key reference or an isolated native public connection",
+        ));
+    }
+    if definition.harness == HarnessId::OpenCode
+        && matches!(
+            reference,
+            CredentialRef::Environment(_) | CredentialRef::File(_) | CredentialRef::Keychain { .. }
+        )
+    {
+        let offering = definition
+            .models
+            .iter()
+            .find(|offering| offering.id == model)
+            .ok_or_else(|| invalid("OpenCode model is missing"))?;
+        if crate::opencode::model_ref(offering.native_model.as_deref().unwrap_or(&offering.id))?["providerID"]
+            != "opencode"
+        {
+            return Err(invalid(
+                "OpenCode explicit API key binding supports Zen only",
+            ));
+        }
+    }
     match (&definition.connection, &reference) {
+        (
+            ProviderConnection::Native,
+            CredentialRef::Environment(_) | CredentialRef::File(_) | CredentialRef::Keychain { .. },
+        ) if definition.harness == HarnessId::OpenCode => {}
         (ProviderConnection::Native, CredentialRef::Native(harness))
         | (ProviderConnection::Native, CredentialRef::Named { harness, .. })
             if *harness == definition.harness => {}
@@ -254,6 +283,9 @@ pub fn materialize_selected(
     }
     if !workdir.is_absolute() || !workdir.is_dir() {
         return Err(invalid("provider workdir must exist"));
+    }
+    if definition.harness == HarnessId::OpenCode && !role.worker_mcp {
+        return Err(invalid("OpenCode requires the built-in worker MCP"));
     }
     let role_profile = profile(&role);
     let mut runtime = runtime(config, definition.harness, model)?;
@@ -537,6 +569,13 @@ pub fn plan_selected_with(
         },
     );
     match (&sealed.connection, &reference, sealed.harness) {
+        (
+            ProviderConnection::Native,
+            CredentialRef::Environment(_) | CredentialRef::File(_) | CredentialRef::Keychain { .. },
+            HarnessId::OpenCode,
+        ) => {
+            environment.insert("OPENCODE_API_KEY".into(), reader.read(&reference)?);
+        }
         (ProviderConnection::Native, CredentialRef::Native(harness), _)
         | (ProviderConnection::Native, CredentialRef::Named { harness, .. }, _)
             if *harness == sealed.harness => {}
@@ -586,7 +625,9 @@ pub fn plan_selected_with(
             bind_native_codex(&reference, home, app_home, host)?;
         }
         environment.insert("CODEX_HOME".into(), home.to_string_lossy().into_owned());
-    } else if let CredentialRef::Named { label, .. } = &reference {
+    } else if sealed.harness == HarnessId::ClaudeCode
+        && let CredentialRef::Named { label, .. } = &reference
+    {
         environment.insert(
             "CLAUDE_CONFIG_DIR".into(),
             materialize::claude_account_config(app_home, &runtime.home, label.as_str())?
@@ -594,7 +635,64 @@ pub fn plan_selected_with(
                 .into_owned(),
         );
     }
-    let args = if sealed.harness == HarnessId::Codex {
+    let args = if sealed.harness == HarnessId::OpenCode {
+        crate::opencode::model_ref(&sealed.native_model)?;
+        let selected_key = if matches!(
+            reference,
+            CredentialRef::Environment(_) | CredentialRef::File(_) | CredentialRef::Keychain { .. }
+        ) {
+            environment.remove("OPENCODE_API_KEY")
+        } else {
+            None
+        };
+
+        environment.retain(|name, _| !name.starts_with("OPENCODE_") && !name.starts_with("XDG_"));
+        if let Some(key) = selected_key {
+            environment.insert("OPENCODE_API_KEY".into(), key);
+        }
+        let data = home.join("opencode-data");
+        for (name, relative) in [
+            ("OPENCODE_DATA_ROOT", "opencode-data"),
+            ("XDG_DATA_HOME", "opencode-data"),
+            ("XDG_CACHE_HOME", "opencode-cache"),
+            ("XDG_STATE_HOME", "opencode-state"),
+            ("XDG_CONFIG_HOME", "opencode-config"),
+            ("OPENCODE_CONFIG_DIR", "opencode-config"),
+        ] {
+            environment.insert(
+                name.into(),
+                home.join(relative).to_string_lossy().into_owned(),
+            );
+        }
+        environment.insert("HOME".into(), home.to_string_lossy().into_owned());
+        environment.insert(
+            "OPENCODE_DB".into(),
+            data.join("opencode.db").to_string_lossy().into_owned(),
+        );
+        environment.insert(
+            "OPENCODE_CONFIG".into(),
+            home.join("opencode.json").to_string_lossy().into_owned(),
+        );
+        environment.insert("OPENCODE_CONFIG_PROJECT_DISABLE".into(), "true".into());
+        environment.insert(
+            "OPENCODE_PASSWORD".into(),
+            format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            ),
+        );
+        vec![
+            "serve".into(),
+            "--stdio".into(),
+            "--port".into(),
+            "0".into(),
+            "--hostname".into(),
+            "127.0.0.1".into(),
+            "--log-level".into(),
+            "error".into(),
+        ]
+    } else if sealed.harness == HarnessId::Codex {
         // The same fast-tier overrides the historical codex launch uses.
         let mut args: Vec<String> = Vec::new();
         if options.fast {

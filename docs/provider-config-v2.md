@@ -1,6 +1,6 @@
 # Provider configuration v2
 
-Schema v2 declares two native harnesses and any number of named providers.
+Schema v2 requires Codex and Claude Code declarations and accepts optional OpenCode, with any number of named providers.
 Capacity sources are `exec` and `none`. Every collector is an external
 executable explicitly selected by its provider; no collector code is embedded.
 Provider ids are operator-chosen; names such as `codex-plus` and `glm` carry
@@ -184,3 +184,44 @@ an absolute `command` and optional literal `args`, or `limits_source = "none"`.
 The former `lua` and `codex_appserver` choices are retired. See
 [the executable contract](quota-collectors.md) for stdin/stdout, credentials,
 script installation, source identity and replacement behavior.
+
+## OpenCode v2
+
+OpenCode CLI 2.0.28 runs as an owned `serve --stdio --port 0` child. Stdin is
+its lifetime lease; commands use authenticated loopback HTTP. Each lineage
+retains private config/data/cache/state roots and its own native database.
+The selected `native_model` must be an explicit `provider/model` reference.
+
+```toml
+[harnesses.opencode]
+binary = "/opt/bin/opencode"
+home = "/var/lib/agent-run/opencode"
+
+[providers.opencode-zen]
+harness = "opencode"
+connection = { kind = "native" }
+auth_family = "opencode"
+limits_source = "none"
+[[providers.opencode-zen.models]]
+id = "muse-free"
+native_model = "opencode/muse-spark-1.3-contributor-free"
+[[providers.opencode-zen.bindings]]
+label = "public"
+account = "acct-opencode-public"
+```
+
+Register `acct-opencode-public` with family `opencode` and reference
+`native:opencode` for the isolated native public connection. It imports no
+host login/database. Zen API keys may instead use an existing environment,
+file or Keychain reference; only the selected value reaches child
+`OPENCODE_API_KEY`. Named native accounts and custom gateways are unsupported.
+`none` means unknown capacity, not an unlimited quota or a measured balance.
+
+The managed role supplies exact MCP caps and skill permissions. Native editor
+access is scoped to the workdir; read-only shell asks are rejected. These are
+tool filters, not an OS filesystem/network sandbox. Explicit finish is required.
+Start, cancel, idle steering and same-account explicit resume use the shared
+supervisor. Hooks, plugins, native tuning, Codex workspace roots, restricted
+research, effort and output schemas are refused. Native background-job wake
+correlation remains unqualified. Larger native responses/snapshots retain the
+existing bounded transport and transcript limits.

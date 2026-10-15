@@ -203,6 +203,20 @@ impl Process {
     /// forged locators, and opted-in children receive only their actual endpoint
     /// locator. The core remains the sole engine writer.
     pub fn spawn(plan: &LaunchPlan) -> Result<Self> {
+        Self::spawn_with_stdout(plan, false)
+    }
+
+    /// Spawns an owned HTTP server whose stdin is a lifetime lease, not RPC.
+    /// JSON readiness lines remain events; bounded non-JSON stdout is drained
+    /// and discarded as native diagnostics. EOF/oversized frames still fail.
+    /// All environment, ownership, stderr and reaping behavior equals `spawn`.
+    pub fn spawn_lease(plan: &LaunchPlan) -> Result<Self> {
+        Self::spawn_with_stdout(plan, true)
+    }
+
+    /// Owns the common spawn implementation; `lease` tolerates only non-JSON
+    /// stdout diagnostics, without retrying, persisting them or changing bounds.
+    fn spawn_with_stdout(plan: &LaunchPlan, lease: bool) -> Result<Self> {
         let mut environment = plan.environment.clone();
         let native_owner = crate::native_owner::Owner::prepare(&mut environment)?;
         let redactor = Redactor::from_environment(&environment);
@@ -244,6 +258,7 @@ impl Process {
                         }
                         match serde_json::from_slice(&data) {
                             Ok(v) => Event::Json(v),
+                            Err(_) if lease => continue,
                             Err(_) => Event::Failure("malformed_engine_json"),
                         }
                     }
@@ -923,5 +938,50 @@ mod tests {
 
         assert!(!is_broken_pipe(&error));
         assert_eq!(error.machine_code(), MachineCode::IOError);
+    }
+    /// HTTP-lease stdout may contain human diagnostics after JSON readiness;
+    /// the existing Codex/Claude mode continues to reject those same bytes.
+    #[tokio::test]
+    async fn lease_stdout_drains_diagnostics_without_relaxing_rpc() {
+        use super::{Event, Process};
+        use crate::LaunchPlan;
+        use std::{collections::BTreeMap, time::Duration};
+        let plan = LaunchPlan {
+            binary: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "printf '%s\\n' '{\"url\":\"http://127.0.0.1:12345\"}' 'native diagnostic'; exit 0"
+                    .into(),
+            ],
+            cwd: std::env::current_dir().unwrap(),
+            environment: BTreeMap::new(),
+            initial_input: None,
+        };
+        for lease in [false, true] {
+            let mut process = if lease {
+                Process::spawn_lease(&plan)
+            } else {
+                Process::spawn(&plan)
+            }
+            .unwrap();
+            assert!(matches!(process.next().await, Event::Json(_)));
+            let next = tokio::time::timeout(Duration::from_secs(5), process.next())
+                .await
+                .unwrap();
+            if lease {
+                assert!(matches!(next, Event::Eof));
+            } else {
+                assert!(matches!(next, Event::Failure("malformed_engine_json")));
+            }
+            assert!(
+                process
+                    .owner
+                    .cleanup(Duration::from_millis(50))
+                    .await
+                    .unwrap()
+                    .confirmed
+            );
+            process.reap().await;
+        }
     }
 }

@@ -729,6 +729,52 @@ impl Persist {
         self.push(fragment).await
     }
 
+    /// Atomically records one normalized native item with its replay marker.
+    /// The caller supplies already-redacted text and a stable key/digest marker;
+    /// spool preparation reuses the ordinary transcript boundary. No native action
+    /// is retried when this write is uncertain. Returns only after writer commit.
+    #[allow(clippy::too_many_arguments)] // One transcript row plus its atomic replay marker.
+    pub async fn native_item(
+        &mut self,
+        id: &AgentId,
+        role: &str,
+        text: &str,
+        name: Option<&str>,
+        raw_ref: Option<&str>,
+        error: Option<(bool, &str)>,
+        marker: Value,
+    ) -> Result<()> {
+        self.own(id)?;
+        let fragment = agent_run_store::journal::prepare_message_fragment(
+            &self.home,
+            id,
+            role,
+            text,
+            name,
+            raw_ref,
+            self.attempt.as_deref(),
+            error,
+        )?;
+        self.flush().await?;
+        self.producer
+            .call(
+                ops::AppendJournal {
+                    execution: id.clone(),
+                    fragments: vec![
+                        fragment,
+                        JournalFragment::Event {
+                            kind: "opencode_item_v1".into(),
+                            data: marker,
+                            attempt: self.attempt.clone(),
+                        },
+                    ],
+                },
+                JOURNAL_BUDGET,
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Flushes, then submits one critical operation.
     async fn critical<P>(&mut self, op: P) -> Result<P::Output>
     where

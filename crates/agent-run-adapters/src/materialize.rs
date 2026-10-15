@@ -835,6 +835,10 @@ fn materialize_with_provider(
                 p.link(&target, &source)?;
             }
         }
+        Adapter::OpenCode => {
+            let native = super::opencode::render(config, runtime, profile, home, &request.workdir)?;
+            p.json("opencode.json", &native)?;
+        }
         Adapter::Claude | Adapter::Glm => {
             let mut settings = native;
             if !hooks.is_null() && !hooks.as_object().is_some_and(|groups| groups.is_empty()) {

@@ -159,6 +159,9 @@ pub fn plan_v1(
         let expected = match runtime.kind()? {
             Adapter::Codex => HarnessId::Codex,
             Adapter::Claude | Adapter::Glm => HarnessId::ClaudeCode,
+            Adapter::OpenCode => {
+                return Err(invalid("OpenCode requires a schema-2 harness declaration"));
+            }
         };
         if mapped.harness != expected || !harnesses.contains_key(&expected) {
             return Err(invalid("v1 adapter and mapped harness disagree"));
