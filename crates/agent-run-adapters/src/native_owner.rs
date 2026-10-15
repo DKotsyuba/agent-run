@@ -481,10 +481,10 @@ mod tests {
         environment: BTreeMap<String, String>,
     }
     impl Fixture {
-        /// Create a protected channel with the test process as the actual current daemon peer.
+        /// Create a protected channel under canonical TMPDIR with this process as the actual daemon peer.
         fn new() -> Self {
             use std::os::unix::fs::PermissionsExt;
-            let root = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
             std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
             let path = root.path().join("c.sock");
             let listener = UnixListener::bind(&path).unwrap();
@@ -651,7 +651,7 @@ mod tests {
         let mut out = [0];
         assert!(matches!(stream.read(&mut out), Ok(0) | Err(_)));
     }
-    /// Partial settings, public parent and replaced endpoint never gain an owner effect.
+    /// Partial settings, public or symlinked parents and replaced endpoints never gain an owner effect.
     #[tokio::test]
     async fn unsafe_settings_and_replaced_socket_fail_closed() {
         use std::os::unix::fs::PermissionsExt;
@@ -660,6 +660,16 @@ mod tests {
         f.environment.remove(SETTINGS[1]);
         assert!(Owner::prepare(&mut f.environment).is_err());
         f.environment = original;
+        let alias = f.root.path().join("alias");
+        std::os::unix::fs::symlink(f.root.path(), &alias).unwrap();
+        for (key, path) in [
+            (SETTINGS[0], alias.join("c.sock")),
+            (SETTINGS[1], alias.clone()),
+        ] {
+            let mut aliased = f.environment.clone();
+            aliased.insert(key.into(), path.to_str().unwrap().into());
+            assert!(Owner::prepare(&mut aliased).is_err());
+        }
         std::fs::set_permissions(f.root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(Owner::prepare(&mut f.environment).is_err());
         std::fs::set_permissions(f.root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -777,7 +787,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use std::process::Stdio;
         use tokio::io::{AsyncBufReadExt, BufReader};
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let channel = root.path().join("c.sock");
         let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
