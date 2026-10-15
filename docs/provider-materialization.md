@@ -79,3 +79,26 @@ alias. Its compatibility-only removal points are
 `core::stream::plan_with_environment`, GLM-specific environment handling in
 `adapters::auth`, and the matching `core::supervisor` dispatch. No
 public permanent GLM launch alias is promised by the v2 path.
+
+## Managed OpenCode Bridge lifecycle
+
+An operator may configure `[delivery.bridge.opencode_plugin]` with absolute
+`package` and `hook_command` paths to the deployed first-party Bridge lifecycle
+package and credential-free hook executable. The selected harness environment
+must explicitly configure `BRIDGE_NATIVE_OWNER_CHANNEL` and
+`BRIDGE_NATIVE_OWNER_DIRECTORY`. These settings identify components and IPC;
+native recipient identity still comes from actual kernel and lifecycle facts.
+
+Eligible explicit-finish roles receive exactly the package manifest, `index.js`
+and hook executable in the existing immutable runtime snapshot. Source files
+must be canonical regular owner/root-owned files, bounded in size and not
+group/other-writable. Snapshot paths replace mutable deployment paths in native
+configuration. Install scripts/dependencies, arbitrary harness plugins and hooks
+remain unsupported. Research and IPC-isolated roles receive no projection.
+Provider materialization derives explicit-finish eligibility from the admitted
+worker-MCP role, preserving the same rule as the compatibility path.
+
+The pinned OpenCode 2.0.28 plugin reports lifecycle only. Incoming Bridge messages
+use the supervisor's existing owner route and native queue admission, with one
+original deadline and no second input scheduler. Context injection and standalone
+OpenCode root return delivery are not qualified by this managed-worker path.

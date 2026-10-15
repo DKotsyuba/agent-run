@@ -250,7 +250,8 @@ pub fn credential_reference(
 /// directory, and `account` an enabled in-scope registered identity. Returns
 /// the digest to persist in `ResolvedLaunchAuthority.assets_sha256`; no
 /// credential value enters the generated files or returned digest. Claude Code
-/// plugin skills are allowed only when the frozen role declares them.
+/// plugin skills are allowed only when the frozen role declares them. The
+/// admitted worker-MCP capability also selects explicit-finish lifecycle assets.
 #[allow(clippy::too_many_arguments)]
 pub fn materialize_selected(
     config: &ProviderConfig,
@@ -303,6 +304,7 @@ pub fn materialize_selected(
         "runtime": provider.as_str(), "model": model, "profile": role.role_name,
         "task": "provider materialization", "workdir": workdir,
         "account": selected_label,
+        "explicit_finish": role.worker_mcp,
     }))?;
     let config_sha256 = config
         .snapshot()?

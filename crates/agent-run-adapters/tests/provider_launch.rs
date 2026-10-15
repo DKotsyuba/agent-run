@@ -981,6 +981,8 @@ fn custom_providers_use_sealed_settings_and_fake_credentials() {
 
 /// OpenCode selects only the registered credential, isolates native paths and
 /// never puts a credential or the local server capability into sealed assets.
+/// An explicitly configured Bridge component is copied into the same immutable
+/// snapshot through the actual provider path; absent configuration adds nothing.
 #[test]
 fn opencode_launch_isolates_ambient_state_and_selected_credentials() {
     use agent_run_config::role_plan::resolve_role_plan;
@@ -1012,6 +1014,29 @@ fn opencode_launch_isolates_ambient_state_and_selected_credentials() {
         ("public", "native:opencode"),
         ("key", "env:FAKE_OPENCODE_KEY"),
     ] {
+        if name == "key" {
+            let package = root.join("bridge-package");
+            fs::create_dir(&package).unwrap();
+            fs::write(package.join("package.json"), r#"{"name":"@agent-bridge/opencode","main":"index.js","type":"module","agentBridge":{"protocol":1,"mode":"lifecycle"}}"#).unwrap();
+            fs::write(
+                package.join("index.js"),
+                "export default {id:'agent-bridge'};\n",
+            )
+            .unwrap();
+            config.delivery.bridge = Some(serde_json::from_value(serde_json::json!({
+                "registration_socket":root.join("bridge.sock"),"core_socket":root.join("core.sock"),
+                "token_file":root.join("credential"),"host_id":"local","codex_store":"main",
+                "opencode_plugin":{"package":package,"hook_command":fake_engine(&root)}
+            })).unwrap());
+            config.environments.insert("bridge".into(), serde_json::from_value(serde_json::json!({
+                "variables":{"BRIDGE_NATIVE_OWNER_CHANNEL":root.join("bridge.sock"),"BRIDGE_NATIVE_OWNER_DIRECTORY":root.join("owner")}
+            })).unwrap());
+            config
+                .harnesses
+                .get_mut(&HarnessId::OpenCode)
+                .unwrap()
+                .environment = Some("bridge".into());
+        }
         let catalog = config
             .resolve_catalog(vec![AccountRecord {
                 account_id: "acct-opencode".parse().unwrap(),
@@ -1093,6 +1118,39 @@ fn opencode_launch_isolates_ambient_state_and_selected_credentials() {
             }
         );
         let native = fs::read_to_string(home.join("opencode.json")).unwrap();
+        let rendered: serde_json::Value = serde_json::from_str(&native).unwrap();
+        assert_eq!(
+            rendered["plugins"].as_array().unwrap().len(),
+            usize::from(name == "key")
+        );
+        if name == "key" {
+            assert_eq!(
+                rendered["plugins"][0]["package"],
+                home.join("bridge-opencode/plugin").display().to_string()
+            );
+            assert_eq!(
+                rendered["plugins"][0]["options"]["hookCommand"],
+                home.join("bridge-opencode/bridge-hook")
+                    .display()
+                    .to_string()
+            );
+            let sealed = home.join("bridge-opencode/plugin/index.js");
+            let original = fs::read(&sealed).unwrap();
+            fs::write(root.join("bridge-package/index.js"), "changed source").unwrap();
+            assert_eq!(fs::read(&sealed).unwrap(), original);
+            assert_eq!(
+                fs::metadata(&sealed).unwrap().permissions().mode() & 0o777,
+                0o400
+            );
+            assert_eq!(
+                fs::metadata(home.join("bridge-opencode/bridge-hook"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o500
+            );
+        }
         for secret in [
             "synthetic-secret",
             "foreign-secret",

@@ -13,6 +13,55 @@ pub const AGENT: &str = "agent-run";
 /// Maximum bytes accepted from one native HTTP response or SSE frame.
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 
+/// Resolve only an explicitly configured first-party component for an eligible
+/// explicit-finish role. Restricted/IPC-isolated roles receive no lifecycle IPC.
+/// The channel comes from the same frozen runtime environment as the native owner;
+/// missing/relative channel settings refuse before any asset or process I/O.
+pub(super) fn bridge_projection<'a>(
+    config: &'a Config,
+    runtime: &Runtime,
+    profile: &Profile,
+    explicit_finish: bool,
+) -> Result<Option<(&'a agent_run_config::config::OpenCodeBridgePlugin, &'a str)>> {
+    use agent_run_domain::domain::Constraint;
+    let Some(component) = config
+        .delivery
+        .bridge
+        .as_ref()
+        .and_then(|bridge| bridge.opencode_plugin.as_ref())
+    else {
+        return Ok(None);
+    };
+    if !explicit_finish
+        || profile.research_tools_only()
+        || [Constraint::UnixIpcIsolation, Constraint::McpIpcIsolation]
+            .iter()
+            .any(|constraint| profile.required_constraints.contains(constraint))
+    {
+        return Ok(None);
+    }
+    let environment = runtime
+        .environment
+        .as_ref()
+        .and_then(|name| config.environments.get(name))
+        .ok_or_else(|| invalid("OpenCode Bridge requires an explicit owner environment"))?;
+    let channel = environment
+        .variables
+        .get(crate::native_owner::SETTINGS[0])
+        .filter(|path| Path::new(path).is_absolute())
+        .ok_or_else(|| invalid("OpenCode Bridge owner channel is missing or relative"))?;
+    if !environment
+        .variables
+        .get(crate::native_owner::SETTINGS[1])
+        .is_some_and(|path| Path::new(path).is_absolute())
+    {
+        return Err(invalid(
+            "OpenCode Bridge owner directory is missing or relative",
+        ));
+    }
+    Ok(Some((component, channel)))
+}
+
 /// Rejects unqualified native features instead of silently weakening a role.
 pub fn validate(runtime: &Runtime, profile: &Profile) -> Result<()> {
     if !runtime.hooks.is_empty()
@@ -149,12 +198,15 @@ pub fn permissions(profile: &Profile, home: &Path, workdir: &Path) -> Result<Val
 /// Renders only frozen skills, native permissions and selected local MCPs.
 /// `home` stores sealed assets and `workdir` grants editor access; no I/O or
 /// credential lookup occurs. Missing servers/unsupported role features refuse.
+/// `explicit_finish` permits only the configured first-party lifecycle projection;
+/// one-shot and IPC-isolated roles retain an empty plugin list.
 pub fn render(
     config: &Config,
     runtime: &Runtime,
     profile: &Profile,
     home: &Path,
     workdir: &Path,
+    explicit_finish: bool,
 ) -> Result<Value> {
     validate(runtime, profile)?;
     let permissions = permissions(profile, home, workdir)?;
@@ -172,12 +224,21 @@ pub fn render(
             json!({"type":"local","command":command,"codemode":false}),
         );
     }
+    let plugins: Vec<Value> = bridge_projection(config, runtime, profile, explicit_finish)?
+        .map(|(_, channel)| {
+            json!({
+                "package":home.join("bridge-opencode/plugin"),
+                "options":{"channel":channel,"hookCommand":home.join("bridge-opencode/bridge-hook")}
+            })
+        })
+        .into_iter()
+        .collect();
     Ok(json!({
         "agents":{AGENT:{"system":profile.body,"mode":"primary","permissions":permissions},"title":{"disabled":true},"summary":{"disabled":true}},
         "permissions":[{"action":"*","resource":"*","effect":"deny"}],
         "mcp":{"servers":servers},
         "skills":profile.skills.iter().map(|name|home.join("skills").join(name).to_string_lossy().into_owned()).collect::<Vec<_>>(),
-        "plugins":[]
+        "plugins":plugins
     }))
 }
 
@@ -612,6 +673,7 @@ mod tests {
             &profile,
             Path::new("/native"),
             Path::new("/workspace"),
+            true,
         )
         .unwrap();
         let rules = native["agents"][AGENT]["permissions"].as_array().unwrap();
@@ -645,7 +707,94 @@ mod tests {
                 &runtime,
                 &profile,
                 Path::new("/native"),
-                Path::new("/workspace")
+                Path::new("/workspace"),
+                true
+            )
+            .is_err()
+        );
+    }
+
+    /// Only explicit, nonisolated launches project the separately configured
+    /// lifecycle component; arbitrary plugins remain rejected in the same setup.
+    #[test]
+    fn bridge_projection_keeps_arbitrary_and_restricted_plugins_denied() {
+        use agent_run_domain::domain::Constraint;
+        let request=serde_json::from_value(json!({"runtime":"opencode","model":"free","profile":"review","task":"canary","workdir":"/workspace"})).unwrap();
+        let mut profile=agent_run_config::profiles::parse("+++\nrevision='one'\nwrite=false\nnetwork=false\nallow_external_read_roots=false\nskills=[]\nmcp=[]\nrequired_constraints=[]\n+++\nReview only.",&request).unwrap();
+        let mut runtime:Runtime=serde_json::from_value(json!({"enabled":true,"adapter":"opencode","binary":"/usr/bin/true","home":"/native","models":["free"],"environment":"bridge"})).unwrap();
+        let config:Config=serde_json::from_value(json!({"schema_version":1,"delivery":{"bridge":{"registration_socket":"/bridge/ch.sock","core_socket":"/bridge/core.sock","token_file":"/bridge/key","host_id":"local","codex_store":"codex-main","opencode_plugin":{"package":"/bridge/plugin","hook_command":"/bridge/hook"}}},"environments":{"bridge":{"variables":{"BRIDGE_NATIVE_OWNER_CHANNEL":"/bridge/ch.sock","BRIDGE_NATIVE_OWNER_DIRECTORY":"/bridge/owner"}}}})).unwrap();
+        let native = render(
+            &config,
+            &runtime,
+            &profile,
+            Path::new("/native"),
+            Path::new("/workspace"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(native["plugins"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            native["plugins"][0]["package"],
+            "/native/bridge-opencode/plugin"
+        );
+        assert_eq!(
+            native["plugins"][0]["options"]["hookCommand"],
+            "/native/bridge-opencode/bridge-hook"
+        );
+        assert!(
+            render(
+                &config,
+                &runtime,
+                &profile,
+                Path::new("/native"),
+                Path::new("/workspace"),
+                false
+            )
+            .unwrap()["plugins"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        for constraint in [Constraint::UnixIpcIsolation, Constraint::McpIpcIsolation] {
+            profile.required_constraints = std::collections::BTreeSet::from([constraint]);
+            assert!(
+                render(
+                    &config,
+                    &runtime,
+                    &profile,
+                    Path::new("/native"),
+                    Path::new("/workspace"),
+                    true
+                )
+                .unwrap()["plugins"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        profile.required_constraints.clear();
+        runtime.plugins.push("/unrelated".into());
+        assert!(
+            render(
+                &config,
+                &runtime,
+                &profile,
+                Path::new("/native"),
+                Path::new("/workspace"),
+                true
+            )
+            .is_err()
+        );
+        runtime.plugins.clear();
+        runtime.environment = None;
+        assert!(
+            render(
+                &config,
+                &runtime,
+                &profile,
+                Path::new("/native"),
+                Path::new("/workspace"),
+                true
             )
             .is_err()
         );
