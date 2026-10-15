@@ -65,18 +65,20 @@ async fn reply(stream: &mut UnixStream) -> Value {
     .await
     .unwrap()
 }
-/// Wait only inside a bounded provider-free fixture for the actual durable worker phase.
+/// Observe this fixture run in the read-only store until its exact phase and turn count match.
+/// Panic on a read failure or five-second expiry; never drive the native actor.
 async fn phase(
     store: &agent_run_store::Store<'_>,
     id: &agent_run_domain::domain::AgentId,
     expected: &str,
+    expected_turn: u64,
 ) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if store
                 .worker_lifecycle_view(id)
                 .unwrap()
-                .is_some_and(|x| x["phase"] == expected)
+                .is_some_and(|x| x["phase"] == expected && x["turn_count"] == expected_turn)
             {
                 return;
             }
@@ -173,7 +175,7 @@ sleep 1
         .contains("native input and logical authority do not match")
     );
     let driver = async {
-        phase(&control, &id, "idle").await;
+        phase(&control, &id, "idle", 1).await;
         let mut request = Request {
             thread_id: "s".into(),
             call_id: "original-call".into(),
@@ -324,7 +326,14 @@ esac; done"#
         .unwrap();
     let mut control = home.store();
     let driver = async {
-        phase(&control, &id, "idle").await;
+        phase(&control, &id, "idle", 1).await;
+        // No second input exists yet, so old idle must not satisfy wake readiness.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), phase(&control, &id, "idle", 2),)
+                .await
+                .is_err(),
+            "an old idle is not a completed wake"
+        );
         let request = Request {
             thread_id: "s".into(),
             call_id: "codex-alias-call".into(),
@@ -338,7 +347,7 @@ esac; done"#
         assert_eq!(accepted["state"], "accepted");
         assert_eq!(accepted["protocol"], "codex_turn");
         assert_eq!(accepted["native_id"], "wake");
-        phase(&control, &id, "idle").await;
+        phase(&control, &id, "idle", 2).await;
         control
             .accept_worker_finish(
                 &id,
@@ -712,7 +721,7 @@ async fn claude_owner_missing_replay_retires_one_effect() {
         .unwrap();
     let control = home.store();
     let driver = async {
-        phase(&control, &id, "idle").await;
+        phase(&control, &id, "idle", 1).await;
         let call = Request {
             thread_id: "s".into(),
             call_id: "uncertain".into(),

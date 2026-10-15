@@ -4,8 +4,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
-## 0.28.0
-
+- test(bridge): wait for the expected durable turn as well as idle before
+  finishing the native-owner canary; reject an unchanged first idle explicitly
+- docs(runtime): require direct native-process ownership for managed Bridge wake
 - fix(dependencies): update rustls to 0.23.46 for RUSTSEC-2026-0346 through
   RUSTSEC-2026-0349 without advisory exceptions
 - feat(opencode): add the owned OpenCode v2 runtime with explicit finish,
@@ -23,6 +24,11 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 OpenCode v2 requires a compatible Agent Bridge installation and explicit
 first-party plugin/hook configuration. Standalone OpenCode orchestrator return,
 child-session wake and OpenCode injection are not qualified by this release.
+
+## 0.28.0
+
+Unpublished candidate; the immutable tag is retained. OpenCode and managed native
+Bridge wake are first distributed in 0.28.1.
 
 ## 0.27.0
 
