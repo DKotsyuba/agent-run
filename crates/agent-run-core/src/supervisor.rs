@@ -724,13 +724,23 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Persist) -> Result<()> {
                     &mut process,
                     store,
                     &row,
+                    &row,
                     &runtime,
                     &identity.profile,
                     &runtime_home,
                 )
                 .await
             }
-            _ => crate::stream::run(&mut process, store, &row, plan.initial_input.as_deref()).await,
+            _ => {
+                crate::stream::run(
+                    &mut process,
+                    store,
+                    &row,
+                    &row,
+                    plan.initial_input.as_deref(),
+                )
+                .await
+            }
         }
     };
     let execution = execution.await;
@@ -1672,6 +1682,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                     &mut process,
                     store,
                     &native_row,
+                    &row,
                     &planned.runtime,
                     &planned.profile,
                     &runtime_home,
@@ -1682,6 +1693,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                     &mut process,
                     store,
                     &native_row,
+                    &row,
                     planned.launch.initial_input.as_deref(),
                 )
                 .await

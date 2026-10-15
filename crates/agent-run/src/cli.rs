@@ -683,11 +683,11 @@ pub enum Hook {
     Bind(HookTransport),
 }
 
-/// Hook transport selection constrained to the two Python-compatible values.
+/// Native host transport selection for normalized bind/context hook payloads.
 #[derive(Args, Debug)]
 pub struct HookTransport {
     /// The delivery transport encoded by the hook payload.
-    #[arg(long, default_value = "codex_queue", value_parser = ["claude_uds", "codex_queue"])]
+    #[arg(long, default_value = "codex_queue", value_parser = ["claude_uds", "codex_queue", "opencode"])]
     pub transport: String,
 }
 /// Paging filters for the Python-compatible agent listing command.

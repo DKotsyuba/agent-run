@@ -413,6 +413,22 @@ async fn agents_follow_binary_tracks_the_real_lifecycle_without_duplicates() {
     .await;
     assert_eq!(tool_page["items"][0]["tool_counts"]["unknown_results"], 0);
 
+    // Counts and progress are separate reads in a view: a concurrent commit
+    // can make the first completed-count page carry the preceding timestamp.
+    // The fixture is parked at its release marker, so positively observe its
+    // final committed progress before declaring the following window unchanged.
+    let progress = agent_run_store::fixture::open(&harness.home)
+        .unwrap()
+        .last_progress(&id)
+        .unwrap();
+    assert!(progress.is_some());
+    wait_for_snapshot(&seen_first, |page| {
+        page["items"][0]["last_progress_at"].as_f64() == progress
+            && page["items"][0]["tool_counts"]["calls"] == 1
+            && page["items"][0]["tool_counts"]["failed"] == 0
+    })
+    .await;
+
     // A store event that changes no displayed fact must not re-emit a page:
     // the wake rebuilds the page with fresh observation timestamps only.
     let settled = {
@@ -423,10 +439,11 @@ async fn agents_follow_binary_tracks_the_real_lifecycle_without_duplicates() {
         seen_first.lock().unwrap().len()
     };
     tokio::time::sleep(Duration::from_millis(1500)).await;
+    let observed = seen_first.lock().unwrap().clone();
     assert_eq!(
-        seen_first.lock().unwrap().len(),
+        observed.len(),
         settled,
-        "an unchanged page was re-emitted after the probe event"
+        "an unchanged page was re-emitted after the probe event: {observed:?}"
     );
 
     // Interrupting the viewer leaves the supervised agent running.

@@ -685,14 +685,24 @@ pub async fn models(process: &mut Process) -> Result<Vec<Value>> {
 /// grant drift, unavailable models, and nonterminal completion statuses.
 /// Pending safe text is flushed on every terminal path; failure diagnostics
 /// are redacted before their exported length is bounded.
+/// `record` carries the verified native model/input projection; `logical_record`
+/// retains the original request used for owner authorization. They must name the
+/// same execution, sequence and frozen identity; mixed authority fails before I/O.
 pub async fn run(
     process: &mut Process,
     store: &mut Persist,
     record: &Record,
+    logical_record: &Record,
     runtime: &Runtime,
     role: &Profile,
     home: &Path,
 ) -> Result<EngineResult> {
+    if record.id != logical_record.id
+        || record.sequence != logical_record.sequence
+        || record.identity != logical_record.identity
+    {
+        return Err(invalid("native input and logical authority do not match"));
+    }
     agent_run_adapters::validate_role(runtime, role)?;
     initialize(process).await?;
     if role.research_tools_only() {
@@ -933,7 +943,7 @@ pub async fn run(
                 use agent_run_adapters::{native_owner::Reply,io::RpcDisposition};
                 let id=call.request.call_id.clone();
                 if let Err(reply)=native_calls.reserve(&call.request) {call.answer(reply);continue;}
-                let refusal=crate::native_owner::refusal(process,store,record,&call,Some(&tid),idle,closing_at.is_some()).unwrap_or(Some("unavailable"));
+                let refusal=crate::native_owner::refusal(process,store,logical_record,&call,Some(&tid),idle,closing_at.is_some()).unwrap_or(Some("unavailable"));
                 if let Some(reason)=refusal {let reply=Reply::unsent(&id,reason);native_calls.finish(reply.clone());call.answer(reply);continue;}
                 let old_turn=turn_id.clone();
                 let exchange=turn_input(process,&mut session,&tid,&mut turn_id,&mut idle,&call.request.text,record.request.effort.as_deref(),call.deadline).await;

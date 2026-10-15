@@ -33,11 +33,7 @@ pub fn replay_request(store: &Store, request: &StartRequest) -> Result<Option<Re
             .optional()?);
     };
     let transport = reference.canonical_transport()?;
-    let legacy = match transport {
-        "codex_queue" => "codex",
-        "claude_uds" => "claude",
-        _ => unreachable!(),
-    };
+    let legacy = reference.legacy_transport()?;
     Ok(store
         .conn
         .query_row(
@@ -224,11 +220,7 @@ pub(crate) fn replay_in_transaction(
         return Ok(None);
     }
     let canonical = reference.canonical_transport()?;
-    let legacy = match canonical {
-        "codex_queue" => "codex",
-        "claude_uds" => "claude",
-        _ => unreachable!(),
-    };
+    let legacy = reference.legacy_transport()?;
     Ok(tx
         .query_row(
             "SELECT a.* FROM agents a JOIN orchestrator_sessions o ON o.id=a.orchestrator_session_id \
