@@ -50,11 +50,7 @@ fn start_replay_fingerprints(request: &StartRequest) -> Result<Vec<String>> {
         true,
     )];
     if let Some(reference) = &request.orchestrator {
-        let alias = match reference.canonical_transport()? {
-            "codex_queue" => "codex",
-            "claude_uds" => "claude",
-            _ => unreachable!(),
-        };
+        let alias = reference.legacy_transport()?;
         let mut legacy = serde_json::to_value(request)?;
         legacy["orchestrator"]["transport"] = json!(alias);
         fingerprints.push(agent_run_domain::canonical::sha256_hex(&legacy, true));
@@ -735,12 +731,7 @@ impl Service {
         };
         let mut replay_keys = vec![(namespace.clone(), sha.clone())];
         if let Some(reference) = &request.orchestrator {
-            let canonical = reference.canonical_transport()?;
-            let alias = match canonical {
-                "codex_queue" => "codex",
-                "claude_uds" => "claude",
-                _ => unreachable!(),
-            };
+            let alias = reference.legacy_transport()?;
             let mut compatible = request_value.clone();
             compatible["orchestrator"]["transport"] = json!(alias);
             replay_keys.push((
@@ -2523,6 +2514,16 @@ pub(crate) fn prepare_provider(
         .clone()
         .or_else(|| offering.params.get("effort").cloned());
     offering.permits_effort(effective_effort.as_deref())?;
+    if provider.harness == agent_run_domain::HarnessId::OpenCode {
+        adapters::opencode::model_ref(offering.native_model.as_deref().unwrap_or(&offering.id))?;
+        if !request.explicit_finish {
+            return Err(invalid("OpenCode requires explicit_finish"));
+        }
+        if effective_effort.is_some() {
+            return Err(invalid("OpenCode effort variants are not qualified"));
+        }
+    }
+
     // Harness options run through the existing launch mechanisms: fast
     // is the codex service tier, output_schema the claude answer schema.
     if request.fast && provider.harness != agent_run_domain::catalog::HarnessId::Codex {

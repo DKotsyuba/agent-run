@@ -151,6 +151,72 @@ async fn python_bind_hook_is_idempotent_and_activates_one_delivery() {
     assert!(conflict.to_string().contains("immutable"));
 }
 
+/// OpenCode root binding reuses the same immutable session, replay and waiting-notice mechanism.
+#[tokio::test]
+async fn opencode_root_binding_replay_and_context_stay_in_one_session() {
+    let home = common::Home::new();
+    let reference = OrchestratorRef {
+        transport: "opencode".into(),
+        external_session_id: "root-session".into(),
+        external_turn_id: Some("message-1".into()),
+    };
+    let mut request = home.request();
+    request.orchestrator = Some(reference.clone());
+    request.request_id = Some("opencode-start".into());
+    let mut store = home.store();
+    let (id, created) = store
+        .admit(&request, &home.config, &json!({}), None)
+        .unwrap();
+    assert!(created);
+    let (replayed, created) = store
+        .admit(&request, &home.config, &json!({}), None)
+        .unwrap();
+    assert!(!created);
+    assert_eq!(replayed, id);
+    assert_eq!(store.list(false, 0, 10, Some(&reference)).unwrap().1, 1);
+    store
+        .finish(&id, &Outcome::failure("fixture"), None, None)
+        .unwrap();
+    drop(store);
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
+    let payload = json!({
+        "agent_id":id,
+        "transport":"opencode",
+        "external_session_id":"root-session",
+        "external_turn_id":"message-1"
+    });
+    let first = bind::run_hook(&home.path, &payload, "opencode", Some(5.0))
+        .await
+        .unwrap();
+    let second = bind::run_hook(&home.path, &payload, "opencode", Some(6.0))
+        .await
+        .unwrap();
+    assert_eq!(first.session_id, second.session_id);
+    let context = context::build(&home.path, &reference, Some(7.0))
+        .await
+        .unwrap();
+    assert_eq!(
+        context.orchestrator_session_id.as_deref(),
+        Some(first.session_id.as_str())
+    );
+    let store = home.store();
+    let destinations: Vec<(String, String)> = store.conn.prepare(
+        "SELECT o.transport,o.external_session_id FROM deliveries d JOIN orchestrator_sessions o ON o.id=d.orchestrator_session_id WHERE d.agent_id=?"
+    ).unwrap().query_map([id.as_str()], |row| Ok((row.get(0)?,row.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    assert_eq!(
+        destinations,
+        vec![("opencode".into(), "root-session".into())]
+    );
+    let mut conflict = payload;
+    conflict["external_session_id"] = json!("other-session");
+    assert!(
+        bind::run_hook(&home.path, &conflict, "opencode", Some(8.0))
+            .await
+            .is_err()
+    );
+}
+
 /// Mirrors `tests/test_bind_hook.py::BindHookTests::test_unbound_terminal_agent_never_gets_a_notice_row`.
 #[tokio::test]
 async fn unbound_terminal_agent_never_gets_a_notice_row() {

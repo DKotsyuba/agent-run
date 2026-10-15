@@ -140,6 +140,48 @@ fn identity(request: &ProviderStartRequest, authority: &ResolvedLaunchAuthority)
     })
 }
 
+/// A provider start from OpenCode retains one execution and session across request replay.
+#[test]
+fn opencode_orchestrator_provider_replay_preserves_one_admission() {
+    let home = home();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
+    let catalog = catalog(&store);
+    let mut request = provider_request(home.path(), "opencode-root-start");
+    request.orchestrator = Some(agent_run_domain::domain::OrchestratorRef {
+        transport: "opencode".into(),
+        external_session_id: "root-session".into(),
+        external_turn_id: Some("input-1".into()),
+    });
+    request.validate().unwrap();
+    let authority = authority(&catalog, home.path());
+    let identity = identity(&request, &authority);
+    let candidates = candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+    let mut first = None;
+    for created in [true, false] {
+        let result = store
+            .admit_provider(
+                &request,
+                &request.storage_projection(),
+                &catalog,
+                &authority,
+                &candidates,
+                &identity,
+                2,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.created, created);
+        let original = first.get_or_insert(result.agent_id.clone());
+        assert_eq!(*original, result.agent_id);
+    }
+    let (rows, total) = store
+        .list(false, 0, 10, request.orchestrator.as_ref())
+        .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(rows[0].id, first.unwrap());
+}
+
 /// Stale input changes no row; eligible rank ties use account id, physical
 /// reservations are exact, and replay wins after the revision changes.
 #[test]

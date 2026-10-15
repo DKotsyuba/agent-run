@@ -111,3 +111,50 @@ async fn mixed_unicode_and_escaped_chunks_are_never_lost() {
         .unwrap();
     assert_eq!(rows, expected);
 }
+
+/// One native transcript row and its replay identity cross the writer together;
+/// invalid provenance is refused before either half of that pair is committed.
+#[tokio::test]
+async fn native_item_and_replay_marker_share_one_journal_admission() {
+    let home = common::Home::new();
+    let (id, _) = home
+        .store()
+        .admit(&home.request(), &home.config, &json!({}), None)
+        .unwrap();
+    let mut store = home.store();
+    let preparation = common::writer::prepare_supervisor(&mut store, &id);
+    drop(store);
+    let harness = common::writer::Harness::start(&home.path);
+    let mut persist = harness.supervisor(&home.path, preparation, &id).await;
+    persist
+        .native_item(
+            &id,
+            "tool_result",
+            "result",
+            Some("tool"),
+            Some("owned-call"),
+            Some((false, "opencode.tool.state")),
+            json!({"key":"one","sha256":"digest"}),
+        )
+        .await
+        .unwrap();
+    assert!(!persist.has_pending());
+    let counts:(i64,i64)=persist.conn.query_row("SELECT (SELECT COUNT(*) FROM messages WHERE agent_id=?1 AND raw_ref='owned-call'),(SELECT COUNT(*) FROM events WHERE agent_id=?1 AND kind='opencode_item_v1')",[id.as_str()],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert_eq!(counts, (1, 1));
+    assert!(
+        persist
+            .native_item(
+                &id,
+                "tool_result",
+                "refused",
+                Some("tool"),
+                Some("foreign-call"),
+                Some((false, "untrusted-source")),
+                json!({"key":"two"})
+            )
+            .await
+            .is_err()
+    );
+    let after:(i64,i64)=persist.conn.query_row("SELECT (SELECT COUNT(*) FROM messages WHERE agent_id=?1),(SELECT COUNT(*) FROM events WHERE agent_id=?1 AND kind='opencode_item_v1')",[id.as_str()],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert_eq!(after, (1, 1));
+}

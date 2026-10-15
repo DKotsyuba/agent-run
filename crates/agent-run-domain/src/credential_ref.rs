@@ -11,7 +11,8 @@ use std::{path::PathBuf, str::FromStr};
 /// One existing credential location; no variant contains credential bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialRef {
-    /// Existing host-native login owned and refreshed by the harness.
+    /// Native default authentication: host login for Codex/Claude, isolated
+    /// public provider connection for OpenCode (no host database is imported).
     Native(HarnessId),
     /// Existing labelled native login owned and refreshed by the harness.
     Named {
@@ -110,6 +111,11 @@ impl CredentialRef {
                 harness: HarnessId::ClaudeCode,
                 ..
             } => family.as_str() == "anthropic",
+            Self::Native(HarnessId::OpenCode)
+            | Self::Named {
+                harness: HarnessId::OpenCode,
+                ..
+            } => family.as_str() == "opencode",
             _ => true,
         }
     }

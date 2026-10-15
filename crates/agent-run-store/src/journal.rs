@@ -332,7 +332,8 @@ pub fn prepare_message_fragment(
 }
 
 /// Native tool error provenance labels accepted on `tool_result` rows.
-const ERROR_SOURCES: [&str; 5] = [
+const ERROR_SOURCES: [&str; 6] = [
+    "opencode.tool.state",
     "claude.is_error",
     "codex.command.exitCode",
     "codex.command.status",

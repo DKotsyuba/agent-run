@@ -349,6 +349,8 @@ mod tests {
             host_id: "host/part".into(),
             codex_store: Some("store%name".into()),
             claude_store: Some("claude-main".into()),
+            opencode_store: None,
+            opencode_plugin: None,
         };
         for (payload, kind, marker) in [
             (
@@ -428,6 +430,8 @@ mod tests {
             host_id: "local".into(),
             codex_store: Some("codex-main".into()),
             claude_store: None,
+            opencode_store: None,
+            opencode_plugin: None,
         };
         assert!(client(&config).is_ok());
         std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o644)).unwrap();

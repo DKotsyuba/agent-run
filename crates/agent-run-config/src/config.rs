@@ -17,6 +17,8 @@ pub enum Adapter {
     Claude,
     /// GLM's Anthropic-compatible stream runtime.
     Glm,
+    /// Owned OpenCode v2 server using the local HTTP API.
+    OpenCode,
 }
 impl Adapter {
     /// Resolves a supported current or legacy adapter identifier.
@@ -34,6 +36,7 @@ impl Adapter {
             "glm" | "agent_run.adapters.glm:ADAPTER" | "agent_run.adapters.glm.adapter:ADAPTER" => {
                 Ok(Self::Glm)
             }
+            "opencode" => Ok(Self::OpenCode),
             "qwen"
             | "agent_run.adapters.qwen:ADAPTER"
             | "agent_run.adapters.qwen.adapter:ADAPTER" => Err(invalid(
@@ -50,6 +53,7 @@ impl Adapter {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Glm => "glm",
+            Self::OpenCode => "opencode",
         }
     }
 }
@@ -170,7 +174,8 @@ impl Default for Delivery {
     }
 }
 
-/// Trusted deployment configuration for delivery-only Bridge publication.
+/// Trusted deployment configuration for Bridge publication and an optional
+/// first-party OpenCode lifecycle asset projection.
 /// This creates no credential, native caller identity or job admission authority.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -187,6 +192,23 @@ pub struct BridgeDelivery {
     pub codex_store: Option<String>,
     /// Explicit Claude Code store namespace; absent means Claude destinations are unsupported.
     pub claude_store: Option<String>,
+    /// Explicit OpenCode namespace; absence never guesses a return destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_store: Option<String>,
+    /// Operator-selected first-party lifecycle component, sealed into each eligible home.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_plugin: Option<OpenCodeBridgePlugin>,
+}
+
+/// First-party OpenCode lifecycle assets, independent of arbitrary runtime plugins.
+/// These paths identify deployed Bridge code, never recipient admission authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenCodeBridgePlugin {
+    /// Absolute source package containing the Bridge lifecycle manifest and index.js.
+    pub package: PathBuf,
+    /// Absolute credential-free bridge-hook executable, copied into the frozen home.
+    pub hook_command: PathBuf,
 }
 
 impl BridgeDelivery {
@@ -201,10 +223,16 @@ impl BridgeDelivery {
         ]
         .iter()
         .any(|path| !path.is_absolute())
-            || self.codex_store.is_none() && self.claude_store.is_none()
+            || self.codex_store.is_none()
+                && self.claude_store.is_none()
+                && self.opencode_store.is_none()
+            || self.opencode_plugin.as_ref().is_some_and(|component| {
+                !component.package.is_absolute() || !component.hook_command.is_absolute()
+            })
             || std::iter::once(&self.host_id)
                 .chain(self.codex_store.iter())
                 .chain(self.claude_store.iter())
+                .chain(self.opencode_store.iter())
                 .any(|part| {
                     part.trim().is_empty() || part.len() > 256 || part.chars().any(char::is_control)
                 })
@@ -802,9 +830,13 @@ const CLAUDE_RESERVED: &str = "model env environment permissions sandbox credent
 /// permissions, sandbox, hooks, and transport controls) always fail closed so
 /// an owner's native table cannot weaken the delegated capability grant.
 pub fn native_settings(kind: Adapter, settings: &BTreeMap<String, toml::Value>) -> Result<()> {
+    if kind == Adapter::OpenCode && !settings.is_empty() {
+        return Err(invalid("OpenCode native tuning is not yet supported"));
+    }
     let reserved = match kind {
         Adapter::Codex => CODEX_RESERVED,
         Adapter::Claude | Adapter::Glm => CLAUDE_RESERVED,
+        Adapter::OpenCode => "",
     };
     /// Returns whether a TOML key cannot splice another generated namespace.
     fn key(k: &str) -> bool {

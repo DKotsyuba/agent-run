@@ -540,6 +540,89 @@ fn catalog_skill_source(catalog: &Path, skill: &str) -> Result<PathBuf> {
     Ok(source)
 }
 
+/// Read one bounded first-party component through a no-follow descriptor.
+/// Source must be canonical, owner/root-owned and not group/other-writable;
+/// identity and modification timestamps must remain unchanged while reading.
+/// No source path or bytes are included in validation diagnostics.
+fn bridge_component_bytes(path: &Path, owner: u32, limit: usize) -> Result<Vec<u8>> {
+    use std::{io::Read, os::unix::fs::MetadataExt};
+    if !path.is_absolute() || path.canonicalize()?.as_path() != path {
+        return Err(invalid("OpenCode Bridge asset path must be canonical"));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("OpenCode Bridge asset parent missing"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| invalid("OpenCode Bridge asset name missing"))?;
+    let file = Dir::open(parent)?.open_file(Path::new(name))?;
+    let before = file.metadata()?;
+    if !before.is_file()
+        || ![owner, 0].contains(&before.uid())
+        || before.mode() & 0o022 != 0
+        || before.len() > limit as u64
+    {
+        return Err(invalid(
+            "OpenCode Bridge asset protection or size is invalid",
+        ));
+    }
+    let fingerprint = |metadata: &std::fs::Metadata| {
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.uid(),
+            metadata.mode(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
+    };
+    let mut bytes = Vec::new();
+    (&file).take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit || fingerprint(&before) != fingerprint(&file.metadata()?) {
+        return Err(invalid("OpenCode Bridge asset changed while reading"));
+    }
+    Ok(bytes)
+}
+
+/// Seal exactly the first-party lifecycle package and credential-free hook
+/// executable into the existing runtime snapshot. Arbitrary runtime plugins,
+/// package install scripts/dependencies and mutable external launch paths are
+/// never enabled by this projection.
+fn seal_opencode_bridge(
+    publisher: &mut Publisher,
+    component: &agent_run_config::config::OpenCodeBridgePlugin,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let owner = std::fs::metadata(&publisher.root)?.uid();
+    let manifest = bridge_component_bytes(&component.package.join("package.json"), owner, 65536)?;
+    let parsed: Value = serde_json::from_slice(&manifest)
+        .map_err(|_| invalid("OpenCode Bridge manifest is malformed"))?;
+    if parsed["name"] != "@agent-bridge/opencode"
+        || parsed["main"] != "index.js"
+        || parsed["type"] != "module"
+        || parsed.pointer("/agentBridge/protocol") != Some(&json!(1))
+        || parsed.pointer("/agentBridge/mode") != Some(&json!("lifecycle"))
+        || ["dependencies", "scripts"].iter().any(|name| {
+            parsed
+                .get(*name)
+                .is_some_and(|value| !value.as_object().is_some_and(|object| object.is_empty()))
+        })
+    {
+        return Err(invalid(
+            "OpenCode Bridge lifecycle package contract is invalid",
+        ));
+    }
+    let source = bridge_component_bytes(&component.package.join("index.js"), owner, 1024 * 1024)?;
+    let hook = bridge_component_bytes(&component.hook_command, owner, 64 * 1024 * 1024)?;
+    publisher.file("bridge-opencode/plugin/package.json", &manifest, 0o400)?;
+    publisher.file("bridge-opencode/plugin/index.js", &source, 0o400)?;
+    publisher.file("bridge-opencode/bridge-hook", &hook, 0o500)?;
+    Ok(())
+}
+
 /// Publishes a new v1/v2 home with frozen local assets and private native state.
 ///
 /// Codex homes disable remote catalog discovery and forward resolved Rust roots
@@ -835,6 +918,25 @@ fn materialize_with_provider(
                 p.link(&target, &source)?;
             }
         }
+        Adapter::OpenCode => {
+            if let Some((component, _)) = super::opencode::bridge_projection(
+                config,
+                runtime,
+                profile,
+                request.explicit_finish,
+            )? {
+                seal_opencode_bridge(&mut p, component)?;
+            }
+            let native = super::opencode::render(
+                config,
+                runtime,
+                profile,
+                home,
+                &request.workdir,
+                request.explicit_finish,
+            )?;
+            p.json("opencode.json", &native)?;
+        }
         Adapter::Claude | Adapter::Glm => {
             let mut settings = native;
             if !hooks.is_null() && !hooks.as_object().is_some_and(|groups| groups.is_empty()) {
@@ -927,6 +1029,30 @@ mod tests {
     use agent_run_domain::domain::StartRequest;
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
+
+    /// Component reads reject writable, oversized and symlinked files before
+    /// any executable is frozen into a runtime home.
+    #[test]
+    fn bridge_component_rejects_unsafe_sources() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("source");
+        std::fs::write(&source, b"component").unwrap();
+        let owner = std::fs::metadata(&root).unwrap().uid();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            bridge_component_bytes(&source, owner, 9).unwrap(),
+            b"component"
+        );
+        assert!(bridge_component_bytes(&source, owner, 8).is_err());
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o620)).unwrap();
+        assert!(bridge_component_bytes(&source, owner, 9).is_err());
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let alias = root.join("alias");
+        symlink(&source, &alias).unwrap();
+        assert!(bridge_component_bytes(&alias, owner, 9).is_err());
+    }
 
     /// Builds an isolated Claude fixture for materialization assertions.
     fn claude_fixture(root: &Path) -> (Config, Runtime, StartRequest, Profile) {

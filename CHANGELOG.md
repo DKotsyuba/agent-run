@@ -4,6 +4,26 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.28.0
+
+- fix(dependencies): update rustls to 0.23.46 for RUSTSEC-2026-0346 through
+  RUSTSEC-2026-0349 without advisory exceptions
+- feat(opencode): add the owned OpenCode v2 runtime with explicit finish,
+  same-session continuation, queued input, worker pools and native journal evidence
+- feat(bridge): wake managed native Codex, Claude and OpenCode sessions through
+  authenticated owner control channels; preserve logical task authority separately
+  from native session identity
+- feat(opencode): freeze first-party Bridge lifecycle plugin and hook assets in
+  immutable run snapshots; project them through the actual provider launch path
+- refactor(bridge): authenticate native owners through the live private channel,
+  process birth identity and peer credentials instead of static executable trust
+- test(runtime): qualify real idle-to-message wake in the same OpenCode session,
+  plus Codex and Claude graph completion through Bridge with verified cleanup
+
+OpenCode v2 requires a compatible Agent Bridge installation and explicit
+first-party plugin/hook configuration. Standalone OpenCode orchestrator return,
+child-session wake and OpenCode injection are not qualified by this release.
+
 ## 0.27.0
 
 - feat(delivery)!: use Agent Bridge as the sole sender for completion notices,

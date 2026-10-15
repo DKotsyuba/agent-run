@@ -79,7 +79,7 @@ async fn native_claude_correlates_queued_steering() {
     let initial = json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":requested.task}]}}).to_string();
     let result = tokio::time::timeout(
         Duration::from_secs(90),
-        stream::run(&mut process, &mut persist, &record, Some(&initial)),
+        stream::run(&mut process, &mut persist, &record, &record, Some(&initial)),
     )
     .await;
     persist.flush().await.unwrap();
@@ -105,7 +105,13 @@ async fn native_claude_correlates_queued_steering() {
     let initial = json!({"type":"user","message":{"role":"user","content":[{"type":"text","text":"Respond with only RESUMED."}]}}).to_string();
     let continuation = tokio::time::timeout(
         Duration::from_secs(90),
-        stream::run(&mut process, &mut persist, &resumed, Some(&initial)),
+        stream::run(
+            &mut process,
+            &mut persist,
+            &resumed,
+            &resumed,
+            Some(&initial),
+        ),
     )
     .await;
     persist.flush().await.unwrap();
@@ -190,7 +196,7 @@ async fn closed_stdin_control_cannot_certify_success() {
     let (result, driven) = tokio::join!(
         tokio::time::timeout(
             Duration::from_secs(5),
-            stream::run(&mut process, &mut persist, &record, Some(&initial))
+            stream::run(&mut process, &mut persist, &record, &record, Some(&initial))
         ),
         driver,
     );

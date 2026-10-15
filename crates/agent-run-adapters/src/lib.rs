@@ -9,6 +9,10 @@ pub mod io;
 pub mod materialize;
 pub mod mcp_catalog;
 pub mod native_failure;
+/// Protected bounded handoff into the sole existing native owner loop.
+pub mod native_owner;
+/// Owned OpenCode v2 native settings and HTTP transport.
+pub mod opencode;
 pub mod plugins;
 pub mod provider;
 pub mod redact;
@@ -38,6 +42,9 @@ pub struct LaunchPlan {
 /// path are checked without spawning a child or consulting provider state.
 pub fn validate(request: &StartRequest, runtime: &Runtime, profile: &Profile) -> Result<()> {
     let kind = runtime.kind()?;
+    if kind == Adapter::OpenCode {
+        return Err(invalid("OpenCode requires schema-2 provider admission"));
+    }
     if profile.research_tools_only() {
         return Err(invalid(
             "restricted research requires a schema-2 provider launch",
@@ -81,6 +88,9 @@ pub fn validate(request: &StartRequest, runtime: &Runtime, profile: &Profile) ->
 /// No child, credential or mutable state is opened by this check.
 pub fn validate_role(runtime: &Runtime, profile: &Profile) -> Result<()> {
     profile.validate_research()?;
+    if runtime.kind()? == Adapter::OpenCode {
+        opencode::validate(runtime, profile)?;
+    }
     if runtime.kind()? == Adapter::Codex
         && profile.network
         && !profile.write
@@ -119,7 +129,13 @@ pub fn capabilities(kind: Adapter) -> Vec<&'static str> {
         "hooks",
         "resume",
     ];
-    c.extend(["steer", "effort"]);
+    c.push("steer");
+    if kind == Adapter::OpenCode {
+        c.retain(|name| !["hooks"].contains(name));
+    } else {
+        c.push("effort");
+    }
+
     if matches!(kind, Adapter::Claude | Adapter::Glm) {
         c.push("output_schema");
     }

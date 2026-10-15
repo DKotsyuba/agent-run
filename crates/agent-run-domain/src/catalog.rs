@@ -42,7 +42,7 @@ fn identifier(label: &str, value: &str, max: usize) -> Result<()> {
     Ok(())
 }
 
-/// The execution harness a provider binds to; exactly the two supported ones.
+/// The packaged execution harness a provider binds to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum HarnessId {
     /// The Codex app-server harness.
@@ -51,17 +51,21 @@ pub enum HarnessId {
     /// The Claude Code harness.
     #[serde(rename = "claude-code")]
     ClaudeCode,
+    /// The owned OpenCode v2 HTTP server.
+    #[serde(rename = "opencode")]
+    OpenCode,
 }
 
 impl HarnessId {
     /// Lists every supported harness in stable declaration order.
-    pub const ALL: [Self; 2] = [Self::Codex, Self::ClaudeCode];
+    pub const ALL: [Self; 3] = [Self::Codex, Self::ClaudeCode, Self::OpenCode];
 
     /// Returns the stable wire name used in configuration and catalogs.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Codex => "codex",
             Self::ClaudeCode => "claude-code",
+            Self::OpenCode => "opencode",
         }
     }
 }
@@ -81,7 +85,7 @@ impl FromStr for HarnessId {
         Self::ALL
             .into_iter()
             .find(|harness| harness.as_str() == value)
-            .ok_or_else(|| invalid("unknown harness; expected codex or claude-code"))
+            .ok_or_else(|| invalid("unknown harness; expected codex, claude-code or opencode"))
     }
 }
 
@@ -614,7 +618,9 @@ impl ProviderDefinition {
         }
         if !matches!(
             (self.harness, self.auth_family.as_str()),
-            (HarnessId::Codex, "openai") | (HarnessId::ClaudeCode, "anthropic")
+            (HarnessId::Codex, "openai")
+                | (HarnessId::ClaudeCode, "anthropic")
+                | (HarnessId::OpenCode, "opencode")
         ) {
             return Err(invalid("provider auth family does not match harness"));
         }

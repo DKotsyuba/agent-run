@@ -81,6 +81,7 @@ pub fn plan_with_environment(
     mut env: std::collections::BTreeMap<String, String>,
 ) -> Result<LaunchPlan> {
     let kind = runtime.kind()?;
+    crate::native_owner::configure(&mut env, record, role, kind == Adapter::Claude);
     let req = &record.request;
     let (mut args, input) = {
         let mut tools = vec!["Read".to_owned(), "Grep".into(), "Glob".into()];
@@ -550,12 +551,22 @@ fn result_failure_kind(subtype: &str, text: Option<&str>) -> &'static str {
 /// under one durable `raw_ref`: the native message id from `message_start` or
 /// the full event, or one producer-owned bounded fallback per message boundary
 /// when the engine omits ids, so distinct messages never merge.
+/// `record` carries native input metadata; `logical_record` preserves the exact
+/// admitted request for owner authorization. Mixed execution, sequence or frozen
+/// identity is rejected before native input, without normalizing the authority.
 pub async fn run(
     process: &mut Process,
     store: &mut Persist,
     record: &Record,
+    logical_record: &Record,
     initial_input: Option<&str>,
 ) -> Result<EngineResult> {
+    if record.id != logical_record.id
+        || record.sequence != logical_record.sequence
+        || record.identity != logical_record.identity
+    {
+        return Err(invalid("native input and logical authority do not match"));
+    }
     let mut inputs = ResultInputs::default();
     if let Some(input) = initial_input {
         if let Ok(mut frame) = serde_json::from_str::<Value>(input)
@@ -600,9 +611,24 @@ pub async fn run(
     // message share it, so distinct messages never merge.
     let mut message_id: Option<String> = None;
     let mut fallback_messages: u64 = 0;
+    let mut native_owner = process.native_owner.take();
+    let mut native_calls = agent_run_adapters::native_owner::Calls::default();
+    let mut native_pending: Option<(agent_run_adapters::native_owner::Call, String)> = None;
+    let mut native_idle = false;
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        if native_pending
+            .as_ref()
+            .is_some_and(|(call, _)| tokio::time::Instant::now() >= call.deadline)
+        {
+            let (call, _) = native_pending.take().expect("checked pending input");
+            let reply = agent_run_adapters::native_owner::Reply::unknown(&call.request.call_id);
+            native_calls.finish(reply.clone());
+            call.answer(reply);
+            native_owner.take();
+            return Err(invalid("native owner input acknowledgement is uncertain"));
+        }
         if record.request.explicit_finish && store.worker_finish_intent(&record.id, true)?.is_some()
         {
             if closing_at.is_none() {
@@ -626,6 +652,23 @@ pub async fn run(
         }
         let event = tokio::select! {
             biased;
+            call = agent_run_adapters::native_owner::Owner::receive(&mut native_owner) => {
+                use agent_run_adapters::native_owner::Reply;
+                let id=call.request.call_id.clone();
+                if let Err(reply)=native_calls.reserve(&call.request) {call.answer(reply);continue;}
+                let refusal=crate::native_owner::refusal(process,store,logical_record,&call,session.as_deref(),native_idle && native_pending.is_none(),closing_at.is_some()).unwrap_or(Some("unavailable"));
+                if let Some(reason)=refusal {let reply=Reply::unsent(&id,reason);native_calls.finish(reply.clone());call.answer(reply);continue;}
+                let input_id=uuid::Uuid::new_v4().to_string();
+                if !send_user_text(process,&call.request.text,&input_id,call.deadline).await {
+                    let reply=Reply::unknown(&id);native_calls.finish(reply.clone());call.answer(reply);native_owner.take();
+                    return Err(invalid("native owner input write is uncertain"));
+                }
+                inputs.sent(input_id.clone(),false);
+                native_idle=false;
+                process.observing(store.worker_turn(&record.id,false,crate::domain::now())).await?;
+                native_pending=Some((call,input_id));
+                continue;
+            }
             event = process.next() => Some(event),
             _ = tick.tick() => None,
         };
@@ -687,6 +730,7 @@ pub async fn run(
                         let open = process.input.is_some();
                         let accepted = send_user_text(process, text, &id, deadline).await;
                         if accepted {
+                            native_idle = false;
                             inputs.sent(id, true);
                             // The bytes reached the engine: its observed result, the
                             // worker-turn effect and the transcript row are ONE
@@ -736,6 +780,7 @@ pub async fn run(
                             let id = uuid::Uuid::new_v4().to_string();
                             let open = process.input.is_some();
                             if send_user_text(process, &text, &id, deadline).await {
+                                native_idle = false;
                                 inputs.sent(id, false);
                                 written = true;
                                 commands::pool_result("written", "stdin_write")
@@ -934,6 +979,7 @@ pub async fn run(
             || (v.get("type").and_then(Value::as_str) == Some("stream_event")
                 && v.pointer("/event/type").and_then(Value::as_str) == Some("message_start"))
         {
+            native_idle = false;
             process
                 .observing(store.worker_turn(&record.id, false, crate::domain::now()))
                 .await?;
@@ -1201,6 +1247,24 @@ pub async fn run(
                 }
             }
             Some("user") => {
+                if native_pending.as_ref().is_some_and(|(call, input)| {
+                    tokio::time::Instant::now() < call.deadline
+                        && v.get("isReplay").and_then(Value::as_bool) == Some(true)
+                        && v.get("uuid").and_then(Value::as_str) == Some(input.as_str())
+                        && v.get("session_id").and_then(Value::as_str)
+                            == Some(call.request.thread_id.as_str())
+                }) {
+                    let (call, input) = native_pending
+                        .take()
+                        .expect("checked native replay ownership");
+                    let reply = agent_run_adapters::native_owner::Reply::accepted(
+                        &call.request.call_id,
+                        "claude_input",
+                        &input,
+                    );
+                    native_calls.finish(reply.clone());
+                    call.answer(reply);
+                }
                 if let Some(content) = v.pointer("/message/content").and_then(Value::as_array) {
                     for block in content {
                         if block.get("type").and_then(Value::as_str) == Some("tool_result") {
@@ -1284,6 +1348,7 @@ pub async fn run(
                     return Ok(result);
                 }
                 if record.request.explicit_finish && outcome.status == Status::Succeeded {
+                    native_idle = true;
                     process
                         .observing(store.worker_turn(&record.id, true, crate::domain::now()))
                         .await?;

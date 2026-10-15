@@ -70,11 +70,7 @@ fn replayed(
     let request_value = serde_json::to_value(request)?;
     let mut fingerprints = vec![canonical::sha256_hex(&request_value, true)];
     if let Some(reference) = &request.orchestrator {
-        let alias = match reference.canonical_transport()? {
-            "codex_queue" => "codex",
-            "claude_uds" => "claude",
-            _ => unreachable!(),
-        };
+        let alias = reference.legacy_transport()?;
         let mut legacy = request_value;
         legacy["orchestrator"]["transport"] = json!(alias);
         fingerprints.push(canonical::sha256_hex(&legacy, true));
@@ -85,11 +81,7 @@ fn replayed(
     let historical = ProviderStartRequest::from_history(raw.clone())?;
     if let Some(reference) = &historical.orchestrator {
         let canonical = reference.canonical_transport()?;
-        let legacy = match canonical {
-            "codex_queue" => "codex",
-            "claude_uds" => "claude",
-            _ => unreachable!(),
-        };
+        let legacy = reference.legacy_transport()?;
         for transport in [canonical, legacy] {
             let mut spelling = raw.clone();
             spelling["orchestrator"]["transport"] = json!(transport);

@@ -67,7 +67,7 @@ async fn native_success_without_callback_is_not_completion() {
             format!("read initial; printf '%s\\n' '{TURN}'"),
         ))
         .unwrap();
-        let result = stream::run(&mut process, &mut persist, &row, Some("initial\n"))
+        let result = stream::run(&mut process, &mut persist, &row, &row, Some("initial\n"))
             .await
             .unwrap();
         persist.flush().await.unwrap();
@@ -164,7 +164,7 @@ sleep 1
     };
     let result = tokio::time::timeout(Duration::from_secs(10), async {
         let (result, ()) = tokio::join!(
-            stream::run(&mut process, &mut persist, &row, Some("initial\n")),
+            stream::run(&mut process, &mut persist, &row, &row, Some("initial\n")),
             driver
         );
         persist.flush().await.unwrap();

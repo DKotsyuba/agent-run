@@ -269,11 +269,7 @@ pub(crate) fn session_ids_for_reference(
 ) -> Result<Vec<String>> {
     reference.validate()?;
     let canonical = reference.canonical_transport()?;
-    let legacy = match canonical {
-        "codex_queue" => "codex",
-        "claude_uds" => "claude",
-        _ => unreachable!(),
-    };
+    let legacy = reference.legacy_transport()?;
     let mut statement = conn.prepare(
         "SELECT id FROM orchestrator_sessions WHERE external_session_id=? AND transport IN (?,?) \
          ORDER BY (transport=?) DESC,id",
@@ -1298,11 +1294,7 @@ impl Store<'_> {
             Some(reference) => {
                 reference.validate()?;
                 let canonical = reference.canonical_transport()?;
-                let legacy = match canonical {
-                    "codex_queue" => "codex",
-                    "claude_uds" => "claude",
-                    _ => unreachable!(),
-                };
+                let legacy = reference.legacy_transport()?;
                 (reference.external_session_id.as_str(), canonical, legacy)
             }
             None => ("", "", ""),
