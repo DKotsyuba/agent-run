@@ -221,7 +221,17 @@ The managed role supplies exact MCP caps and skill permissions. Native editor
 access is scoped to the workdir; read-only shell asks are rejected. These are
 tool filters, not an OS filesystem/network sandbox. Explicit finish is required.
 Start, cancel, idle steering and same-account explicit resume use the shared
-supervisor. Hooks, plugins, native tuning, Codex workspace roots, restricted
-research, effort and output schemas are refused. Native background-job wake
-correlation remains unqualified. Larger native responses/snapshots retain the
+supervisor. Native shell background completion resumes the same parent through
+OpenCode's own notification mechanism; native inputs and synthetic notifications
+are journaled by stable native IDs. No second background scheduler is added.
+
+A configured launch-owned Bridge channel may admit a queued input only after
+fresh native idle and empty-inbox proof. The original absolute deadline, logical
+admission identity and exact input acknowledgement remain binding; admission is
+not a claim that the model consumed the input. Busy/gapped evidence cannot certify
+idle. One-shot, research and IPC-isolated launches do not receive this channel.
+Arbitrary hooks/plugins, native tuning, Codex workspace roots, restricted research,
+effort and output schemas are still refused. Bridge lifecycle plugin projection
+and standalone OpenCode root delivery require their separate trusted integration;
+other native background/subagent variants are not advertised as qualified. Larger native responses/snapshots retain the
 existing bounded transport and transcript limits.

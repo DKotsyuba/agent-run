@@ -5445,6 +5445,83 @@ async fn private_launch_creates_the_store_before_the_first_publication() {
     );
 }
 
+/// Real v2 supervisor launches strip owner settings for one-shot Codex/Claude,
+/// while explicit supported launches retain opt-in and refuse an unavailable channel before spawn.
+#[tokio::test]
+async fn provider_owner_eligibility_is_applied_before_native_spawn() {
+    for codex in [true, false] {
+        for explicit in [false, true] {
+            let (_temp, home) = if codex {
+                codex_home_with(&["ok"])
+            } else {
+                home()
+            };
+            let path = home.join("config.toml");
+            let mut config = agent_run_config::provider_config::ProviderConfig::load(&home)
+                .unwrap()
+                .0;
+            let harness = if codex {
+                agent_run_domain::HarnessId::Codex
+            } else {
+                agent_run_domain::HarnessId::ClaudeCode
+            };
+            config.harnesses.get_mut(&harness).unwrap().environment = Some("owner-fixture".into());
+            let mut environment = agent_run_config::config::Environment::default();
+            environment.variables.insert(
+                "BRIDGE_NATIVE_OWNER_CHANNEL".into(),
+                home.join("absent-owner.sock")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            environment.variables.insert(
+                "BRIDGE_NATIVE_OWNER_DIRECTORY".into(),
+                home.join("owner-control").to_string_lossy().into_owned(),
+            );
+            config
+                .environments
+                .insert("owner-fixture".into(), environment);
+            fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+            let service = fixture_service(home.clone()).await;
+            let mut input = if codex {
+                request_for(&home, "codex-user", "owner-eligibility", Some("a"))
+            } else {
+                request(&home)
+            };
+            input.explicit_finish = explicit;
+            let admitted = service.admit_provider(input).await.unwrap();
+            let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+            let mut child = supervisor(&home, &id).await;
+            tokio::time::timeout(Duration::from_secs(20), child.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            let store = agent_run_store::fixture::open(&home).unwrap();
+            let row = store.get(&id).unwrap();
+            let spawned:i64=store.conn.query_row("SELECT count(*) FROM attempts WHERE agent_id=? AND process_identity IS NOT NULL",[id.as_str()],|r|r.get(0)).unwrap();
+            if explicit {
+                assert_eq!(
+                    row.status,
+                    Status::Failed,
+                    "explicit opt-in must not be silently stripped"
+                );
+                assert_eq!(
+                    spawned, 0,
+                    "invalid owner channel must refuse before native effect"
+                );
+            } else {
+                assert_eq!(row.status, Status::Succeeded, "{:?}", row.failure_text);
+                assert_eq!(
+                    spawned, 1,
+                    "ordinary one-shot launch must keep native parity"
+                );
+            }
+            drop(store);
+            drop(service);
+            test_broker::stop_broker(&home).await;
+        }
+    }
+}
+
 /// A managed Codex home publishes required launch assets, then completes without
 /// optional cache publication. Explicit offline compaction still freezes a newly
 /// accumulated native cache through the same verified registry mapping; source

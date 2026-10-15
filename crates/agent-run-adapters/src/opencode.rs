@@ -257,17 +257,34 @@ impl Client {
         allowance: Duration,
     ) -> Result<Value> {
         let allowance = if route.ends_with("/interrupt") {
-            Duration::from_secs(1)
+            allowance.min(Duration::from_secs(1))
         } else {
             allowance
         };
-        let mut request = self.request(method, route)?.timeout(allowance);
+        self.call_until(method, route, body, tokio::time::Instant::now() + allowance)
+            .await
+    }
+
+    /// Sends one control under the original absolute deadline, including body reads.
+    /// Expired calls fail before opening a connection; transport/ACK loss is never replayed.
+    pub async fn call_until(
+        &self,
+        method: reqwest::Method,
+        route: &str,
+        body: Option<Value>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Value> {
+        let mut request = self.request(method, route)?;
         if let Some(body) = body {
             request = request
                 .header("content-type", "application/json")
                 .body(serde_json::to_vec(&body)?);
         }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(invalid("OpenCode control deadline elapsed"));
+        }
         let mut response = request
+            .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
             .send()
             .await
             .map_err(|_| invalid("OpenCode control transport failed"))?;
@@ -455,6 +472,65 @@ mod tests {
             stream.get_mut().shutdown().await.unwrap();
         });
         (Client::new(&url, "secret".into()).unwrap(), server)
+    }
+
+    /// An expired owner budget opens no socket; a response body cannot renew the original deadline.
+    #[tokio::test]
+    async fn control_deadline_prevents_expired_effects_and_bounds_body_reads() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::new(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            "probe".into(),
+        )
+        .unwrap();
+        assert!(
+            client
+                .call_until(
+                    reqwest::Method::POST,
+                    "/api/session/ses_one/prompt",
+                    Some(json!({"text":"must not send"})),
+                    tokio::time::Instant::now() - Duration::from_millis(1)
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            loop {
+                let mut line = String::new();
+                assert!(stream.read_line(&mut line).await.unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            stream
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let _ = stream.get_mut().write_all(b"}").await;
+        });
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            client.call_until(
+                reqwest::Method::GET,
+                "/api/info",
+                None,
+                tokio::time::Instant::now() + Duration::from_millis(25),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        server.await.unwrap();
     }
 
     /// Fragmented UTF-8, comments, all SSE newline forms and multiple frames survive.

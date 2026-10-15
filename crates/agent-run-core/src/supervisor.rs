@@ -1267,7 +1267,8 @@ async fn verify_sealed_home<B: crate::runtime_storage::LayoutBackend>(
 /// per-stage completion durations; logging never changes that outcome.
 /// Checkpoints root and descendant identities through cleanup, and injects an attempt-bound
 /// worker capability. Preparation, execution, cleanup and durable-store failures propagate;
-/// an unconfirmed cleanup keeps ownership reserved for recovery.
+/// an unconfirmed cleanup keeps ownership reserved for recovery. Native-owner settings
+/// are filtered against the frozen role and actual v2 adapter before process preparation.
 async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Result<()> {
     if store.cancel_pending(id)? {
         if !persist::attempt_never_spawned(&store.conn, id)? {
@@ -1578,6 +1579,18 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         store
             .event(id, "phase", &json!({"phase":"spawning"}))
             .await?;
+        let owner_supported = matches!(
+            planned.runtime.kind()?,
+            crate::config::Adapter::Codex
+                | crate::config::Adapter::Claude
+                | crate::config::Adapter::OpenCode
+        );
+        crate::native_owner::configure(
+            &mut planned.launch.environment,
+            &row,
+            &planned.profile,
+            owner_supported,
+        );
         // Process::spawn yields Io only when the OS refused Command::spawn,
         // before a child exists; other failures retain ownership for recovery.
         let spawned = if identity.authority.harness == HarnessId::OpenCode {
@@ -1644,8 +1657,15 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             native_row.request.task = task.to_owned();
             native_row.resume_of_runtime_session_id = resume_session.map(str::to_owned);
             if identity.authority.harness == HarnessId::OpenCode {
-                crate::opencode::run(&mut process, store, &native_row, &planned, &runtime_home)
-                    .await
+                crate::opencode::run(
+                    &mut process,
+                    store,
+                    &native_row,
+                    &row,
+                    &planned,
+                    &runtime_home,
+                )
+                .await
             } else if identity.authority.harness == HarnessId::Codex {
                 native_row.request.model = planned.native_model.clone();
                 crate::codex::run(

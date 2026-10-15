@@ -132,6 +132,7 @@ async fn item(
 }
 
 /// Reconciles only newly admitted native messages; source tool identities own receipts.
+/// Native input/notification IDs are journaled once; the initial task echo is excluded.
 /// Partial reasoning/text is not mistaken for a settled replayable item.
 async fn reconcile(
     process: &mut Process,
@@ -148,7 +149,38 @@ async fn reconcile(
     let mut failure = None;
     for message in rows {
         let id = identifier(&message["id"])?;
-        if baseline.contains(id) || message["type"] != "assistant" {
+        if baseline.contains(id) {
+            continue;
+        }
+        if let Some(kind @ ("user" | "synthetic")) = message["type"].as_str() {
+            let Some(text) = message["text"].as_str() else {
+                if kind == "synthetic" {
+                    return Err(invalid("OpenCode notification text is missing"));
+                }
+                continue;
+            };
+            if !text.is_empty() {
+                item(
+                    process,
+                    store,
+                    record,
+                    seen,
+                    format!("{id}:input"),
+                    "user",
+                    text,
+                    Some(if kind == "synthetic" {
+                        "opencode.notification"
+                    } else {
+                        "opencode.input"
+                    }),
+                    None,
+                    None,
+                )
+                .await?;
+            }
+            continue;
+        }
+        if message["type"] != "assistant" {
             continue;
         }
         if let Some(error) = message.get("error").filter(|v| !v.is_null()) {
@@ -309,15 +341,92 @@ fn input_ack(result: &Value, session: &str, id: &str, text: &str) -> bool {
 /// Submits one stable input identity and verifies the durable inbox receipt.
 /// The caller records the payload digest before the HTTP write; an error never resends it.
 async fn prompt(client: &Client, session: &str, id: &str, text: &str) -> Result<()> {
+    prompt_until(
+        client,
+        session,
+        id,
+        text,
+        "steer",
+        tokio::time::Instant::now() + Duration::from_secs(30),
+    )
+    .await
+}
+
+/// Admits one immutable input by the original deadline. Queue delivery never steers
+/// an active native pass; exact id/session/text acknowledgement proves admission only.
+async fn prompt_until(
+    client: &Client,
+    session: &str,
+    id: &str,
+    text: &str,
+    delivery: &str,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
     let result = client
-        .call(
+        .call_until(
             Method::POST,
             &format!("/api/session/{session}/prompt"),
-            Some(json!({"id":id,"text":text,"delivery":"steer"})),
+            Some(json!({"id":id,"text":text,"delivery":delivery})),
+            deadline,
         )
         .await?;
     if !input_ack(&result, session, id, text) {
         return Err(invalid("OpenCode input receipt belongs to another request"));
+    }
+    Ok(())
+}
+
+/// Returns positive process-local idle proof only after native awaitIdle and an
+/// empty inbox, both within one original deadline. Errors/gaps cannot certify idle.
+/// This metadata request never starts inference or consumes a queued input.
+async fn idle_now(client: &Client, session: &str, deadline: tokio::time::Instant) -> bool {
+    if client
+        .call_until(
+            Method::POST,
+            &format!("/api/experimental/session/{session}/wait"),
+            None,
+            deadline,
+        )
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    client
+        .call_until(
+            Method::GET,
+            &format!("/api/session/{session}/inbox"),
+            None,
+            deadline,
+        )
+        .await
+        .ok()
+        .and_then(|reply| reply["data"].as_array().map(Vec::is_empty))
+        .unwrap_or(false)
+}
+
+/// Only this session's positive execution/status event can mark a native pass busy.
+/// Terminals and historical idle watermarks still require fresh native idle proof.
+fn busy_event(event: &Value, session: &str) -> bool {
+    event.pointer("/data/sessionID").and_then(Value::as_str) == Some(session)
+        && (event["type"] == "session.execution.started"
+            || (event["type"] == "session.status"
+                && matches!(
+                    event.pointer("/data/status/type").and_then(Value::as_str),
+                    Some("busy" | "retry")
+                )))
+}
+
+/// Refuses any change to the native session's frozen id, role, model or grants.
+fn verify_session(current: &Value, initial: &Value) -> Result<()> {
+    if ["id", "agent", "model", "permissions"]
+        .iter()
+        .any(|field| current[*field] != initial[*field])
+        || current.pointer("/location/directory") != initial.pointer("/location/directory")
+    {
+        return Err(invalid(
+            "OpenCode session changed its frozen execution authority",
+        ));
     }
     Ok(())
 }
@@ -466,14 +575,25 @@ async fn verify_tools(
 /// Executes the owned native runner and records incomplete tool coverage on error.
 /// The original error is preserved even when the diagnostic writer is unavailable;
 /// the shared supervisor remains responsible for cleanup and terminal evidence.
+/// The logical record retains exact admission authority; native record task text may
+/// carry the supervisor's explicit continuation boundary and is never used as that authority.
 pub async fn run(
     process: &mut Process,
     store: &mut Persist,
     record: &Record,
+    logical_record: &Record,
     plan: &ProviderLaunchPlan,
     home: &Path,
 ) -> Result<EngineResult> {
-    let result = run_native(process, store, record, plan, home).await;
+    if record.id != logical_record.id
+        || record.sequence != logical_record.sequence
+        || record.identity != logical_record.identity
+    {
+        return Err(invalid(
+            "OpenCode logical/native execution association changed",
+        ));
+    }
+    let result = run_native(process, store, record, logical_record, plan, home).await;
     if result.is_err() {
         let _ = process
             .observing(store.event(
@@ -493,6 +613,7 @@ async fn run_native(
     process: &mut Process,
     store: &mut Persist,
     record: &Record,
+    logical_record: &Record,
     plan: &ProviderLaunchPlan,
     _home: &Path,
 ) -> Result<EngineResult> {
@@ -583,7 +704,7 @@ async fn run_native(
         .observing(store.runtime_session(&record.id, &session))
         .await?;
     let baseline_rows = process.observing(messages(&client, &session)).await?;
-    let baseline: BTreeSet<String> = baseline_rows
+    let mut baseline: BTreeSet<String> = baseline_rows
         .iter()
         .map(|row| identifier(&row["id"]).map(str::to_owned))
         .collect::<Result<_>>()?;
@@ -591,6 +712,8 @@ async fn run_native(
         "msg_{}",
         &crate::fs::sha256(record.id.as_str().as_bytes())[..32]
     );
+    // The supervisor has already journaled the original task; skip only that native echo.
+    baseline.insert(input_id.clone());
     process
         .observing(store.event(
             &record.id,
@@ -612,6 +735,8 @@ async fn run_native(
             &json!({"protocol":"opencode","version":1}),
         ))
         .await?;
+    let mut native_owner = process.native_owner.take();
+    let mut native_calls = agent_run_adapters::native_owner::Calls::default();
     let mut seen = BTreeMap::new();
     let mut idle = false;
     let mut last_idle = initial
@@ -645,9 +770,51 @@ async fn run_native(
             }
         }
         tokio::select! {
+            call = agent_run_adapters::native_owner::Owner::receive(&mut native_owner) => {
+                use agent_run_adapters::native_owner::Reply;
+                let call_id = call.request.call_id.clone();
+                if let Err(reply) = native_calls.reserve(&call.request) { call.answer(reply); continue; }
+                let refusal = crate::native_owner::refusal(process, store, logical_record, &call, Some(&session), idle, closing.is_some()).unwrap_or(Some("unavailable"));
+                if let Some(reason) = refusal {
+                    let reply = Reply::unsent(&call_id, reason);
+                    native_calls.finish(reply.clone()); call.answer(reply); continue;
+                }
+                let current = process.observing(client.call_until(Method::GET, &format!("/api/session/{session}"), None, call.deadline)).await?;
+                verify_session(data(&current), &initial)?;
+                let proof_deadline = call.deadline.min(tokio::time::Instant::now() + Duration::from_millis(50));
+                if !process.observing(async { Ok::<bool, crate::Error>(idle_now(&client, &session, proof_deadline).await) }).await? {
+                    idle = false;
+                    let reply = Reply::unsent(&call_id, "unavailable");
+                    native_calls.finish(reply.clone()); call.answer(reply); continue;
+                }
+                let input_id = format!("msg_{}", &crate::fs::sha256(format!("{}:bridge:{call_id}",record.id).as_bytes())[..32]);
+                process.observing(store.event(&record.id,"opencode_input_v1",&json!({"id":input_id,"sha256":crate::fs::sha256(call.request.text.as_bytes())}))).await?;
+                process.observing(store.flush()).await?;
+                if tokio::time::Instant::now() >= call.deadline {
+                    let reply = Reply::unsent(&call_id, "unavailable");
+                    native_calls.finish(reply.clone()); call.answer(reply); continue;
+                }
+                let result = process.observing(prompt_until(&client,&session,&input_id,&call.request.text,"queue",call.deadline)).await;
+                let reply = if result.is_ok() { Reply::accepted(&call_id,"opencode_input",&input_id) } else { Reply::unknown(&call_id) };
+                let unknown = reply.state == "unknown";
+                native_calls.finish(reply.clone()); call.answer(reply);
+                if unknown { native_owner.take(); return Err(invalid("OpenCode owner input outcome is uncertain")); }
+                idle = false;
+                process.observing(store.worker_turn(&record.id,false,crate::domain::now())).await?;
+                continue;
+            }
             event=process.next()=> match event {Event::Eof=>return Err(invalid("OpenCode exited without finish")), Event::OwnershipFailure(error)=>return Err(error), Event::Failure(_)=>return Err(invalid("OpenCode process transport failed")), Event::Json(_)=>{}},
             event=stream.next()=> {
-                match event {Ok(Some(event))=>{if event.pointer("/data/sessionID").and_then(Value::as_str)==Some(session.as_str()) {hint=true;}}, Ok(None)|Err(_)=>{stream=process.observing(client.subscribe()).await?;hint=true;}}
+                match event {
+                    Ok(Some(event)) => {
+                        if event.pointer("/data/sessionID").and_then(Value::as_str)==Some(session.as_str()) { hint=true; }
+                        if busy_event(&event,&session) {
+                            idle=false;
+                            process.observing(store.worker_turn(&record.id,false,crate::domain::now())).await?;
+                        }
+                    },
+                    Ok(None)|Err(_) => { idle=false; stream=process.observing(client.subscribe()).await?; hint=true; }
+                }
             },
             _=tick.tick()=>{}
         }
@@ -759,23 +926,29 @@ async fn run_native(
                 ))
                 .await?;
             let current = data(&current);
-            if ["id", "agent", "model", "permissions"]
-                .iter()
-                .any(|field| current[*field] != initial[*field])
-                || current.pointer("/location/directory") != initial.pointer("/location/directory")
-            {
-                return Err(invalid(
-                    "OpenCode session changed its frozen execution authority",
-                ));
-            }
+            verify_session(current, &initial)?;
             let failure = reconcile(process, store, record, &rows, &baseline, &mut seen).await?;
 
             let observed_idle = current
                 .pointer("/time/idle")
                 .filter(|value| !value.is_null())
                 .cloned();
-            if observed_idle.is_some() && observed_idle != last_idle {
-                idle = true;
+            let fresh_idle = process
+                .observing(async {
+                    Ok::<bool, crate::Error>(
+                        idle_now(
+                            &client,
+                            &session,
+                            tokio::time::Instant::now() + Duration::from_millis(50),
+                        )
+                        .await,
+                    )
+                })
+                .await?;
+            let was_idle = idle;
+            idle = fresh_idle;
+            if idle && (!was_idle || (observed_idle.is_some() && observed_idle != last_idle)) {
+                let new_terminal = observed_idle.is_some() && observed_idle != last_idle;
                 last_idle = observed_idle;
                 process
                     .observing(store.worker_turn(&record.id, true, crate::domain::now()))
@@ -789,7 +962,7 @@ async fn run_native(
                 )? {
                     return Ok(result);
                 }
-                if current["outcome"] == "failed" {
+                if new_terminal && current["outcome"] == "failed" {
                     let mut outcome = Outcome::failure(
                         failure.unwrap_or_else(|| "opencode_native_failed".into()),
                     );
@@ -810,6 +983,137 @@ async fn run_native(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Serves a finite metadata script; captures actual request lines/payloads, no native engine or model.
+    /// Each tuple is an exact path, HTTP status and JSON body; 204 emits no body.
+    async fn scripted_client(
+        script: Vec<(&'static str, u16, Value)>,
+    ) -> (Client, tokio::task::JoinHandle<Vec<(String, Value)>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::new(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            "probe".into(),
+        )
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let mut received = Vec::new();
+            for (path, status, body) in script {
+                let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut first = String::new();
+                stream.read_line(&mut first).await.unwrap();
+                assert_eq!(first.split_whitespace().nth(1), Some(path));
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    assert!(stream.read_line(&mut line).await.unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                assert!(length < 4096);
+                let mut payload = vec![0; length];
+                stream.read_exact(&mut payload).await.unwrap();
+                received.push((
+                    first.trim().to_owned(),
+                    if payload.is_empty() {
+                        Value::Null
+                    } else {
+                        serde_json::from_slice(&payload).unwrap()
+                    },
+                ));
+                let payload = if status == 204 {
+                    Vec::new()
+                } else {
+                    serde_json::to_vec(&body).unwrap()
+                };
+                stream.get_mut().write_all(format!("HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",payload.len()).as_bytes()).await.unwrap();
+                stream.get_mut().write_all(&payload).await.unwrap();
+            }
+            received
+        });
+        (client, server)
+    }
+
+    /// A parked or malformed inbox cannot certify readiness, even after native awaitIdle succeeds.
+    #[tokio::test]
+    async fn idle_proof_requires_settlement_and_an_empty_inbox() {
+        for (inbox, expected) in [
+            (json!([]), true),
+            (json!([{"id":"msg_parked"}]), false),
+            (Value::Null, false),
+        ] {
+            let (client, server) = scripted_client(vec![
+                ("/api/experimental/session/ses_one/wait", 204, Value::Null),
+                ("/api/session/ses_one/inbox", 200, json!({"data":inbox})),
+            ])
+            .await;
+            assert_eq!(
+                idle_now(
+                    &client,
+                    "ses_one",
+                    tokio::time::Instant::now() + Duration::from_secs(2)
+                )
+                .await,
+                expected
+            );
+            assert_eq!(server.await.unwrap().len(), 2);
+        }
+    }
+
+    /// A Bridge wake stays queued with the exact immutable payload, never requesting active-pass steering.
+    #[tokio::test]
+    async fn owner_input_queues_and_requires_its_exact_native_receipt() {
+        let (client,server)=scripted_client(vec![("/api/session/ses_one/prompt",200,json!({"data":{"id":"msg_one","sessionID":"ses_one","payload":{"text":"literal marker"}}}))]).await;
+        prompt_until(
+            &client,
+            "ses_one",
+            "msg_one",
+            "literal marker",
+            "queue",
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let requests = server.await.unwrap();
+        assert_eq!(requests[0].0, "POST /api/session/ses_one/prompt HTTP/1.1");
+        assert_eq!(
+            requests[0].1,
+            json!({"id":"msg_one","text":"literal marker","delivery":"queue"})
+        );
+    }
+
+    /// Foreign sessions and historical terminals never fabricate a busy observation for this session.
+    #[test]
+    fn busy_observation_is_owned_and_positive() {
+        assert!(busy_event(
+            &json!({"type":"session.execution.started","data":{"sessionID":"ses_one"}}),
+            "ses_one"
+        ));
+        assert!(busy_event(
+            &json!({"type":"session.status","data":{"sessionID":"ses_one","status":{"type":"retry"}}}),
+            "ses_one"
+        ));
+        assert!(!busy_event(
+            &json!({"type":"session.execution.started","data":{"sessionID":"ses_other"}}),
+            "ses_one"
+        ));
+        assert!(!busy_event(
+            &json!({"type":"session.execution.succeeded","data":{"sessionID":"ses_one"}}),
+            "ses_one"
+        ));
+        assert!(!busy_event(
+            &json!({"type":"session.status","data":{"sessionID":"ses_one","status":{"type":"idle"}}}),
+            "ses_one"
+        ));
+    }
+
     /// Native additional denials narrow a role; any later grant must refuse.
     #[test]
     fn loaded_role_may_only_narrow_frozen_grants() {
