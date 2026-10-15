@@ -6,6 +6,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## 0.28.0
 
+- fix(dependencies): update rustls to 0.23.46 for RUSTSEC-2026-0346 through
+  RUSTSEC-2026-0349 without advisory exceptions
 - feat(opencode): add the owned OpenCode v2 runtime with explicit finish,
   same-session continuation, queued input, worker pools and native journal evidence
 - feat(bridge): wake managed native Codex, Claude and OpenCode sessions through
