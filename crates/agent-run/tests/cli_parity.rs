@@ -247,11 +247,16 @@ fn python_cli_spec_command_surface_is_present() {
                     .iter()
                     .map(|value| value.get_name().to_owned())
                     .collect::<Vec<_>>();
-                let expected_choices = expected_choices
+                let mut expected_choices = expected_choices
                     .iter()
                     .filter_map(Value::as_str)
                     .map(str::to_owned)
                     .collect::<Vec<_>>();
+                // OpenCode adds one host to the frozen Python hook roster;
+                // keep every historical choice and all other command checks exact.
+                if matches!(path, "hook bind" | "hook context") && action["dest"] == "transport" {
+                    expected_choices.push("opencode".into());
+                }
                 assert_eq!(
                     actual_choices,
                     expected_choices,
