@@ -45,16 +45,11 @@ Reconnect MCP clients with the broker upgrade so binding and rendering agree.
 
 ## Bridge delivery and receiver policy
 
-Bridge is the sole sender. Configure `delivery.bridge` with protected sockets,
-a dedicated token and explicit host/store namespaces. Bindings accept
-`codex_queue`/`claude_uds` or `codex`/`claude`, solely as destination identifiers.
-New rows use canonical names; equivalent aliases reuse the exact historical
-binding. Unknown names fail before admission.
-
-OpenCode root sessions use `opencode` for normalized context and binding payloads.
-They share the same immutable session and request-replay rules. Binding alone
-does not enable native delivery: OpenCode publication additionally requires a
-Bridge SDK and deployment that support its native address.
+Bridge is the sole sender. `delivery.bridge` names protected sockets, a dedicated
+token and explicit host/store namespaces. Binding names are `codex_queue`,
+`claude_uds` (aliases `codex`, `claude`) and `opencode`. Aliases share canonical
+rows; unknown names refuse before admission. OpenCode native publication needs
+a supporting Bridge SDK and deployment.
 
 Binding proves a destination, not a configured or available notification route.
 Without Bridge configuration, notices stay durable with `bridge_unconfigured`,
