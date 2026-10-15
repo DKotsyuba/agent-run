@@ -49,6 +49,11 @@ jobs:
         run: cargo fetch --locked
       - name: Verify native runner architecture
         run: test "$(uname -m)" = "${{ matrix.architecture }}"
+      - name: Normalize temporary root for Unix socket fixtures
+        shell: bash
+        run: |
+          temporary="$(cd "$RUNNER_TEMP" && pwd -P)"
+          printf 'TMPDIR=%s\nTMP=%s\nTEMP=%s\n' "$temporary" "$temporary" "$temporary" >> "$GITHUB_ENV"
       - name: Verify shared filesystem support
         if: runner.os == 'macOS'
         run: |

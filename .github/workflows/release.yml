@@ -47,6 +47,11 @@ jobs:
           cargo xtask prepare
       - name: Verify annotated exact-source tag
         run: cargo xtask release verify --accepted-commit "$GITHUB_SHA"
+      - name: Normalize temporary root for Unix socket fixtures
+        shell: bash
+        run: |
+          temporary="$(cd "$RUNNER_TEMP" && pwd -P)"
+          printf 'TMPDIR=%s\nTMP=%s\nTEMP=%s\n' "$temporary" "$temporary" "$temporary" >> "$GITHUB_ENV"
       - name: Observe full source and dependency gates
         shell: bash
         run: |

@@ -26,6 +26,10 @@ cargo build --locked --release --package agent-run --bin agent-run
 node --test scripts/check-desktop-transport.cjs scripts/check-codegraph-probe.cjs
 ```
 
+Use a short canonical temporary root for native-owner Unix-socket fixtures.
+Hosted source gates normalize `RUNNER_TEMP` into `TMPDIR`, `TMP` and `TEMP`;
+the native no-symlink checks remain mandatory.
+
 Run the release gates on macOS arm64. The non-blocking Linux validation lane
 runs the workspace and sealed-build checks independently, but its result does
 not gate or add an artifact to the qualified native release.
