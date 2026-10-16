@@ -949,6 +949,18 @@ async fn first_finish_intent_requires_the_supervisor_launch_context() {
         .set_finish_guard(Some(context.clone()))
         .await
         .unwrap();
+    // A later duplicate key cannot hide an earlier JSON-escaped secret.
+    refused_with(
+        &lane,
+        &id,
+        &format!(
+            r#"{{"ok":true,"note":"{}\u{:04x}","note":"safe"}}"#,
+            &LAUNCH_SECRET[..LAUNCH_SECRET.len() - 1],
+            LAUNCH_SECRET.as_bytes()[LAUNCH_SECRET.len() - 1]
+        ),
+        RejectCode::Validation,
+    )
+    .await;
     // Re-sending the hello on the same connection (an idle refresh) keeps
     // that connection's context installed.
     for _ in 0..3 {
