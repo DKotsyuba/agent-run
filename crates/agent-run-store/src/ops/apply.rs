@@ -1119,7 +1119,9 @@ pub(crate) fn record_recovery(
 /// older than 14 days of wall time AND its operation identity is stale on the
 /// monotonic clock (another boot, or issued more than the maximum operation
 /// age ago), so no live retry can need it; a wall-clock jump alone never
-/// removes anything. A watermark is removed only when it scopes no
+/// removes anything. Receipt pages follow commit time (sequence breaks ties),
+/// using the age index so recent history is skipped under the producer gate.
+/// A watermark is removed only when it scopes no
 /// execution, no receipt references it, it is 14 days old in wall time, its
 /// last issue is stale on the monotonic clock and its producer has no
 /// unfinished scheduler work (`temp.writer_live_producers`, filled by the
@@ -1141,7 +1143,7 @@ pub(crate) fn prune_receipts(conn: &Connection, op: &super::PruneReceipts) -> Re
     let cutoff = op.at - 14.0 * 86_400.0;
     let mut statement = conn.prepare(
         "SELECT commit_seq,operation_id FROM operation_receipts \
-         WHERE agent_id IS NULL AND committed_at < ?1 ORDER BY commit_seq LIMIT 2000",
+         WHERE agent_id IS NULL AND committed_at < ?1 ORDER BY committed_at,commit_seq LIMIT 2000",
     )?;
     let receipts: Vec<i64> = statement
         .query_map([cutoff], |row| {
@@ -1208,6 +1210,79 @@ mod tests {
     //! Rollback confirmation and closed persistence diagnostics of the
     //! transaction boundary, checked without a writer home.
     use super::*;
+
+    /// Retention must leave recent receipts intact without spending work proportional
+    /// to their population while the queue's producer-admission gate is held.
+    /// A deterministic SQLite VM budget catches a full history scan even on a fast disk;
+    /// one expired receipt still proves that real retention work is performed.
+    #[test]
+    fn receipt_pruning_skips_large_recent_history_with_bounded_work() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../../../sql/schema.sql"))
+            .unwrap();
+        let (boot, now_ns) = agent_run_platform::monotonic::now().unwrap();
+        let at = agent_run_domain::domain::now();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO operation_receipts(operation_id,digest,op_kind,producer_key,ordinal,authority_kind,authority_fingerprint,agent_id,outcome,result_json,writer_epoch,committed_at) \
+                 VALUES(?1,?2,'fixture','retention-fixture',?3,'broker',?4,NULL,'committed','{}',1,?5)",
+            ).unwrap();
+            for ordinal in 1..=20_000 {
+                insert
+                    .execute(params![
+                        OperationId::new("retention-fixture", ordinal).as_str(),
+                        "d".repeat(64),
+                        ordinal,
+                        "f".repeat(64),
+                        at,
+                    ])
+                    .unwrap();
+            }
+            insert
+                .execute(params![
+                    OperationId::new("expired-fixture", 1).as_str(),
+                    "d".repeat(64),
+                    20_001,
+                    "f".repeat(64),
+                    at - 15.0 * 86_400.0,
+                ])
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let steps = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter = steps.clone();
+        conn.progress_handler(
+            1,
+            Some(move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                false
+            }),
+        )
+        .unwrap();
+        let removed = prune_receipts(
+            &conn,
+            &super::super::PruneReceipts {
+                at,
+                boot_id: boot,
+                now_ns,
+            },
+        )
+        .unwrap();
+        conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+        let steps = steps.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(removed, 1);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM operation_receipts", [], |row| row
+                .get::<_, u64>(0))
+                .unwrap(),
+            20_000
+        );
+        assert!(
+            steps < 5_000,
+            "receipt retention spent {steps} VM steps over recent history"
+        );
+    }
 
     /// A SQLite failure with `code` as its extended result code.
     fn sql(code: i32) -> Error {

@@ -4,6 +4,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- fix(store): seek the receipt-age index during retention instead of scanning
+  recent history while producer admission is blocked; preserve scoped receipts,
+  monotonic retry protection and live producer watermarks
+- test(store): enforce a bounded SQLite work budget over a large recent history
+  while still removing an expired receipt
+
 ## 0.28.1
 
 - test(bridge): wait for the expected durable turn as well as idle before
