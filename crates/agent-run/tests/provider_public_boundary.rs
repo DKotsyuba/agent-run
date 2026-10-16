@@ -113,12 +113,14 @@ impl Broker {
         }
     }
 
-    /// Restarts only this fixture's unreaped broker child while native fixture
+    /// Restarts only this fixture's running or already-reaped broker child while native fixture
     /// supervisors retain their immutable identities and work. The replacement
     /// must answer a real socket ping within ten seconds; no agent is replayed.
     async fn restart(&mut self) {
-        self.child.kill().unwrap();
-        self.child.wait().unwrap();
+        if self.child.try_wait().unwrap().is_none() {
+            self.child.kill().unwrap();
+            self.child.wait().unwrap();
+        }
         self.child = Command::new(qualification_binary())
             .arg("--home")
             .arg(&self.home)
@@ -126,7 +128,7 @@ impl Broker {
             .env("FAKE_TOKEN", "synthetic-token")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(std::fs::File::create(self.home.join("broker-restart.stderr.log")).unwrap())
             .spawn()
             .unwrap();
         let until = Instant::now() + Duration::from_secs(10);
@@ -254,6 +256,75 @@ impl Drop for Broker {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// A real broker with ordinary history idle must drain more than one receipt
+/// page on its backlog cadence. Only synthetic expired fixture receipts are seeded;
+/// restart and readiness concern this owned model-free broker, never production.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receipt_backlog_drains_when_ordinary_history_is_idle() {
+    let mut broker = Broker::start();
+    broker.child.kill().unwrap();
+    broker.child.wait().unwrap();
+    {
+        let mut store = agent_run_store::fixture::open(&broker.home).unwrap();
+        let tx = store.conn.transaction().unwrap();
+        let mut insert = tx.prepare(
+            "INSERT INTO operation_receipts(operation_id,digest,op_kind,producer_key,ordinal,authority_kind,authority_fingerprint,agent_id,outcome,result_json,writer_epoch,committed_at) VALUES(?1,?2,'retention-backlog-fixture','retention-backlog-fixture',?3,'broker',?4,NULL,'committed','{}',1,?5)",
+        ).unwrap();
+        let at = agent_run_domain::domain::now() - 15.0 * 86_400.0;
+        for ordinal in 1..=6_001 {
+            insert
+                .execute(rusqlite::params![
+                    agent_run_domain::storage::OperationId::new(
+                        "retention-backlog-fixture",
+                        ordinal
+                    )
+                    .as_str(),
+                    "d".repeat(64),
+                    ordinal,
+                    "f".repeat(64),
+                    at,
+                ])
+                .unwrap();
+        }
+        drop(insert);
+        tx.commit().unwrap();
+    }
+    broker.restart().await;
+    let until = Instant::now() + Duration::from_secs(20);
+    loop {
+        let reader = agent_run_store::writer::StoreReader::open(&broker.home).unwrap();
+        let remaining: i64 = reader
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM operation_receipts WHERE op_kind='retention-backlog-fixture'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if remaining == 0 {
+            break;
+        }
+        if Instant::now() >= until {
+            broker.retain_evidence();
+            panic!(
+                "receipt backlog stalled with {remaining} rows while ordinary history was idle; evidence={}",
+                broker.home.display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let reader = agent_run_store::writer::StoreReader::open(&broker.home).unwrap();
+    let no_op_receipts: i64 = reader.conn().query_row(
+        "SELECT COUNT(*) FROM operation_receipts WHERE op_kind IN ('settle_pool','release_finished_service_leases')",
+        [],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(
+        no_op_receipts, 0,
+        "an idle broker must not generate per-tick receipts"
+    );
 }
 
 /// Selects the compiled candidate by default, or an explicitly supplied absolute

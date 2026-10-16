@@ -682,6 +682,7 @@ CREATE TABLE operation_receipts (
 );
 CREATE INDEX operation_receipts_unscoped ON operation_receipts(committed_at) WHERE agent_id IS NULL;
 CREATE INDEX operation_receipts_agent ON operation_receipts(agent_id) WHERE agent_id IS NOT NULL;
+CREATE INDEX operation_receipts_producer ON operation_receipts(producer_key);
 CREATE TABLE writer_producers (
   producer_key TEXT PRIMARY KEY,
   last_ordinal INTEGER NOT NULL CHECK (last_ordinal >= 0),
@@ -704,4 +705,4 @@ ALTER TABLE agents ADD COLUMN supervisor_capability_sha256 TEXT
 ALTER TABLE managed_service_generations ADD COLUMN exec_capability_sha256 TEXT
   CHECK (exec_capability_sha256 IS NULL OR length(exec_capability_sha256) = 64);
 
-PRAGMA user_version = 31;
+PRAGMA user_version = 32;

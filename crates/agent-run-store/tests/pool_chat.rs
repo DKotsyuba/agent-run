@@ -1947,16 +1947,19 @@ fn rows_of(store: &Store, table: &str) -> i64 {
 /// Agreement while members still run, or finished without proven cleanup,
 /// never completes; once everything is proven it completes exactly once with
 /// one frozen event and one waiting (unbound) outbox row, and a repeat adds nothing.
+/// The read-only maintenance preflight must mirror those completion fences.
 #[test]
 fn completion_needs_agreement_succeeded_tips_and_cleanup() {
     let home = common::Home::new();
     let (_, members, pool_id) = voted_pool(&home);
     let mut store = home.store();
+    assert!(!store.pool_settlement_pending(20, 0).unwrap());
     assert!(
         store.settle_pool(&pool_id).unwrap().is_none(),
         "agreed but running"
     );
     finish_members(&store, &members, false);
+    assert!(!store.pool_settlement_pending(20, 0).unwrap());
     assert!(
         store.settle_pool(&pool_id).unwrap().is_none(),
         "succeeded but cleanup unknown"
@@ -1964,8 +1967,10 @@ fn completion_needs_agreement_succeeded_tips_and_cleanup() {
     assert_eq!(store.settle_open_pools(20, 0).unwrap(), 0);
     assert_eq!(rows_of(&store, "deliveries"), 0);
     finish_members(&store, &members, true);
+    assert!(store.pool_settlement_pending(20, 7).unwrap());
     // The maintenance sweep converges once cleanup proof lands later.
     assert_eq!(store.settle_open_pools(20, 7).unwrap(), 1);
+    assert!(!store.pool_settlement_pending(20, 7).unwrap());
     let again = store.settle_pool(&pool_id).unwrap().unwrap();
     assert!(!again.created && !again.bound);
     let (state, delivery, completed): (String, String, f64) = store

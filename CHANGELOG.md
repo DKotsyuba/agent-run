@@ -4,6 +4,13 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.28.3
+
+- fix(store): index receipt lookups by producer and cooperatively bound receipt
+  retention, preserving retry fences and live-producer protection; migrate to schema 32
+- fix(runtime): skip unchanged pool-settlement and service-lease writes and use
+  actual receipt-retention progress when scheduling bounded backlog cleanup
+
 ## 0.28.2
 
 - fix(store): seek the receipt-age index during retention instead of scanning

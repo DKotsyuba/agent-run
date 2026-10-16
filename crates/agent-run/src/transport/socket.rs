@@ -310,11 +310,12 @@ const FILESYSTEM_BACKLOG: Duration = Duration::from_secs(1);
 const MAINTENANCE_RETRY: Duration = Duration::from_secs(60);
 
 /// Returns the next database maintenance delay after one pass removed
-/// `removed` rows plus reclaimed-page batches.
+/// `removed` history/receipt/producer rows plus reclaimed-page batches.
 ///
-/// `removed == 0` means the pass proved the database idle (a read-only probe
-/// can skip the writer transaction entirely), so expiry returns to its hourly
-/// steady cadence. Any filesystem outcome is invisible here: the two
+/// `removed == 0` means this pass committed no eligible removal/reclamation,
+/// so database maintenance returns to its hourly steady cadence. A receipt
+/// backlog keeps draining even when ordinary history is idle. Any filesystem
+/// outcome is invisible here: the two
 /// schedules are independent, so a filesystem backlog cannot force a database
 /// writer transaction every second.
 fn database_maintenance_delay(removed: usize) -> Duration {
@@ -903,7 +904,7 @@ pub async fn serve_at_with_options(
                         )
                         .await?;
                     let (boot_id, now_ns) = agent_run_platform::monotonic::now()?;
-                    retention_lane
+                    let receipt_rows = retention_lane
                         .local(
                             crate::state::ops::PruneReceipts {
                                 at: crate::domain::now(),
@@ -946,7 +947,7 @@ pub async fn serve_at_with_options(
                             _ => {}
                         }
                     }
-                    Ok(removed)
+                    Ok(removed.saturating_add(receipt_rows))
                 }
                 .await;
                 let at = tokio::time::Instant::now();

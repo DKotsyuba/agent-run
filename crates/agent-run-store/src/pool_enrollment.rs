@@ -267,7 +267,7 @@ fn failure_reason(
 /// healthy pending workers and identical recorded failures return no work.
 /// The same reads repeat under the admission writer transaction before any
 /// update; a concurrent ACK/GC can only remove a proposed change.
-fn enrollment_changes(
+pub(crate) fn enrollment_changes(
     conn: &Connection,
     pool: &agent_run_domain::pool::PoolId,
 ) -> Result<Vec<(String, &'static str)>> {

@@ -12,6 +12,69 @@ use rusqlite::params;
 use serde_json::{Value, json};
 use std::{fs, path::PathBuf};
 
+/// Empty pool maintenance must not create one durable no-op receipt per tick.
+/// The owned writer and real reconciliation path run without launching engines.
+#[tokio::test]
+async fn reconciliation_skips_unneeded_pool_settlement_receipts() {
+    let fixture = Fixture::new(None, 4).await;
+    let store = agent_run_store::fixture::open(&fixture.root).unwrap();
+    let before: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM operation_receipts WHERE op_kind='settle_pool'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    for _ in 0..5 {
+        assert_eq!(fixture.service.reconcile().await.unwrap(), 0);
+    }
+    let after: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM operation_receipts WHERE op_kind='settle_pool'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "unchanged pool state must not generate receipts"
+    );
+}
+
+/// A read-only settlement hint must retain changed enrollment attention while
+/// suppressing unchanged healthy and already-reconciled pending membership.
+#[tokio::test]
+async fn pool_preflight_keeps_changed_enrollment_attention() {
+    let fixture = Fixture::new(None, 4).await;
+    fixture
+        .service
+        .admit_pool(fixture.request("preflight-attention", 1, None))
+        .await
+        .unwrap();
+    let store = agent_run_store::fixture::open(&fixture.root).unwrap();
+    assert!(!store.pool_settlement_pending(20, 0).unwrap());
+    store.conn.execute(
+        "UPDATE commands SET state='completed',result_json='{\"accepted\":false}' WHERE agent_id=? AND kind='steer'",
+        [fixture.agent.as_str()],
+    ).unwrap();
+    assert!(store.pool_settlement_pending(20, 0).unwrap());
+    fixture.service.reconcile().await.unwrap();
+    assert!(!store.pool_settlement_pending(20, 0).unwrap());
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='pool_join_needs_action'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
 /// Owns one isolated provider configuration and a fixture-owned running attempt.
 struct Fixture {
     /// Holds the disposable database and role assets.
