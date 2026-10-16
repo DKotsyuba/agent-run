@@ -117,3 +117,38 @@ fn contains_secret_separates_credentials_from_json_normalization() {
         assert!(redactor.contains_secret(leaked), "{leaked}");
     }
 }
+
+/// A later duplicate key cannot hide an earlier decoded credential: every
+/// decoded string and key of a JSON summary is checked, including values a
+/// parsed map would overwrite, while duplicates holding only safe values stay
+/// accepted and are never rewritten.
+#[test]
+fn contains_secret_sees_values_overwritten_by_duplicate_keys() {
+    let redactor = Redactor::from_environment(&BTreeMap::from([(
+        "SERVICE_TOKEN".into(),
+        "synthetic-secret".into(),
+    )]));
+    for leaked in [
+        r#"{"note":"synthetic-secre\u0074","note":"safe"}"#,
+        r#"{"outer":{"note":"synthetic-secre\u0074","note":1},"outer":2}"#,
+        r#"[{"k":["synthetic-secre\u0074"],"k":[]}]"#,
+        r#"{"synthetic-secre\u0074":1,"synthetic-secre\u0074":2}"#,
+        r#"{"api_key":"other","api_key":5}"#,
+    ] {
+        assert!(redactor.contains_secret(leaked), "{leaked}");
+    }
+    for clean in [
+        r#"{"note":"safe","note":"also safe"}"#,
+        r#"{"api_key":"<redacted>","api_key":7}"#,
+        r#"{ "tokens_used" : 3, "tokens_used" : 4 }"#,
+    ] {
+        assert!(!redactor.contains_secret(clean), "{clean}");
+    }
+    // JSON deeper than the parser limit cannot be decoded, so it fails closed
+    // (a deliberate bound) instead of hiding an escaped secret.
+    let deep = |inner: &str| format!("{}{inner}{}", "[".repeat(200), "]".repeat(200));
+    assert!(redactor.contains_secret(&deep(r#""synthetic-secre\u0074""#)));
+    assert!(redactor.contains_secret(&deep("1")));
+    // Text that is not JSON keeps only the raw literal check.
+    assert!(!redactor.contains_secret(r#"{"note":"synthetic-secre\u0074""#));
+}
