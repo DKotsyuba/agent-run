@@ -1273,6 +1273,69 @@ async fn provider_cancel_before_spawn_releases_only_its_attempt() {
     assert_eq!(service.answer(&id).unwrap()["available"], false);
 }
 
+/// An explicit-finish launch whose known launch secrets exceed the writer's
+/// finish-guard bound fails before the spawn claim: the run ends failed with
+/// a fixed diagnostic, no native child, a never-spawned proof and no active
+/// ownership, so neither the attempt nor agent capacity stays held.
+#[tokio::test]
+async fn oversized_finish_guard_fails_before_the_spawn_claim() {
+    let (_temp, home) = home();
+    let service = fixture_service(home.clone()).await;
+    let mut request = request(&home);
+    request.explicit_finish = true;
+    let admitted = service
+        .admit_provider_trusted(request, candidates(committed(&home)))
+        .await
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    // The selected credential becomes ANTHROPIC_AUTH_TOKEN in the launch.
+    let oversized = "s".repeat(13 * 1024);
+    let mut child = test_broker::spawn_supervisor_with_env(
+        env!("CARGO_BIN_EXE_agent-run"),
+        &home,
+        &id,
+        &[
+            ("HOME", home.as_os_str()),
+            ("FAKE_TOKEN", std::ffi::OsStr::new(&oversized)),
+        ],
+    )
+    .await;
+    let _ = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    let row = store.get(&id).unwrap();
+    assert_eq!(row.status, Status::Failed);
+    let text = row.failure_text.unwrap_or_default();
+    assert!(
+        text.contains("launch secret context exceeds the writer hello bound"),
+        "{text}"
+    );
+    assert!(!text.contains(&oversized[..64]));
+    let (active, proof, process, phase): (i64, Option<String>, Option<String>, String) = store
+        .conn
+        .query_row(
+            "SELECT ownership_active,cleanup_proof_json,process_identity,phase FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(active, 0);
+    assert_eq!(proof.as_deref(), Some("{\"never_spawned\":true}"));
+    assert_eq!(process, None);
+    assert_eq!(phase, "cleanup_complete");
+    let live: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM agents WHERE finished_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(live, 0, "no admitted execution keeps capacity");
+}
+
 /// A changed sealed role cannot acquire different grants on retry; the
 /// pre-spawn failure closes the owned attempt without a process identity.
 #[tokio::test]
