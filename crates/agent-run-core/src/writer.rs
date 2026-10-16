@@ -126,6 +126,18 @@ impl WriterHandle {
         self.writer.fixture_barrier(entered, release).await
     }
 
+    /// Fixture-only actual retention-gate barrier; the entered signal means SQL owns the gate.
+    #[cfg(feature = "test-fixtures")]
+    pub async fn fixture_retention_barrier(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> Result<()> {
+        self.writer
+            .fixture_retention_barrier(entered, release)
+            .await
+    }
+
     /// Test-only revision-race control using the actual queue/fenced connection.
     #[cfg(feature = "test-fixtures")]
     pub async fn fixture_advance_quota_revision(&self) -> Result<()> {

@@ -150,12 +150,15 @@ pub struct PendingWrite {
 /// phase and SQLite codes instead of a generic expiry).
 #[derive(Debug, Clone, Default)]
 pub struct Totals {
-    /// Submissions of the identical operation that reached the wire.
+    /// Attempts of the identical operation: wire requests remotely, handle submissions locally.
     pub attempts: u32,
     /// Time from the head of the lane to the final outcome.
     pub elapsed: Duration,
     /// The writer's last non-durable refusal, when it caused retries.
     pub last_rejection: Option<agent_run_domain::storage::StorageRejection>,
+    /// Last retryable proven non-enqueue cause; mutually exclusive with last_rejection.
+    /// Closed enum only: no request data, server messages or arbitrary errors are retained.
+    pub last_not_enqueued: Option<NotEnqueuedReason>,
 }
 
 /// Shared view of a submission's [`Totals`], readable after awaiting it.
@@ -493,7 +496,8 @@ fn frame_io(error: wire::FrameError) -> io::Error {
 pub(crate) fn transient(reason: NotEnqueuedReason) -> bool {
     matches!(
         reason,
-        NotEnqueuedReason::QueueFull
+        NotEnqueuedReason::RetentionGate
+            | NotEnqueuedReason::QueueFull
             | NotEnqueuedReason::BytesFull
             | NotEnqueuedReason::ProducerFull
             | NotEnqueuedReason::ReservedForCritical
@@ -621,7 +625,10 @@ async fn drive(
                 if rejection.code == RejectCode::StorageUnavailable =>
             {
                 // Nothing was acquired or executed by THIS attempt; retry identically.
-                note(&mut |totals| totals.last_rejection = Some(rejection.clone()));
+                note(&mut |totals| {
+                    totals.last_rejection = Some(rejection.clone());
+                    totals.last_not_enqueued = None;
+                });
                 pause(&mut backoff, &request.deadline).await;
             }
             Ok(SubmitResult::Rejected(rejection)) => match uncertain {
@@ -629,6 +636,10 @@ async fn drive(
                 Some(cause) => return SubmitResult::Unknown(cause),
             },
             Ok(SubmitResult::NotEnqueued(reason)) if transient(reason) => {
+                note(&mut |totals| {
+                    totals.last_not_enqueued = Some(reason);
+                    totals.last_rejection = None;
+                });
                 pause(&mut backoff, &request.deadline).await;
             }
             Ok(SubmitResult::NotEnqueued(reason)) => match uncertain {
@@ -704,6 +715,47 @@ mod tests {
     //! Scripted-peer protocol tests of the lane. The peer is a protocol test
     //! double, not a writer: these tests prove client behavior only and say
     //! nothing about queue or storage correctness.
+    /// A real retryable admission category must survive expiry into closed diagnostics.
+    #[tokio::test]
+    async fn admission_refusal_survives_expiry_diagnostics() {
+        for reason in [
+            NotEnqueuedReason::QueueFull,
+            NotEnqueuedReason::RetentionGate,
+            NotEnqueuedReason::BytesFull,
+            NotEnqueuedReason::ProducerFull,
+            NotEnqueuedReason::ReservedForCritical,
+            NotEnqueuedReason::Degraded,
+        ] {
+            let mut script = Script::new(vec![Step::Reply(SubmitResult::Rejected(
+                StorageRejection::new(
+                    RejectCode::StorageUnavailable,
+                    RejectStage::Acquire,
+                    "closed fixture refusal",
+                ),
+            ))]);
+            script.rest = Step::Reply(SubmitResult::NotEnqueued(reason));
+            let (dial, seen, _dir) = peer(script).await;
+            let lane = ProducerLane::new(dial, hello(), 1);
+            let pending = lane.submit(|ordinal| Ok(request(ordinal, Duration::from_millis(120))));
+            let totals = pending.totals();
+            let result = pending.await;
+            let totals = totals.snapshot();
+            assert_eq!(totals.attempts as usize, seen.lock().unwrap().len());
+            assert_eq!(totals.last_not_enqueued, Some(reason));
+            assert!(
+                totals.last_rejection.is_none(),
+                "latest actual admission supersedes prior storage refusal"
+            );
+            let error = crate::persist::into_result_totals::<()>(result, &totals).unwrap_err();
+            let metadata = crate::supervisor::execution_error_metadata(&error);
+            assert_eq!(
+                metadata["admission_reason"],
+                serde_json::to_value(reason).unwrap()
+            );
+            assert_eq!(metadata["outcome"], "not_enqueued");
+        }
+    }
+
     use super::*;
     use agent_run_domain::storage::{RejectStage, StorageRejection};
     use std::sync::Mutex as StdMutex;
@@ -1206,11 +1258,19 @@ mod tests {
         script.rest = Step::Reply(SubmitResult::NotEnqueued(NotEnqueuedReason::QueueFull));
         let (dial, seen, _dir) = peer(script).await;
         let lane = ProducerLane::new(dial, hello(), 1);
-        let result = lane
-            .submit(|ordinal| Ok(request(ordinal, Duration::from_millis(500))))
-            .await;
+        let pending = lane.submit(|ordinal| Ok(request(ordinal, Duration::from_millis(500))));
+        let totals = pending.totals();
+        let result = pending.await;
         assert!(matches!(result, SubmitResult::Unknown(_)), "{result:?}");
         assert!(seen.lock().unwrap().len() >= 2);
+        let error =
+            crate::persist::into_result_totals::<()>(result, &totals.snapshot()).unwrap_err();
+        let metadata = crate::supervisor::execution_error_metadata(&error);
+        assert_eq!(metadata["outcome"], "unknown");
+        assert!(
+            metadata["admission_reason"].is_null(),
+            "later refusal cannot prove an earlier send did not execute"
+        );
     }
 
     /// C4: after an `Unknown` reply a later non-durable refusal does not replace

@@ -108,7 +108,7 @@ async fn bytes_and_payload_reject_before_enqueue() {
             panic!("overloaded callback ran")
         })
         .await,
-        Err(CallError::<rusqlite::Error>::Overloaded)
+        Err(CallError::<rusqlite::Error>::BytesFull)
     ));
     assert!(matches!(
         db.call(Operation::Write, 5, |_| -> rusqlite::Result<()> {

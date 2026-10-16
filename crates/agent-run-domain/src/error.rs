@@ -192,6 +192,9 @@ pub enum Error {
     /// A safe runtime error message.
     #[error("{0}")]
     Runtime(String),
+    /// Closed writer outcome; payload-free diagnostic source, never durability proof.
+    #[error("writer operation did not complete")]
+    WriterFailure(crate::storage::WriterFailure),
     /// An ownership observer/checkpoint failed. The typed source stays private;
     /// diagnostics retain only closed stage/category and safe numeric codes.
     #[error("runtime ownership checkpoint failed")]
@@ -386,9 +389,10 @@ impl Error {
                 broker_error_code: Some(code),
                 ..
             } => MachineCode::from_wire(code).unwrap_or(MachineCode::RuntimeError),
-            Self::Runtime(_) | Self::OwnershipCheckpoint { .. } | Self::Broker { .. } => {
-                MachineCode::RuntimeError
-            }
+            Self::Runtime(_)
+            | Self::WriterFailure(_)
+            | Self::OwnershipCheckpoint { .. }
+            | Self::Broker { .. } => MachineCode::RuntimeError,
             Self::Bootstrap { .. } => MachineCode::ValidationError,
             Self::Io(_) => MachineCode::IOError,
             Self::Sql(_) => MachineCode::StorageError,

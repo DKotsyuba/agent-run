@@ -13,8 +13,8 @@
 use crate::{
     Error, Result,
     domain::{AgentId, Outcome},
-    persist::into_result,
-    storage_client::{expired, pause, remaining, transient},
+    persist::into_result_totals,
+    storage_client::{Totals, expired, pause, remaining, transient},
     writer::WriterHandle,
 };
 use agent_run_domain::storage::{
@@ -163,20 +163,21 @@ impl BrokerLane {
     /// its typed output.
     ///
     /// # Errors
-    /// See [`into_result`]; an unknown outcome is an error, never success.
+    /// See [`into_result_totals`]; an unknown outcome is an error, never success.
+    /// Closed last-refusal facts and actual retry totals survive deadline expiry.
     pub async fn local<P>(&self, op: P, budget: Duration) -> Result<P::Output>
     where
         P: WriteOp + Send + 'static,
         LocalOp: From<P>,
     {
-        into_result(self.local_raw(WriteAuthority::Broker, op, budget).await)
+        self.local_as(WriteAuthority::Broker, op, budget).await
     }
 
     /// Submits a broker-local operation under an explicit `authority` (the
     /// `Worker` authority of an authenticated worker tool call for rows 44-47).
     ///
     /// # Errors
-    /// See [`into_result`].
+    /// See [`into_result_totals`]; retains the same typed failures as [`Self::local`].
     pub async fn local_as<P>(
         &self,
         authority: WriteAuthority,
@@ -187,7 +188,8 @@ impl BrokerLane {
         P: WriteOp + Send + 'static,
         LocalOp: From<P>,
     {
-        into_result(self.local_raw(authority, op, budget).await)
+        let (result, totals) = self.local_outcome(authority, op, budget).await;
+        into_result_totals(result, &totals)
     }
 
     /// Submits a broker-local operation and returns the raw final outcome.
@@ -197,6 +199,21 @@ impl BrokerLane {
         op: P,
         budget: Duration,
     ) -> SubmitResult
+    where
+        P: WriteOp + Send + 'static,
+        LocalOp: From<P>,
+    {
+        self.local_outcome(authority, op, budget).await.0
+    }
+
+    /// Builds one local envelope and returns its raw outcome plus payload-free retry facts.
+    /// Authority and budget have the same meaning as local_raw; no retry identity is renewed.
+    async fn local_outcome<P>(
+        &self,
+        authority: WriteAuthority,
+        op: P,
+        budget: Duration,
+    ) -> (SubmitResult, Totals)
     where
         P: WriteOp + Send + 'static,
         LocalOp: From<P>,
@@ -213,18 +230,29 @@ impl BrokerLane {
     /// command enqueued on behalf of the API) and returns its typed output.
     ///
     /// # Errors
-    /// See [`into_result`].
+    /// See [`into_result_totals`]; closed refusal/timing facts survive bounded retries.
     pub async fn remote<P>(&self, op: P, budget: Duration) -> Result<P::Output>
     where
         P: WriteOp + Send + 'static,
         RemoteOp: From<P>,
     {
-        into_result(self.remote_raw(op, budget).await)
+        let (result, totals) = self.remote_outcome(op, budget).await;
+        into_result_totals(result, &totals)
     }
 
     /// Submits a wire-decodable operation as the broker and returns the raw
     /// final outcome.
     pub async fn remote_raw<P>(&self, op: P, budget: Duration) -> SubmitResult
+    where
+        P: WriteOp + Send + 'static,
+        RemoteOp: From<P>,
+    {
+        self.remote_outcome(op, budget).await.0
+    }
+
+    /// Builds one remote envelope for the broker and returns outcome and actual retry totals.
+    /// The same envelope and original budget govern every attempt; no transport is opened.
+    async fn remote_outcome<P>(&self, op: P, budget: Duration) -> (SubmitResult, Totals)
     where
         P: WriteOp + Send + 'static,
         RemoteOp: From<P>,
@@ -241,80 +269,97 @@ impl BrokerLane {
         .await
     }
 
-    /// Runs one operation to its final outcome under the held head lock.
+    /// Runs one operation to its final outcome and closed retry totals under the head lock.
     ///
     /// The envelope is built once; every retry resubmits the identical value
     /// (same identity, ordinal and original deadline). `Unknown` is sticky:
     /// only a definitive receipt, a durable rejection or the deadline ends it.
-    async fn drive<F>(&self, authority: WriteAuthority, budget: Duration, build: F) -> SubmitResult
+    async fn drive<F>(
+        &self,
+        authority: WriteAuthority,
+        budget: Duration,
+        build: F,
+    ) -> (SubmitResult, Totals)
     where
         F: FnOnce(OperationId, u64, MonoDeadline) -> Result<Built>,
     {
         let mut head = self.head.lock().await;
-        let ordinal = *head;
-        *head += 1;
-        let (boot, now) = match monotonic::now() {
-            Ok(reading) => reading,
-            Err(error) => return rejected(&Error::Io(error)),
-        };
-        let operation_id = OperationId::new(&boot, now);
-        let deadline = MonoDeadline {
-            boot_id: boot,
-            ns: now.saturating_add(budget.as_nanos().min(u128::from(u64::MAX)) as u64),
-        };
-        let built = match build(operation_id, ordinal, deadline.clone()) {
-            Ok(built) => built,
-            Err(error) => return rejected(&error),
-        };
-        let mut uncertain: Option<UnknownCause> = None;
-        let mut backoff = Duration::from_millis(20);
-        loop {
-            if remaining(&deadline).is_none() {
-                return expired(uncertain);
-            }
-            let result = match &built {
-                Built::Local(envelope) => {
-                    self.handle
-                        .local(authority.clone(), (**envelope).clone())
-                        .await
-                }
-                Built::Remote(envelope) => {
-                    self.handle
-                        .submit(authority.clone(), envelope.clone())
-                        .await
-                }
+        let started = std::time::Instant::now();
+        let mut totals = Totals::default();
+        let result = async {
+            let ordinal = *head;
+            *head += 1;
+            let (boot, now) = match monotonic::now() {
+                Ok(reading) => reading,
+                Err(error) => return rejected(&Error::Io(error)),
             };
-            match result {
-                SubmitResult::Committed(receipt) => return SubmitResult::Committed(receipt),
-                SubmitResult::Rejected(rejection) if rejection.durable => {
-                    return SubmitResult::Rejected(rejection);
+            let operation_id = OperationId::new(&boot, now);
+            let deadline = MonoDeadline {
+                boot_id: boot,
+                ns: now.saturating_add(budget.as_nanos().min(u128::from(u64::MAX)) as u64),
+            };
+            let built = match build(operation_id, ordinal, deadline.clone()) {
+                Ok(built) => built,
+                Err(error) => return rejected(&error),
+            };
+            let mut uncertain: Option<UnknownCause> = None;
+            let mut backoff = Duration::from_millis(20);
+            loop {
+                if remaining(&deadline).is_none() {
+                    return expired(uncertain);
                 }
-                SubmitResult::Rejected(rejection)
-                    if rejection.code == RejectCode::StorageUnavailable =>
-                {
-                    pause(&mut backoff, &deadline).await;
-                }
-                SubmitResult::Rejected(rejection) => {
-                    return match uncertain {
-                        None => SubmitResult::Rejected(rejection),
-                        Some(cause) => SubmitResult::Unknown(cause),
-                    };
-                }
-                SubmitResult::NotEnqueued(reason) if transient(reason) => {
-                    pause(&mut backoff, &deadline).await;
-                }
-                SubmitResult::NotEnqueued(reason) => {
-                    return match uncertain {
-                        None => SubmitResult::NotEnqueued(reason),
-                        Some(cause) => SubmitResult::Unknown(cause),
-                    };
-                }
-                SubmitResult::Unknown(cause) => {
-                    uncertain = Some(cause);
-                    pause(&mut backoff, &deadline).await;
+                totals.attempts = totals.attempts.saturating_add(1);
+                let result = match &built {
+                    Built::Local(envelope) => {
+                        self.handle
+                            .local(authority.clone(), (**envelope).clone())
+                            .await
+                    }
+                    Built::Remote(envelope) => {
+                        self.handle
+                            .submit(authority.clone(), envelope.clone())
+                            .await
+                    }
+                };
+                match result {
+                    SubmitResult::Committed(receipt) => return SubmitResult::Committed(receipt),
+                    SubmitResult::Rejected(rejection) if rejection.durable => {
+                        return SubmitResult::Rejected(rejection);
+                    }
+                    SubmitResult::Rejected(rejection)
+                        if rejection.code == RejectCode::StorageUnavailable =>
+                    {
+                        totals.last_rejection = Some(rejection);
+                        totals.last_not_enqueued = None;
+                        pause(&mut backoff, &deadline).await;
+                    }
+                    SubmitResult::Rejected(rejection) => {
+                        return match uncertain {
+                            None => SubmitResult::Rejected(rejection),
+                            Some(cause) => SubmitResult::Unknown(cause),
+                        };
+                    }
+                    SubmitResult::NotEnqueued(reason) if transient(reason) => {
+                        totals.last_not_enqueued = Some(reason);
+                        totals.last_rejection = None;
+                        pause(&mut backoff, &deadline).await;
+                    }
+                    SubmitResult::NotEnqueued(reason) => {
+                        return match uncertain {
+                            None => SubmitResult::NotEnqueued(reason),
+                            Some(cause) => SubmitResult::Unknown(cause),
+                        };
+                    }
+                    SubmitResult::Unknown(cause) => {
+                        uncertain = Some(cause);
+                        pause(&mut backoff, &deadline).await;
+                    }
                 }
             }
         }
+        .await;
+        totals.elapsed = started.elapsed();
+        (result, totals)
     }
 }
 

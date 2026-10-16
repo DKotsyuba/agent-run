@@ -19,6 +19,10 @@ use sha2::{Digest, Sha256};
 
 /// Version of the writer request/receipt protocol; a peer speaking another
 /// version is refused with [`RejectCode::ProtocolUnsupported`].
+/// Admission reason additions keep the framing/envelope at version1. Updated
+/// readers accept earlier spellings; an earlier reader cannot decode a new
+/// reason and its existing client reports an unknown transport outcome after
+/// a possible send. Mixed-release diagnostic/availability parity is not promised.
 pub const WRITE_PROTOCOL: u16 = 1;
 /// Maximum bytes of a receipt result in its canonical `ensure_ascii` JSON
 /// encoding (the exact bytes stored in `operation_receipts.result_json`).
@@ -584,6 +588,7 @@ impl StorageRejection {
             Error::Sql(_)
             | Error::Io(_)
             | Error::Runtime(_)
+            | Error::WriterFailure(_)
             | Error::BrokerUnavailable
             | Error::Broker { .. }
             | Error::Bootstrap { .. } => (
@@ -682,6 +687,9 @@ fn sqlite_codes(error: &Error) -> (Option<i32>, Option<i32>) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotEnqueuedReason {
+    /// Receipt pruning owns the producer-registration gate; retry the same identity.
+    /// Added in version1: earlier closed-enum readers fail conservatively as unknown.
+    RetentionGate,
     /// Job count limit reached.
     QueueFull,
     /// Byte budget reached.
@@ -717,6 +725,17 @@ pub enum UnknownCause {
     WriterStopped,
     /// The transport lost the reply.
     Transport,
+}
+
+/// Closed unsuccessful writer outcome retained as a persistence error's typed source.
+/// Carries no payload or text, and never turns uncertainty into a definite refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", content = "cause", rename_all = "snake_case")]
+pub enum WriterFailure {
+    /// Proven never accepted/claimed, including the last real refusal at expiry.
+    NotEnqueued(NotEnqueuedReason),
+    /// An earlier attempt may have executed; resolve only its original identity.
+    Unknown(UnknownCause),
 }
 
 /// Outcome of one submission.

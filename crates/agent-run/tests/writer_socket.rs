@@ -39,6 +39,83 @@ struct Fixture {
     service: Option<WriterService>,
 }
 
+/// Actual retention-gate refusals reach both wire and in-process persistence callers.
+/// The SQL worker owns the gate until both original deadlines expire; no SQL effect is admitted.
+#[cfg(feature = "test-fixtures")]
+#[tokio::test]
+async fn actual_retention_refusal_survives_both_lanes() {
+    let fixture = Fixture::new(ConnectionLimits::default()).await;
+    let handle = fixture.service.as_ref().unwrap().handle();
+    let (entered, ready) = oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let owner = handle.clone();
+    let barrier = tokio::spawn(async move {
+        owner
+            .fixture_retention_barrier(entered, wait)
+            .await
+            .unwrap();
+    });
+    ready.await.unwrap();
+    let producer = fixture.producer(&fixture.capability);
+    let pending = producer.submit(
+        agent_run_store::ops::AppendJournal {
+            execution: fixture.id.clone(),
+            fragments: vec![agent_run_store::ops::JournalFragment::Event {
+                kind: "refused".into(),
+                data: json!({}),
+                attempt: None,
+            }],
+        },
+        Duration::from_millis(120),
+    );
+    let totals = pending.totals();
+    let outcome = pending.await;
+    let remote = persist::into_result_totals::<Vec<i64>>(outcome, &totals.snapshot()).unwrap_err();
+    let lane = agent_run_core::broker_writer::BrokerWriter::new(handle).lane("refusal");
+    let local = lane
+        .local(
+            agent_run_store::ops::PruneIncidentLedger {
+                at: agent_run_domain::domain::now(),
+            },
+            Duration::from_millis(120),
+        )
+        .await
+        .unwrap_err();
+    let local_as = lane
+        .local_as(
+            agent_run_domain::storage::WriteAuthority::Broker,
+            agent_run_store::ops::PruneIncidentLedger {
+                at: agent_run_domain::domain::now(),
+            },
+            Duration::from_millis(120),
+        )
+        .await
+        .unwrap_err();
+    let broker_remote = lane
+        .remote(
+            agent_run_store::ops::AppendJournal {
+                execution: fixture.id.clone(),
+                fragments: vec![],
+            },
+            Duration::from_millis(120),
+        )
+        .await
+        .unwrap_err();
+    release.send(()).unwrap();
+    barrier.await.unwrap();
+    fixture.finish().await;
+    assert!(
+        format!("{remote:?}").contains("RetentionGate"),
+        "remote lost actual refusal: {remote:?}"
+    );
+    assert!(
+        format!("{local:?}").contains("RetentionGate"),
+        "broker lost actual refusal: {local:?}"
+    );
+    assert!(format!("{local_as:?}").contains("RetentionGate"));
+    assert!(format!("{broker_remote:?}").contains("RetentionGate"));
+}
+
 impl Fixture {
     /// Admits one `starting` execution whose startup owner is THIS process,
     /// then starts the writer service and the socket server.

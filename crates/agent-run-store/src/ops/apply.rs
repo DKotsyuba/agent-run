@@ -24,6 +24,15 @@ use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 use serde_json::Value;
 use std::time::Instant;
 
+#[cfg(test)]
+thread_local! {
+    /// One-shot worker-thread pause inside the actual watermark SELECT progress hook.
+    /// Tests install it on their owned connection thread; production has no seam.
+    pub(crate) static WATERMARK_READ_PAUSE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    /// Whether this thread is currently reading watermark candidates.
+    static READING_WATERMARKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Facts of one submission the transaction needs besides the payload.
 pub(crate) struct Submission<'a> {
     /// Envelope header.
@@ -1119,7 +1128,7 @@ pub(crate) fn record_recovery(
 const RECEIPT_PRUNE_LIMIT: usize = 500;
 
 /// Removes stale unscoped receipts and producer watermarks (row 87), at most
-/// 500 receipts and 2000 watermarks. A receipt is removed only when it is unscoped, its commit is
+/// 500 receipts, or 2000 watermarks when no receipt candidates qualify. A receipt is removed only when it is unscoped, its commit is
 /// older than 14 days of wall time AND its operation identity is stale on the
 /// monotonic clock (another boot, or issued more than the maximum operation
 /// age ago), so no live retry can need it; a wall-clock jump alone never
@@ -1134,7 +1143,9 @@ const RECEIPT_PRUNE_LIMIT: usize = 500;
 /// `at` must be finite nonnegative Unix seconds. Read probes and bounded row
 /// loops share a cooperative 200 ms budget. Read expiry is a storage failure;
 /// deletion stops at the budget and returns the actual prefix for atomic commit.
-/// Newly orphaned watermarks may wait one pass. The sole writer owns this
+/// Watermarks wait until an eligible receipt backlog drains; their potentially
+/// expensive scan cannot consume the selected receipt page's mutation budget.
+/// The sole writer owns this
 /// connection's progress callback; it is cleared before primary-key mutations.
 pub(crate) fn prune_receipts(conn: &Connection, op: &super::PruneReceipts) -> Result<usize> {
     prune_receipts_until(
@@ -1165,15 +1176,30 @@ fn prune_receipts_until(
         "CREATE TEMP TABLE IF NOT EXISTS writer_live_producers(key TEXT PRIMARY KEY)",
         [],
     )?;
-    conn.progress_handler(1_000, Some(move || Instant::now() >= deadline))?;
+    conn.progress_handler(
+        1_000,
+        Some(move || {
+            #[cfg(test)]
+            if READING_WATERMARKS.get() {
+                WATERMARK_READ_PAUSE.with(|pause| {
+                    if let Some(pause) = pause.borrow_mut().take() {
+                        pause();
+                    }
+                });
+            }
+            Instant::now() >= deadline
+        }),
+    )?;
     let result = receipt_prune_candidates(conn, op, deadline);
+    #[cfg(test)]
+    READING_WATERMARKS.set(false);
     let cleanup = conn.progress_handler(0, None::<fn() -> bool>);
     let (receipts, watermarks) = result?;
     cleanup?;
     apply_receipt_pruning(conn, &receipts, &watermarks, || Instant::now() < deadline)
 }
 
-/// Reads at most 500 receipt sequences and 2000 already-orphaned producer keys
+/// Reads at most 500 receipt sequences, or 2000 already-orphaned producer keys
 /// under the caller's progress hook, with no persistent mutation. Validates the
 /// same time/boot/retry guards as [`prune_receipts`]; `writer_live_producers` must
 /// already exist. Read-budget expiry returns SQLITE_INTERRUPT before any deletes.
@@ -1220,7 +1246,13 @@ fn receipt_prune_candidates(
         .collect();
     drop(statement);
     check_deadline()?;
+    // ponytail: watermark scans wait for receipt backlog; split budgets if independent progress is needed.
+    if !receipts.is_empty() {
+        return Ok((receipts, Vec::new()));
+    }
     let current = agent_run_domain::storage::boot_tag(&op.boot_id);
+    #[cfg(test)]
+    READING_WATERMARKS.set(true);
     // Producers with unfinished scheduler work (filled by the sole writer in
     // this transaction) keep their watermarks however old.
     let mut statement = conn.prepare(
@@ -1248,6 +1280,8 @@ fn receipt_prune_candidates(
         .map(|(key, ..)| key)
         .collect();
     drop(statement);
+    #[cfg(test)]
+    READING_WATERMARKS.set(false);
     check_deadline()?;
     Ok((receipts, watermarks))
 }
@@ -1376,18 +1410,22 @@ mod tests {
         )
         .unwrap();
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
-        let (receipts, watermarks) = receipt_prune_candidates(
-            &conn,
-            &super::super::PruneReceipts {
-                at,
-                boot_id: boot,
-                now_ns,
-            },
-            deadline,
-        )
-        .unwrap();
+        let op = super::super::PruneReceipts {
+            at,
+            boot_id: boot,
+            now_ns,
+        };
+        let (receipts, watermarks) = receipt_prune_candidates(&conn, &op, deadline).unwrap();
         let removed =
             apply_receipt_pruning(&conn, &receipts, &watermarks, || Instant::now() < deadline)
+                .unwrap();
+        assert_eq!(
+            removed, 1,
+            "receipt page gets its mutation budget before watermark scanning"
+        );
+        let (receipts, watermarks) = receipt_prune_candidates(&conn, &op, deadline).unwrap();
+        let removed = removed
+            + apply_receipt_pruning(&conn, &receipts, &watermarks, || Instant::now() < deadline)
                 .unwrap();
         conn.progress_handler(0, None::<fn() -> bool>).unwrap();
         let steps = steps.load(std::sync::atomic::Ordering::Relaxed);

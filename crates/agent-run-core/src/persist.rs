@@ -25,7 +25,7 @@ use agent_run_domain::{
     error::PersistenceOperation,
     storage::{
         MonoDeadline, NotEnqueuedReason, OperationId, PayloadDigest, ProducerId, ProducerKind,
-        RejectStage, SubmitResult, UnknownCause,
+        RejectStage, SubmitResult,
     },
 };
 use agent_run_platform::{monotonic, process::OwnershipSnapshot, verify::Proof};
@@ -72,14 +72,18 @@ pub fn into_result<O: DeserializeOwned>(result: SubmitResult) -> Result<O> {
             elapsed_ms: 0,
             attempts: 1,
             phase: Some(RejectStage::Gate),
-            source: Box::new(Error::Runtime(not_enqueued_text(reason).into())),
+            source: Box::new(Error::WriterFailure(
+                agent_run_domain::storage::WriterFailure::NotEnqueued(reason),
+            )),
         }),
         SubmitResult::Unknown(cause) => Err(Error::Persistence {
             operation: PersistenceOperation::WriterApply,
             elapsed_ms: 0,
             attempts: 1,
             phase: None,
-            source: Box::new(Error::Runtime(unknown_text(cause).into())),
+            source: Box::new(Error::WriterFailure(
+                agent_run_domain::storage::WriterFailure::Unknown(cause),
+            )),
         }),
     }
 }
@@ -87,8 +91,8 @@ pub fn into_result<O: DeserializeOwned>(result: SubmitResult) -> Result<O> {
 /// [`into_result`] with the submission's truthful totals.
 ///
 /// A refusal before acceptance that outlived the original deadline reports the
-/// writer's last refusal (operation, closed phase, SQLite primary/extended
-/// codes) with the real attempt count and elapsed time instead of a generic
+/// writer's last actual admission reason or storage refusal (operation, closed
+/// phase, SQLite primary/extended codes) with the real attempt count and elapsed time instead of a generic
 /// expiry. An unknown outcome stays unknown (it is never turned into a
 /// definite refusal) but carries the same real numbers.
 pub fn into_result_totals<O: DeserializeOwned>(
@@ -96,6 +100,14 @@ pub fn into_result_totals<O: DeserializeOwned>(
     totals: &crate::storage_client::Totals,
 ) -> Result<O> {
     match result {
+        SubmitResult::NotEnqueued(NotEnqueuedReason::DeadlineExpired)
+            if totals.last_not_enqueued.is_some() =>
+        {
+            into_result::<O>(SubmitResult::NotEnqueued(
+                totals.last_not_enqueued.expect("checked above"),
+            ))
+            .map_err(|error| error.persistence_totals(totals.elapsed, totals.attempts))
+        }
         SubmitResult::NotEnqueued(NotEnqueuedReason::DeadlineExpired)
             if totals.last_rejection.is_some() =>
         {
@@ -107,32 +119,6 @@ pub fn into_result_totals<O: DeserializeOwned>(
         SubmitResult::NotEnqueued(_) | SubmitResult::Unknown(_) => into_result::<O>(result)
             .map_err(|error| error.persistence_totals(totals.elapsed, totals.attempts.max(1))),
         other => into_result(other),
-    }
-}
-
-/// Closed text of a refusal before acceptance (no operation reached the writer).
-fn not_enqueued_text(reason: NotEnqueuedReason) -> &'static str {
-    match reason {
-        NotEnqueuedReason::QueueFull => "writer queue is full",
-        NotEnqueuedReason::BytesFull => "writer queue byte budget is full",
-        NotEnqueuedReason::ProducerFull => "writer producer limit reached",
-        NotEnqueuedReason::ReservedForCritical => "writer capacity is reserved for critical work",
-        NotEnqueuedReason::AdmissionsClosed => "writer admissions are closed",
-        NotEnqueuedReason::Draining => "writer is draining",
-        NotEnqueuedReason::Degraded => "writer is degraded",
-        NotEnqueuedReason::DeadlineExpired => "operation deadline expired before acceptance",
-        NotEnqueuedReason::DeadlineBeforeStart => "operation deadline expired in the queue",
-    }
-}
-
-/// Closed text of an unknown outcome: the operation may or may not be durable.
-fn unknown_text(cause: UnknownCause) -> &'static str {
-    match cause {
-        UnknownCause::CommitUncertain => "commit outcome is unknown",
-        UnknownCause::RollbackUncertain => "rollback outcome is unknown",
-        UnknownCause::DeadlineDuringExecution => "deadline passed during execution",
-        UnknownCause::WriterStopped => "writer stopped during execution",
-        UnknownCause::Transport => "writer transport failed after a possible send",
     }
 }
 
