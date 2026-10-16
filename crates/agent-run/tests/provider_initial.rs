@@ -1129,6 +1129,76 @@ async fn provider_start_completes_one_owned_fake_engine_attempt() {
     assert_eq!(replay["agent_id"], admitted["agent_id"]);
 }
 
+/// Provider admission records the revision of the skill bytes the configured
+/// plugin will actually supply, not of a differing catalog duplicate, and the
+/// detached supervisor then launches that unchanged plugin to completion.
+#[tokio::test]
+async fn admission_freezes_configured_plugin_skill_revision_and_launches() {
+    let (_temp, home) = home();
+    let catalog = home.join("skills/demo");
+    fs::create_dir_all(&catalog).unwrap();
+    fs::write(catalog.join("SKILL.md"), "Catalog duplicate.\n").unwrap();
+    let plugin = home.join("demo-plugin");
+    fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
+    fs::write(
+        plugin.join(".claude-plugin/plugin.json"),
+        r#"{"name":"demo-plugin","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(plugin.join("skills/demo")).unwrap();
+    fs::write(
+        plugin.join("skills/demo/SKILL.md"),
+        "Configured plugin bytes.\n",
+    )
+    .unwrap();
+    fs::write(home.join("profiles/review.md"),
+        "+++\nrevision = \"1\"\nwrite = false\nnetwork = false\nallow_external_read_roots = false\nskills = [\"demo\"]\nmcp = []\nrequired_constraints = []\n+++\nReview safely.\n").unwrap();
+    let config = fs::read_to_string(home.join("config.toml")).unwrap();
+    let claude_home = format!("home = \"{}/claude\"\n", home.display());
+    assert!(config.contains(&claude_home));
+    fs::write(
+        home.join("config.toml"),
+        config.replacen(
+            &claude_home,
+            &format!("{claude_home}plugins = [\"{}\"]\n", plugin.display()),
+            1,
+        ),
+    )
+    .unwrap();
+    let service = fixture_service(home.clone()).await;
+    let admitted = service
+        .admit_provider_trusted(request(&home), candidates(committed(&home)))
+        .await
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    let identity = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap()
+        .identity
+        .unwrap();
+    let frozen = &identity["authority"]["role_payload"]["skills"][0];
+    assert_eq!(frozen["id"], "demo");
+    let plugin_revision =
+        agent_run_config::role_plan::tree_revision(&plugin.join("skills/demo")).unwrap();
+    assert_eq!(frozen["revision"], plugin_revision);
+    assert_ne!(
+        plugin_revision,
+        agent_run_config::role_plan::tree_revision(&catalog).unwrap()
+    );
+    let mut child = supervisor(&home, &id).await;
+    let exit = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(exit.success(), "supervisor exit: {exit}");
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
+    assert_eq!(row.status, Status::Succeeded);
+}
+
 /// A valid result does not end a still-live provider engine. Old admission age
 /// never signals it; explicit cancellation preserves transcript and cleanup evidence.
 #[tokio::test]

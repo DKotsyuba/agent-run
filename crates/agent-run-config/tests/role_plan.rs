@@ -399,3 +399,65 @@ fn worker_preamble_is_frozen_once_before_role_body() {
     assert_eq!(restored.to_payload(), historical);
     assert!(!restored.prompt.contains(prefix));
 }
+
+/// Builds the ordering-sensitive skill tree shared by the revision parity tests:
+/// nested and empty directories, an empty file, an executable file, a non-ASCII
+/// name, and `a-b` between `a` and `a/b` so only a global path-string sort agrees.
+fn parity_tree(root: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(root.join("a")).unwrap();
+    fs::create_dir_all(root.join("empty-dir")).unwrap();
+    fs::create_dir_all(root.join("deep/er")).unwrap();
+    for (path, bytes) in [
+        ("SKILL.md", &b"Skill body\n"[..]),
+        ("a-b", b"dash\n"),
+        ("a/b", b"nested\n"),
+        ("a/empty", b""),
+        ("\u{e9}.md", b"unicode\n"),
+        ("Z", b"upper\n"),
+        ("deep/er/x.sh", b"#!/bin/sh\n"),
+    ] {
+        fs::write(root.join(path), bytes).unwrap();
+    }
+    fs::set_permissions(root.join("deep/er/x.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// The shared revision helper reproduces the pre-existing algorithm exactly:
+/// this digest was computed independently from the documented model
+/// (`json.dumps` of sorted `[path, "directory"|"file", bytes, sha256]` rows).
+const PARITY_TREE_REVISION: &str =
+    "2caca16719d1c10836479595d05c37f83fccb0c94a6a55d23ec8405f6f018ceb";
+
+/// Admission-time `tree_revision` equals both the independent golden value and the
+/// `content_revision` of a snapshot published from the same tree, regardless of modes.
+#[test]
+fn admission_and_published_snapshot_revisions_agree() {
+    let source = tempfile::tempdir().unwrap();
+    parity_tree(source.path());
+    assert_eq!(
+        agent_run_config::role_plan::tree_revision(source.path()).unwrap(),
+        PARITY_TREE_REVISION
+    );
+    let home = tempfile::tempdir().unwrap();
+    let published = agent_run_platform::snapshot_tree::snapshot_managed_tree(
+        home.path(),
+        std::path::Path::new("skills/parity"),
+        source.path(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(published.content_revision, PARITY_TREE_REVISION);
+    // A one-byte change moves both revisions together.
+    fs::write(source.path().join("a/b"), b"nested!").unwrap();
+    let changed = agent_run_config::role_plan::tree_revision(source.path()).unwrap();
+    assert_ne!(changed, PARITY_TREE_REVISION);
+    let other = tempfile::tempdir().unwrap();
+    let republished = agent_run_platform::snapshot_tree::snapshot_managed_tree(
+        other.path(),
+        std::path::Path::new("skills/parity"),
+        source.path(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(republished.content_revision, changed);
+}

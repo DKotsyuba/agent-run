@@ -19,6 +19,7 @@ use crate::{
 use agent_run_domain::{
     Result, Sha256Digest, canonical, catalog::ResolvedLaunchAuthority, error::invalid,
 };
+use agent_run_platform::snapshot_tree::{self, RevisionEntry};
 use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -527,6 +528,34 @@ pub fn resolve_role_plan(
     auth_mode: &str,
     auth_reference: Option<&str>,
 ) -> Result<ResolvedRolePlan> {
+    resolve_role_plan_with_sources(
+        profile,
+        skills_root,
+        &BTreeMap::new(),
+        mcp_catalog,
+        auth_mode,
+        auth_reference,
+    )
+}
+
+/// [`resolve_role_plan`] for a harness-aware caller that knows which skills a
+/// configured plugin supplies instead of the catalog.
+///
+/// `skill_sources` maps a declared skill id to the absolute directory the
+/// launch will actually consume (the plugin's `skills/<id>`); its content
+/// revision is recorded as the skill's admitted provenance. A skill absent from
+/// the map is hashed from `skills_root/<id>`. The catalog directory must still
+/// hold `SKILL.md` for every declared skill, and an override must be an
+/// absolute directory holding `SKILL.md`, so which skills are admissible is
+/// unchanged and only the recorded revision follows the effective source.
+pub fn resolve_role_plan_with_sources(
+    profile: &Profile,
+    skills_root: &Path,
+    skill_sources: &BTreeMap<String, PathBuf>,
+    mcp_catalog: &BTreeMap<String, Mcp>,
+    auth_mode: &str,
+    auth_reference: Option<&str>,
+) -> Result<ResolvedRolePlan> {
     if mcp_catalog.contains_key(agent_run_domain::worker::SERVER_NAME)
         || profile
             .mcp
@@ -571,9 +600,18 @@ pub fn resolve_role_plan(
         if !source.join("SKILL.md").is_file() {
             return Err(invalid(format!("canonical skill is not available: {name}")));
         }
+        let effective = match skill_sources.get(name) {
+            Some(path) if path.is_absolute() && path.join("SKILL.md").is_file() => path,
+            Some(_) => {
+                return Err(invalid(format!(
+                    "effective skill source is not available: {name}"
+                )));
+            }
+            None => &source,
+        };
         skills.push(ResolvedSkill {
             id: name.clone(),
-            revision: tree_revision(&source)?,
+            revision: tree_revision(effective)?,
         });
     }
 
@@ -817,22 +855,25 @@ fn lexical_absolute(input: &str) -> Result<String> {
 /// Return the role-skill content revision used by canonical role plans.
 ///
 /// Ports `src/agent_run/adapters/snapshot_tree.py:tree_revision`'s content
-/// model: sorted `[path, "directory"]` / `[path, "file", bytes, sha256]`
-/// entries hashed as compact canonical JSON. File mode is deliberately
-/// excluded, matching Python.
+/// model through [`snapshot_tree::content_revision`], the same helper that
+/// computes the revision of a published snapshot, so admission and
+/// materialization cannot disagree about the model: sorted
+/// `[path, "directory"]` / `[path, "file", bytes, sha256]` entries hashed as
+/// compact canonical JSON. File mode is deliberately excluded, matching
+/// Python. A symlink or special file anywhere below `source` is rejected.
 // ponytail: plain `std::fs` traversal with `symlink_metadata` type checks,
 // not Python's O_NOFOLLOW-descriptor walk. Adequate for hashing a trusted,
 // local skills catalog; revisit with descriptor-based no-follow traversal if
 // skills catalogs ever admit untrusted or concurrently-mutated content.
-fn tree_revision(source: &Path) -> Result<String> {
-    let mut entries: Vec<(String, Value)> = Vec::new();
+pub fn tree_revision(source: &Path) -> Result<String> {
+    let mut entries = Vec::new();
     walk_tree(source, Path::new(""), &mut entries)?;
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    let array = Value::Array(entries.into_iter().map(|(_, value)| value).collect());
-    Ok(canonical::sha256_hex(&array, true))
+    Ok(snapshot_tree::content_revision(entries))
 }
 
-fn walk_tree(dir: &Path, prefix: &Path, out: &mut Vec<(String, Value)>) -> Result<()> {
+/// Appends every entry below `dir` (paths prefixed by `prefix`) to `out`,
+/// recursing into directories and failing on any non-regular entry.
+fn walk_tree(dir: &Path, prefix: &Path, out: &mut Vec<(String, RevisionEntry)>) -> Result<()> {
     let mut names: Vec<_> = std::fs::read_dir(dir)?
         .map(|entry| entry.map(|entry| entry.file_name()))
         .collect::<std::io::Result<Vec<_>>>()?;
@@ -843,15 +884,12 @@ fn walk_tree(dir: &Path, prefix: &Path, out: &mut Vec<(String, Value)>) -> Resul
         let portable = relative.to_string_lossy().into_owned();
         let metadata = std::fs::symlink_metadata(&full)?;
         if metadata.is_dir() {
-            out.push((portable.clone(), json!([portable, "directory"])));
+            out.push((portable, RevisionEntry::Directory));
             walk_tree(&full, &relative, out)?;
         } else if metadata.is_file() {
             let bytes = std::fs::read(&full)?;
             let sha = agent_run_platform::fs::sha256(&bytes);
-            out.push((
-                portable.clone(),
-                json!([portable, "file", bytes.len(), sha]),
-            ));
+            out.push((portable, RevisionEntry::File(bytes.len(), sha)));
         } else {
             return Err(invalid(format!(
                 "snapshot entry must be regular: {portable}"

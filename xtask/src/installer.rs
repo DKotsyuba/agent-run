@@ -117,7 +117,12 @@ fn copy_release(source: &Path, destination: &Path) -> Result<(), String> {
 /// permanent prefix before using the journalled deployer. Broker and SQLite
 /// writer locks stay held through backup, pointer switch and launcher placement.
 /// All bundled launchers are ownership-checked and prepared before cutover.
-/// Legacy releases without a TUI remain supported. No schema migration, service
+/// Legacy releases without a TUI remain supported. Every release involved (the
+/// candidate, its staged copy and an existing same-version destination) must pass
+/// the closed regular-file inventory check of [`release::verify`], so an unlisted
+/// executable or asset, including `bin/agent-run-tui`, is refused before any pointer
+/// switch or launcher publication and nothing existing is removed. This is local
+/// candidate integrity, not remote archive attestation. No schema migration, service
 /// control, model setup or credential change occurs.
 pub fn install(
     candidate: &Path,
@@ -159,7 +164,8 @@ pub fn install(
     }
     let mut launchers = Vec::new();
     for name in ["agent-run", "agent-run-tui"] {
-        // Legacy releases have no observer; leave unrelated commands untouched.
+        // Legacy releases have no observer; leave unrelated commands untouched. A verified
+        // release lists every file, so existence here means the observer is sealed.
         if name == "agent-run-tui" && !candidate.join("bin/agent-run-tui").is_file() {
             continue;
         }
