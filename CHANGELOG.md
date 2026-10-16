@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.28.2
+
 - fix(store): seek the receipt-age index during retention instead of scanning
   recent history while producer admission is blocked; preserve scoped receipts,
   monotonic retry protection and live producer watermarks
