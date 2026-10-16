@@ -32,8 +32,12 @@ pub const MAGIC: [u8; 4] = *b"ARWQ";
 pub const PROTOCOL: u16 = 1;
 /// Hard ceiling for any frame body, independent of the per-operation table.
 pub const BODY_HARD_MAX: usize = 16 * 1024 * 1024 + 64 * 1024;
-/// Largest hello / hello-ok body.
-pub const HELLO_MAX: usize = 4 * 1024;
+/// Largest hello / hello-ok body. A supervisor hello may carry its finish
+/// launch-secret context, which is bounded by [`FINISH_GUARD_MAX`].
+pub const HELLO_MAX: usize = 16 * 1024;
+/// Largest encoded finish launch-secret context a supervisor hello may carry,
+/// leaving room for the hello's other claims within [`HELLO_MAX`].
+pub const FINISH_GUARD_MAX: usize = 12 * 1024;
 /// Largest encoded reply or status reply (`72 KiB`, section 5a of the contract).
 pub const REPLY_MAX: usize = 72 * 1024;
 /// Largest status request body (operation id plus digest).

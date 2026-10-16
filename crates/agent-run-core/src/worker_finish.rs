@@ -1,7 +1,7 @@
 //! Adapter-shared explicit completion: receipt observation precedes owned cleanup.
 use crate::{
     Result,
-    domain::{Outcome, Status},
+    domain::{AgentId, Outcome, Status},
     persist::Persist,
     state::{Record, Store},
 };
@@ -12,6 +12,9 @@ use serde_json::Value;
 /// Observe a native private finish tool's reply only when it contains the
 /// current immutable digest. Unknown or error tool output cannot close a run.
 /// The caller has already verified native tool identity and session ownership.
+/// An accepted summary carrying this launch's secret material refuses with
+/// `Error::Validation` before the receipt is marked; harmless JSON formatting
+/// of the exact accepted bytes is not secret material.
 pub async fn receipt(
     process: &mut Process,
     store: &mut Persist,
@@ -26,7 +29,7 @@ pub async fn receipt(
     {
         if store
             .worker_finish_intent(&record.id, false)?
-            .is_some_and(|intent| process.redact(&intent.summary) != intent.summary)
+            .is_some_and(|intent| process.contains_secret(&intent.summary))
         {
             return Err(crate::Error::Validation(
                 "finish summary contains launch secret material".into(),
@@ -40,8 +43,9 @@ pub async fn receipt(
 }
 
 /// Produce a result after the native finish reply, leaving cleanup and answer
-/// sealing to the supervisor. Cancellation wins. Refuse secret-redacted text
-/// instead of publishing a summary different from the accepted callback.
+/// sealing to the supervisor. Cancellation wins. Refuse a summary carrying
+/// launch secret material instead of publishing it; the answer is otherwise
+/// the exact accepted callback bytes.
 pub fn result(
     process: &Process,
     store: &Store,
@@ -62,7 +66,7 @@ pub fn result(
     };
     outcome.runtime_session_id = session;
     let mut answer = Some(intent.summary.clone());
-    if process.redact(&intent.summary) != intent.summary {
+    if process.contains_secret(&intent.summary) {
         outcome = Outcome::failure("finish_secret_refused");
         answer = None;
     }
@@ -76,4 +80,16 @@ pub fn result(
         answer,
         usage,
     }))
+}
+
+/// The only public answer an explicit-finish run may seal at finalization:
+/// the exact current-attempt summary, provided its native finish receipt was
+/// observed and it carries no launch secret material. An accepted intent
+/// whose native reply was lost yields `None` whatever the run's outcome, so
+/// an unobserved summary never becomes even a failed run's answer.
+pub fn answer(process: &Process, store: &Store, id: &AgentId) -> Result<Option<String>> {
+    Ok(store
+        .worker_finish_intent(id, true)?
+        .map(|intent| intent.summary)
+        .filter(|summary| !process.contains_secret(summary)))
 }

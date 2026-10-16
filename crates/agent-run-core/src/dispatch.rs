@@ -308,6 +308,8 @@ async fn worker_tool_call(
                         token: call.token,
                         input,
                         at: crate::domain::now(),
+                        // The writer handle replaces this with its pre-SQL verdict.
+                        guard: agent_run_domain::worker::FinishGuard::Unavailable,
                     },
                     BROKER_BUDGET,
                 )

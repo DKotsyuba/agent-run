@@ -1601,6 +1601,14 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             &planned.profile,
             owner_supported,
         );
+        if row.request.explicit_finish && planned.role.worker_mcp {
+            // Before the engine exists, give the broker this attempt's final
+            // launch secrets: it refuses every first finish intent that
+            // carries one, or that arrives while the context is unavailable.
+            store
+                .install_finish_guard(&planned.launch.environment)
+                .await?;
+        }
         // Process::spawn yields Io only when the OS refused Command::spawn,
         // before a child exists; other failures retain ownership for recovery.
         let spawned = if identity.authority.harness == HarnessId::OpenCode {
@@ -1838,9 +1846,9 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             }
         }
         if row.request.explicit_finish {
-            result.answer = store.worker_finish_intent(id, false)?.and_then(|intent| {
-                (process.redact(&intent.summary) == intent.summary).then_some(intent.summary)
-            });
+            // Only an observed native receipt publishes the exact summary,
+            // for failed runs too; a lost reply leaves the run answerless.
+            result.answer = crate::worker_finish::answer(&process, store, id)?;
         }
         let answer_started = std::time::Instant::now();
         let proof = match result.answer.as_deref() {

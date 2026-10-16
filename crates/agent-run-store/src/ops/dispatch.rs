@@ -470,6 +470,7 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
             &op.token,
             &op.input,
             op.at,
+            op.guard,
         )?),
         L::NotifyOrchestrator(op) => out(store.notify_orchestrator(
             &op.execution,

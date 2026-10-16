@@ -61,9 +61,10 @@ pub fn finish(
 /// A pending cancel observed while success or an explicit-mode outcome is
 /// being committed wins in this same scope and receives its terminal command
 /// result. Explicit success also requires an observed done finish; any
-/// supplied answer proof must match that attempt's immutable callback
-/// summary. Returns the commit time, or `None` when the execution was already
-/// terminal (no-op).
+/// supplied answer proof, for every outcome, requires an observed finish
+/// receipt and must match that attempt's immutable callback summary, so an
+/// intent whose native reply was lost never becomes a public answer. Returns
+/// the commit time, or `None` when the execution was already terminal (no-op).
 pub fn commit_terminal(
     store: &mut Store,
     id: &AgentId,
@@ -107,8 +108,13 @@ pub fn commit_terminal(
             ));
         }
         if let Some(proof) = proof {
-            let (intent, _) =
+            let (intent, observed) =
                 intent.ok_or_else(|| invalid("explicit answer requires a finish intent"))?;
+            if !observed {
+                return Err(invalid(
+                    "explicit answer requires an observed private finish receipt",
+                ));
+            }
             if proof.sha256 != agent_run_platform::fs::sha256(intent.summary.as_bytes())
                 || proof.bytes != intent.summary.len() as u64
             {

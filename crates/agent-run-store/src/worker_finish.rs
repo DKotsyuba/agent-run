@@ -5,7 +5,7 @@ use agent_run_domain::{
     Error, Result,
     domain::AgentId,
     error::invalid,
-    worker::{FinishReceipt, FinishRequest},
+    worker::{FinishGuard, FinishReceipt, FinishRequest},
 };
 use agent_run_platform::fs::sha256;
 use rusqlite::{OptionalExtension, params};
@@ -56,6 +56,14 @@ impl Store<'_> {
     /// Identical retries return the original digest; changed payloads conflict.
     /// Cancellation wins if already pending. No outcome or answer is published
     /// until the supervisor observes the native receipt and verifies cleanup.
+    /// The store holds no launch environment and refuses only the worker's own
+    /// capability itself. `guard` is the broker's pre-SQL verdict against the
+    /// launch-secret context the verified supervisor installed for this exact
+    /// attempt: after authentication, an identical replay of an accepted
+    /// intent still returns its receipt (and a changed payload conflicts)
+    /// whatever the verdict, but a FIRST intent is written only when the verdict is
+    /// [`FinishGuard::Clean`]. A secret refuses as validation and an unavailable
+    /// context as a retryable unsupported refusal; neither writes intent or event.
     pub fn accept_worker_finish(
         &mut self,
         run: &AgentId,
@@ -63,6 +71,7 @@ impl Store<'_> {
         token: &str,
         input: &FinishRequest,
         at: f64,
+        guard: FinishGuard,
     ) -> Result<FinishReceipt> {
         input.validate()?;
         if input.summary.contains(token) || !at.is_finite() || at < 0.0 {
@@ -118,6 +127,20 @@ impl Store<'_> {
                 sha256: digest,
                 duplicate: true,
             });
+        }
+        match guard {
+            FinishGuard::Clean => {}
+            FinishGuard::Secret => {
+                return Err(invalid(
+                    "finish summary contains launch secret material; nothing was recorded",
+                ));
+            }
+            FinishGuard::Unavailable => {
+                return Err(Error::Unsupported(
+                    "finish launch-secret context is unavailable; retry the same finish shortly"
+                        .into(),
+                ));
+            }
         }
         tx.execute("UPDATE worker_lifecycle SET idle_seconds=idle_seconds+CASE WHEN phase='idle' THEN MAX(0,?-transition_at) ELSE 0 END, \
             phase='closing',transition_at=?,finish_json=?,finish_sha256=?,accepted_at=? \

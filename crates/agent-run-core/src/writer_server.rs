@@ -24,7 +24,11 @@
 //!   computed from the verified operation and the authority from the
 //!   connection;
 //! * replies carry the writer's outcome verbatim (committed receipt, durable or
-//!   non-durable rejection, not enqueued, unknown), bounded to 72 KiB.
+//!   non-durable rejection, not enqueued, unknown), bounded to 72 KiB;
+//! * a verified supervisor hello may carry its pinned attempt's finish
+//!   launch-secret context, which is installed in the writer handle's memory
+//!   for exactly as long as this connection keeps that claim; no other role
+//!   or unverified claim installs one.
 //!
 //! This module never executes SQL, never opens the database for writing and
 //! never holds a statement across an await.
@@ -184,6 +188,10 @@ where
         Ok(session) => session,
         Err(_) => return Ok(()),
     };
+    // A verified supervisor's launch-secret context lives exactly as long as
+    // this connection and its current attempt claim.
+    let mut guard = GuardLease::new(endpoint.handle.clone());
+    guard.update(&session.authority, hello.finish_guard.as_ref());
     // The verified-class slot is held before the pre-auth slot is released.
     drop(preauth);
     let ok = HelloOk {
@@ -232,6 +240,7 @@ where
                     return Ok(());
                 };
                 session.authority = authority;
+                guard.update(&session.authority, hello.finish_guard.as_ref());
                 let ok = HelloOk {
                     epoch: endpoint.handle.health().epoch,
                     boot_id: monotonic::boot_id()?,
@@ -664,5 +673,71 @@ fn frame_io(error: wire::FrameError) -> std::io::Error {
     match error {
         wire::FrameError::Io(error) => error,
         other => std::io::Error::new(std::io::ErrorKind::InvalidData, other.to_string()),
+    }
+}
+
+/// Source of process-unique writer connection identities for guard ownership.
+static NEXT_CONNECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The finish launch-secret context one connection installed in the writer
+/// handle. Only a supervisor authority with a pinned attempt installs one;
+/// changing or dropping the claim, or closing the connection, retires it,
+/// and retiring never removes a context a newer connection installed.
+struct GuardLease {
+    /// Writer handle that holds the transient contexts.
+    handle: WriterHandle,
+    /// This connection's identity.
+    connection: u64,
+    /// Execution and attempt of the context this connection installed.
+    installed: Option<(AgentId, String)>,
+}
+
+impl GuardLease {
+    /// A lease that has installed nothing yet.
+    fn new(handle: WriterHandle) -> Self {
+        Self {
+            handle,
+            connection: NEXT_CONNECTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            installed: None,
+        }
+    }
+
+    /// Replaces this connection's context with the one carried by its latest
+    /// verified hello; any other role, an unpinned attempt or an absent
+    /// context leaves none installed.
+    fn update(
+        &mut self,
+        authority: &WriteAuthority,
+        context: Option<&crate::storage_client::FinishGuardContext>,
+    ) {
+        self.retire();
+        if let (
+            WriteAuthority::Supervisor {
+                execution,
+                attempt: Some(attempt),
+                ..
+            },
+            Some(context),
+        ) = (authority, context)
+        {
+            self.handle
+                .install_finish_guard(execution, attempt, self.connection, &context.0);
+            self.installed = Some((execution.clone(), attempt.clone()));
+        }
+    }
+
+    /// Retires the context this connection installed, if it is still current.
+    fn retire(&mut self) {
+        if let Some((execution, attempt)) = self.installed.take() {
+            self.handle
+                .retire_finish_guard(&execution, &attempt, self.connection);
+        }
+    }
+}
+
+impl Drop for GuardLease {
+    /// A closed connection's context no longer guards any finish.
+    fn drop(&mut self) {
+        self.retire();
     }
 }
