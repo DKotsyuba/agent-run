@@ -27,7 +27,7 @@ use agent_run_store::ops::{
     LocalOp, RemoteOp, WriteEnvelope, WriteOp,
 };
 use serde_json::Value;
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
 /// Default budget of one broker operation from the moment it reaches the head
@@ -274,92 +274,99 @@ impl BrokerLane {
     /// The envelope is built once; every retry resubmits the identical value
     /// (same identity, ordinal and original deadline). `Unknown` is sticky:
     /// only a definitive receipt, a durable rejection or the deadline ends it.
-    async fn drive<F>(
+    /// The returned future owns one heap allocation so its large retry state
+    /// is not embedded and copied through every caller's synchronous poll stack.
+    /// First poll acquires the head; cancellation and SQL ownership are unchanged.
+    fn drive<F>(
         &self,
         authority: WriteAuthority,
         budget: Duration,
         build: F,
-    ) -> (SubmitResult, Totals)
+    ) -> Pin<Box<impl Future<Output = (SubmitResult, Totals)> + Send + '_>>
     where
-        F: FnOnce(OperationId, u64, MonoDeadline) -> Result<Built>,
+        F: FnOnce(OperationId, u64, MonoDeadline) -> Result<Built> + Send + 'static,
     {
-        let mut head = self.head.lock().await;
-        let started = std::time::Instant::now();
-        let mut totals = Totals::default();
-        let result = async {
-            let ordinal = *head;
-            *head += 1;
-            let (boot, now) = match monotonic::now() {
-                Ok(reading) => reading,
-                Err(error) => return rejected(&Error::Io(error)),
-            };
-            let operation_id = OperationId::new(&boot, now);
-            let deadline = MonoDeadline {
-                boot_id: boot,
-                ns: now.saturating_add(budget.as_nanos().min(u128::from(u64::MAX)) as u64),
-            };
-            let built = match build(operation_id, ordinal, deadline.clone()) {
-                Ok(built) => built,
-                Err(error) => return rejected(&error),
-            };
-            let mut uncertain: Option<UnknownCause> = None;
-            let mut backoff = Duration::from_millis(20);
-            loop {
-                if remaining(&deadline).is_none() {
-                    return expired(uncertain);
-                }
-                totals.attempts = totals.attempts.saturating_add(1);
-                let result = match &built {
-                    Built::Local(envelope) => {
-                        self.handle
-                            .local(authority.clone(), (**envelope).clone())
-                            .await
-                    }
-                    Built::Remote(envelope) => {
-                        self.handle
-                            .submit(authority.clone(), envelope.clone())
-                            .await
-                    }
+        Box::pin(async move {
+            let mut head = self.head.lock().await;
+            let started = std::time::Instant::now();
+            let mut totals = Totals::default();
+            let result = async {
+                let ordinal = *head;
+                *head += 1;
+                let (boot, now) = match monotonic::now() {
+                    Ok(reading) => reading,
+                    Err(error) => return rejected(&Error::Io(error)),
                 };
-                match result {
-                    SubmitResult::Committed(receipt) => return SubmitResult::Committed(receipt),
-                    SubmitResult::Rejected(rejection) if rejection.durable => {
-                        return SubmitResult::Rejected(rejection);
+                let operation_id = OperationId::new(&boot, now);
+                let deadline = MonoDeadline {
+                    boot_id: boot,
+                    ns: now.saturating_add(budget.as_nanos().min(u128::from(u64::MAX)) as u64),
+                };
+                let built = match build(operation_id, ordinal, deadline.clone()) {
+                    Ok(built) => built,
+                    Err(error) => return rejected(&error),
+                };
+                let mut uncertain: Option<UnknownCause> = None;
+                let mut backoff = Duration::from_millis(20);
+                loop {
+                    if remaining(&deadline).is_none() {
+                        return expired(uncertain);
                     }
-                    SubmitResult::Rejected(rejection)
-                        if rejection.code == RejectCode::StorageUnavailable =>
-                    {
-                        totals.last_rejection = Some(rejection);
-                        totals.last_not_enqueued = None;
-                        pause(&mut backoff, &deadline).await;
-                    }
-                    SubmitResult::Rejected(rejection) => {
-                        return match uncertain {
-                            None => SubmitResult::Rejected(rejection),
-                            Some(cause) => SubmitResult::Unknown(cause),
-                        };
-                    }
-                    SubmitResult::NotEnqueued(reason) if transient(reason) => {
-                        totals.last_not_enqueued = Some(reason);
-                        totals.last_rejection = None;
-                        pause(&mut backoff, &deadline).await;
-                    }
-                    SubmitResult::NotEnqueued(reason) => {
-                        return match uncertain {
-                            None => SubmitResult::NotEnqueued(reason),
-                            Some(cause) => SubmitResult::Unknown(cause),
-                        };
-                    }
-                    SubmitResult::Unknown(cause) => {
-                        uncertain = Some(cause);
-                        pause(&mut backoff, &deadline).await;
+                    totals.attempts = totals.attempts.saturating_add(1);
+                    let result = match &built {
+                        Built::Local(envelope) => {
+                            self.handle
+                                .local(authority.clone(), (**envelope).clone())
+                                .await
+                        }
+                        Built::Remote(envelope) => {
+                            self.handle
+                                .submit(authority.clone(), envelope.clone())
+                                .await
+                        }
+                    };
+                    match result {
+                        SubmitResult::Committed(receipt) => {
+                            return SubmitResult::Committed(receipt);
+                        }
+                        SubmitResult::Rejected(rejection) if rejection.durable => {
+                            return SubmitResult::Rejected(rejection);
+                        }
+                        SubmitResult::Rejected(rejection)
+                            if rejection.code == RejectCode::StorageUnavailable =>
+                        {
+                            totals.last_rejection = Some(rejection);
+                            totals.last_not_enqueued = None;
+                            pause(&mut backoff, &deadline).await;
+                        }
+                        SubmitResult::Rejected(rejection) => {
+                            return match uncertain {
+                                None => SubmitResult::Rejected(rejection),
+                                Some(cause) => SubmitResult::Unknown(cause),
+                            };
+                        }
+                        SubmitResult::NotEnqueued(reason) if transient(reason) => {
+                            totals.last_not_enqueued = Some(reason);
+                            totals.last_rejection = None;
+                            pause(&mut backoff, &deadline).await;
+                        }
+                        SubmitResult::NotEnqueued(reason) => {
+                            return match uncertain {
+                                None => SubmitResult::NotEnqueued(reason),
+                                Some(cause) => SubmitResult::Unknown(cause),
+                            };
+                        }
+                        SubmitResult::Unknown(cause) => {
+                            uncertain = Some(cause);
+                            pause(&mut backoff, &deadline).await;
+                        }
                     }
                 }
             }
-        }
-        .await;
-        totals.elapsed = started.elapsed();
-        (result, totals)
+            .await;
+            totals.elapsed = started.elapsed();
+            (result, totals)
+        })
     }
 }
 
