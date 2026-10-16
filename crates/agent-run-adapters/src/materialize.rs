@@ -510,7 +510,7 @@ pub fn materialize(
 /// `admitted_skills` are the frozen role's skill identities and content
 /// revisions. Every declared skill must appear there and its captured bytes
 /// must hash to that revision, otherwise materialization fails before the
-/// index is sealed; see [`materialize_with_provider`].
+/// index is sealed.
 // Each argument is an independent, already-validated input of the one seal.
 #[allow(clippy::too_many_arguments)]
 pub fn materialize_provider(
