@@ -2565,9 +2565,12 @@ pub(crate) fn prepare_provider(
     profile
         .required_constraints
         .extend(offering.restrictions.iter().copied());
-    let role = role_plan::resolve_role_plan(
+    let skill_sources =
+        adapters::provider::effective_skill_sources(config, provider.harness, &profile)?;
+    let role = role_plan::resolve_role_plan_with_sources(
         &profile,
         config.skills_dir(),
+        &skill_sources,
         &config.mcp,
         if request.account.is_some() {
             "account"

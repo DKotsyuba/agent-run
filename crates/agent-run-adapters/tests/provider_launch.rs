@@ -2,12 +2,14 @@
 
 use agent_run_adapters::{
     authorized_request::CredentialReader,
-    provider::{materialize_selected, plan_selected},
+    provider::{effective_skill_sources, materialize_selected, plan_selected},
 };
 use agent_run_config::{
     profiles::Profile,
     provider_config::ProviderConfig,
-    role_plan::{ResolvedRolePlan, resolve_role_plan},
+    role_plan::{
+        ResolvedRolePlan, resolve_role_plan, resolve_role_plan_with_sources, tree_revision,
+    },
 };
 use agent_run_domain::{
     CredentialRef, Result, Sha256Digest,
@@ -1159,4 +1161,345 @@ fn opencode_launch_isolates_ambient_state_and_selected_credentials() {
             assert!(!native.contains(secret));
         }
     }
+}
+
+/// Read-only canonical profile declaring `skills`.
+fn skill_profile(skills: &[&str]) -> Profile {
+    Profile {
+        name: "review".into(),
+        body: "Review safely.".into(),
+        write: false,
+        network: false,
+        revision: "1".into(),
+        canonical: true,
+        allow_external_read_roots: false,
+        read_roots: vec![],
+        skills: skills.iter().map(|skill| (*skill).to_owned()).collect(),
+        mcp: vec![],
+        mcp_tools: Default::default(),
+        required_constraints: BTreeSet::from([Constraint::WebToolsDisabled]),
+    }
+}
+
+/// Freezes a role declaring `skills`, hashed from `<root>/skills` at call time.
+fn skill_role(root: &Path, skills: &[&str]) -> ResolvedRolePlan {
+    resolve_role_plan(
+        &skill_profile(skills),
+        &root.join("skills"),
+        &BTreeMap::new(),
+        "account",
+        Some("work"),
+    )
+    .unwrap()
+}
+
+/// Writes one catalog skill directory and returns it.
+fn catalog_skill(root: &Path, name: &str, text: &str) -> std::path::PathBuf {
+    let dir = root.join("skills").join(name);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("SKILL.md"), text).unwrap();
+    dir
+}
+
+/// Materializes `role` for one provider into `<root>/<home>` with the fixture config.
+fn materialize_skill_home(
+    root: &Path,
+    provider: &str,
+    role: &ResolvedRolePlan,
+    home: &str,
+) -> Result<(agent_run_adapters::materialize::Snapshot, Sha256Digest)> {
+    let config = config(root, &fake_engine(root));
+    let catalog = catalog(&config);
+    let (model, account) = match provider {
+        "codex-plus" => ("gpt", "acct-native"),
+        _ => ("sonnet", "acct-claude"),
+    };
+    materialize_selected(
+        &config,
+        &catalog,
+        &provider.parse().unwrap(),
+        model,
+        &account.parse().unwrap(),
+        role,
+        root,
+        &root.join(home),
+        root,
+    )
+}
+
+/// Returns where `provider` places a copied catalog skill below its run home.
+fn copied_skill(root: &Path, provider: &str, home: &str, name: &str) -> std::path::PathBuf {
+    let base = root.join(home);
+    match provider {
+        "codex-plus" => base.join("skills").join(name),
+        _ => base.join("plugins").join(name).join("skills").join(name),
+    }
+}
+
+/// A catalog change between admission and initial capture is refused for every
+/// harness shape, names only the skill and never seals the generated index.
+#[test]
+fn changed_skill_between_admission_and_capture_is_refused() {
+    for provider in ["codex-plus", "claude-main"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let dir = catalog_skill(root, "demo", "Admitted text.\n");
+        let role = skill_role(root, &["demo"]);
+        fs::write(dir.join("SKILL.md"), "Edited after admission.\n").unwrap();
+        let error = materialize_skill_home(root, provider, &role, "run").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("skill content differs from admitted revision: demo"),
+            "{provider}: {error}"
+        );
+        assert!(!error.to_string().contains(root.to_str().unwrap()));
+        let index =
+            fs::read_to_string(root.join("run/.agent-run-snapshots.json")).unwrap_or_default();
+        assert!(
+            !index.contains("materialize_revision"),
+            "{provider}: sealed"
+        );
+    }
+}
+
+/// A catalog link retargeted after admission is refused when its bytes differ and
+/// accepted only when the new target holds exactly the admitted bytes.
+#[test]
+fn retargeted_skill_source_is_checked_against_admitted_bytes() {
+    for provider in ["codex-plus", "claude-main"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let outside = root.join("outside");
+        for (name, text) in [
+            ("admitted", "Admitted text.\n"),
+            ("other", "Other text.\n"),
+            ("same", "Admitted text.\n"),
+        ] {
+            fs::create_dir_all(outside.join(name)).unwrap();
+            fs::write(outside.join(name).join("SKILL.md"), text).unwrap();
+        }
+        fs::create_dir_all(root.join("skills")).unwrap();
+        let link = root.join("skills/demo");
+        std::os::unix::fs::symlink(outside.join("admitted"), &link).unwrap();
+        let role = skill_role(&root, &["demo"]);
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(outside.join("other"), &link).unwrap();
+        let error = materialize_skill_home(&root, provider, &role, "refused").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("differs from admitted revision: demo"),
+            "{provider}: {error}"
+        );
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(outside.join("same"), &link).unwrap();
+        materialize_skill_home(&root, provider, &role, "accepted").unwrap();
+        assert_eq!(
+            fs::read_to_string(copied_skill(&root, provider, "accepted", "demo").join("SKILL.md"))
+                .unwrap(),
+            "Admitted text.\n"
+        );
+    }
+}
+
+/// An unchanged catalog launches, the sealed home is reused unchanged by later
+/// plans even after the catalog moves on, and post-seal tampering is still refused.
+#[test]
+fn unchanged_skill_seals_and_sealed_home_is_reused_after_catalog_drift() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let dir = catalog_skill(root, "demo", "Admitted text.\n");
+    let role = skill_role(root, &["demo"]);
+    let (_, digest) = materialize_skill_home(root, "claude-main", &role, "run").unwrap();
+    let config = config(root, &fake_engine(root));
+    let catalog = catalog(&config);
+    let provider: ProviderId = "claude-main".parse().unwrap();
+    let authority = make_authority(
+        &catalog,
+        &provider,
+        "sonnet",
+        &role,
+        root,
+        digest,
+        "acct-claude",
+    );
+    let plan = |home: &Path| {
+        plan_selected(
+            &config,
+            &catalog,
+            &authority,
+            &"acct-claude".parse().unwrap(),
+            home,
+            root,
+            &BTreeMap::from([("HOME".into(), root.display().to_string())]),
+            &FakeReader,
+            "task",
+            None,
+        )
+    };
+    plan(&root.join("run")).unwrap();
+    fs::write(dir.join("SKILL.md"), "Catalog moved on.\n").unwrap();
+    plan(&root.join("run")).unwrap();
+    let sealed = copied_skill(root, "claude-main", "run", "demo").join("SKILL.md");
+    assert_eq!(fs::read_to_string(&sealed).unwrap(), "Admitted text.\n");
+    fs::set_permissions(&sealed, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(&sealed, "Tampered after seal.\n").unwrap();
+    assert!(plan(&root.join("run")).is_err());
+}
+
+/// Builds a Claude plugin shipping `skills/demo/SKILL.md` with `text`.
+fn plugin_with_skill(root: &Path, text: &str) -> std::path::PathBuf {
+    let plugin = root.join("demo-plugin");
+    fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
+    fs::write(
+        plugin.join(".claude-plugin/plugin.json"),
+        serde_json::json!({"name":"demo-plugin","version":"1.0.0"}).to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(plugin.join("skills/demo")).unwrap();
+    fs::write(plugin.join("skills/demo/SKILL.md"), text).unwrap();
+    plugin
+}
+
+/// Adds `plugin` to the harness `provider` runs on.
+fn add_plugin(config: &mut ProviderConfig, provider: &str, plugin: std::path::PathBuf) {
+    let harness = if provider == "codex-plus" {
+        HarnessId::Codex
+    } else {
+        HarnessId::ClaudeCode
+    };
+    config
+        .harnesses
+        .get_mut(&harness)
+        .unwrap()
+        .plugins
+        .push(plugin);
+}
+
+/// Returns the model and account the fixture binds for `provider`.
+fn model_account(provider: &str) -> (&'static str, &'static str) {
+    match provider {
+        "glm-any" => ("glm", "acct-glm"),
+        "codex-plus" => ("gpt", "acct-native"),
+        _ => ("sonnet", "acct-claude"),
+    }
+}
+
+/// An unchanged configured plugin launches whether its bytes equal or differ from
+/// a catalog duplicate, because admission records the plugin's revision as the
+/// effective source. Changing that plugin after admission, or admitting without
+/// the plugin-aware sources, is refused for every harness shape.
+#[test]
+fn configured_plugin_skill_is_admitted_and_checked_as_effective_source() {
+    for text in ["Admitted text.\n", "Plugin text.\n"] {
+        for provider in ["claude-main", "glm-any", "codex-plus"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            catalog_skill(root, "demo", "Admitted text.\n");
+            let plugin = plugin_with_skill(root, text);
+            let mut config = config(root, &fake_engine(root));
+            add_plugin(&mut config, provider, plugin.clone());
+            let catalog = catalog(&config);
+            let (model, account) = model_account(provider);
+            let harness = catalog
+                .provider(&provider.parse().unwrap())
+                .unwrap()
+                .harness;
+            let profile = skill_profile(&["demo"]);
+            let sources = effective_skill_sources(&config, harness, &profile).unwrap();
+            assert_eq!(sources.len(), 1, "{provider}");
+            let role = resolve_role_plan_with_sources(
+                &profile,
+                &root.join("skills"),
+                &sources,
+                &BTreeMap::new(),
+                "account",
+                Some("work"),
+            )
+            .unwrap();
+            // Truthful provenance: the revision names the plugin bytes that will run.
+            assert_eq!(
+                role.skills[0].revision,
+                tree_revision(&plugin.join("skills/demo")).unwrap()
+            );
+            assert_eq!(
+                role.skills[0].revision == skill_role(root, &["demo"]).skills[0].revision,
+                text == "Admitted text.\n"
+            );
+            let launch = |role: &ResolvedRolePlan, home: &str| {
+                materialize_selected(
+                    &config,
+                    &catalog,
+                    &provider.parse().unwrap(),
+                    model,
+                    &account.parse().unwrap(),
+                    role,
+                    root,
+                    &root.join(home),
+                    root,
+                )
+            };
+            let (snapshot, _) = launch(&role, "run").unwrap();
+            assert_eq!(snapshot.plugin_paths.len(), 1, "{provider}");
+            if provider == "codex-plus" {
+                assert_eq!(
+                    fs::read_to_string(root.join("run/skills/demo/SKILL.md")).unwrap(),
+                    text
+                );
+            }
+            // Admission that ignores the plugin records the catalog bytes; a
+            // plugin that differs from them is refused rather than mislabeled.
+            if text != "Admitted text.\n" {
+                let error = launch(&skill_role(root, &["demo"]), "unaware").unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("differs from admitted revision: demo"),
+                    "{provider}: {error}"
+                );
+            }
+            // Post-admission change of the effective plugin is always refused.
+            fs::write(
+                plugin.join("skills/demo/SKILL.md"),
+                "Changed after admission.\n",
+            )
+            .unwrap();
+            let error = launch(&role, "changed").unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("differs from admitted revision: demo"),
+                "{provider}: {error}"
+            );
+        }
+    }
+}
+
+/// Restricted research uses no plugin, so the catalog skill stays the effective source.
+#[test]
+fn research_profiles_keep_catalog_skill_sources() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    catalog_skill(root, "demo", "Admitted text.\n");
+    let mut config = config(root, &fake_engine(root));
+    add_plugin(
+        &mut config,
+        "claude-main",
+        plugin_with_skill(root, "Plugin text.\n"),
+    );
+    let mut profile = skill_profile(&["demo"]);
+    profile.required_constraints = BTreeSet::from([Constraint::ResearchToolsOnly]);
+    assert!(
+        effective_skill_sources(&config, HarnessId::ClaudeCode, &profile)
+            .unwrap()
+            .is_empty()
+    );
+    profile.required_constraints = BTreeSet::from([Constraint::WebToolsDisabled]);
+    assert_eq!(
+        effective_skill_sources(&config, HarnessId::ClaudeCode, &profile)
+            .unwrap()
+            .len(),
+        1
+    );
 }

@@ -61,7 +61,12 @@ cargo xtask archive --revision HEAD \
 `build-native` seals the current host binaries. The sealed directory contains the
 runtime, the separate `bin/agent-run-tui` observer, `bin/agent-run-deploy` (the native xtask deployment entry point), external
 quota scripts, metadata, `SHA256SUMS`, and the `COMPLETE` marker. It contains no
-interpreter, virtual environment, or package installation. Cross-platform
+interpreter, virtual environment, or package installation. `release verify` and the
+installer treat that directory as a closed inventory of regular files: every file
+except `SHA256SUMS` and `COMPLETE` must be listed with a matching hash, and an
+unlisted executable or asset (including a stray `bin/agent-run-tui`), a symlink or a
+special file is refused. Legacy releases that never listed a TUI stay valid. This
+is local candidate integrity, not an attestation of the downloaded archive. Cross-platform
 release archives are built on their matching hosted runners, not by relabelling
 one host's binary.
 

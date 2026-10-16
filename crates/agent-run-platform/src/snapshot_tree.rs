@@ -35,6 +35,63 @@ pub struct TreeSnapshot {
     pub manifest_path: PathBuf,
     /// Canonically sorted paths represented by the manifest.
     pub entries: Vec<String>,
+    /// [`content_revision`] of the exact entries and bytes published, equal to
+    /// the revision any admission-time walk of an identical tree computes.
+    pub content_revision: String,
+}
+
+/// One tree entry for [`content_revision`]: a directory, or a regular file's
+/// byte length and lowercase SHA-256.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevisionEntry {
+    /// A directory entry.
+    Directory,
+    /// A regular file with its exact byte length and SHA-256 hex digest.
+    File(usize, String),
+}
+
+/// Hashes a content tree into the role-skill revision recorded at admission.
+///
+/// `items` pairs each `/`-joined path relative to the tree root with its
+/// [`RevisionEntry`]; order is irrelevant because entries are sorted by path
+/// string. The digest is SHA-256 over the compact canonical JSON array of
+/// `[path, "directory"]` / `[path, "file", bytes, sha256]` rows. File modes
+/// and manifest metadata are deliberately excluded, so the value is stable
+/// across the admission walk and the published snapshot manifest.
+pub fn content_revision(items: impl IntoIterator<Item = (String, RevisionEntry)>) -> String {
+    let mut rows: Vec<(String, Value)> = items
+        .into_iter()
+        .map(|(path, entry)| {
+            let row = match entry {
+                RevisionEntry::Directory => json!([path, "directory"]),
+                RevisionEntry::File(bytes, sha256) => json!([path, "file", bytes, sha256]),
+            };
+            (path, row)
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    canonical::sha256_hex(
+        &Value::Array(rows.into_iter().map(|row| row.1).collect()),
+        true,
+    )
+}
+
+/// [`content_revision`] of manifest entries produced by `read_tree`.
+fn manifest_revision(entries: &[Value]) -> String {
+    content_revision(entries.iter().filter_map(|entry| {
+        let path = entry["path"].as_str()?.to_owned();
+        match entry["type"].as_str()? {
+            "directory" => Some((path, RevisionEntry::Directory)),
+            "file" => Some((
+                path,
+                RevisionEntry::File(
+                    usize::try_from(entry["bytes"].as_u64()?).ok()?,
+                    entry["sha256"].as_str()?.to_owned(),
+                ),
+            )),
+            _ => None,
+        }
+    }))
 }
 
 /// Non-destructive classification of one tree's recovery state.
@@ -388,6 +445,7 @@ pub fn snapshot_managed_tree(
             .iter()
             .filter_map(|entry| entry["path"].as_str().map(str::to_owned))
             .collect(),
+        content_revision: manifest_revision(&entries),
     })
 }
 

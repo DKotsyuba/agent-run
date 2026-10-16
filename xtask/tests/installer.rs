@@ -674,3 +674,95 @@ fn adding_tui_to_an_existing_release_requires_a_new_version() {
     release::verify(&fixture.candidate).unwrap();
     assert!(!fixture.candidate.join("bin/agent-run-tui").exists());
 }
+
+/// Asserts a refused install left the prefix, journal, launchers and releases as captured.
+fn assert_untouched(fixture: &Fixture, pointer: &Option<PathBuf>, journal: &Option<Vec<u8>>) {
+    assert_eq!(&fs::read_link(fixture.prefix.join("current")).ok(), pointer);
+    assert_eq!(&fs::read(fixture.prefix.join("deploy.json")).ok(), journal);
+    assert!(!fixture.prefix.join("releases/1.0.0").exists());
+}
+
+/// An executable or asset added to a sealed candidate after sealing is refused by the
+/// verifier and the installer before any release, pointer, journal or launcher change.
+#[test]
+fn unlisted_candidate_files_are_refused_without_changes() {
+    for added in [
+        "bin/agent-run-tui",
+        "bin/agent-run-extra",
+        "collectors/extra.sh",
+        "extra.txt",
+    ] {
+        for existing in [false, true] {
+            let fixture = Fixture::new();
+            if existing {
+                let legacy = release::build_with_installer(
+                    &fixture.temporary.path().join("old"),
+                    "0.9.0",
+                    &fixture.temporary.path().join("runtime"),
+                    Path::new(env!("CARGO_BIN_EXE_xtask")),
+                    None,
+                )
+                .unwrap();
+                installer::install(
+                    &legacy,
+                    &fixture.prefix,
+                    &fixture.home,
+                    &fixture.bin,
+                    "0.9.0",
+                )
+                .unwrap();
+            }
+            let pointer = fs::read_link(fixture.prefix.join("current")).ok();
+            let journal = fs::read(fixture.prefix.join("deploy.json")).ok();
+            let launchers = fs::read_dir(&fixture.bin).map(|d| d.count()).unwrap_or(0);
+            let extra = fixture.candidate.join(added);
+            fs::write(&extra, "added after sealing").unwrap();
+            executable(&extra, "#!/bin/sh\necho added\n");
+            assert!(release::verify(&fixture.candidate).is_err(), "{added}");
+            let error = fixture.install().unwrap_err();
+            assert!(error.contains("unlisted file"), "{added}: {error}");
+            assert_untouched(&fixture, &pointer, &journal);
+            assert_eq!(
+                fs::read_dir(&fixture.bin).map(|d| d.count()).unwrap_or(0),
+                launchers
+            );
+            assert!(!fixture.bin.join("agent-run-tui").exists());
+            assert!(extra.is_file(), "refusal must not delete the extra file");
+        }
+    }
+}
+
+/// An unlisted file inside an already installed same-version release is refused even
+/// when the candidate's manifest is byte-identical, and nothing is repaired or removed.
+#[test]
+fn unlisted_file_in_installed_release_is_refused_and_preserved() {
+    let fixture = Fixture::new();
+    fixture.install().unwrap();
+    let installed = fixture.prefix.join("releases/1.0.0");
+    let pointer = fs::read_link(fixture.prefix.join("current")).ok();
+    let journal = fs::read(fixture.prefix.join("deploy.json")).ok();
+    executable(
+        &installed.join("bin/agent-run-tui"),
+        "#!/bin/sh\necho added\n",
+    );
+    assert!(release::verify(&installed).is_err());
+    let error = fixture.install().unwrap_err();
+    assert!(error.contains("unlisted file"), "{error}");
+    assert_eq!(fs::read_link(fixture.prefix.join("current")).ok(), pointer);
+    assert_eq!(fs::read(fixture.prefix.join("deploy.json")).ok(), journal);
+    assert!(installed.join("bin/agent-run-tui").is_file());
+    assert!(!fixture.bin.join("agent-run-tui").exists());
+}
+
+/// Supported legacy (no observer) and complete (observer listed) inventories install.
+#[test]
+fn legacy_and_complete_inventories_still_install() {
+    let legacy = Fixture::new();
+    release::verify(&legacy.candidate).unwrap();
+    legacy.install().unwrap();
+    assert!(!legacy.bin.join("agent-run-tui").exists());
+    let complete = Fixture::with_tui(true);
+    release::verify(&complete.candidate).unwrap();
+    complete.install().unwrap();
+    assert!(complete.bin.join("agent-run-tui").is_file());
+}

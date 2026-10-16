@@ -139,6 +139,37 @@ fn shared(config: &ProviderConfig, worker_mcp: bool) -> Result<Config> {
     Ok(shared)
 }
 
+/// Returns the plugin-supplied skill directories a launch of `profile` on
+/// `harness` will consume instead of the catalog copy.
+///
+/// Admission passes the result to
+/// [`agent_run_config::role_plan::resolve_role_plan_with_sources`] so the
+/// recorded skill revision describes the effective source that
+/// [`materialize_selected`] later checks. It applies the same selection as the
+/// materializer: a configured plugin shipping `skills/<id>/SKILL.md` wins, two
+/// plugins shipping one id are refused, and restricted research profiles use
+/// no plugin so the map is empty. Errors when the harness is not configured.
+pub fn effective_skill_sources(
+    config: &ProviderConfig,
+    harness: HarnessId,
+    profile: &Profile,
+) -> Result<BTreeMap<String, PathBuf>> {
+    let native = config
+        .harnesses
+        .get(&harness)
+        .ok_or_else(|| invalid("unknown harness"))?;
+    let mut sources = BTreeMap::new();
+    if profile.research_tools_only() {
+        return Ok(sources);
+    }
+    for skill in &profile.skills {
+        if let Some(source) = crate::plugins::plugin_skill_dir(&native.plugins, skill)? {
+            sources.insert(skill.clone(), source);
+        }
+    }
+    Ok(sources)
+}
+
 /// Reconstructs role grants from a validated canonical plan rather than a
 /// mutable profile file; the materializer still verifies skill/MCP assets.
 /// Includes the built-in worker namespace only when frozen in the role.
@@ -336,6 +367,7 @@ pub fn materialize_selected(
         definition,
         native_model,
         &config_sha256,
+        &role.skills,
     )?;
     Ok((snapshot, Sha256Digest::from_str(&digest)?))
 }

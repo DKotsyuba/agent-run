@@ -22,7 +22,8 @@ cargo xtask release verify --release "$release_root/releases/X.Y.Z"
 ```
 
 A valid sealed directory contains `bin/agent-run`, `metadata.json`,
-`SHA256SUMS`, and `COMPLETE`. Never switch `current` to a directory that fails
+`SHA256SUMS`, and `COMPLETE`, plus only regular files that `SHA256SUMS` lists; an
+unlisted file, symlink or special file fails verification. Never switch `current` to a directory that fails
 `cargo xtask release verify`.
 
 ## Update and rollback
