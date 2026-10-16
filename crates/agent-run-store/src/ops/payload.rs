@@ -18,7 +18,7 @@ use agent_run_domain::{
     provider_start::ProviderStartRequest,
     quota_snapshot::NormalizedQuotaSnapshot,
     storage::{OperationId, PayloadDigest},
-    worker::{FinishRequest, NotifyRequest, WorkerCatalogProof},
+    worker::{FinishGuard, FinishRequest, NotifyRequest, WorkerCatalogProof},
 };
 use agent_run_platform::{
     process::{Cleanup, Identity, OwnershipSnapshot},
@@ -778,6 +778,12 @@ pub struct AcceptWorkerFinish {
     pub input: FinishRequest,
     /// Acceptance time.
     pub at: f64,
+    /// The broker writer handle's pre-SQL launch-secret verdict. Never
+    /// serialized: it is not part of the payload digest, envelope bytes or any
+    /// receipt. Constructors pass [`FinishGuard::Unavailable`]; only
+    /// [`super::LocalEnvelope::set_finish_guard`] changes it before SQL.
+    #[serde(skip)]
+    pub guard: FinishGuard,
 }
 
 /// 46 — queue one worker report (worker authority).

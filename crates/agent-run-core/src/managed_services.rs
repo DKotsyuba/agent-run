@@ -1055,6 +1055,7 @@ pub async fn bootstrap(home: &Path, id: &str) -> Result<()> {
             attempt: None,
             generation: Some(id.to_owned()),
             capability_hex: Some(secret.iter().map(|byte| format!("{byte:02x}")).collect()),
+            finish_guard: None,
         },
         agent_run_domain::storage::ProducerId {
             kind: agent_run_domain::storage::ProducerKind::ServiceExec,

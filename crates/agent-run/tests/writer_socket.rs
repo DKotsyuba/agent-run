@@ -120,13 +120,28 @@ impl Fixture {
     /// Admits one `starting` execution whose startup owner is THIS process,
     /// then starts the writer service and the socket server.
     async fn new(limits: ConnectionLimits) -> Self {
-        Self::with_assembly(limits, None).await
+        Self::build(limits, None, false).await
     }
 
     /// [`Self::new`] with an explicit frame-assembly budget.
     async fn with_assembly(
         limits: ConnectionLimits,
         assembly: Option<agent_run_core::writer_limits::AssemblyBudget>,
+    ) -> Self {
+        Self::build(limits, assembly, false).await
+    }
+
+    /// [`Self::new`] whose execution admitted explicit finish and already runs
+    /// attempt `attempt` with the worker capability [`WORKER_TOKEN`].
+    async fn explicit() -> Self {
+        Self::build(ConnectionLimits::default(), None, true).await
+    }
+
+    /// Shared constructor; `explicit` also seeds the running finish attempt.
+    async fn build(
+        limits: ConnectionLimits,
+        assembly: Option<agent_run_core::writer_limits::AssemblyBudget>,
+        explicit: bool,
     ) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().canonicalize().unwrap();
@@ -151,6 +166,7 @@ impl Fixture {
             "task": "fixture task", "workdir": home,
         }))
         .unwrap();
+        request.explicit_finish = explicit;
         request.validate().unwrap();
         let capability = format!(
             "{}{}",
@@ -175,6 +191,20 @@ impl Fixture {
             store
                 .record_startup_owner(&id, &serde_json::to_value(me).unwrap())
                 .unwrap();
+            if explicit {
+                store
+                    .conn
+                    .execute(
+                        "UPDATE agents SET status='running' WHERE id=?",
+                        [id.as_str()],
+                    )
+                    .unwrap();
+                store.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES('attempt',?,1,'running','{}',1.0,1)", [id.as_str()]).unwrap();
+                store
+                    .issue_worker_capability(&id, "attempt", WORKER_TOKEN, 1.0)
+                    .unwrap();
+                store.begin_worker_lifecycle(&id, "attempt", 1.0).unwrap();
+            }
             id
         };
         let service = WriterService::start(&home, WriterConfig::default()).unwrap();
@@ -374,6 +404,7 @@ async fn unverified_owner_claims_never_hold_owner_slots() {
         attempt: None,
         generation: None,
         capability_hex: Some(capability.to_owned()),
+        finish_guard: None,
     };
     let unknown = "ag-20260101-000000-ffffffffff";
     let fakes = [
@@ -558,6 +589,7 @@ async fn a_forged_critical_opcode_cannot_take_the_protected_reserve() {
         attempt: None,
         generation: None,
         capability_hex: None,
+        finish_guard: None,
     };
     let me = process::inspect(std::process::id() as i32).unwrap();
     let broker = agent_run_core::broker_writer::BrokerWriter::new(
@@ -730,6 +762,7 @@ async fn identical_envelope_is_applied_once_across_a_lost_acknowledgement() {
         attempt: None,
         generation: None,
         capability_hex: Some(fixture.capability.clone()),
+        finish_guard: None,
     };
     /// Connects to the writer socket, introduces itself with `hello` and returns
     /// the acknowledged stream.
@@ -856,5 +889,235 @@ async fn identical_envelope_is_applied_once_across_a_lost_acknowledgement() {
     assert!(answered.replayed);
     assert_eq!(count(&fixture.home), 2, "the retry applied nothing again");
     drop(retry);
+    fixture.finish().await;
+}
+
+/// Attempt-bound worker capability seeded by [`Fixture::explicit`].
+const WORKER_TOKEN: &str = "ffffffffffffffffffffffffffffffff33333333333333333333333333333333";
+/// Synthetic launch secret installed as the supervisor's finish context.
+const LAUNCH_SECRET: &str = "synthetic-launch-credential-91c2";
+
+/// Submits one finish exactly as the broker does for any worker tool call
+/// (the private MCP proxy or a direct socket client alike).
+async fn broker_finish(
+    lane: &agent_run_core::broker_writer::BrokerLane,
+    id: &AgentId,
+    summary: &str,
+) -> SubmitResult {
+    lane.local_raw(
+        agent_run_domain::storage::WriteAuthority::Worker {
+            execution: id.clone(),
+            attempt: "attempt".into(),
+        },
+        ops::AcceptWorkerFinish {
+            execution: id.clone(),
+            attempt: "attempt".into(),
+            token: WORKER_TOKEN.into(),
+            input: agent_run_domain::worker::FinishRequest {
+                summary: summary.into(),
+                status: agent_run_domain::worker::FinishStatus::Done,
+            },
+            at: agent_run_core::domain::now(),
+            guard: agent_run_domain::worker::FinishGuard::Unavailable,
+        },
+        Duration::from_secs(10),
+    )
+    .await
+}
+
+/// Waits (bounded) until a broker finish of `summary` is refused with `code`.
+async fn refused_with(
+    lane: &agent_run_core::broker_writer::BrokerLane,
+    id: &AgentId,
+    summary: &str,
+    code: agent_run_domain::storage::RejectCode,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match broker_finish(lane, id, summary).await {
+            SubmitResult::Rejected(rejection) if rejection.code == code => return,
+            other => assert!(
+                std::time::Instant::now() < deadline,
+                "expected {code:?}, got {other:?}"
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The broker refuses a first finish intent unless a verified supervisor
+/// connection installed its attempt's launch-secret context, and refuses one
+/// carrying a known launch secret, whoever submits it. Operators and
+/// unverified claims cannot install a context, a stale connection closing
+/// never retires its replacement's context, and an accepted intent's exact
+/// replay is still answered while the context is unavailable.
+#[tokio::test]
+async fn first_finish_intent_requires_the_supervisor_launch_context() {
+    use agent_run_core::storage_client::{FinishGuardContext, Hello};
+    use agent_run_core::storage_wire::{self as wire, Message};
+    use agent_run_domain::storage::RejectCode;
+    let fixture = Fixture::explicit().await;
+    let writer = agent_run_core::broker_writer::BrokerWriter::new(
+        fixture.service.as_ref().unwrap().handle(),
+    );
+    let lane = writer.lane("workers");
+    let id = fixture.id.clone();
+    let context = FinishGuardContext(std::collections::BTreeMap::from([(
+        "PROVIDER_TOKEN".to_owned(),
+        LAUNCH_SECRET.to_owned(),
+    )]));
+    let leaked = format!(r#"{{"ok":true,"note":"{LAUNCH_SECRET}"}}"#);
+    let clean = "{ \"ok\" : true }";
+    let intent = || {
+        agent_run_store::writer::StoreReader::open(&fixture.home)
+            .unwrap()
+            .worker_finish_intent(&id, false)
+            .unwrap()
+    };
+
+    // No supervisor context yet: even a clean finish creates no intent, and
+    // neither its summary nor any intent or event reaches durable storage.
+    let probe = r#"{"ok":true,"probe":"unavailable-marker-5d1"}"#;
+    refused_with(&lane, &id, probe, RejectCode::Unsupported).await;
+
+    // An operator hello and an unverified supervisor claim carrying a context
+    // install nothing.
+    for (role, capability) in [("cli", None), ("supervisor", Some("0".repeat(64)))] {
+        let mut stream = tokio::net::UnixStream::connect(&fixture.socket)
+            .await
+            .unwrap();
+        let hello = Hello {
+            protocol: agent_run_domain::storage::WRITE_PROTOCOL,
+            role: role.into(),
+            logical: Some(id.to_string()),
+            execution: Some(id.to_string()),
+            attempt: Some("attempt".into()),
+            generation: None,
+            capability_hex: capability,
+            finish_guard: Some(context.clone()),
+        };
+        wire::write_frame(
+            &mut stream,
+            Message::Hello,
+            0,
+            1,
+            &serde_json::to_vec(&hello).unwrap(),
+        )
+        .await
+        .unwrap();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            wire::read_header(&mut stream, |m, _| {
+                (m == Message::HelloOk).then_some(wire::HELLO_MAX)
+            }),
+        )
+        .await;
+        refused_with(&lane, &id, probe, RejectCode::Unsupported).await;
+    }
+
+    // Two verified supervisor connections install the same attempt context.
+    let first = fixture.producer(&fixture.capability);
+    first.repin(Some("attempt".into())).await.unwrap();
+    first.set_finish_guard(Some(context.clone())).await.unwrap();
+    refused_with(&lane, &id, &leaked, RejectCode::Validation).await;
+    let second = fixture.producer(&fixture.capability);
+    second.repin(Some("attempt".into())).await.unwrap();
+    second
+        .set_finish_guard(Some(context.clone()))
+        .await
+        .unwrap();
+    // Re-sending the hello on the same connection (an idle refresh) keeps
+    // that connection's context installed.
+    for _ in 0..3 {
+        second.refresh().await.unwrap();
+        refused_with(&lane, &id, &leaked, RejectCode::Validation).await;
+    }
+    // The older connection closing does not retire the newer context.
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    refused_with(&lane, &id, &leaked, RejectCode::Validation).await;
+    assert!(intent().is_none());
+
+    // Once the last verified connection closes, its context is retired.
+    drop(second);
+    refused_with(&lane, &id, &leaked, RejectCode::Unsupported).await;
+    assert!(intent().is_none());
+
+    // A reconnected supervisor restores the context; a clean formatted
+    // summary is then accepted once, with its exact bytes.
+    let third = fixture.producer(&fixture.capability);
+    third.repin(Some("attempt".into())).await.unwrap();
+    third.set_finish_guard(Some(context.clone())).await.unwrap();
+    assert!(matches!(
+        broker_finish(&lane, &id, clean).await,
+        SubmitResult::Committed(_)
+    ));
+    assert_eq!(intent().unwrap().summary, clean);
+
+    // Without any context the exact replay is still answered, and a changed
+    // payload still conflicts.
+    drop(third);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(matches!(
+        broker_finish(&lane, &id, clean).await,
+        SubmitResult::Committed(_)
+    ));
+    assert!(matches!(
+        broker_finish(&lane, &id, "{\"ok\":false}").await,
+        SubmitResult::Rejected(ref r) if r.code == RejectCode::Conflict
+    ));
+    assert_eq!(intent().unwrap().summary, clean);
+    let events: i64 = agent_run_store::writer::StoreReader::open(&fixture.home)
+        .unwrap()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='worker_finish_accepted_v1'",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(events, 1);
+    for file in ["state.db", "state.db-wal", "state.db-shm"] {
+        if let Ok(bytes) = std::fs::read(fixture.home.join(file)) {
+            for needle in [LAUNCH_SECRET, "unavailable-marker-5d1"] {
+                assert!(
+                    !bytes
+                        .windows(needle.len())
+                        .any(|window| window == needle.as_bytes()),
+                    "{needle} persisted in {file}"
+                );
+            }
+        }
+    }
+    fixture.finish().await;
+}
+
+/// A launch-secret context larger than the closed hello bound is refused by
+/// the supervisor facade before anything is sent, with a fixed diagnostic that
+/// echoes no value, so the native engine is never released without it.
+#[tokio::test]
+async fn oversized_finish_context_fails_before_any_send() {
+    let fixture = Fixture::explicit().await;
+    let mut persist = Persist::open(
+        &fixture.home,
+        &fixture.id,
+        fixture.producer(&fixture.capability),
+    )
+    .unwrap();
+    let value = "v".repeat(agent_run_core::storage_wire::FINISH_GUARD_MAX + 1);
+    let error = persist
+        .install_finish_guard(&std::collections::BTreeMap::from([(
+            "PROVIDER_TOKEN".to_owned(),
+            value.clone(),
+        )]))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, agent_run_core::Error::Validation(_)));
+    assert_eq!(
+        error.to_string(),
+        "launch secret context exceeds the writer hello bound"
+    );
+    assert!(!error.to_string().contains(&value[..32]));
+    drop(persist);
     fixture.finish().await;
 }

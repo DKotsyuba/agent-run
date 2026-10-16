@@ -58,6 +58,19 @@ impl Redactor {
             .unwrap_or_else(|_| redact_literals(text, &self.literals))
     }
 
+    /// Returns whether `text` carries material this redactor would remove: a
+    /// launch-secret literal in the raw bytes, or, when the trimmed text is a
+    /// JSON document, a literal revealed by string unescaping or a string
+    /// value under a credential-shaped key. JSON formatting, key order and
+    /// escaping choices alone never count, unlike comparing [`Self::redact`]
+    /// output, which compacts JSON. Used to refuse, never to rewrite, exact
+    /// worker summaries.
+    pub fn contains_secret(&self, text: &str) -> bool {
+        redact_literals(text, &self.literals) != text
+            || serde_json::from_str::<Value>(text.trim())
+                .is_ok_and(|value| self.redact_value(&value) != value)
+    }
+
     /// Sanitizes a parsed native event without losing literal matching to
     /// JSON string escaping or leaking a secret used as an object key.
     pub fn redact_value(&self, value: &Value) -> Value {

@@ -85,3 +85,35 @@ fn streaming_redaction_without_literals_preserves_text() {
     assert_eq!(stream.feed(" 1 "), " 1 ");
     assert_eq!(stream.finish(), "");
 }
+
+/// Secret detection for exact worker summaries ignores harmless JSON
+/// formatting, key order and escaping choices, yet still finds literals,
+/// literals hidden by JSON escaping and credential-shaped string fields.
+#[test]
+fn contains_secret_separates_credentials_from_json_normalization() {
+    let redactor = Redactor::from_environment(&BTreeMap::from([(
+        "SERVICE_TOKEN".into(),
+        "synthetic-secret".into(),
+    )]));
+    for clean in [
+        "{ \"ok\" : true }",
+        "{\n  \"b\": 1,\n  \"a\": \"caf\\u00e9\"\n}",
+        "[1, 2.50, \"x\\/y\"]",
+        "plain text summary",
+        "{\"tokens_used\": 12}",
+    ] {
+        assert!(!redactor.contains_secret(clean), "{clean}");
+    }
+    // Transcript redaction still compacts JSON, which is why byte comparison
+    // with its output cannot detect secrets in an exact summary.
+    assert_eq!(redactor.redact("{ \"ok\" : true }"), "{\"ok\":true}");
+    for leaked in [
+        "leaked synthetic-secret",
+        "{ \"note\" : \"synthetic-secret\" }",
+        "{\"note\":\"synthetic-secre\\u0074\"}",
+        "{\"synthetic-secret\":1}",
+        "{\"api_key\":\"other\"}",
+    ] {
+        assert!(redactor.contains_secret(leaked), "{leaked}");
+    }
+}

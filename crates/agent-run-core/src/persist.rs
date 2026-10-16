@@ -18,7 +18,8 @@ use crate::{
     Error, Result,
     domain::{AgentId, Outcome},
     storage_client::{
-        Dial, Hello, PendingRepin, PendingWrite, ProducerLane, UnixDial, WireRequest,
+        Dial, FinishGuardContext, Hello, PendingRepin, PendingWrite, ProducerLane, UnixDial,
+        WireRequest,
     },
 };
 use agent_run_domain::{
@@ -52,6 +53,9 @@ const BATCH_FRAGMENTS: usize = 32;
 const BATCH_BYTES: usize = 512 * 1024;
 /// Longest a buffered journal fragment waits before [`Persist::flush_due`] writes it.
 pub const JOURNAL_MAX_AGE: Duration = Duration::from_millis(150);
+/// How often an installed finish launch-secret context is re-sent while the
+/// supervisor flushes, bounding how long a restarted broker lacks it.
+pub const FINISH_GUARD_REFRESH: Duration = Duration::from_secs(2);
 
 /// Maps a final writer outcome to the typed output or an error.
 ///
@@ -165,6 +169,18 @@ impl Producer {
     /// Re-pins the supervisor attempt claim through an ordered re-hello.
     pub fn repin(&self, attempt: Option<String>) -> PendingRepin {
         self.lane.repin(attempt)
+    }
+
+    /// Replaces the hello's finish launch-secret context through an ordered,
+    /// immediately exchanged re-hello (see [`ProducerLane::set_finish_guard`]).
+    pub fn set_finish_guard(&self, guard: Option<FinishGuardContext>) -> PendingRepin {
+        self.lane.set_finish_guard(guard)
+    }
+
+    /// Re-sends the current hello, reconnecting if needed (see
+    /// [`ProducerLane::refresh`]).
+    pub fn refresh(&self) -> PendingRepin {
+        self.lane.refresh()
     }
 
     /// Claims the next ordinal and submits `op`; the returned handle resolves to
@@ -396,6 +412,9 @@ pub struct Persist {
     recoveries: Vec<Recovery>,
     /// Next local recovery sequence number.
     recovery_seq: u64,
+    /// When the current attempt's finish launch-secret context was last
+    /// (re)sent to the broker; `None` while no context is installed.
+    finish_guard_sent: Option<std::time::Instant>,
 }
 
 /// The payload of one observed command result, kept until its evidence is
@@ -461,6 +480,7 @@ impl Persist {
             pending: Pending::default(),
             recoveries: Vec::new(),
             recovery_seq: 0,
+            finish_guard_sent: None,
         })
     }
 
@@ -494,12 +514,47 @@ impl Persist {
     /// # Errors
     /// The re-hello failed; the lane reconnects with the new claim on the next call.
     pub async fn repin(&mut self, attempt: &str) -> Result<()> {
+        // The lane drops the previous attempt's context with the claim.
+        self.finish_guard_sent = None;
         self.flush().await?;
         self.producer
             .repin(Some(attempt.to_owned()))
             .await
             .map_err(Error::Io)?;
         self.bind_attempt(attempt);
+        Ok(())
+    }
+
+    /// Installs the bound attempt's finish launch-secret context, taken from
+    /// its final native launch `environment`, before the engine is released.
+    /// The broker refuses that attempt's first finish intent while no verified
+    /// supervisor connection carries the context, and refuses a summary that
+    /// holds any of its values. Only nonempty secret-shaped variables are sent,
+    /// on the private writer socket, and nothing is persisted. While installed,
+    /// [`Self::flush`] re-sends it every [`FINISH_GUARD_REFRESH`], so an idle
+    /// supervisor restores it after a broker restart or a dropped connection.
+    ///
+    /// # Errors
+    /// The context exceeds [`crate::storage_wire::FINISH_GUARD_MAX`] (refused
+    /// before any send), or the immediate re-hello hit a protocol violation.
+    pub async fn install_finish_guard(
+        &mut self,
+        environment: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        let context = FinishGuardContext::from_environment(environment);
+        if serde_json::to_vec(&context)?.len() > crate::storage_wire::FINISH_GUARD_MAX {
+            // Never send a hello the writer would refuse; without a context the
+            // broker refuses every finish of this attempt (fail closed).
+            return Err(Error::Validation(
+                "launch secret context exceeds the writer hello bound".into(),
+            ));
+        }
+        self.flush().await?;
+        self.producer
+            .set_finish_guard(Some(context))
+            .await
+            .map_err(Error::Io)?;
+        self.finish_guard_sent = Some(std::time::Instant::now());
         Ok(())
     }
 
@@ -541,7 +596,18 @@ impl Persist {
     /// The writer refused or could not confirm a batch; rows of that batch are
     /// not retried under a new identity (the lane already retried the identical
     /// operation within its original deadline).
+    ///
+    /// While a finish launch-secret context is installed, a flush at least
+    /// [`FINISH_GUARD_REFRESH`] after the last send also queues one detached,
+    /// ordered re-hello (reconnecting if needed); its outcome is not awaited.
     pub async fn flush(&mut self) -> Result<()> {
+        if self
+            .finish_guard_sent
+            .is_some_and(|sent| sent.elapsed() >= FINISH_GUARD_REFRESH)
+        {
+            drop(self.producer.refresh());
+            self.finish_guard_sent = Some(std::time::Instant::now());
+        }
         while !self.pending.fragments.is_empty() {
             // Cut a batch by exact encoded size (always at least one fragment).
             // Both bounds are honored independently: the operation's decoded
@@ -1494,6 +1560,7 @@ pub fn supervisor_hello(logical: &AgentId, execution: &AgentId, capability_hex: 
         attempt: None,
         generation: None,
         capability_hex: Some(capability_hex),
+        finish_guard: None,
     }
 }
 
@@ -1529,6 +1596,7 @@ pub fn cli_hello() -> Hello {
         attempt: None,
         generation: None,
         capability_hex: None,
+        finish_guard: None,
     }
 }
 
