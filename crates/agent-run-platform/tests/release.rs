@@ -142,3 +142,86 @@ fn existing_seal_checks_still_hold() {
     let missing_entry = sealed(&["bin/agent-run", "collectors/codex.sh"]);
     assert!(verify(missing_entry.path()).is_err());
 }
+
+/// Child-process entry for the bounded FIFO checks: when the parent sets
+/// `AGENT_RUN_FIFO_RELEASE` it verifies that release and prints the outcome;
+/// otherwise this is a no-op, so a normal run does nothing here.
+#[test]
+fn fifo_child_entry() {
+    let Some(release) = std::env::var_os("AGENT_RUN_FIFO_RELEASE") else {
+        return;
+    };
+    println!("OUTCOME:{:?}", verify(Path::new(&release)));
+}
+
+/// Verifies `release` in a child copy of this test executable and returns its
+/// printed outcome, or `None` when it has not exited within five seconds. A
+/// child that blocks on a FIFO is killed and reaped here, so a broken verifier
+/// can strand no thread or process.
+fn bounded_verify(release: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "fifo_child_entry", "--nocapture"])
+        .env("AGENT_RUN_FIFO_RELEASE", release)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let mut output = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("OUTCOME:").map(str::to_owned))
+}
+
+/// Replaces `name` below `root` with a named pipe (no reader or writer).
+fn replace_with_fifo(root: &Path, name: &str) -> std::path::PathBuf {
+    let path = root.join(name);
+    fs::remove_file(&path).unwrap();
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    path
+}
+
+/// Asserts a FIFO standing in for `seal_file` is refused promptly as a special
+/// file; the verifier must classify entries before it opens either seal file.
+fn assert_fifo_seal_refused(seal_file: &str) {
+    let release = sealed(LEGACY);
+    replace_with_fifo(release.path(), seal_file);
+    assert_eq!(
+        bounded_verify(release.path()).as_deref(),
+        Some(r#"Err("release contains a link or special file")"#),
+        "{seal_file}"
+    );
+}
+
+/// A FIFO `COMPLETE` is refused without blocking the verifier.
+#[test]
+fn fifo_complete_is_refused_without_blocking() {
+    assert_fifo_seal_refused("COMPLETE");
+}
+
+/// A FIFO `SHA256SUMS` beside a valid `COMPLETE` is refused without blocking.
+#[test]
+fn fifo_manifest_is_refused_without_blocking() {
+    assert_fifo_seal_refused("SHA256SUMS");
+}

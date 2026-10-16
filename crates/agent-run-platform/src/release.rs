@@ -62,11 +62,17 @@ fn regular_files(
 /// `bin/agent-run` and `metadata.json`, and the metadata names its schema.
 ///
 /// The inventory is closed: the release holds only directories and regular
-/// files, and every file except `COMPLETE` and `SHA256SUMS` is listed. An
+/// files (checked before any seal file is opened, so a special file in place
+/// of `COMPLETE` or `SHA256SUMS` is refused rather than blocking the read),
+/// and every file except `COMPLETE` and `SHA256SUMS` is listed. An
 /// added executable or asset, including an unlisted `bin/agent-run-tui`, is
 /// refused, while a legacy release that never listed a TUI stays valid. This
 /// proves local candidate integrity only; it is not an archive attestation.
 pub fn verify(release: &Path) -> Result<(), String> {
+    // Classify every entry first so a FIFO or other special file standing in
+    // for a seal file is refused before either seal is opened (open would block).
+    let mut actual = BTreeSet::new();
+    regular_files(release, release, &mut actual)?;
     if fs::read_to_string(release.join("COMPLETE")).map_err(|error| error.to_string())?
         != "complete\n"
     {
@@ -74,8 +80,6 @@ pub fn verify(release: &Path) -> Result<(), String> {
     }
     let manifest =
         fs::read_to_string(release.join("SHA256SUMS")).map_err(|error| error.to_string())?;
-    let mut actual = BTreeSet::new();
-    regular_files(release, release, &mut actual)?;
     let mut seen = BTreeSet::new();
     for line in manifest.lines() {
         let (hash, name) = line.split_once("  ").ok_or("invalid sealed manifest")?;
