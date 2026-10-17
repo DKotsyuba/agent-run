@@ -152,3 +152,38 @@ fn contains_secret_sees_values_overwritten_by_duplicate_keys() {
     // Text that is not JSON keeps only the raw literal check.
     assert!(!redactor.contains_secret(r#"{"note":"synthetic-secre\u0074""#));
 }
+
+/// A journaled copy of private finish arguments cannot keep a launch secret
+/// that only its nested JSON summary reveals (the exact OpenCode tool_call
+/// row: an escaped final character behind a later duplicate key). The copy's
+/// summary becomes the redaction marker, other fields and safe nested JSON
+/// keep their bytes, and existing literal and field policies are unchanged.
+#[test]
+fn journal_copy_hides_secret_in_nested_json_summary() {
+    use serde_json::{Value, json};
+    let redactor = Redactor::from_environment(&BTreeMap::from([(
+        "CANARY_SIGNING_KEY".into(),
+        "synthetic-canary-k3y-77d1".into(),
+    )]));
+    let journaled = r##"{"status":"done","summary":"{\"ok\":true,\"note\":\"synthetic-canary-k3y-77d\\u0031\",\"note\":\"safe\"}"}"##;
+    assert!(!journaled.contains("synthetic-canary-k3y-77d1"));
+    let safe: Value = serde_json::from_str(&redactor.redact(journaled)).unwrap();
+    assert_eq!(safe, json!({"status": "done", "summary": "<redacted>"}));
+    let input: Value = serde_json::from_str(journaled).unwrap();
+    let event = redactor.redact_value(&json!({"type": "tool_use", "input": input}));
+    assert_eq!(event["input"]["summary"], "<redacted>");
+    assert_eq!(event["type"], "tool_use");
+    for summary in [
+        r#"{ "ok" : true, "note":"safe","note":"also safe" }"#,
+        r#"{"token":"not a launch value"}"#,
+        "plain words",
+    ] {
+        let arguments = json!({"status": "done", "summary": summary}).to_string();
+        let safe: Value = serde_json::from_str(&redactor.redact(&arguments)).unwrap();
+        assert_eq!(safe["summary"], summary);
+    }
+    assert_eq!(
+        redactor.redact(r#"{"note":"x synthetic-canary-k3y-77d1 y"}"#),
+        r#"{"note":"x <redacted> y"}"#
+    );
+}
