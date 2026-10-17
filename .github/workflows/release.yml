@@ -67,7 +67,7 @@ jobs:
           cp install.sh dist/install.sh
           cp "$RUNNER_TEMP/gate.json" dist/gate.json
       - name: Upload source and observed evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: source
           path: dist/*
@@ -75,7 +75,7 @@ jobs:
           retention-days: 7
       - name: Retain closed failure evidence
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: gate-diagnostics-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/gate.json
@@ -115,7 +115,7 @@ jobs:
           cargo xtask package smoke --accepted-commit "$GITHUB_SHA" --directory dist
           mv dist/acceptance.json dist/native.json
       - name: Upload exact native payload and evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-aarch64-apple-darwin
           path: dist/*
