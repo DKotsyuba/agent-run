@@ -3,6 +3,7 @@
 //! The library serializes SQL; producer lanes preserve per-producer order.
 //! Receipts and authority remain store-owned. No custom scheduler lives here.
 
+use agent_run_adapters::redact::Redactor;
 use agent_run_domain::{
     Error, Result,
     storage::{
@@ -10,11 +11,13 @@ use agent_run_domain::{
         OutcomeCounters, PayloadDigest, SubmitResult, WriteAuthority, WriterHealth,
     },
 };
+use agent_run_domain::{domain::AgentId, worker::FinishGuard};
 use agent_run_store::{
-    ops::{LocalEnvelope, MaintenanceOp, OpKindRef, WriteEnvelope},
+    ops::{AcceptWorkerFinish, LocalEnvelope, LocalOp, MaintenanceOp, OpKindRef, WriteEnvelope},
     writer::{StoreWriter, WriterLease, queued::QueuedWriter},
 };
 use std::{
+    collections::{BTreeMap, HashMap},
     path::Path,
     sync::{
         Arc, Mutex,
@@ -62,6 +65,17 @@ pub struct WriterHandle {
     counters: Arc<Mutex<OutcomeCounters>>,
     /// Admission seal independent of evidence writes for existing executions.
     admissions_closed: Arc<AtomicBool>,
+    /// Transient launch-secret contexts keyed by (execution, attempt), each
+    /// installed by one verified supervisor connection; never persisted.
+    finish_guards: Arc<Mutex<HashMap<(AgentId, String), InstalledGuard>>>,
+}
+
+/// One supervisor connection's launch-secret context for its exact attempt.
+struct InstalledGuard {
+    /// Connection that installed it; only that connection may retire it.
+    connection: u64,
+    /// Literal and credential-shaped field detector for that launch.
+    redactor: Redactor,
 }
 
 impl WriterService {
@@ -83,6 +97,7 @@ impl WriterService {
                 writer,
                 counters: Arc::default(),
                 admissions_closed: Arc::new(AtomicBool::new(false)),
+                finish_guards: Arc::default(),
             },
         })
     }
@@ -126,6 +141,18 @@ impl WriterHandle {
         self.writer.fixture_barrier(entered, release).await
     }
 
+    /// Fixture-only actual retention-gate barrier; the entered signal means SQL owns the gate.
+    #[cfg(feature = "test-fixtures")]
+    pub async fn fixture_retention_barrier(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> Result<()> {
+        self.writer
+            .fixture_retention_barrier(entered, release)
+            .await
+    }
+
     /// Test-only revision-race control using the actual queue/fenced connection.
     #[cfg(feature = "test-fixtures")]
     pub async fn fixture_advance_quota_revision(&self) -> Result<()> {
@@ -148,10 +175,67 @@ impl WriterHandle {
         self.count(self.writer.submit(authority, envelope).await)
     }
 
+    /// Installs the launch-secret context of `execution`'s exact `attempt`,
+    /// replacing any earlier one. Only the writer socket calls this, for a
+    /// supervisor session whose recorded capability and process identity were
+    /// verified; worker capabilities never reach it. Values stay in memory.
+    pub(crate) fn install_finish_guard(
+        &self,
+        execution: &AgentId,
+        attempt: &str,
+        connection: u64,
+        environment: &BTreeMap<String, String>,
+    ) {
+        self.finish_guards
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                (execution.clone(), attempt.to_owned()),
+                InstalledGuard {
+                    connection,
+                    redactor: Redactor::from_environment(environment),
+                },
+            );
+    }
+
+    /// Removes the context only if `connection` installed the current one, so
+    /// a stale connection closing never deletes its replacement's context.
+    pub(crate) fn retire_finish_guard(&self, execution: &AgentId, attempt: &str, connection: u64) {
+        let mut guards = self.finish_guards.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (execution.clone(), attempt.to_owned());
+        if guards
+            .get(&key)
+            .is_some_and(|guard| guard.connection == connection)
+        {
+            guards.remove(&key);
+        }
+    }
+
+    /// Pre-SQL verdict on one finish callback for its claimed attempt; the
+    /// store still authenticates the capability and answers exact replays.
+    fn finish_guard(&self, op: &AcceptWorkerFinish) -> FinishGuard {
+        let guards = self.finish_guards.lock().unwrap_or_else(|e| e.into_inner());
+        match guards.get(&(op.execution.clone(), op.attempt.clone())) {
+            None => FinishGuard::Unavailable,
+            Some(guard) if guard.redactor.contains_secret(&op.input.summary) => FinishGuard::Secret,
+            Some(_) => FinishGuard::Clean,
+        }
+    }
+
     /// Submit a typed broker-local unit through the same connection and bounds.
     /// An admission seal refuses new starts but still resolves exact durable replays
-    /// and accepts evidence for already-running executions.
-    pub async fn local(&self, authority: WriteAuthority, envelope: LocalEnvelope) -> SubmitResult {
+    /// and accepts evidence for already-running executions. A finish callback
+    /// first receives this handle's launch-secret verdict, so no submitter can
+    /// create a first finish intent without its supervisor's installed context.
+    pub async fn local(
+        &self,
+        authority: WriteAuthority,
+        mut envelope: LocalEnvelope,
+    ) -> SubmitResult {
+        if let LocalOp::AcceptWorkerFinish(op) = envelope.op() {
+            let guard = self.finish_guard(op);
+            envelope.set_finish_guard(guard);
+        }
         if self.admissions_closed.load(Ordering::Acquire)
             && matches!(
                 envelope.kind(),

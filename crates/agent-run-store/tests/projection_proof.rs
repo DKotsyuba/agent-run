@@ -15,7 +15,7 @@ use agent_run_domain::{
     },
 };
 use agent_run_store::{
-    migrations,
+    VERSION, migrations,
     ops::{CaptureIncident, IncidentProjection, LocalEnvelope, LocalOp, PruneHistoryBatch},
     writer::{StoreReader, StoreWriter, WriterLease},
 };
@@ -607,12 +607,13 @@ fn populated_v29(path: &Path) -> Vec<String> {
 
 /// Migration 030 rebuilds a populated schema-29 ledger with byte-exact rows,
 /// its index and the key-guarded trigger, and only the proof row refreshes.
+/// Later migrations still reach the current schema without changing that ledger.
 #[test]
 fn migration_030_rebuilds_the_ledger_exactly() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("state.db");
     let before = populated_v29(&path);
-    assert_eq!(migrations::migrate(&path).unwrap(), 31);
+    assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
     let conn = Connection::open(&path).unwrap();
     assert_eq!(ledger_rows(&conn), before);
     let objects: Vec<String> = conn
@@ -705,15 +706,16 @@ fn current_fixture_carries_the_rebuilt_ledger() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/baseline/db");
     let manifest: Value =
         serde_json::from_slice(&std::fs::read(root.join("manifest.json")).unwrap()).unwrap();
+    let fixture_name = format!("current-v{VERSION}.sqlite");
     let entry = manifest["files"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|file| file["file"] == "current-v31.sqlite")
+        .find(|file| file["file"].as_str() == Some(fixture_name.as_str()))
         .unwrap();
-    assert_eq!(entry["user_version"], 31);
+    assert_eq!(entry["user_version"], VERSION);
     let conn = Connection::open_with_flags(
-        root.join("current-v31.sqlite"),
+        root.join(fixture_name),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .unwrap();

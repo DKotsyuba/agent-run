@@ -674,3 +674,190 @@ fn adding_tui_to_an_existing_release_requires_a_new_version() {
     release::verify(&fixture.candidate).unwrap();
     assert!(!fixture.candidate.join("bin/agent-run-tui").exists());
 }
+
+/// Asserts a refused install left the prefix, journal, launchers and releases as captured.
+fn assert_untouched(fixture: &Fixture, pointer: &Option<PathBuf>, journal: &Option<Vec<u8>>) {
+    assert_eq!(&fs::read_link(fixture.prefix.join("current")).ok(), pointer);
+    assert_eq!(&fs::read(fixture.prefix.join("deploy.json")).ok(), journal);
+    assert!(!fixture.prefix.join("releases/1.0.0").exists());
+}
+
+/// An executable or asset added to a sealed candidate after sealing is refused by the
+/// verifier and the installer before any release, pointer, journal or launcher change.
+#[test]
+fn unlisted_candidate_files_are_refused_without_changes() {
+    for added in [
+        "bin/agent-run-tui",
+        "bin/agent-run-extra",
+        "collectors/extra.sh",
+        "extra.txt",
+    ] {
+        for existing in [false, true] {
+            let fixture = Fixture::new();
+            if existing {
+                let legacy = release::build_with_installer(
+                    &fixture.temporary.path().join("old"),
+                    "0.9.0",
+                    &fixture.temporary.path().join("runtime"),
+                    Path::new(env!("CARGO_BIN_EXE_xtask")),
+                    None,
+                )
+                .unwrap();
+                installer::install(
+                    &legacy,
+                    &fixture.prefix,
+                    &fixture.home,
+                    &fixture.bin,
+                    "0.9.0",
+                )
+                .unwrap();
+            }
+            let pointer = fs::read_link(fixture.prefix.join("current")).ok();
+            let journal = fs::read(fixture.prefix.join("deploy.json")).ok();
+            let launchers = fs::read_dir(&fixture.bin).map(|d| d.count()).unwrap_or(0);
+            let extra = fixture.candidate.join(added);
+            fs::write(&extra, "added after sealing").unwrap();
+            executable(&extra, "#!/bin/sh\necho added\n");
+            assert!(release::verify(&fixture.candidate).is_err(), "{added}");
+            let error = fixture.install().unwrap_err();
+            assert!(error.contains("unlisted file"), "{added}: {error}");
+            assert_untouched(&fixture, &pointer, &journal);
+            assert_eq!(
+                fs::read_dir(&fixture.bin).map(|d| d.count()).unwrap_or(0),
+                launchers
+            );
+            assert!(!fixture.bin.join("agent-run-tui").exists());
+            assert!(extra.is_file(), "refusal must not delete the extra file");
+        }
+    }
+}
+
+/// An unlisted file inside an already installed same-version release is refused even
+/// when the candidate's manifest is byte-identical, and nothing is repaired or removed.
+#[test]
+fn unlisted_file_in_installed_release_is_refused_and_preserved() {
+    let fixture = Fixture::new();
+    fixture.install().unwrap();
+    let installed = fixture.prefix.join("releases/1.0.0");
+    let pointer = fs::read_link(fixture.prefix.join("current")).ok();
+    let journal = fs::read(fixture.prefix.join("deploy.json")).ok();
+    executable(
+        &installed.join("bin/agent-run-tui"),
+        "#!/bin/sh\necho added\n",
+    );
+    assert!(release::verify(&installed).is_err());
+    let error = fixture.install().unwrap_err();
+    assert!(error.contains("unlisted file"), "{error}");
+    assert_eq!(fs::read_link(fixture.prefix.join("current")).ok(), pointer);
+    assert_eq!(fs::read(fixture.prefix.join("deploy.json")).ok(), journal);
+    assert!(installed.join("bin/agent-run-tui").is_file());
+    assert!(!fixture.bin.join("agent-run-tui").exists());
+}
+
+/// Supported legacy (no observer) and complete (observer listed) inventories install.
+#[test]
+fn legacy_and_complete_inventories_still_install() {
+    let legacy = Fixture::new();
+    release::verify(&legacy.candidate).unwrap();
+    legacy.install().unwrap();
+    assert!(!legacy.bin.join("agent-run-tui").exists());
+    let complete = Fixture::with_tui(true);
+    release::verify(&complete.candidate).unwrap();
+    complete.install().unwrap();
+    assert!(complete.bin.join("agent-run-tui").is_file());
+}
+
+/// Child-process entry for the bounded FIFO installer check: with
+/// `AGENT_RUN_FIFO_INSTALL` set to `candidate:prefix:home:bin` it runs the
+/// installer and prints the outcome; otherwise it is a no-op.
+#[test]
+fn fifo_installer_child_entry() {
+    let Some(paths) = std::env::var_os("AGENT_RUN_FIFO_INSTALL") else {
+        return;
+    };
+    let paths = paths.to_string_lossy().into_owned();
+    let [candidate, prefix, home, bin] = paths.split(':').collect::<Vec<_>>()[..] else {
+        panic!("expected four paths");
+    };
+    let outcome = installer::install(
+        Path::new(candidate),
+        Path::new(prefix),
+        Path::new(home),
+        Path::new(bin),
+        "1.0.0",
+    );
+    println!("OUTCOME:{outcome:?}");
+}
+
+/// Asserts a FIFO in place of `seal_file` is refused by the installer promptly, before any
+/// lock, release directory, pointer or launcher exists. The install runs in a child copy of
+/// this test executable that is killed and reaped when it blocks past five seconds, so a
+/// broken verifier strands no thread or process.
+fn assert_fifo_install_refused(seal_file: &str) {
+    use std::io::Read;
+    let fixture = Fixture::new();
+    let fifo = fixture.candidate.join(seal_file);
+    fs::remove_file(&fifo).unwrap();
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let paths = [
+        &fixture.candidate,
+        &fixture.prefix,
+        &fixture.home,
+        &fixture.bin,
+    ]
+    .map(|path| path.to_string_lossy().into_owned())
+    .join(":");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "fifo_installer_child_entry", "--nocapture"])
+        .env("AGENT_RUN_FIFO_INSTALL", paths)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("{seal_file}: installer blocked on the FIFO");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let mut output = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    let outcome = output
+        .lines()
+        .find(|line| line.starts_with("OUTCOME:"))
+        .unwrap_or_else(|| panic!("{seal_file}: no outcome: {output}"));
+    assert!(
+        outcome.starts_with("OUTCOME:Err(") && outcome.contains("special file"),
+        "{seal_file}: {outcome}"
+    );
+    assert!(
+        !fixture.prefix.exists() && !fixture.bin.exists(),
+        "{seal_file}"
+    );
+}
+
+/// A FIFO `COMPLETE` is refused by the installer without blocking.
+#[test]
+fn fifo_complete_is_refused_by_the_installer_without_blocking() {
+    assert_fifo_install_refused("COMPLETE");
+}
+
+/// A FIFO `SHA256SUMS` beside a valid `COMPLETE` is refused by the installer without blocking.
+#[test]
+fn fifo_manifest_is_refused_by_the_installer_without_blocking() {
+    assert_fifo_install_refused("SHA256SUMS");
+}

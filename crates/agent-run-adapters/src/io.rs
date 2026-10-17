@@ -511,6 +511,12 @@ impl Process {
         self.redactor.redact(text)
     }
 
+    /// Reports whether `text` contains this launch's secret material, per
+    /// [`Redactor::contains_secret`]; harmless JSON formatting does not count.
+    pub fn contains_secret(&self, text: &str) -> bool {
+        self.redactor.contains_secret(text)
+    }
+
     /// Sanitizes one parsed engine event before durable storage.
     pub fn redact_value(&self, value: &Value) -> Value {
         self.redactor.redact_value(value)

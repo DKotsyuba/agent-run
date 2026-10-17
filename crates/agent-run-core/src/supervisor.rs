@@ -502,6 +502,19 @@ pub(crate) fn execution_error_metadata(error: &Error) -> serde_json::Value {
             data["io_kind"] = json!(format!("{:?}", source.kind()));
             data["os_code"] = json!(source.raw_os_error());
         }
+        Error::WriterFailure(failure) => {
+            use agent_run_domain::storage::WriterFailure;
+            match failure {
+                WriterFailure::NotEnqueued(reason) => {
+                    data["outcome"] = json!("not_enqueued");
+                    data["admission_reason"] = json!(reason);
+                }
+                WriterFailure::Unknown(cause) => {
+                    data["outcome"] = json!("unknown");
+                    data["unknown_cause"] = json!(cause);
+                }
+            }
+        }
         Error::Sql(rusqlite::Error::SqliteFailure(source, _)) => {
             data["sqlite_code"] = json!(format!("{:?}", source.code));
             data["sqlite_extended_code"] = json!(source.extended_code);
@@ -1578,17 +1591,6 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 });
             discovery.await?;
         }
-        // The spawn claim itself refuses while a cancel is pending, so an
-        // accepted cancel can never race past this boundary.
-        if !store.provider_spawning(id, &attempt_id).await? {
-            if !persist::attempt_never_spawned(&store.conn, id)? {
-                return Err(invalid("provider attempt was already spawning"));
-            }
-            return cancelled_before_spawn(id, store).await;
-        }
-        store
-            .event(id, "phase", &json!({"phase":"spawning"}))
-            .await?;
         let owner_supported = matches!(
             planned.runtime.kind()?,
             crate::config::Adapter::Codex
@@ -1601,6 +1603,27 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             &planned.profile,
             owner_supported,
         );
+        if row.request.explicit_finish && planned.role.worker_mcp {
+            // Before the spawn claim, give the broker this attempt's final
+            // launch secrets: it refuses every first finish intent that
+            // carries one, or that arrives while the context is unavailable.
+            // A refusal here (an oversized context or a writer error) still
+            // leaves a never-spawned attempt that failure handling closes.
+            store
+                .install_finish_guard(&planned.launch.environment)
+                .await?;
+        }
+        // The spawn claim itself refuses while a cancel is pending, so an
+        // accepted cancel can never race past this boundary.
+        if !store.provider_spawning(id, &attempt_id).await? {
+            if !persist::attempt_never_spawned(&store.conn, id)? {
+                return Err(invalid("provider attempt was already spawning"));
+            }
+            return cancelled_before_spawn(id, store).await;
+        }
+        store
+            .event(id, "phase", &json!({"phase":"spawning"}))
+            .await?;
         // Process::spawn yields Io only when the OS refused Command::spawn,
         // before a child exists; other failures retain ownership for recovery.
         let spawned = if identity.authority.harness == HarnessId::OpenCode {
@@ -1838,9 +1861,9 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             }
         }
         if row.request.explicit_finish {
-            result.answer = store.worker_finish_intent(id, false)?.and_then(|intent| {
-                (process.redact(&intent.summary) == intent.summary).then_some(intent.summary)
-            });
+            // Only an observed native receipt publishes the exact summary,
+            // for failed runs too; a lost reply leaves the run answerless.
+            result.answer = crate::worker_finish::answer(&process, store, id)?;
         }
         let answer_started = std::time::Instant::now();
         let proof = match result.answer.as_deref() {
@@ -2555,6 +2578,42 @@ mod tests {
             Error::Runtime("x".into()),
         );
         assert!(execution_error_metadata(&legacy)["phase"].is_null());
+    }
+
+    /// Closed non-enqueue/unknown diagnostics remain distinct, and domain validation
+    /// still reaches failed_result as a contract failure rather than a storage failure.
+    #[test]
+    fn writer_outcomes_are_closed_and_validation_stays_typed() {
+        use agent_run_domain::storage::{
+            NotEnqueuedReason, RejectCode, RejectStage, StorageRejection, SubmitResult,
+            UnknownCause,
+        };
+        for result in [
+            SubmitResult::NotEnqueued(NotEnqueuedReason::DeadlineExpired),
+            SubmitResult::NotEnqueued(NotEnqueuedReason::DeadlineBeforeStart),
+            SubmitResult::Unknown(UnknownCause::CommitUncertain),
+        ] {
+            let error = crate::persist::into_result::<()>(result.clone()).unwrap_err();
+            let metadata = execution_error_metadata(&error);
+            assert_eq!(
+                metadata["outcome"],
+                if matches!(result, SubmitResult::Unknown(_)) {
+                    "unknown"
+                } else {
+                    "not_enqueued"
+                }
+            );
+            assert_eq!(metadata["operation"], "writer_apply");
+        }
+        let error = crate::persist::into_result::<()>(SubmitResult::Rejected(
+            StorageRejection::new(RejectCode::Validation, RejectStage::Gate, "invalid fixture"),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, Error::Validation(_)));
+        assert_eq!(
+            failed_result(&error).outcome.failure_kind.as_deref(),
+            Some("runtime_contract_rejected")
+        );
     }
 
     /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_blank_startup_error_uses_exception_type_in_ready_failure`.

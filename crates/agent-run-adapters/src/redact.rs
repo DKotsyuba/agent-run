@@ -1,9 +1,11 @@
 //! Secret-safe output normalization for adapter stream and diagnostic paths.
 
 use regex::Regex;
+use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt,
     sync::LazyLock,
 };
 
@@ -58,8 +60,36 @@ impl Redactor {
             .unwrap_or_else(|_| redact_literals(text, &self.literals))
     }
 
+    /// The finish-summary admission predicate: whether `text` holds a
+    /// launch-secret literal in its raw bytes, or, when the trimmed text is
+    /// one JSON document, a literal in any decoded key or string, or a string
+    /// value under a credential-shaped key. It does not decode JSON carried
+    /// inside string values; [`Self::redact_value`] does that for journal
+    /// copies, so the two are not equivalent. The JSON check streams every map
+    /// entry, so a value that a later duplicate key would overwrite in a
+    /// parsed [`Value`] is still seen. JSON formatting, key order and escaping
+    /// choices alone never count, unlike comparing [`Self::redact`] output,
+    /// which compacts JSON, and safe duplicate keys are not refused. Used to
+    /// refuse, never to rewrite, exact worker summaries.
+    ///
+    /// Bounds: text that is not JSON gets only the raw literal check. A
+    /// decoded hit in a JSON value counts even if trailing text makes the
+    /// whole document invalid. JSON nested deeper than the parser's recursion
+    /// limit cannot be decoded and is reported as secret-bearing (fail
+    /// closed), never as clean.
+    pub fn contains_secret(&self, text: &str) -> bool {
+        redact_literals(text, &self.literals) != text
+            || json_holds_secret(text, &self.literals, true)
+    }
+
     /// Sanitizes a parsed native event without losing literal matching to
-    /// JSON string escaping or leaking a secret used as an object key.
+    /// JSON string escaping or leaking a secret used as an object key. When
+    /// launch literals exist, a string value that is itself one JSON document
+    /// whose decoded keys or strings reveal a literal (such as a finish
+    /// summary inside journaled tool arguments) is replaced whole; JSON inside
+    /// that embedded document's strings is not decoded again. Such a string
+    /// nested deeper than the parser's recursion limit is also replaced
+    /// (fail closed), even when it holds no literal.
     pub fn redact_value(&self, value: &Value) -> Value {
         let mut safe = value.clone();
         redact_value(&mut safe, &self.literals);
@@ -192,7 +222,40 @@ fn redact_literals(text: &str, literals: &[String]) -> String {
     })
 }
 
+/// Whether trimmed `text`, read as one JSON value, holds a launch-secret
+/// literal in any decoded key or string (including values a later duplicate
+/// key overwrites) or, when `credential_fields` is set, a string other than
+/// the redaction marker directly under a credential-shaped key. Text that is
+/// not JSON holds nothing here. JSON nested deeper than the parser's
+/// recursion limit cannot be decoded and returns true without any actual hit
+/// (fail closed), in both modes.
+fn json_holds_secret(text: &str, literals: &[String], credential_fields: bool) -> bool {
+    let mut document = serde_json::Deserializer::from_str(text.trim());
+    let scan = SecretScan {
+        literals,
+        credential_fields,
+        credential_field: false,
+    };
+    match scan.deserialize(&mut document) {
+        Ok(found) => found,
+        // ponytail: serde_json exposes no typed recursion-limit category, so
+        // its fixed message selects this case; other syntax errors mean the
+        // text is not JSON and only literal checks apply.
+        Err(error) => error.to_string().starts_with("recursion limit exceeded"),
+    }
+}
+
 /// Recursively removes launch secrets and string values under credential-shaped keys.
+///
+/// A string value may itself carry JSON, as the summary inside a journaled
+/// copy of private finish arguments does. When launch literals exist and that
+/// string's own decoded keys or values reveal one (for example behind a JSON
+/// escape and a later duplicate key), the whole string becomes the redaction
+/// marker. This is a literal check only, one embedded level deep: the
+/// credential-shaped-key rule is not applied inside such strings, and safe
+/// embedded JSON within the parser's depth limit keeps its exact bytes. An
+/// embedded document deeper than that limit is replaced whole (fail closed)
+/// whenever launch literals exist, even without a hit.
 fn redact_value(value: &mut Value, literals: &[String]) {
     match value {
         Value::Object(object) => {
@@ -209,7 +272,116 @@ fn redact_value(value: &mut Value, literals: &[String]) {
         Value::Array(values) => values
             .iter_mut()
             .for_each(|value| redact_value(value, literals)),
-        Value::String(text) => *text = redact_literals(text, literals),
+        Value::String(text) => {
+            *text = redact_literals(text, literals);
+            if !literals.is_empty() && json_holds_secret(text, literals, false) {
+                *text = "<redacted>".into();
+            }
+        }
         _ => {}
+    }
+}
+
+/// Streams one JSON value and reports whether it holds a launch-secret
+/// literal in any decoded key or string, or, when `credential_fields` is set,
+/// a string other than the `<redacted>` marker directly under a
+/// credential-shaped key. Strings are not decoded as JSON again. Unlike a parsed
+/// [`Value`], it visits every map entry in order, including values a later
+/// duplicate key overwrites, and it keeps nothing but the verdict. Numbers,
+/// booleans and null never count.
+#[derive(Clone, Copy)]
+struct SecretScan<'a> {
+    /// Launch-secret literals to look for; nonempty values only.
+    literals: &'a [String],
+    /// Whether strings directly under credential-shaped keys count at all.
+    credential_fields: bool,
+    /// Whether the value being visited sits directly under a credential-shaped key.
+    credential_field: bool,
+}
+
+impl SecretScan<'_> {
+    /// The scan of a child value, directly under a credential-shaped key or
+    /// not; only counted when this scan applies the credential-field rule.
+    fn child(self, credential_field: bool) -> Self {
+        Self {
+            credential_field: credential_field && self.credential_fields,
+            ..self
+        }
+    }
+
+    /// Whether decoded `text` contains any launch-secret literal.
+    fn holds_literal(self, text: &str) -> bool {
+        self.literals
+            .iter()
+            .any(|literal| text.contains(literal.as_str()))
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for SecretScan<'_> {
+    type Value = bool;
+
+    /// Scans one complete JSON value of any type.
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<bool, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for SecretScan<'_> {
+    type Value = bool;
+
+    /// Names the accepted input for parser error messages.
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    /// A boolean holds no secret.
+    fn visit_bool<E>(self, _: bool) -> Result<bool, E> {
+        Ok(false)
+    }
+
+    /// An integer holds no secret, even under a credential-shaped key.
+    fn visit_i64<E>(self, _: i64) -> Result<bool, E> {
+        Ok(false)
+    }
+
+    /// An unsigned integer holds no secret, even under a credential-shaped key.
+    fn visit_u64<E>(self, _: u64) -> Result<bool, E> {
+        Ok(false)
+    }
+
+    /// A float holds no secret, even under a credential-shaped key.
+    fn visit_f64<E>(self, _: f64) -> Result<bool, E> {
+        Ok(false)
+    }
+
+    /// `null` holds no secret.
+    fn visit_unit<E>(self) -> Result<bool, E> {
+        Ok(false)
+    }
+
+    /// A decoded string counts when it contains a literal, or when it sits
+    /// under a credential-shaped key and is not already the redaction marker.
+    fn visit_str<E>(self, text: &str) -> Result<bool, E> {
+        Ok((self.credential_field && text != "<redacted>") || self.holds_literal(text))
+    }
+
+    /// Scans every element; credential-field status does not pass into arrays.
+    fn visit_seq<A: SeqAccess<'de>>(self, mut items: A) -> Result<bool, A::Error> {
+        let mut found = false;
+        while let Some(item) = items.next_element_seed(self.child(false))? {
+            found |= item;
+        }
+        Ok(found)
+    }
+
+    /// Scans every entry, duplicates included: each decoded key for literals
+    /// and its value as a credential field when the key is credential-shaped.
+    fn visit_map<A: MapAccess<'de>>(self, mut entries: A) -> Result<bool, A::Error> {
+        let mut found = false;
+        while let Some(key) = entries.next_key::<String>()? {
+            found |= self.holds_literal(&key);
+            found |= entries.next_value_seed(self.child(is_secret_name(&key)))?;
+        }
+        Ok(found)
     }
 }

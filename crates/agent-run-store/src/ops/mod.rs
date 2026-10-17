@@ -919,6 +919,16 @@ impl LocalEnvelope {
         &self.op
     }
 
+    /// Records the broker's pre-SQL launch-secret verdict on a finish
+    /// callback. The verdict is not serialized, so the envelope's digest,
+    /// encoded length and receipt identity are unchanged; other operations
+    /// ignore it.
+    pub fn set_finish_guard(&mut self, guard: agent_run_domain::worker::FinishGuard) {
+        if let LocalOp::AcceptWorkerFinish(op) = &mut self.op {
+            op.guard = guard;
+        }
+    }
+
     /// Header and operation, moved out of the envelope.
     pub(crate) fn into_parts(self) -> (EnvelopeHeader, LocalOp) {
         (self.header, self.op)

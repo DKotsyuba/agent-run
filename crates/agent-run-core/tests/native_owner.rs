@@ -215,6 +215,7 @@ sleep 1
                     status: FinishStatus::Done,
                 },
                 agent_run_domain::domain::now(),
+                agent_run_domain::worker::FinishGuard::Clean,
             )
             .unwrap();
         std::fs::write(home.path.join("receipt"), format!("{}\n", receipt.sha256)).unwrap();
@@ -358,6 +359,7 @@ esac; done"#
                     status: FinishStatus::Done,
                 },
                 agent_run_domain::domain::now(),
+                agent_run_domain::worker::FinishGuard::Clean,
             )
             .unwrap();
         control.observe_worker_finish_receipt(&id).unwrap();

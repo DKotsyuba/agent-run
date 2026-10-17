@@ -269,7 +269,18 @@ impl Manager {
 
     /// Ends leases only after logical completion and resolution of all attempt ownership.
     /// Records actual release time so delayed cleanup cannot consume the service's idle grace.
+    /// An off-executor read skips unchanged state; writer predicates remain authoritative.
     async fn release_finished(&self) -> Result<()> {
+        let home = self.home.clone();
+        let pending = tokio::task::spawn_blocking(move || {
+            agent_run_store::writer::StoreReader::open_with(&home, Duration::from_millis(250))?
+                .service_lease_release_pending()
+        })
+        .await
+        .map_err(|_| Error::Runtime("service lease preflight task failed".into()))??;
+        if !pending {
+            return Ok(());
+        }
         self.lane()?
             .local(
                 ops::ReleaseFinishedServiceLeases { at: now() },
@@ -1044,6 +1055,7 @@ pub async fn bootstrap(home: &Path, id: &str) -> Result<()> {
             attempt: None,
             generation: Some(id.to_owned()),
             capability_hex: Some(secret.iter().map(|byte| format!("{byte:02x}")).collect()),
+            finish_guard: None,
         },
         agent_run_domain::storage::ProducerId {
             kind: agent_run_domain::storage::ProducerKind::ServiceExec,
@@ -1159,6 +1171,31 @@ pub async fn wait_for_gate(home: &Path, id: &AgentId) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A broker with no service generations or leases must not append one
+    /// durable release receipt on every manager tick; no process is launched.
+    #[tokio::test]
+    async fn idle_service_maintenance_skips_empty_receipts() {
+        let home = tempfile::tempdir().unwrap();
+        let store = agent_run_store::fixture::initialize(home.path()).unwrap();
+        let writer = crate::writer_test_harness::Harness::start(home.path());
+        let mut manager = Manager::new(home.path(), std::env::current_exe().unwrap())
+            .unwrap()
+            .with_writer(writer.broker().lane("services"));
+        for _ in 0..5 {
+            manager.tick().await.unwrap();
+        }
+        let receipts: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM operation_receipts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            receipts, 0,
+            "idle service maintenance must not create receipts"
+        );
+    }
 
     /// A duplicate descriptor may outlive the manager during a concurrent fork before exec.
     #[test]

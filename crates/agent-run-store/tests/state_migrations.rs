@@ -140,6 +140,51 @@ fn every_historical_version_migrates_to_a_schema_indistinguishable_from_fresh() 
     }
 }
 
+/// A schema-31 upgrade adds the producer lookup index without changing durable
+/// receipt identity/content or producer ordering watermarks.
+#[test]
+fn v31_upgrade_indexes_receipt_producers_without_changing_history() {
+    let home = tempfile::tempdir().unwrap();
+    let db_path = home.path().join("state.db");
+    let conn = build_fixture(&db_path, 31);
+    agent_run_store::fixture::fenced(&conn).unwrap();
+    let operation = agent_run_domain::storage::OperationId::new("migration-receipt", 1);
+    conn.execute(
+        "INSERT INTO operation_receipts(operation_id,digest,op_kind,producer_key,ordinal,authority_kind,authority_fingerprint,agent_id,outcome,result_json,writer_epoch,committed_at) VALUES(?1,?2,'fixture','migration-producer',1,'broker',?3,NULL,'committed','{}',1,1000)",
+        params![operation.as_str(), "d".repeat(64), "f".repeat(64)],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO writer_producers VALUES('migration-producer',1,'0000000000000000',0,NULL,1000)",
+        [],
+    ).unwrap();
+    drop(conn);
+    assert_eq!(migrations::migrate(&db_path).unwrap(), VERSION);
+    let migrated = open_ro(&db_path);
+    let receipt: (String, String) = migrated
+        .query_row(
+            "SELECT digest,result_json FROM operation_receipts WHERE operation_id=?",
+            [operation.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(receipt, ("d".repeat(64), "{}".into()));
+    assert_eq!(
+        migrated
+            .query_row(
+                "SELECT last_ordinal FROM writer_producers WHERE producer_key='migration-producer'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert!(
+        schema_objects(&migrated)
+            .iter()
+            .any(|(_, name, _)| name == "operation_receipts_producer")
+    );
+}
+
 /// The committed current-version binary fixture is a real current store,
 /// including its triggers and singleton quota revision, not a stale dev copy.
 #[test]

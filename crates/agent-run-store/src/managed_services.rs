@@ -16,6 +16,11 @@ use serde_json::json;
 /// Live states: the generation may still own processes and serve leases.
 const LIVE: [&str; 3] = ["starting", "ready", "unhealthy"];
 
+/// Unreleased terminal-agent leases whose process ownership is fully resolved.
+const RELEASABLE_LEASE: &str = "released_at IS NULL AND EXISTS(SELECT 1 FROM agents a WHERE a.id=managed_service_leases.agent_id AND a.status IN ('succeeded','failed','cancelled','lost','timed_out')) AND NOT EXISTS(SELECT 1 FROM attempts t WHERE t.agent_id=managed_service_leases.agent_id AND t.ownership_active=1)";
+/// Non-stopped generations not yet marked idle and holding no live lease.
+const NEWLY_IDLE_GENERATION: &str = "state!='stopped' AND idle_since IS NULL AND NOT EXISTS(SELECT 1 FROM managed_service_leases l WHERE l.generation_id=managed_service_generations.id AND l.released_at IS NULL)";
+
 /// Validates a closed failure reason label.
 fn reason(label: &str) -> Result<&str> {
     if label.is_empty()
@@ -67,21 +72,29 @@ fn expect_state(conn: &Connection, generation: &str, allowed: &[&str]) -> Result
 }
 
 impl Store<'_> {
+    /// Read-only hint for a real lease release or newly idle generation.
+    /// False skips a no-op receipt; the writer repeats the identical predicates,
+    /// so a race only defers work or submits one harmless no-op. SQL errors propagate.
+    pub fn service_lease_release_pending(&self) -> Result<bool> {
+        Ok(self.conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM managed_service_leases WHERE {RELEASABLE_LEASE}) OR EXISTS(SELECT 1 FROM managed_service_generations WHERE {NEWLY_IDLE_GENERATION})"),
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Releases leases of terminal executions that own no attempt and marks
-    /// generations without live leases idle (row 63).
+    /// generations without live leases idle (row 63). `at` is finite nonnegative
+    /// Unix seconds; the transaction rechecks the read preflight's predicates.
     pub fn release_finished_service_leases(&self, at: f64) -> Result<()> {
         let at = finite(at)?;
         let tx = crate::writer::WriteTx::begin(&self.conn)?;
         tx.execute(
-            "UPDATE managed_service_leases SET released_at=?1 WHERE released_at IS NULL \
-             AND EXISTS(SELECT 1 FROM agents a WHERE a.id=managed_service_leases.agent_id AND a.status IN ('succeeded','failed','cancelled','lost','timed_out')) \
-             AND NOT EXISTS(SELECT 1 FROM attempts t WHERE t.agent_id=managed_service_leases.agent_id AND t.ownership_active=1)",
+            &format!("UPDATE managed_service_leases SET released_at=?1 WHERE {RELEASABLE_LEASE}"),
             [at],
         )?;
         tx.execute(
-            "UPDATE managed_service_generations SET idle_since=COALESCE((SELECT MAX(released_at) FROM managed_service_leases WHERE generation_id=managed_service_generations.id),?1) \
-             WHERE state!='stopped' AND idle_since IS NULL \
-             AND NOT EXISTS(SELECT 1 FROM managed_service_leases l WHERE l.generation_id=managed_service_generations.id AND l.released_at IS NULL)",
+            &format!("UPDATE managed_service_generations SET idle_since=COALESCE((SELECT MAX(released_at) FROM managed_service_leases WHERE generation_id=managed_service_generations.id),?1) WHERE {NEWLY_IDLE_GENERATION}"),
             [at],
         )?;
         tx.commit()

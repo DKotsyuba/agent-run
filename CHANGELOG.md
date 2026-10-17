@@ -4,6 +4,27 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.28.3
+
+- fix(store): index receipt lookups by producer and cooperatively bound receipt
+  retention, preserving retry fences and live-producer protection; migrate to schema 32
+- fix(runtime): skip unchanged pool-settlement and service-lease writes and use
+  actual receipt-retention progress when scheduling bounded backlog cleanup
+- fix(runtime): preserve typed admission failures and producer ownership during
+  cancellation, and reduce broker polling stack pressure
+- fix(worker): reject known launch secrets before accepting finish intents,
+  preserve receipt-backed answer content, and redact nested journal copies
+- fix(integrity): bind launched skill bytes to admitted revisions and reject
+  unlisted, linked or special files in sealed release inventories
+
+## 0.28.2
+
+- fix(store): seek the receipt-age index during retention instead of scanning
+  recent history while producer admission is blocked; preserve scoped receipts,
+  monotonic retry protection and live producer watermarks
+- test(store): enforce a bounded SQLite work budget over a large recent history
+  while still removing an expired receipt
+
 ## 0.28.1
 
 - test(bridge): wait for the expected durable turn as well as idle before

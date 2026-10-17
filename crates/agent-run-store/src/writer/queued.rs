@@ -21,7 +21,7 @@ use std::{
     collections::BTreeMap,
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::Instant,
@@ -41,29 +41,13 @@ struct State {
     faults: Faults,
 }
 
-/// Accepted/pending producer identities protecting receipt watermarks from pruning.
-type Producers = Arc<Mutex<BTreeMap<String, usize>>>;
+/// Weak registrations of accepted/pending producers, collected at admission and pruning.
+/// The registry never owns a live token: discarded closures release protection without locks.
+type Producers = Arc<Mutex<BTreeMap<String, Weak<()>>>>;
 
-/// Registration remains alive through executed SQL, even when the caller cancels.
-struct ProducerGuard {
-    /// Registry shared with the sole receipt-retention callback.
-    producers: Producers,
-    /// Canonical producer identity; never contains credentials or SQL.
-    key: String,
-}
-
-impl Drop for ProducerGuard {
-    /// Release one outstanding registration after the SQL callback is discarded/done.
-    fn drop(&mut self) {
-        let mut producers = self.producers.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(count) = producers.get_mut(&self.key) {
-            *count -= 1;
-            if *count == 0 {
-                producers.remove(&self.key);
-            }
-        }
-    }
-}
+/// Shared registration retained through actual SQL, even if its caller cancels.
+/// Last-owner destruction is lock-free; a later admission/prune collects the dead key.
+type ProducerGuard = Arc<()>;
 
 /// Cloneable application writer over one bounded sqlite-access connection.
 #[derive(Clone)]
@@ -150,6 +134,25 @@ impl QueuedWriter {
         .map_err(|_| Error::Runtime("fixture barrier failed".into()))
     }
 
+    /// Holds the actual receipt-pruning admission gate on the SQL worker until released.
+    /// Fixture-only, with a finite escape; exposes neither raw SQL nor a production RPC.
+    #[cfg(feature = "test-fixtures")]
+    pub async fn fixture_retention_barrier(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> Result<()> {
+        self.execute(1024, None, true, move |_| {
+            let _ = entered.send(());
+            release
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .map_err(|_| Error::Runtime("fixture retention release unavailable".into()))?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| Error::Runtime("fixture retention barrier failed".into()))
+    }
+
     /// Advance a disposable fixture's quota revision on the real authorized connection.
     /// This test-only race seam opens no independent writer and is not an RPC op.
     #[cfg(feature = "test-fixtures")]
@@ -172,12 +175,14 @@ impl QueuedWriter {
         let mut producers = self
             .producers
             .try_lock()
-            .map_err(|_| NotEnqueuedReason::QueueFull)?;
-        *producers.entry(key.clone()).or_default() += 1;
-        Ok(ProducerGuard {
-            producers: self.producers.clone(),
-            key,
-        })
+            .map_err(|_| NotEnqueuedReason::RetentionGate)?;
+        producers.retain(|_, token| token.strong_count() != 0);
+        let token = producers
+            .get(&key)
+            .and_then(Weak::upgrade)
+            .unwrap_or_default();
+        producers.insert(key, Arc::downgrade(&token));
+        Ok(token)
     }
 
     /// Borrow the library connection for one application callback, retaining metadata.
@@ -204,7 +209,9 @@ impl QueuedWriter {
                 // receipt pruning holds the gate during SQL; producers refuse instead
                 // of blocking on it. All other callbacks merely copy bounded keys.
                 let prune_gate = if prune {
-                    Some(producers.lock().unwrap_or_else(|e| e.into_inner()))
+                    let mut gate = producers.lock().unwrap_or_else(|e| e.into_inner());
+                    gate.retain(|_, token| token.strong_count() != 0);
+                    Some(gate)
                 } else {
                     None
                 };
@@ -441,6 +448,7 @@ fn probe_failure(source: rusqlite::Error, phase: RejectStage, started: Instant) 
 fn submit_error(error: CallError<Error>) -> SubmitResult {
     match error {
         CallError::Overloaded => SubmitResult::NotEnqueued(NotEnqueuedReason::QueueFull),
+        CallError::BytesFull => SubmitResult::NotEnqueued(NotEnqueuedReason::BytesFull),
         CallError::Closing => SubmitResult::NotEnqueued(NotEnqueuedReason::Draining),
         CallError::PayloadTooLarge => SubmitResult::Rejected(StorageRejection::new(
             RejectCode::PayloadTooLarge,
@@ -452,5 +460,283 @@ fn submit_error(error: CallError<Error>) -> SubmitResult {
             RejectStage::Statement,
         )),
         _ => SubmitResult::Unknown(UnknownCause::WriterStopped),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Real SQL-worker interleavings, isolated under each test's private home.
+    use super::*;
+    use std::{sync::mpsc, time::Duration};
+
+    /// Initializes schema32 and adopts its fenced writer with the selected queue bounds.
+    fn queue(limits: Limits) -> (tempfile::TempDir, QueuedWriter) {
+        let home = tempfile::tempdir().unwrap();
+        crate::fixture::initialize(home.path()).unwrap();
+        let writer =
+            StoreWriter::open(super::super::WriterLease::acquire_online(home.path()).unwrap())
+                .unwrap();
+        (home, writer.into_queue(limits).unwrap())
+    }
+
+    /// Builds one same-boot broker retention envelope; ordinal increases within this fixture.
+    fn prune_envelope(ordinal: u64) -> Result<LocalEnvelope> {
+        let (boot_id, now_ns) = agent_run_platform::monotonic::now()?;
+        LocalEnvelope::new(
+            OperationId::new(&boot_id, now_ns),
+            agent_run_domain::storage::ProducerId {
+                kind: agent_run_domain::storage::ProducerKind::Broker,
+                scope: Some("retention".into()),
+                instance: "fixture".into(),
+            },
+            ordinal,
+            MonoDeadline {
+                boot_id: boot_id.clone(),
+                ns: now_ns + 5_000_000_000,
+            },
+            crate::ops::LocalOp::from(crate::ops::PruneReceipts {
+                at: agent_run_domain::domain::now(),
+                boot_id,
+                now_ns,
+            }),
+        )
+    }
+
+    /// Actual prune-gate contention is distinguishable from a full SQL queue.
+    #[tokio::test]
+    async fn retention_gate_has_its_own_refusal() {
+        let (_home, queue) = queue(Limits::default());
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = mpsc::channel();
+        let owner = queue.clone();
+        let prune = tokio::spawn(async move {
+            owner
+                .execute(1, None, true, move |_| {
+                    entered.send(()).unwrap();
+                    wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        });
+        ready.await.unwrap();
+        let reason = queue.protect("refused".into()).err().unwrap();
+        release.send(()).unwrap();
+        prune.await.unwrap();
+        queue.close().await.unwrap();
+        assert_eq!(serde_json::to_value(reason).unwrap(), "retention_gate");
+    }
+
+    /// Shared registrations keep a real stale watermark until the last holder disappears.
+    /// Pruning then collects the dead registry entry and deletes the orphan on the same writer.
+    #[tokio::test]
+    async fn shared_guard_lifetime_protects_actual_watermark() {
+        let (_home, queue) = queue(Limits::default());
+        queue
+            .execute(1, None, false, |writer| {
+                writer.store.conn.execute(
+                    "INSERT INTO writer_producers VALUES('p-live',1,'0000000000000000',0,NULL,0)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let first = queue.protect("p-live".into()).unwrap();
+        let last = queue.protect("p-live".into()).unwrap();
+        drop(first);
+        let protected = queue
+            .local(WriteAuthority::Broker, prune_envelope(1).unwrap())
+            .await;
+        let retained = queue
+            .execute(1, None, false, |writer| {
+                Ok(writer.store.conn.query_row(
+                    "SELECT count(*) FROM writer_producers WHERE producer_key='p-live'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        drop(last);
+        let unprotected = queue
+            .local(WriteAuthority::Broker, prune_envelope(2).unwrap())
+            .await;
+        let remaining = queue
+            .execute(1, None, false, |writer| {
+                Ok(writer.store.conn.query_row(
+                    "SELECT count(*) FROM writer_producers WHERE producer_key='p-live'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        queue.close().await.unwrap();
+        assert!(
+            matches!(protected,SubmitResult::Committed(ref r) if r.result.as_u64()==Some(0)),
+            "{protected:?}"
+        );
+        assert_eq!(retained, 1);
+        assert!(
+            matches!(unprotected,SubmitResult::Committed(ref r) if r.result.as_u64()==Some(1)),
+            "{unprotected:?}"
+        );
+        assert_eq!(remaining, 0);
+    }
+
+    /// Real job and byte credits report separate closed refusal causes before effects.
+    #[tokio::test]
+    async fn actual_queue_and_byte_refusals_remain_distinct() {
+        for (jobs, expected) in [(1, "queue_full"), (8, "bytes_full")] {
+            let (_home, queue) = queue(Limits {
+                jobs,
+                bytes: 8,
+                job_bytes: 8,
+            });
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let (release, wait) = mpsc::channel();
+            let owner = queue.clone();
+            let blocked = tokio::spawn(async move {
+                owner
+                    .execute(8, None, false, move |_| {
+                        entered.send(()).unwrap();
+                        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+            });
+            ready.await.unwrap();
+            let error = queue
+                .execute::<()>(1, None, false, |_| panic!("refused SQL must never execute"))
+                .await
+                .unwrap_err();
+            let outcome = submit_error(error);
+            release.send(()).unwrap();
+            blocked.await.unwrap();
+            queue.close().await.unwrap();
+            assert_eq!(serde_json::to_value(outcome).unwrap()["value"], expected);
+        }
+    }
+
+    /// Rejection and destruction of an unpolled submission cannot block Tokio on SQL pruning.
+    /// The release thread waits for the unrelated pulse, with a finite escape for broken Drop.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejected_and_cancelled_guards_do_not_block_async_progress() {
+        for cancelled in [false, true] {
+            let (_home, queue) = queue(Limits {
+                jobs: 1,
+                bytes: 8,
+                job_bytes: 8,
+            });
+            let guard = queue.protect("protected".into()).unwrap();
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let (release, wait) = mpsc::channel();
+            let owner = queue.clone();
+            let prune = tokio::spawn(async move {
+                owner
+                    .execute(1, None, true, move |writer| {
+                        assert!(writer.live_producers.iter().any(|key| key == "protected"));
+                        entered.send(()).unwrap();
+                        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+            });
+            ready.await.unwrap();
+            let (pulse, observed) = mpsc::channel();
+            let released = Arc::new(AtomicBool::new(false));
+            let signal = released.clone();
+            let release_thread = std::thread::spawn(move || {
+                let progressed = observed.recv_timeout(Duration::from_millis(500)).is_ok();
+                signal.store(true, Ordering::Release);
+                release.send(()).unwrap();
+                progressed
+            });
+            let neighbour = tokio::spawn(async move {
+                let _ = pulse.send(());
+            });
+            let pending = Box::pin(queue.execute(1, Some(guard), false, |_| Ok(())));
+            if cancelled {
+                drop(pending);
+            } else {
+                assert!(matches!(pending.await, Err(CallError::Overloaded)));
+            }
+            let blocked_until_release = released.load(Ordering::Acquire);
+            neighbour.await.unwrap();
+            prune.await.unwrap();
+            let progressed = release_thread.join().unwrap();
+            queue.close().await.unwrap();
+            assert!(
+                !blocked_until_release && progressed,
+                "guard destruction blocked unrelated async progress; cancelled={cancelled}"
+            );
+        }
+    }
+
+    /// A full watermark scan must not discard a cheap selected receipt page.
+    /// The SQL hook spends the actual production200ms budget mid-SELECT on the owned writer.
+    #[tokio::test]
+    async fn rust_writer_keeps_receipt_progress_before_watermark_expiry() {
+        let (_home, queue) = queue(Limits::default());
+        let result = queue.execute(1, None, true, |writer| {
+            let conn = &writer.store.conn;
+            conn.execute_batch("BEGIN IMMEDIATE; WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<100000) INSERT INTO writer_producers SELECT printf('recent-%06d',x),1,'0000000000000000',0,'scoped',0 FROM n; COMMIT;")?;
+            conn.execute("INSERT INTO operation_receipts(operation_id,digest,op_kind,producer_key,ordinal,authority_kind,authority_fingerprint,agent_id,outcome,result_json,writer_epoch,committed_at) VALUES(?1,?2,'fixture','expired',1,'broker',?3,NULL,'committed','{}',1,0)", rusqlite::params![OperationId::new("old-boot",1).as_str(), "d".repeat(64), "f".repeat(64)])?;
+            crate::ops::apply::WATERMARK_READ_PAUSE.with(|pause| *pause.borrow_mut() = Some(Box::new(|| std::thread::sleep(Duration::from_millis(210)))));
+            let first = writer.apply_local_owned(&WriteAuthority::Broker,prune_envelope(1)?);
+            let remaining: i64 = writer.store.conn.query_row("SELECT count(*) FROM operation_receipts WHERE producer_key='expired'",[],|r|r.get(0))?;
+            let scoped: i64 = writer.store.conn.query_row("SELECT count(*) FROM writer_producers WHERE execution_id='scoped'",[],|r|r.get(0))?;
+            let second = writer.apply_local_owned(&WriteAuthority::Broker,prune_envelope(2)?);
+            crate::ops::apply::WATERMARK_READ_PAUSE.with(|pause| pause.borrow_mut().take());
+            let autocommit = writer.store.conn.is_autocommit();
+            let sum: i64 = writer.store.conn.query_row("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<10000) SELECT SUM(x) FROM n",[],|r|r.get(0))?;
+            Ok((first,second,remaining,scoped,autocommit,sum))
+        }).await;
+        queue.close().await.unwrap();
+        let (first, second, remaining, scoped, autocommit, sum) = result.unwrap();
+        assert!(
+            matches!(first, SubmitResult::Committed(ref r) if r.result.as_u64().is_some_and(|n| n>0)),
+            "cheap receipt progress lost: {first:?}"
+        );
+        assert_eq!(remaining, 0);
+        assert_eq!(scoped, 100000);
+        assert!(
+            matches!(second, SubmitResult::Rejected(ref r) if r.persistence.as_ref().and_then(|d|d.sqlite_primary)==Some(9)),
+            "watermark-only expiry must remain a typed SQL failure: {second:?}"
+        );
+        assert!(autocommit);
+        assert_eq!(sum, 50_005_000, "read hook cleared before follow-on work");
+    }
+
+    /// A non-budget DELETE failure remains a rolled-back SQL refusal; removing the
+    /// owned fault permits the next real pruning transaction on the same writer.
+    #[tokio::test]
+    async fn receipt_sql_failure_rolls_back_and_writer_recovers() {
+        let (_home, queue) = queue(Limits::default());
+        let observations = queue.execute(1,None,true,|writer| {
+            writer.store.conn.execute("INSERT INTO operation_receipts(operation_id,digest,op_kind,producer_key,ordinal,authority_kind,authority_fingerprint,agent_id,outcome,result_json,writer_epoch,committed_at) VALUES(?1,?2,'fixture','expired',1,'broker',?3,NULL,'committed','{}',1,0)",rusqlite::params![OperationId::new("old-boot",1).as_str(),"d".repeat(64),"f".repeat(64)])?;
+            writer.store.conn.execute_batch("CREATE TEMP TRIGGER fail_receipt_prune BEFORE DELETE ON operation_receipts BEGIN SELECT RAISE(ABORT,'fixture'); END;")?;
+            let failed = writer.apply_local_owned(&WriteAuthority::Broker,prune_envelope(1)?);
+            let retained: i64 = writer.store.conn.query_row("SELECT count(*) FROM operation_receipts WHERE producer_key='expired'",[],|r|r.get(0))?;
+            let settled = writer.store.conn.is_autocommit();
+            writer.store.conn.execute_batch("DROP TRIGGER fail_receipt_prune;")?;
+            let recovered = writer.apply_local_owned(&WriteAuthority::Broker,prune_envelope(2)?);
+            Ok((failed,retained,settled,recovered))
+        }).await;
+        queue.close().await.unwrap();
+        let (failed, retained, settled, recovered) = observations.unwrap();
+        assert!(
+            matches!(failed,SubmitResult::Rejected(ref r) if r.code==RejectCode::StorageRolledBack && r.persistence.as_ref().and_then(|d|d.sqlite_primary)==Some(19)),
+            "{failed:?}"
+        );
+        assert_eq!(retained, 1);
+        assert!(settled);
+        assert!(
+            matches!(recovered,SubmitResult::Committed(ref r) if r.result.as_u64()==Some(1)),
+            "{recovered:?}"
+        );
     }
 }

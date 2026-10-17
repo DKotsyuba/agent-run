@@ -2139,6 +2139,8 @@ impl Service {
     ///
     /// Native process observation is performed by the lifecycle module and
     /// never treats unavailable OS evidence as a terminal outcome.
+    /// Pool eligibility is read off the executor before admission; unchanged
+    /// pools create no settlement receipts. The writer rechecks each decision.
     pub async fn reconcile(&self) -> Result<usize> {
         let lane = self.lane("reconcile")?;
         let reconciled = reconcile::queued::reconcile(&self.home, &lane, 100)
@@ -2147,16 +2149,21 @@ impl Service {
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs() as usize);
-        lane.local(
-            agent_run_store::ops::SettlePool {
-                target: agent_run_store::ops::SettleTarget::Open {
-                    limit: POOL_SWEEP_LIMIT,
-                    seed,
+        if self
+            .read(move |reader| reader.pool_settlement_pending(POOL_SWEEP_LIMIT, seed))
+            .await?
+        {
+            lane.local(
+                agent_run_store::ops::SettlePool {
+                    target: agent_run_store::ops::SettleTarget::Open {
+                        limit: POOL_SWEEP_LIMIT,
+                        seed,
+                    },
                 },
-            },
-            crate::broker_writer::BROKER_BUDGET,
-        )
-        .await?;
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await?;
+        }
         Ok(reconciled)
     }
     /// Returns the active cached config revision after the request-boundary
@@ -2558,9 +2565,12 @@ pub(crate) fn prepare_provider(
     profile
         .required_constraints
         .extend(offering.restrictions.iter().copied());
-    let role = role_plan::resolve_role_plan(
+    let skill_sources =
+        adapters::provider::effective_skill_sources(config, provider.harness, &profile)?;
+    let role = role_plan::resolve_role_plan_with_sources(
         &profile,
         config.skills_dir(),
+        &skill_sources,
         &config.mcp,
         if request.account.is_some() {
             "account"

@@ -158,6 +158,7 @@ sleep 1
                     status: FinishStatus::Done,
                 },
                 agent_run_domain::domain::now(),
+                agent_run_domain::worker::FinishGuard::Clean,
             )
             .unwrap();
         std::fs::write(home.path.join("receipt"), format!("{}\n", receipt.sha256)).unwrap();
@@ -223,6 +224,7 @@ async fn acknowledged_finish_recovers_after_supervisor_exit() {
                 status: FinishStatus::Done,
             },
             101.0,
+            agent_run_domain::worker::FinishGuard::Clean,
         )
         .unwrap();
     store.observe_worker_finish_receipt(&id).unwrap();
@@ -271,4 +273,156 @@ async fn acknowledged_finish_recovers_after_supervisor_exit() {
             .unwrap(),
         1
     );
+}
+
+/// Synthetic launch credential carried by the native fixture environment.
+const LAUNCH_SECRET: &str = "synthetic-launch-secret";
+
+/// Run one explicit stream whose native child requests finish, waits until
+/// the broker-equivalent store accepted `summary`, then either returns the
+/// digest-bearing tool result (`reply`) or exits with a controlled failure
+/// after losing that reply. The child launch carries `LAUNCH_SECRET`, which
+/// seeds the process redactor; `schema` is the admitted output schema.
+async fn finish_run(
+    summary: &str,
+    schema: Option<serde_json::Value>,
+    reply: bool,
+) -> (
+    common::Home,
+    agent_run_domain::domain::AgentId,
+    agent_run_core::Result<agent_run_adapters::EngineResult>,
+    Process,
+) {
+    let home = common::Home::new();
+    let mut req = home.request();
+    req.explicit_finish = true;
+    req.output_schema = schema.map(|schema| schema.as_object().unwrap().clone());
+    let (id, _) = home
+        .store()
+        .admit(&req, &home.config, &json!({}), None)
+        .unwrap();
+    let mut store = home.store();
+    store.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES('attempt',?,1,'running','{}',100,1)",[id.as_str()]).unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='running' WHERE id=?",
+            [id.as_str()],
+        )
+        .unwrap();
+    store
+        .issue_worker_capability(&id, "attempt", TOKEN, 100.0)
+        .unwrap();
+    store.begin_worker_lifecycle(&id, "attempt", 100.0).unwrap();
+    let row = store.get(&id).unwrap();
+    let prep = common::writer::prepare_supervisor(&mut store, &id);
+    let harness = common::writer::Harness::start(&home.path);
+    let mut persist = harness.supervisor(&home.path, prep, &id).await;
+    let ending = if reply {
+        r#"printf '{"type":"user","session_id":"s","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"finish-call","content":"%s"}]}}\n' "$digest"
+sleep 1"#
+    } else {
+        "exit 3"
+    };
+    let script = format!(
+        r#"read initial
+printf '%s\n' '{{"type":"assistant","session_id":"s","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"finish-call","name":"mcp__agent_run_worker__finish","input":{{"summary":"see receipt"}}}}]}}}}'
+for i in $(seq 1 500); do test -f receipt && break; sleep 0.01; done
+read digest < receipt
+{ending}
+"#
+    );
+    let mut launch = plan(&home, script);
+    launch.environment = BTreeMap::from([("SERVICE_TOKEN".into(), LAUNCH_SECRET.into())]);
+    let mut process = Process::spawn(&launch).unwrap();
+    let mut control = home.store();
+    let driver = async {
+        let receipt = control
+            .accept_worker_finish(
+                &id,
+                "attempt",
+                TOKEN,
+                &FinishRequest {
+                    summary: summary.into(),
+                    status: FinishStatus::Done,
+                },
+                agent_run_domain::domain::now(),
+                agent_run_domain::worker::FinishGuard::Clean,
+            )
+            .unwrap();
+        std::fs::write(home.path.join("receipt"), format!("{}\n", receipt.sha256)).unwrap();
+    };
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        let (result, ()) = tokio::join!(
+            stream::run(&mut process, &mut persist, &row, &row, Some("initial\n")),
+            driver
+        );
+        persist.flush().await.unwrap();
+        result
+    })
+    .await
+    .expect("finite finish fixture");
+    (home, id, result, process)
+}
+
+/// Schema-valid JSON with insignificant whitespace is not credential
+/// material: with a launch secret configured, the observed finish succeeds
+/// and its answer is the exact accepted summary bytes, not a compact copy.
+#[tokio::test]
+async fn formatted_json_finish_keeps_exact_bytes() {
+    let summary = "{ \"ok\" : true }";
+    let schema = json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false});
+    let (_home, _id, result, mut process) = finish_run(summary, Some(schema), true).await;
+    let result = result.expect("formatted JSON finish completes");
+    assert_eq!(result.outcome.status, Status::Succeeded);
+    assert_eq!(result.answer.as_deref(), Some(summary));
+    let proof = process.owner.cleanup(Duration::from_secs(2)).await.unwrap();
+    assert!(proof.confirmed && proof.group_gone);
+    process.reap().await;
+}
+
+/// The post-acceptance backstop still refuses a known launch secret whether
+/// it appears literally or only after JSON string unescaping.
+#[tokio::test]
+async fn launch_secret_summary_is_refused_at_receipt() {
+    for summary in [
+        format!("leaked {LAUNCH_SECRET}"),
+        r#"{"note":"synthetic-launch-secret"}"#.to_owned(),
+    ] {
+        let (_home, _id, result, mut process) = finish_run(&summary, None, true).await;
+        assert!(matches!(
+            result,
+            Err(agent_run_core::Error::Validation(ref message))
+                if message == "finish summary contains launch secret material"
+        ));
+        let _ = process.owner.cleanup(Duration::from_secs(2)).await;
+        process.reap().await;
+    }
+}
+
+/// A finish accepted by the broker whose native reply was lost, followed by
+/// a controlled engine failure, leaves the run without an answer: the
+/// finalization helper returns the exact summary only after the receipt.
+#[tokio::test]
+async fn lost_finish_reply_never_becomes_an_answer() {
+    let summary = "accepted but unobserved";
+    let (home, id, result, mut process) = finish_run(summary, None, false).await;
+    let result = result.expect("controlled engine failure is a result");
+    assert_ne!(result.outcome.status, Status::Succeeded);
+    assert!(result.answer.is_none());
+    let store = home.store();
+    assert!(store.worker_finish_intent(&id, false).unwrap().is_some());
+    assert_eq!(
+        agent_run_core::worker_finish::answer(&process, &store, &id).unwrap(),
+        None
+    );
+    store.observe_worker_finish_receipt(&id).unwrap();
+    assert_eq!(
+        agent_run_core::worker_finish::answer(&process, &store, &id)
+            .unwrap()
+            .as_deref(),
+        Some(summary)
+    );
+    let _ = process.owner.cleanup(Duration::from_secs(2)).await;
+    process.reap().await;
 }

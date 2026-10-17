@@ -24,6 +24,15 @@ use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 use serde_json::Value;
 use std::time::Instant;
 
+#[cfg(test)]
+thread_local! {
+    /// One-shot worker-thread pause inside the actual watermark SELECT progress hook.
+    /// Tests install it on their owned connection thread; production has no seam.
+    pub(crate) static WATERMARK_READ_PAUSE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    /// Whether this thread is currently reading watermark candidates.
+    static READING_WATERMARKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Facts of one submission the transaction needs besides the payload.
 pub(crate) struct Submission<'a> {
     /// Envelope header.
@@ -1114,18 +1123,98 @@ pub(crate) fn record_recovery(
     })
 }
 
+/// Receipt-page bound that leaves headroom for validation and writes within
+/// the short cooperative budget under parallel broker load.
+const RECEIPT_PRUNE_LIMIT: usize = 500;
+
 /// Removes stale unscoped receipts and producer watermarks (row 87), at most
-/// 2000 of each. A receipt is removed only when it is unscoped, its commit is
+/// 500 receipts, or 2000 watermarks when no receipt candidates qualify. A receipt is removed only when it is unscoped, its commit is
 /// older than 14 days of wall time AND its operation identity is stale on the
 /// monotonic clock (another boot, or issued more than the maximum operation
 /// age ago), so no live retry can need it; a wall-clock jump alone never
-/// removes anything. A watermark is removed only when it scopes no
+/// removes anything. Receipt pages follow commit time (sequence breaks ties),
+/// using the age index so recent history is skipped under the producer gate.
+/// A watermark is removed only when it scopes no
 /// execution, no receipt references it, it is 14 days old in wall time, its
 /// last issue is stale on the monotonic clock and its producer has no
 /// unfinished scheduler work (`temp.writer_live_producers`, filled by the
 /// sole writer in the same transaction). `boot_id`/`now_ns` must be
 /// the writer's current boot and clock. Returns the number of removed rows.
+/// `at` must be finite nonnegative Unix seconds. Read probes and bounded row
+/// loops share a cooperative 200 ms budget. Read expiry is a storage failure;
+/// deletion stops at the budget and returns the actual prefix for atomic commit.
+/// Watermarks wait until an eligible receipt backlog drains; their potentially
+/// expensive scan cannot consume the selected receipt page's mutation budget.
+/// The sole writer owns this
+/// connection's progress callback; it is cleared before primary-key mutations.
 pub(crate) fn prune_receipts(conn: &Connection, op: &super::PruneReceipts) -> Result<usize> {
+    prune_receipts_until(
+        conn,
+        op,
+        Instant::now() + std::time::Duration::from_millis(200),
+    )
+}
+
+/// Constructs the closed storage interruption for an exhausted read budget.
+/// The caller has not changed persistent rows, so its normal rollback remains valid.
+fn receipt_retention_interrupted() -> Error {
+    Error::Sql(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+        None,
+    ))
+}
+
+/// Selects before `deadline`, clears its SQL progress hook on every ordinary
+/// return, then atomically prunes a budget-limited prefix in the caller's transaction.
+/// Only read probes are interruptible: SQLite may auto-roll back interrupted DML.
+fn prune_receipts_until(
+    conn: &Connection,
+    op: &super::PruneReceipts,
+    deadline: Instant,
+) -> Result<usize> {
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS writer_live_producers(key TEXT PRIMARY KEY)",
+        [],
+    )?;
+    conn.progress_handler(
+        1_000,
+        Some(move || {
+            #[cfg(test)]
+            if READING_WATERMARKS.get() {
+                WATERMARK_READ_PAUSE.with(|pause| {
+                    if let Some(pause) = pause.borrow_mut().take() {
+                        pause();
+                    }
+                });
+            }
+            Instant::now() >= deadline
+        }),
+    )?;
+    let result = receipt_prune_candidates(conn, op, deadline);
+    #[cfg(test)]
+    READING_WATERMARKS.set(false);
+    let cleanup = conn.progress_handler(0, None::<fn() -> bool>);
+    let (receipts, watermarks) = result?;
+    cleanup?;
+    apply_receipt_pruning(conn, &receipts, &watermarks, || Instant::now() < deadline)
+}
+
+/// Reads at most 500 receipt sequences, or 2000 already-orphaned producer keys
+/// under the caller's progress hook, with no persistent mutation. Validates the
+/// same time/boot/retry guards as [`prune_receipts`]; `writer_live_producers` must
+/// already exist. Read-budget expiry returns SQLITE_INTERRUPT before any deletes.
+fn receipt_prune_candidates(
+    conn: &Connection,
+    op: &super::PruneReceipts,
+    deadline: Instant,
+) -> Result<(Vec<i64>, Vec<String>)> {
+    let check_deadline = || {
+        if Instant::now() >= deadline {
+            Err(receipt_retention_interrupted())
+        } else {
+            Ok(())
+        }
+    };
     let invalid = agent_run_domain::error::invalid;
     if !op.at.is_finite() || op.at < 0.0 {
         return Err(invalid("receipt retention requires a finite Unix time"));
@@ -1138,11 +1227,12 @@ pub(crate) fn prune_receipts(conn: &Connection, op: &super::PruneReceipts) -> Re
             ));
         }
     }
+    check_deadline()?;
     let cutoff = op.at - 14.0 * 86_400.0;
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare(&format!(
         "SELECT commit_seq,operation_id FROM operation_receipts \
-         WHERE agent_id IS NULL AND committed_at < ?1 ORDER BY commit_seq LIMIT 2000",
-    )?;
+         WHERE agent_id IS NULL AND committed_at < ?1 ORDER BY committed_at,commit_seq LIMIT {RECEIPT_PRUNE_LIMIT}",
+    ))?;
     let receipts: Vec<i64> = statement
         .query_map([cutoff], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
@@ -1155,16 +1245,16 @@ pub(crate) fn prune_receipts(conn: &Connection, op: &super::PruneReceipts) -> Re
         .map(|(seq, _)| seq)
         .collect();
     drop(statement);
-    for seq in &receipts {
-        conn.execute("DELETE FROM operation_receipts WHERE commit_seq=?", [seq])?;
+    check_deadline()?;
+    // ponytail: watermark scans wait for receipt backlog; split budgets if independent progress is needed.
+    if !receipts.is_empty() {
+        return Ok((receipts, Vec::new()));
     }
     let current = agent_run_domain::storage::boot_tag(&op.boot_id);
+    #[cfg(test)]
+    READING_WATERMARKS.set(true);
     // Producers with unfinished scheduler work (filled by the sole writer in
     // this transaction) keep their watermarks however old.
-    conn.execute(
-        "CREATE TEMP TABLE IF NOT EXISTS writer_live_producers(key TEXT PRIMARY KEY)",
-        [],
-    )?;
     let mut statement = conn.prepare(
         "SELECT w.producer_key,w.last_boot_tag,w.last_issued_ns FROM writer_producers w \
          WHERE w.updated_at < ?1 AND w.execution_id IS NULL \
@@ -1190,10 +1280,50 @@ pub(crate) fn prune_receipts(conn: &Connection, op: &super::PruneReceipts) -> Re
         .map(|(key, ..)| key)
         .collect();
     drop(statement);
-    for key in &watermarks {
-        conn.execute("DELETE FROM writer_producers WHERE producer_key=?", [key])?;
+    #[cfg(test)]
+    READING_WATERMARKS.set(false);
+    check_deadline()?;
+    Ok((receipts, watermarks))
+}
+
+/// Deletes selected primary keys while `may_continue` permits another bounded
+/// statement. The caller must clear interrupt hooks and own the transaction.
+/// Returns the actual deleted prefix for atomic commit; zero progress on a
+/// nonempty expired batch is a storage interruption, so maintenance retries.
+/// Ordinary SQL errors propagate without a commit or a rollback claim here.
+fn apply_receipt_pruning(
+    conn: &Connection,
+    receipts: &[i64],
+    watermarks: &[String],
+    mut may_continue: impl FnMut() -> bool,
+) -> Result<usize> {
+    let mut removed = 0;
+    let expired = |removed| {
+        if removed == 0 {
+            Err(receipt_retention_interrupted())
+        } else {
+            Ok(removed)
+        }
+    };
+    {
+        let mut delete = conn.prepare("DELETE FROM operation_receipts WHERE commit_seq=?")?;
+        for seq in receipts {
+            if !may_continue() {
+                return expired(removed);
+            }
+            removed += delete.execute([seq])?;
+        }
     }
-    Ok(receipts.len() + watermarks.len())
+    {
+        let mut delete = conn.prepare("DELETE FROM writer_producers WHERE producer_key=?")?;
+        for key in watermarks {
+            if !may_continue() {
+                return expired(removed);
+            }
+            removed += delete.execute([key])?;
+        }
+    }
+    Ok(removed)
 }
 
 /// Stored outcome of `id` regardless of authority (trusted read path).
@@ -1208,6 +1338,176 @@ mod tests {
     //! Rollback confirmation and closed persistence diagnostics of the
     //! transaction boundary, checked without a writer home.
     use super::*;
+
+    /// Retention must leave recent receipts intact without spending work proportional
+    /// to their population while the queue's producer-admission gate is held.
+    /// A deterministic SQLite VM budget catches a full history scan even on a fast disk;
+    /// one expired receipt and ten stale orphan watermarks prove both indexed
+    /// selectors perform real work. The batch seam preserves the counting hook.
+    #[test]
+    fn receipt_pruning_skips_large_recent_history_with_bounded_work() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../../../sql/schema.sql"))
+            .unwrap();
+        let (boot, now_ns) = agent_run_platform::monotonic::now().unwrap();
+        let at = agent_run_domain::domain::now();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO operation_receipts(operation_id,digest,op_kind,producer_key,ordinal,authority_kind,authority_fingerprint,agent_id,outcome,result_json,writer_epoch,committed_at) \
+                 VALUES(?1,?2,'fixture','retention-fixture',?3,'broker',?4,NULL,'committed','{}',1,?5)",
+            ).unwrap();
+            for ordinal in 1..=20_000 {
+                insert
+                    .execute(params![
+                        OperationId::new("retention-fixture", ordinal).as_str(),
+                        "d".repeat(64),
+                        ordinal,
+                        "f".repeat(64),
+                        at,
+                    ])
+                    .unwrap();
+            }
+            insert
+                .execute(params![
+                    OperationId::new("expired-fixture", 1).as_str(),
+                    "d".repeat(64),
+                    20_001,
+                    "f".repeat(64),
+                    at - 15.0 * 86_400.0,
+                ])
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        for ordinal in 0..10 {
+            conn.execute(
+                "INSERT INTO writer_producers VALUES(?1,1,?2,0,NULL,?3)",
+                params![
+                    format!("retention-orphan-{ordinal:03}"),
+                    if agent_run_domain::storage::boot_tag(&boot) == "0000000000000000" {
+                        "ffffffffffffffff"
+                    } else {
+                        "0000000000000000"
+                    },
+                    at - 15.0 * 86_400.0,
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "CREATE TEMP TABLE writer_live_producers(key TEXT PRIMARY KEY)",
+            [],
+        )
+        .unwrap();
+        let steps = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter = steps.clone();
+        conn.progress_handler(
+            1,
+            Some(move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                false
+            }),
+        )
+        .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let op = super::super::PruneReceipts {
+            at,
+            boot_id: boot,
+            now_ns,
+        };
+        let (receipts, watermarks) = receipt_prune_candidates(&conn, &op, deadline).unwrap();
+        let removed =
+            apply_receipt_pruning(&conn, &receipts, &watermarks, || Instant::now() < deadline)
+                .unwrap();
+        assert_eq!(
+            removed, 1,
+            "receipt page gets its mutation budget before watermark scanning"
+        );
+        let (receipts, watermarks) = receipt_prune_candidates(&conn, &op, deadline).unwrap();
+        let removed = removed
+            + apply_receipt_pruning(&conn, &receipts, &watermarks, || Instant::now() < deadline)
+                .unwrap();
+        conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+        let steps = steps.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(removed, 11);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM operation_receipts", [], |row| row
+                .get::<_, u64>(0))
+                .unwrap(),
+            20_000
+        );
+        assert!(
+            steps > 0 && steps < 5_000,
+            "receipt retention spent {steps} VM steps over recent history"
+        );
+    }
+
+    /// Expiry after a real deletion preserves that prefix for one atomic commit
+    /// and leaves the connection usable. A deterministic budget predicate avoids
+    /// timing guesses or relaxing the production deadline.
+    #[test]
+    fn receipt_pruning_commits_progress_when_budget_ends_between_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../../../sql/schema.sql"))
+            .unwrap();
+        for ordinal in 1..=2 {
+            conn.execute(
+                "INSERT INTO operation_receipts(operation_id,digest,op_kind,producer_key,ordinal,authority_kind,authority_fingerprint,agent_id,outcome,result_json,writer_epoch,committed_at) VALUES(?1,?2,'fixture','budget-fixture',?3,'broker',?4,NULL,'committed','{}',1,0)",
+                params![OperationId::new("budget-fixture", ordinal).as_str(), "d".repeat(64), ordinal, "f".repeat(64)],
+            ).unwrap();
+        }
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let mut checks = 0;
+        let removed = apply_receipt_pruning(&conn, &[1, 2], &[], || {
+            checks += 1;
+            checks == 1
+        })
+        .unwrap();
+        assert_eq!(removed, 1);
+        assert!(!conn.is_autocommit());
+        conn.execute_batch("COMMIT").unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM operation_receipts", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        conn.execute("DELETE FROM operation_receipts", []).unwrap();
+        assert!(conn.is_autocommit());
+    }
+
+    /// Expired retention returns a storage interruption and clears its callback,
+    /// allowing the caller to roll back and execute later substantial SQL normally.
+    #[test]
+    fn receipt_pruning_deadline_interrupt_clears_callback() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../../../sql/schema.sql"))
+            .unwrap();
+        let (boot_id, now_ns) = agent_run_platform::monotonic::now().unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let error = prune_receipts_until(
+            &conn,
+            &super::super::PruneReceipts {
+                at: agent_run_domain::domain::now(),
+                boot_id,
+                now_ns,
+            },
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::Sql(error) if error.sqlite_error_code() == Some(ErrorCode::OperationInterrupted))
+        );
+        conn.execute_batch("ROLLBACK").unwrap();
+        let sum: i64 = conn
+            .query_row(
+                "WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<10000) SELECT SUM(x) FROM n",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sum, 50_005_000);
+    }
 
     /// A SQLite failure with `code` as its extended result code.
     fn sql(code: i32) -> Error {

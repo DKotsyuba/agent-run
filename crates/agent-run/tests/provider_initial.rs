@@ -1129,6 +1129,76 @@ async fn provider_start_completes_one_owned_fake_engine_attempt() {
     assert_eq!(replay["agent_id"], admitted["agent_id"]);
 }
 
+/// Provider admission records the revision of the skill bytes the configured
+/// plugin will actually supply, not of a differing catalog duplicate, and the
+/// detached supervisor then launches that unchanged plugin to completion.
+#[tokio::test]
+async fn admission_freezes_configured_plugin_skill_revision_and_launches() {
+    let (_temp, home) = home();
+    let catalog = home.join("skills/demo");
+    fs::create_dir_all(&catalog).unwrap();
+    fs::write(catalog.join("SKILL.md"), "Catalog duplicate.\n").unwrap();
+    let plugin = home.join("demo-plugin");
+    fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
+    fs::write(
+        plugin.join(".claude-plugin/plugin.json"),
+        r#"{"name":"demo-plugin","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(plugin.join("skills/demo")).unwrap();
+    fs::write(
+        plugin.join("skills/demo/SKILL.md"),
+        "Configured plugin bytes.\n",
+    )
+    .unwrap();
+    fs::write(home.join("profiles/review.md"),
+        "+++\nrevision = \"1\"\nwrite = false\nnetwork = false\nallow_external_read_roots = false\nskills = [\"demo\"]\nmcp = []\nrequired_constraints = []\n+++\nReview safely.\n").unwrap();
+    let config = fs::read_to_string(home.join("config.toml")).unwrap();
+    let claude_home = format!("home = \"{}/claude\"\n", home.display());
+    assert!(config.contains(&claude_home));
+    fs::write(
+        home.join("config.toml"),
+        config.replacen(
+            &claude_home,
+            &format!("{claude_home}plugins = [\"{}\"]\n", plugin.display()),
+            1,
+        ),
+    )
+    .unwrap();
+    let service = fixture_service(home.clone()).await;
+    let admitted = service
+        .admit_provider_trusted(request(&home), candidates(committed(&home)))
+        .await
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    let identity = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap()
+        .identity
+        .unwrap();
+    let frozen = &identity["authority"]["role_payload"]["skills"][0];
+    assert_eq!(frozen["id"], "demo");
+    let plugin_revision =
+        agent_run_config::role_plan::tree_revision(&plugin.join("skills/demo")).unwrap();
+    assert_eq!(frozen["revision"], plugin_revision);
+    assert_ne!(
+        plugin_revision,
+        agent_run_config::role_plan::tree_revision(&catalog).unwrap()
+    );
+    let mut child = supervisor(&home, &id).await;
+    let exit = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(exit.success(), "supervisor exit: {exit}");
+    let row = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
+    assert_eq!(row.status, Status::Succeeded);
+}
+
 /// A valid result does not end a still-live provider engine. Old admission age
 /// never signals it; explicit cancellation preserves transcript and cleanup evidence.
 #[tokio::test]
@@ -1271,6 +1341,69 @@ async fn provider_cancel_before_spawn_releases_only_its_attempt() {
     assert_eq!(proof.as_deref(), Some("{\"never_spawned\":true}"));
     assert_eq!(process, None);
     assert_eq!(service.answer(&id).unwrap()["available"], false);
+}
+
+/// An explicit-finish launch whose known launch secrets exceed the writer's
+/// finish-guard bound fails before the spawn claim: the run ends failed with
+/// a fixed diagnostic, no native child, a never-spawned proof and no active
+/// ownership, so neither the attempt nor agent capacity stays held.
+#[tokio::test]
+async fn oversized_finish_guard_fails_before_the_spawn_claim() {
+    let (_temp, home) = home();
+    let service = fixture_service(home.clone()).await;
+    let mut request = request(&home);
+    request.explicit_finish = true;
+    let admitted = service
+        .admit_provider_trusted(request, candidates(committed(&home)))
+        .await
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    // The selected credential becomes ANTHROPIC_AUTH_TOKEN in the launch.
+    let oversized = "s".repeat(13 * 1024);
+    let mut child = test_broker::spawn_supervisor_with_env(
+        env!("CARGO_BIN_EXE_agent-run"),
+        &home,
+        &id,
+        &[
+            ("HOME", home.as_os_str()),
+            ("FAKE_TOKEN", std::ffi::OsStr::new(&oversized)),
+        ],
+    )
+    .await;
+    let _ = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    let row = store.get(&id).unwrap();
+    assert_eq!(row.status, Status::Failed);
+    let text = row.failure_text.unwrap_or_default();
+    assert!(
+        text.contains("launch secret context exceeds the writer hello bound"),
+        "{text}"
+    );
+    assert!(!text.contains(&oversized[..64]));
+    let (active, proof, process, phase): (i64, Option<String>, Option<String>, String) = store
+        .conn
+        .query_row(
+            "SELECT ownership_active,cleanup_proof_json,process_identity,phase FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(active, 0);
+    assert_eq!(proof.as_deref(), Some("{\"never_spawned\":true}"));
+    assert_eq!(process, None);
+    assert_eq!(phase, "cleanup_complete");
+    let live: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM agents WHERE finished_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(live, 0, "no admitted execution keeps capacity");
 }
 
 /// A changed sealed role cannot acquire different grants on retry; the

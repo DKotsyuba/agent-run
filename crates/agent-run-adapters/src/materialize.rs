@@ -2,6 +2,7 @@ use crate::{auth, redact::is_secret_name};
 use agent_run_config::{
     config::{Adapter, Auth, Config, Runtime},
     profiles::Profile,
+    role_plan::ResolvedSkill,
 };
 use agent_run_domain::{Error, Result, domain::StartRequest, error::invalid};
 use agent_run_platform::{
@@ -137,9 +138,19 @@ impl Publisher {
             .insert(path.into(), real.to_string_lossy().into_owned());
         Ok(())
     }
-    pub fn tree(&mut self, source: &Path, prefix: &str, selected: Option<&[String]>) -> Result<()> {
+    /// Publishes `source` (or only its `selected` entries) below `prefix` as one
+    /// managed snapshot and returns the identity of the exact bytes captured.
+    ///
+    /// The returned [`snapshot_tree::TreeSnapshot::content_revision`] describes
+    /// the published copy, not a later re-read of `source`, so callers can
+    /// compare it with an admitted provenance revision without a gap.
+    pub fn tree(
+        &mut self,
+        source: &Path,
+        prefix: &str,
+        selected: Option<&[String]>,
+    ) -> Result<snapshot_tree::TreeSnapshot> {
         snapshot_tree::snapshot_managed_tree(&self.root, Path::new(prefix), source, selected)
-            .map(drop)
     }
     /// Bind adapter-owned files and links into the Python-v1 runtime index.
     pub fn finish(self) -> Result<(Snapshot, String)> {
@@ -488,11 +499,18 @@ pub fn materialize(
     home: &Path,
     app_home: &Path,
 ) -> Result<(Snapshot, String)> {
-    materialize_with_provider(config, runtime, request, profile, home, app_home, None)
+    materialize_with_provider(
+        config, runtime, request, profile, home, app_home, None, None,
+    )
 }
 
 /// Seals provider-specific native settings and nonsecret launch metadata into
 /// the same verified runtime index as skills, MCP, hooks, and permissions.
+///
+/// `admitted_skills` are the frozen role's skill identities and content
+/// revisions. Every declared skill must appear there and its captured bytes
+/// must hash to that revision, otherwise materialization fails before the
+/// index is sealed.
 // Each argument is an independent, already-validated input of the one seal.
 #[allow(clippy::too_many_arguments)]
 pub fn materialize_provider(
@@ -505,6 +523,7 @@ pub fn materialize_provider(
     provider: &agent_run_domain::ProviderDefinition,
     native_model: &str,
     config_sha256: &str,
+    admitted_skills: &[ResolvedSkill],
 ) -> Result<(Snapshot, String)> {
     materialize_with_provider(
         config,
@@ -514,6 +533,7 @@ pub fn materialize_provider(
         home,
         app_home,
         Some((provider, native_model, config_sha256)),
+        Some(admitted_skills),
     )
 }
 
@@ -628,6 +648,19 @@ fn seal_opencode_bridge(
 /// Codex homes disable remote catalog discovery and forward resolved Rust roots
 /// to user MCP servers; the optional provider branch seals connection settings.
 /// Existing homes are verified separately and never regenerated during resume.
+///
+/// With `admitted_skills` (provider launches) each declared skill's effective
+/// source, whether a catalog directory or a configured plugin that ships the
+/// name, must still hold the revision recorded when the role was admitted. A
+/// copied skill is compared with the revision of the bytes actually published,
+/// so a content change or retargeted catalog link between admission and capture
+/// is refused rather than silently sealed under stale provenance. A
+/// Claude/GLM plugin skill stays in its plugin directory, so it is checked once
+/// at this capture and is not sealed afterwards. Without `admitted_skills`
+/// (legacy v1 homes) no provenance exists and nothing is compared. The refusal
+/// message names only the skill id.
+// Each argument is an independent, already-validated input of the one seal.
+#[allow(clippy::too_many_arguments)]
 fn materialize_with_provider(
     config: &Config,
     runtime: &Runtime,
@@ -636,6 +669,7 @@ fn materialize_with_provider(
     home: &Path,
     app_home: &Path,
     provider: Option<(&agent_run_domain::ProviderDefinition, &str, &str)>,
+    admitted_skills: Option<&[ResolvedSkill]>,
 ) -> Result<(Snapshot, String)> {
     crate::validate_role(runtime, profile)?;
     let research = profile.research_tools_only();
@@ -665,8 +699,30 @@ fn materialize_with_provider(
         app_home.join("skills").join(&request.runtime)
     };
     for skill in &profile.skills {
+        let admitted = admitted_skills
+            .map(|skills| {
+                skills
+                    .iter()
+                    .find(|admitted| admitted.id == *skill)
+                    .map(|admitted| admitted.revision.as_str())
+                    .ok_or_else(|| invalid("declared skill is not in the admitted role"))
+            })
+            .transpose()?;
+        let mismatch = || {
+            invalid(format!(
+                "skill content differs from admitted revision: {skill}"
+            ))
+        };
         let plugin_source = super::plugins::plugin_skill_dir(&runtime.plugins, skill)?;
-        if matches!(kind, Adapter::Claude | Adapter::Glm) && plugin_source.is_some() {
+        if matches!(kind, Adapter::Claude | Adapter::Glm)
+            && let Some(source) = &plugin_source
+        {
+            // Referenced in place by the native plugin loader: checked at capture only.
+            if let Some(admitted) = admitted
+                && agent_run_config::role_plan::tree_revision(source)? != admitted
+            {
+                return Err(mismatch());
+            }
             continue;
         }
         let source = match plugin_source {
@@ -681,7 +737,10 @@ fn materialize_with_provider(
         } else {
             format!("skills/{skill}")
         };
-        p.tree(&source, &relative, None)?;
+        let captured = p.tree(&source, &relative, None)?;
+        if admitted.is_some_and(|admitted| captured.content_revision != admitted) {
+            return Err(mismatch());
+        }
         if !research && matches!(kind, Adapter::Claude | Adapter::Glm) {
             p.json(
                 &format!("plugins/{skill}/.claude-plugin/plugin.json"),

@@ -31,6 +31,22 @@ pub const RESEARCH_ENV: &str = "AGENT_RUN_WORKER_RESEARCH";
 /// broker checks frozen admission and capability independently of this flag.
 pub const FINISH_ENV: &str = "AGENT_RUN_WORKER_FINISH";
 
+/// The broker's pre-SQL verdict on one finish summary against the transient
+/// launch-secret context its verified supervisor installed for that exact
+/// attempt. Only a clean verdict may create a first finish intent; an exact
+/// replay of an already accepted intent is answered whatever the verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishGuard {
+    /// No installed context for the attempt (supervisor not yet connected,
+    /// reconnecting, gone, or a broker restart): refuse without intent; the
+    /// worker may retry the same finish.
+    Unavailable,
+    /// The summary carries a known launch secret: refuse without intent.
+    Secret,
+    /// Checked against the installed context and free of launch secrets.
+    Clean,
+}
+
 /// Trusted runtime boundary for a supervisor-admitted explicit continuation.
 /// Earlier finishes stay immutable; this new execution uses its own callback.
 pub const EXPLICIT_RESUME_BOUNDARY: &str = "Agent Run runtime execution boundary: this is a newly admitted explicit continuation in the retained native session, with a fresh execution and private finish binding. Earlier finish receipts and summaries belong to earlier executions and remain immutable there. They do not close this execution or forbid its newly assigned work. Complete this execution's task, then call its private finish with a NEW final summary; identical-payload retry applies only after this execution's own finish has been accepted. Keep all existing permissions and secret protections.";

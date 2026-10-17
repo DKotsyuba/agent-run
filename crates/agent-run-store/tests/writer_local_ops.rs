@@ -227,13 +227,27 @@ fn stale_unscoped_receipts_and_watermarks_are_pruned() {
     assert!(foreign.durable);
     let removed = f.commit_local(LocalOp::from(PruneReceipts {
         at,
-        boot_id: boot,
+        boot_id: boot.clone(),
         now_ns: now,
     }));
-    assert_eq!(removed, json!(2));
+    assert_eq!(
+        removed,
+        json!(1),
+        "receipt progress precedes watermark scanning"
+    );
     assert_eq!(
         f.count("SELECT COUNT(*) FROM operation_receipts WHERE producer_key='p-old'"),
         3
+    );
+    let watermarks = f.commit_local(LocalOp::from(PruneReceipts {
+        at,
+        boot_id: boot,
+        now_ns: now,
+    }));
+    assert_eq!(
+        watermarks,
+        json!(1),
+        "receipt-empty pass removes only the stale orphan"
     );
     assert_eq!(
         f.count("SELECT COUNT(*) FROM writer_producers WHERE producer_key='p-gone'"),

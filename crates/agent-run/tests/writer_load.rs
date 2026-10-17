@@ -70,9 +70,11 @@ async fn try_connect(home: &Path) -> Option<UnixStream> {
     Some(stream)
 }
 
-/// Retry only explicit no-enqueue capacity outcomes while retaining the same
-/// identity and deadline. Rejections and unknown outcomes remain visible;
-/// no SQL mutation or model turn is blindly repeated.
+/// Retry only explicit queue/byte capacity or retention-gate no-enqueue outcomes
+/// within the original 20s bound, using the same envelope, deadline and sequence.
+/// Rejections, unknown outcomes and terminal admission refusals remain visible;
+/// no SQL mutation or model turn is blindly repeated. Production lane clients
+/// already recognize RetentionGate; this raw wire fixture must do so as well.
 async fn submit(
     stream: &mut UnixStream,
     envelope: &ops::WriteEnvelope,
@@ -86,6 +88,7 @@ async fn submit(
                 SubmitResult::NotEnqueued(
                     agent_run_domain::storage::NotEnqueuedReason::QueueFull
                         | agent_run_domain::storage::NotEnqueuedReason::BytesFull
+                        | agent_run_domain::storage::NotEnqueuedReason::RetentionGate
                 )
             ) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -154,6 +157,102 @@ fn envelope(worker: usize, ordinal: u64, seconds: u64) -> ops::WriteEnvelope {
         account(format!("load-{worker}-{ordinal}")).into(),
     )
     .unwrap()
+}
+
+/// A real framed peer refuses queue/bytes/retention admission, then returns one
+/// terminal outcome. Every retry must preserve all request bytes and correlation;
+/// committed/rejected/unknown/closed outcomes must return without another send.
+#[tokio::test]
+async fn retention_gate_retry_keeps_identical_requests_and_terminal_outcomes() {
+    use agent_run_domain::storage::{
+        NotEnqueuedReason, RejectCode, RejectStage, StorageRejection, UnknownCause, WriteReceipt,
+    };
+    let request = envelope(99, 1, 0);
+    let header = request.header();
+    let outcomes = [
+        SubmitResult::Committed(WriteReceipt {
+            operation_id: header.operation_id.clone(),
+            digest: header.digest.clone(),
+            op_kind: request.kind().name().into(),
+            producer: header.producer.clone(),
+            ordinal: header.ordinal,
+            scope: None,
+            writer_epoch: 1,
+            commit_seq: 1,
+            committed_at: 0.0,
+            replayed: false,
+            result: serde_json::Value::Null,
+        }),
+        SubmitResult::Rejected(StorageRejection::new(
+            RejectCode::StorageRolledBack,
+            RejectStage::Statement,
+            "fixture refusal",
+        )),
+        SubmitResult::Unknown(UnknownCause::CommitUncertain),
+        SubmitResult::NotEnqueued(NotEnqueuedReason::AdmissionsClosed),
+    ];
+    for terminal in outcomes {
+        let (mut stream, mut peer) = UnixStream::pair().unwrap();
+        let (kind, body) = request.to_wire();
+        let body = body.to_vec();
+        let sequence = 73;
+        let replies = [
+            SubmitResult::NotEnqueued(NotEnqueuedReason::QueueFull),
+            SubmitResult::NotEnqueued(NotEnqueuedReason::BytesFull),
+            SubmitResult::NotEnqueued(NotEnqueuedReason::RetentionGate),
+            terminal.clone(),
+        ];
+        let server = tokio::spawn(async move {
+            let mut received = 0;
+            for reply in replies {
+                let Some(head) = wire::read_header(&mut peer, |message, _| {
+                    (message == Message::Request).then_some(wire::BODY_HARD_MAX)
+                })
+                .await
+                .unwrap() else {
+                    return received;
+                };
+                assert_eq!(head.message, Message::Request);
+                assert_eq!(head.op_kind, kind);
+                assert_eq!(head.seq, sequence);
+                assert_eq!(
+                    wire::read_body(&mut peer, &head).await.unwrap(),
+                    body,
+                    "retry must preserve identity, ordinal, digest, deadline and payload bytes"
+                );
+                received += 1;
+                wire::write_frame(
+                    &mut peer,
+                    Message::Reply,
+                    0,
+                    sequence,
+                    &serde_json::to_vec(&reply).unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+            assert!(
+                wire::read_header(&mut peer, |_, _| Some(wire::BODY_HARD_MAX))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "terminal/unknown outcome must not trigger another request"
+            );
+            received
+        });
+        let result = submit(&mut stream, &request, sequence).await;
+        drop(stream);
+        let received = server.await;
+        assert_eq!(
+            result, terminal,
+            "RetentionGate must retry, and the exact terminal result must remain visible"
+        );
+        assert_eq!(
+            received.unwrap(),
+            4,
+            "only the three explicit no-enqueue causes permit retry"
+        );
+    }
 }
 
 /// Child entry point in this same test executable. With no explicit fixture

@@ -310,11 +310,12 @@ const FILESYSTEM_BACKLOG: Duration = Duration::from_secs(1);
 const MAINTENANCE_RETRY: Duration = Duration::from_secs(60);
 
 /// Returns the next database maintenance delay after one pass removed
-/// `removed` rows plus reclaimed-page batches.
+/// `removed` history/receipt/producer rows plus reclaimed-page batches.
 ///
-/// `removed == 0` means the pass proved the database idle (a read-only probe
-/// can skip the writer transaction entirely), so expiry returns to its hourly
-/// steady cadence. Any filesystem outcome is invisible here: the two
+/// `removed == 0` means this pass committed no eligible removal/reclamation,
+/// so database maintenance returns to its hourly steady cadence. A receipt
+/// backlog keeps draining even when ordinary history is idle. Any filesystem
+/// outcome is invisible here: the two
 /// schedules are independent, so a filesystem backlog cannot force a database
 /// writer transaction every second.
 fn database_maintenance_delay(removed: usize) -> Duration {
@@ -415,6 +416,59 @@ fn maintenance_diagnostic(operation: &str, stage: &str, error: &Error) {
             error.public().kind
         ),
     }
+}
+
+/// Prunes one receipt page, checkpointing only when history and receipts made no progress.
+/// Returns committed row credit for the database cadence. The optional checkpoint
+/// gets its own fresh250ms budget after pruning; SQL failures still propagate.
+async fn receipt_maintenance(
+    lane: &agent_run_core::broker_writer::BrokerLane,
+    removed: usize,
+) -> Result<usize> {
+    let (boot_id, now_ns) = agent_run_platform::monotonic::now()?;
+    let receipt_rows = lane
+        .local(
+            crate::state::ops::PruneReceipts {
+                at: crate::domain::now(),
+                boot_id: boot_id.clone(),
+                now_ns,
+            },
+            agent_run_core::broker_writer::BROKER_BUDGET,
+        )
+        .await?;
+    if removed.saturating_add(receipt_rows) == 0 {
+        let (boot_id, now_ns) = agent_run_platform::monotonic::now()?;
+        let checkpoint = lane
+            .handle()
+            .maintain(
+                crate::state::ops::MaintenanceOp::CheckpointWal { truncate: false },
+                agent_run_domain::storage::MonoDeadline {
+                    boot_id,
+                    ns: now_ns.saturating_add(250_000_000),
+                },
+            )
+            .await;
+        match checkpoint {
+            agent_run_domain::storage::MaintenanceOutcome::Interrupted => {
+                return Err(Error::Runtime("history checkpoint interrupted".into()));
+            }
+            agent_run_domain::storage::MaintenanceOutcome::Refused(error) => {
+                return Err(error.into_error());
+            }
+            agent_run_domain::storage::MaintenanceOutcome::Checkpoint {
+                busy,
+                log,
+                checkpointed,
+            } if busy != 0 || checkpointed < log => {
+                eprintln!(
+                    "history checkpoint deferred: busy={busy} backlog={}",
+                    log.saturating_sub(checkpointed)
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(removed.saturating_add(receipt_rows))
 }
 
 /// Bounds one socket server's connections, request queue, and frame deadlines.
@@ -902,51 +956,7 @@ pub async fn serve_at_with_options(
                             agent_run_core::broker_writer::BROKER_BUDGET,
                         )
                         .await?;
-                    let (boot_id, now_ns) = agent_run_platform::monotonic::now()?;
-                    retention_lane
-                        .local(
-                            crate::state::ops::PruneReceipts {
-                                at: crate::domain::now(),
-                                boot_id: boot_id.clone(),
-                                now_ns,
-                            },
-                            agent_run_core::broker_writer::BROKER_BUDGET,
-                        )
-                        .await?;
-                    if removed == 0 {
-                        let checkpoint = retention_lane
-                            .handle()
-                            .maintain(
-                                crate::state::ops::MaintenanceOp::CheckpointWal { truncate: false },
-                                agent_run_domain::storage::MonoDeadline {
-                                    boot_id,
-                                    ns: now_ns.saturating_add(250_000_000),
-                                },
-                            )
-                            .await;
-                        match checkpoint {
-                            agent_run_domain::storage::MaintenanceOutcome::Interrupted => {
-                                return Err(Error::Runtime(
-                                    "history checkpoint interrupted".into(),
-                                ));
-                            }
-                            agent_run_domain::storage::MaintenanceOutcome::Refused(error) => {
-                                return Err(error.into_error());
-                            }
-                            agent_run_domain::storage::MaintenanceOutcome::Checkpoint {
-                                busy,
-                                log,
-                                checkpointed,
-                            } if busy != 0 || checkpointed < log => {
-                                eprintln!(
-                                    "history checkpoint deferred: busy={busy} backlog={}",
-                                    log.saturating_sub(checkpointed)
-                                );
-                            }
-                            _ => {}
-                        }
-                    }
-                    Ok(removed)
+                    receipt_maintenance(&retention_lane, removed).await
                 }
                 .await;
                 let at = tokio::time::Instant::now();
@@ -1428,6 +1438,71 @@ mod tests {
         assert_eq!(filesystem_maintenance_delay(0), FILESYSTEM_STEADY);
         assert_eq!(filesystem_maintenance_delay(1), FILESYSTEM_BACKLOG);
         assert_eq!(MAINTENANCE_RETRY, Duration::from_secs(60));
+    }
+
+    /// An owned SQL barrier spends the old checkpoint window before receipt pruning.
+    /// Both committed receipt credit and an empty pass must survive that queue delay.
+    #[cfg(feature = "test-fixtures")]
+    #[tokio::test]
+    async fn receipt_maintenance_keeps_progress_after_owned_queue_delay() {
+        use agent_run_core::{
+            broker_writer::BrokerWriter,
+            writer::{WriterConfig, WriterService},
+        };
+        use agent_run_domain::storage::{MonoDeadline, OperationId};
+        use std::{future::Future, task::Poll};
+        for rows in [1, 0] {
+            let home = tempfile::tempdir().unwrap();
+            agent_run_store::fixture::initialize(home.path()).unwrap();
+            if rows > 0 {
+                let store = agent_run_store::fixture::open(home.path()).unwrap();
+                store.conn.execute("INSERT INTO operation_receipts(operation_id,digest,op_kind,producer_key,ordinal,authority_kind,authority_fingerprint,agent_id,outcome,result_json,writer_epoch,committed_at) VALUES(?1,?2,'fixture','expired',1,'broker',?3,NULL,'committed','{}',1,0)",rusqlite::params![OperationId::new("old-boot",1).as_str(),"d".repeat(64),"f".repeat(64)]).unwrap();
+            }
+            let service = WriterService::start(home.path(), WriterConfig::default()).unwrap();
+            let handle = service.handle();
+            let lane = BrokerWriter::new(handle.clone()).lane("retention");
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            let owner = handle.clone();
+            let barrier = tokio::spawn(async move {
+                owner.fixture_barrier(entered, wait).await.unwrap();
+            });
+            ready.await.unwrap();
+            let mut pass = Box::pin(receipt_maintenance(&lane, 0));
+            std::future::poll_fn(|cx| {
+                assert!(matches!(pass.as_mut().poll(cx), Poll::Pending));
+                Poll::Ready(())
+            })
+            .await;
+            let delayed_release = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                release.send(()).unwrap();
+            });
+            let result = pass.await;
+            delayed_release.join().unwrap();
+            barrier.await.unwrap();
+            let (boot_id, now) = agent_run_platform::monotonic::now().unwrap();
+            service
+                .shutdown(MonoDeadline {
+                    boot_id,
+                    ns: now + 5_000_000_000,
+                })
+                .await
+                .unwrap();
+            let removed = result.expect("queue delay cannot consume the later checkpoint budget or erase committed receipt progress");
+            assert_eq!(removed, rows);
+            let at = tokio::time::Instant::now();
+            let mut schedules = MaintenanceSchedules::starting_at(at);
+            schedules.database_pass(at, removed);
+            assert_eq!(
+                schedules.next_database - at,
+                if rows > 0 {
+                    DATABASE_BACKLOG
+                } else {
+                    DATABASE_STEADY
+                }
+            );
+        }
     }
 
     /// Polls `condition` every 5 ms for at most 2 s and reports whether it held.

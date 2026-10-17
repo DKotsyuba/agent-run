@@ -17,16 +17,41 @@ Pool logs and rosters remain protected whenever a member has a workflow
 reference, an active managed-service lease, or a prepared runtime layout,
 matching the underlying agent protection.
 
-Database expiry runs on startup and then hourly; a
-backlog drains in small transactions with a one-second pause between batches.
+Database expiry runs on startup and then hourly; a backlog of ordinary history,
+operation receipts or producer watermarks drains in small transactions with a
+one-second pause between batches.
 Filesystem cleanup keeps its own independent schedule — a one-second cadence
 while entries remain, hourly when idle — so a filesystem backlog never forces
 a database writer transaction every second, and a database backlog never
-starves reclaiming disposable files. A pass that finds nothing eligible
-proves the database idle with a read-only query (age windows plus a cheap
-session-count superset) and skips the writer transaction entirely. Failures
+starves reclaiming disposable files. A read-only query (age windows plus a cheap
+session-count superset) can skip an empty ordinary-history transaction; receipt
+and incident maintenance remain separate bounded operations. Failures
 and deferrals retry after a minute. No cron job
 or provider-specific configuration is needed.
+
+## Operation receipts and idle maintenance (schema 32)
+
+Unscoped operation receipts become eligible after fourteen days only when their
+operation identities are also stale on the monotonic clock. Scoped receipts,
+referenced producer watermarks and producers with unfinished scheduler work stay
+protected. Schema 32 indexes receipt references by producer as well as retaining
+the existing receipt-age index, so orphan checks do not scan all receipt history.
+
+A pass selects at most 500 receipts and 2,000 already-orphaned producer watermarks
+under a cooperative 200 ms read budget. The SQL interruption hook is cleared
+before mutations: SQLite can automatically roll back a transaction when DML is
+interrupted ([SQLite interruption contract](https://sqlite.org/c3ref/interrupt.html)).
+Prepared primary-key deletes check the remaining budget between rows; a completed
+prefix and its actual count commit atomically with the operation receipt. A
+watermark newly orphaned by those deletes may wait until the following pass.
+Read expiry or no-progress budget expiry defers rather than claiming success.
+As with other cooperative budgets, operating-system I/O is not preempted.
+
+Actual receipt/watermark removals keep the one-second drain cadence even when
+ordinary history is empty. Reconciliation and managed-service ticks use read-only
+preflights before submitting pool-settlement or service-lease operations;
+unchanged state creates no per-tick receipt. Writer-side completion, cleanup,
+lease and process-ownership predicates remain authoritative after every hint.
 
 Maintenance yields to normal workload. Every maintenance connection uses a
 100 ms busy timeout, so a held writer makes a prune or compaction pass defer —

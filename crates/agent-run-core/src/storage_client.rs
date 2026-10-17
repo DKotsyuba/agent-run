@@ -96,6 +96,42 @@ pub struct Hello {
     pub generation: Option<String>,
     /// Hex of the per-launch capability secret, when the role needs one.
     pub capability_hex: Option<String>,
+    /// A supervisor's launch-secret context for its pinned attempt. The
+    /// server installs it only for a verified supervisor session, keeps it in
+    /// memory while that connection lives, and checks first finish intents of
+    /// that exact attempt against it. Older servers ignore the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_guard: Option<FinishGuardContext>,
+}
+
+/// The nonempty secret-shaped variables of one native launch environment,
+/// names with values. Sent only inside a supervisor [`Hello`] on the private
+/// writer socket; `Debug` never shows a value.
+#[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FinishGuardContext(pub std::collections::BTreeMap<String, String>);
+
+impl FinishGuardContext {
+    /// Selects from `environment` exactly the variables the launch's process
+    /// redactor protects: nonempty values under secret-shaped names.
+    pub fn from_environment(environment: &std::collections::BTreeMap<String, String>) -> Self {
+        Self(
+            environment
+                .iter()
+                .filter(|(name, value)| {
+                    !value.is_empty() && agent_run_adapters::redact::is_secret_name(name)
+                })
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        )
+    }
+}
+
+impl std::fmt::Debug for FinishGuardContext {
+    /// Shows only how many variables the context holds.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "FinishGuardContext({} variables)", self.0.len())
+    }
 }
 
 /// Server acknowledgement of a [`Hello`], the body of a [`Message::HelloOk`].
@@ -150,12 +186,15 @@ pub struct PendingWrite {
 /// phase and SQLite codes instead of a generic expiry).
 #[derive(Debug, Clone, Default)]
 pub struct Totals {
-    /// Submissions of the identical operation that reached the wire.
+    /// Attempts of the identical operation: wire requests remotely, handle submissions locally.
     pub attempts: u32,
     /// Time from the head of the lane to the final outcome.
     pub elapsed: Duration,
     /// The writer's last non-durable refusal, when it caused retries.
     pub last_rejection: Option<agent_run_domain::storage::StorageRejection>,
+    /// Last retryable proven non-enqueue cause; mutually exclusive with last_rejection.
+    /// Closed enum only: no request data, server messages or arbitrary errors are retained.
+    pub last_not_enqueued: Option<NotEnqueuedReason>,
 }
 
 /// Shared view of a submission's [`Totals`], readable after awaiting it.
@@ -380,16 +419,61 @@ impl ProducerLane {
     /// may be dropped at any time (never polled, or while waiting for an earlier
     /// call) without releasing the predecessor barrier, so a later call can never
     /// overtake an unresolved earlier one. The capability and process identity
-    /// are unchanged by construction; only the attempt claim moves. If a
-    /// connection is open the new hello is exchanged immediately, otherwise it is
-    /// sent on the next connect. Must be called inside a Tokio runtime.
+    /// are unchanged by construction; only the attempt claim moves, and any
+    /// launch-secret context of the previous attempt is dropped from the claim.
+    /// If a connection is open the new hello is exchanged immediately,
+    /// otherwise it is sent on the next connect. Must be called inside a Tokio
+    /// runtime.
     ///
     /// # Errors
     /// (through the pending result) The transport or refusal error of the
     /// immediate exchange; the lane then reconnects with the new claim on the
     /// next submission.
     pub fn repin(&self, attempt: Option<String>) -> PendingRepin {
+        self.rehello(
+            move |hello| {
+                hello.attempt = attempt;
+                hello.finish_guard = None;
+            },
+            false,
+        )
+    }
+
+    /// Replaces the hello's launch-secret context for the pinned attempt and
+    /// exchanges it at once, connecting when no connection is open, so a
+    /// verified server holds it before the caller releases the native engine.
+    /// Ordered and detached exactly like [`Self::repin`]. A failed connect is
+    /// not an error: the context travels with the next connection's hello, and
+    /// until then the server refuses that attempt's first finish intent.
+    ///
+    /// # Errors
+    /// (through the pending result) A protocol violation of the exchange.
+    pub fn set_finish_guard(&self, guard: Option<FinishGuardContext>) -> PendingRepin {
+        self.rehello(move |hello| hello.finish_guard = guard, true)
+    }
+
+    /// Re-sends the current hello, reconnecting when the connection is gone, so
+    /// a restarted or reconnected broker regains this supervisor's finish
+    /// context even while the lane is otherwise idle. Ordered and detached
+    /// exactly like [`Self::repin`].
+    ///
+    /// # Errors
+    /// (through the pending result) A protocol violation of the exchange.
+    pub fn refresh(&self) -> PendingRepin {
+        self.rehello(|_| {}, true)
+    }
+
+    /// Applies `change` to the stored hello under the head lock and exchanges
+    /// it on the open connection; a lost connection is dropped and, when
+    /// `connect` is set, one fresh connection is dialed within the connect
+    /// budget. Only a protocol violation is reported.
+    fn rehello(
+        &self,
+        change: impl FnOnce(&mut Hello) + Send + 'static,
+        connect: bool,
+    ) -> PendingRepin {
         let state = self.state.clone();
+        let config = self.config.clone();
         let budget = self.config.connect_budget;
         let (previous, turn) = self.claim_turn();
         let handle = tokio::spawn(async move {
@@ -398,7 +482,7 @@ impl ProducerLane {
                 let _ = previous.await;
             }
             let mut state = state.lock().await;
-            state.hello.attempt = attempt;
+            change(&mut state.hello);
             if let Some(mut connection) = state.connection.take() {
                 let hello = state.hello.clone();
                 let seq = state.seq;
@@ -406,14 +490,31 @@ impl ProducerLane {
                 match tokio::time::timeout(budget, exchange_hello(&mut connection, &hello, seq))
                     .await
                 {
-                    Ok(Ok(_)) => state.connection = Some(connection),
+                    Ok(Ok(_)) => {
+                        state.connection = Some(connection);
+                        return Ok(());
+                    }
                     // The connection is gone (the broker restarted): the new
-                    // claim is already stored and the next submission reconnects
-                    // with it, where the server verifies it. Only a protocol
+                    // claim is already stored and the next connection carries
+                    // it, where the server verifies it. Only a protocol
                     // violation is reported here.
                     Ok(Err(error)) if lost_connection(&error) => {}
                     Ok(Err(error)) => return Err(error),
                     Err(_) => {}
+                }
+            }
+            if connect {
+                let hello = state.hello.clone();
+                let seq = state.seq;
+                let dialed = tokio::time::timeout(budget, async {
+                    let mut connection = config.dial.dial().await?;
+                    exchange_hello(&mut connection, &hello, seq).await?;
+                    Ok::<_, io::Error>(connection)
+                })
+                .await;
+                state.seq = seq + 1;
+                if let Ok(Ok(connection)) = dialed {
+                    state.connection = Some(connection);
                 }
             }
             Ok(())
@@ -493,7 +594,8 @@ fn frame_io(error: wire::FrameError) -> io::Error {
 pub(crate) fn transient(reason: NotEnqueuedReason) -> bool {
     matches!(
         reason,
-        NotEnqueuedReason::QueueFull
+        NotEnqueuedReason::RetentionGate
+            | NotEnqueuedReason::QueueFull
             | NotEnqueuedReason::BytesFull
             | NotEnqueuedReason::ProducerFull
             | NotEnqueuedReason::ReservedForCritical
@@ -621,7 +723,10 @@ async fn drive(
                 if rejection.code == RejectCode::StorageUnavailable =>
             {
                 // Nothing was acquired or executed by THIS attempt; retry identically.
-                note(&mut |totals| totals.last_rejection = Some(rejection.clone()));
+                note(&mut |totals| {
+                    totals.last_rejection = Some(rejection.clone());
+                    totals.last_not_enqueued = None;
+                });
                 pause(&mut backoff, &request.deadline).await;
             }
             Ok(SubmitResult::Rejected(rejection)) => match uncertain {
@@ -629,6 +734,10 @@ async fn drive(
                 Some(cause) => return SubmitResult::Unknown(cause),
             },
             Ok(SubmitResult::NotEnqueued(reason)) if transient(reason) => {
+                note(&mut |totals| {
+                    totals.last_not_enqueued = Some(reason);
+                    totals.last_rejection = None;
+                });
                 pause(&mut backoff, &request.deadline).await;
             }
             Ok(SubmitResult::NotEnqueued(reason)) => match uncertain {
@@ -704,6 +813,47 @@ mod tests {
     //! Scripted-peer protocol tests of the lane. The peer is a protocol test
     //! double, not a writer: these tests prove client behavior only and say
     //! nothing about queue or storage correctness.
+    /// A real retryable admission category must survive expiry into closed diagnostics.
+    #[tokio::test]
+    async fn admission_refusal_survives_expiry_diagnostics() {
+        for reason in [
+            NotEnqueuedReason::QueueFull,
+            NotEnqueuedReason::RetentionGate,
+            NotEnqueuedReason::BytesFull,
+            NotEnqueuedReason::ProducerFull,
+            NotEnqueuedReason::ReservedForCritical,
+            NotEnqueuedReason::Degraded,
+        ] {
+            let mut script = Script::new(vec![Step::Reply(SubmitResult::Rejected(
+                StorageRejection::new(
+                    RejectCode::StorageUnavailable,
+                    RejectStage::Acquire,
+                    "closed fixture refusal",
+                ),
+            ))]);
+            script.rest = Step::Reply(SubmitResult::NotEnqueued(reason));
+            let (dial, seen, _dir) = peer(script).await;
+            let lane = ProducerLane::new(dial, hello(), 1);
+            let pending = lane.submit(|ordinal| Ok(request(ordinal, Duration::from_millis(120))));
+            let totals = pending.totals();
+            let result = pending.await;
+            let totals = totals.snapshot();
+            assert_eq!(totals.attempts as usize, seen.lock().unwrap().len());
+            assert_eq!(totals.last_not_enqueued, Some(reason));
+            assert!(
+                totals.last_rejection.is_none(),
+                "latest actual admission supersedes prior storage refusal"
+            );
+            let error = crate::persist::into_result_totals::<()>(result, &totals).unwrap_err();
+            let metadata = crate::supervisor::execution_error_metadata(&error);
+            assert_eq!(
+                metadata["admission_reason"],
+                serde_json::to_value(reason).unwrap()
+            );
+            assert_eq!(metadata["outcome"], "not_enqueued");
+        }
+    }
+
     use super::*;
     use agent_run_domain::storage::{RejectStage, StorageRejection};
     use std::sync::Mutex as StdMutex;
@@ -879,6 +1029,7 @@ mod tests {
             attempt: Some("ag-1:1".into()),
             generation: None,
             capability_hex: Some("00".into()),
+            finish_guard: None,
         }
     }
 
@@ -1206,11 +1357,19 @@ mod tests {
         script.rest = Step::Reply(SubmitResult::NotEnqueued(NotEnqueuedReason::QueueFull));
         let (dial, seen, _dir) = peer(script).await;
         let lane = ProducerLane::new(dial, hello(), 1);
-        let result = lane
-            .submit(|ordinal| Ok(request(ordinal, Duration::from_millis(500))))
-            .await;
+        let pending = lane.submit(|ordinal| Ok(request(ordinal, Duration::from_millis(500))));
+        let totals = pending.totals();
+        let result = pending.await;
         assert!(matches!(result, SubmitResult::Unknown(_)), "{result:?}");
         assert!(seen.lock().unwrap().len() >= 2);
+        let error =
+            crate::persist::into_result_totals::<()>(result, &totals.snapshot()).unwrap_err();
+        let metadata = crate::supervisor::execution_error_metadata(&error);
+        assert_eq!(metadata["outcome"], "unknown");
+        assert!(
+            metadata["admission_reason"].is_null(),
+            "later refusal cannot prove an earlier send did not execute"
+        );
     }
 
     /// C4: after an `Unknown` reply a later non-durable refusal does not replace
@@ -1342,6 +1501,81 @@ mod tests {
         assert_eq!(claims[0].attempt.as_deref(), Some("ag-1:1"));
         assert_eq!(claims[1].attempt.as_deref(), Some("ag-1:2"));
         assert_eq!(claims[0].capability_hex, claims[1].capability_hex);
+    }
+
+    /// The finish context is exchanged at once (dialing when no connection is
+    /// open), dropped with an attempt re-pin, and restored by an idle refresh
+    /// on a fresh connection after the broker closed the previous one.
+    #[tokio::test]
+    async fn finish_guard_hellos_follow_attempt_and_reconnect() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("w.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let claims: Arc<StdMutex<Vec<(usize, Hello)>>> = Arc::default();
+        let log = claims.clone();
+        let boot = monotonic::boot_id().unwrap();
+        tokio::spawn(async move {
+            for connection in 0.. {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                while let Ok(Some(header)) = wire::read_header(&mut stream, |m, _| {
+                    (m == Message::Hello).then_some(wire::HELLO_MAX)
+                })
+                .await
+                {
+                    let body = wire::read_body(&mut stream, &header).await.unwrap();
+                    let total = {
+                        let mut log = log.lock().unwrap();
+                        log.push((connection, serde_json::from_slice(&body).unwrap()));
+                        log.len()
+                    };
+                    let ok = serde_json::to_vec(&HelloOk {
+                        epoch: 1,
+                        boot_id: boot.clone(),
+                        mono_ns: 0,
+                    })
+                    .unwrap();
+                    wire::write_frame(&mut stream, Message::HelloOk, 0, header.seq, &ok)
+                        .await
+                        .unwrap();
+                    if total == 3 {
+                        // A broker restart: this connection goes away.
+                        break;
+                    }
+                }
+            }
+        });
+        let context = FinishGuardContext(std::collections::BTreeMap::from([(
+            "PROVIDER_TOKEN".to_owned(),
+            "synthetic".to_owned(),
+        )]));
+        let lane = ProducerLane::new(UnixDial { path }, hello(), 1);
+        lane.set_finish_guard(Some(context.clone())).await.unwrap();
+        lane.repin(Some("ag-1:2".into())).await.unwrap();
+        lane.set_finish_guard(Some(context.clone())).await.unwrap();
+        lane.refresh().await.unwrap();
+        let claims = claims.lock().unwrap();
+        let seen: Vec<(usize, Option<&str>, bool)> = claims
+            .iter()
+            .map(|(connection, hello)| {
+                (
+                    *connection,
+                    hello.attempt.as_deref(),
+                    hello.finish_guard.as_ref() == Some(&context),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (0, Some("ag-1:1"), true),
+                (0, Some("ag-1:2"), false),
+                (0, Some("ag-1:2"), true),
+                (1, Some("ag-1:2"), true),
+            ]
+        );
+        assert!(!format!("{:?}", claims[0].1).contains("synthetic"));
     }
 
     /// C1: dropping a repin that was never polled, or cancelling one that waits for

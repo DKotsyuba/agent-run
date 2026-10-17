@@ -115,6 +115,34 @@ enum Evaluation {
     Ready(Box<Ready>),
 }
 
+/// Reads the same fair candidate page for preflight and writer settlement.
+/// `seed` rotates at most `limit` open proposal/enrollment pools; zero limit
+/// returns an empty page. This only reads, and SQL/id decoding errors propagate.
+// ponytail: retain the existing count/window; an indexed pending marker would
+// replace it if the open-pool population grows to thousands.
+fn open_pool_candidates(conn: &Connection, limit: usize, seed: usize) -> Result<Vec<PoolId>> {
+    /// Open proposals or unfinished enrollments that may need convergence.
+    const OPEN: &str = "state='open' AND (EXISTS(SELECT 1 FROM pool_entries e WHERE e.pool_id=p.id AND e.kind='proposal') OR EXISTS(SELECT 1 FROM pool_enrollments j JOIN pool_members m ON m.agent_id=j.agent_id WHERE m.pool_id=p.id AND j.state<>'joined' AND m.replaced_by IS NULL))";
+    let total: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM pools p WHERE {OPEN}"),
+        [],
+        |row| row.get(0),
+    )?;
+    if total == 0 || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let offset = seed.wrapping_mul(limit) % total as usize;
+    let mut statement = conn.prepare(&format!(
+        "SELECT id FROM pools p WHERE {OPEN} ORDER BY id LIMIT ? OFFSET ?"
+    ))?;
+    let ids = statement
+        .query_map(params![limit as i64, offset as i64], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    ids.into_iter().map(|id| id.parse()).collect()
+}
+
 /// Checks every completion condition against one snapshot without writing.
 ///
 /// Used read-only as the cheap preflight of the maintenance sweep and again,
@@ -311,6 +339,21 @@ fn settle_in_tx(tx: &rusqlite::Connection, pool_id: &PoolId) -> Result<Option<Po
 }
 
 impl Store<'_> {
+    /// Read-only hint that the fair `limit`/`seed` page has actual settlement or
+    /// enrollment changes. Unchanged/unready pools return false without receipts.
+    /// The writer repeats all deciding reads; a race may defer work until the next
+    /// sweep or submit one harmless no-op, never certify an unverified completion.
+    pub fn pool_settlement_pending(&self, limit: usize, seed: usize) -> Result<bool> {
+        for pool in open_pool_candidates(&self.conn, limit, seed)? {
+            if !crate::pool_enrollment::enrollment_changes(&self.conn, &pool)?.is_empty()
+                || matches!(evaluate(&self.conn, &pool)?, Evaluation::Ready(_))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Completes `pool_id` when every condition holds, in one immediate
     /// transaction after read-only preflight. Pending enrollment acquires a
     /// writer only for changed join state/attention; ordinary unchanged pools
@@ -356,31 +399,10 @@ impl Store<'_> {
     /// and cleanup proof that arrived after the terminal write. `seed`
     /// rotates the window each call so no pool starves behind the first
     /// `limit` open ones.
-    // ponytail: one count plus one windowed page per tick; an indexed
-    // "possibly settleable" marker would avoid it if open pools reach thousands.
     pub fn settle_open_pools(&mut self, limit: usize, seed: usize) -> Result<usize> {
-        const OPEN: &str = "state='open' AND (EXISTS(SELECT 1 FROM pool_entries e WHERE e.pool_id=p.id AND e.kind='proposal') OR EXISTS(SELECT 1 FROM pool_enrollments j JOIN pool_members m ON m.agent_id=j.agent_id WHERE m.pool_id=p.id AND j.state<>'joined' AND m.replaced_by IS NULL))";
-        let total: i64 = self.conn.query_row(
-            &format!("SELECT COUNT(*) FROM pools p WHERE {OPEN}"),
-            [],
-            |r| r.get(0),
-        )?;
-        if total == 0 {
-            return Ok(0);
-        }
-        let offset = seed.wrapping_mul(limit) % total as usize;
-        let mut statement = self.conn.prepare(&format!(
-            "SELECT id FROM pools p WHERE {OPEN} ORDER BY id LIMIT ? OFFSET ?"
-        ))?;
-        let ids = statement
-            .query_map(params![limit as i64, offset as i64], |r| {
-                r.get::<_, String>(0)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(statement);
+        let ids = open_pool_candidates(&self.conn, limit, seed)?;
         let mut completed = 0;
-        for id in ids {
-            let pool: PoolId = id.parse()?;
+        for pool in ids {
             if self.settle_pool(&pool)?.is_some_and(|c| c.created) {
                 completed += 1;
             }

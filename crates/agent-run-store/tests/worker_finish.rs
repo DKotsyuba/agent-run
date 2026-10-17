@@ -53,7 +53,14 @@ fn finish_persists_and_idle_never_expires() {
         2
     );
     let receipt = store
-        .accept_worker_finish(&run, "attempt", TOKEN, &report(), 1e12)
+        .accept_worker_finish(
+            &run,
+            "attempt",
+            TOKEN,
+            &report(),
+            1e12,
+            agent_run_domain::worker::FinishGuard::Clean,
+        )
         .unwrap();
     assert!(!receipt.duplicate);
     assert!(store.worker_finish_intent(&run, true).unwrap().is_none());
@@ -71,14 +78,28 @@ fn finish_persists_and_idle_never_expires() {
     );
     assert!(
         store
-            .accept_worker_finish(&run, "attempt", TOKEN, &report(), 1e12 + 1.0)
+            .accept_worker_finish(
+                &run,
+                "attempt",
+                TOKEN,
+                &report(),
+                1e12 + 1.0,
+                agent_run_domain::worker::FinishGuard::Clean
+            )
             .unwrap()
             .duplicate
     );
     let mut other = report();
     other.summary = "Different".into();
     assert!(matches!(
-        store.accept_worker_finish(&run, "attempt", TOKEN, &other, 1e12),
+        store.accept_worker_finish(
+            &run,
+            "attempt",
+            TOKEN,
+            &other,
+            1e12,
+            agent_run_domain::worker::FinishGuard::Clean
+        ),
         Err(Error::Conflict)
     ));
     store.worker_turn(&run, false, 1e12 + 2.0).unwrap();
@@ -123,14 +144,28 @@ fn callback_authority_and_validation_are_closed() {
         ] {
             assert!(
                 store
-                    .accept_worker_finish(id, attempt, token, &report(), 200.0)
+                    .accept_worker_finish(
+                        id,
+                        attempt,
+                        token,
+                        &report(),
+                        200.0,
+                        agent_run_domain::worker::FinishGuard::Clean
+                    )
                     .is_err()
             );
         }
         if !explicit {
             assert!(
                 store
-                    .accept_worker_finish(&run, "attempt", TOKEN, &report(), 200.0)
+                    .accept_worker_finish(
+                        &run,
+                        "attempt",
+                        TOKEN,
+                        &report(),
+                        200.0,
+                        agent_run_domain::worker::FinishGuard::Clean
+                    )
                     .is_err()
             );
             continue;
@@ -145,7 +180,14 @@ fn callback_authority_and_validation_are_closed() {
             r.summary = text;
             assert!(
                 store
-                    .accept_worker_finish(&run, "attempt", TOKEN, &r, 200.0)
+                    .accept_worker_finish(
+                        &run,
+                        "attempt",
+                        TOKEN,
+                        &r,
+                        200.0,
+                        agent_run_domain::worker::FinishGuard::Clean
+                    )
                     .is_err()
             );
         }
@@ -159,7 +201,14 @@ fn callback_authority_and_validation_are_closed() {
             .unwrap();
         assert!(
             store
-                .accept_worker_finish(&run, "attempt", TOKEN, &report(), 200.0)
+                .accept_worker_finish(
+                    &run,
+                    "attempt",
+                    TOKEN,
+                    &report(),
+                    200.0,
+                    agent_run_domain::worker::FinishGuard::Clean
+                )
                 .is_err()
         );
         store
@@ -167,7 +216,14 @@ fn callback_authority_and_validation_are_closed() {
             .execute("UPDATE agents SET status='running'", [])
             .unwrap();
         store
-            .accept_worker_finish(&run, "attempt", TOKEN, &report(), 200.0)
+            .accept_worker_finish(
+                &run,
+                "attempt",
+                TOKEN,
+                &report(),
+                200.0,
+                agent_run_domain::worker::FinishGuard::Clean,
+            )
             .unwrap();
         store
             .conn
@@ -175,7 +231,14 @@ fn callback_authority_and_validation_are_closed() {
             .unwrap();
         assert!(
             store
-                .accept_worker_finish(&run, "attempt", TOKEN, &report(), 201.0)
+                .accept_worker_finish(
+                    &run,
+                    "attempt",
+                    TOKEN,
+                    &report(),
+                    201.0,
+                    agent_run_domain::worker::FinishGuard::Clean
+                )
                 .is_err()
         );
     }
@@ -253,7 +316,14 @@ fn output_schema_is_checked_before_finish_intent() {
         };
         assert!(
             store
-                .accept_worker_finish(&run, "attempt", TOKEN, &r, 200.0)
+                .accept_worker_finish(
+                    &run,
+                    "attempt",
+                    TOKEN,
+                    &r,
+                    200.0,
+                    agent_run_domain::worker::FinishGuard::Clean
+                )
                 .is_err()
         );
         assert!(store.worker_finish_intent(&run, false).unwrap().is_none());
@@ -263,7 +333,14 @@ fn output_schema_is_checked_before_finish_intent() {
         status: FinishStatus::Done,
     };
     store
-        .accept_worker_finish(&run, "attempt", TOKEN, &r, 201.0)
+        .accept_worker_finish(
+            &run,
+            "attempt",
+            TOKEN,
+            &r,
+            201.0,
+            agent_run_domain::worker::FinishGuard::Clean,
+        )
         .unwrap();
     assert_eq!(store.worker_finish_intent(&run, false).unwrap(), Some(r));
     for reference in ["file:///etc/passwd", "https://example.invalid/schema"] {
@@ -312,7 +389,14 @@ fn native_wakes_are_durable_deduplicated_and_fenced() {
         1
     );
     store
-        .accept_worker_finish(&run, "attempt", TOKEN, &report(), 103.0)
+        .accept_worker_finish(
+            &run,
+            "attempt",
+            TOKEN,
+            &report(),
+            103.0,
+            agent_run_domain::worker::FinishGuard::Clean,
+        )
         .unwrap();
     assert!(
         !store
@@ -325,6 +409,54 @@ fn native_wakes_are_durable_deduplicated_and_fenced() {
             .is_err()
     );
     assert!(store.enqueue(&run, "cancel", &json!({})).is_ok());
+}
+
+/// An accepted intent whose native finish reply was never observed cannot
+/// become any run's public answer: a matching proof is refused even for a
+/// failed outcome, the same failure without an answer commits, and the
+/// observed receipt still permits a blocked/failed worker's answer.
+#[test]
+fn unobserved_finish_intent_is_never_a_public_answer() {
+    use agent_run_domain::domain::{Outcome, Status};
+    for observed in [false, true] {
+        let (home, mut store, run) = running(true);
+        let input = FinishRequest {
+            status: FinishStatus::Failed,
+            ..report()
+        };
+        store
+            .accept_worker_finish(
+                &run,
+                "attempt",
+                TOKEN,
+                &input,
+                200.0,
+                agent_run_domain::worker::FinishGuard::Clean,
+            )
+            .unwrap();
+        if observed {
+            store.observe_worker_finish_receipt(&run).unwrap();
+        }
+        let root = home.path().join("agents").join(run.as_str());
+        agent_run_platform::fs::private_dir(&root).unwrap();
+        let proof = agent_run_platform::verify::seal(
+            &root,
+            std::path::Path::new("answer.md"),
+            &input.summary,
+        )
+        .unwrap();
+        let outcome = Outcome::failure("runtime_protocol_failed");
+        if observed {
+            store.finish(&run, &outcome, Some(&proof), None).unwrap();
+            assert!(store.get(&run).unwrap().answer_path.is_some());
+        } else {
+            assert!(store.finish(&run, &outcome, Some(&proof), None).is_err());
+            assert_eq!(store.get(&run).unwrap().status, Status::Running);
+            store.finish(&run, &outcome, None, None).unwrap();
+            assert!(store.get(&run).unwrap().answer_path.is_none());
+        }
+        assert_eq!(store.get(&run).unwrap().status, Status::Failed);
+    }
 }
 
 /// Cancellation arriving after accepted finish but before terminal commit wins
@@ -340,7 +472,14 @@ fn cancel_after_finish_wins_at_the_terminal_transaction() {
         let (home, mut store, run) = running(true);
         let input = FinishRequest { status, ..report() };
         store
-            .accept_worker_finish(&run, "attempt", TOKEN, &input, 200.0)
+            .accept_worker_finish(
+                &run,
+                "attempt",
+                TOKEN,
+                &input,
+                200.0,
+                agent_run_domain::worker::FinishGuard::Clean,
+            )
             .unwrap();
         store.observe_worker_finish_receipt(&run).unwrap();
         let root = home.path().join("agents").join(run.as_str());
@@ -425,5 +564,107 @@ fn typed_idle_observations_freeze_after_native_exit() {
     let view = serde_json::to_value(legacy.agent_view_at(&id, 120.0).unwrap()).unwrap();
     for field in ["completion_mode", "turn_count", "idle_seconds"] {
         assert!(view.get(field).is_none());
+    }
+}
+
+/// Only a clean broker verdict creates the first finish intent; an
+/// unavailable or secret verdict writes neither intent nor event, while an
+/// identical replay of the accepted intent is answered whatever the verdict
+/// and a changed payload still conflicts.
+#[test]
+fn finish_guard_verdict_gates_only_the_first_intent() {
+    use agent_run_domain::worker::FinishGuard;
+    let (_home, mut store, run) = running(true);
+    let accepted_events = |store: &Store<'_>| -> i64 {
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='worker_finish_accepted_v1'",
+                [run.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    for (guard, expected) in [
+        (FinishGuard::Unavailable, "unsupported"),
+        (FinishGuard::Secret, "validation"),
+    ] {
+        let refused = store
+            .accept_worker_finish(&run, "attempt", TOKEN, &report(), 200.0, guard)
+            .unwrap_err();
+        match (expected, &refused) {
+            ("unsupported", Error::Unsupported(_)) | ("validation", Error::Validation(_)) => {}
+            _ => panic!("{guard:?} refused as {refused:?}"),
+        }
+        assert!(store.worker_finish_intent(&run, false).unwrap().is_none());
+        assert_eq!(accepted_events(&store), 0);
+    }
+    let first = store
+        .accept_worker_finish(&run, "attempt", TOKEN, &report(), 201.0, FinishGuard::Clean)
+        .unwrap();
+    assert!(!first.duplicate);
+    for guard in [FinishGuard::Unavailable, FinishGuard::Secret] {
+        let replay = store
+            .accept_worker_finish(&run, "attempt", TOKEN, &report(), 202.0, guard)
+            .unwrap();
+        assert!(replay.duplicate);
+        assert_eq!(replay.sha256, first.sha256);
+        let changed = FinishRequest {
+            summary: "other".into(),
+            ..report()
+        };
+        assert!(matches!(
+            store.accept_worker_finish(&run, "attempt", TOKEN, &changed, 203.0, guard),
+            Err(Error::Conflict)
+        ));
+    }
+    assert_eq!(accepted_events(&store), 1);
+}
+
+/// The broker's verdict travels beside the payload, never inside it: setting
+/// it changes neither the envelope digest nor the serialized operation, so
+/// replay identity and receipts are independent of the verdict.
+#[test]
+fn finish_guard_verdict_never_changes_operation_identity() {
+    use agent_run_domain::{
+        storage::{MonoDeadline, OperationId, ProducerId, ProducerKind},
+        worker::FinishGuard,
+    };
+    use agent_run_store::ops::{AcceptWorkerFinish, LocalEnvelope, LocalOp};
+    let op = AcceptWorkerFinish {
+        execution: "ag-20261010-000000-0123456789".parse().unwrap(),
+        attempt: "attempt".into(),
+        token: TOKEN.into(),
+        input: report(),
+        at: 200.0,
+        guard: FinishGuard::Unavailable,
+    };
+    let payload = serde_json::to_value(&op).unwrap();
+    assert!(payload.get("guard").is_none());
+    let (boot, now) = agent_run_platform::monotonic::now().unwrap();
+    let mut envelope = LocalEnvelope::new(
+        OperationId::new(&boot, now),
+        ProducerId {
+            kind: ProducerKind::Broker,
+            scope: Some("workers".into()),
+            instance: "instance-1".into(),
+        },
+        1,
+        MonoDeadline {
+            boot_id: boot,
+            ns: now + 60_000_000_000,
+        },
+        LocalOp::from(op),
+    )
+    .unwrap();
+    let digest = envelope.header().digest.clone();
+    for guard in [FinishGuard::Clean, FinishGuard::Secret] {
+        envelope.set_finish_guard(guard);
+        assert_eq!(envelope.header().digest, digest);
+        let LocalOp::AcceptWorkerFinish(op) = envelope.op() else {
+            panic!("finish envelope changed kind");
+        };
+        assert_eq!(op.guard, guard);
+        assert_eq!(serde_json::to_value(op).unwrap(), payload);
     }
 }

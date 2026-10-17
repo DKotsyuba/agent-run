@@ -151,8 +151,10 @@ pub struct Diagnostic {
 /// Errors distinguish unaccepted work from failed/uncertain accepted work.
 #[derive(Debug)]
 pub enum CallError<E> {
-    /// No request was enqueued: count or byte budget was already occupied.
+    /// No request was enqueued: job count budget was already occupied.
     Overloaded,
+    /// No request was enqueued: retained byte credits were already occupied.
+    BytesFull,
     /// No request was enqueued: declared payload exceeds its permitted size.
     PayloadTooLarge,
     /// No request was enqueued: drain/close has begun.
@@ -189,6 +191,7 @@ impl<E> fmt::Display for CallError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Overloaded => "database queue occupied",
+            Self::BytesFull => "database byte budget occupied",
             Self::PayloadTooLarge => "database payload exceeds limit",
             Self::Closing => "database closing",
             Self::InvalidLimits => "invalid database limits",
@@ -368,7 +371,7 @@ impl Database {
             .bytes
             .clone()
             .try_acquire_many_owned(retained_bytes as u32)
-            .map_err(|_| CallError::Overloaded)?;
+            .map_err(|_| CallError::BytesFull)?;
         let connection = inner.connection.clone();
         let lease = inner.lease.clone();
         let state = self.0.clone();
