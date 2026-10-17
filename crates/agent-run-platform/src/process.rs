@@ -2,14 +2,25 @@
 use agent_run_domain::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+/// Kernel process identity; optional program metadata never grants signalling rights.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Identity {
+    /// Kernel process identifier, greater than one for owned processes.
     pub pid: i32,
+    /// Parent identifier at observation time.
     pub ppid: i32,
+    /// Process group at observation time.
     pub group: i32,
+    /// Kernel start time in Unix seconds, used with the token to fence PID reuse.
     pub birth: f64,
+    /// Immutable platform start token for this PID generation.
     pub token: String,
+    /// Whether the observed process was already a zombie.
     pub zombie: bool,
+    /// Observed executable basename, at most 128 bytes; absent for old or unreadable evidence.
+    /// Arguments and full paths are never collected. This is diagnostic metadata only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<String>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,6 +112,7 @@ pub fn inspect(pid: i32) -> std::io::Result<Identity> {
         group: num(2)? as i32,
         birth: epoch + ticks as f64 / hz as f64,
         token: format!("linux:{}:{ticks}", boot.trim()),
+        program: None,
         zombie: parts
             .first()
             .is_some_and(|state| *state == b"Z" || *state == b"X"),
@@ -173,6 +185,7 @@ pub fn inspect(pid: i32) -> std::io::Result<Identity> {
             group: 0,
             birth: seconds as f64 + micros as f64 / 1_000_000.,
             token: format!("darwin:{seconds}:{micros}"),
+            program: None,
             zombie: false,
         });
     }
@@ -182,6 +195,7 @@ pub fn inspect(pid: i32) -> std::io::Result<Identity> {
         group: info.pbi_pgid as i32,
         birth: info.pbi_start_tvsec as f64 + info.pbi_start_tvusec as f64 / 1_000_000.,
         token: format!("darwin:{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec),
+        program: None,
         zombie: info.pbi_status == 5, // SZOMB
     })
 }
@@ -530,6 +544,35 @@ pub struct OwnershipSnapshot {
     pub descendants_observed: bool,
 }
 
+/// Accepts a bounded diagnostic basename, never a path, empty value or control text.
+fn valid_program(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.contains(['/', '\\'])
+        && !name.chars().any(char::is_control)
+}
+
+/// Adds a basename only if the same PID generation still exists after executable lookup.
+/// Lookup/encoding/identity failures leave the name unknown and never alter ownership evidence.
+fn with_program(mut identity: Identity) -> Identity {
+    identity.program = executable(identity.pid)
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .filter(|name| valid_program(name))
+        .filter(|_| {
+            observe(
+                Some(identity.pid),
+                Some(&identity.token),
+                Some(identity.birth),
+            ) == ProcessState::Alive
+        });
+    identity
+}
+
 /// PID-reuse-aware ownership evidence for one child process group.
 pub struct OwnedProcess {
     /// Captured identity of the group leader, when readable at spawn time.
@@ -538,6 +581,8 @@ pub struct OwnedProcess {
     pub pid: i32,
     /// Captured leader and descendants indexed by PID and immutable start token.
     known: BTreeMap<(i32, String), Identity>,
+    /// Keys in capture order, allowing bounded deltas without copying historical identities.
+    captured: Vec<(i32, String)>,
     /// Whether tracking began from a live verified leader or a later live snapshot.
     ///
     /// False means no descendant set was ever verified, so cleanup reports the
@@ -554,8 +599,8 @@ impl OwnedProcess {
     /// An already absent, zombie or unreadable leader cannot establish this root,
     /// so descendant cleanup stays unknown unless a later live snapshot succeeds.
     pub fn capture(pid: i32) -> Self {
-        let leader = inspect(pid).ok();
-        let known = leader
+        let leader = inspect(pid).ok().map(with_program);
+        let known: BTreeMap<_, _> = leader
             .clone()
             .into_iter()
             .map(|p| ((p.pid, p.token.clone()), p))
@@ -564,6 +609,7 @@ impl OwnedProcess {
         Self {
             leader,
             pid,
+            captured: known.keys().cloned().collect(),
             known,
             descendants_observed,
         }
@@ -576,6 +622,7 @@ impl OwnedProcess {
     pub fn adopt(leader: Identity) -> Self {
         let pid = leader.pid;
         Self {
+            captured: vec![(pid, leader.token.clone())],
             known: BTreeMap::from([((pid, leader.token.clone()), leader.clone())]),
             leader: Some(leader),
             pid,
@@ -589,6 +636,34 @@ impl OwnedProcess {
             members: self.known.values().cloned().collect(),
             descendants_observed: self.descendants_observed,
         })
+    }
+    /// Copies at most 512 newly captured identities after acknowledged offset after.
+    /// The root is included in every batch so each delta is independently validated.
+    /// Returns the batch and its exclusive capture offset; missing root or invalid offset returns None.
+    /// Offsets remain stable for this owner and advance only after durable acknowledgement.
+    pub fn snapshot_since(&self, after: usize) -> Option<(OwnershipSnapshot, usize)> {
+        let end = after.saturating_add(512).min(self.captured.len());
+        let leader = self.leader.clone()?;
+        let mut members: Vec<_> = self
+            .captured
+            .get(after..end)?
+            .iter()
+            .map(|key| self.known[key].clone())
+            .collect();
+        if !members
+            .iter()
+            .any(|p| p.pid == leader.pid && p.token == leader.token)
+        {
+            members.push(leader.clone());
+        }
+        Some((
+            OwnershipSnapshot {
+                leader,
+                members,
+                descendants_observed: self.descendants_observed,
+            },
+            end,
+        ))
     }
     /// Returns the append-only capture revision without cloning identities, for change-only persistence.
     pub fn capture_revision(&self) -> (usize, bool) {
@@ -604,6 +679,10 @@ impl OwnedProcess {
                 || member.group < 0
                 || member.token.is_empty()
                 || member.token.len() > 256
+                || member
+                    .program
+                    .as_deref()
+                    .is_some_and(|name| !valid_program(name))
                 || !member.birth.is_finite()
                 || member.birth < 0.0
                 || known
@@ -614,9 +693,13 @@ impl OwnedProcess {
             }
         }
         let leader = snapshot.leader;
-        if known
-            .get(&(leader.pid, leader.token.clone()))
-            .is_none_or(|root| root.birth != leader.birth || root.group != leader.group)
+        if leader
+            .program
+            .as_deref()
+            .is_some_and(|name| !valid_program(name))
+            || known
+                .get(&(leader.pid, leader.token.clone()))
+                .is_none_or(|root| root.birth != leader.birth || root.group != leader.group)
         {
             return Err(Error::Integrity(
                 "captured process root is missing or inconsistent".into(),
@@ -625,6 +708,7 @@ impl OwnedProcess {
         Ok(Self {
             pid: leader.pid,
             leader: Some(leader),
+            captured: known.keys().cloned().collect(),
             known,
             descendants_observed: snapshot.descendants_observed,
         })
@@ -667,7 +751,9 @@ impl OwnedProcess {
                     });
                 let in_group = leader_owned && p.group == self.pid;
                 if (child || in_group) && !self.known.contains_key(&(p.pid, p.token.clone())) {
-                    self.known.insert((p.pid, p.token.clone()), p.clone());
+                    let key = (p.pid, p.token.clone());
+                    self.captured.push(key.clone());
+                    self.known.insert(key, with_program(p.clone()));
                     changed = true;
                 }
             }

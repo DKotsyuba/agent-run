@@ -78,7 +78,7 @@ pub async fn reconcile(home: &Path, lane: &BrokerLane, limit: usize) -> Result<V
                 FinishPreparation::Pending => false,
                 FinishPreparation::Ready(op, captured) => {
                     if let Some((owner, snapshot)) = captured {
-                        lane.remote(ops::RememberProcesses { kind: "attempt".into(), owner, snapshot }, BROKER_BUDGET).await?;
+                        persist_process_batches(lane, owner, snapshot).await?;
                     }
                     lane.local(*op, BROKER_BUDGET).await?
                 }
@@ -90,6 +90,13 @@ pub async fn reconcile(home: &Path, lane: &BrokerLane, limit: usize) -> Result<V
                 }, BROKER_BUDGET).await?,
             };
             if applied {
+                let reader = Store::open(home)?;
+                let _ = crate::housekeeping::compact_process_artifacts(
+                    home,
+                    &reader.conn,
+                    row.id.as_str(),
+                    64,
+                );
                 changed.push(row.id);
             }
         }
@@ -102,10 +109,13 @@ pub async fn reconcile(home: &Path, lane: &BrokerLane, limit: usize) -> Result<V
         lane.local(cursor, BROKER_BUDGET).await?;
     }
     for captured in prepared.captured {
-        lane.remote(captured, BROKER_BUDGET).await?;
+        persist_process_batches(lane, captured.owner, captured.snapshot).await?;
     }
     for release in prepared.releases {
+        let id = release.execution.clone();
         lane.local(release, BROKER_BUDGET).await?;
+        let reader = Store::open(home)?;
+        let _ = crate::housekeeping::compact_process_artifacts(home, &reader.conn, id.as_str(), 64);
     }
     Ok(changed)
 }
@@ -252,7 +262,7 @@ struct OrphanPreparation {
 /// Prepare orphan cleanup using only recorded immutable identity and native absence proof.
 fn prepare_orphans(home: &Path, limit: usize) -> Result<OrphanPreparation> {
     let store = Store::open(home)?;
-    let select = "SELECT t.id,t.agent_id,t.phase,t.process_identity,t.process_birth_time,t.cleanup_proof_json,a.process_group_id,t.created_at FROM attempts t JOIN agents a ON a.id=t.agent_id WHERE t.ownership_active=1 AND a.status IN ('succeeded','failed','cancelled','lost','timed_out')";
+    let select = "SELECT t.id,t.agent_id,t.phase,t.process_identity,t.process_birth_time,t.cleanup_proof_json,a.process_group_id,t.created_at FROM attempts t JOIN agents a ON a.id=t.agent_id WHERE a.status IN ('succeeded','failed','cancelled','lost','timed_out') AND (t.ownership_active=1 OR (t.phase='cleanup_complete' AND json_extract(t.cleanup_proof_json,'$.confirmed')=1 AND EXISTS(SELECT 1 FROM process_ownership p WHERE p.owner_kind='attempt' AND p.owner_id=t.id)))";
     let cursor: Option<(f64, String)> = store
         .conn
         .query_row(
@@ -358,6 +368,7 @@ fn prepare_orphans(home: &Path, limit: usize) -> Result<OrphanPreparation> {
                                         group: pid,
                                         birth,
                                         token: token.clone(),
+                                        program: None,
                                         zombie: false,
                                     })
                                 }
@@ -417,4 +428,31 @@ fn prepare_orphans(home: &Path, limit: usize) -> Result<OrphanPreparation> {
         });
     }
     Ok(prepared)
+}
+
+/// Sends restored recovery evidence in independently validated batches, never a size-limited full history.
+/// Idempotent store insertion tolerates previously committed members; writer admission stays bounded.
+async fn persist_process_batches(
+    lane: &BrokerLane,
+    owner: String,
+    snapshot: process::OwnershipSnapshot,
+) -> Result<()> {
+    let captured = process::OwnedProcess::restore(snapshot)?;
+    let mut offset = 0;
+    while offset < captured.capture_revision().0 {
+        let (snapshot, end) = captured
+            .snapshot_since(offset)
+            .ok_or_else(|| invalid("recovery process root is unavailable"))?;
+        lane.remote(
+            ops::RememberProcesses {
+                kind: "attempt".into(),
+                owner: owner.clone(),
+                snapshot,
+            },
+            BROKER_BUDGET,
+        )
+        .await?;
+        offset = end;
+    }
+    Ok(())
 }

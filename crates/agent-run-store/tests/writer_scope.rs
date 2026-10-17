@@ -195,6 +195,7 @@ fn remember(kind: &str, owner: &str) -> RemoteOp {
             group: 99_999,
             birth: 1.0,
             token: "darwin:1:1".into(),
+            program: None,
             zombie: false,
         }
     };
@@ -454,6 +455,7 @@ fn service_identity_and_births_must_be_the_principal() {
                 group: pid,
                 birth,
                 token: "s".into(),
+                program: None,
                 zombie: false,
             },
         })
@@ -543,6 +545,7 @@ fn bootstrap_leader_must_be_the_executor() {
             group: pid,
             birth,
             token: token.into(),
+            program: None,
             zombie: false,
         };
         RemoteOp::from(BootstrapServiceProcess {

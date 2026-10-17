@@ -98,7 +98,7 @@ pub type PersistFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + Sync +
 
 /// Durable ownership sink installed by the supervisor.
 ///
-/// Each call starts the persistence of one identity-only snapshot and returns
+/// Each call starts the persistence of one root-bearing identity delta with optional basenames and returns
 /// the future that resolves when the write is committed, durably refused or its
 /// original deadline ended. The sink owns retry of the same operation identity
 /// and its single original deadline; [`Process`] never restarts or renews it.
@@ -408,9 +408,10 @@ impl Process {
         }
     }
 
-    /// Starts persistence of the current snapshot for `revision`.
+    /// Starts a bounded delta after the last acknowledged capture; failed writes keep the offset.
     fn start_ownership(&mut self, revision: (usize, bool), stage: OwnershipStage) -> Result<()> {
-        let snapshot = self.owner.snapshot().ok_or_else(|| {
+        let after = self.ownership_revision.map_or(0, |revision| revision.0);
+        let (snapshot, end) = self.owner.snapshot_since(after).ok_or_else(|| {
             Error::ownership_checkpoint(
                 stage,
                 Error::Integrity("process root identity is unavailable".into()),
@@ -421,7 +422,7 @@ impl Process {
             .as_mut()
             .expect("sink presence is checked before starting");
         self.ownership_pending = Some(PendingOwnership {
-            revision,
+            revision: (end, revision.1),
             stage,
             future: sink(snapshot),
         });

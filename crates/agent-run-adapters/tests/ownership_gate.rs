@@ -266,3 +266,60 @@ async fn final_checkpoint_is_not_failed_by_a_write_started_before_it() {
         .expect("only a write started by the final checkpoint can fail it");
     assert_eq!(starts.load(Ordering::SeqCst), 2, "persisted again once");
 }
+
+/// A failed first batch never advances the cursor; final retry persists a >2-MiB history in deltas.
+#[tokio::test]
+async fn large_capture_retries_only_unacknowledged_bounded_batches() {
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+    let (mut fixture, _) = spawn().await;
+    let mut snapshot = fixture.0.owner.snapshot().unwrap();
+    snapshot
+        .members
+        .extend((100_000..120_000).map(|pid| process::Identity {
+            pid,
+            ppid: 0,
+            group: 0,
+            birth: 1.0,
+            token: format!("inert-{pid}-{}", "x".repeat(80)),
+            zombie: false,
+            program: Some("fixture".into()),
+        }));
+    assert!(serde_json::to_vec(&snapshot).unwrap().len() > 2 * 1024 * 1024);
+    fixture.0.owner = process::OwnedProcess::restore(snapshot).unwrap();
+    let seen = Arc::new(Mutex::new(BTreeSet::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (seen_sink, calls_sink) = (seen.clone(), calls.clone());
+    fixture
+        .0
+        .install_ownership_sink(Box::new(move |batch| -> PersistFuture {
+            assert!(batch.members.len() <= 513);
+            if calls_sink.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Box::pin(async { Err(Error::Validation("injected batch refusal".into())) });
+            }
+            let seen = seen_sink.clone();
+            Box::pin(async move {
+                for p in batch.members {
+                    seen.lock().unwrap().insert((p.pid, p.token));
+                }
+                Ok(())
+            })
+        }));
+    assert!(
+        fixture
+            .0
+            .checkpoint_ownership_ready(OwnershipStage::Streaming)
+            .await
+            .is_err()
+    );
+    fixture
+        .0
+        .checkpoint_ownership_ready(OwnershipStage::Final)
+        .await
+        .unwrap();
+    let seen = seen.lock().unwrap();
+    for pid in 100_000..120_000 {
+        assert!(seen.contains(&(pid, format!("inert-{pid}-{}", "x".repeat(80)))));
+    }
+    assert!(calls.load(Ordering::SeqCst) > 2);
+}
