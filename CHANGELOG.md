@@ -10,6 +10,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   retention, preserving retry fences and live-producer protection; migrate to schema 32
 - fix(runtime): skip unchanged pool-settlement and service-lease writes and use
   actual receipt-retention progress when scheduling bounded backlog cleanup
+- fix(runtime): preserve typed admission failures and producer ownership during
+  cancellation, and reduce broker polling stack pressure
+- fix(worker): reject known launch secrets before accepting finish intents,
+  preserve receipt-backed answer content, and redact nested journal copies
+- fix(integrity): bind launched skill bytes to admitted revisions and reject
+  unlisted, linked or special files in sealed release inventories
 
 ## 0.28.2
 
