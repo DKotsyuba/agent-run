@@ -63,13 +63,23 @@ Custom Codex writes only the supported Responses
 `model_provider = "agent_run_gateway"` settings and an `env_key` name into
 the sealed config. Its token enters the child environment at attempt time,
 and the generated shell policy excludes that key from tool shells. Custom
-Claude sets `ANTHROPIC_BASE_URL` plus exactly one selected
-`ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY`; it uses an isolated
-per-lineage config directory rather than saved native login. No custom
-credential is written to generated settings, argv, the provider metadata,
+Claude sets `ANTHROPIC_BASE_URL` and the selected credential. Bearer gateways
+receive `ANTHROPIC_AUTH_TOKEN` plus an explicitly empty `ANTHROPIC_API_KEY`
+to prevent Claude from falling back to a saved API key; `x_api_key` gateways
+receive only `ANTHROPIC_API_KEY`. It uses an isolated per-lineage config
+directory rather than saved native login. No custom credential is written to
+generated settings, argv, the provider metadata,
 or the durable role document. Both routes keep configured roots, MCP, hooks,
 native-setting guards, and model restrictions under the sealed role/assets
 checks.
+
+For OpenRouter, use an ordinary inference API key, not a management/provisioning
+key. A successful `GET /api/v1/key` only confirms that the key is recognized:
+`is_management_key = true` or `is_provisioning_key = true` identifies an
+administrative key that cannot call completion endpoints. Check these metadata
+flags before interpreting a successful credential probe as inference readiness.
+See [OpenRouter's Claude setup](https://openrouter.ai/docs/cookbook/coding-agents/claude-code-integration)
+and [management-key scope](https://openrouter.ai/docs/guides/overview/auth/management-api-keys).
 
 Public `start` and `resume` use the provider path. Historical v1 rows retain
 their separate compatibility reader; they do not create a public runtime

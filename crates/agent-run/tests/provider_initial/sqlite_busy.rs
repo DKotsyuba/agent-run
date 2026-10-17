@@ -155,13 +155,17 @@ async fn concurrent_streaming_busy_preserves_results_and_resume_lineage() {
                 .unwrap(),
             1
         );
-        let captured = store
-            .remembered_processes("attempt", attempt)
-            .unwrap()
-            .unwrap()
-            .snapshot()
-            .unwrap();
-        assert!(captured.members.len() >= 2, "new descendant not persisted");
+        assert!(
+            store
+                .remembered_processes("attempt", attempt)
+                .unwrap()
+                .is_none()
+        );
+        let summary = store.last_event(id, "process_summary_v1").unwrap().unwrap();
+        assert!(
+            summary["observed_processes"].as_u64().unwrap() >= 2,
+            "new descendant not accounted for"
+        );
         let proof: String = store
             .conn
             .query_row(
@@ -273,17 +277,6 @@ async fn terminal_busy_commits_exactly_once_through_the_writer() {
         })
         .await
         .unwrap();
-        let held = writer(&home, hold);
-        fs::write(home.join("fixture-resume-terminal-1"), b"go").unwrap();
-        let before = std::time::Instant::now();
-        let exit = tokio::time::timeout(Duration::from_secs(18), child.wait())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(before.elapsed() < Duration::from_secs(12));
-        held.join().unwrap();
-        let store = agent_run_store::fixture::open(&home).unwrap();
-        let row = store.get(&id).unwrap();
         let dir = home.join("agents").join(id.as_str());
         let receipt: serde_json::Value = serde_json::from_slice(
             &fs::read(dir.join(format!("recovery.{attempt}.json"))).unwrap(),
@@ -302,6 +295,29 @@ async fn terminal_busy_commits_exactly_once_through_the_writer() {
             "fixture final answer\n"
         );
         assert!(!receipt.to_string().contains("synthetic-token"));
+        let held = writer(&home, hold);
+        fs::write(home.join("fixture-resume-terminal-1"), b"go").unwrap();
+        let before = std::time::Instant::now();
+        let exit = tokio::time::timeout(Duration::from_secs(18), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(before.elapsed() < Duration::from_secs(12));
+        held.join().unwrap();
+        let store = agent_run_store::fixture::open(&home).unwrap();
+        let row = store.get(&id).unwrap();
+        assert!(
+            !home
+                .join("agents")
+                .join(id.as_str())
+                .join(format!("recovery.{attempt}.json"))
+                .exists()
+        );
+        let summary = store
+            .last_event(&id, "process_summary_v1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary["cleanup_confirmed"], true);
         // The single resident writer waits out a foreign lock holder inside the
         // supervisor's original deadline: whatever the outage length, the final
         // commit lands exactly once (no per-process busy allowance remains).

@@ -744,6 +744,75 @@ fn native_provider_keeps_login_and_model_alias() {
     assert!(run_fake(&plan.launch).contains("claude-sonnet"));
 }
 
+/// Custom Claude uses only the selected credential; bearer gateways explicitly
+/// blank the API-key variable so Claude cannot fall back to another login.
+#[test]
+fn custom_claude_auth_clears_conflicting_host_credentials() {
+    use agent_run_domain::catalog::{CredentialHeader, ProviderConnection};
+
+    for header in [CredentialHeader::Bearer, CredentialHeader::XApiKey] {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path();
+        let mut config = config(root, &fake_engine(root));
+        let provider: ProviderId = "glm-any".parse().unwrap();
+        let ProviderConnection::Custom { auth_header, .. } =
+            &mut config.providers.get_mut(&provider).unwrap().connection
+        else {
+            panic!("fixture must use a custom connection");
+        };
+        *auth_header = header;
+        let catalog = catalog(&config);
+        let role = role(root, false);
+        let account = "acct-glm".parse().unwrap();
+        let run_home = root.join("gateway-run");
+        let (_, digest) = materialize_selected(
+            &config, &catalog, &provider, "glm", &account, &role, root, &run_home, root,
+        )
+        .unwrap();
+        let authority = make_authority(&catalog, &provider, "glm", &role, root, digest, "acct-glm");
+        let host = BTreeMap::from([
+            ("HOME".into(), root.to_string_lossy().into_owned()),
+            ("ANTHROPIC_AUTH_TOKEN".into(), "stale-host-token".into()),
+            ("ANTHROPIC_API_KEY".into(), "stale-host-api-key".into()),
+        ]);
+        let plan = plan_selected(
+            &config,
+            &catalog,
+            &authority,
+            &account,
+            &run_home,
+            root,
+            &host,
+            &FakeReader,
+            "task",
+            None,
+        )
+        .unwrap();
+        match header {
+            CredentialHeader::Bearer => {
+                assert_eq!(
+                    plan.launch.environment["ANTHROPIC_AUTH_TOKEN"],
+                    "synthetic-secret"
+                );
+                assert_eq!(
+                    plan.launch
+                        .environment
+                        .get("ANTHROPIC_API_KEY")
+                        .map(String::as_str),
+                    Some("")
+                );
+            }
+            CredentialHeader::XApiKey => {
+                assert_eq!(
+                    plan.launch.environment["ANTHROPIC_API_KEY"],
+                    "synthetic-secret"
+                );
+                assert!(!plan.launch.environment.contains_key("ANTHROPIC_AUTH_TOKEN"));
+            }
+        }
+    }
+}
+
 /// Arbitrary custom providers use configured models and gateways; drift in
 /// authority, account scope, or sealed files fails before native execution.
 #[test]
@@ -817,7 +886,7 @@ fn custom_providers_use_sealed_settings_and_fake_credentials() {
         plan.launch.environment["ANTHROPIC_AUTH_TOKEN"],
         "synthetic-secret"
     );
-    assert!(!plan.launch.environment.contains_key("ANTHROPIC_API_KEY"));
+    assert_eq!(plan.launch.environment["ANTHROPIC_API_KEY"], "");
     let output = run_fake(&plan.launch);
     assert!(output.contains("glm-5.3[1m]"));
     assert!(!output.contains("synthetic-secret"));

@@ -509,7 +509,9 @@ pub fn plan_selected(
 /// The caller supplies fresh task text, an optional exact native session id
 /// and the admitted request's [`LaunchOptions`]; none can alter frozen
 /// model, grants, connection, binary, or assets. `reader` resolves custom
-/// credentials only into the child environment. `shared` names the
+/// credentials only into the child environment. Custom Claude bearer launches
+/// explicitly blank the API-key variable to prevent native credential fallback.
+/// `shared` names the
 /// committed shared-store placement of the home's managed trees, when the
 /// registry recorded one; without it the sealed home verifies strictly as a
 /// private tree. The returned plan always launches the sealed native binary
@@ -638,6 +640,10 @@ pub fn plan_selected_with(
             environment.insert("ANTHROPIC_BASE_URL".into(), endpoint.clone());
             environment.remove("ANTHROPIC_AUTH_TOKEN");
             environment.remove("ANTHROPIC_API_KEY");
+            if *auth_header == agent_run_domain::CredentialHeader::Bearer {
+                // An absent API key allows Claude to fall back to saved credentials.
+                environment.insert("ANTHROPIC_API_KEY".into(), String::new());
+            }
             environment.insert(
                 match auth_header {
                     agent_run_domain::CredentialHeader::Bearer => "ANTHROPIC_AUTH_TOKEN",

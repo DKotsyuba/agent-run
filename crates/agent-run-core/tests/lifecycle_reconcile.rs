@@ -152,12 +152,27 @@ fn dead_pre_spawn_supervisor_cleans_journaled_mcp_discovery() {
     let mut child = Child(command.spawn().unwrap());
     let mut owned = process::OwnedProcess::capture(child.0.id() as i32);
     owned.refresh();
+    let mut escape_command = Command::new("/bin/sleep");
+    escape_command.arg("10").process_group(0);
+    let mut escaped = Child(escape_command.spawn().unwrap());
+    let mut first = owned.snapshot().unwrap();
+    first
+        .members
+        .push(process::inspect(escaped.0.id() as i32).unwrap());
     let home = common::Home::new();
     let mut store = home.store();
     let id = admitted(&home, &mut store);
     active(&store, &id, 4246, "fixture:dead:6", 6.0);
     store.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,phase,ownership_active) VALUES('att_probe',?,1,'prepared','{}',?,'prepared',1)",rusqlite::params![id.as_str(),agent_run_core::domain::now()]).unwrap();
     store.bind_attempt("att_probe");
+    store
+        .event(
+            &id,
+            "mcp_discovery_ownership",
+            &serde_json::to_value(first).unwrap(),
+        )
+        .unwrap();
+    // A later root-only delta must not discard the previously captured detached member.
     store
         .event(
             &id,
@@ -173,6 +188,10 @@ fn dead_pre_spawn_supervisor_cleans_journaled_mcp_discovery() {
     assert!(child.0.try_wait().unwrap().is_none());
     reconcile_with(&mut store, 10, |_, _, _| ProcessState::Dead).unwrap();
     assert!(child.0.try_wait().unwrap().is_some());
+    assert!(
+        escaped.0.try_wait().unwrap().is_some(),
+        "an earlier delta still owns the detached member"
+    );
     let active: i64 = store
         .conn
         .query_row(
@@ -182,6 +201,17 @@ fn dead_pre_spawn_supervisor_cleans_journaled_mcp_discovery() {
         )
         .unwrap();
     assert_eq!(active, 0);
+    let summary = store
+        .last_event(&id, "process_summary_v1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary["observed_processes"], 2);
+    assert!(
+        store
+            .last_event(&id, "mcp_discovery_ownership")
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// A missing group does not prove that an attempt already claiming spawn left
@@ -1094,18 +1124,21 @@ fn orphan_recovery_uses_durable_members_after_leader_exit() {
         reconcile(&mut store, 10).unwrap();
         if group_case == 3 {
             fixture.child.wait().unwrap();
-            let retained = store
-                .remembered_processes("attempt", "att_recover")
-                .unwrap()
-                .unwrap()
-                .snapshot()
-                .unwrap();
             assert!(
-                retained
-                    .members
-                    .iter()
-                    .any(|member| member.pid == descendant.pid && member.token == descendant.token)
+                store
+                    .remembered_processes("attempt", "att_recover")
+                    .unwrap()
+                    .is_none()
             );
+            let summary = store
+                .last_event(
+                    &"ag-20260924-000000-0000000011".parse().unwrap(),
+                    "process_summary_v1",
+                )
+                .unwrap()
+                .unwrap();
+            assert!(summary["observed_processes"].as_u64().unwrap() >= 2);
+            assert_eq!(summary["cleanup_confirmed"], true);
         }
         assert!(
             started.elapsed() < Duration::from_secs(3),

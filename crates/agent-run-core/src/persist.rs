@@ -1461,6 +1461,12 @@ impl Persist {
         // committed rows by a bounded read off the executor and persisted as a
         // separate background operation. A failure never changes the committed
         // terminal outcome.
+        let _ = crate::housekeeping::compact_process_artifacts(
+            &self.home,
+            &self.reader.conn,
+            id.as_str(),
+            64,
+        );
         self.persist_run_stats(id).await;
         Ok(status)
     }

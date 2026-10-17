@@ -133,6 +133,8 @@ impl Store<'_> {
     /// process identity; a release without a new proof needs a stored
     /// confirmed (or never-spawned) proof with cleanup complete. Anything
     /// else refuses without change. Returns whether ownership was released.
+    /// A confirmed release also compacts terminal process details; repeated release
+    /// converges historical details without changing the prior ownership outcome.
     pub fn release_orphaned_attempt(
         &self,
         op: &crate::ops::ReleaseOrphanedAttempt,
@@ -177,6 +179,9 @@ impl Store<'_> {
             ));
         }
         if active != 1 {
+            if matches!(op.outcome, crate::ops::OrphanOutcome::Release { .. }) {
+                crate::process_ownership::compact_terminal_processes(&tx, op.execution.as_str())?;
+            }
             tx.commit()?;
             return Ok(false);
         }
@@ -257,6 +262,7 @@ impl Store<'_> {
                 false
             }
         };
+        crate::process_ownership::compact_terminal_processes(&tx, op.execution.as_str())?;
         tx.commit()?;
         Ok(released)
     }

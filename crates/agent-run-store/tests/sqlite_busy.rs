@@ -57,6 +57,7 @@ fn ownership_write_and_commit_failures_are_not_replayable() {
         group: 10,
         birth: 123.0,
         token: "inert-root".into(),
+        program: None,
         zombie: false,
     };
     let snapshot = OwnershipSnapshot {
