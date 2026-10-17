@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-run"
-version = "0.28.3"
+version = "0.28.4"
 dependencies = [
  "agent-run-adapters",
  "agent-run-config",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-adapters"
-version = "0.28.3"
+version = "0.28.4"
 dependencies = [
  "agent-run-config",
  "agent-run-domain",
@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-config"
-version = "0.28.3"
+version = "0.28.4"
 dependencies = [
  "agent-run-domain",
  "agent-run-platform",
@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-core"
-version = "0.28.3"
+version = "0.28.4"
 dependencies = [
  "agent-run-adapters",
  "agent-run-config",
@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-domain"
-version = "0.28.3"
+version = "0.28.4"
 dependencies = [
  "chrono",
  "jsonschema",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-platform"
-version = "0.28.3"
+version = "0.28.4"
 dependencies = [
  "agent-run-domain",
  "libc",
@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-store"
-version = "0.28.3"
+version = "0.28.4"
 dependencies = [
  "agent-run-config",
  "agent-run-core",
@@ -140,7 +140,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-tui"
-version = "0.28.3"
+version = "0.28.4"
 dependencies = [
  "agent-run",
  "agent-run-domain",
@@ -2268,7 +2268,7 @@ dependencies = [
 
 [[package]]
 name = "sqlite-access"
-version = "0.28.3"
+version = "0.28.4"
 dependencies = [
  "fs2",
  "libc",
@@ -3026,7 +3026,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xtask"
-version = "0.28.3"
+version = "0.28.4"
 dependencies = [
  "agent-run-config",
  "agent-run-domain",

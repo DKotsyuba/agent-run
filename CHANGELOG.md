@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.28.4
+
 - fix(claude): explicitly blank the API-key variable for custom bearer gateways
   while preserving selected credentials and native login behavior
 - docs(openrouter): distinguish inference keys from management/provisioning keys
