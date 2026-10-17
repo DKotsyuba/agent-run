@@ -827,6 +827,11 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Persist) -> Result<()> {
         domain::now(),
         verify::DEFAULT_SILENCE_THRESHOLD_SECONDS,
     )?;
+    #[cfg(feature = "test-fixtures")]
+    {
+        store.flush().await?;
+        fixture_hold(home, "legacy-terminal").await;
+    }
     store
         .finish(id, &outcome, proof.as_ref(), result.usage.as_ref())
         .await?;

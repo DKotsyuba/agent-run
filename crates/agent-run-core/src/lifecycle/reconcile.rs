@@ -201,6 +201,7 @@ where
         }
     }
     release_orphaned_attempts(store, limit)?;
+    compact_completed_processes(store, limit)?;
     Ok(changed)
 }
 
@@ -210,20 +211,47 @@ const ORPHAN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 /// Recovers a terminal attempt's temporary MCP discovery processes from journaled
 /// identities before releasing its reservation. The owning supervisor may also call
 /// this after discovery stops. Never call it concurrently with a live discovery.
-/// Latest snapshots per root supersede earlier ones; no command or secret is stored.
+/// Root-bearing deltas are merged by immutable identity, including old full snapshots.
+/// Earlier escaped descendants must survive a later batch that mentions only the root.
 pub(crate) fn cleanup_mcp_discovery(store: &Store, attempt: &str) -> Result<bool> {
+    /// Union of all durable observations for one discovery child; metadata grants no new ownership.
+    struct Root {
+        /// Original immutable process-group leader.
+        leader: process::Identity,
+        /// Deduplicated PID generations across every acknowledged delta.
+        members: std::collections::BTreeMap<(i32, String), process::Identity>,
+        /// Whether at least one observation established a live root.
+        observed: bool,
+    }
     let mut query = store.conn.prepare("SELECT data_json FROM events WHERE agent_id=(SELECT agent_id FROM attempts WHERE id=?1) AND attempt_id=?1 AND kind='mcp_discovery_ownership' ORDER BY seq")?;
     let rows = query.query_map([attempt], |row| row.get::<_, String>(0))?;
     let mut roots = std::collections::BTreeMap::new();
     for row in rows {
         let snapshot: process::OwnershipSnapshot = serde_json::from_str(&row?)?;
-        roots.insert(
-            (snapshot.leader.pid, snapshot.leader.token.clone()),
-            snapshot,
-        );
+        process::OwnedProcess::restore(snapshot.clone())?;
+        let key = (snapshot.leader.pid, snapshot.leader.token.clone());
+        let root = roots.entry(key).or_insert_with(|| Root {
+            leader: snapshot.leader.clone(),
+            members: std::collections::BTreeMap::new(),
+            observed: false,
+        });
+        if root.leader.birth != snapshot.leader.birth || root.leader.group != snapshot.leader.group
+        {
+            return Err(Error::Integrity("discovery root identity changed".into()));
+        }
+        root.observed |= snapshot.descendants_observed;
+        for member in snapshot.members {
+            root.members
+                .entry((member.pid, member.token.clone()))
+                .or_insert(member);
+        }
     }
-    for snapshot in roots.into_values() {
-        let mut owned = process::OwnedProcess::restore(snapshot)?;
+    for root in roots.into_values() {
+        let mut owned = process::OwnedProcess::restore(process::OwnershipSnapshot {
+            leader: root.leader,
+            members: root.members.into_values().collect(),
+            descendants_observed: root.observed,
+        })?;
         if !owned.cleanup_blocking(ORPHAN_GRACE)?.confirmed {
             return Ok(false);
         }
@@ -393,6 +421,7 @@ fn release_orphaned_attempts(store: &mut Store, limit: usize) -> Result<()> {
                             group: pid,
                             birth,
                             token: token.clone(),
+                            program: None,
                             zombie: false,
                         });
                         let cleanup = owned.cleanup_blocking(ORPHAN_GRACE);
@@ -458,6 +487,7 @@ fn release_orphaned_attempts(store: &mut Store, limit: usize) -> Result<()> {
                 }
             }
         }
+        agent_run_store::process_ownership::compact_terminal_processes(&tx, &attempt.agent)?;
         tx.commit()?;
     }
     Ok(())
@@ -849,6 +879,24 @@ fn same_ownership(expected: &Candidate, current: &Candidate) -> bool {
         && current.supervisor_identity.is_none()
         && expected.startup_owner == current.startup_owner
         && expected.startup_birth_time == current.startup_birth_time
+}
+
+/// Converges completed process evidence after restart; each summary/delete is one write scope.
+/// Historical unknown cleanup is retained. File cleanup follows the committed summary and can retry.
+fn compact_completed_processes(store: &mut Store, limit: usize) -> Result<()> {
+    let ids = store.conn.prepare("SELECT DISTINCT a.id FROM agents a JOIN attempts t ON t.agent_id=a.id
+        JOIN process_ownership p ON p.owner_kind='attempt' AND p.owner_id=t.id
+        WHERE a.status IN ('succeeded','failed','cancelled','lost','timed_out')
+        AND NOT EXISTS(SELECT 1 FROM attempts u WHERE u.agent_id=a.id AND (u.ownership_active=1
+          OR u.phase IS NOT 'cleanup_complete' OR COALESCE(json_extract(u.cleanup_proof_json,'$.confirmed'),0)!=1)) LIMIT ?")?
+        .query_map([limit as i64], |row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in ids {
+        let tx = agent_run_store::writer::WriteTx::begin(&store.conn)?;
+        agent_run_store::process_ownership::compact_terminal_processes(&tx, &id)?;
+        tx.commit()?;
+        let _ = crate::housekeeping::compact_process_artifacts(&store.home, &store.conn, &id, 64);
+    }
+    Ok(())
 }
 
 /// Checks that orphaned-attempt diagnostics use bounded indexed history reads.

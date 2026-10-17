@@ -4,6 +4,17 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.28.4
+
+- fix(process): persist newly observed process identities in bounded batches and
+  compact completed ownership history after verified cleanup; preserve unresolved
+  ownership and reject late writes to closed histories
+
+- fix(claude): explicitly blank the API-key variable for custom bearer gateways
+  while preserving selected credentials and native login behavior
+- docs(openrouter): distinguish inference keys from management/provisioning keys
+  when diagnosing authentication failures
+
 ## 0.28.3
 
 - fix(store): index receipt lookups by producer and cooperatively bound receipt

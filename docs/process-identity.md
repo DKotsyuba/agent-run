@@ -73,3 +73,32 @@ rounding beyond that division.
 Historical rows that contain only a birth-time float remain readable. They can
 prove a missing PID dead or a birth mismatch reused, but a present PID without
 matching evidence remains unknown.
+
+
+## Incremental ownership and terminal diagnostics
+
+Harness ownership checkpoints send at most 512 newly captured identities plus the root.
+The capture offset advances only after acknowledgement; cancelled or refused writes
+keep the same unacknowledged identities. Individual writer requests remain bounded,
+but accumulated process history has no two-MiB ceiling. Recovery sends historical
+evidence through the same bounded batch shape and store inserts remain idempotent.
+
+Each captured identity may include an executable basename (maximum 128 UTF-8 bytes),
+looked up while the same kernel identity is alive. No arguments, environment or full
+executable path is stored. Old or unreadable names remain explicitly unknown.
+Counts describe observed process starts, not every exec transition or children that
+exited before observation.
+
+After terminal status and confirmed cleanup of every owned attempt, one transaction
+stores a process_summary_v1 event and deletes detailed attempt process membership,
+ownership and discovery snapshots. The summary deduplicates main and discovery process identities and includes the
+observed total, the
+16 most frequent program basenames/counts, and counts for unknown and other names.
+Unconfirmed cleanup retains all ownership evidence. Reconciliation converges old
+confirmed terminal records too. Only after a committed summary may filesystem
+cleanup remove the corresponding recovery.<attempt>.json process snapshots;
+failed executions with a sealed candidate retain its receipt with the ownership
+list removed, so the candidate proof is not lost.
+Candidate answers, transcripts, failure diagnostics and unresolved command receipts
+keep their existing policy. A restart retries interrupted cleanup. No SQL schema
+migration is needed: names are optional identity JSON and summaries use events.

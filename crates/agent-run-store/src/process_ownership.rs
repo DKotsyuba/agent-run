@@ -21,7 +21,9 @@ impl Store<'_> {
     /// Adds captured members atomically without changing an existing root or stealing another owner's PID/token.
     ///
     /// `kind` is attempt, service or probe, `id` names an existing durable owner, and
-    /// `snapshot` comes from its OwnedProcess. Repeated observations are no-ops.
+    /// The snapshot is a root-bearing delta; total history has no size cap.
+    /// Repeated identities are no-ops. Remote operations retain their per-batch transport bound.
+    /// Closed terminal attempts reject new writes so delayed producers cannot resurrect compacted details.
     /// Environment, command arguments and credentials are never accepted here.
     /// SQL refusals identify acquire, write or commit with elapsed milliseconds.
     /// Only a refused BEGIN is safe to replay; write/commit are never replayed by
@@ -34,10 +36,6 @@ impl Store<'_> {
     ) -> Result<()> {
         validate_owner(kind, id)?;
         OwnedProcess::restore(snapshot.clone())?;
-        let bytes = serde_json::to_vec(snapshot)?;
-        if bytes.len() > 2 * 1024 * 1024 {
-            return Err(invalid("process ownership snapshot exceeds two MiB"));
-        }
         let started = std::time::Instant::now();
         let tx = crate::writer::WriteTx::begin(&self.conn).map_err(|error| {
             Error::persistence(
@@ -62,6 +60,12 @@ impl Store<'_> {
             )?;
             if !exists {
                 return Err(invalid("process owner does not exist"));
+            }
+            if kind == "attempt" && tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM attempts t JOIN agents a ON a.id=t.agent_id WHERE t.id=?
+                 AND t.ownership_active=0 AND a.status IN ('succeeded','failed','cancelled','lost','timed_out'))",
+                [id], |row|row.get::<_,bool>(0))? {
+                return Err(Error::Transition("terminal process ownership is closed".into()));
             }
             let leader = serde_json::to_string(&snapshot.leader)?;
             let previous: Option<String> = tx
@@ -133,4 +137,89 @@ impl Store<'_> {
             descendants_observed: observed,
         })?))
     }
+}
+
+/// Deduplicates all acknowledged main/discovery identities of one execution before summarizing.
+/// The agent is bound as ?1; old full discovery snapshots and new deltas count each PID generation once.
+const PROCESS_OBSERVATIONS: &str = "WITH observations AS (
+    SELECT pid,token,identity_json FROM process_members WHERE owner_kind='attempt'
+      AND owner_id IN (SELECT id FROM attempts WHERE agent_id=?1)
+    UNION ALL
+    SELECT json_extract(j.value,'$.pid'),json_extract(j.value,'$.token'),j.value
+      FROM events e,json_each(e.data_json,'$.members') j
+      WHERE e.agent_id=?1 AND e.kind='mcp_discovery_ownership'
+), processes AS (
+    SELECT pid,token,MAX(json_extract(identity_json,'$.program')) AS program
+      FROM observations GROUP BY pid,token
+) ";
+
+/// Replaces detailed process evidence with one bounded event after terminal, fully proven cleanup.
+/// Runs inside the caller's transaction: summary insertion and deletions roll back together.
+/// Active/uncertain attempts retain every identity. Repetition after compaction is a no-op.
+/// Counts observed process starts, not exec transitions or unobserved short-lived children.
+pub fn compact_terminal_processes(conn: &rusqlite::Connection, id: &str) -> Result<bool> {
+    if conn.is_autocommit() {
+        return Err(invalid("process compaction requires a transaction"));
+    }
+    let eligible: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agents a WHERE a.id=?1 AND a.status IN ('succeeded','failed','cancelled','lost','timed_out')
+         AND NOT EXISTS(SELECT 1 FROM attempts t WHERE t.agent_id=a.id AND (t.ownership_active=1
+         OR t.phase IS NOT 'cleanup_complete' OR (COALESCE(json_extract(t.cleanup_proof_json,'$.confirmed'),0) != 1 AND NOT (COALESCE(json_extract(t.cleanup_proof_json,'$.never_spawned'),0)=1 AND t.process_identity IS NULL AND NOT EXISTS(SELECT 1 FROM process_ownership x WHERE x.owner_kind='attempt' AND x.owner_id=t.id))))))",
+        [id], |row| row.get(0))?;
+    if !eligible {
+        return Ok(false);
+    }
+    let total: i64 = conn.query_row(
+        &format!("{PROCESS_OBSERVATIONS} SELECT COUNT(*) FROM processes"),
+        [id],
+        |row| row.get(0),
+    )?;
+    if total == 0 {
+        return Ok(false);
+    }
+    let mut stmt = conn.prepare(&format!(
+        "{PROCESS_OBSERVATIONS} SELECT program,COUNT(*) FROM processes
+        WHERE program IS NOT NULL GROUP BY program ORDER BY COUNT(*) DESC,program LIMIT 16"
+    ))?;
+    let rows = stmt
+        .query_map([id], |row| {
+            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut programs = Vec::new();
+    let mut named = 0_i64;
+    for (name, count) in rows {
+        if let Some(name) = name {
+            named += count;
+            programs.push(serde_json::json!({"name":name,"count":count}));
+        }
+    }
+    let unknown: i64 = conn.query_row(
+        &format!("{PROCESS_OBSERVATIONS} SELECT COUNT(*) FROM processes WHERE program IS NULL"),
+        [id],
+        |row| row.get(0),
+    )?;
+    let (status, started_at, finished_at, failure_kind): (
+        String,
+        Option<f64>,
+        Option<f64>,
+        Option<String>,
+    ) = conn.query_row(
+        "SELECT status,started_at,finished_at,failure_kind FROM agents WHERE id=?",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    let summary = serde_json::json!({"status":status,"started_at":started_at,"finished_at":finished_at,"failure_kind":failure_kind,"version":1,"observed_processes":total,"programs":programs,
+        "unknown_program":unknown,"other_programs":total-named-unknown,"cleanup_confirmed":true});
+    conn.execute(
+        "INSERT INTO events(agent_id,at,kind,data_json,attempt_id) VALUES(?1,?2,'process_summary_v1',?3,(SELECT id FROM attempts WHERE agent_id=?1 ORDER BY number DESC LIMIT 1))",
+        params![id, now(), summary.to_string()],
+    )?;
+    conn.execute("DELETE FROM process_members WHERE owner_kind='attempt' AND owner_id IN (SELECT id FROM attempts WHERE agent_id=?)",[id])?;
+    conn.execute("DELETE FROM process_ownership WHERE owner_kind='attempt' AND owner_id IN (SELECT id FROM attempts WHERE agent_id=?)",[id])?;
+    conn.execute(
+        "DELETE FROM events WHERE agent_id=? AND kind='mcp_discovery_ownership'",
+        [id],
+    )?;
+    Ok(true)
 }

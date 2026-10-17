@@ -529,6 +529,12 @@ fn run_directories(
         let Some(created) = run_id_created(id) else {
             continue;
         };
+        if pass.unlinks > 0
+            && let Ok(removed) = compact_process_artifacts(home, &store.conn, id, pass.unlinks)
+        {
+            pass.unlinks -= removed;
+            pass.removed += removed;
+        }
         if !older_than(created, now, STORAGE_SECONDS)
             && !count_retired(store, boundary, id, created)
         {
@@ -1110,6 +1116,78 @@ fn drain(dir: &fs::Dir, preserve_complete: bool, depth: usize, pass: &mut Pass) 
 /// [`sweep_on`] over a raw store held under the caller's offline authority.
 pub fn sweep(home: &Path, now: f64, store: &mut Store) -> Result<usize> {
     crate::runtime_storage::ready(sweep_on(home, now, store))
+}
+
+/// Drops recognized per-attempt process recovery details only after a committed compact summary.
+/// Read-only database guards and descriptor-relative owned-file checks fail closed. Other artifacts,
+/// including candidate answers, transcripts and unresolved command receipts, are retained.
+/// A crash or removal failure leaves files for the next collection pass without changing outcome.
+/// Handles at most budget files and returns the number removed or compacted; zero does nothing.
+/// A failed execution's sealed candidate proof is retained in a receipt without the ownership list.
+/// Invalid agent IDs are rejected before filesystem access.
+pub fn compact_process_artifacts(
+    home: &Path,
+    conn: &rusqlite::Connection,
+    id: &str,
+    budget: usize,
+) -> Result<usize> {
+    let _: AgentId = id.parse()?;
+    let safe: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM events e JOIN agents a ON a.id=e.agent_id
+        WHERE a.id=? AND e.kind='process_summary_v1' AND a.status IN ('succeeded','failed','cancelled','lost','timed_out')
+        AND NOT EXISTS(SELECT 1 FROM attempts t WHERE t.agent_id=a.id AND (t.ownership_active=1 OR t.phase IS NOT 'cleanup_complete' OR (COALESCE(json_extract(t.cleanup_proof_json,'$.confirmed'),0)!=1 AND NOT (COALESCE(json_extract(t.cleanup_proof_json,'$.never_spawned'),0)=1 AND t.process_identity IS NULL)))))",
+        [id], |row| row.get(0))?;
+    if !safe || budget == 0 {
+        return Ok(0);
+    }
+    let failed: bool = conn.query_row(
+        "SELECT status != 'succeeded' FROM agents WHERE id=?",
+        [id],
+        |row| row.get(0),
+    )?;
+    let directory = match fs::Dir::open(&home.join("agents").join(id)) {
+        Ok(directory) => directory,
+        Err(crate::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(0);
+        }
+        Err(error) => return Err(error),
+    };
+    let attempts = conn
+        .prepare("SELECT id FROM attempts WHERE agent_id=?")?
+        .query_map([id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut removed = 0;
+    for attempt in attempts {
+        if removed == budget {
+            break;
+        }
+        // Attempt IDs come from the database but must still be single filename components.
+        if attempt.contains(['/', '\\']) || attempt == "." || attempt == ".." {
+            continue;
+        }
+        let name = PathBuf::from(format!("recovery.{attempt}.json"));
+        match directory.entry(Some(&name)) {
+            Ok(entry) if entry.kind == fs::EntryType::File && entry.uid == euid() => {
+                if failed {
+                    let mut receipt: serde_json::Value =
+                        serde_json::from_reader(directory.open_file(&name)?)?;
+                    if !receipt["candidate"].is_null() {
+                        if let Some(object) = receipt.as_object_mut()
+                            && object.remove("ownership").is_some()
+                        {
+                            directory.write(&name, &fs::canonical_json(&receipt)?, 0o600)?;
+                            removed += 1;
+                        }
+                        continue;
+                    }
+                }
+                directory.remove(&name)?;
+                removed += 1;
+            }
+            Err(crate::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => {}
+        }
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]

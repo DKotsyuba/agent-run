@@ -243,6 +243,25 @@ async fn wait_journaled_text(home: &Path, id: &AgentId, needle: &str) {
 async fn run_task(home: &Path, task: &str) -> Record {
     let id = admit(home, task);
     let mut child = spawn_supervisor(home, &id).await;
+    if home.join("fixture-hold-legacy-terminal").exists() {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !home.join("fixture-held-legacy-terminal").exists() {
+            assert!(Instant::now() < deadline, "terminal checkpoint not reached");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let captured = agent_run_store::fixture::open(home)
+            .unwrap()
+            .remembered_processes("attempt", &format!("{id}:1"))
+            .unwrap()
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert!(
+            captured.members.len() > 1,
+            "descendant evidence must be durable before terminal compaction"
+        );
+        std::fs::write(home.join("fixture-release-legacy-terminal"), "").unwrap();
+    }
     let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .expect("supervisor subprocess timed out")
@@ -681,21 +700,27 @@ async fn ten_consecutive_supervisor_entrypoints_land_durably() {
     }
 }
 
-/// Legacy supervision keeps durable root/descendant ownership and its confirmed cleanup proof.
+/// Legacy supervision keeps ownership through cleanup, then replaces details with a compact summary.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stability_legacy_supervisor_checkpoints_owned_cleanup() {
     let (_tmp, home) = home();
+    std::fs::write(home.join("fixture-hold-legacy-terminal"), "").unwrap();
     let row = run_task(&home, "fixture:descendant").await;
     assert_eq!(row.status, Status::Succeeded);
     let store = agent_run_store::fixture::open(&home).unwrap();
     let attempt = format!("{}:1", row.id);
-    let owned = store
-        .remembered_processes("attempt", &attempt)
+    assert!(
+        store
+            .remembered_processes("attempt", &attempt)
+            .unwrap()
+            .is_none()
+    );
+    let summary = store
+        .last_event(&row.id, "process_summary_v1")
         .unwrap()
-        .unwrap()
-        .snapshot()
         .unwrap();
-    assert!(owned.members.len() > 1);
+    assert!(summary["observed_processes"].as_u64().unwrap() > 1);
+    assert_eq!(summary["cleanup_confirmed"], true);
     let active: bool = store
         .conn
         .query_row(
@@ -1215,6 +1240,7 @@ async fn signal_is_never_sent_to_an_already_dead_process() {
 /// returns the settled row. The engine must be observed throughout the hold.
 async fn run_with_held_first_write(home: &Path, phase: &str) -> (AgentId, Record) {
     std::fs::write(home.join("fixture-fork-at-start"), "").unwrap();
+    std::fs::write(home.join("fixture-hold-legacy-terminal"), "").unwrap();
     std::fs::write(home.join(format!("fixture-hold-{phase}")), "").unwrap();
     let id = admit(home, "hold");
     let mut child = spawn_supervisor(home, &id).await;
@@ -1227,6 +1253,30 @@ async fn run_with_held_first_write(home: &Path, phase: &str) -> (AgentId, Record
     // write stays held far longer than that.
     tokio::time::sleep(Duration::from_millis(1800)).await;
     std::fs::write(home.join(format!("fixture-release-{phase}")), "").unwrap();
+    while !home.join("fixture-held-legacy-terminal").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "terminal ownership barrier not reached"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let owned = agent_run_store::fixture::open(home)
+        .unwrap()
+        .remembered_processes("attempt", &format!("{id}:1"))
+        .unwrap()
+        .unwrap()
+        .snapshot()
+        .unwrap();
+    let escaped: i32 = std::fs::read_to_string(home.join("escaped.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        owned.members.iter().any(|p| p.pid == escaped),
+        "escaped descendant must be captured before compaction"
+    );
+    std::fs::write(home.join("fixture-release-legacy-terminal"), "").unwrap();
     let status = tokio::time::timeout(Duration::from_secs(30), child.wait())
         .await
         .expect("supervisor timed out")
@@ -1259,21 +1309,23 @@ async fn held_write_keeps_the_spawned_engine_observed(phase: &str) {
     assert!(row.status.terminal(), "{:?}", row.status);
     let store = agent_run_store::fixture::open(&home).unwrap();
     let attempt = format!("{id}:1");
-    let owned = store
-        .remembered_processes("attempt", &attempt)
+    assert!(
+        store
+            .remembered_processes("attempt", &attempt)
+            .unwrap()
+            .is_none()
+    );
+    let summary = store
+        .last_event(&id, "process_summary_v1")
         .unwrap()
-        .expect("ownership evidence was recorded")
-        .snapshot()
         .unwrap();
+    assert!(summary["observed_processes"].as_u64().unwrap() >= 2);
     let escaped: i32 = std::fs::read_to_string(home.join("escaped.pid"))
         .unwrap()
         .trim()
         .parse()
         .unwrap();
-    assert!(
-        owned.members.iter().any(|member| member.pid == escaped),
-        "the group-escaping descendant forked at startup must be captured while the first write was held"
-    );
+    // Exact escaped identity was checked at the pre-terminal barrier by the helper.
     let proof: String = store
         .conn
         .query_row(
