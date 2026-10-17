@@ -65,6 +65,8 @@ pub fn finish(
 /// receipt and must match that attempt's immutable callback summary, so an
 /// intent whose native reply was lost never becomes a public answer. Returns
 /// the commit time, or `None` when the execution was already terminal (no-op).
+/// Once all attempts have confirmed cleanup, a bounded process summary replaces
+/// detailed ownership evidence in this same transaction.
 pub fn commit_terminal(
     store: &mut Store,
     id: &AgentId,
@@ -246,6 +248,7 @@ pub fn commit_terminal(
             [id.as_str()],
         )?;
     }
+    crate::process_ownership::compact_terminal_processes(&tx, id.as_str())?;
     tx.commit()?;
     Ok(Some(time))
 }

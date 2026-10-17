@@ -1056,7 +1056,29 @@ async fn provider_start_completes_one_owned_fake_engine_attempt() {
     assert!(!stored_identity.contains("synthetic-token"));
     assert!(!stored_identity.contains("env:FAKE_TOKEN"));
     fs::write(home.join("config.toml"), "schema_version=2\n").unwrap();
+    fs::write(home.join("fixture-pause-terminal-1"), "pause").unwrap();
     let mut child = supervisor(&home, &id).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !home.join("fixture-paused-terminal-1").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("provider terminal barrier");
+    let captured = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .remembered_processes("attempt", &attempt)
+        .unwrap()
+        .unwrap()
+        .snapshot()
+        .unwrap();
+    assert!(captured.descendants_observed);
+    assert!(
+        !serde_json::to_string(&captured)
+            .unwrap()
+            .contains("synthetic-token")
+    );
+    fs::write(home.join("fixture-resume-terminal-1"), "resume").unwrap();
     let exit = tokio::time::timeout(Duration::from_secs(20), child.wait())
         .await
         .unwrap()
@@ -1081,11 +1103,18 @@ async fn provider_start_completes_one_owned_fake_engine_attempt() {
     assert_eq!(selected, "acct-work");
     assert_eq!(active, 0);
     assert!(cleanup.is_some() && process.is_some());
-    let captured = store
-        .remembered_processes("attempt", &attempt)
-        .unwrap()
-        .expect("provider supervisor checkpoints ownership");
-    let captured = captured.snapshot().unwrap();
+    assert!(
+        store
+            .remembered_processes("attempt", &attempt)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .last_event(&id, "process_summary_v1")
+            .unwrap()
+            .is_some()
+    );
     assert!(captured.descendants_observed);
     assert_eq!(Some(&captured.leader.token), process.as_ref());
     assert!(
