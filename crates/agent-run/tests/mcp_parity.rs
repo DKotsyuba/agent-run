@@ -220,6 +220,7 @@ fn additive_wires() -> Vec<Value> {
         "pool_replace",
         "pool",
         "list_pools",
+        "agent_integration",
     ]
     .into_iter()
     .map(|name| {

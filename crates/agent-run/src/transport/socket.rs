@@ -674,7 +674,15 @@ async fn connection(
             Err(_) => return Ok(()),
         };
         let response = match serde_json::from_slice::<Value>(&raw) {
-            Ok(value) => {
+            Ok(mut value) => {
+                if !valid_start_frame(
+                    &raw,
+                    value.get("method").and_then(Value::as_str).unwrap_or(""),
+                ) {
+                    // Keep envelope/notification validation in the normal responder;
+                    // this marker can never decode as a valid admission request.
+                    value["params"] = json!({"invalid_start_frame":true});
+                }
                 let method = value.get("method").and_then(Value::as_str).unwrap_or("");
                 if control_only && !CONTROL_METHODS.contains(&method) {
                     let id = value.get("id").cloned().unwrap_or(Value::Null);
@@ -743,6 +751,29 @@ async fn connection(
         if control_only {
             return Ok(());
         }
+    }
+}
+
+/// Decodes start parameters from their original frame before a generic JSON map
+/// can erase duplicate required_mcp keys. Other methods retain existing decoding.
+/// No filesystem/config/admission work occurs at this protocol boundary.
+fn valid_start_frame(raw: &[u8], method: &str) -> bool {
+    /// Only parameters need typed validation here; the normal responder owns the envelope.
+    #[derive(serde::Deserialize)]
+    struct Frame<T> {
+        /// Validated start request; read only to ensure deserialization completes.
+        params: T,
+    }
+    match method {
+        "start" => serde_json::from_slice::<Frame<agent_run_domain::ProviderStartRequest>>(raw)
+            .map(|frame| frame.params)
+            .is_ok(),
+        "start_pool" => {
+            serde_json::from_slice::<Frame<agent_run_domain::pool::PoolStartRequest>>(raw)
+                .map(|frame| frame.params)
+                .is_ok()
+        }
+        _ => true,
     }
 }
 /// Binds one private same-user broker socket under its exclusive startup lock.
@@ -1314,6 +1345,62 @@ async fn client_with_wait_deadlines(
 mod tests {
     use super::*;
     use tokio::net::UnixListener;
+
+    /// Duplicate server keys cannot collapse into an admissible socket start.
+    #[test]
+    fn required_mcp_duplicate_socket_keys_fail_before_dispatch() {
+        let frame = br#"{"jsonrpc":"2.0","id":1,"method":"start","params":{"provider":"p","model":"m","profile":"review","task":"t","workdir":"/gone","required_mcp":{"pool":[],"pool":[]}}}"#;
+        assert!(!valid_start_frame(frame, "start"));
+        let valid = br#"{"jsonrpc":"2.0","id":1,"method":"start","params":{"provider":"p","model":"m","profile":"review","task":"t","workdir":"/gone","required_mcp":{"pool":[]}}}"#;
+        assert!(valid_start_frame(valid, "start"));
+    }
+
+    /// Raw duplicate-map requests retain protocol correlation, envelope precedence
+    /// and notification silence, and never reach a nonexistent service home.
+    #[tokio::test]
+    async fn required_mcp_raw_socket_rejection_preserves_protocol() {
+        use tokio::io::AsyncWriteExt;
+        let (client, server) = UnixStream::pair().unwrap();
+        let service = Service::new(PathBuf::from("/nonexistent-required-mcp-fixture"));
+        let serving = tokio::spawn(connection(
+            server,
+            service,
+            Lanes::new(1),
+            false,
+            ServeOptions::default(),
+        ));
+        let (reader, mut writer) = client.into_split();
+        let mut reader = BufReader::new(reader);
+        let params = r#"{"provider":"p","model":"m","profile":"review","task":"t","workdir":"/gone","required_mcp":{"pool":[],"pool":[]}}"#;
+        for (version, id, code) in [("2.0", 1, -32602), ("1.0", 2, -32600)] {
+            writer.write_all(format!("{{\"jsonrpc\":\"{version}\",\"id\":{id},\"method\":\"start\",\"params\":{params}}}\n").as_bytes()).await.unwrap();
+            let raw =
+                tokio::time::timeout(Duration::from_secs(5), frame::read(&mut reader, MAX_FRAME))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            let value: Value = serde_json::from_slice(&raw).unwrap();
+            assert_eq!(value["id"], id);
+            assert_eq!(value["error"]["code"], code);
+        }
+        writer.write_all(format!("{{\"jsonrpc\":\"2.0\",\"method\":\"start\",\"params\":{params}}}\n{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}}\n").as_bytes()).await.unwrap();
+        let raw = tokio::time::timeout(Duration::from_secs(5), frame::read(&mut reader, MAX_FRAME))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let value: Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(value["id"], 3);
+        assert_eq!(value["result"]["ok"], true);
+        drop(writer);
+        drop(reader);
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 
     /// Pool discovery consumes only the read lane and no control reservation.
     #[test]

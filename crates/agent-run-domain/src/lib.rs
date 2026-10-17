@@ -6,6 +6,7 @@ pub mod credential_ref;
 pub mod domain;
 pub mod error;
 pub mod fsm;
+pub mod integration;
 mod legacy_provider;
 pub mod pool;
 mod provider_connection;

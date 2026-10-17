@@ -931,17 +931,20 @@ impl Persist {
         .await
     }
 
-    /// Records the spawned leader identity.
+    /// Records the spawned leader and actual canonical native store atomically.
+    /// Only the later native session event completes this attempt's private tuple.
     pub async fn provider_process(
         &mut self,
         id: &AgentId,
         attempt: &str,
         leader: &agent_run_platform::process::Identity,
+        integration: Option<agent_run_domain::integration::NativeIntegration>,
     ) -> Result<()> {
         self.own(id)?;
         self.critical(ops::ProviderProcess {
             target: target(id, attempt),
             leader: leader.clone(),
+            integration,
         })
         .await
     }

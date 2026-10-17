@@ -7,7 +7,10 @@ use crate::{
     types::AccountLabel,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 /// A new orchestrator-selected provider/model request.
 ///
@@ -64,6 +67,80 @@ pub struct ProviderStartRequest {
     /// Constraints requested in addition to those required by the role/model.
     #[serde(default, deserialize_with = "unique_constraints")]
     pub required_constraints: BTreeSet<Constraint>,
+    /// Non-grant assertion on the resolved MCP selection: at most eight servers
+    /// and 32 exact unprefixed tool names per server. Empty lists require only
+    /// server presence. Empty/omitted maps serialize absent for historical replay.
+    #[serde(
+        default,
+        deserialize_with = "required_mcp",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub required_mcp: BTreeMap<String, Vec<String>>,
+}
+
+/// Decodes bounded MCP assertions without losing duplicate object keys or tools.
+/// Null and non-object input fail; names and canonical ordering are validated here
+/// and again by request validation for callers constructing the public type directly.
+fn required_mcp<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, Vec<String>>, D::Error> {
+    /// Streams the bounded map, rejecting duplicate server keys before insertion.
+    struct RequiredMcp;
+    impl<'de> serde::de::Visitor<'de> for RequiredMcp {
+        /// Canonical server map; each value is a sorted exact tool set.
+        type Value = BTreeMap<String, Vec<String>>;
+        /// Describes the sole accepted wire representation.
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a bounded map of MCP servers to exact tool names")
+        }
+        /// Retains exact names and refuses duplicates, wildcards and oversized maps.
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut result = BTreeMap::new();
+            while let Some((server, tools)) = map.next_entry::<String, Vec<String>>()? {
+                if result.len() >= 8 || result.insert(server, tools).is_some() {
+                    return Err(serde::de::Error::custom(
+                        "duplicate or excessive required MCP servers",
+                    ));
+                }
+            }
+            normalize_required_mcp(&mut result).map_err(serde::de::Error::custom)?;
+            Ok(result)
+        }
+    }
+    deserializer.deserialize_map(RequiredMcp)
+}
+
+/// Validates the config name/tool grammar and limits, sorting each exact tool set.
+/// No server or tool is selected or granted by this normalization.
+fn normalize_required_mcp(requirements: &mut BTreeMap<String, Vec<String>>) -> Result<()> {
+    let name = |value: &str| {
+        (1..=128).contains(&value.len())
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+    };
+    if requirements.len() > 8 {
+        return Err(crate::error::invalid("required_mcp exceeds eight servers"));
+    }
+    for (server, tools) in requirements {
+        if !name(server)
+            || !server.as_bytes()[0].is_ascii_alphanumeric()
+            || tools.len() > 32
+            || tools.iter().any(|tool| !name(tool))
+        {
+            return Err(crate::error::invalid(
+                "required_mcp requires bounded exact server and tool names",
+            ));
+        }
+        tools.sort();
+        if tools.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(crate::error::invalid("duplicate required MCP tool"));
+        }
+    }
+    Ok(())
 }
 
 /// Decodes required constraints without silently collapsing duplicate input.
@@ -79,11 +156,12 @@ fn unique_constraints<'de, D: serde::Deserializer<'de>>(
 }
 
 impl ProviderStartRequest {
-    /// Validates paths, task, effort, namespace, orchestrator transport
+    /// Validates/canonicalizes MCP assertions, paths, task, effort, namespace, orchestrator transport
     /// and the optional human label; stores canonical paths, labels and transport
     /// in place. Invalid values return `ValidationError` before admission.
     /// Historical runtime selectors remain excluded from public v2 input.
     pub fn validate(&mut self) -> Result<()> {
+        normalize_required_mcp(&mut self.required_mcp)?;
         let mut projection = self.storage_projection();
         projection.validate()?;
         self.workdir = projection.workdir;
@@ -93,9 +171,11 @@ impl ProviderStartRequest {
         Ok(())
     }
 
-    /// Validates immutable fields for exact replay without requiring live directories.
+    /// Validates immutable fields and canonicalizes MCP assertions for exact replay
+    /// without requiring live directories. Never selects or grants requested tools.
     /// A new request still calls `validate` before admission and canonicalizes paths.
     pub fn validate_intent(&mut self) -> Result<()> {
+        normalize_required_mcp(&mut self.required_mcp)?;
         let mut projection = self.storage_projection();
         projection.validate_intent()?;
         self.display_name = projection.display_name;
@@ -142,5 +222,95 @@ impl ProviderStartRequest {
             account: self.account.as_ref().map(|label| label.as_str().into()),
             required_constraints: self.required_constraints.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    /// Minimal intent without any filesystem dependency.
+    fn request() -> Value {
+        json!({"provider":"p","model":"m","profile":"review","task":"task","workdir":"/already-removed"})
+    }
+
+    /// Empty assertions preserve old fingerprints; maps and tool sets are canonical.
+    #[test]
+    fn required_mcp_is_canonical_and_absence_compatible() {
+        let absent: ProviderStartRequest = serde_json::from_value(request()).unwrap();
+        let mut value = request();
+        value["required_mcp"] = json!({});
+        let empty: ProviderStartRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(absent).unwrap(),
+            serde_json::to_value(empty).unwrap()
+        );
+        value["required_mcp"] = json!({"z":[], "a":["write","read"]});
+        let first: ProviderStartRequest = serde_json::from_value(value.clone()).unwrap();
+        value["required_mcp"] = json!({"a":["read","write"], "z":[]});
+        let second: ProviderStartRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.required_mcp["a"], ["read", "write"]);
+        assert_eq!(
+            ProviderStartRequest::from_history(serde_json::to_value(&first).unwrap()).unwrap(),
+            first
+        );
+    }
+
+    /// Invalid names, nulls, duplicates and hard size limits fail before admission.
+    #[test]
+    fn required_mcp_rejects_malformed_and_duplicate_wire_input() {
+        let mut invalid = vec![
+            Value::Null,
+            json!([]),
+            json!({"":[]}),
+            json!({"_bad":[]}),
+            json!({"server":null}),
+            json!({"server":["*"]}),
+            json!({"server":["x","x"]}),
+            json!({"server":[""]}),
+            json!({"server":["tool/other"]}),
+            json!({"сервер":[]}),
+        ];
+        invalid.push(json!({"server":(0..33).map(|n|format!("t{n}")).collect::<Vec<_>>()}));
+        invalid.push(json!({"server":["x".repeat(129)]}));
+        invalid.push(Value::Object(
+            (0..9).map(|n| (format!("s{n}"), json!([]))).collect(),
+        ));
+        for requirements in invalid {
+            let mut value = request();
+            value["required_mcp"] = requirements;
+            assert!(
+                serde_json::from_value::<ProviderStartRequest>(value.clone()).is_err(),
+                "{value}"
+            );
+        }
+        let duplicate = r#"{"provider":"p","model":"m","profile":"review","task":"t","workdir":"/gone","required_mcp":{"server":[],"server":[]}}"#;
+        assert!(serde_json::from_str::<ProviderStartRequest>(duplicate).is_err());
+        let mut boundary = request();
+        boundary["required_mcp"] = Value::Object(
+            (0..8)
+                .map(|server| {
+                    (
+                        format!("s{server}{}", "x".repeat(126)),
+                        json!(
+                            (0..32)
+                                .map(|tool| format!("t{tool:02}{}", "x".repeat(125)))
+                                .collect::<Vec<_>>()
+                        ),
+                    )
+                })
+                .collect(),
+        );
+        assert!(serde_json::from_value::<ProviderStartRequest>(boundary).is_ok());
+        let mut valid: ProviderStartRequest = serde_json::from_value(request()).unwrap();
+        valid
+            .required_mcp
+            .insert("server".into(), vec!["tool".into(), "tool".into()]);
+        assert!(
+            valid.validate_intent().is_err(),
+            "direct Rust construction remains checked"
+        );
     }
 }

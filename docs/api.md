@@ -164,9 +164,10 @@ channels, and status-preserving presentation fallback are documented in
 `schemas/mcp-registration.json` describes commands and environment names
 without registering anything with a host.
 
-Shared MCP/socket discovery advertises 15 tools: `start`, `resume`, `cancel`,
+Shared MCP/socket discovery advertises 16 tools: `start`, `resume`, `cancel`,
 `steer`, `list_agents`, `answer`, `transcript`, `doc`, `delegation_guide`,
-`limits`, `start_pool`, `pool_post`, `pool_replace`, `pool`, and `list_pools`.
+`limits`, `start_pool`, `pool_post`, `pool_replace`, `pool`, `list_pools`, and
+`agent_integration`.
 `models` and `capacity_order` remain call-only compatibility methods in the
 same registry/dispatcher; their original structured CLI/socket responses and
 schema-1 behavior remain available, including direct MCP calls by known name.
@@ -214,6 +215,50 @@ satisfy isolation requirements. Unknown or duplicate names are invalid. The
 effective requirement is the union of the role's `required_constraints` and the
 request's, for every profile kind; a caller can add a boundary but no role or
 request can drop one the other declared.
+
+`start.required_mcp` optionally asserts the already resolved MCP selection:
+`{"agent-pool":["pool_join","pool_read"]}`. It accepts at most eight configured
+server names and 32 exact unprefixed tool names per server. Names use the existing
+1–128-byte ASCII config/tool grammar; duplicate keys/tools, wildcards and null
+are invalid. An empty tool list requires that server to be selected. Each named
+tool must fit the frozen role/global cap; an unrestricted cap permits any exact
+tool assertion, while an empty cap permits none. This check runs before durable
+admission or reservation and never selects/injects a server or widens authority.
+It does not prove tool liveness. Map and tool order are canonical; omitted and
+empty maps have the historical request fingerprint. Exact retained start replay
+can succeed after the canonical workdir disappears, without consulting new
+configuration or launching another worker. New starts still require live paths.
+
+`agent_integration` accepts only `{"agent_id":"...","sequence":1}`. Sequence
+is an optional positive u32 execution receipt; omission pins latest once and an
+explicit sequence selects exactly that retained execution. Null, zero and unknown
+fields are invalid. Missing executions return `AgentNotFound`. The response is
+`{"schema_version":1,"agent":AgentView,"communication":...}` with one of:
+
+- `{"state":"observed","address":"canonical Bridge address","sampled_at_ms":1}`;
+- `{"state":"unknown","reason":"not_started|unavailable|identity_changed|terminal|closing|cancelled"}`;
+- `{"state":"unsupported","reason":"unsupported_harness|legacy_completion|restricted_role|observer_unconfigured|observer_forbidden"}`.
+
+Each reason is one literal code, not the pipe-separated list. The stable agent
+view retains lifecycle, completion, cleanup and frozen MCP selection; its cleanup
+process-group ID is null on this privacy-preserving surface. No native session,
+store, PID, process token, full birth time or credentials are added. Storage and
+integrity errors remain typed errors rather than fabricated observations.
+
+Observation requires a current owned explicit-finish attempt and unchanged
+supervisor/native process tokens and full-precision births before and after the
+Bridge SDK lookup. The supervisor records actual launch storage; the adapter
+records the session on its exact attempt. Parent notification bindings never
+identify workers. Restricted research/IPC roles, closing, cancelled and terminal
+executions cannot yield an address. A busy observed worker is not necessarily
+idle, addressable later, or enrolled in any service.
+
+Set `delivery.bridge.observation_token_file` to a separate absolute protected
+credential file explicitly granted Bridge `host_observations`, recipients and
+native scopes. Its file must differ from `delivery.bridge.token_file`; omission
+does not borrow delivery authority. The Bridge-configured harness namespace owns
+the returned address, independently of the parent delivery namespace. This read
+is operator/service-only and absent from worker capabilities.
 
 `request_id` replay is scoped to the caller namespace in the original request.
 A later PostToolUse notification binding does not change that identity. Clients

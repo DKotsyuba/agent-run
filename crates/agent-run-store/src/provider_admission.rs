@@ -197,10 +197,29 @@ impl Store<'_> {
     /// Persists the inspected child leader identity immediately after spawn,
     /// before the supervisor can mark the agent running.
     pub fn provider_process(&self, id: &AgentId, attempt: &str, leader: &Identity) -> Result<()> {
+        self.provider_process_evidence(id, attempt, leader, None)
+    }
+
+    /// Atomically anchors the leader and optional actual native store before running.
+    /// Only supervisor operations supply evidence; session is observed separately.
+    /// An existing identity, foreign attempt or prepopulated session refuses.
+    pub fn provider_process_evidence(
+        &self,
+        id: &AgentId,
+        attempt: &str,
+        leader: &Identity,
+        integration: Option<&agent_run_domain::integration::NativeIntegration>,
+    ) -> Result<()> {
+        if let Some(evidence) = integration {
+            evidence.validate()?;
+            if evidence.session.is_some() {
+                return Err(invalid("native session must be observed by the adapter"));
+            }
+        }
         let changed = self.conn.execute(
-            "UPDATE attempts SET process_identity=?,process_birth_time=? \
+            "UPDATE attempts SET process_identity=?,process_birth_time=?,session_facts_json=? \
              WHERE id=? AND agent_id=? AND ownership_active=1 AND phase='spawning' AND process_identity IS NULL",
-            params![leader.token, leader.birth, attempt, id.as_str()],
+            params![leader.token, leader.birth, integration.map(serde_json::to_string).transpose()?, attempt, id.as_str()],
         )?;
         if changed != 1 {
             return Err(Error::Conflict);
