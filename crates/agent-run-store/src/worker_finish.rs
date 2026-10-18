@@ -161,12 +161,17 @@ impl Store<'_> {
         if !row.request.explicit_finish {
             return Ok(());
         }
-        self.conn.execute(
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
+        let changed = self.conn.execute(
             "INSERT INTO worker_lifecycle(attempt_id,phase,transition_at) \
             SELECT id,'running',? FROM attempts WHERE id=? AND agent_id=? AND ownership_active=1 \
             ON CONFLICT(attempt_id) DO NOTHING",
             params![at, attempt, run.as_str()],
         )?;
+        if changed != 0 {
+            self.begin_worker_health(run, attempt, at)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 

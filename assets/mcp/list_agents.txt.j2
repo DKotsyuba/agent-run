@@ -14,6 +14,9 @@ agent-run agents: {{ returned }} of {{ total }} matching (offset {{ offset }})
 {% if agent.tool_counts %}
   tools: {{ agent.tool_counts }}
 {% endif %}
+{% if agent.health %}
+  health: {{ agent.health }}
+{% endif %}
 {% if agent.failure_kind %}
   failure: {{ agent.failure_kind }}{% if agent.failure_text %}: {{ agent.failure_text }}{% endif %}{{ "" }}
 {% endif %}

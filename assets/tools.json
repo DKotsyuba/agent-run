@@ -139,6 +139,16 @@
           "type": "boolean",
           "default": true,
           "description": "New admissions default to explicit callback completion: turn completion waits for events; only private finish ends the run. False selects legacy compatibility. No lifetime timeout."
+        },
+        "idle_ping": {
+          "type": "string",
+          "enum": [
+            "off",
+            "observe",
+            "recover"
+          ],
+          "default": "observe",
+          "description": "Frozen health policy: observe invokes no model; recover permits one model control turn per task-progress episode; off preserves explicit holds. No automatic cancellation."
         }
       },
       "required": [
@@ -503,7 +513,8 @@
     "description": "Diagnose stored quota windows, percentages, resets and freshness plus ranked provider/model standing, numeric priorities and provider multipliers from one committed snapshot. Unknown or stale capacity remains explicit; no collection or model turn is started. MCP text omits private account and pool identities. Schema 1 retains its historical quota-window response.",
     "inputSchema": {
       "additionalProperties": false,
-      "properties": {},
+      "properties": {
+      },
       "type": "object"
     },
     "name": "limits",
@@ -705,6 +716,16 @@
                     "type": "boolean",
                     "default": true,
                     "description": "New admissions default to explicit callback completion: turn completion waits for events; only private finish ends the run. False selects legacy compatibility. No lifetime timeout."
+                  },
+                  "idle_ping": {
+                    "type": "string",
+                    "enum": [
+                      "off",
+                      "observe",
+                      "recover"
+                    ],
+                    "default": "observe",
+                    "description": "Frozen health policy: observe invokes no model; recover permits one model control turn per task-progress episode; off preserves explicit holds. No automatic cancellation."
                   }
                 },
                 "required": [
@@ -898,6 +919,16 @@
                   "type": "boolean",
                   "default": true,
                   "description": "New admissions default to explicit callback completion: turn completion waits for events; only private finish ends the run. False selects legacy compatibility. No lifetime timeout."
+                },
+                "idle_ping": {
+                  "type": "string",
+                  "enum": [
+                    "off",
+                    "observe",
+                    "recover"
+                  ],
+                  "default": "observe",
+                  "description": "Frozen health policy: observe invokes no model; recover permits one model control turn per task-progress episode; off preserves explicit holds. No automatic cancellation."
                 }
               },
               "required": [
@@ -1007,7 +1038,9 @@
           "default": 0
         }
       },
-      "required": [],
+      "required": [
+
+      ],
       "type": "object"
     },
     "outputSchema": null,

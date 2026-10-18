@@ -1504,3 +1504,29 @@ pub struct CaptureIncident {
     /// Projection.
     pub projection: IncidentProjection,
 }
+
+/// 93 — reconcile one exact current attempt's bounded health checks (broker only).
+#[derive(Debug, Clone, Serialize)]
+pub struct HealthTick {
+    /// Consistent, bounded read facts prepared outside the sole writer.
+    pub facts: crate::health::HealthFacts,
+    /// Exact execution selected before enqueue; attempt/phase are rechecked in SQL.
+    pub execution: AgentId,
+    /// Finite nonnegative observation time in Unix seconds.
+    pub at: f64,
+}
+
+/// 94 — authenticate one model probe reply through the existing worker capability.
+#[derive(Debug, Clone, Serialize)]
+pub struct AcceptHealthReply {
+    /// Exact execution, never an implicitly resolved latest run.
+    pub execution: AgentId,
+    /// Exact active attempt carrying the challenge.
+    pub attempt: String,
+    /// Ephemeral private capability, never stored verbatim or logged.
+    pub token: String,
+    /// Closed bounded response; no arbitrary prose or credentials.
+    pub input: agent_run_domain::health::PingReply,
+    /// Finite nonnegative observation time in Unix seconds.
+    pub at: f64,
+}

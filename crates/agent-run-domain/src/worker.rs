@@ -14,7 +14,7 @@ pub const CATALOG_METHOD: &str = "worker/catalog";
 /// The reviewed version of the five-tool private pool-capable server contract.
 pub const POOL_CATALOG_VERSION: u32 = 1;
 /// Reviewed explicit-completion catalog; legacy pool/research catalogs stay v1.
-pub const FINISH_CATALOG_VERSION: u32 = 2;
+pub const FINISH_CATALOG_VERSION: u32 = 3;
 
 /// Fingerprints the actual embedded private catalog served by this binary.
 /// The digest includes schemas/effect hints, not runtime capability material.
@@ -135,7 +135,7 @@ pub struct FinishReceipt {
     pub duplicate: bool,
 }
 
-/// Adds completion only for an explicitly admitted worker. Legacy catalog
+/// Adds completion and the bounded health reply for an explicit worker. Legacy catalog
 /// bytes and digest stay unchanged; research retains its confined report tool.
 pub fn finish_tools_json(research: bool) -> Vec<Value> {
     let mut tools = if research {
@@ -159,6 +159,16 @@ pub fn finish_tools_json(research: bool) -> Vec<Value> {
         }
     }
     tools.push(serde_json::json!({
+        "name":"health_reply",
+        "description":"Reply once to an exact agent-run/health-ping challenge using its ping_id and your current working, waiting or blocked state. The broker verifies actual task activity independently. This reply does not finish the task, create waiting work, change permissions or authorize cancellation. Continue the original task when possible; use finish only for its true final outcome.",
+        "annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},
+        "inputSchema":{"type":"object","additionalProperties":false,"required":["ping_id","state"],"properties":{
+            "ping_id":{"type":"string","pattern":"^[0-9a-f]{64}$"},
+            "state":{"type":"string","enum":["working","waiting","blocked"]}
+        }}
+    }));
+    tools.push(serde_json::json!({
+
         "name":"finish",
         "description":"End your current run with its final verified summary. Ending a turn only waits for notifications; it does not finish. Call only when done, blocked or failed. The summary is immutable. Retry exactly the same payload after an uncertain receipt; a different payload conflicts. The receipt acknowledges durable finish intent, not process cleanup or owner approval. Never include credentials.",
         "annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},
@@ -201,6 +211,14 @@ pub fn research_catalog_digest() -> String {
 pub fn known_pool_catalog(version: u32, digest: &str) -> bool {
     (version == POOL_CATALOG_VERSION
         && (digest == pool_catalog_digest() || digest == research_catalog_digest()))
+        || (version == 2
+            && [false, true].into_iter().any(|research| {
+                let old: Vec<_> = finish_tools_json(research)
+                    .into_iter()
+                    .filter(|tool| tool["name"] != "health_reply")
+                    .collect();
+                crate::canonical::sha256_hex(&serde_json::json!(old), true) == digest
+            }))
         || (version == FINISH_CATALOG_VERSION
             && (digest == finish_catalog_digest(false) || digest == finish_catalog_digest(true)))
 }
@@ -385,6 +403,8 @@ pub const TOOL_METHOD: &str = "worker/call";
 pub enum WorkerTool {
     /// Declare this attempt's immutable final summary through its private capability.
     Finish,
+    /// Answer only a current attempt-owned liveness challenge.
+    HealthReply,
     /// Report a material finding to this run's orchestrator.
     Notify,
     /// Atomically save a report within frozen research workdir authority.
@@ -404,6 +424,7 @@ impl WorkerTool {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Finish => "finish",
+            Self::HealthReply => "health_reply",
             Self::Notify => "notify_orchestrator",
             Self::SaveReport => "save_report",
             Self::PoolPost => "pool_post",
@@ -417,6 +438,7 @@ impl WorkerTool {
     pub fn parse(name: &str) -> Option<Self> {
         [
             (Self::Finish.as_str(), Self::Finish),
+            (Self::HealthReply.as_str(), Self::HealthReply),
             (Self::Notify.as_str(), Self::Notify),
             (Self::SaveReport.as_str(), Self::SaveReport),
             (Self::PoolPost.as_str(), Self::PoolPost),

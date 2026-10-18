@@ -830,6 +830,11 @@ async fn run_native(
             else {
                 break;
             };
+            if crate::health::command(process, store, &record.id, (id, &kind, &payload), idle)
+                .await?
+            {
+                continue;
+            }
             if kind == "cancel" {
                 process
                     .observing(store.event(
@@ -876,6 +881,32 @@ async fn run_native(
                     .await?;
                 continue;
             };
+            if payload.get("health_ping").is_some() {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                let ready = process
+                    .observing(async {
+                        Ok::<bool, crate::Error>(idle_now(&client, &session, deadline).await)
+                    })
+                    .await?;
+                if !ready
+                    || !store.health_command_current(
+                        &record.id,
+                        &payload,
+                        true,
+                        crate::domain::now(),
+                    )?
+                {
+                    process
+                        .observing(store.complete_command(
+                            &record.id,
+                            id,
+                            &json!({"accepted":false,"reason":"native_not_idle"}),
+                        ))
+                        .await?;
+                    idle = false;
+                    continue;
+                }
+            }
             let message_id = format!(
                 "msg_{}",
                 &crate::fs::sha256(format!("{}:{id}", record.id).as_bytes())[..32]

@@ -215,6 +215,8 @@ inventory! {
     90 RemoveRuntimeLayout "remove_runtime_layout" L B n;
     91 CaptureIncident "capture_incident" L B n;
     92 PrepareBridgeDelivery "prepare_bridge_delivery" R N n;
+    93 HealthTick "health_tick" L B y;
+    94 AcceptHealthReply "accept_health_reply" L N y;
 }
 
 /// Seals one payload and binds it to its inventory row and typed output.
@@ -276,6 +278,8 @@ op! {
     PersistRunStats => ();
     RegisterWorkerCatalog => ();
     AcceptWorkerFinish => agent_run_domain::worker::FinishReceipt;
+    HealthTick => bool;
+    AcceptHealthReply => bool;
     NotifyOrchestrator => agent_run_domain::worker::NotifyReceipt;
     PoolWrite => PoolOutcome<PoolWriteOutput>;
     PoolOperatorPost => PoolOutcome<PoolWriteOutput>;
@@ -413,7 +417,7 @@ op_enum! {
 
 op_enum! {
     /// Broker-only operations, constructed in-process and never decodable
-    /// from a request frame. Rows 44-47 require an explicit `Worker`
+    /// from a request frame. Rows 44-47 and 94 require an explicit `Worker`
     /// authority; all others require `Broker`.
     #[derive(Clone, Serialize)]
     pub enum LocalOp {
@@ -430,6 +434,8 @@ op_enum! {
         SetOwner,
         RegisterWorkerCatalog,
         AcceptWorkerFinish,
+        HealthTick,
+        AcceptHealthReply,
         NotifyOrchestrator,
         PoolWrite,
         PoolOperatorPost,
@@ -519,6 +525,7 @@ impl OpKindRef {
         match self {
             Self::RegisterWorkerCatalog
             | Self::AcceptWorkerFinish
+            | Self::AcceptHealthReply
             | Self::NotifyOrchestrator
             | Self::PoolWrite => matches!(authority, A::Worker { .. }),
             kind if !kind.is_remote() => broker,

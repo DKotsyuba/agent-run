@@ -317,6 +317,12 @@ pub struct StartRequest {
     /// Omitted/false preserves historical request bytes and legacy behavior.
     #[serde(default, skip_serializing_if = "crate::worker::legacy_completion")]
     pub explicit_finish: bool,
+    /// Frozen health policy; recover explicitly authorizes bounded model probes.
+    #[serde(
+        default = "crate::health::observe",
+        skip_serializing_if = "crate::health::PingPolicy::is_observe"
+    )]
+    pub idle_ping: crate::health::PingPolicy,
     #[serde(default)]
     pub effort: Option<String>,
     /// Optional human display label for the agent; normalized in place by
@@ -379,6 +385,9 @@ impl StartRequest {
             nonblank(name, s)?;
         }
         task_text(&self.task)?;
+        if self.idle_ping == crate::health::PingPolicy::Recover && !self.explicit_finish {
+            return Err(invalid("recover ping requires explicit finish"));
+        }
         for (name, s) in [("effort", &self.effort), ("account", &self.account)] {
             if let Some(s) = s {
                 nonblank(name, s)?;

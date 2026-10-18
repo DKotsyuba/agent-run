@@ -9,6 +9,7 @@ fn python_doc_topics_are_embedded_and_bounded() {
     for topic in [
         "index",
         "completion",
+        "idle-ping",
         "config",
         "skills",
         "mcp-servers",

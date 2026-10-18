@@ -11,6 +11,8 @@ pub mod diagnostics;
 /// Fenced raw store access for tests (feature `test-fixtures` only).
 #[cfg(feature = "test-fixtures")]
 pub mod fixture;
+/// Attempt-owned liveness and bounded model recovery probes.
+pub mod health;
 /// Bounded, content-free incident phases independent of expirable history.
 pub mod incidents;
 /// Durable append-only journal operations and bounded transcript spooling.

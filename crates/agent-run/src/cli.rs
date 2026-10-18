@@ -593,6 +593,9 @@ pub struct Start {
     /// Callback completion is the default; false selects legacy compatibility.
     #[arg(long, action=clap::ArgAction::Set, num_args=0..=1, default_value="true", default_missing_value="true")]
     pub explicit_finish: bool,
+    /// Observe without inference, opt into bounded model recovery, or pause probes.
+    #[arg(long, value_parser = ["off", "observe", "recover"], default_value = "observe")]
+    pub idle_ping: String,
     /// Compatibility only: complete on the native result instead of finish.
     #[arg(long, conflicts_with = "explicit_finish")]
     pub legacy_completion: bool,
@@ -1565,6 +1568,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                     "write": a.write,
                     "fast": a.fast,
                     "explicit_finish": a.explicit_finish && !a.legacy_completion,
+                    "idle_ping": a.idle_ping,
                     "effort": a.effort,
                     "read_roots": read_roots,
                     "output_schema": schema,

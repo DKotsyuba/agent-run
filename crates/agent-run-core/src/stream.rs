@@ -686,11 +686,26 @@ pub async fn run(
                 if tokio::time::Instant::now() >= deadline {
                     break;
                 }
-                let Some((cid, command, payload)) =
-                    process.observing(store.claim_command(&record.id)).await?
+                let Some((cid, command, payload)) = process
+                    .observing(store.claim_command_for_turn(
+                        &record.id,
+                        !record.request.explicit_finish || native_idle,
+                    ))
+                    .await?
                 else {
                     break;
                 };
+                if crate::health::command(
+                    process,
+                    store,
+                    &record.id,
+                    (cid, &command, &payload),
+                    native_idle,
+                )
+                .await?
+                {
+                    continue;
+                }
                 if command == "cancel" {
                     process
                         .observing(store.complete_command(

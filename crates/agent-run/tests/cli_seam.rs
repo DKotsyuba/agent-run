@@ -1465,6 +1465,7 @@ async fn test_transcript_text_pipe_receives_fragments_before_the_agent_finishes(
         display_name: None,
         read_roots: vec![],
         explicit_finish: false,
+        idle_ping: Default::default(),
         output_schema: None,
         orchestrator: None,
         request_id: None,

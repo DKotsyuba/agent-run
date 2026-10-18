@@ -845,3 +845,85 @@ fn long_rpc_ids_are_rejected_before_tool_dispatch() {
     stopped.store(true, Ordering::SeqCst);
     broker.join().unwrap();
 }
+
+/// The same health reason is readable through the actual CLI, Unix socket and
+/// stdio MCP processes; initialization/discovery never starts a model turn.
+#[test]
+fn health_attention_survives_cli_socket_and_mcp() {
+    let mut harness = Harness::new();
+    let id: agent_run_domain::domain::AgentId = "ag-20261018-000000-0123456789".parse().unwrap();
+    {
+        let mut store = agent_run_store::fixture::open(&harness.home).unwrap();
+        let me = agent_run_platform::process::inspect(std::process::id() as i32).unwrap();
+        let request = json!({"runtime":"codex","model":"fixture","profile":"review","task":"fixture only","workdir":harness.home,"explicit_finish":true,"idle_ping":"observe"});
+        store.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id,supervisor_pid,supervisor_identity,supervisor_birth_time) VALUES(?,'codex','fixture','review','fixture only','fixture only',?,?,'running',100,'fixture',?,?,?,?)",rusqlite::params![id.as_str(),harness.home.to_str().unwrap(),request.to_string(),id.as_str(),me.pid,me.token,me.birth]).unwrap();
+        store.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES('attempt',?,1,'running','{}',100,1)",[id.as_str()]).unwrap();
+        let token = "a".repeat(64);
+        store
+            .issue_worker_capability(&id, "attempt", &token, 100.0)
+            .unwrap();
+        store
+            .register_worker_catalog(
+                &agent_run_domain::worker::WorkerCatalogProof {
+                    run_id: id.clone(),
+                    attempt_id: "attempt".into(),
+                    token,
+                    version: agent_run_domain::worker::FINISH_CATALOG_VERSION,
+                    digest: agent_run_domain::worker::finish_catalog_digest(false),
+                },
+                100.0,
+            )
+            .unwrap();
+        store.conn.execute("INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES(?,'attempt',100,'native_tool_observer_v1','{}')",[id.as_str()]).unwrap();
+        store.begin_worker_lifecycle(&id, "attempt", 100.0).unwrap();
+        store.worker_turn(&id, true, 101.0).unwrap();
+        store
+            .health_tick(&id, agent_run_domain::domain::now())
+            .unwrap();
+    }
+    harness.start_broker();
+    let cli = Command::new(env!("CARGO_BIN_EXE_agent-run"))
+        .arg("--home")
+        .arg(&harness.home)
+        .args(["agents", "--active", "--limit", "20"])
+        .output()
+        .unwrap();
+    assert!(
+        cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let page: Value = serde_json::from_slice(&cli.stdout).unwrap();
+    assert_eq!(
+        page["items"][0]["health"]["reason"],
+        "idle_without_wait_source"
+    );
+    let mut socket =
+        std::os::unix::net::UnixStream::connect(harness.home.join("api.sock")).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    writeln!(
+        socket,
+        "{}",
+        json!({"jsonrpc":"2.0","id":1,"method":"list_agents","params":{"active":true,"limit":20}})
+    )
+    .unwrap();
+    let mut line = String::new();
+    BufReader::new(socket).read_line(&mut line).unwrap();
+    let response: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(
+        response["result"]["items"][0]["health"]["reason"],
+        "idle_without_wait_source"
+    );
+    let mut mcp = harness.mcp();
+    let init = mcp.send(initialize("2025-06-18")).unwrap();
+    assert_eq!(init["result"]["serverInfo"]["name"], "agent-run");
+    mcp.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    let reply=mcp.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_agents","arguments":{"active":true,"limit":20}}})).unwrap();
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("health: needs_attention: idle_without_wait_source"),
+        "{text}"
+    );
+}

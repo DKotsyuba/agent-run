@@ -1447,7 +1447,7 @@ impl Service {
     /// Runs one read-only store job off the async executor under the bounded
     /// read allowance. A contended database ends the job with a typed busy
     /// error instead of holding an executor thread.
-    async fn read<T: Send + 'static>(
+    pub(crate) async fn read<T: Send + 'static>(
         &self,
         job: impl FnOnce(&StoreReader) -> Result<T> + Send + 'static,
     ) -> Result<T> {
@@ -2128,6 +2128,9 @@ impl Service {
             view["completion_mode"] = json!("explicit_finish");
             view["turn_count"] = lifecycle["turn_count"].clone();
             view["idle_seconds"] = lifecycle["idle_seconds"].clone();
+        }
+        if let Some(health) = store.health_view(&row.id)? {
+            view["health"] = health;
         }
         let mcp = agent_run_store::projections::selected_mcp(row.identity.as_ref());
         if !mcp.is_empty() {

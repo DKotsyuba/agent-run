@@ -295,6 +295,25 @@ async fn worker_tool_call(
         Ok(json!({"error": {"code": denial.code(), "message": denial.message()}}))
     };
     match tool {
+        WorkerTool::HealthReply => {
+            let input: agent_run_domain::health::PingReply = serde_json::from_value(call.input)
+                .map_err(|_| invalid("invalid health reply arguments"))?;
+            let duplicate = service
+                .lane("workers")?
+                .local_as(
+                    worker_authority(&call.run_id, &call.attempt_id),
+                    agent_run_store::ops::AcceptHealthReply {
+                        execution: call.run_id,
+                        attempt: call.attempt_id,
+                        token: call.token,
+                        input,
+                        at: crate::domain::now(),
+                    },
+                    BROKER_BUDGET,
+                )
+                .await?;
+            Ok(json!({"accepted":true,"duplicate":duplicate}))
+        }
         WorkerTool::Finish => {
             let input: agent_run_domain::worker::FinishRequest = serde_json::from_value(call.input)
                 .map_err(|_| invalid("invalid finish arguments"))?;

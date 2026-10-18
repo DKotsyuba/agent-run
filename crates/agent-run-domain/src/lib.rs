@@ -6,6 +6,8 @@ pub mod credential_ref;
 pub mod domain;
 pub mod error;
 pub mod fsm;
+/// Frozen ping policy and private model response contracts.
+pub mod health;
 mod legacy_provider;
 pub mod pool;
 mod provider_connection;

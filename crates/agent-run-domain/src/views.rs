@@ -134,6 +134,9 @@ pub struct McpSelectionView {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentView {
+    /// Content-free current-attempt ping diagnostics; absent on historical/off runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<Value>,
     /// Admitted MCP selections from the sealed role; omitted on historical/empty roles.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp: Vec<McpSelectionView>,

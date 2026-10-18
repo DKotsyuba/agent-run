@@ -59,6 +59,8 @@ pub fn implemented(kind: OpKindRef) -> bool {
             | K::ClaimServiceProcessIdentity
             | K::RegisterWorkerCatalog
             | K::AcceptWorkerFinish
+            | K::HealthTick
+            | K::AcceptHealthReply
             | K::NotifyOrchestrator
             | K::RecordSupervisorLaunch
             | K::RecordStartupOwner
@@ -243,6 +245,8 @@ pub(crate) fn local_facts(op: &LocalOp) -> Facts {
             None,
         ),
         L::AcceptWorkerFinish(op) => (Some(op.execution.clone()), Some(op.attempt.clone()), None),
+        L::AcceptHealthReply(op) => (Some(op.execution.clone()), Some(op.attempt.clone()), None),
+        L::HealthTick(op) => (Some(op.execution.clone()), None, None),
         L::NotifyOrchestrator(op) => (Some(op.execution.clone()), Some(op.attempt.clone()), None),
         L::PoolWrite(op) => (Some(op.execution.clone()), Some(op.attempt.clone()), None),
         L::ReconcileReapedAgent(op) => exec(&op.execution),
@@ -471,6 +475,14 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
             &op.input,
             op.at,
             op.guard,
+        )?),
+        L::HealthTick(op) => out(store.health_tick_prepared(&op.execution, op.at, &op.facts)?),
+        L::AcceptHealthReply(op) => out(store.accept_health_reply(
+            &op.execution,
+            &op.attempt,
+            &op.token,
+            &op.input,
+            op.at,
         )?),
         L::NotifyOrchestrator(op) => out(store.notify_orchestrator(
             &op.execution,

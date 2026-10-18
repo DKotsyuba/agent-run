@@ -983,6 +983,11 @@ pub async fn run(
                 else {
                     break;
                 };
+                if crate::health::command(process, store, &record.id, (cid, &kind, &payload), idle)
+                    .await?
+                {
+                    continue;
+                }
                 if kind == "cancel" {
                     // App-server interruption is advisory.  Once the durable
                     // command is claimed, return to the supervisor so its
