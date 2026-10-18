@@ -60,25 +60,27 @@ async fn guarded<F: std::future::Future>(future: F) -> std::thread::Result<F::Ou
 /// its pong cannot rearm inference, and ordinary cancellation/cleanup still work.
 #[tokio::test]
 async fn stream_service_ping_then_one_correlated_model_turn() {
-    run_native_fixture(false, None, false).await;
+    run_native_fixture(false, None, false, false).await;
 }
 
 /// The original Codex idle case uses a new correlated turn on its existing
 /// app-server thread; a service ping never starts that native turn.
 #[tokio::test]
 async fn codex_service_ping_then_one_correlated_model_turn() {
-    run_native_fixture(true, None, false).await;
+    run_native_fixture(true, None, false, false).await;
 }
 
 /// Shared native fixture ownership, writer, challenge, reply and cleanup proof
 /// for the two supported engine transports. `background=None` exercises ping;
 /// Some(true) exercises an early asynchronous completion, Some(false) its
 /// synchronous negative control. `completion_after_idle` gates completion on
-/// the driver's actual idle observation. No model or provider is invoked.
+/// the driver's actual idle observation. `fulfilled` wraps a background/foreground
+/// pair exactly like Promise.allSettled output. No model or provider is invoked.
 async fn run_native_fixture(
     codex_mode: bool,
     background: Option<bool>,
     completion_after_idle: bool,
+    fulfilled: bool,
 ) {
     let home = common::Home::new();
     let mut req = home.request();
@@ -156,7 +158,13 @@ printf '%s\n' "$unexpected" > unexpected.json
             agent_run_core::codex::Grant::new(&runtime, &row.request, &role, &app_home).unwrap();
         let sessions = app_home.join("sessions");
         let history = sessions.join("fixture.jsonl");
-        codex_fixture(&grant, background, &history, completion_after_idle)
+        codex_fixture(
+            &grant,
+            background,
+            &history,
+            completion_after_idle,
+            fulfilled,
+        )
     } else {
         (script, BTreeMap::new())
     };
@@ -236,6 +244,9 @@ printf '%s\n' "$unexpected" > unexpected.json
                 i64::from(background)
             );
             assert_eq!(store.conn.query_row("SELECT COUNT(*) FROM messages WHERE agent_id=? AND role='tool_result' AND raw_ref='background-job'",[id.as_str()],|r|r.get::<_,i64>(0)).unwrap(),1,"duplicate completion cannot duplicate journal");
+            if fulfilled {
+                assert_eq!(store.conn.query_row("SELECT COUNT(*) FROM messages WHERE agent_id=? AND role='tool_result' AND raw_ref='foreground-job'",[id.as_str()],|r|r.get::<_,i64>(0)).unwrap(),1,"wrapped foreground completion journals once without a wake");
+            }
             service.cancel(&id).await.unwrap();
             return;
         }
@@ -365,12 +376,15 @@ printf '%s\n' "$unexpected" > unexpected.json
 /// `history` names a rollout lazily created on the first turn, as in real Codex;
 /// `completion_after_idle`
 /// waits for the driver's release file after the first real idle boundary.
-/// Returns shell source and environment data; the shell never evaluates env data.
+/// `fulfilled` adds a matched foreground command and groups both returns in
+/// standard Promise result wrappers. Returns shell source and environment data;
+/// the shell never evaluates env data.
 fn codex_fixture(
     grant: &agent_run_core::codex::Grant,
     background: Option<bool>,
     history: &std::path::Path,
     completion_after_idle: bool,
+    fulfilled: bool,
 ) -> (String, BTreeMap<String, String>) {
     let legacy = json!({"model":grant.model,"cwd":grant.cwd,"roots":grant.roots,"writableRoots":grant.writable_roots,"sandbox":grant.sandbox,"approvalPolicy":grant.approval_policy,"threadId":"thread","thread":{"path":history}});
     let modern = json!({"model":grant.model,"cwd":grant.cwd,"runtimeWorkspaceRoots":grant.roots,"sandbox":{"type":"readOnly","networkAccess":grant.network_access},"approvalPolicy":grant.approval_policy,"activePermissionProfile":{"id":grant.permission_profile.as_deref().unwrap_or(":read-only")},"threadId":"thread","thread":{"path":history}});
@@ -400,7 +414,19 @@ fn codex_fixture(
         } else {
             result["exit_code"] = json!(0);
         }
-        environment.insert("RETURNED".into(), json!({"type":"response_item","payload":{"type":"custom_tool_call_output","internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"},"output":[{"type":"input_text","text":result.to_string()}]}}).to_string());
+        let returned = if fulfilled {
+            let foreground = json!({"chunk_id":"foreground","wall_time_seconds":0.2,"exit_code":0,"original_token_count":1,"output":"FOREGROUND_INLINE"});
+            environment.insert("FG_STARTED".into(), json!({"method":"item/started","params":{"threadId":"thread","turnId":"turn-1","item":{"type":"commandExecution","id":"foreground-job","processId":"86310","status":"inProgress"}}}).to_string());
+            environment.insert("FG_COMPLETED".into(), json!({"method":"item/completed","params":{"threadId":"thread","turnId":"turn-1","item":{"type":"commandExecution","id":"foreground-job","processId":"86310","status":"completed","exitCode":0,"aggregatedOutput":"FOREGROUND_INLINE"}}}).to_string());
+            json!([
+                {"type":"input_text","text":"Script completed\nOutput:\n"},
+                {"type":"input_text","text":json!({"status":"fulfilled","value":result}).to_string()},
+                {"type":"input_text","text":json!({"status":"fulfilled","value":foreground}).to_string()}
+            ])
+        } else {
+            json!([{"type":"input_text","text":result.to_string()}])
+        };
+        environment.insert("RETURNED".into(), json!({"type":"response_item","payload":{"type":"custom_tool_call_output","internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"},"output":returned}}).to_string());
         environment.insert("JOB_STARTED".into(),json!({"method":"item/started","params":{"threadId":"thread","turnId":"turn-1","item":{"type":"commandExecution","id":"background-job","status":"inProgress"}}}).to_string());
         environment.insert("JOB_COMPLETED".into(),json!({"method":"item/completed","params":{"threadId":"thread","turnId":"turn-1","item":item}}).to_string());
     }
@@ -425,7 +451,9 @@ if test "$turns" -gt 1; then printf '%s\n' "$line" > wake.json; fi
 printf '{"id":%s,"result":{"turn":{"id":"turn-%s"}}}\n' "$id" "$turns"
 if test "$turns" -eq 1 && test -n "$JOB_STARTED"; then
 printf '%s\n' "$JOB_STARTED"
+if test -n "$FG_STARTED"; then printf '%s\n' "$FG_STARTED"; fi
 if test "$COMPLETE_LATE" = no; then printf '%s\n' "$JOB_COMPLETED" "$JOB_COMPLETED"; fi
+if test -n "$FG_COMPLETED"; then printf '%s\n' "$FG_COMPLETED" "$FG_COMPLETED"; fi
 printf '%s\n' "$RETURNED" >> "$HISTORY"
 printf '%s\n' '{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}' >> "$HISTORY"
 fi
@@ -448,27 +476,38 @@ done"#;
 /// create a redundant turn. All paths retain exact process cleanup.
 #[tokio::test]
 async fn codex_background_completion_before_idle_wakes_once() {
-    run_native_fixture(true, Some(true), false).await;
-    run_native_fixture(true, Some(false), false).await;
+    run_native_fixture(true, Some(true), false, false).await;
+    run_native_fixture(true, Some(false), false, false).await;
 }
 
 /// A terminal command already returned inline must not create another model
 /// turn merely because its native completion retains a PTY process identifier.
 #[tokio::test]
 async fn codex_foreground_with_process_id_does_not_wake() {
-    run_native_fixture(true, Some(false), false).await;
+    run_native_fixture(true, Some(false), false, false).await;
 }
 
 /// A real pending return still wakes exactly once when completion follows the
 /// observed idle boundary; replayed native terminal frames do not add turns.
 #[tokio::test]
 async fn codex_background_completion_after_idle_wakes_once() {
-    run_native_fixture(true, Some(true), true).await;
+    run_native_fixture(true, Some(true), true, false).await;
 }
 
 /// A delayed native terminal frame is not a new result if the command returned
 /// its final output inline before the observed native inference turn ended.
 #[tokio::test]
 async fn codex_foreground_completion_after_idle_does_not_wake() {
-    run_native_fixture(true, Some(false), true).await;
+    run_native_fixture(true, Some(false), true, false).await;
+}
+
+/// The real reported shape has a fulfilled pending background return alongside
+/// a fulfilled terminal foreground return. Early and late completion each wake
+/// once; wrapped foreground-only cases never add a turn, including duplicates.
+#[tokio::test]
+async fn codex_fulfilled_background_completions_wake_once() {
+    for late in [false, true] {
+        run_native_fixture(true, Some(true), late, true).await;
+        run_native_fixture(true, Some(false), late, true).await;
+    }
 }

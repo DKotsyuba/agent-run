@@ -261,12 +261,10 @@ fn optional_file(directory: &Dir, relative: &Path) -> Result<Option<File>> {
     }
 }
 
-/// Extracts only complete structured command-return envelopes, not stdout text.
-/// Code-mode content blocks and direct JSON tool returns use the same shape.
-/// A nonempty chunk, nonnegative timings/token count, output string and pending
-/// session_id without any exit_code are required. Malformed/terminal envelopes
-/// are not evidence. This does not grant authority: the caller must still match
-/// the process handle, native thread, origin turn and owned started item.
+/// Extracts complete structured native returns, including outer batches and
+/// standard fulfilled Promise results. Preamble, rejected results and opaque
+/// stdout remain non-evidence. The caller still verifies the exact owned native
+/// thread, origin turn, process and started item before a handle can wake.
 fn pending_handles(output: &Value) -> Vec<String> {
     let texts = match output {
         Value::String(text) => vec![text.as_str()],
@@ -280,27 +278,54 @@ fn pending_handles(output: &Value) -> Vec<String> {
             .collect(),
         _ => Vec::new(),
     };
-    texts
-        .into_iter()
-        .filter_map(|text| {
-            let value: Value = serde_json::from_str(text).ok()?;
-            if value.get("exit_code").is_some()
-                || value["chunk_id"].as_str().is_none_or(str::is_empty)
-                || value["wall_time_seconds"]
-                    .as_f64()
-                    .is_none_or(|n| n < 0.0 || !n.is_finite())
-                || value["original_token_count"].as_u64().is_none()
-                || value["output"].as_str().is_none()
-            {
-                return None;
-            }
-            let handle = value["session_id"]
-                .as_u64()
-                .map(|id| id.to_string())
-                .or_else(|| value["session_id"].as_str().map(str::to_owned))?;
-            (!handle.is_empty() && handle.len() <= 256).then_some(handle)
-        })
-        .collect()
+    let mut handles = Vec::new();
+    for text in texts {
+        if let Ok(value) = serde_json::from_str::<Value>(text) {
+            collect_pending_handles(&value, &mut handles);
+        }
+    }
+    handles
+}
+
+/// Visits only outer arrays and exact `{status:"fulfilled", value:...}` wrappers
+/// in one parsed native return. JSON parsing already bounds nesting and the
+/// observer bounds row bytes and total retained evidence. Arbitrary map fields,
+/// strings and native stdout are never recursively decoded. Terminal/malformed
+/// envelopes add nothing; valid pending handles retain the original 256-byte cap.
+fn collect_pending_handles(value: &Value, handles: &mut Vec<String>) {
+    if let Some(items) = value.as_array() {
+        for item in items {
+            collect_pending_handles(item, handles);
+        }
+        return;
+    }
+    if value["status"] == "fulfilled"
+        && value.as_object().is_some_and(|fields| fields.len() == 2)
+        && let Some(inner) = value.get("value")
+    {
+        collect_pending_handles(inner, handles);
+        return;
+    }
+    if value.get("exit_code").is_some()
+        || value["chunk_id"].as_str().is_none_or(str::is_empty)
+        || value["wall_time_seconds"]
+            .as_f64()
+            .is_none_or(|n| n < 0.0 || !n.is_finite())
+        || value["original_token_count"].as_u64().is_none()
+        || value["output"].as_str().is_none()
+    {
+        return;
+    }
+    let Some(handle) = value["session_id"]
+        .as_u64()
+        .map(|id| id.to_string())
+        .or_else(|| value["session_id"].as_str().map(str::to_owned))
+    else {
+        return;
+    };
+    if !handle.is_empty() && handle.len() <= 256 {
+        handles.push(handle);
+    }
 }
 
 /// Regression evidence for bounded native return parsing and admission fences.
@@ -342,6 +367,56 @@ mod tests {
         .unwrap();
         let response = json!({"thread":{"path":path}});
         (home, path, response)
+    }
+
+    /// Code-mode Promise.allSettled output retains a pending background handle,
+    /// including a batch next to an inline foreground result. Native preamble
+    /// text is not a result; grouping must not turn terminal output into a wake.
+    #[test]
+    fn fulfilled_and_batched_native_returns_are_evidence() {
+        let background = json!({"status":"fulfilled","value":pending()});
+        let mut terminal = pending();
+        terminal["exit_code"] = json!(0);
+        let foreground = json!({"status":"fulfilled","value":terminal});
+        assert_eq!(pending_handles(&output(&pending())), ["42"]);
+        assert_eq!(pending_handles(&output(&background)), ["42"]);
+        assert_eq!(
+            pending_handles(&output(&json!([background.clone(), foreground.clone()]))),
+            ["42"]
+        );
+        assert_eq!(
+            pending_handles(&json!([
+                {"type":"input_text","text":"Script completed\nOutput:\n"},
+                {"type":"input_text","text":background.to_string()},
+                {"type":"input_text","text":foreground.to_string()}
+            ])),
+            ["42"]
+        );
+        assert!(pending_handles(&output(&foreground)).is_empty());
+    }
+
+    /// Grouping does not grant rejected, terminal, malformed or opaque stdout
+    /// data authority, and mixed wrapper/terminal objects cannot hide exit_code.
+    #[test]
+    fn wrapped_returns_preserve_rejection_boundaries() {
+        let mut terminal = pending();
+        terminal["exit_code"] = json!(0);
+        for value in [
+            json!({"status":"fulfilled","value":terminal}),
+            json!({"status":"rejected","reason":pending()}),
+            json!({"status":"rejected","value":pending()}),
+            json!({"status":"fulfilled","value":pending().to_string()}),
+            json!({"status":"fulfilled","value":pending(),"exit_code":0}),
+            json!({"arbitrary":[pending()]}),
+            json!({"chunk_id":"c","wall_time_seconds":0.1,"original_token_count":0,"exit_code":0,"output":pending().to_string()}),
+        ] {
+            assert!(pending_handles(&output(&json!([value]))).is_empty());
+        }
+        let mut too_deep = pending();
+        for _ in 0..140 {
+            too_deep = json!({"status":"fulfilled","value":too_deep});
+        }
+        assert!(pending_handles(&output(&too_deep)).is_empty());
     }
 
     /// Terminal, malformed and stdout-injected handles cannot create wait proof.
