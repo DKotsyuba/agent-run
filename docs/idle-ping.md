@@ -128,8 +128,8 @@ home, through no-follow regular-file descriptors. Lazy file creation is retried
 without skipping the first return. It skips pre-admission history,
 checks session identity, retains partial JSONL rows, and consumes at most64KiB
 per existing supervisor pass. Each row is bounded to4MiB and handle evidence
-to4096entries. It parses native tool-return envelopes, never JSON embedded in
-stdout. The same path covers fresh threads and resumed native sessions; it does
-not enable experimental raw events or change permissions. Missing, malformed,
+to4096entries. Returns may be direct, batched or wrapped in fulfilled Promise
+results; stdout stays opaque. Fresh and resumed threads use the same observer
+without experimental raw events or permission changes. Missing, malformed,
 foreign or oversized observation records one bounded coverage-gap event instead
 of guessing that a command was pending. MCP completion handling is unchanged.

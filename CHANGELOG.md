@@ -4,6 +4,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.28.7
+
+- fix(codex): recognize pending background handles in fulfilled Promise results
+  and batched native returns without waking again for foreground, rejected or
+  opaque stdout results
+
 ## 0.28.6
 
 - fix(codex): require an actual returned background-session handle before waking
