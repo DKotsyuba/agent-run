@@ -8,7 +8,7 @@ const path = require('node:path');
 const {execFile} = require('node:child_process');
 
 test('readiness accepts external endpoints while preserving owned PID and protocol checks', {timeout: 15000}, async t => {
-  const root = await fs.mkdtemp('/tmp/ar-cg-probe-');
+  const root = await fs.mkdtemp(path.join(require('node:os').tmpdir(), 'ar-cg-probe-'));
   const socketPath = path.join(root, 'daemon.sock');
   const clients = new Set();
   const pid = process.pid;

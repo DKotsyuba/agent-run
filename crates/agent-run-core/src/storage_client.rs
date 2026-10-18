@@ -186,6 +186,9 @@ pub struct PendingWrite {
 /// phase and SQLite codes instead of a generic expiry).
 #[derive(Debug, Clone, Default)]
 pub struct Totals {
+    /// Exact built operation and closed inventory id; absent before build.
+    /// Payloads, producer tokens and arbitrary operation labels never enter it.
+    pub identity: Option<(OperationId, u16)>,
     /// Attempts of the identical operation: wire requests remotely, handle submissions locally.
     pub attempts: u32,
     /// Time from the head of the lane to the final outcome.
@@ -389,6 +392,8 @@ impl ProducerLane {
                     ),
                 );
             }
+            recorded.lock().unwrap_or_else(|p| p.into_inner()).identity =
+                Some((request.operation_id.clone(), request.kind));
             let started = std::time::Instant::now();
             let result = drive(&config, &mut state, &request, &recorded).await;
             recorded
@@ -1122,6 +1127,7 @@ mod tests {
     async fn refusal_until_expiry_keeps_the_writers_last_facts() {
         use agent_run_domain::{Error, error::PersistenceOperation};
         let busy = Error::Persistence {
+            writer_identity: None,
             operation: PersistenceOperation::EventAppend,
             elapsed_ms: 5,
             attempts: 1,

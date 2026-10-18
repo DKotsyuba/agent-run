@@ -141,6 +141,11 @@ impl WorkerProxy {
         use agent_run_domain::pool::{PoolMessage, PoolPropose, PoolReadRequest, PoolVote};
         use agent_run_domain::worker::WorkerTool;
         let validated = match tool {
+            WorkerTool::HealthReply => validated_input(
+                arguments,
+                name,
+                agent_run_domain::health::PingReply::validate,
+            ),
             WorkerTool::Finish => validated_input(
                 arguments,
                 name,
@@ -206,6 +211,11 @@ impl WorkerProxy {
         value: Value,
         request_id: Option<&str>,
     ) -> rmcp::model::CallToolResult {
+        if tool == agent_run_domain::worker::WorkerTool::HealthReply {
+            return rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                value.to_string(),
+            )]);
+        }
         if tool == agent_run_domain::worker::WorkerTool::Finish {
             return match serde_json::from_value::<agent_run_domain::worker::FinishReceipt>(value) {
                 Ok(receipt) => {
@@ -439,10 +449,10 @@ pub async fn serve_from_env() -> Result<()> {
 #[cfg(test)]
 mod tests {
 
-    /// Completion mode adds only finish; research adds only its confined report
+    /// Completion mode adds finish and health_reply; research adds its confined report
     /// writer. No mode exposes operator launches, shell or arbitrary writes.
     #[test]
-    fn research_inventory_adds_only_report_writer() {
+    fn research_inventory_preserves_grants_and_explicit_callbacks() {
         let mut proxy = WorkerProxy {
             broker: Arc::new(Broker::default()),
             run_id: "ag-20260928-000000-0000000001".parse().unwrap(),
@@ -467,8 +477,9 @@ mod tests {
         for research in [false, true] {
             proxy.research = research;
             proxy.explicit_finish = true;
-            assert_eq!(proxy.tools().unwrap().len(), if research { 7 } else { 6 });
+            assert_eq!(proxy.tools().unwrap().len(), if research { 8 } else { 7 });
             assert!(proxy.get_tool("finish").is_some());
+            assert!(proxy.get_tool("health_reply").is_some());
             assert_eq!(proxy.get_tool("save_report").is_some(), research);
         }
         for name in ["start", "resume", "Bash", "exec_command", "write_file"] {

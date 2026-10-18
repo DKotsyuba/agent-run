@@ -7,6 +7,7 @@ topic for this index.
 | Topic | Covers |
 |---|---|
 | completion | MCP start response, automatic bound-chat delivery, compact notice format, result retrieval, cooperative pools |
+| idle-ping | free supervisor checks, optional bounded recovery, real waiting and risk notices |
 | config | `<home>/config.toml`: source of truth, fail-closed validation, hot reload, safe-edit discipline |
 | skills | revisioned-profile `skills = [...]`, plugin ownership, snapshots |
 | mcp-servers | `[mcp.<name>]` declarations and revisioned-profile selection |

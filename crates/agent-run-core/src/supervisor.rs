@@ -483,6 +483,7 @@ pub(crate) fn execution_error_metadata(error: &Error) -> serde_json::Value {
             attempts,
             phase,
             source,
+            writer_identity,
         } => {
             data = execution_error_metadata(source);
             // The closed writer phase (acquire, statement, commit, ...) is a
@@ -497,6 +498,11 @@ pub(crate) fn execution_error_metadata(error: &Error) -> serde_json::Value {
             data["operation"] = json!(operation);
             data["wait_ms"] = json!(elapsed_ms);
             data["attempts"] = json!(attempts);
+            if let Some((id, kind)) = writer_identity {
+                data["writer_operation_id"] = json!(id);
+                data["writer_op_kind"] =
+                    json!(agent_run_store::ops::OpKindRef::from_wire_id(*kind).map(|k| k.name()));
+            }
         }
         Error::Io(source) => {
             data["io_kind"] = json!(format!("{:?}", source.kind()));
@@ -2558,6 +2564,7 @@ mod tests {
             RejectStage::Commit,
         ] {
             let error = Error::Persistence {
+                writer_identity: None,
                 operation: PersistenceOperation::WriterApply,
                 elapsed_ms: 17,
                 attempts: 3,
@@ -2625,5 +2632,40 @@ mod tests {
     #[test]
     fn blank_startup_errors_report_their_error_type() {
         assert_eq!(error_text(&Error::Runtime(String::new())), "RuntimeError");
+    }
+}
+
+#[cfg(test)]
+mod writer_identity_diagnostic_tests {
+    use super::*;
+
+    /// A failed write keeps its original unknown outcome, phase and totals,
+    /// while supplying the exact immutable receipt key without source text.
+    #[test]
+    fn writer_identity_survives_failure_diagnostics() {
+        let identity = agent_run_domain::storage::OperationId::new("fixture", 1);
+        let totals = crate::storage_client::Totals {
+            identity: Some((
+                identity.clone(),
+                agent_run_store::ops::OpKindRef::AppendJournal.wire_id(),
+            )),
+            attempts: 2,
+            elapsed: std::time::Duration::from_secs(30),
+            ..Default::default()
+        };
+        let error = crate::persist::into_result_totals::<()>(
+            agent_run_domain::storage::SubmitResult::Unknown(
+                agent_run_domain::storage::UnknownCause::DeadlineDuringExecution,
+            ),
+            &totals,
+        )
+        .unwrap_err();
+        let metadata = execution_error_metadata(&error);
+        assert_eq!(metadata["writer_operation_id"], identity.as_str());
+        assert_eq!(metadata["writer_op_kind"], "append_journal");
+        assert_eq!(metadata["outcome"], "unknown");
+        assert_eq!(metadata["wait_ms"], 30000);
+        assert_eq!(metadata["attempts"], 2);
+        assert_eq!(error.public().message, "state persistence operation failed");
     }
 }

@@ -11,6 +11,8 @@ pub mod diagnostics;
 /// Fenced raw store access for tests (feature `test-fixtures` only).
 #[cfg(feature = "test-fixtures")]
 pub mod fixture;
+/// Attempt-owned liveness and bounded model recovery probes.
+pub mod health;
 /// Bounded, content-free incident phases independent of expirable history.
 pub mod incidents;
 /// Durable append-only journal operations and bounded transcript spooling.
@@ -1342,21 +1344,35 @@ impl Store<'_> {
     }
     /// Read a bounded page for one exact execution, preserving global cursors.
     pub fn transcript(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
-        self.transcript_selected(id, cursor, limit, false)
+        self.transcript_selected(id, cursor, limit, false, false)
     }
 
     /// Read retained messages across the logical agent's complete lineage.
     pub fn transcript_lineage(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
-        self.transcript_selected(id, cursor, limit, true)
+        self.transcript_selected(id, cursor, limit, true, false)
+    }
+
+    /// Read exact-execution raw rows with opaque attempt-boundary booleans for
+    /// explicit display reconstruction. Native ids and attempt ids never escape;
+    /// ordinary transcript responses retain their historical shape and meaning.
+    /// `id` pins one retained execution; `cursor` is an exclusive nonnegative
+    /// global sequence and `limit` is 1..=1000 rows, bounded by page bytes.
+    /// Validation/SQLite errors propagate; no journal or native file is written.
+    pub fn transcript_recovery(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
+        self.transcript_selected(id, cursor, limit, false, true)
     }
 
     /// Share cursor validation and byte limits for exact and lineage transcripts.
+    /// `lineage` selects the stable root instead of one execution; `recovery`
+    /// adds only boolean scope boundaries. Invalid bounds and SQLite errors
+    /// propagate without writes; pagination keeps exclusive global cursors.
     fn transcript_selected(
         &self,
         id: &AgentId,
         cursor: i64,
         limit: usize,
         lineage: bool,
+        recovery: bool,
     ) -> Result<Value> {
         let row = self.get(id)?;
         if cursor < 0 || limit == 0 || limit > 1000 {
@@ -1414,8 +1430,14 @@ impl Store<'_> {
                 raw_ref.clone(),
             );
             let starts_block = key.4.is_none() || previous.as_ref() != Some(&key);
+            let scope_start = previous
+                .as_ref()
+                .is_none_or(|old| old.0 != key.0 || old.1 != key.1);
             previous = Some(key);
             messages.push(json!({"starts_block":starts_block,"seq":row.get::<_,i64>(0)?,"at":row.get::<_,f64>(1)?,"role":row.get::<_,String>(2)?,"name":row.get::<_,Option<String>>(3)?,"content":content,"raw_ref":row.get::<_,Option<String>>(5)?,"error":row.get::<_,Option<bool>>(6)?,"error_source":row.get::<_,Option<String>>(7)?,"content_complete":row.get::<_,Option<bool>>(8)?}));
+            if recovery {
+                messages.last_mut().expect("inserted row")["scope_start"] = json!(scope_start);
+            }
         }
         let next = if more {
             messages.last().and_then(|m| m.get("seq")).cloned()

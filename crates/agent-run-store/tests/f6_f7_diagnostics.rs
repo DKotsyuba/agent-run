@@ -189,3 +189,40 @@ fn incident_projection_keeps_the_closed_writer_phase() {
     assert!(failure.details["phase"].is_null());
     assert!(!failure.details.to_string().contains("SECRET_TOKEN"));
 }
+
+/// New exact writer identities survive history retirement, while malformed
+/// identifiers and arbitrary operation labels never enter the closed ledger.
+#[test]
+fn incident_projection_retains_only_typed_writer_identity() {
+    let home = common::Home::new();
+    let identity = agent_run_domain::storage::OperationId::new("fixture", 1);
+    let id = failed_agent(
+        &home,
+        json!({"operation":"writer_apply","writer_operation_id":identity,"writer_op_kind":"append_journal"}),
+    );
+    let projection = StoreReader::open(&home.path)
+        .unwrap()
+        .incident_projection(&id, 20.0)
+        .unwrap();
+    let phase = projection
+        .phases
+        .iter()
+        .find(|p| p.phase == "execution_failure")
+        .unwrap();
+    assert_eq!(phase.details["writer_operation_id"], identity.as_str());
+    assert_eq!(phase.details["writer_op_kind"], "append_journal");
+    let bad = failed_agent(
+        &home,
+        json!({"writer_operation_id":"private-source-token","writer_op_kind":"private-source-token"}),
+    );
+    let projection = StoreReader::open(&home.path)
+        .unwrap()
+        .incident_projection(&bad, 20.0)
+        .unwrap();
+    let phase = projection
+        .phases
+        .iter()
+        .find(|p| p.phase == "execution_failure")
+        .unwrap();
+    assert!(!phase.details.to_string().contains("private-source-token"));
+}

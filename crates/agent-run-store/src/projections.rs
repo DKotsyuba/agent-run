@@ -139,6 +139,7 @@ impl Store<'_> {
                 .unwrap_or(phase_started_at);
         }
         Ok(AgentView {
+            health: self.health_view(&record.id)?,
             mcp: selected_mcp(record.identity.as_ref()),
             parent_run_id: None,
             run_id: None,

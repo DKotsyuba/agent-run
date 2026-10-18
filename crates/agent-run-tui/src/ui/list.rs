@@ -304,6 +304,19 @@ fn card_row(
                     format!("{} ", app::id_hash(agent.agent_id.as_str(), 8)),
                     theme::dim(),
                 )
+            } else if let Some(label) = super::health_label(agent) {
+                cell(
+                    format!("{label} "),
+                    if agent
+                        .health
+                        .as_ref()
+                        .is_some_and(|h| h["state"] == "needs_attention")
+                    {
+                        theme::warning()
+                    } else {
+                        theme::dim()
+                    },
+                )
             } else {
                 cell(
                     format!(

@@ -37,6 +37,16 @@
         "fast": {
           "type": "boolean"
         },
+        "idle_ping": {
+          "default": "observe",
+          "description": "Frozen health policy: observe invokes no model; recover permits one model control turn per task-progress episode; off preserves explicit holds. No automatic cancellation.",
+          "enum": [
+            "off",
+            "observe",
+            "recover"
+          ],
+          "type": "string"
+        },
         "model": {
           "type": "string"
         },
@@ -570,6 +580,16 @@
                   "fast": {
                     "type": "boolean"
                   },
+                  "idle_ping": {
+                    "default": "observe",
+                    "description": "Frozen health policy: observe invokes no model; recover permits one model control turn per task-progress episode; off preserves explicit holds. No automatic cancellation.",
+                    "enum": [
+                      "off",
+                      "observe",
+                      "recover"
+                    ],
+                    "type": "string"
+                  },
                   "model": {
                     "type": "string"
                   },
@@ -769,6 +789,16 @@
                 },
                 "fast": {
                   "type": "boolean"
+                },
+                "idle_ping": {
+                  "default": "observe",
+                  "description": "Frozen health policy: observe invokes no model; recover permits one model control turn per task-progress episode; off preserves explicit holds. No automatic cancellation.",
+                  "enum": [
+                    "off",
+                    "observe",
+                    "recover"
+                  ],
+                  "type": "string"
                 },
                 "model": {
                   "type": "string"

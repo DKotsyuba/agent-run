@@ -983,6 +983,11 @@ pub async fn run(
                 else {
                     break;
                 };
+                if crate::health::command(process, store, &record.id, (cid, &kind, &payload), idle)
+                    .await?
+                {
+                    continue;
+                }
                 if kind == "cancel" {
                     // App-server interruption is advisory.  Once the durable
                     // command is claimed, return to the supervisor so its
@@ -1331,7 +1336,15 @@ pub async fn run(
         {
             let key = item["id"].as_str().expect("matched native item");
             pending_jobs.remove(key);
-            if idle || event_turn != Some(turn_id.as_str()) {
+            // A processId proves this command yielded a pending native handle.
+            // Its completion is not necessarily in the model's tool response:
+            // retain the wake even when it beats the originating turn's end.
+            // Ordinary synchronous commands have no processId and need no wake.
+            let background = item
+                .get("processId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty());
+            if idle || event_turn != Some(turn_id.as_str()) || background {
                 native_job_completion(
                     process,
                     store,
@@ -1706,7 +1719,7 @@ fn finish_developer_instructions(config: &Value) -> Result<String> {
         _ => return Err(invalid("native developer instructions have invalid type")),
     };
     Ok(format!(
-        "{existing}\n\nAgent Run runtime completion contract: an inference turn is not the logical run. End the turn while an owned background job or message is pending; the supervisor keeps this run and native thread alive and delivers its completion as a new step. Do not poll or sleep solely to keep inference alive. Do not call finish(failed) merely to suspend, from empty initial job output or speculation about a lost handle. A valid execution session_id is pending work, not failure. Call the private finish tool only when the assigned work is truly done, blocked or failed, with its exact final summary. Keep every configured global and role permission, approval and secret-protection rule."
+        "{existing}\n\nAgent Run runtime completion contract: an inference turn is not the logical run. End the turn while an owned background job or message is pending; the supervisor keeps this run and native thread alive and delivers its completion as a new step. Do not poll or sleep solely to keep inference alive. Before waiting, report newly completed work to its requester through the existing pool or orchestrator tool. Name the concrete pending job or message and its responsible actor; if no such event can advance the task, report the blocker. A result observed by the supervisor does not prove it was delivered into your model context. Do not call finish(failed) merely to suspend, from empty initial job output or speculation about a lost handle. A valid execution session_id is pending work, not failure. Call the private finish tool only when the assigned work is truly done, blocked or failed, with its exact final summary. Keep every configured global and role permission, approval and secret-protection rule."
     ))
 }
 

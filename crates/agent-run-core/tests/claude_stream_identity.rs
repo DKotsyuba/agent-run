@@ -348,3 +348,29 @@ async fn background_notification_rejects_session_rebind_with_safe_reason() {
     );
     assert!(!metadata.contains("PRIVATE") && !metadata.contains("FOREIGN"));
 }
+
+/// A provider may omit message_start entirely. Fragments still share one
+/// producer identity, including a late full native id and the completion tail;
+/// the following message must receive a distinct identity.
+#[tokio::test]
+async fn missing_message_start_keeps_fragments_and_tail_together() {
+    let (rows, _) = run_stream(&[
+        stream_event(json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"An"}})),
+        stream_event(json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"swer "}})),
+        json!({"type":"assistant","message":{"id":"late-native","content":[{"type":"text","text":"Answer complete"}]}}),
+        stream_event(json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"Next"}})),
+        json!({"type":"assistant","message":{"content":[{"type":"text","text":"Next"}]}}),
+        json!({"type":"result","subtype":"success","is_error":false,"result":"done","usage":{}}),
+    ]).await;
+    assert_eq!(
+        rows.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(),
+        ["An", "swer ", "complete", "Next"]
+    );
+    assert!(
+        rows[0].2.is_some(),
+        "first delta establishes message identity"
+    );
+    assert_eq!(rows[0].2, rows[1].2);
+    assert_eq!(rows[0].2, rows[2].2);
+    assert_ne!(rows[0].2, rows[3].2);
+}

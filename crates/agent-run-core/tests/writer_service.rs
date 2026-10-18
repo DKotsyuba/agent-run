@@ -264,3 +264,85 @@ async fn shutdown_timeout_retains_fence_until_owned_drain_finishes() {
         .await
         .unwrap();
 }
+
+/// Queue/operation diagnostics remain observable while actual SQL is blocked.
+/// Readiness is established by the writer barrier and accepted-job credits,
+/// not a guessed sleep. Payload content never appears in the public ping.
+#[cfg(feature = "test-fixtures")]
+#[tokio::test]
+async fn writer_operation_timing_is_safe_and_nonblocking() {
+    let home = common::Home::new();
+    let (id, _) = home
+        .store()
+        .admit(&home.request(), &home.config, &serde_json::json!({}), None)
+        .unwrap();
+    let writer = WriterService::start(&home.path, WriterConfig::default()).unwrap();
+    let handle = writer.handle();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let blocked = handle.clone();
+    let barrier =
+        tokio::spawn(async move { blocked.fixture_barrier(entered_tx, release_rx).await });
+    entered_rx.await.unwrap();
+    let (boot, now) = agent_run_platform::monotonic::now().unwrap();
+    let identity = OperationId::new(&boot, now);
+    let request = WriteEnvelope::new(
+        identity.clone(),
+        ProducerId {
+            kind: ProducerKind::Broker,
+            scope: Some("timing".into()),
+            instance: "fixture".into(),
+        },
+        1,
+        MonoDeadline {
+            boot_id: boot,
+            ns: now + 60_000_000_000,
+        },
+        RemoteOp::from(agent_run_store::ops::AppendJournal {
+            execution: id,
+            fragments: vec![agent_run_store::ops::JournalFragment::Event {
+                kind: "timing_fixture".into(),
+                data: serde_json::json!({"private_payload":"DO_NOT_EXPOSE"}),
+                attempt: None,
+            }],
+        }),
+    )
+    .unwrap();
+    let submitted = handle.clone();
+    let work = tokio::spawn(async move { submitted.submit(WriteAuthority::Broker, request).await });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while handle.health().accepted_jobs != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let service = agent_run_core::service::Service::new(home.path.clone()).with_writer(
+        agent_run_core::broker_writer::BrokerWriter::new(handle.clone()),
+    );
+    let ping = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        agent_run_core::dispatch::call(&service, "ping", serde_json::json!({"writer_health":true})),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(ping["writer"]["accepted_jobs"], 2);
+    assert!(!ping.to_string().contains("DO_NOT_EXPOSE"));
+    release_tx.send(()).unwrap();
+    barrier.await.unwrap().unwrap();
+    assert!(matches!(work.await.unwrap(), SubmitResult::Committed(_)));
+    let observed = handle.health();
+    assert!(observed.current_operation.is_none());
+    let last = observed.last_operation.unwrap();
+    assert_eq!(last.operation_id, identity);
+    assert_eq!(last.op_kind, "append_journal");
+    let (boot, now) = agent_run_platform::monotonic::now().unwrap();
+    writer
+        .shutdown(MonoDeadline {
+            boot_id: boot,
+            ns: now + 3_000_000_000,
+        })
+        .await
+        .unwrap();
+}

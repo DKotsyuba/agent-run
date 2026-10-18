@@ -112,3 +112,5 @@ notice from the durable terminal event exactly once. Successful pool members
 still omit individual notices. Cancelled notices omit failure metadata while
 retaining internal evidence; malformed stored payloads end only their own
 delivery row with `invalid_payload`, allowing later notices to proceed.
+
+Idle monitoring: `agent-run doc idle-ping`.

@@ -90,3 +90,56 @@ impl TranscriptQuery {
         Ok(())
     }
 }
+
+/// Decode an intact MCP text-block array for display only. Non-text blocks,
+/// malformed JSON, empty arrays and oversized inputs remain verbatim so a view
+/// cannot silently discard image/resource/error evidence. No status is inferred
+/// from text. The caller still applies its terminal sanitizer and redaction.
+pub fn display_tool_text(content: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if content.len() > 65536 || !content.trim_start().starts_with('[') {
+        return Cow::Borrowed(content);
+    }
+    let Ok(serde_json::Value::Array(blocks)) = serde_json::from_str(content) else {
+        return Cow::Borrowed(content);
+    };
+    if blocks.is_empty()
+        || !blocks
+            .iter()
+            .all(|b| b["type"] == "text" && b["text"].is_string())
+    {
+        return Cow::Borrowed(content);
+    }
+    Cow::Owned(
+        blocks
+            .iter()
+            .map(|b| b["text"].as_str().expect("checked text block"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+#[cfg(test)]
+mod tool_display_tests {
+    /// Only complete text-only MCP payloads decode; missing/error/image evidence
+    /// is never turned into a success or discarded by presentation.
+    #[test]
+    fn mcp_text_blocks_decode_without_status_inference() {
+        use super::display_tool_text;
+        assert_eq!(
+            display_tool_text(
+                r#"[{"type":"text","text":"one"},{"type":"text","text":"FAILED two"}]"#
+            ),
+            "one\nFAILED two"
+        );
+        for raw in [
+            "plain",
+            "[]",
+            r#"[{"type":"image","data":"x"}]"#,
+            r#"[{"type":"text"}]"#,
+            "[broken",
+        ] {
+            assert_eq!(display_tool_text(raw), raw);
+        }
+    }
+}

@@ -560,6 +560,7 @@ impl StorageRejection {
                 attempts,
                 phase,
                 source,
+                ..
             } => {
                 let mut refusal = Self::from_error(source, stage);
                 let (primary, extended) = sqlite_codes(source);
@@ -573,7 +574,9 @@ impl StorageRejection {
                 });
                 return refusal;
             }
-            Error::OwnershipCheckpoint { source, .. } => return Self::from_error(source, stage),
+            Error::OwnershipCheckpoint { source, .. } => {
+                return Self::from_error(source, stage);
+            }
             Error::Validation(text) => (RejectCode::Validation, text.clone()),
             Error::PathEscape(text) => (RejectCode::PathEscape, text.clone()),
             Error::NotFound(text) => (RejectCode::NotFound, text.clone()),
@@ -626,6 +629,7 @@ impl StorageRejection {
         };
         match self.persistence {
             Some(diag) => Error::Persistence {
+                writer_identity: None,
                 operation: diag.operation,
                 elapsed_ms: diag.wait_ms,
                 attempts: diag.attempts,
@@ -810,6 +814,21 @@ pub struct OutcomeCounters {
     pub unknown: u64,
 }
 
+/// Content-free observation of one actual SQL callback. Completion of the
+/// callback is not itself proof the business operation committed; resolve its
+/// original operation receipt for that outcome. No SQL, arguments or secrets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WriterTiming {
+    /// Exact immutable identity for receipt reconciliation.
+    pub operation_id: OperationId,
+    /// Closed typed operation name from the maintained inventory.
+    pub op_kind: String,
+    /// Milliseconds from queue submission to callback start.
+    pub queue_wait_ms: u64,
+    /// Milliseconds spent in the callback, live for a current operation.
+    pub execution_ms: u64,
+}
+
 /// Writer health snapshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WriterHealth {
@@ -825,6 +844,12 @@ pub struct WriterHealth {
     pub poisoned: bool,
     /// Replies actually observed by facade callers, including replay replies.
     pub counters: OutcomeCounters,
+    /// Actual executing typed SQL callback, observed without entering its lock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_operation: Option<WriterTiming>,
+    /// Last completed callback; outcome still belongs to its durable receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_operation: Option<WriterTiming>,
 }
 
 /// Outcome of one maintenance job (outside business transactions, no receipt).
@@ -1018,6 +1043,7 @@ mod tests {
             RejectStage::Commit,
         ] {
             let error = Error::Persistence {
+                writer_identity: None,
                 operation: PersistenceOperation::OwnershipWrite,
                 elapsed_ms: 7,
                 attempts: 3,
@@ -1036,6 +1062,7 @@ mod tests {
                     attempts: 3,
                     phase: Some(back),
                     source,
+                    writer_identity: None,
                 } => {
                     assert_eq!(back, phase);
                     assert!(
@@ -1068,6 +1095,7 @@ mod tests {
         let refusal = StorageRejection::from_error(&legacy, RejectStage::Commit);
         assert_eq!(refusal.persistence.unwrap().phase, RejectStage::Commit);
         let phased = Error::Persistence {
+            writer_identity: None,
             operation: PersistenceOperation::OwnershipAcquire,
             elapsed_ms: 1,
             attempts: 1,
@@ -1100,6 +1128,7 @@ mod tests {
             ))
         };
         let error = |operation, phase, source| Error::Persistence {
+            writer_identity: None,
             operation,
             elapsed_ms: 1,
             attempts: 1,
@@ -1160,6 +1189,7 @@ mod tests {
             PersistenceOperation::WriterApply
         );
         let error = Error::Persistence {
+            writer_identity: None,
             operation: PersistenceOperation::WriterApply,
             elapsed_ms: 12,
             attempts: 1,

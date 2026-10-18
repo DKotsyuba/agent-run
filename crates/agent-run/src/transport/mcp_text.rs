@@ -316,6 +316,8 @@ struct AgentTextView {
     usage_lineage: String,
     /// Optional latest-execution tool counts, preserving unknown values.
     tool_counts: Option<String>,
+    /// Content-free ping state and actionable broker diagnosis.
+    health: Option<String>,
     /// Optional fixed failure classification.
     failure_kind: String,
     /// Display-safe failure explanation.
@@ -716,6 +718,9 @@ struct PoolDeliveryTextView {
 /// Whole pool read page, with every log entry rendered by the shared formatter.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PoolPageTextView {
+    /// Broker hint for an empty explicit-mode page, never completion evidence.
+    #[serde(default)]
+    suspend_inference: bool,
     /// Stable target pool.
     pool_id: String,
     /// Optional validated read-time activity, independent of stored lifecycle.
@@ -1869,7 +1874,12 @@ fn agent_fields(view: &Value) -> Value {
         "name": view["name"].as_str().map(display_label).unwrap_or_default(),
         "usage": usage_line(&view["usage"]),
         "usage_lineage": lineage_line(&view["usage_cumulative"]),
+        "health": view["health"].as_object().map(|health| {
+            let state=health.get("state").and_then(Value::as_str).map(exact_display).unwrap_or_else(||"unknown".into());
+            health.get("reason").and_then(Value::as_str).map(|reason|format!("{state}: {}",exact_display(reason))).unwrap_or(state)
+        }),
         "tool_counts": view["tool_counts"].as_object().map(|counts| {
+
             let number = |key: &str| counts.get(key).and_then(Value::as_u64).map(|n| n.to_string()).unwrap_or_else(|| "?".into());
             format!("{} native calls, {} failed, {} unknown results (latest execution)", number("calls"), number("failed"), number("unknown_results"))
         }),
@@ -2743,7 +2753,26 @@ mod tests {
         );
     }
 
+    /// A health diagnosis survives closed projection and is visible without
+    /// changing the still-active execution into an invented terminal result.
+    #[test]
+    fn list_agents_exposes_health_attention() {
+        let mut agent = agent_view();
+        agent["phase"] = json!("idle");
+        agent["health"] = json!({"state":"needs_attention","reason":"idle_without_wait_source"});
+        let page = text(
+            "list_agents",
+            &json!({"items":[agent],"total":1,"offset":0,"limit":20,"complete":true}),
+        );
+        assert!(page.contains("running (idle)"), "{page}");
+        assert!(
+            page.contains("health: needs_attention: idle_without_wait_source"),
+            "{page}"
+        );
+    }
+
     /// transcript preserves content verbatim and states its cursor contract.
+
     #[test]
     fn transcript_preserves_content_and_cursor() {
         let page = text(

@@ -4,6 +4,27 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.28.5
+
+- feat(supervisor): add bounded service and model health checks with exact-attempt,
+  native-turn and budget fencing; retain owned event waits without age-based cancellation
+- fix(codex): preserve asynchronous command completion wakes when the originating
+  turn yields after the command has already finished
+- fix(claude): retain one message identity across streamed text and late completion,
+  including streams without a message-start event
+- feat(transcript): reconstruct anchored legacy fragments from an explicit native
+  history snapshot for display only, preserving raw journal and attempt boundaries
+- fix(pool): report completed work before passive waiting, detect stalled pools,
+  and bound repeated empty reads with deduplicated attention and corrective input
+- fix(worker): declare polling guard effects in private catalog v4 while retaining
+  historical v1-v3 catalog identities and admission behavior
+- feat(observability): show owned wait sources in the terminal observer and expose
+  opt-in writer queue/current-operation diagnostics without changing ordinary ping
+- fix(storage): preserve failing operation identity and typed SQLite causes, skip
+  unchanged maintenance writes, and improve failure recovery guidance
+- fix(transcript): decode intact MCP text results consistently in CLI and TUI
+  without discarding non-text evidence or inferring tool success
+
 ## 0.28.4
 
 - fix(process): persist newly observed process identities in bounded batches and
