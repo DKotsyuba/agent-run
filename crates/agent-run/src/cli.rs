@@ -97,6 +97,13 @@ pub trait CliService: Send + Sync {
     fn transcript_public(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
         self.transcript(id, cursor, limit)
     }
+    /// Read exact-execution rows with proven attempt boundaries. A service seam
+    /// lacking this evidence refuses historical reconstruction instead of guessing.
+    fn transcript_recovery(&self, _id: &AgentId, _cursor: i64, _limit: usize) -> Result<Value> {
+        Err(crate::Error::Unsupported(
+            "scoped transcript reader is unavailable".into(),
+        ))
+    }
     /// Reads typed transcript options. Historical service seams retain raw
     /// behavior; block readers must implement this method explicitly.
     fn transcript_options(
@@ -173,6 +180,10 @@ impl CliService for Service {
     }
     fn transcript(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
         Service::transcript(self, id, cursor, limit)
+    }
+    /// Read bounded recovery rows directly through the existing read-only store.
+    fn transcript_recovery(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
+        Store::open(&self.home)?.transcript_recovery(id, cursor, limit)
     }
     /// Reads raw or bounded blocks through the same public service validator.
     fn transcript_options(
@@ -1846,7 +1857,10 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             };
             query.validate()?;
             if native_history.is_some()
-                && (cursor != 0 || view != agent_run_domain::transcript::TranscriptView::Raw)
+                && (!full
+                    || follow
+                    || cursor != 0
+                    || view != agent_run_domain::transcript::TranscriptView::Raw)
             {
                 return Err(invalid(
                     "native history reconstruction requires --full, raw view and cursor zero",
@@ -1858,6 +1872,13 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 ));
             }
             let page_at = |cursor| {
+                if native_history.is_some() {
+                    return dependencies.service.transcript_recovery(
+                        &agent_id,
+                        cursor,
+                        query.limit,
+                    );
+                }
                 let mut page = query.clone();
                 page.cursor = cursor;
                 dependencies.service.transcript_options(

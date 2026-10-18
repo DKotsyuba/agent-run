@@ -535,7 +535,8 @@ mod tests {
 /// JSON and every sessionId must agree. A known journal tail id anchors the
 /// group, and concatenated already-redacted journal text must equal the exact
 /// full native text. Missing/ambiguous ids, partial groups, redaction mismatch,
-/// role/attempt boundaries and unanchored text stay unchanged. No native text
+/// role/attempt boundaries (requiring explicit scope_start evidence) and
+/// unanchored text stay unchanged. No native text
 /// is copied into output, no journal is written, and this is not a continuation
 /// seal or proof of task completion. Returns the number of repaired messages.
 pub(crate) fn restore_claude_history(messages: &mut [Value], history: &[u8]) -> Result<usize> {
@@ -597,7 +598,7 @@ pub(crate) fn restore_claude_history(messages: &mut [Value], history: &[u8]) -> 
             let next = &messages[end + 1];
             let first = &messages[start];
             if next["role"] != "assistant"
-                || next["starts_block"] == true
+                || next["scope_start"] != false
                 || [
                     "name",
                     "agent_id",
@@ -628,6 +629,9 @@ pub(crate) fn restore_claude_history(messages: &mut [Value], history: &[u8]) -> 
                 for row in &mut messages[start..end] {
                     row["raw_ref"] = Value::String(id.clone());
                 }
+                for row in &mut messages[start + 1..=end] {
+                    row["starts_block"] = Value::Bool(false);
+                }
                 repaired += 1;
             }
         }
@@ -647,13 +651,14 @@ mod native_reconstruction_tests {
     fn native_boundaries_require_exact_anchored_redacted_text() {
         let history=b"{\"type\":\"assistant\",\"sessionId\":\"s\",\"message\":{\"id\":\"m\",\"content\":[{\"type\":\"text\",\"text\":\"Answer\"}]}}\n";
         let original = vec![
-            json!({"role":"assistant","content":"An","raw_ref":null}),
-            json!({"role":"assistant","content":"swer","raw_ref":"m"}),
+            json!({"role":"assistant","content":"An","raw_ref":null,"starts_block":true,"scope_start":true}),
+            json!({"role":"assistant","content":"swer","raw_ref":"m","starts_block":true,"scope_start":false}),
         ];
         let mut rows = original.clone();
         assert_eq!(restore_claude_history(&mut rows, history).unwrap(), 1);
         assert_eq!(rows[0]["raw_ref"], "m");
         assert_eq!(rows[0]["content"], "An");
+        assert_eq!(rows[1]["starts_block"], false);
         let mut redacted = original.clone();
         redacted[0]["content"] = json!("[REDACTED]");
         assert_eq!(restore_claude_history(&mut redacted, history).unwrap(), 0);
@@ -661,7 +666,7 @@ mod native_reconstruction_tests {
         unanchored[1]["raw_ref"] = Value::Null;
         assert_eq!(restore_claude_history(&mut unanchored, history).unwrap(), 0);
         let mut boundary = original;
-        boundary[1]["starts_block"] = json!(true);
+        boundary[1]["scope_start"] = json!(true);
         assert_eq!(restore_claude_history(&mut boundary, history).unwrap(), 0);
         assert!(restore_claude_history(&mut [], b"{}\n").is_err());
         assert!(
