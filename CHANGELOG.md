@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.28.5
+
 - feat(supervisor): add bounded service and model health checks with exact-attempt,
   native-turn and budget fencing; retain owned event waits without age-based cancellation
 - fix(codex): preserve asynchronous command completion wakes when the originating
