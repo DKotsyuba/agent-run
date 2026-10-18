@@ -60,21 +60,26 @@ async fn guarded<F: std::future::Future>(future: F) -> std::thread::Result<F::Ou
 /// its pong cannot rearm inference, and ordinary cancellation/cleanup still work.
 #[tokio::test]
 async fn stream_service_ping_then_one_correlated_model_turn() {
-    run_native_fixture(false, None).await;
+    run_native_fixture(false, None, false).await;
 }
 
 /// The original Codex idle case uses a new correlated turn on its existing
 /// app-server thread; a service ping never starts that native turn.
 #[tokio::test]
 async fn codex_service_ping_then_one_correlated_model_turn() {
-    run_native_fixture(true, None).await;
+    run_native_fixture(true, None, false).await;
 }
 
 /// Shared native fixture ownership, writer, challenge, reply and cleanup proof
 /// for the two supported engine transports. `background=None` exercises ping;
 /// Some(true) exercises an early asynchronous completion, Some(false) its
-/// synchronous negative control. No model or provider is invoked.
-async fn run_native_fixture(codex_mode: bool, background: Option<bool>) {
+/// synchronous negative control. `completion_after_idle` gates completion on
+/// the driver's actual idle observation. No model or provider is invoked.
+async fn run_native_fixture(
+    codex_mode: bool,
+    background: Option<bool>,
+    completion_after_idle: bool,
+) {
     let home = common::Home::new();
     let mut req = home.request();
     req.explicit_finish = true;
@@ -149,7 +154,9 @@ printf '%s\n' "$unexpected" > unexpected.json
     let (script, environment) = if codex_mode {
         let grant =
             agent_run_core::codex::Grant::new(&runtime, &row.request, &role, &app_home).unwrap();
-        codex_fixture(&grant, background)
+        let sessions = app_home.join("sessions");
+        let history = sessions.join("fixture.jsonl");
+        codex_fixture(&grant, background, &history, completion_after_idle)
     } else {
         (script, BTreeMap::new())
     };
@@ -172,6 +179,16 @@ printf '%s\n' "$unexpected" > unexpected.json
     let pid = process.owner.pid;
     let driver = async {
         if let Some(background) = background {
+            if completion_after_idle {
+                observed(|| {
+                    store
+                        .worker_lifecycle_view(&id)
+                        .unwrap()
+                        .is_some_and(|v| v["phase"] == "idle")
+                })
+                .await;
+                std::fs::write(home.path.join("release-completion"), "release").unwrap();
+            }
             if background {
                 observed(|| home.path.join("wake.json").exists()).await;
                 let wake = std::fs::read_to_string(home.path.join("wake.json")).unwrap();
@@ -193,6 +210,18 @@ printf '%s\n' "$unexpected" > unexpected.json
                         .is_some_and(|v| v["phase"] == "idle")
                 })
                 .await;
+                observed(|| store.conn.query_row("SELECT COUNT(*) FROM messages WHERE agent_id=? AND role='tool_result' AND raw_ref='background-job'",[id.as_str()],|r|r.get::<_,i64>(0)).unwrap()==1).await;
+                // The free ping is a FIFO supervisor-pass barrier: return
+                // observation runs before command handling, with zero inference.
+                assert!(
+                    lane.local(
+                        health_op(&store, &id, agent_run_core::domain::now()),
+                        Duration::from_secs(5)
+                    )
+                    .await
+                    .unwrap()
+                );
+                observed(||store.conn.query_row("SELECT EXISTS(SELECT 1 FROM commands WHERE agent_id=? AND kind='ping' AND state='completed')",[id.as_str()],|r|r.get::<_,bool>(0)).unwrap()).await;
                 assert!(!home.path.join("wake.json").exists());
             }
             assert_eq!(
@@ -331,13 +360,20 @@ printf '%s\n' "$unexpected" > unexpected.json
 /// Environment data is printed as data, never evaluated as shell source. Two
 /// turn/start calls are observable; health replies are driven by the real writer.
 /// `background` optionally emits one started/duplicated terminal command before
-/// idle, with a process handle only for the asynchronous case.
+/// idle. Both command forms have a PTY id; only the asynchronous result
+/// returns a pending session_id in its complete model-facing native history.
+/// `history` names a rollout lazily created on the first turn, as in real Codex;
+/// `completion_after_idle`
+/// waits for the driver's release file after the first real idle boundary.
+/// Returns shell source and environment data; the shell never evaluates env data.
 fn codex_fixture(
     grant: &agent_run_core::codex::Grant,
     background: Option<bool>,
+    history: &std::path::Path,
+    completion_after_idle: bool,
 ) -> (String, BTreeMap<String, String>) {
-    let legacy = json!({"model":grant.model,"cwd":grant.cwd,"roots":grant.roots,"writableRoots":grant.writable_roots,"sandbox":grant.sandbox,"approvalPolicy":grant.approval_policy,"threadId":"thread"});
-    let modern = json!({"model":grant.model,"cwd":grant.cwd,"runtimeWorkspaceRoots":grant.roots,"sandbox":{"type":"readOnly","networkAccess":grant.network_access},"approvalPolicy":grant.approval_policy,"activePermissionProfile":{"id":grant.permission_profile.as_deref().unwrap_or(":read-only")},"threadId":"thread"});
+    let legacy = json!({"model":grant.model,"cwd":grant.cwd,"roots":grant.roots,"writableRoots":grant.writable_roots,"sandbox":grant.sandbox,"approvalPolicy":grant.approval_policy,"threadId":"thread","thread":{"path":history}});
+    let modern = json!({"model":grant.model,"cwd":grant.cwd,"runtimeWorkspaceRoots":grant.roots,"sandbox":{"type":"readOnly","networkAccess":grant.network_access},"approvalPolicy":grant.approval_policy,"activePermissionProfile":{"id":grant.permission_profile.as_deref().unwrap_or(":read-only")},"threadId":"thread","thread":{"path":history}});
     let tools: serde_json::Map<String, Value> = agent_run_domain::worker::finish_tools_json(false)
         .into_iter()
         .map(|tool| (tool["name"].as_str().unwrap().to_owned(), tool))
@@ -348,12 +384,23 @@ fn codex_fixture(
         ("ECHO_LEGACY".into(), legacy.to_string()),
         ("ECHO_MODERN".into(), modern.to_string()),
         ("CATALOG".into(), catalog.to_string()),
+        ("HISTORY".into(), history.display().to_string()),
+        (
+            "COMPLETE_LATE".into(),
+            if completion_after_idle { "yes" } else { "no" }.into(),
+        ),
     ]);
     if let Some(background) = background {
         let mut item = json!({"type":"commandExecution","id":"background-job","status":"completed","exitCode":0,"aggregatedOutput":"BACKGROUND_PASS"});
+        // Native 0.163 assigns a PTY processId to foreground commands too.
+        item["processId"] = json!("86309");
+        let mut result = json!({"chunk_id":"fixture-chunk","wall_time_seconds":0.1,"original_token_count":0,"output":""});
         if background {
-            item["processId"] = json!("86309");
+            result["session_id"] = json!(86309);
+        } else {
+            result["exit_code"] = json!(0);
         }
+        environment.insert("RETURNED".into(), json!({"type":"response_item","payload":{"type":"custom_tool_call_output","internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"},"output":[{"type":"input_text","text":result.to_string()}]}}).to_string());
         environment.insert("JOB_STARTED".into(),json!({"method":"item/started","params":{"threadId":"thread","turnId":"turn-1","item":{"type":"commandExecution","id":"background-job","status":"inProgress"}}}).to_string());
         environment.insert("JOB_COMPLETED".into(),json!({"method":"item/completed","params":{"threadId":"thread","turnId":"turn-1","item":item}}).to_string());
     }
@@ -369,14 +416,25 @@ case "$line" in
 *'"method":"mcpServerStatus/list"'*) printf '{"id":%s,"result":%s}\n' "$id" "$CATALOG" ;;
 *'"method":"turn/start"'*)
 turns=$((turns+1))
+if test "$turns" -eq 1; then
+mkdir -p "$(dirname "$HISTORY")"
+printf '%s\n' '{"type":"session_meta","payload":{"id":"thread"}}' > "$HISTORY"
+fi
 printf '%s\n' "$turns" > turns.txt
 if test "$turns" -gt 1; then printf '%s\n' "$line" > wake.json; fi
 printf '{"id":%s,"result":{"turn":{"id":"turn-%s"}}}\n' "$id" "$turns"
 if test "$turns" -eq 1 && test -n "$JOB_STARTED"; then
-printf '%s\n' "$JOB_STARTED" "$JOB_COMPLETED" "$JOB_COMPLETED"
+printf '%s\n' "$JOB_STARTED"
+if test "$COMPLETE_LATE" = no; then printf '%s\n' "$JOB_COMPLETED" "$JOB_COMPLETED"; fi
+printf '%s\n' "$RETURNED" >> "$HISTORY"
+printf '%s\n' '{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}' >> "$HISTORY"
 fi
 if test "$turns" -gt 1; then while test ! -f health-receipt; do sleep 0.01; done; fi
 printf '{"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn-%s","status":"completed","items":[]}}}\n' "$turns"
+if test "$turns" -eq 1 && test -n "$JOB_STARTED" && test "$COMPLETE_LATE" = yes; then
+while test ! -f release-completion; do sleep 0.01; done
+printf '%s\n' "$JOB_COMPLETED" "$JOB_COMPLETED"
+fi
 ;;
 *'"method":"turn/interrupt"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
 esac
@@ -385,11 +443,32 @@ done"#;
 }
 
 /// An asynchronous command can finish before its originating inference turn
-/// yields. Its process handle proves the model needs a completion wake; a
-/// duplicate item still journals/enqueues once, while synchronous calls do not
+/// yields. Its actual pending return proves the model needs a completion wake;
+/// a duplicate item still journals/enqueues once, while synchronous calls do not
 /// create a redundant turn. All paths retain exact process cleanup.
 #[tokio::test]
 async fn codex_background_completion_before_idle_wakes_once() {
-    run_native_fixture(true, Some(true)).await;
-    run_native_fixture(true, Some(false)).await;
+    run_native_fixture(true, Some(true), false).await;
+    run_native_fixture(true, Some(false), false).await;
+}
+
+/// A terminal command already returned inline must not create another model
+/// turn merely because its native completion retains a PTY process identifier.
+#[tokio::test]
+async fn codex_foreground_with_process_id_does_not_wake() {
+    run_native_fixture(true, Some(false), false).await;
+}
+
+/// A real pending return still wakes exactly once when completion follows the
+/// observed idle boundary; replayed native terminal frames do not add turns.
+#[tokio::test]
+async fn codex_background_completion_after_idle_wakes_once() {
+    run_native_fixture(true, Some(true), true).await;
+}
+
+/// A delayed native terminal frame is not a new result if the command returned
+/// its final output inline before the observed native inference turn ended.
+#[tokio::test]
+async fn codex_foreground_completion_after_idle_does_not_wake() {
+    run_native_fixture(true, Some(false), true).await;
 }

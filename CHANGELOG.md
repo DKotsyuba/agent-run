@@ -4,6 +4,14 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.28.6
+
+- fix(codex): require an actual returned background-session handle before waking
+  an agent for native command completion; synchronous PTY results no longer
+  trigger a duplicate turn, including delayed completion frames
+- fix(codex): preserve once-only background completion across start, resume and
+  idle boundaries with bounded, identity-checked native return observation
+
 ## 0.28.5
 
 - feat(supervisor): add bounded service and model health checks with exact-attempt,

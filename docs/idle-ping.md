@@ -111,3 +111,25 @@ group cleanup. Real model calls and installed-runtime qualification are separate
 this source change neither publishes nor installs a release.
 
 See [reliability recovery](reliability-recovery.md) for native completion races, pool waiting, legacy transcript reconstruction and writer observations.
+
+
+## Native command completion is distinct from a pending return
+
+Codex assigns a PTY `processId` to foreground commands too. That field alone
+must never enqueue another model turn. Explicit runs journal terminal command
+results once, then correlate the exact owned thread, origin turn and process
+with a complete model-facing structured return containing an unfinished
+`session_id`. Early background completion is retained until that return is
+observed; synchronous results, duplicate terminal frames and delayed foreground
+frames do not create a second turn.
+
+The observer reads only the exact native rollout beneath the isolated native
+home, through no-follow regular-file descriptors. Lazy file creation is retried
+without skipping the first return. It skips pre-admission history,
+checks session identity, retains partial JSONL rows, and consumes at most64KiB
+per existing supervisor pass. Each row is bounded to4MiB and handle evidence
+to4096entries. It parses native tool-return envelopes, never JSON embedded in
+stdout. The same path covers fresh threads and resumed native sessions; it does
+not enable experimental raw events or change permissions. Missing, malformed,
+foreign or oversized observation records one bounded coverage-gap event instead
+of guessing that a command was pending. MCP completion handling is unchanged.
