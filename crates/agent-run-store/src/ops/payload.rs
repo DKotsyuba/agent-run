@@ -1530,3 +1530,19 @@ pub struct AcceptHealthReply {
     /// Finite nonnegative observation time in Unix seconds.
     pub at: f64,
 }
+
+/// 95 — fixed broker-generated polling attention under exact worker authority.
+/// This is local-only; no prose, outcome declaration or native action crosses SQL.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReportPoolReadLoop {
+    /// Exact logical execution owning the observed reads.
+    pub execution: AgentId,
+    /// Exact active capability-bound attempt.
+    pub attempt: String,
+    /// Transient private capability; persisted only as its existing hash.
+    pub token: String,
+    /// Actual indexed pool revision, not a worker-supplied cursor.
+    pub revision: u64,
+    /// Finite nonnegative broker observation time in Unix seconds.
+    pub at: f64,
+}

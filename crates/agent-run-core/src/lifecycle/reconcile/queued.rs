@@ -21,22 +21,26 @@ pub async fn reconcile(home: &Path, lane: &BrokerLane, limit: usize) -> Result<V
             break;
         }
         let root = home.to_owned();
-        let rows = tokio::task::spawn_blocking(move || {
-            fair_read(&Store::open(&root)?, name, select, remaining)
-        })
-        .await
-        .map_err(|_| Error::Runtime("reconciliation reader stopped".into()))??;
-        if let Some(last) = rows.last() {
-            lane.local(
-                ops::ReconcileReapedAgent {
+        let (rows, cursor) = tokio::task::spawn_blocking(move || {
+            let store = Store::open(&root)?;
+            let rows = fair_read(&store, name, select, remaining)?;
+            let cursor = rows
+                .last()
+                .map(|last| ops::ReconcileReapedAgent {
                     cursor: name.into(),
                     created_at: last.created_at,
                     execution: last.id.clone(),
                     attempt: None,
-                },
-                BROKER_BUDGET,
-            )
-            .await?;
+                })
+                .map(|op| changed_cursor(&store, op))
+                .transpose()?
+                .flatten();
+            Ok::<_, Error>((rows, cursor))
+        })
+        .await
+        .map_err(|_| Error::Runtime("reconciliation reader stopped".into()))??;
+        if let Some(cursor) = cursor {
+            lane.local(cursor, BROKER_BUDGET).await?;
         }
         for row in rows {
             let (state, kind) = if name == "unowned_starting" {
@@ -320,6 +324,9 @@ fn prepare_orphans(home: &Path, limit: usize) -> Result<OrphanPreparation> {
         captured: Vec::new(),
         releases: Vec::new(),
     };
+    if let Some(op) = prepared.cursor.take() {
+        prepared.cursor = changed_cursor(&store, op)?;
+    }
     for (attempt, _) in rows {
         if !cleanup_mcp_discovery(&store, &attempt.id)? {
             continue;
@@ -427,7 +434,34 @@ fn prepare_orphans(home: &Path, limit: usize) -> Result<OrphanPreparation> {
             outcome,
         });
     }
+    let mut releases = Vec::new();
+    for op in prepared.releases {
+        // The OS/process evidence above is still checked each sweep. Only a
+        // repeated durable no-change observation is skipped, never a release
+        // with fresh proof or a newly discovered unresolved reason.
+        let unchanged = if let ops::OrphanOutcome::Unresolved { reason } = &op.outcome {
+            store.conn.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE agent_id=? AND attempt_id=? AND kind='attempt_cleanup_unresolved' AND json_extract(data_json,'$.reason')=?)",params![op.execution.as_str(),op.attempt,reason],|r|r.get::<_,bool>(0))?
+        } else {
+            false
+        };
+        if !unchanged {
+            releases.push(op);
+        }
+    }
+    prepared.releases = releases;
     Ok(prepared)
+}
+
+/// Return a cursor update only when its exact last-read key changes. This
+/// read-side optimization avoids a new durable receipt on every idle sweep;
+/// cursor wrap/fairness and all writer-side ownership checks remain unchanged.
+fn changed_cursor(
+    store: &Store<'_>,
+    op: ops::ReconcileReapedAgent,
+) -> Result<Option<ops::ReconcileReapedAgent>> {
+    let key = op.attempt.as_deref().unwrap_or(op.execution.as_str());
+    let same=store.conn.query_row("SELECT EXISTS(SELECT 1 FROM reconciliation_cursors WHERE name=? AND created_at=? AND agent_id=?)",params![op.cursor,op.created_at,key],|r|r.get::<_,bool>(0))?;
+    Ok((!same).then_some(op))
 }
 
 /// Sends restored recovery evidence in independently validated batches, never a size-limited full history.

@@ -215,6 +215,9 @@ pub enum Error {
         elapsed_ms: u64,
         /// Number of completed attempts, including a failing attempt.
         attempts: u32,
+        /// Optional immutable writer receipt identity and closed inventory id.
+        /// Separate from source so native SQLite error matching stays unchanged.
+        writer_identity: Option<(crate::storage::OperationId, u16)>,
         /// Closed writer phase (acquire, statement, commit, ...) when known;
         /// `None` for legacy boundaries that never recorded one. Distinct from
         /// [`OwnershipStage`].
@@ -296,12 +299,30 @@ impl Error {
         source: Self,
     ) -> Self {
         Self::Persistence {
+            writer_identity: None,
             operation,
             elapsed_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
             attempts: 1,
             phase: None,
             source: Box::new(source),
         }
+    }
+
+    /// Add typed, nonsecret writer identity to a persistence diagnostic without
+    /// wrapping or replacing its original typed source. Ordinary errors retain
+    /// their shape; operation, phase, outcome and retry predicates do not change.
+    pub fn with_writer_identity(
+        mut self,
+        operation_id: crate::storage::OperationId,
+        op_kind_id: u16,
+    ) -> Self {
+        if let Self::Persistence {
+            writer_identity, ..
+        } = &mut self
+        {
+            *writer_identity = Some((operation_id, op_kind_id));
+        }
+        self
     }
 
     /// Whether ownership BEGIN failed before acquiring a transaction with SQLITE_BUSY.
@@ -344,11 +365,13 @@ impl Error {
                 operation,
                 phase,
                 source,
+                writer_identity,
                 ..
             } => Self::Persistence {
                 operation,
                 phase,
                 source,
+                writer_identity,
                 elapsed_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
                 attempts: count,
             },
@@ -459,4 +482,30 @@ impl Error {
 /// Constructs a typed public validation error from a safe category message.
 pub fn invalid(message: impl Into<String>) -> Error {
     Error::Validation(message.into())
+}
+
+#[cfg(test)]
+mod writer_identity_tests {
+    use super::*;
+    /// Safe identity metadata cannot broaden or remove the existing proven
+    /// ownership-BEGIN contention retry; numeric totals stay replaceable.
+    #[test]
+    fn identity_metadata_preserves_safe_retry_predicate() {
+        let busy = Error::Sql(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("private source".into()),
+        ));
+        let error = Error::persistence(
+            PersistenceOperation::OwnershipAcquire,
+            std::time::Duration::from_millis(1),
+            busy,
+        );
+        assert!(error.retryable_ownership_acquire());
+        let error = error
+            .with_writer_identity(crate::storage::OperationId::new("fixture", 1), 1)
+            .persistence_totals(std::time::Duration::from_millis(3), 2);
+        assert!(error.retryable_ownership_acquire());
+        assert_eq!(error.persistence_attempts(), 2);
+        assert!(!error.public().message.contains("private source"));
+    }
 }

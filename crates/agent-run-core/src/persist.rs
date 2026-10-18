@@ -72,6 +72,7 @@ pub fn into_result<O: DeserializeOwned>(result: SubmitResult) -> Result<O> {
         SubmitResult::Committed(receipt) => receipt.output(),
         SubmitResult::Rejected(rejection) => Err(rejection.into_error()),
         SubmitResult::NotEnqueued(reason) => Err(Error::Persistence {
+            writer_identity: None,
             operation: PersistenceOperation::WriterApply,
             elapsed_ms: 0,
             attempts: 1,
@@ -81,6 +82,7 @@ pub fn into_result<O: DeserializeOwned>(result: SubmitResult) -> Result<O> {
             )),
         }),
         SubmitResult::Unknown(cause) => Err(Error::Persistence {
+            writer_identity: None,
             operation: PersistenceOperation::WriterApply,
             elapsed_ms: 0,
             attempts: 1,
@@ -124,6 +126,10 @@ pub fn into_result_totals<O: DeserializeOwned>(
             .map_err(|error| error.persistence_totals(totals.elapsed, totals.attempts.max(1))),
         other => into_result(other),
     }
+    .map_err(|error| match &totals.identity {
+        Some((id, kind)) => error.with_writer_identity(id.clone(), *kind),
+        None => error,
+    })
 }
 
 /// Whether `result` leaves the operation's durability genuinely unknown.

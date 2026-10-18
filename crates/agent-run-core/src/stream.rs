@@ -1135,6 +1135,13 @@ pub async fn run(
                             if emitted.len() + text.len() > verify::MAX_ANSWER {
                                 return Err(invalid("stream output exceeds answer bound"));
                             }
+                            // Some Claude-compatible providers omit message_start.
+                            // Establish identity before the first fragment, then
+                            // retain it through a late full-message native id.
+                            if message_id.is_none() {
+                                fallback_messages += 1;
+                                message_id = Some(format!("stream-message-{fallback_messages}"));
+                            }
                             saw_delta = true;
                             saw_answer = true;
                             emitted.push_str(text);

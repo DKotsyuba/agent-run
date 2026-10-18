@@ -62,6 +62,46 @@ pub struct QueuedWriter {
     epoch: u64,
     /// Nonblocking readiness mirror of application-level degradation.
     degraded: Arc<AtomicBool>,
+    /// Bounded nonblocking diagnostics, separate from serialized SQL metadata.
+    progress: Arc<Mutex<OperationProgress>>,
+}
+
+/// At most one current and one finished callback; no unbounded metric labels.
+#[derive(Default)]
+struct OperationProgress {
+    /// Current typed callback and its monotonic start.
+    current: Option<(agent_run_domain::storage::WriterTiming, Instant)>,
+    /// Finished callback timing, never an inferred commit result.
+    last: Option<agent_run_domain::storage::WriterTiming>,
+}
+
+/// Restore only disposable telemetry after poison; no business/queue state is
+/// reset. Missing observations remain unknown and never certify readiness.
+fn progress_lock(
+    progress: &Mutex<OperationProgress>,
+) -> std::sync::MutexGuard<'_, OperationProgress> {
+    progress.lock().unwrap_or_else(|poison| {
+        let mut state = poison.into_inner();
+        *state = OperationProgress::default();
+        progress.clear_poison();
+        state
+    })
+}
+
+/// Callback-owned observation survives caller cancellation and clears on panic.
+struct OperationObservation {
+    /// Shared small state, never held across SQL or await.
+    progress: Arc<Mutex<OperationProgress>>,
+}
+impl Drop for OperationObservation {
+    /// Finish timing only when the actual callback leaves, including unwind.
+    fn drop(&mut self) {
+        let mut progress = progress_lock(&self.progress);
+        if let Some((mut timing, started)) = progress.current.take() {
+            timing.execution_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            progress.last = Some(timing);
+        }
+    }
 }
 
 impl StoreWriter<'static> {
@@ -94,11 +134,55 @@ impl StoreWriter<'static> {
             producers: Arc::default(),
             epoch,
             degraded,
+            progress: Arc::default(),
         })
     }
 }
 
 impl QueuedWriter {
+    /// Observe one current/last typed operation without waiting for SQL.
+    /// Current execution time is monotonic; history is bounded to one callback.
+    pub fn timing(
+        &self,
+    ) -> (
+        Option<agent_run_domain::storage::WriterTiming>,
+        Option<agent_run_domain::storage::WriterTiming>,
+    ) {
+        let progress = progress_lock(&self.progress);
+        let current = progress.current.as_ref().map(|(timing, started)| {
+            let mut timing = timing.clone();
+            timing.execution_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            timing
+        });
+        (current, progress.last.clone())
+    }
+
+    /// Queue a typed callback with an exact safe identity. The observation is
+    /// owned by actual SQL execution, not by this cancellable caller future.
+    async fn execute_observed<R: Send + 'static>(
+        &self,
+        weight: usize,
+        producer: ProducerGuard,
+        prune: bool,
+        identity: (OpKindRef, OperationId),
+        work: impl FnOnce(&mut StoreWriter<'_>) -> Result<R> + Send + 'static,
+    ) -> std::result::Result<R, CallError<Error>> {
+        let progress = self.progress.clone();
+        let queued = Instant::now();
+        self.execute(weight, Some(producer), prune, move |writer| {
+            let timing = agent_run_domain::storage::WriterTiming {
+                operation_id: identity.1,
+                op_kind: identity.0.name().into(),
+                queue_wait_ms: queued.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                execution_ms: 0,
+            };
+            progress_lock(&progress).current = Some((timing, Instant::now()));
+            let _observation = OperationObservation { progress };
+            work(writer)
+        })
+        .await
+    }
+
     /// This incarnation's immutable durable writer epoch.
     pub fn epoch(&self) -> u64 {
         self.epoch
@@ -258,8 +342,9 @@ impl QueuedWriter {
             Err(reason) => return SubmitResult::NotEnqueued(reason),
         };
         let weight = envelope.encoded_len().saturating_add(1024);
+        let identity = (envelope.kind(), envelope.header().operation_id.clone());
         match self
-            .execute(weight, Some(guard), false, move |writer| {
+            .execute_observed(weight, guard, false, identity, move |writer| {
                 if writer.degraded.is_some()
                     && writer.store.conn.is_autocommit()
                     && let Some(outcome) = writer.lookup_digest(
@@ -295,8 +380,9 @@ impl QueuedWriter {
             .saturating_mul(16)
             .saturating_add(1024);
         let prune = envelope.kind() == OpKindRef::PruneReceipts;
+        let identity = (envelope.kind(), envelope.header().operation_id.clone());
         match self
-            .execute(weight, Some(guard), prune, move |writer| {
+            .execute_observed(weight, guard, prune, identity, move |writer| {
                 if writer.degraded.is_some()
                     && writer.store.conn.is_autocommit()
                     && let Some(outcome) = writer.lookup_digest(
@@ -431,6 +517,7 @@ fn probe_failure(source: rusqlite::Error, phase: RejectStage, started: Instant) 
     let retryable = phase == RejectStage::Acquire
         && source.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy);
     let error = Error::Persistence {
+        writer_identity: None,
         operation: agent_run_domain::error::PersistenceOperation::WriterApply,
         elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         attempts: 1,

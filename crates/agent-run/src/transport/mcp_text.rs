@@ -718,6 +718,9 @@ struct PoolDeliveryTextView {
 /// Whole pool read page, with every log entry rendered by the shared formatter.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PoolPageTextView {
+    /// Broker hint for an empty explicit-mode page, never completion evidence.
+    #[serde(default)]
+    suspend_inference: bool,
     /// Stable target pool.
     pool_id: String,
     /// Optional validated read-time activity, independent of stored lifecycle.

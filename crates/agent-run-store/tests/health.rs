@@ -654,3 +654,118 @@ fn similarly_named_task_tools_remain_real_wait_sources() {
         );
     }
 }
+
+/// Current membership is a concrete event source, not proof that somebody will
+/// produce the event. All-idle/no-delivery is surfaced once without inference,
+/// voting or cancellation; the cached view exposes exact waiting actors/cursor.
+#[test]
+fn all_idle_pool_reports_one_stall_with_concrete_wait_source() {
+    let (_home, mut store, run) = running(PingPolicy::Observe);
+    store.conn.execute("INSERT INTO pools(id,request_namespace,request_id,request_sha256,goal,acceptance_json,state,roster_revision,created_at) VALUES('pool-20261018-000000-0123456789','ns','r',lower(hex(zeroblob(32))),'goal','[]','open',1,100)",[]).unwrap();
+    store.conn.execute("INSERT INTO pool_members(agent_id,pool_id,slot,name,role,personal_task,joined_roster_revision) VALUES(?,'pool-20261018-000000-0123456789',1,'Sol','implement','t',1)",[run.as_str()]).unwrap();
+    stalled(&mut store, &run);
+    let view = store.health_view(&run).unwrap().unwrap();
+    assert_eq!(view["reason"], "pool_progress_stalled");
+    assert_eq!(view["waiting_for"], "pool_entry_or_proposal");
+    assert_eq!(view["pool"]["members"][0]["agent_id"], run.as_str());
+    assert_eq!(models(&store, &run), 0);
+    let notices: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM worker_notifications", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    control(&mut store, &run, 461.0);
+    store.health_tick(&run, 520.0).unwrap();
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM worker_notifications", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        notices
+    );
+    assert_eq!(
+        store.get(&run).unwrap().status,
+        agent_run_domain::domain::Status::Running
+    );
+}
+
+/// A corrective pool message is not a new paid wake: idle, replacement and
+/// advanced-log cases refuse it before any native input is written.
+#[test]
+fn poll_guard_requires_same_active_attempt_and_pool_revision() {
+    let (_home, store, run) = running(PingPolicy::Observe);
+    store.conn.execute("INSERT INTO pools(id,request_namespace,request_id,request_sha256,goal,acceptance_json,state,roster_revision,created_at) VALUES('pool-20261018-000000-0123456789','ns','r',lower(hex(zeroblob(32))),'goal','[]','open',1,100)",[]).unwrap();
+    store.conn.execute("INSERT INTO pool_members(agent_id,pool_id,slot,name,role,personal_task,joined_roster_revision) VALUES(?,'pool-20261018-000000-0123456789',1,'Sol','implement','t',1)",[run.as_str()]).unwrap();
+    let mut payload = json!({"attempt_id":"attempt","pool_read_guard":0});
+    assert!(!store.pool_poll_guard_current(&run, &payload).unwrap());
+    store.worker_turn(&run, false, 102.0).unwrap();
+    assert!(store.pool_poll_guard_current(&run, &payload).unwrap());
+    payload["attempt_id"] = json!("foreign");
+    assert!(!store.pool_poll_guard_current(&run, &payload).unwrap());
+    payload["attempt_id"] = json!("attempt");
+    payload["pool_read_guard"] = json!(1);
+    assert!(!store.pool_poll_guard_current(&run, &payload).unwrap());
+}
+
+/// A failed control insert cannot strand an already-committed notice. Both
+/// durable intents roll back together; retry creates exactly one of each.
+#[test]
+fn pool_loop_notice_and_corrective_command_commit_atomically() {
+    let (_home, store, run) = running(PingPolicy::Observe);
+    store.conn.execute("INSERT INTO pools(id,request_namespace,request_id,request_sha256,goal,acceptance_json,state,roster_revision,created_at) VALUES('pool-20261018-000000-0123456789','ns','r',lower(hex(zeroblob(32))),'goal','[]','open',1,100)",[]).unwrap();
+    store.conn.execute("INSERT INTO pool_members(agent_id,pool_id,slot,name,role,personal_task,joined_roster_revision) VALUES(?,'pool-20261018-000000-0123456789',1,'Sol','implement','t',1)",[run.as_str()]).unwrap();
+    store.conn.execute_batch("CREATE TEMP TRIGGER refuse_guard BEFORE INSERT ON commands WHEN json_extract(NEW.payload_json,'$.pool_read_guard') IS NOT NULL BEGIN SELECT RAISE(ABORT,'fixture control insert refused'); END;").unwrap();
+    assert!(
+        store
+            .report_pool_read_loop(&run, "attempt", TOKEN, 0, 102.0)
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM worker_notifications", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM deliveries", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    store
+        .conn
+        .execute_batch("DROP TRIGGER refuse_guard")
+        .unwrap();
+    assert!(
+        store
+            .report_pool_read_loop(&run, "attempt", TOKEN, 0, 103.0)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .report_pool_read_loop(&run, "attempt", TOKEN, 0, 104.0)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM worker_notifications", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(store.conn.query_row("SELECT COUNT(*) FROM commands WHERE json_extract(payload_json,'$.pool_read_guard') IS NOT NULL",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    let payload:String=store.conn.query_row("SELECT payload_json FROM commands WHERE json_extract(payload_json,'$.pool_read_guard') IS NOT NULL",[],|r|r.get(0)).unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    let text = payload["text"].as_str().unwrap();
+    assert!(
+        text.contains("merely to suspend") && text.contains("truly done, blocked or failed"),
+        "waiting correction must not forbid a later legitimate finish"
+    );
+}

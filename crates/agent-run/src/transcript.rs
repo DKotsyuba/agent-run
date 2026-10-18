@@ -19,8 +19,9 @@
 //! the engine's `message.id` (or a per-boundary `stream-message-<n>`
 //! fallback when the engine omits it). Same-identity assistant rows are
 //! fragments of one message; a different identity starts a new item. Older
-//! rows without any `raw_ref` still join consecutively, and no text-matching
-//! heuristic is invented to split them.
+//! rows without known identity remain separate. Explicit native-history display
+//! reconstruction joins only an anchored full-message match, never a time/text
+//! heuristic; it imports no native text and never rewrites journal history.
 
 use serde_json::Value;
 
@@ -204,12 +205,13 @@ impl Renderer {
                         self.streamed_role = false;
                         self.identity = None;
                         self.name = None;
-                        self.standalone(
-                            role,
-                            message["name"].as_str(),
-                            message["content"].as_str().unwrap_or(""),
-                            emit,
-                        )?;
+                        let content = message["content"].as_str().unwrap_or("");
+                        let display = if role == "tool_result" {
+                            agent_run_domain::transcript::display_tool_text(content)
+                        } else {
+                            std::borrow::Cow::Borrowed(content)
+                        };
+                        self.standalone(role, message["name"].as_str(), &display, emit)?;
                     }
                 }
             }
@@ -525,5 +527,149 @@ mod tests {
         })
         .unwrap();
         assert_eq!(raw, "Hello\n");
+    }
+}
+
+/// Restore only display identities of anonymous Claude fragments, using an
+/// explicit native JSONL snapshot (at most 64 MiB). Every line must be complete
+/// JSON and every sessionId must agree. A known journal tail id anchors the
+/// group, and concatenated already-redacted journal text must equal the exact
+/// full native text. Missing/ambiguous ids, partial groups, redaction mismatch,
+/// role/attempt boundaries and unanchored text stay unchanged. No native text
+/// is copied into output, no journal is written, and this is not a continuation
+/// seal or proof of task completion. Returns the number of repaired messages.
+pub(crate) fn restore_claude_history(messages: &mut [Value], history: &[u8]) -> Result<usize> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let invalid = crate::error::invalid;
+    if history.len() > 64 * 1024 * 1024 || history.last() != Some(&b'\n') {
+        return Err(invalid(
+            "native history must be complete JSONL within 64 MiB",
+        ));
+    }
+    let text = std::str::from_utf8(history).map_err(|_| invalid("native history must be UTF-8"))?;
+    let mut session: Option<String> = None;
+    let mut native = BTreeMap::<String, String>::new();
+    let mut ambiguous = BTreeSet::new();
+    for line in text.lines().filter(|s| !s.trim().is_empty()) {
+        let row: Value =
+            serde_json::from_str(line).map_err(|_| invalid("malformed native history line"))?;
+        if let Some(id) = row.get("sessionId") {
+            let id = id
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| invalid("invalid native session identity"))?;
+            if session.as_deref().is_some_and(|old| old != id) {
+                return Err(invalid("native history mixes sessions"));
+            }
+            session = Some(id.into());
+        }
+        if row["type"] != "assistant" {
+            continue;
+        }
+        let Some(id) = row["message"]["id"].as_str().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let Some(blocks) = row["message"]["content"].as_array() else {
+            continue;
+        };
+        let full = blocks
+            .iter()
+            .filter(|b| b["type"] == "text")
+            .filter_map(|b| b["text"].as_str())
+            .collect::<String>();
+        if native.get(id).is_some_and(|old| old != &full) {
+            ambiguous.insert(id.to_owned());
+        }
+        native.insert(id.into(), full);
+    }
+    if session.is_none() {
+        return Err(invalid("native history has no session identity"));
+    }
+    let mut start = 0;
+    let mut repaired = 0;
+    while start < messages.len() {
+        if messages[start]["role"] != "assistant" || messages[start]["raw_ref"].is_string() {
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        while end + 1 < messages.len() && !messages[end]["raw_ref"].is_string() {
+            let next = &messages[end + 1];
+            let first = &messages[start];
+            if next["role"] != "assistant"
+                || next["starts_block"] == true
+                || [
+                    "name",
+                    "agent_id",
+                    "run_id",
+                    "attempt_id",
+                    "error",
+                    "error_source",
+                ]
+                .iter()
+                .any(|k| next[*k] != first[*k])
+            {
+                break;
+            }
+            end += 1;
+        }
+        if let Some(id) = messages[end]["raw_ref"].as_str().map(str::to_owned)
+            && !ambiguous.contains(&id)
+            && let Some(full) = native.get(&id)
+        {
+            let joined = messages[start..=end]
+                .iter()
+                .filter_map(|m| m["content"].as_str())
+                .collect::<String>();
+            let intact = messages[start..=end]
+                .iter()
+                .all(|m| m["content_complete"] != false && m["omitted_bytes"].is_null());
+            if intact && &joined == full {
+                for row in &mut messages[start..end] {
+                    row["raw_ref"] = Value::String(id.clone());
+                }
+                repaired += 1;
+            }
+        }
+        start = end + 1;
+    }
+    Ok(repaired)
+}
+
+#[cfg(test)]
+mod native_reconstruction_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Known tail identity plus exact full native content proves a boundary.
+    /// No history text is copied, ambiguous ids and unanchored rows never join.
+    #[test]
+    fn native_boundaries_require_exact_anchored_redacted_text() {
+        let history=b"{\"type\":\"assistant\",\"sessionId\":\"s\",\"message\":{\"id\":\"m\",\"content\":[{\"type\":\"text\",\"text\":\"Answer\"}]}}\n";
+        let original = vec![
+            json!({"role":"assistant","content":"An","raw_ref":null}),
+            json!({"role":"assistant","content":"swer","raw_ref":"m"}),
+        ];
+        let mut rows = original.clone();
+        assert_eq!(restore_claude_history(&mut rows, history).unwrap(), 1);
+        assert_eq!(rows[0]["raw_ref"], "m");
+        assert_eq!(rows[0]["content"], "An");
+        let mut redacted = original.clone();
+        redacted[0]["content"] = json!("[REDACTED]");
+        assert_eq!(restore_claude_history(&mut redacted, history).unwrap(), 0);
+        let mut unanchored = original.clone();
+        unanchored[1]["raw_ref"] = Value::Null;
+        assert_eq!(restore_claude_history(&mut unanchored, history).unwrap(), 0);
+        let mut boundary = original;
+        boundary[1]["starts_block"] = json!(true);
+        assert_eq!(restore_claude_history(&mut boundary, history).unwrap(), 0);
+        assert!(restore_claude_history(&mut [], b"{}\n").is_err());
+        assert!(
+            restore_claude_history(
+                &mut [],
+                b"{\"sessionId\":\"s\"}\n{\"sessionId\":\"other\"}\n"
+            )
+            .is_err()
+        );
     }
 }

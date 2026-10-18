@@ -808,6 +808,7 @@ fn read_page(
     let last_seq = entries.last().map(|entry| entry.seq);
     let page = json!({
             "pool_id": pool_id,
+            "log_revision":tx.query_row("SELECT COALESCE(MAX(seq),0) FROM pool_entries WHERE pool_id=?",[pool_id],|r|r.get::<_,i64>(0))?,
             "entries": entries,
             "after_seq": after_seq,
             "before_seq": before_seq,

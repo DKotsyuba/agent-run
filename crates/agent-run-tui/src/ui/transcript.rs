@@ -382,7 +382,8 @@ impl ResultMemo {
     /// (`error`), never from the content text.
     fn push(&mut self, message: &MessageView) {
         self.processed += message.content.len();
-        let clean = self.sanitizer.push(&message.content);
+        let display = agent_run_domain::transcript::display_tool_text(&message.content);
+        let clean = self.sanitizer.push(&display);
         if !clean.is_empty() {
             self.nonempty = true;
             self.trailing_newline = clean.ends_with('\n');
@@ -1284,7 +1285,7 @@ fn concat_results(results: &[&MessageView]) -> String {
     for result in results {
         joined.push_str(&result.content);
     }
-    joined
+    agent_run_domain::transcript::display_tool_text(&joined).into_owned()
 }
 
 /// Builds a tool row's right side within `width` terminal cells. Native
@@ -1433,7 +1434,8 @@ fn tool_args(message: &MessageView) -> Vec<(String, String)> {
 
 /// The full payload lines of one result body, pretty-printed when JSON.
 fn payload_lines(content: &str) -> Vec<String> {
-    let content = agent_run::transcript::sanitize(content);
+    let display = agent_run_domain::transcript::display_tool_text(content);
+    let content = agent_run::transcript::sanitize(&display);
     match serde_json::from_str::<serde_json::Value>(&content) {
         Ok(value) => serde_json::to_string_pretty(&value)
             .unwrap_or(content)
@@ -1806,6 +1808,9 @@ fn render_header(f: &mut Frame, app: &App, buffer: &TranscriptBuffer, split: boo
             if warn { theme::warning() } else { theme::dim() },
         ));
     }
+    if let Some(label) = super::health_label(agent) {
+        meta.push(Span::styled(format!("  {label}"), theme::warning()));
+    }
     if let Some(failure) = &agent.failure_text {
         meta.push(Span::raw(" "));
         meta.push(Span::styled(truncate_one(failure, 80), theme::failure()));
@@ -1947,6 +1952,17 @@ mod tests {
             }
         }
         serde_json::from_value(base).unwrap()
+    }
+
+    /// MCP block arrays display their text without upgrading unknown status.
+    #[test]
+    fn mcp_result_preview_is_text_and_keeps_unknown_evidence() {
+        let mut memo = ResultMemo::default();
+        memo.push(&view(
+            serde_json::json!({"content":r#"[{"type":"text","text":"pool has no new entries"}]"#}),
+        ));
+        assert_eq!(memo.summary(), "pool has no new entries");
+        assert_eq!(memo.error, None);
     }
 
     /// Failure dominates mixed chunks; success requires every chunk to report

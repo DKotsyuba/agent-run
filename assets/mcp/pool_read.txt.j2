@@ -35,3 +35,6 @@ page complete in this direction; this does not imply a finished pool
 {% else %}
 next cursor: {{ next_cursor }} — request the next page with {% if before_seq %}before_seq{% else %}after_seq{% endif %}={{ next_cursor }}
 {% endif %}
+{% if suspend_inference %}
+No new owned pool event. End this inference turn and wait for a pushed entry on the same session. Do not poll or sleep; do not finish the logical run merely to wait. If no actor can produce the required event, report the concrete blocker once.
+{% endif %}

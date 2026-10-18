@@ -231,6 +231,8 @@ pub struct Service {
     /// Producer lanes of the resident writer; `None` until the broker attaches
     /// its writer (a service without one cannot mutate durable state).
     writer: Option<BrokerWriter>,
+    /// Bounded empty-read episodes shared by service clones; no credential data.
+    pub(crate) pool_reads: Arc<std::sync::Mutex<crate::dispatch::PoolReadGuards>>,
 }
 /// One immutable configuration revision retained between service calls.
 #[derive(Clone)]
@@ -300,15 +302,35 @@ impl Query {
     }
 }
 impl Service {
+    /// Borrow bounded advisory read counters. Poison discards and restores the
+    /// entire hint cache; durable notices still deduplicate corrective input.
+    /// This cache never authenticates a call or authorizes native work.
+    pub(crate) fn pool_read_guards(
+        &self,
+    ) -> std::sync::MutexGuard<'_, crate::dispatch::PoolReadGuards> {
+        self.pool_reads.lock().unwrap_or_else(|poison| {
+            let mut state = poison.into_inner();
+            *state = crate::dispatch::PoolReadGuards::default();
+            self.pool_reads.clear_poison();
+            state
+        })
+    }
+
+    /// Nonblocking writer queue and exact current/last callback observations.
+    /// Absent on client-only services; never opens a database or mutates state.
+    pub fn writer_health(&self) -> Option<agent_run_domain::storage::WriterHealth> {
+        self.writer.as_ref().map(|writer| writer.handle().health())
+    }
+
     /// Creates a service whose configuration is loaded lazily on first use.
-    ///
-    /// Clones share one configuration cache. File access and validation errors
-    /// are returned by [`Self::refresh_config`] or the operation using config.
+    /// Clones share one cache. File access and validation errors are returned
+    /// by [`Self::refresh_config`] or the operation using configuration.
     pub fn new(home: PathBuf) -> Self {
         Self {
             home,
             config: Arc::new(RwLock::new(None)),
             writer: None,
+            pool_reads: Arc::default(),
         }
     }
 
@@ -818,6 +840,7 @@ impl Service {
                     &seats,
                     seat,
                     &original.task,
+                    original.explicit_finish,
                 )?;
                 if !pending.is_empty() {
                     start.task.push_str(&format!("\nExisting seats pending authenticated enrollment acknowledgement: {pending}. They retain their current work and deadline; do not assume they read the context until joined.\n"));
@@ -1142,6 +1165,7 @@ impl Service {
                     context.roster_revision + 1,
                     context.last_seq
                 ),
+                start.explicit_finish,
             )?;
             start.validate()?;
             let prepared = prepare_provider(&config, &revision, &catalog, start)?;

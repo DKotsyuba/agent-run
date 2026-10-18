@@ -109,3 +109,5 @@ long-running native work, replay/restart, paid-probe budget, frozen policy,
 operator/cancel races, clock causality, actual stream input and verified child
 group cleanup. Real model calls and installed-runtime qualification are separate;
 this source change neither publishes nor installs a release.
+
+See [reliability recovery](reliability-recovery.md) for native completion races, pool waiting, legacy transcript reconstruction and writer observations.

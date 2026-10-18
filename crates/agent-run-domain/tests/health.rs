@@ -81,8 +81,9 @@ fn health_reply_is_closed_and_bounded() {
     assert!(serde_json::from_value::<PingReply>(input).is_err());
 }
 
-/// Version three adds only the private reply; old v1/v2 catalogs keep their exact
-/// tool bytes and remain recognized, without falsely certifying a v2 health tool.
+/// v3 introduced the private reply and v4 declares polling-guard effects.
+/// Pin actual previous compiled ordinary/research fingerprints rather than
+/// deriving history from a newer catalog whose annotations have changed.
 #[test]
 fn health_catalog_preserves_legacy_and_research_grants() {
     use agent_run_domain::worker::*;
@@ -91,7 +92,18 @@ fn health_catalog_preserves_legacy_and_research_grants() {
             .iter()
             .any(|t| t["name"] == "health_reply")
     );
-    for research in [false, true] {
+    for (research, old2, old3) in [
+        (
+            false,
+            "a7ca2499ed9d72fa957780418d2bd45674db3ca9394b5d97fe0270012e6a3089",
+            "57ba0c3ed7f3a689488e78456180031c8ca1df57e8a62e43466f5d0c5549a212",
+        ),
+        (
+            true,
+            "6b2361e439c781a352e4fb578fe273727dc326c5bc5378854588b68620bd7f12",
+            "d8ffbe5925a0cb29b7d0ff1a0dcfeb3e5c610de586d3cb0fee40c1964d382a14",
+        ),
+    ] {
         let current = finish_tools_json(research);
         assert_eq!(
             current
@@ -105,8 +117,16 @@ fn health_catalog_preserves_legacy_and_research_grants() {
             .filter(|t| t["name"] != "health_reply")
             .collect();
         let digest = agent_run_domain::canonical::sha256_hex(&json!(old), true);
-        assert!(known_pool_catalog(2, &digest));
-        assert!(!known_pool_catalog(3, &digest));
-        assert!(known_pool_catalog(3, &finish_catalog_digest(research)));
+        assert!(
+            !known_pool_catalog(2, &digest),
+            "new effect hints are not an old v2 catalog"
+        );
+        assert!(known_pool_catalog(2, old2));
+        assert!(!known_pool_catalog(3, old2));
+        assert!(known_pool_catalog(3, old3));
+        assert!(known_pool_catalog(
+            FINISH_CATALOG_VERSION,
+            &finish_catalog_digest(research)
+        ));
     }
 }

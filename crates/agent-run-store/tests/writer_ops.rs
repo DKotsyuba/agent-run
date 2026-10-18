@@ -48,16 +48,16 @@ fn cancel_envelope(kind: &str) -> WriteEnvelope {
     .unwrap()
 }
 
-/// The inventory has 91 active rows with retired ids 54, 55 and 58 with stable, unique wire ids and
+/// The inventory has 92 active rows with retired ids 54, 55 and 58 with stable, unique wire ids and
 /// unique snake-case names, and rows 6, 49 and 79 are internal-only.
 #[test]
 fn inventory_is_closed_with_stable_unique_ids() {
     let all = OpKindRef::all();
-    assert_eq!(all.len(), 91);
+    assert_eq!(all.len(), 92);
     for (index, kind) in all.iter().enumerate() {
         assert_eq!(
             kind.wire_id() as usize,
-            (1..=94)
+            (1..=95)
                 .filter(|id| ![54, 55, 58].contains(id))
                 .nth(index)
                 .unwrap()
@@ -65,12 +65,12 @@ fn inventory_is_closed_with_stable_unique_ids() {
         assert_eq!(OpKindRef::from_wire_id(kind.wire_id()), Some(*kind));
     }
     assert_eq!(OpKindRef::from_wire_id(0), None);
-    assert_eq!(OpKindRef::from_wire_id(95), None);
+    assert_eq!(OpKindRef::from_wire_id(96), None);
     for retired in [54, 55, 58] {
         assert_eq!(OpKindRef::from_wire_id(retired), None);
     }
     let names: BTreeSet<_> = all.iter().map(|kind| kind.name()).collect();
-    assert_eq!(names.len(), 91);
+    assert_eq!(names.len(), 92);
     assert!(
         names
             .iter()
@@ -143,7 +143,16 @@ fn authority_matrix_confines_roles() {
     for role in [&cli, &collector, &supervisor] {
         assert!(!OpKindRef::AcceptHealthReply.permits(role));
     }
-    for kind in [OpKindRef::HealthTick, OpKindRef::AcceptHealthReply] {
+    assert_eq!(OpKindRef::ReportPoolReadLoop.wire_id(), 95);
+    assert!(OpKindRef::ReportPoolReadLoop.permits(&worker));
+    for role in [&cli, &collector, &supervisor, &WriteAuthority::Broker] {
+        assert!(!OpKindRef::ReportPoolReadLoop.permits(role));
+    }
+    for kind in [
+        OpKindRef::HealthTick,
+        OpKindRef::AcceptHealthReply,
+        OpKindRef::ReportPoolReadLoop,
+    ] {
         assert!(!kind.is_remote());
         assert_eq!(
             WriteEnvelope::from_wire(kind.wire_id(), b"{}")

@@ -96,6 +96,9 @@ struct Activity {
     ping_id: String,
     /// At most eight display-safe tool/cursor references.
     sources: Vec<Value>,
+    /// Read-time bounded pool wait evidence; never a promise peers will act.
+    #[serde(default)]
+    pool: Option<Value>,
 }
 
 impl Store<'_> {
@@ -182,6 +185,7 @@ impl Store<'_> {
                         format!("{}:{progress}", facts.attempt).as_bytes(),
                     ),
                     sources,
+                    pool: self.health_pool_wait(run)?,
                 });
             }
         }
@@ -329,7 +333,12 @@ impl Store<'_> {
                 );
             }
         } else if phase == "idle" && at - transition >= IDLE_GRACE && pending == 0 {
-            if !activity.is_some_and(|a| a.ready) {
+            let pool = activity.and_then(|a| a.pool.as_ref());
+            if pool.is_some_and(|p| p["stalled"] == true) {
+                state.reason = Some("pool_progress_stalled".into());
+            } else if pool.is_some_and(|p| p["active_peer_or_delivery"] == true) {
+                state.reason = None;
+            } else if !activity.is_some_and(|a| a.ready) {
                 state.reason = Some("native_observation_unavailable".into());
             } else if state.policy == PingPolicy::Recover
                 && control_alive
@@ -365,7 +374,20 @@ impl Store<'_> {
             });
         }
         if let Some(reason) = state.reason.as_deref() {
-            self.health_notice(run, &attempt, state.progress, reason, at)?;
+            let pool = state.activity.as_ref().and_then(|a| a.pool.as_ref());
+            // One representative reports a pool-wide stall. Peer facts are an
+            // observation, never authority to finish, vote, cancel or wake them.
+            if reason != "pool_progress_stalled"
+                || pool.is_some_and(|p| p["representative"] == run.as_str())
+            {
+                let episode = if reason == "pool_progress_stalled" {
+                    pool.and_then(|p| p["log_revision"].as_i64())
+                        .unwrap_or(state.progress)
+                } else {
+                    state.progress
+                };
+                self.health_notice(run, &attempt, episode, reason, at)?;
+            }
         }
         self.save_health(run, &attempt, at, &state)?;
         tx.commit()?;
@@ -523,9 +545,124 @@ impl Store<'_> {
         let control=state.control.as_ref()
 .map(|probe|self.health_command(probe.command).map(|(status,result,at)|json!({"state":status,"checked_at":at,"native_alive":result.and_then(|r|r["native_alive"].as_bool())}))).transpose()?;
         let model=state.model.as_ref().map(|probe|self.conn.query_row("SELECT json_extract(payload_json,'$.health_ping') FROM commands WHERE id=?",[probe.command],|r|r.get::<_,String>(0)).map(|id|json!({"ping_id":id,"requested_at":probe.at,"observation_closed":probe.closed,"reply":probe.reply}))).transpose()?;
+        let pool = state.activity.as_ref().and_then(|a| a.pool.clone());
         Ok(Some(
-            json!({"policy":state.policy,"state":if row.status.terminal(){"terminal"}else if state.reason.is_some(){"needs_attention"}else if model.is_some(){"checking"}else if idle&&pending>0{"waiting"}else{"observing"},"reason":state.reason,"waiting_for":if idle&&pending>0{Some("native_tool")}else{None},"activity_observed_at":observed_at,"pending_native_tools":pending,"waiting_sources":sources,"waiting_sources_more":more,"control":control,"model":model}),
+            json!({"pool":pool,"policy":state.policy,"state":if row.status.terminal(){"terminal"}else if state.reason.is_some(){"needs_attention"}else if model.is_some(){"checking"}else if idle&&pending>0{"waiting"}else{"observing"},"reason":state.reason,"waiting_for":if idle&&pending>0{Some("native_tool")}else if idle&&pool.is_some(){Some("pool_entry_or_proposal")}else{None},"activity_observed_at":observed_at,"pending_native_tools":pending,"waiting_sources":sources,"waiting_sources_more":more,"control":control,"model":model}),
         ))
+    }
+
+    /// Prepare concrete pool wait evidence off the writer: at most five current
+    /// members, their exact lineage tips, native phases, queued message count,
+    /// and the indexed durable-log watermark. No task/message bodies are read.
+    /// A membership alone never proves a useful event will be produced.
+    fn health_pool_wait(&self, run: &AgentId) -> Result<Option<Value>> {
+        let pool:Option<String>=self.conn.query_row("SELECT m.pool_id FROM pool_members m JOIN pools p ON p.id=m.pool_id WHERE m.replaced_by IS NULL AND p.state='open' AND (m.agent_id=?1 OR m.agent_id=(SELECT root_agent_id FROM agents WHERE id=?1)) LIMIT 1",[run.as_str()],|r|r.get(0)).optional()?;
+        let Some(pool) = pool else { return Ok(None) };
+        let (revision, last_at): (i64, Option<f64>) = self.conn.query_row(
+            "SELECT COALESCE(MAX(seq),0),MAX(created_at) FROM pool_entries WHERE pool_id=?",
+            [&pool],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let mut statement=self.conn.prepare("SELECT agent_id FROM pool_members WHERE pool_id=? AND replaced_by IS NULL ORDER BY agent_id LIMIT 6")?;
+        let roots = statement
+            .query_map([&pool], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if roots.len() > 5 {
+            return Err(Error::Integrity("pool wait roster exceeds bound".into()));
+        }
+        let mut peers = Vec::new();
+        let mut all_idle = !roots.is_empty();
+        let mut active = false;
+        let mut representative = None;
+        for root in roots {
+            let tip = crate::pool_log::tip_of(&self.conn, &root.parse()?)?;
+            let monitored:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM events e JOIN attempts t ON t.id=e.attempt_id WHERE e.agent_id=? AND e.kind='worker_ping_state_v1' AND t.ownership_active=1 AND t.finished_at IS NULL AND json_extract(e.data_json,'$.policy') IN ('observe','recover'))",[tip.as_str()],|r|r.get(0))?;
+            if representative.is_none() && monitored {
+                representative = Some(tip.to_string());
+            }
+            let (status,phase):(String,Option<String>)=self.conn.query_row("SELECT a.status,(SELECT l.phase FROM attempts t JOIN worker_lifecycle l ON l.attempt_id=t.id WHERE t.agent_id=a.id AND t.ownership_active=1 AND t.finished_at IS NULL ORDER BY t.number DESC LIMIT 1) FROM agents a WHERE a.id=?",[tip.as_str()],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            let queued:i64=self.conn.query_row("SELECT COUNT(*) FROM commands WHERE agent_id=? AND state IN ('pending','claimed') AND kind IN ('pool','steer') AND json_extract(payload_json,'$.health_ping') IS NULL",[tip.as_str()],|r|r.get(0))?;
+            all_idle &= status == "running" && phase.as_deref() == Some("idle") && queued == 0;
+            active |= (tip != *run && status == "running" && phase.as_deref() == Some("running"))
+                || queued > 0;
+            peers.push(json!({"agent_id":root,"execution_id":tip,"status":status,"phase":phase,"pending_messages":queued}));
+        }
+        Ok(Some(
+            json!({"pool_id":pool,"log_revision":revision,"last_entry_at":last_at,"members":peers,"representative":representative,"stalled":all_idle,"active_peer_or_delivery":active}),
+        ))
+    }
+
+    /// True only for the new explicit catalog which declares read-loop guard
+    /// side effects. Older frozen catalogs retain their original read contract.
+    /// The subsequent read/report still authenticates the actual bearer token.
+    pub fn pool_read_guard_enabled(&self, run: &AgentId, attempt: &str) -> Result<bool> {
+        let proof:Option<(u32,String)>=self.conn.query_row("SELECT c.pool_catalog_version,c.pool_catalog_digest FROM worker_capabilities c JOIN attempts t ON t.id=c.attempt_id WHERE c.attempt_id=?1 AND t.agent_id=?2 AND c.pool_catalog_version IS NOT NULL AND c.pool_catalog_digest IS NOT NULL",params![attempt,run.as_str()],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        Ok(self.get(run)?.request.explicit_finish
+            && proof.is_some_and(|(version, digest)| {
+                version == agent_run_domain::worker::FINISH_CATALOG_VERSION
+                    && agent_run_domain::worker::known_pool_catalog(version, &digest)
+            }))
+    }
+
+    /// Persist one fixed attention notice for an authenticated empty-read
+    /// episode, including unbound runs. The indexed pool revision is rechecked;
+    /// stale observations and duplicates return false without another notice.
+    /// Notice, guarded control intent and health reason commit atomically. This
+    /// performs no native I/O and cannot close, finish, vote or cancel a run.
+    pub fn report_pool_read_loop(
+        &self,
+        run: &AgentId,
+        attempt: &str,
+        token: &str,
+        revision: u64,
+        at: f64,
+    ) -> Result<bool> {
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
+        let auth = crate::worker::authenticate_attempt(&tx, run, attempt, token, at)?;
+        if !auth.is_some_and(|a| a.running)
+            || !self.pool_read_guard_enabled(run, attempt)?
+            || revision > i64::MAX as u64
+        {
+            return Err(invalid("invalid pool read-loop observation"));
+        }
+        let current:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM pool_members m JOIN pools p ON p.id=m.pool_id WHERE m.replaced_by IS NULL AND p.state='open' AND (m.agent_id=?1 OR m.agent_id=(SELECT root_agent_id FROM agents WHERE id=?1)) AND (SELECT COALESCE(MAX(seq),0) FROM pool_entries WHERE pool_id=p.id)=?2)",params![run.as_str(),revision as i64],|r|r.get(0))?;
+        if !current {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let number: i64 =
+            tx.query_row("SELECT number FROM attempts WHERE id=?", [attempt], |r| {
+                r.get(0)
+            })?;
+        let key = format!("health-{number}-{revision}-pool_empty_read_loop");
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM worker_notifications WHERE agent_id=? AND request_id=?)",
+            params![run.as_str(), key],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            self.health_notice(run, attempt, revision as i64, "pool_empty_read_loop", at)?;
+            self.health_enqueue(run,"steer",json!({"text":"Agent Run detected repeated empty reads of an unchanged pool log. End this inference turn now and await a new pushed pool entry on this same session. Do not call pool_read again without a new event. Do not finish or cancel merely to suspend. Resume the original task on the next owned event; use finish only when it is truly done, blocked or failed. Report any concrete external blocker once to the orchestrator.","attempt_id":attempt,"pool_read_guard":revision}),at)?;
+            if let Some(mut state) = self.health_snapshot(run, attempt)? {
+                state.reason = Some("pool_empty_read_loop".into());
+                self.save_health(run, attempt, at, &state)?;
+            }
+        }
+        tx.commit()?;
+        Ok(!exists)
+    }
+
+    /// A polling correction may steer only its exact still-running native turn
+    /// while the same pool log revision remains current. It must never wake an
+    /// idle model, a replacement attempt, a closing run or a newly advanced pool.
+    pub fn pool_poll_guard_current(&self, run: &AgentId, payload: &Value) -> Result<bool> {
+        let (Some(attempt), Some(revision)) = (
+            payload["attempt_id"].as_str(),
+            payload["pool_read_guard"].as_i64(),
+        ) else {
+            return Ok(false);
+        };
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM attempts t JOIN agents a ON a.id=t.agent_id JOIN worker_lifecycle l ON l.attempt_id=t.id JOIN pool_members m ON (m.agent_id=a.id OR m.agent_id=a.root_agent_id) JOIN pools p ON p.id=m.pool_id WHERE a.id=? AND t.id=? AND a.status='running' AND t.ownership_active=1 AND t.finished_at IS NULL AND l.phase='running' AND l.finish_json IS NULL AND m.replaced_by IS NULL AND p.state='open' AND (SELECT COALESCE(MAX(seq),0) FROM pool_entries WHERE pool_id=p.id)=?)",params![run.as_str(),attempt,revision],|r|r.get::<_,bool>(0))?)
     }
 
     /// Decode the current typed snapshot without silently replacing corrupt state.

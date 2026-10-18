@@ -178,7 +178,13 @@ fn python_cli_spec_command_surface_is_present() {
             "resume" => (&["--timeout"], &["--run-id", "--name"]),
             "transcript" => (
                 &[],
-                &["--run-id", "--view", "--tail-blocks", "--before-cursor"],
+                &[
+                    "--run-id",
+                    "--view",
+                    "--tail-blocks",
+                    "--before-cursor",
+                    "--native-history",
+                ],
             ),
             "bind" => (&[], &["--run-id", "--pool"]),
             "cancel" | "steer" | "answer" | "delivery status" => (&[], &["--run-id"]),

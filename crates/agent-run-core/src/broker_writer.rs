@@ -306,6 +306,16 @@ impl BrokerLane {
                     Ok(built) => built,
                     Err(error) => return rejected(&error),
                 };
+                totals.identity = Some(match &built {
+                    Built::Local(envelope) => (
+                        envelope.header().operation_id.clone(),
+                        envelope.kind().wire_id(),
+                    ),
+                    Built::Remote(envelope) => (
+                        envelope.header().operation_id.clone(),
+                        envelope.kind().wire_id(),
+                    ),
+                });
                 let mut uncertain: Option<UnknownCause> = None;
                 let mut backoff = Duration::from_millis(20);
                 loop {
