@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- fix(opencode): wait for the admitted model catalog to settle before starting a
+  session; cold catalog snapshots no longer reject an available model, while
+  exact provider/model and disabled-model checks remain mandatory
+
 ## 0.28.7
 
 - fix(codex): recognize pending background handles in fulfilled Promise results
