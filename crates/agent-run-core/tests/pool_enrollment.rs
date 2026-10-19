@@ -1276,3 +1276,91 @@ async fn unchanged_pool_settlement_does_not_reserve_wal_writer() {
         .unwrap();
     assert_settlement_uses_only_reads(&f, &pool);
 }
+
+/// Three empty explicit reads trigger one correction and notice; configured
+/// long-poll waits do not hold initial inference open. A real new entry clears
+/// backpressure. Everything runs through authenticated private dispatch.
+#[tokio::test]
+async fn explicit_empty_reads_report_once_and_rearm_on_new_entry() {
+    let f = Fixture::new(None, 4).await;
+    let pool = f
+        .service
+        .admit_pool(f.request("empty-guard", 1, None))
+        .await
+        .unwrap();
+    let mut store = agent_run_store::fixture::open(&f.root).unwrap();
+    store.conn.execute("UPDATE worker_capabilities SET pool_catalog_version=NULL,pool_catalog_digest=NULL,pool_catalog_observed_at=NULL WHERE attempt_id=?",[&f.attempt]).unwrap();
+    store
+        .register_worker_catalog(
+            &WorkerCatalogProof {
+                run_id: f.agent.clone(),
+                attempt_id: f.attempt.clone(),
+                token: f.token.clone(),
+                version: agent_run_domain::worker::FINISH_CATALOG_VERSION,
+                digest: agent_run_domain::worker::finish_catalog_digest(false),
+            },
+            agent_run_core::domain::now(),
+        )
+        .unwrap();
+    store
+        .begin_worker_lifecycle(&f.agent, &f.attempt, agent_run_core::domain::now())
+        .unwrap();
+    let call = |input: Value, token: String| json!({"run_id":f.agent,"attempt_id":f.attempt,"token":token,"tool":"pool_read","input":input});
+    let first = agent_run_core::dispatch::call(
+        &f.service,
+        agent_run_domain::worker::TOOL_METHOD,
+        call(json!({"after_seq":0}), f.token.clone()),
+    )
+    .await
+    .unwrap();
+    let revision = first["log_revision"].as_u64().unwrap();
+    let remaining = if first["entries"].as_array().unwrap().is_empty() {
+        2
+    } else {
+        3
+    };
+    for _ in 0..remaining {
+        let page = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            agent_run_core::dispatch::call(
+                &f.service,
+                agent_run_domain::worker::TOOL_METHOD,
+                call(
+                    json!({"after_seq":revision,"wait_seconds":25}),
+                    f.token.clone(),
+                ),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(page["entries"], json!([]));
+        assert_eq!(page["suspend_inference"], true);
+    }
+    assert_eq!(store.conn.query_row("SELECT COUNT(*) FROM worker_notifications WHERE agent_id=? AND request_id LIKE 'health-%-pool_empty_read_loop'",[f.agent.as_str()],|r|r.get::<_,i64>(0)).unwrap(),1);
+    assert_eq!(store.conn.query_row("SELECT COUNT(*) FROM commands WHERE agent_id=? AND json_extract(payload_json,'$.pool_read_guard') IS NOT NULL",[f.agent.as_str()],|r|r.get::<_,i64>(0)).unwrap(),1);
+    let held:String=store.conn.query_row("SELECT d.state FROM deliveries d JOIN worker_notifications n ON n.delivery_id=d.id WHERE n.agent_id=? AND n.request_id LIKE 'health-%-pool_empty_read_loop'",[f.agent.as_str()],|r|r.get(0)).unwrap();
+    assert_eq!(held, "waiting_binding");
+    let bad = agent_run_core::dispatch::call(
+        &f.service,
+        agent_run_domain::worker::TOOL_METHOD,
+        call(json!({"after_seq":revision}), "b".repeat(64)),
+    )
+    .await;
+    assert!(matches!(bad, Err(agent_run_domain::Error::Validation(_))));
+    let pool_id: agent_run_domain::pool::PoolId =
+        serde_json::from_value(pool["pool_id"].clone()).unwrap();
+    store
+        .pool_operator_post(&pool_id, "new-entry", "A concrete new event")
+        .unwrap()
+        .unwrap();
+    let next = agent_run_core::dispatch::call(
+        &f.service,
+        agent_run_domain::worker::TOOL_METHOD,
+        call(json!({"after_seq":revision}), f.token.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(!next["entries"].as_array().unwrap().is_empty());
+    assert_eq!(next["suspend_inference"], false);
+}

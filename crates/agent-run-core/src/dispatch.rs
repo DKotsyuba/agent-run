@@ -114,6 +114,15 @@ fn integration_sequence<'de, D: serde::Deserializer<'de>>(
 ) -> std::result::Result<Option<std::num::NonZeroU32>, D::Error> {
     std::num::NonZeroU32::deserialize(deserializer).map(Some)
 }
+/// Compatible socket liveness request; writer diagnostics are explicit so the
+/// historical empty request keeps its exact {ok:true} response shape.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Ping {
+    /// Opt in to bounded content-free current/last writer observations.
+    #[serde(default)]
+    writer_health: bool,
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 /// Private socket wait arguments; omission means wait without a client deadline.
@@ -262,8 +271,14 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
             Ok(Value::Array(tools()))
         }
         "ping" => {
-            let _: Empty = args(raw)?;
-            Ok(json!({"ok":true}))
+            let options: Ping = args(raw)?;
+            let mut value = json!({"ok":true});
+            if options.writer_health
+                && let Some(health) = service.writer_health()
+            {
+                value["writer"] = serde_json::to_value(health)?;
+            }
+            Ok(value)
         }
         "wait" => {
             let a: Wait = args(raw)?;
@@ -298,6 +313,56 @@ pub fn doc(topic: &str) -> Result<&'static str> {
     crate::doc::topic_text(topic)
 }
 
+/// Three empty forward reads of the same actual pool revision form one
+/// polling episode. Bounded process-local hints never grant authority; every
+/// read/report still authenticates its exact attempt in the store.
+#[derive(Default)]
+pub(crate) struct PoolReadGuards(std::collections::BTreeMap<String, (String, u64, u8, bool)>);
+impl PoolReadGuards {
+    /// Whether the prior episode needs bounded backpressure; cursor arguments
+    /// cannot reset this because the key is the actual durable log revision.
+    fn waiting(&self, key: &str) -> bool {
+        self.0.get(key).is_some_and(|v| v.2 >= 3)
+    }
+    /// Observe one authenticated forward page. Returns (guarded, needs report).
+    /// A failed report remains retryable until its durable acknowledgement.
+    /// New data/revision rearms; old attempts consume at most 256 small slots.
+    fn observe(&mut self, key: String, page: &Value) -> (bool, bool) {
+        if page["before_seq"].is_number() {
+            return (false, false);
+        }
+        if page["entries"].as_array().is_some_and(|v| !v.is_empty()) {
+            self.0.remove(&key);
+            return (false, false);
+        }
+        let Some(revision) = page["log_revision"].as_u64() else {
+            return (false, false);
+        };
+        let pool = page["pool_id"].as_str().unwrap_or("").to_owned();
+        if !self.0.contains_key(&key) && self.0.len() >= 256 {
+            self.0.pop_first();
+        }
+        let state = self
+            .0
+            .entry(key)
+            .or_insert((pool.clone(), revision, 0, false));
+        if state.0 != pool || state.1 != revision {
+            *state = (pool, revision, 0, false);
+        }
+        state.2 = state.2.saturating_add(1).min(3);
+        (state.2 >= 3, state.2 >= 3 && !state.3)
+    }
+    /// Mark only the observed revision after the writer acknowledged its
+    /// idempotent notice/control unit. A delayed old reply cannot mark new work.
+    fn reported(&mut self, key: &str, revision: u64) {
+        if let Some(state) = self.0.get_mut(key)
+            && state.1 == revision
+        {
+            state.3 = true;
+        }
+    }
+}
+
 /// Maximum seconds one private `pool_read` may hold for a new entry, kept
 /// below the broker socket's per-request deadline so the wait never outlives
 /// its transport.
@@ -321,6 +386,25 @@ async fn worker_tool_call(
         Ok(json!({"error": {"code": denial.code(), "message": denial.message()}}))
     };
     match tool {
+        WorkerTool::HealthReply => {
+            let input: agent_run_domain::health::PingReply = serde_json::from_value(call.input)
+                .map_err(|_| invalid("invalid health reply arguments"))?;
+            let duplicate = service
+                .lane("workers")?
+                .local_as(
+                    worker_authority(&call.run_id, &call.attempt_id),
+                    agent_run_store::ops::AcceptHealthReply {
+                        execution: call.run_id,
+                        attempt: call.attempt_id,
+                        token: call.token,
+                        input,
+                        at: crate::domain::now(),
+                    },
+                    BROKER_BUDGET,
+                )
+                .await?;
+            Ok(json!({"accepted":true,"duplicate":duplicate}))
+        }
         WorkerTool::Finish => {
             let input: agent_run_domain::worker::FinishRequest = serde_json::from_value(call.input)
                 .map_err(|_| invalid("invalid finish arguments"))?;
@@ -425,16 +509,27 @@ async fn worker_tool_call(
             request.validate()?;
             let after_seq = request.after_seq.unwrap_or(0).min(i64::MAX as u64);
             let limit = request.limit.unwrap_or(50);
+            let run = call.run_id.clone();
+            let attempt = call.attempt_id.clone();
+            let explicit = service
+                .read(move |store| store.pool_read_guard_enabled(&run, &attempt))
+                .await?;
+            let guard_key = format!("{}:{}", call.run_id, call.attempt_id);
+            let guarded = explicit && service.pool_read_guards().waiting(&guard_key);
             // The bounded optional wait: one short store probe per interval,
             // never a lock across awaits, ended by data, deadline or a
             // stopped attempt. A reverse page never waits.
             let deadline = tokio::time::Instant::now()
-                + Duration::from_secs_f64(
+                + Duration::from_secs_f64(if request.before_seq.is_some() {
+                    0.0
+                } else if explicit {
+                    if guarded { POOL_READ_WAIT_SECONDS } else { 0.0 }
+                } else {
                     request
                         .wait_seconds
                         .unwrap_or(0.0)
-                        .min(POOL_READ_WAIT_SECONDS),
-                );
+                        .min(POOL_READ_WAIT_SECONDS)
+                });
             loop {
                 let home = service.home.clone();
                 let (run_id, attempt_id, token) = (
@@ -483,7 +578,37 @@ async fn worker_tool_call(
             .await
             .map_err(|_| crate::Error::Runtime("worker pool read failed".into()))??;
             match page {
-                Ok(page) => Ok(page),
+                Ok(mut page) => {
+                    if explicit {
+                        let (guarded, first) =
+                            service.pool_read_guards().observe(guard_key.clone(), &page);
+                        page["suspend_inference"] =
+                            json!(guarded || page["entries"].as_array().is_some_and(Vec::is_empty));
+                        if first {
+                            let _newly_reported = service
+                                .lane("workers")?
+                                .local_as(
+                                    worker_authority(&call.run_id, &call.attempt_id),
+                                    agent_run_store::ops::ReportPoolReadLoop {
+                                        execution: call.run_id.clone(),
+                                        attempt: call.attempt_id.clone(),
+                                        token: call.token.clone(),
+                                        revision: page["log_revision"].as_u64().ok_or_else(
+                                            || invalid("pool page has no log revision"),
+                                        )?,
+                                        at: crate::domain::now(),
+                                    },
+                                    BROKER_BUDGET,
+                                )
+                                .await?;
+                            service.pool_read_guards().reported(
+                                &guard_key,
+                                page["log_revision"].as_u64().expect("validated above"),
+                            );
+                        }
+                    }
+                    Ok(page)
+                }
                 Err(reason) => denial(reason),
             }
         }
@@ -533,6 +658,43 @@ async fn register_catalog(service: &Service, proof: WorkerCatalogProof) -> Resul
                 )
                 .await?;
             Ok(json!({"registered":true}))
+        }
+    }
+}
+
+#[cfg(test)]
+mod pool_read_guard_tests {
+    use super::*;
+    /// Caller cursors cannot evade the guard. Actual new entries/revisions
+    /// rearm it, repeated reads emit one corrective episode, and reverse
+    /// pagination remains available without being mistaken for polling.
+    #[test]
+    fn empty_pool_reads_are_bounded_per_actual_revision() {
+        let mut guard = PoolReadGuards::default();
+        let mut page =
+            json!({"pool_id":"p","log_revision":41,"entries":[],"before_seq":null,"after_seq":41});
+        assert_eq!(guard.observe("attempt".into(), &page), (false, false));
+        page["after_seq"] = json!(999);
+        assert_eq!(guard.observe("attempt".into(), &page), (false, false));
+        assert_eq!(guard.observe("attempt".into(), &page), (true, true));
+        assert_eq!(
+            guard.observe("attempt".into(), &page),
+            (true, true),
+            "unacknowledged report remains retryable"
+        );
+        guard.reported("attempt", 41);
+        for _ in 0..100 {
+            assert_eq!(guard.observe("attempt".into(), &page), (true, false));
+        }
+        assert!(guard.waiting("attempt"));
+        page["entries"] = json!([{"seq":42}]);
+        page["log_revision"] = json!(42);
+        assert_eq!(guard.observe("attempt".into(), &page), (false, false));
+        assert!(!guard.waiting("attempt"));
+        page["entries"] = json!([]);
+        page["before_seq"] = json!(42);
+        for _ in 0..5 {
+            assert_eq!(guard.observe("attempt".into(), &page), (false, false));
         }
     }
 }

@@ -157,6 +157,16 @@
             }
           },
           "description": "Non-grant assertion on frozen selected MCP servers and exact unprefixed tools. Empty lists require server presence. Omitted or empty map adds no condition; null and duplicates are invalid."
+        },
+        "idle_ping": {
+          "type": "string",
+          "enum": [
+            "off",
+            "observe",
+            "recover"
+          ],
+          "default": "observe",
+          "description": "Frozen health policy: observe invokes no model; recover permits one model control turn per task-progress episode; off preserves explicit holds. No automatic cancellation."
         }
       },
       "required": [
@@ -742,6 +752,16 @@
                       }
                     },
                     "description": "Non-grant assertion on frozen selected MCP servers and exact unprefixed tools. Empty lists require server presence. Omitted or empty map adds no condition; null and duplicates are invalid."
+                  },
+                  "idle_ping": {
+                    "type": "string",
+                    "enum": [
+                      "off",
+                      "observe",
+                      "recover"
+                    ],
+                    "default": "observe",
+                    "description": "Frozen health policy: observe invokes no model; recover permits one model control turn per task-progress episode; off preserves explicit holds. No automatic cancellation."
                   }
                 },
                 "required": [
@@ -953,6 +973,16 @@
                     }
                   },
                   "description": "Non-grant assertion on frozen selected MCP servers and exact unprefixed tools. Empty lists require server presence. Omitted or empty map adds no condition; null and duplicates are invalid."
+                },
+                "idle_ping": {
+                  "type": "string",
+                  "enum": [
+                    "off",
+                    "observe",
+                    "recover"
+                  ],
+                  "default": "observe",
+                  "description": "Frozen health policy: observe invokes no model; recover permits one model control turn per task-progress episode; off preserves explicit holds. No automatic cancellation."
                 }
               },
               "required": [

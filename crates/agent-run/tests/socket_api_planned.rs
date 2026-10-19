@@ -535,6 +535,14 @@ async fn python_successful_tool_round_trip() {
         .await["result"],
         json!({"ok":true})
     );
+    let health = request(
+        &path,
+        json!({"jsonrpc":"2.0","id":20,"method":"ping","params":{"writer_health":true}}),
+    )
+    .await;
+    assert_eq!(health["result"]["ok"], true);
+    assert!(health["result"]["writer"]["accepted_jobs"].is_number());
+    assert!(health["result"]["writer"]["counters"].is_object());
     assert!(
         request(
             &path,

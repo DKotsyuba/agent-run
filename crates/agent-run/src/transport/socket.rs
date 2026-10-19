@@ -1050,7 +1050,19 @@ pub async fn serve_at_with_options(
             }
         }
     });
+    let checker = service.clone();
+    workers.spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if let Err(error) = checker.health_tick().await {
+                maintenance_diagnostic("health", "sweep", &error);
+            }
+        }
+    });
     let refresher = service.clone();
+
     let home = service.home.clone();
     spawn_delivery_loop(
         &mut workers,

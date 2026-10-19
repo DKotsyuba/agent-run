@@ -15,6 +15,7 @@ pub fn topic_text(topic: &str) -> Result<&'static str> {
         // Python composes this generated contract without the source file's
         // terminal newline, and the start tool embeds that exact text.
         "completion" => Ok(include_str!("../../../assets/operator_guide/completion.md").trim_end()),
+        "idle-ping" => Ok(include_str!("../../../docs/idle-ping.md")),
         "config" => Ok(include_str!("../../../assets/operator_guide/config.md")),
         "skills" => Ok(include_str!("../../../assets/operator_guide/skills.md")),
         "mcp-servers" => Ok(include_str!(
@@ -29,7 +30,7 @@ pub fn topic_text(topic: &str) -> Result<&'static str> {
             "../../../assets/operator_guide/troubleshoot.md"
         )),
         _ => Err(invalid(format!(
-            "unknown operator guide topic: {topic:?}; valid topics: completion, config, skills, mcp-servers, plugins, models, releases, migrations, storage, troubleshoot"
+            "unknown operator guide topic: {topic:?}; valid topics: completion, idle-ping, config, skills, mcp-servers, plugins, models, releases, migrations, storage, troubleshoot"
         ))),
     }
 }

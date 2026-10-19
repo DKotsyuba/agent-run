@@ -15,6 +15,8 @@ pub mod delivery;
 pub mod dispatch;
 pub mod doc;
 pub mod doctor;
+/// Attempt-owned service and model ping recovery.
+pub mod health;
 /// Session binding and per-turn context hooks shared by CLI hosts.
 pub mod hooks;
 pub mod housekeeping;

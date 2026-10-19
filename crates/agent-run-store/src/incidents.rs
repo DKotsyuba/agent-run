@@ -39,7 +39,9 @@ const PROOF_VERSION: u64 = 2;
 /// ownership category, SQLite/OS codes, the persistence operation (closed
 /// wire name, else `unknown`) and writer phase (closed label, else null),
 /// wait milliseconds (0..=86 400 000) and attempts (0..=1 000 000);
-/// out-of-range or malformed numbers become null.
+/// out-of-range or malformed numbers become null. Valid typed writer operation
+/// ids and closed inventory names are retained when present; missing historical
+/// fields remain absent so old immutable phase projections stay identical.
 ///
 /// The last phase is always the [`PROOF_PHASE`] observed at `at`, with details
 /// `{"version":2,"fingerprint":…,"evidence":{phase: details}}`. The fingerprint
@@ -221,6 +223,21 @@ fn failure_details(value: &Value) -> Value {
             .and_then(|phase| serde_json::to_value(phase).ok())
             .unwrap_or(Value::Null);
     let mut safe = json!({"version":1,"class":class,"stage":stage,"ownership_category":category,"operation":operation,"phase":phase});
+    // Add only new, strictly validated fields. Missing historical fields do
+    // not produce new null keys, preserving immutable old phase projections.
+    if let Some(id) = value["writer_operation_id"]
+        .as_str()
+        .and_then(|id| agent_run_domain::storage::OperationId::parse(id).ok())
+    {
+        safe["writer_operation_id"] = json!(id);
+    }
+    if let Some(kind) = value["writer_op_kind"].as_str().filter(|name| {
+        crate::ops::OpKindRef::all()
+            .iter()
+            .any(|kind| kind.name() == *name)
+    }) {
+        safe["writer_op_kind"] = json!(kind);
+    }
     for key in ["sqlite_extended_code", "os_code"] {
         safe[key] = value[key]
             .as_i64()

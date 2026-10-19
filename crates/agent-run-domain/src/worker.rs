@@ -14,7 +14,7 @@ pub const CATALOG_METHOD: &str = "worker/catalog";
 /// The reviewed version of the five-tool private pool-capable server contract.
 pub const POOL_CATALOG_VERSION: u32 = 1;
 /// Reviewed explicit-completion catalog; legacy pool/research catalogs stay v1.
-pub const FINISH_CATALOG_VERSION: u32 = 2;
+pub const FINISH_CATALOG_VERSION: u32 = 4;
 
 /// Fingerprints the actual embedded private catalog served by this binary.
 /// The digest includes schemas/effect hints, not runtime capability material.
@@ -135,9 +135,9 @@ pub struct FinishReceipt {
     pub duplicate: bool,
 }
 
-/// Adds completion only for an explicitly admitted worker. Legacy catalog
-/// bytes and digest stay unchanged; research retains its confined report tool.
-pub fn finish_tools_json(research: bool) -> Vec<Value> {
+/// Frozen v3 explicit catalog, including its read-only pool_read hint. Used
+/// only to verify historical v2/v3 proofs; never silently upgraded in storage.
+fn finish_tools_json_v3(research: bool) -> Vec<Value> {
     let mut tools = if research {
         research_tools_json()
     } else {
@@ -159,6 +159,16 @@ pub fn finish_tools_json(research: bool) -> Vec<Value> {
         }
     }
     tools.push(serde_json::json!({
+        "name":"health_reply",
+        "description":"Reply once to an exact agent-run/health-ping challenge using its ping_id and your current working, waiting or blocked state. The broker verifies actual task activity independently. This reply does not finish the task, create waiting work, change permissions or authorize cancellation. Continue the original task when possible; use finish only for its true final outcome.",
+        "annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},
+        "inputSchema":{"type":"object","additionalProperties":false,"required":["ping_id","state"],"properties":{
+            "ping_id":{"type":"string","pattern":"^[0-9a-f]{64}$"},
+            "state":{"type":"string","enum":["working","waiting","blocked"]}
+        }}
+    }));
+    tools.push(serde_json::json!({
+
         "name":"finish",
         "description":"End your current run with its final verified summary. Ending a turn only waits for notifications; it does not finish. Call only when done, blocked or failed. The summary is immutable. Retry exactly the same payload after an uncertain receipt; a different payload conflicts. The receipt acknowledges durable finish intent, not process cleanup or owner approval. Never include credentials.",
         "annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},
@@ -167,6 +177,23 @@ pub fn finish_tools_json(research: bool) -> Vec<Value> {
             "status":{"type":"string","enum":["done","blocked","failed"],"default":"done"}
         }}
     }));
+    tools
+}
+
+/// Current v4 catalog declares automatic empty-read protection truthfully:
+/// pool_read may emit a fixed attention notice and an active-turn correction.
+/// Legacy v1/v2/v3 bytes/digests remain separately recognized and unchanged.
+pub fn finish_tools_json(research: bool) -> Vec<Value> {
+    let mut tools = finish_tools_json_v3(research);
+    for tool in &mut tools {
+        if tool["name"] == "pool_read" {
+            tool["annotations"]["readOnlyHint"] = serde_json::json!(false);
+            let description = tool["description"].as_str().unwrap_or("");
+            tool["description"] = serde_json::json!(format!(
+                "{description} Repeated empty reads of an unchanged log trigger one durable attention notice and an active-turn corrective message, with bounded backpressure. This never finishes or cancels your logical run."
+            ));
+        }
+    }
     tools
 }
 
@@ -201,6 +228,21 @@ pub fn research_catalog_digest() -> String {
 pub fn known_pool_catalog(version: u32, digest: &str) -> bool {
     (version == POOL_CATALOG_VERSION
         && (digest == pool_catalog_digest() || digest == research_catalog_digest()))
+        || (version == 2
+            && [false, true].into_iter().any(|research| {
+                let old: Vec<_> = finish_tools_json_v3(research)
+                    .into_iter()
+                    .filter(|tool| tool["name"] != "health_reply")
+                    .collect();
+                crate::canonical::sha256_hex(&serde_json::json!(old), true) == digest
+            }))
+        || (version == 3
+            && [false, true].into_iter().any(|research| {
+                crate::canonical::sha256_hex(
+                    &serde_json::json!(finish_tools_json_v3(research)),
+                    true,
+                ) == digest
+            }))
         || (version == FINISH_CATALOG_VERSION
             && (digest == finish_catalog_digest(false) || digest == finish_catalog_digest(true)))
 }
@@ -385,6 +427,8 @@ pub const TOOL_METHOD: &str = "worker/call";
 pub enum WorkerTool {
     /// Declare this attempt's immutable final summary through its private capability.
     Finish,
+    /// Answer only a current attempt-owned liveness challenge.
+    HealthReply,
     /// Report a material finding to this run's orchestrator.
     Notify,
     /// Atomically save a report within frozen research workdir authority.
@@ -404,6 +448,7 @@ impl WorkerTool {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Finish => "finish",
+            Self::HealthReply => "health_reply",
             Self::Notify => "notify_orchestrator",
             Self::SaveReport => "save_report",
             Self::PoolPost => "pool_post",
@@ -417,6 +462,7 @@ impl WorkerTool {
     pub fn parse(name: &str) -> Option<Self> {
         [
             (Self::Finish.as_str(), Self::Finish),
+            (Self::HealthReply.as_str(), Self::HealthReply),
             (Self::Notify.as_str(), Self::Notify),
             (Self::SaveReport.as_str(), Self::SaveReport),
             (Self::PoolPost.as_str(), Self::PoolPost),
@@ -561,5 +607,46 @@ mod tests {
         );
         notice.message = "bad\0text".into();
         assert!(notice.render().is_err());
+    }
+}
+
+#[cfg(test)]
+mod completion_catalog_history_tests {
+    use super::*;
+    /// The previously admitted ordinary-worker v2 fingerprint stays
+    /// accepted. v3 preserves its old effect hints; v4 truthfully advertises
+    /// the new guard without changing any historical fingerprint.
+    #[test]
+    fn guarded_reads_preserve_v2_v3_catalog_fingerprints() {
+        assert!(known_pool_catalog(
+            2,
+            "a7ca2499ed9d72fa957780418d2bd45674db3ca9394b5d97fe0270012e6a3089"
+        ));
+        for research in [false, true] {
+            let old = finish_tools_json_v3(research);
+            let digest = crate::canonical::sha256_hex(&serde_json::json!(old), true);
+            assert_eq!(
+                digest,
+                if research {
+                    "d8ffbe5925a0cb29b7d0ff1a0dcfeb3e5c610de586d3cb0fee40c1964d382a14"
+                } else {
+                    "57ba0c3ed7f3a689488e78456180031c8ca1df57e8a62e43466f5d0c5549a212"
+                },
+                "previous compiled native catalog fingerprint must remain exact"
+            );
+            assert!(known_pool_catalog(3, &digest));
+            assert_ne!(digest, finish_catalog_digest(research));
+            assert_eq!(
+                old.iter().find(|t| t["name"] == "pool_read").unwrap()["annotations"]["readOnlyHint"],
+                true
+            );
+            assert_eq!(
+                finish_tools_json(research)
+                    .iter()
+                    .find(|t| t["name"] == "pool_read")
+                    .unwrap()["annotations"]["readOnlyHint"],
+                false
+            );
+        }
     }
 }

@@ -1,3 +1,5 @@
+/// Model-visible pending-handle evidence shared by fresh and resumed native turns.
+mod native_returns;
 use crate::commands;
 use crate::{
     Result,
@@ -859,6 +861,13 @@ pub async fn run(
     if let Some(effort) = &record.request.effort {
         turn_params["effort"] = json!(effort);
     }
+    // Capture the old rollout boundary before this attempt starts any tool.
+    // Raw response subscriptions are unavailable on native thread/resume.
+    let mut native_returns = record
+        .request
+        .explicit_finish
+        .then(|| native_returns::NativeReturns::open(home, &thread, &tid).ok())
+        .flatten();
     let response = process
         .rpc("turn/start", turn_params, Duration::from_secs(30))
         .await?;
@@ -891,6 +900,7 @@ pub async fn run(
     let mut tools_started = BTreeSet::new();
     let mut tools_completed = BTreeSet::new();
     let mut pending_jobs: BTreeMap<String, PendingNativeJob> = BTreeMap::new();
+    let mut return_gap_reported = false;
     let mut completed: BTreeMap<String, String> = BTreeMap::new();
     let mut final_answer: Option<String> = None;
     let mut usage = None;
@@ -969,6 +979,55 @@ pub async fn run(
             process.observing(store.flush()).await?;
         }
         let Some(event) = event else {
+            if closing_at.is_none()
+                && pending_jobs
+                    .values()
+                    .any(|job| job.kind == "commandExecution")
+            {
+                let turns = pending_jobs
+                    .values()
+                    .map(|job| job.turn.clone())
+                    .chain(std::iter::once(turn_id.clone()))
+                    .collect();
+                if native_returns
+                    .as_mut()
+                    .is_some_and(|history| history.refresh(&turns).is_err())
+                {
+                    native_returns = None;
+                }
+                if (native_returns.is_none()
+                    || (idle && native_returns.as_ref().is_some_and(|h| !h.ready())))
+                    && !return_gap_reported
+                {
+                    process
+                        .observing(store.event(
+                            &record.id,
+                            "native_tool_coverage_gap_v1",
+                            &json!({"source":"codex_pending_return"}),
+                        ))
+                        .await?;
+                    return_gap_reported = true;
+                }
+                let ambiguous = flush_native_jobs(
+                    process,
+                    store,
+                    record,
+                    &tid,
+                    &mut pending_jobs,
+                    native_returns.as_mut(),
+                )
+                .await?;
+                if ambiguous && !return_gap_reported {
+                    process
+                        .observing(store.event(
+                            &record.id,
+                            "native_tool_coverage_gap_v1",
+                            &json!({"source":"codex_reused_pending_handle"}),
+                        ))
+                        .await?;
+                    return_gap_reported = true;
+                }
+            }
             let started = tokio::time::Instant::now();
             for _ in 0..commands::COMMAND_PAGE_LIMIT {
                 if started.elapsed() >= Duration::from_secs_f64(commands::COMMAND_PAGE_SECONDS) {
@@ -983,6 +1042,11 @@ pub async fn run(
                 else {
                     break;
                 };
+                if crate::health::command(process, store, &record.id, (cid, &kind, &payload), idle)
+                    .await?
+                {
+                    continue;
+                }
                 if kind == "cancel" {
                     // App-server interruption is advisory.  Once the durable
                     // command is claimed, return to the supervisor so its
@@ -1330,6 +1394,35 @@ pub async fn run(
             && let Some(item) = owned_native_job(p, &tid, &pending_jobs)
         {
             let key = item["id"].as_str().expect("matched native item");
+            if item["type"] == "commandExecution" {
+                let job = pending_jobs.get_mut(key).expect("owned started item");
+                if job.completion.is_some() {
+                    continue;
+                }
+                let text = native_job_text(process, item);
+                process
+                    .observing(store.journal_with_error(
+                        &record.id,
+                        "tool_result",
+                        &text,
+                        Some("command"),
+                        Some(key),
+                        tool_error(item),
+                    ))
+                    .await?;
+                job.process_id = item["processId"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned);
+                // Preserve a bounded result until the caller's actual pending
+                // return is known; a PTY process identifier alone proves nothing.
+                let bounded = &text[..text.floor_char_boundary(text.len().min(4096))];
+                job.completion =
+                    Some(json!({"id":key,"type":"commandExecution","aggregatedOutput":bounded}));
+                tools_started.remove(key);
+                tools_completed.insert(key.to_owned());
+                continue;
+            }
             pending_jobs.remove(key);
             if idle || event_turn != Some(turn_id.as_str()) {
                 native_job_completion(
@@ -1339,6 +1432,7 @@ pub async fn run(
                     &tid,
                     event_turn.expect("owned turn"),
                     item,
+                    false,
                 )
                 .await?;
                 tools_started.remove(key);
@@ -1440,6 +1534,11 @@ pub async fn run(
                                 turn: turn_id.clone(),
                                 kind: item["type"].as_str().expect("supported kind").to_owned(),
                                 name: name.clone(),
+                                process_id: item["processId"]
+                                    .as_str()
+                                    .filter(|id| !id.is_empty())
+                                    .map(str::to_owned),
+                                completion: None,
                             },
                         );
                     }
@@ -1706,7 +1805,7 @@ fn finish_developer_instructions(config: &Value) -> Result<String> {
         _ => return Err(invalid("native developer instructions have invalid type")),
     };
     Ok(format!(
-        "{existing}\n\nAgent Run runtime completion contract: an inference turn is not the logical run. End the turn while an owned background job or message is pending; the supervisor keeps this run and native thread alive and delivers its completion as a new step. Do not poll or sleep solely to keep inference alive. Do not call finish(failed) merely to suspend, from empty initial job output or speculation about a lost handle. A valid execution session_id is pending work, not failure. Call the private finish tool only when the assigned work is truly done, blocked or failed, with its exact final summary. Keep every configured global and role permission, approval and secret-protection rule."
+        "{existing}\n\nAgent Run runtime completion contract: an inference turn is not the logical run. End the turn while an owned background job or message is pending; the supervisor keeps this run and native thread alive and delivers its completion as a new step. Do not poll or sleep solely to keep inference alive. Before waiting, report newly completed work to its requester through the existing pool or orchestrator tool. Name the concrete pending job or message and its responsible actor; if no such event can advance the task, report the blocker. A result observed by the supervisor does not prove it was delivered into your model context. Do not call finish(failed) merely to suspend, from empty initial job output or speculation about a lost handle. A valid execution session_id is pending work, not failure. Call the private finish tool only when the assigned work is truly done, blocked or failed, with its exact final summary. Keep every configured global and role permission, approval and secret-protection rule."
     ))
 }
 
@@ -1764,6 +1863,97 @@ struct PendingNativeJob {
     kind: String,
     /// Actual started tool name; a completion cannot rename it.
     name: String,
+    /// Native PTY identity, meaningful only with a model-visible pending return.
+    process_id: Option<String>,
+    /// Already journaled, redacted result capped at4096bytes, awaiting return proof.
+    completion: Option<Value>,
+}
+
+/// Read a terminal native item's output and apply the process's secret redactor.
+/// Missing output becomes empty text; structured MCP content is kept as JSON.
+fn native_job_text(process: &Process, item: &Value) -> String {
+    let text = item
+        .get("aggregatedOutput")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| item.pointer("/result/content").map(Value::to_string))
+        .or_else(|| {
+            item.pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
+    process.redact(&text)
+}
+
+/// Find overlapping native process handles within one exact origin turn.
+/// A returned handle must identify one owned started command. Reused or
+/// conflicting handles are unknown rather than a reason to wake the wrong job.
+/// Linear traversal plus ordered sets avoids a per-completion full map scan.
+fn ambiguous_native_handles(
+    pending: &BTreeMap<String, PendingNativeJob>,
+) -> BTreeSet<(String, String)> {
+    let mut seen = BTreeSet::new();
+    let mut ambiguous = BTreeSet::new();
+    for job in pending
+        .values()
+        .filter(|job| job.kind == "commandExecution")
+    {
+        if let Some(handle) = &job.process_id {
+            let key = (job.turn.clone(), handle.clone());
+            if !seen.insert(key.clone()) {
+                ambiguous.insert(key);
+            }
+        }
+    }
+    ambiguous
+}
+
+/// Queue each completed command once only after its matching pending return.
+/// Foreground results stay journaled without another model turn. A consumed
+/// rollout turn boundary retires unreturned completions; unavailable observation
+/// fails closed rather than guessing that every PTY command was asynchronous.
+/// All retained command text is already redacted and bounded by4096bytes.
+/// Returns true for ambiguous ownership; the caller reports that gap at most once.
+async fn flush_native_jobs(
+    process: &mut Process,
+    store: &mut Persist,
+    record: &Record,
+    thread: &str,
+    pending: &mut BTreeMap<String, PendingNativeJob>,
+    mut history: Option<&mut native_returns::NativeReturns>,
+) -> Result<bool> {
+    let ambiguous = ambiguous_native_handles(pending);
+    let ready = pending
+        .iter()
+        .filter_map(|(key, job)| {
+            let result = job.completion.as_ref()?;
+            let handle = job.process_id.as_deref()?;
+            (history
+                .as_deref()
+                .is_some_and(|h| h.pending(&job.turn, handle))
+                && !ambiguous.contains(&(job.turn.clone(), handle.to_owned())))
+            .then(|| {
+                (
+                    key.clone(),
+                    job.turn.clone(),
+                    handle.to_owned(),
+                    result.clone(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    for (key, turn, handle, result) in ready {
+        native_job_completion(process, store, record, thread, &turn, &result, true).await?;
+        if let Some(history) = history.as_deref_mut() {
+            history.consume(&turn, &handle);
+        }
+        pending.remove(&key);
+    }
+    pending.retain(|_, job| {
+        job.completion.is_none() || history.as_deref().is_some_and(|h| !h.closed(&job.turn))
+    });
+    Ok(!ambiguous.is_empty())
 }
 
 /// Match a terminal job against owned thread, origin turn, exact started
@@ -1783,6 +1973,10 @@ fn owned_native_job<'a>(
     if job.turn != turn
         || item.get("type")?.as_str()? != job.kind
         || tool_name(item)?.as_str() != job.name
+        || job
+            .process_id
+            .as_deref()
+            .is_some_and(|id| item["processId"].as_str() != Some(id))
         || !matches!(
             item.get("status")?.as_str()?,
             "completed" | "failed" | "declined"
@@ -1793,10 +1987,12 @@ fn owned_native_job<'a>(
     Some(item)
 }
 
-/// Journal an owned terminal native job and durably queue its bounded redacted
-/// result as an untrusted completion event. The caller verified pending item,
-/// thread and originating turn. Replayed receipts cannot enqueue twice; closing
-/// rejects new turns. Native identifiers are hashed, never diagnostic text.
+/// Queue an owned result as a bounded redacted untrusted completion event.
+/// The caller verifies item/thread/origin ownership and, for commands, an actual
+/// model-visible pending handle. `already_journaled` is true only for a deferred
+/// command's bounded redacted result; false journals the original MCP completion.
+/// Replayed receipts cannot enqueue twice; closing rejects new turns. Native
+/// identifiers are hashed, never diagnostic text.
 async fn native_job_completion(
     process: &mut Process,
     store: &mut Persist,
@@ -1804,6 +2000,7 @@ async fn native_job_completion(
     thread: &str,
     turn: &str,
     item: &Value,
+    already_journaled: bool,
 ) -> Result<()> {
     let key = item
         .get("id")
@@ -1811,28 +2008,25 @@ async fn native_job_completion(
         .ok_or_else(|| invalid("native completion has no item identity"))?;
     let name =
         tool_name(item).ok_or_else(|| invalid("native completion is not a supported job"))?;
-    let text = item
-        .get("aggregatedOutput")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| item.pointer("/result/content").map(Value::to_string))
-        .or_else(|| {
-            item.pointer("/error/message")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or_default();
-    let text = process.redact(&text);
-    process
-        .observing(store.journal_with_error(
-            &record.id,
-            "tool_result",
-            &text,
-            Some(&process.redact(&name)),
-            Some(key),
-            tool_error(item),
-        ))
-        .await?;
+    let text = if already_journaled {
+        item["aggregatedOutput"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    } else {
+        let text = native_job_text(process, item);
+        process
+            .observing(store.journal_with_error(
+                &record.id,
+                "tool_result",
+                &text,
+                Some(&process.redact(&name)),
+                Some(key),
+                tool_error(item),
+            ))
+            .await?;
+        text
+    };
     let digest = agent_run_domain::canonical::sha256_hex(
         &json!({"thread":thread,"turn":turn,"item":key}),
         true,
@@ -2125,6 +2319,8 @@ mod tests {
                 turn: "origin".into(),
                 kind: "commandExecution".into(),
                 name: "command".into(),
+                process_id: None,
+                completion: None,
             },
         )]);
         let valid = serde_json::json!({"threadId":"thread","turnId":"origin","item":{"id":"job","type":"commandExecution","status":"completed","exitCode":0}});

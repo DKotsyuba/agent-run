@@ -1147,6 +1147,7 @@ fn roles(config: &Config, home: &Path, findings: &mut Vec<Finding>) -> bool {
             display_name: None,
             read_roots: Vec::new(),
             explicit_finish: false,
+            idle_ping: Default::default(),
             output_schema: None,
             orchestrator: None,
             request_id: None,

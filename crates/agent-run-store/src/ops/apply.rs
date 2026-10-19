@@ -794,6 +794,7 @@ fn failure(
     let error = match error {
         error @ Error::Persistence { .. } => error,
         source => Error::Persistence {
+            writer_identity: None,
             operation: boundary(kind, phase),
             elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
             attempts: 1,
@@ -1582,6 +1583,7 @@ mod tests {
         assert_eq!(diag.phase, RejectStage::Statement);
         assert_eq!(diag.sqlite_extended, Some(19));
         let preserved = Error::Persistence {
+            writer_identity: None,
             operation: PersistenceOperation::OwnershipWrite,
             elapsed_ms: 7,
             attempts: 3,

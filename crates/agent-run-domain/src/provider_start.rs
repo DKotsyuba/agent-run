@@ -55,6 +55,12 @@ pub struct ProviderStartRequest {
     /// cannot replace an explicit false with the new-admission default.
     #[serde(default = "crate::worker::default_explicit_finish")]
     pub explicit_finish: bool,
+    /// Frozen health policy; recover explicitly authorizes bounded model probes.
+    #[serde(
+        default = "crate::health::observe",
+        skip_serializing_if = "crate::health::PingPolicy::is_observe"
+    )]
+    pub idle_ping: crate::health::PingPolicy,
     /// Existing output schema for supporting harnesses.
     #[serde(default)]
     pub output_schema: Option<serde_json::Map<String, serde_json::Value>>,
@@ -213,6 +219,7 @@ impl ProviderStartRequest {
             write: self.write,
             fast: self.fast,
             explicit_finish: self.explicit_finish,
+            idle_ping: self.idle_ping,
             effort: self.effort.clone(),
             display_name: self.display_name.clone(),
             read_roots: self.read_roots.clone(),

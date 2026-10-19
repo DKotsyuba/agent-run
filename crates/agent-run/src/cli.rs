@@ -97,6 +97,13 @@ pub trait CliService: Send + Sync {
     fn transcript_public(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
         self.transcript(id, cursor, limit)
     }
+    /// Read exact-execution rows with proven attempt boundaries. A service seam
+    /// lacking this evidence refuses historical reconstruction instead of guessing.
+    fn transcript_recovery(&self, _id: &AgentId, _cursor: i64, _limit: usize) -> Result<Value> {
+        Err(crate::Error::Unsupported(
+            "scoped transcript reader is unavailable".into(),
+        ))
+    }
     /// Reads typed transcript options. Historical service seams retain raw
     /// behavior; block readers must implement this method explicitly.
     fn transcript_options(
@@ -173,6 +180,10 @@ impl CliService for Service {
     }
     fn transcript(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
         Service::transcript(self, id, cursor, limit)
+    }
+    /// Read bounded recovery rows directly through the existing read-only store.
+    fn transcript_recovery(&self, id: &AgentId, cursor: i64, limit: usize) -> Result<Value> {
+        Store::open(&self.home)?.transcript_recovery(id, cursor, limit)
     }
     /// Reads raw or bounded blocks through the same public service validator.
     fn transcript_options(
@@ -398,6 +409,10 @@ pub enum Command {
         follow: bool,
         #[arg(long, conflicts_with = "follow")]
         full: bool,
+        /// Read-only reconstruction of legacy Claude fragments from an explicit
+        /// native JSONL file. Requires --full; raw journal remains unchanged.
+        #[arg(long, requires="full", conflicts_with_all=["follow","tail_blocks","before_cursor"])]
+        native_history: Option<PathBuf>,
         /// Output format; defaults to text on a terminal, JSON otherwise.
         #[arg(long, value_enum)]
         format: Option<TranscriptFormat>,
@@ -593,6 +608,9 @@ pub struct Start {
     /// Callback completion is the default; false selects legacy compatibility.
     #[arg(long, action=clap::ArgAction::Set, num_args=0..=1, default_value="true", default_missing_value="true")]
     pub explicit_finish: bool,
+    /// Observe without inference, opt into bounded model recovery, or pause probes.
+    #[arg(long, value_parser = ["off", "observe", "recover"], default_value = "observe")]
+    pub idle_ping: String,
     /// Compatibility only: complete on the native result instead of finish.
     #[arg(long, conflicts_with = "explicit_finish")]
     pub legacy_completion: bool,
@@ -1565,6 +1583,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                     "write": a.write,
                     "fast": a.fast,
                     "explicit_finish": a.explicit_finish && !a.legacy_completion,
+                    "idle_ping": a.idle_ping,
                     "effort": a.effort,
                     "read_roots": read_roots,
                     "output_schema": schema,
@@ -1823,6 +1842,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             before_cursor,
             follow,
             full,
+            native_history,
             format,
         } => {
             let agent_id = dependencies
@@ -1836,17 +1856,36 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 before_cursor,
             };
             query.validate()?;
+            if native_history.is_some()
+                && (!full
+                    || follow
+                    || cursor != 0
+                    || view != agent_run_domain::transcript::TranscriptView::Raw)
+            {
+                return Err(invalid(
+                    "native history reconstruction requires --full, raw view and cursor zero",
+                ));
+            }
             if view == agent_run_domain::transcript::TranscriptView::Blocks && (follow || full) {
                 return Err(invalid(
                     "blocks are bounded pages; --follow and --full require raw view",
                 ));
             }
             let page_at = |cursor| {
+                if native_history.is_some() {
+                    return dependencies.service.transcript_recovery(
+                        &agent_id,
+                        cursor,
+                        query.limit,
+                    );
+                }
                 let mut page = query.clone();
                 page.cursor = cursor;
-                dependencies
-                    .service
-                    .transcript_options(&agent_id, &page, run_id.is_none())
+                dependencies.service.transcript_options(
+                    &agent_id,
+                    &page,
+                    run_id.is_none() && native_history.is_none(),
+                )
             };
             // An explicit --format always wins; otherwise text is interactive
             // and JSON keeps piped consumers on the historical machine shape.
@@ -1873,11 +1912,32 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                     messages.extend(current["messages"].as_array().cloned().unwrap_or_default());
                     pages += 1;
                 }
+                let reconstruction = if let Some(path) = native_history.as_ref() {
+                    let parent = path
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .unwrap_or_else(|| std::path::Path::new("."));
+                    let name = path
+                        .file_name()
+                        .ok_or_else(|| invalid("native history needs a file name"))?;
+                    let bytes = agent_run_platform::fs::Dir::open(parent)?
+                        .read(std::path::Path::new(name), 64 * 1024 * 1024)?;
+                    let repaired =
+                        crate::transcript::restore_claude_history(&mut messages, &bytes)?;
+                    Some(
+                        json!({"source_sha256":agent_run_platform::fs::sha256(&bytes),"reconstructed_messages":repaired,"raw_journal_unchanged":true}),
+                    )
+                } else {
+                    None
+                };
                 if text {
                     renderer.page(&messages, &mut |line| (dependencies.text_output)(line))?;
                     renderer.finish(&mut |line| (dependencies.text_output)(line))?;
                 } else {
-                    let value = json!({"agent_id":agent_id,"messages":messages,"cursor":cursor,"next_cursor":null,"complete":true,"pages":pages});
+                    let mut value = json!({"agent_id":agent_id,"messages":messages,"cursor":cursor,"next_cursor":null,"complete":true,"pages":pages});
+                    if let Some(proof) = reconstruction {
+                        value["reconstruction"] = proof;
+                    }
                     (dependencies.output)(
                         &dependencies.service.public_run_result(&agent_id, value)?,
                     )?;

@@ -1521,3 +1521,51 @@ mod tests {
         }
     }
 }
+
+/// Compact first-party health label shared by session rows and transcript
+/// header. Unknown model/server strings are never rendered as authority; old
+/// runs without health retain their historical idle display.
+pub(crate) fn health_label(agent: &agent_run_domain::AgentView) -> Option<&'static str> {
+    if agent.status.terminal() {
+        return None;
+    }
+    let health = agent.health.as_ref()?;
+    match health["reason"].as_str() {
+        Some("pool_progress_stalled") => Some("pool stalled"),
+        Some("idle_without_wait_source" | "idle_without_wait_source_after_ping") => {
+            Some("no wake source")
+        }
+        Some("worker_blocked") => Some("blocked"),
+        Some("pool_empty_read_loop") => Some("empty read loop"),
+        Some(_) => Some("needs attention"),
+        None => match health["waiting_for"].as_str() {
+            Some("native_tool") => Some("waiting: native job"),
+            Some("pool_entry_or_proposal") => Some("waiting: pool event"),
+            _ => None,
+        },
+    }
+}
+
+#[cfg(test)]
+mod health_label_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Old rows retain their existing display; new sources and fixed broker
+    /// attention reasons are visible without rendering untrusted model prose.
+    #[test]
+    fn fixed_health_labels_distinguish_waiting_and_stall() {
+        let mut agent = crate::tests_support::agent_view(
+            "ag-20261018-000000-0123456789",
+            "ag-20261018-000000-0123456789",
+            "running",
+        );
+        assert_eq!(health_label(&agent), None);
+        agent.health = Some(json!({"waiting_for":"native_tool"}));
+        assert_eq!(health_label(&agent), Some("waiting: native job"));
+        agent.health = Some(json!({"reason":"pool_progress_stalled"}));
+        assert_eq!(health_label(&agent), Some("pool stalled"));
+        agent.health = Some(json!({"reason":"untrusted arbitrary text"}));
+        assert_eq!(health_label(&agent), Some("needs attention"));
+    }
+}

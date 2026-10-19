@@ -494,3 +494,43 @@ fn tool_counts_keep_failed_null_while_results_are_unknown() {
     assert_eq!(counted.unknown_results, Some(2));
     assert_eq!(counted.failed, None);
 }
+
+/// Recovery sees actual attempt boundaries across page cursors, whereas normal
+/// raw views retain anonymous block boundaries and their historical JSON shape.
+#[test]
+fn recovery_scope_is_explicit_and_independent_of_unknown_message_identity() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = agent(&mut store, &home);
+    store.message(&id, "assistant", "An", None, None).unwrap();
+    store
+        .message(&id, "assistant", "swer", None, Some("native-m"))
+        .unwrap();
+    store.conn.execute(
+        "INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at) VALUES(?,?,1,'running','{}',0)",
+        rusqlite::params![format!("{id}:1"), id.as_str()],
+    ).unwrap();
+    // The immutable journal permits an absent attempt and a later known scope;
+    // changing the synthetic row tests the projection without starting a runtime.
+    store
+        .conn
+        .execute(
+            "UPDATE messages SET attempt_id=? WHERE seq=2",
+            [format!("{id}:1")],
+        )
+        .unwrap();
+    let page = store.transcript_recovery(&id, 0, 1).unwrap();
+    assert_eq!(page["messages"][0]["scope_start"], true);
+    let page = store.transcript_recovery(&id, 1, 1).unwrap();
+    assert_eq!(page["messages"][0]["scope_start"], true);
+    store
+        .conn
+        .execute("UPDATE messages SET attempt_id=NULL WHERE seq=2", [])
+        .unwrap();
+    let page = store.transcript_recovery(&id, 1, 1).unwrap();
+    assert_eq!(page["messages"][0]["scope_start"], false);
+    assert_eq!(page["messages"][0]["starts_block"], true);
+    let raw = store.transcript(&id, 0, 100).unwrap();
+    assert!(raw["messages"][0].get("scope_start").is_none());
+    assert_eq!(raw["messages"][0]["raw_ref"], serde_json::Value::Null);
+}

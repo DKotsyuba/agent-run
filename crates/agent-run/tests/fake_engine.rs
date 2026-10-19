@@ -82,6 +82,7 @@ fn admit_runtime(home: &Path, runtime_name: &str, task: &str) -> AgentId {
         display_name: None,
         read_roots: vec![],
         explicit_finish: false,
+        idle_ping: Default::default(),
         output_schema: None,
         orchestrator: None,
         request_id: None,

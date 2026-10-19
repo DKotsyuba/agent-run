@@ -686,11 +686,26 @@ pub async fn run(
                 if tokio::time::Instant::now() >= deadline {
                     break;
                 }
-                let Some((cid, command, payload)) =
-                    process.observing(store.claim_command(&record.id)).await?
+                let Some((cid, command, payload)) = process
+                    .observing(store.claim_command_for_turn(
+                        &record.id,
+                        !record.request.explicit_finish || native_idle,
+                    ))
+                    .await?
                 else {
                     break;
                 };
+                if crate::health::command(
+                    process,
+                    store,
+                    &record.id,
+                    (cid, &command, &payload),
+                    native_idle,
+                )
+                .await?
+                {
+                    continue;
+                }
                 if command == "cancel" {
                     process
                         .observing(store.complete_command(
@@ -1119,6 +1134,13 @@ pub async fn run(
                         if let Some(text) = event.pointer("/delta/text").and_then(Value::as_str) {
                             if emitted.len() + text.len() > verify::MAX_ANSWER {
                                 return Err(invalid("stream output exceeds answer bound"));
+                            }
+                            // Some Claude-compatible providers omit message_start.
+                            // Establish identity before the first fragment, then
+                            // retain it through a late full-message native id.
+                            if message_id.is_none() {
+                                fallback_messages += 1;
+                                message_id = Some(format!("stream-message-{fallback_messages}"));
                             }
                             saw_delta = true;
                             saw_answer = true;

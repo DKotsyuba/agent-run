@@ -104,6 +104,11 @@ fn registry_matches_python_golden_field_by_field() {
                 "type":"boolean","default":true,
                 "description":"New admissions default to explicit callback completion: turn completion waits for events; only private finish ends the run. False selects legacy compatibility. No lifetime timeout."
             });
+            // Observation is free by default; only explicit recover admits model turns.
+            expected["inputSchema"]["properties"]["idle_ping"] = serde_json::json!({
+                "type":"string","enum":["off","observe","recover"],"default":"observe",
+                "description":"Frozen health policy: observe invokes no model; recover permits one model control turn per task-progress episode; off preserves explicit holds. No automatic cancellation."
+            });
         }
         extend_stable_identity(&mut expected);
         // Pin the exact descriptive delta; the frozen argument contract remains unchanged.

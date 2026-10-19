@@ -280,7 +280,10 @@ impl WriterHandle {
     /// Nonblocking aggregate FIFO snapshot; no fabricated class/reservation metrics.
     pub fn health(&self) -> WriterHealth {
         let snapshot = self.writer.snapshot();
+        let (current_operation, last_operation) = self.writer.timing();
         WriterHealth {
+            current_operation,
+            last_operation,
             epoch: self.writer.epoch(),
             admissions_open: !snapshot.closing
                 && !snapshot.poisoned

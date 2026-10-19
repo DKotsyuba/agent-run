@@ -693,6 +693,28 @@ mod tests {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
+    /// Known persistence categories must not fall back to an unknown failure
+    /// or turn a failed checkpoint write into a claim of lost process ownership.
+    #[test]
+    fn persistence_guidance_distinguishes_storage_and_process_proof() {
+        let (_, reason, advice) = super::guidance(
+            crate::domain::Status::Failed,
+            Some("runtime_storage_failed"),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(reason.contains("database writer"));
+        assert!(advice.contains("unknown write may have committed"));
+        let (_, reason, advice) = super::guidance(
+            crate::domain::Status::Failed,
+            Some("runtime_ownership_checkpoint_failed"),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(reason.contains("does not by itself prove"));
+        assert!(advice.contains("process identity separately"));
+    }
+
     /// A resumed notice exposes stable identity without moving its delivery lease.
     #[tokio::test]
     async fn resumed_notice_keeps_exact_run_and_stable_agent() {
