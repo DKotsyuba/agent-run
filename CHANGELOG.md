@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- fix(hooks): keep optional prompt context nonblocking for Codex and Claude,
+  preserve prepared context across failed or unknown persistence, and bound
+  read work without weakening binding or completion durability
+
 - fix(opencode): wait for the admitted model catalog to settle before starting a
   session; cold catalog snapshots no longer reject an available model, while
   exact provider/model and disabled-model checks remain mandatory

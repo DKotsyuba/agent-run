@@ -590,7 +590,14 @@ where
 fn order_at(home: &Path, at: f64) -> Result<Value> {
     let config = Config::load(home)?;
     let store = Store::open(home)?;
-    let series = history(&store, config.capacity.sample_retention)?;
+    order_from_store(&config, &store, at)
+}
+
+/// Ranks legacy routes at Unix seconds `at` using the caller's validated config
+/// and read-only store. Opens no connection and performs no writes; the caller
+/// owns snapshot and SQL deadline policy. Storage/validation errors propagate.
+pub(crate) fn order_from_store(config: &Config, store: &Store, at: f64) -> Result<Value> {
+    let series = history(store, config.capacity.sample_retention)?;
     let forecasts: BTreeMap<Key, Forecast> = series
         .iter()
         .map(|(k, s)| (k.clone(), forecast(k, s, at)))

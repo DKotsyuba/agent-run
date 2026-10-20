@@ -55,6 +55,33 @@ unusable samples have no displayed remaining percentage. It does not expose
 burn-rate, forecast, or pacing fields. Unknown means no usable known standing,
 not proof that a sample's validity timestamp expired.
 
+## Optional prompt context
+
+`hook context` is advisory for both `codex_queue` and `claude_uds`: an optional
+context failure never blocks a submitted prompt. If the state was read but its
+deduplication write fails or has an unknown outcome, the bounded prepared
+context is still injected. Repeated context is possible on that recovery path;
+normal successful writes retain changed-only injection. Independently readable
+components survive another component's failure. Unavailable data is not invented.
+
+SQL preparation has a 250 ms cooperative deadline; the whole context operation
+has a 750 ms budget, including at most 500 ms for its writer acknowledgement.
+`hook_context_unavailable` in the bounded CLI log records closed failure facts,
+not prompt/configuration text. An empty successful hook response alone is not
+proof that context works: verify a first injection and a deduplicated second one.
+
+Ordinary `context`, `hook bind`, start and completion retain their strict error
+and durability contracts. A context fallback never confirms notification binding.
+No hook migrates an incompatible store. After an accepted installation, project
+both external clients' hook commands from Crew against the same compatible
+sealed release; do not retain a separately pinned old context binary.
+
+For exact-payload qualification, set `AGENT_RUN_CONTEXT_TEST_BINARY` to the sealed
+candidate's `bin/agent-run`, then run the `context_hook_process` integration test
+with the project's approved temporary directories. These tests launch no model
+and use disposable homes. Native delivery additionally requires independent
+receiver evidence; Bridge custody alone is insufficient.
+
 ## Delivery binding
 
 The `PostToolUse` hook on `mcp__agent[-_]run__start` binds a session using

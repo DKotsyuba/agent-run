@@ -1205,3 +1205,43 @@ async fn cross_source_latch_survives_small_retention_and_releases_only_on_covera
         assert_ne!(status("m-a"), "exhausted", "{second:?}");
     }
 }
+
+/// Current schema-2 provider advice survives a missing writer, retains exact
+/// cached quota standing and privacy, then resumes normal per-session deduplication.
+#[tokio::test]
+async fn advisory_provider_context_survives_writer_failure_for_both_clients() {
+    use agent_run_core::hooks::context;
+    for transport in ["codex_queue", "claude_uds"] {
+        let home = home();
+        let reference = agent_run_domain::domain::OrchestratorRef {
+            transport: transport.into(),
+            external_session_id: "provider-context".into(),
+            external_turn_id: None,
+        };
+        let fallback = context::build_for_hook(home.path(), &reference, None)
+            .await
+            .unwrap();
+        assert!(fallback.injected);
+        assert!(fallback.text.starts_with("Provider capacity order"));
+        assert!(fallback.text.contains("\"glm-5.3\":available"));
+        for private in [
+            "private-codex-label",
+            "acct-codex",
+            "acct-glm",
+            "secret-glm",
+            "secret-codex",
+        ] {
+            assert!(!fallback.text.contains(private));
+        }
+        let writer = common::writer::Harness::start(home.path());
+        let _socket = writer.serve_unix(home.path());
+        let first = context::build_for_hook(home.path(), &reference, None)
+            .await
+            .unwrap();
+        assert_eq!(first.text, fallback.text);
+        let repeated = context::build_for_hook(home.path(), &reference, None)
+            .await
+            .unwrap();
+        assert!(!repeated.injected);
+    }
+}

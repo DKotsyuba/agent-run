@@ -1076,3 +1076,80 @@ async fn start_pool_receipt_binds_the_whole_pool_atomically() {
     )
     .is_err());
 }
+
+/// A failed independent SQL component cannot discard the available component;
+/// strict operator context still reports the storage failure rather than success.
+#[tokio::test]
+async fn advisory_context_preserves_independently_available_components() {
+    for broken_table in ["capacity_samples", "messages"] {
+        let home = common::Home::new();
+        let reference = OrchestratorRef {
+            transport: "claude_uds".into(),
+            external_session_id: "partial-context".into(),
+            external_turn_id: None,
+        };
+        active_agent(&home, &reference);
+        home.store()
+            .conn
+            .execute_batch(&format!("DROP TABLE {broken_table}"))
+            .unwrap();
+        let writer = common::writer::Harness::start(&home.path);
+        let _socket = writer.serve_unix(&home.path);
+        let result = context::build_for_hook(&home.path, &reference, None)
+            .await
+            .unwrap();
+        assert!(result.injected);
+        if broken_table == "capacity_samples" {
+            assert!(result.text.contains("Active agents (1)"));
+            assert!(!result.text.contains("Runtime priorities"));
+        } else {
+            assert!(result.text.contains("Runtime priorities"));
+            assert!(!result.text.contains("Active agents"));
+        }
+        assert!(context::build(&home.path, &reference, None).await.is_err());
+    }
+}
+
+/// A deliberately expensive read is interrupted by SQLite itself, preserving
+/// the active component without leaving a detached blocking worker behind.
+#[tokio::test]
+async fn advisory_context_bounds_sql_work_and_keeps_the_prepared_active_block() {
+    let home = common::Home::new();
+    let reference = OrchestratorRef {
+        transport: "codex_queue".into(),
+        external_session_id: "slow-context".into(),
+        external_turn_id: None,
+    };
+    active_agent(&home, &reference);
+    home.store()
+        .conn
+        .execute_batch(
+            "DROP TABLE capacity_samples;
+        CREATE VIEW capacity_samples AS WITH RECURSIVE n(x) AS
+        (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000000)
+        SELECT x AS id,'mock' AS runtime,'standard' AS lane,'window' AS window,
+        NULL AS target,'fixture' AS source,50 AS remaining_percent,
+        x AS observed_at,NULL AS reset_at,NULL AS valid_until FROM n;",
+        )
+        .unwrap();
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
+    let started = std::time::Instant::now();
+    let result = context::build_for_hook(&home.path, &reference, None)
+        .await
+        .unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert!(result.text.contains("Active agents (1)"));
+    assert!(!result.text.contains("Runtime priorities"));
+    assert_eq!(
+        home.store()
+            .conn
+            .query_row(
+                "SELECT count(*) FROM operation_receipts WHERE op_kind='record_context_components'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+}

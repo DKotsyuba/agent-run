@@ -1,6 +1,6 @@
 //! Operator CLI. Starts and resumes always go through the resident broker.
 use crate::{
-    Result, capacity,
+    Error, Result, capacity,
     config::{Adapter, Config},
     domain::{AgentId, OrchestratorRef},
     error::invalid,
@@ -1498,6 +1498,40 @@ pub fn doctor_invocation(arguments: &[std::ffi::OsString]) -> bool {
     false
 }
 
+/// Identifies only the leading `hook context` command before Clap validation,
+/// ignoring the current global home option. Extend this recognizer alongside
+/// any future global options. Task text, ordinary `context`, and `hook bind`
+/// never gain advisory handling. Parse failures of recognized context hooks
+/// remain validation failures in diagnostics, with a nonblocking process exit.
+pub fn context_hook_invocation(arguments: &[std::ffi::OsString]) -> bool {
+    let mut arguments = arguments.iter().skip(1);
+    let mut commands = Vec::new();
+    while let Some(argument) = arguments.next() {
+        if argument == "--home" {
+            arguments.next();
+        } else if argument
+            .to_str()
+            .is_some_and(|value| value.starts_with("--home="))
+        {
+            continue;
+        } else {
+            commands.push(argument);
+            if commands.len() == 2 {
+                return commands[0] == "hook" && commands[1] == "context";
+            }
+        }
+    }
+    false
+}
+
+/// Logs a context hook's final failure using closed metadata, including the
+/// read-only schema observation when available. Missing/invalid homes and
+/// unreadable metadata remain unknown; they never trigger initialization.
+pub fn log_context_failure(home: Option<&Path>, error: &Error) {
+    let version = home.and_then(|home| crate::migrate::stored_version(home).ok().flatten());
+    hooks::context::log_failure(error, version);
+}
+
 /// Executes one parsed command and returns its public process exit status.
 ///
 /// Success writes JSON except for the text guide, text transcript viewer and
@@ -1787,7 +1821,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 Hook::Context(transport) => {
                     let reference =
                         hooks::bind::normalize(&payload, false, &transport.transport)?.reference;
-                    let context = hooks::context::build(&home, &reference, None).await?;
+                    let context = hooks::context::build_for_hook(&home, &reference, None).await?;
                     let output = if context.injected && !context.text.trim().is_empty() {
                         json!({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":context.text}})
                     } else {
