@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.28.8
+
 - fix(hooks): keep optional prompt context nonblocking for Codex and Claude,
   preserve prepared context across failed or unknown persistence, and bound
   read work without weakening binding or completion durability
