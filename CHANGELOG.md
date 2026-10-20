@@ -14,6 +14,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   session; cold catalog snapshots no longer reject an available model, while
   exact provider/model and disabled-model checks remain mandatory
 
+- feat(integration): expose guarded native agent observations and the existing
+  pool tool surface with Bridge SDK 0.3.1; accept the optional separate
+  `delivery.bridge.observation_token_file` credential without a store migration
+
 ## 0.28.7
 
 - fix(codex): recognize pending background handles in fulfilled Promise results
