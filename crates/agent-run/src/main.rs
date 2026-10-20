@@ -2,10 +2,13 @@ use clap::{Parser, error::ErrorKind};
 
 /// Parses the CLI, preserving global errors while doctor uses 0/2/3 for
 /// passed checks, failed checks and invocation/report failures respectively.
+/// Optional context hook failures log safe diagnostics and emit an empty JSON
+/// response with exit 0. Binding and all ordinary commands remain strict.
 #[tokio::main]
 async fn main() {
     let arguments: Vec<_> = std::env::args_os().collect();
     let doctor = agent_run::cli::doctor_invocation(&arguments);
+    let advisory_context = agent_run::cli::context_hook_invocation(&arguments);
     let cli = match agent_run::cli::Cli::try_parse_from(arguments) {
         Ok(cli) => cli,
         Err(error)
@@ -17,6 +20,14 @@ async fn main() {
             let _ = error.print();
             std::process::exit(0);
         }
+        Err(_) if advisory_context => {
+            agent_run::cli::log_context_failure(
+                None,
+                &agent_run_domain::error::invalid("invalid context hook invocation"),
+            );
+            println!("{{}}");
+            std::process::exit(0);
+        }
         Err(error) => {
             eprintln!(
                 "{}",
@@ -25,8 +36,22 @@ async fn main() {
             std::process::exit(if doctor { 3 } else { 2 });
         }
     };
+    let home = if advisory_context {
+        agent_run_platform::fs::home(cli.home.clone()).ok()
+    } else {
+        None
+    };
+    if let Some(home) = &home {
+        agent_run_core::logging::configure(home, "cli");
+    }
     let code = match agent_run::cli::run(cli).await {
         Ok(code) => code,
+        Err(error) if advisory_context => {
+            use std::io::Write;
+            agent_run::cli::log_context_failure(home.as_deref(), &error);
+            let _ = writeln!(std::io::stdout(), "{{}}");
+            0
+        }
         Err(error) => {
             let public = error.public();
             let mut details = serde_json::json!({"type":public.kind,"message":public.message});

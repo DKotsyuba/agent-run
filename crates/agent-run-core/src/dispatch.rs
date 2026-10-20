@@ -97,6 +97,23 @@ struct Doc {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Empty {}
+/// Operator/service-only exact integration selection; null/zero is invalid.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Integration {
+    /// Stable lineage id or its retained historical alias.
+    agent_id: AgentId,
+    /// Positive execution receipt; omission pins the latest once.
+    #[serde(default, deserialize_with = "integration_sequence")]
+    sequence: Option<std::num::NonZeroU32>,
+}
+
+/// Requires a positive integer when present, rejecting explicit null.
+fn integration_sequence<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<std::num::NonZeroU32>, D::Error> {
+    std::num::NonZeroU32::deserialize(deserializer).map(Some)
+}
 /// Compatible socket liveness request; writer diagnostics are explicit so the
 /// historical empty request keeps its exact {ok:true} response shape.
 #[derive(Deserialize)]
@@ -225,6 +242,15 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
                 .map_err(|_| crate::Error::Runtime("pool list failed".into()))?
         }
         "list_agents" => service.list_public(args::<Query>(raw)?).await,
+        "agent_integration" => {
+            let selection: Integration = args(raw)?;
+            service
+                .agent_integration(
+                    selection.agent_id,
+                    selection.sequence.map(std::num::NonZeroU32::get),
+                )
+                .await
+        }
         "doc" => {
             let a: Doc = args(raw)?;
             let topic = a.topic.as_deref().unwrap_or("index");

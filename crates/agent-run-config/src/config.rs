@@ -186,6 +186,10 @@ pub struct BridgeDelivery {
     pub core_socket: PathBuf,
     /// Absolute owner-only regular credential file; its contents are never logged.
     pub token_file: PathBuf,
+    /// Separate owner-only producer credential explicitly granted native observation.
+    /// Absence disables integration reads; the delivery credential is never substituted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_token_file: Option<PathBuf>,
     /// Trusted Bridge host component, never inferred from a caller or working directory.
     pub host_id: String,
     /// Explicit Codex store namespace; absent means Codex destinations are unsupported.
@@ -214,6 +218,7 @@ pub struct OpenCodeBridgePlugin {
 impl BridgeDelivery {
     /// Validate explicit absolute deployment paths and address components without I/O.
     /// Empty, control-bearing or oversized components and missing namespaces refuse;
+    /// an optional observer token must name a separate absolute credential file.
     /// this neither reads a credential nor grants recipient/native capabilities.
     pub fn validate(&self) -> Result<()> {
         if [
@@ -223,6 +228,10 @@ impl BridgeDelivery {
         ]
         .iter()
         .any(|path| !path.is_absolute())
+            || self
+                .observation_token_file
+                .as_ref()
+                .is_some_and(|path| !path.is_absolute() || path == &self.token_file)
             || self.codex_store.is_none()
                 && self.claude_store.is_none()
                 && self.opencode_store.is_none()

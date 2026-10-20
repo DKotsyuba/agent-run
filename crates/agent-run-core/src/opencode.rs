@@ -448,6 +448,41 @@ fn grant_echo(grants: &[Value], frozen: &[Value]) -> bool {
             })
 }
 
+/// Waits for the exact admitted model until the caller's absolute startup deadline.
+/// OpenCode may initially return its embedded catalog while refreshing metadata.
+/// `model` is the validated providerID/id pair; an expired deadline refuses.
+/// Only metadata GETs repeat: no session, prompt, inference or fallback is admitted.
+/// Malformed catalogs and disabled offerings fail immediately; absence may settle.
+async fn verify_model(
+    client: &Client,
+    model: &Value,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            let models = client
+                .call_until(Method::GET, "/api/model", None, deadline)
+                .await?;
+            let rows = data(&models)
+                .as_array()
+                .ok_or_else(|| invalid("OpenCode model inventory is missing"))?;
+            if let Some(offering) = rows
+                .iter()
+                .find(|row| row["id"] == model["id"] && row["providerID"] == model["providerID"])
+            {
+                return if offering["enabled"] == true {
+                    Ok(())
+                } else {
+                    Err(invalid("OpenCode model is disabled"))
+                };
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| invalid("OpenCode did not offer the admitted model before the startup deadline"))?
+}
+
 /// Confirms the loaded managed role and exact configured MCP set before any model input.
 ///
 /// Native connected status follows initialization and tools/list; Code Mode is disabled
@@ -607,6 +642,7 @@ pub async fn run(
 }
 
 /// Runs one isolated OpenCode server using the same provider supervisor and finish semantics.
+/// The exact model must settle within the startup allowance before any session or inference.
 /// Standard serve has no durable event retention: native messages are authoritative recovery.
 /// No elapsed job/idle deadline or synthetic model wake is introduced.
 async fn run_native(
@@ -642,20 +678,13 @@ async fn run_native(
         return Err(invalid("OpenCode server identity/version did not verify"));
     }
     let model = opencode::model_ref(&plan.native_model)?;
-    let models = process
-        .observing(client.call(Method::GET, "/api/model", None))
+    process
+        .observing(verify_model(
+            &client,
+            &model,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        ))
         .await?;
-    let offering = data(&models)
-        .as_array()
-        .and_then(|models| {
-            models
-                .iter()
-                .find(|row| row["id"] == model["id"] && row["providerID"] == model["providerID"])
-        })
-        .ok_or_else(|| invalid("OpenCode did not offer the admitted model"))?;
-    if offering["enabled"] != true {
-        return Err(invalid("OpenCode model is disabled"));
-    }
     if record.request.effort.is_some() {
         return Err(invalid("OpenCode effort variants are not yet qualified"));
     }
@@ -1070,6 +1099,64 @@ mod tests {
             received
         });
         (client, server)
+    }
+
+    /// Cold native catalogs may briefly omit a newly published model; no inference is sent while waiting.
+    #[tokio::test]
+    async fn cold_catalog_settles_before_model_admission() {
+        let model = json!({"id":"minimax-m3.1-flash-free","providerID":"opencode"});
+        let (client, server) = scripted_client(vec![
+            ("/api/model", 200, json!({"data":[{"id":"retired-model","providerID":"opencode","enabled":true}]})),
+            ("/api/model", 200, json!({"data":[{"id":"minimax-m3.1-flash-free","providerID":"opencode","enabled":true}]})),
+        ]).await;
+        verify_model(
+            &client,
+            &model,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    /// A same-named offering from another provider never authorizes the admitted model.
+    /// Malformed or disabled metadata refuses immediately instead of waiting or falling back.
+    #[tokio::test]
+    async fn model_admission_remains_exact_and_fail_closed() {
+        let model = json!({"id":"selected","providerID":"admitted"});
+        for body in [
+            json!({"data":null}),
+            json!({"data":[{"id":"selected","providerID":"admitted","enabled":false}]}),
+        ] {
+            let (client, server) = scripted_client(vec![("/api/model", 200, body)]).await;
+            assert!(
+                verify_model(
+                    &client,
+                    &model,
+                    tokio::time::Instant::now() + Duration::from_secs(1)
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(server.await.unwrap().len(), 1);
+        }
+        let (client, server) = scripted_client(vec![(
+            "/api/model",
+            200,
+            json!({"data":[{"id":"selected","providerID":"foreign","enabled":true}]}),
+        )])
+        .await;
+        let error = verify_model(
+            &client,
+            &model,
+            tokio::time::Instant::now() + Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, crate::Error::Validation(ref message) if message == "OpenCode did not offer the admitted model before the startup deadline")
+        );
+        assert_eq!(server.await.unwrap().len(), 1);
     }
 
     /// A parked or malformed inbox cannot certify readiness, even after native awaitIdle succeeds.

@@ -14,14 +14,14 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.28.7"
+version = "0.28.8"
 edition = "2024"
 license = "MIT"
 rust-version = "1.98.1"
 publish = false
 
 [workspace.dependencies]
-bridge-sdk = { git = "https://github.com/DKotsyuba/agent-bridge.git", rev = "28b876144099cad3636f523424ed5b1de293645d" }
+bridge-sdk = { git = "https://github.com/DKotsyuba/agent-bridge.git", rev = "ae32d1c3c012cc1e40c6d60c9adcad7005298688" }
 jsonschema = { version = "=0.33.0", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.5", features = ["derive", "env"] }

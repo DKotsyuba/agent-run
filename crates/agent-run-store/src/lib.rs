@@ -1077,7 +1077,10 @@ impl Store<'_> {
     ///
     /// The connection remains thread-affine; callers on another thread must open their own
     /// [`Store`] from the same home. Repeated calls retain the latest session identity and
-    /// append the corresponding event for the lifecycle journal. SQL failures
+    /// append the corresponding event for the lifecycle journal. When this handle
+    /// is bound to the current owned attempt with native integration evidence,
+    /// updates that attempt's native session in the same transaction; no historical
+    /// attempt inherits a new session. SQL failures
     /// identify RuntimeSession and elapsed milliseconds with one attempt. No
     /// transaction crosses an await and no ambiguous commit is replayed.
     pub fn runtime_session(&mut self, id: &AgentId, session: &str) -> Result<()> {
@@ -1089,6 +1092,12 @@ impl Store<'_> {
                 tx.execute(
                     "UPDATE agents SET runtime_session_id=? WHERE id=?",
                     params![session, id.as_str()],
+                )?;
+                // The authenticated supervisor's pinned attempt alone receives
+                // native session evidence; never inherit an earlier attempt's id.
+                tx.execute(
+                    "UPDATE attempts SET session_facts_json=json_set(session_facts_json,'$.session',?1) WHERE id=?2 AND agent_id=?3 AND ownership_active=1 AND session_facts_json IS NOT NULL",
+                    params![session, self.attempt, id.as_str()],
                 )?;
                 tx.execute(
             &format!(

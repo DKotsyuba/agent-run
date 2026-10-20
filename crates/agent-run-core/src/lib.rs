@@ -20,6 +20,7 @@ pub mod health;
 /// Session binding and per-turn context hooks shared by CLI hosts.
 pub mod hooks;
 pub mod housekeeping;
+mod integration;
 pub mod lifecycle;
 pub mod logging;
 pub mod managed_services;

@@ -416,7 +416,7 @@ impl Service {
 
     /// Loads schema v2 through the same last-valid exact-byte cache used by
     /// historical starts; an invalid file never replaces the active value.
-    fn current_provider_config(&self) -> Result<(ProviderConfig, String)> {
+    pub(crate) fn current_provider_config(&self) -> Result<(ProviderConfig, String)> {
         self.refresh_config()?;
         self.config
             .read()
@@ -521,6 +521,8 @@ impl Service {
 
     /// Shared admission: replay first, authority once, then up to
     /// `stale_retries + 1` submissions of freshly produced candidates.
+    /// Validates/canonicalizes live paths when possible; a failed path check is
+    /// enforced only for a new admission so exact retained intent can replay.
     ///
     /// `produce` builds one candidate set from the committed store state for
     /// the resolved catalog; it runs outside any write transaction and gets
@@ -539,7 +541,10 @@ impl Service {
                      + Send
              ),
     ) -> Result<Value> {
-        request.validate()?;
+        request.validate_intent()?;
+        // Preserve canonical spelling for live paths, but an exact immutable
+        // retry remains valid after its workdir/read roots have disappeared.
+        let paths = request.validate();
         if let Some(replay) = Store::open(&self.home)?.replay_provider_request(&request)? {
             let store = Store::open(&self.home)?;
             let row = store.get(&replay.agent_id)?;
@@ -548,6 +553,7 @@ impl Service {
                 "created":false,"agent":self.view(&store,&row)?}),
             );
         }
+        paths?;
         let (config, revision) = self.current_provider_config()?;
         let accounts = Store::open(&self.home)?.list_accounts()?;
         let catalog = config.resolve_catalog(accounts)?;
@@ -2527,6 +2533,8 @@ pub(crate) struct Prepared {
 /// exactly the same facts. Static executable, credential-reference, role-policy and Codex permission
 /// checks reuse the launch implementations before durable admission; no harness
 /// or credential is opened. Mutable external state is still verified at spawn.
+/// Requested MCP assertions check only the already-resolved role/global cap
+/// intersection and never add servers, tools or grants.
 /// The effective storage request captures the Codex
 /// harness Fast flag without changing original request/replay hashes.
 pub(crate) fn prepare_provider(
@@ -2606,6 +2614,22 @@ pub(crate) fn prepare_provider(
         },
         request.account.as_ref().map(|label| label.as_str()),
     )?;
+    for (server, tools) in &request.required_mcp {
+        let selected = role
+            .mcp
+            .iter()
+            .find(|selected| &selected.id == server)
+            .ok_or_else(|| invalid("required MCP server is not selected by the resolved role"))?;
+        if selected
+            .allowed_tools
+            .as_ref()
+            .is_some_and(|allowed| tools.iter().any(|tool| !allowed.contains(tool)))
+        {
+            return Err(invalid(
+                "required MCP tool is not permitted by the resolved role",
+            ));
+        }
+    }
     let mut effective = request.storage_projection();
     effective.fast |= provider.harness == agent_run_domain::HarnessId::Codex
         && config

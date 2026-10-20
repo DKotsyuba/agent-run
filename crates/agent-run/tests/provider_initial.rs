@@ -788,13 +788,14 @@ fn home_with(extra: &str, accounts: &[&str]) -> (tempfile::TempDir, std::path::P
 /// bound to the shared store below the home, and a Codex grant refuses a
 /// store inside any temporary root its native sandbox may write, so Codex
 /// fixtures live under Cargo's per-target directory instead.
+/// The short name keeps their real writer socket below macOS Unix-path limits.
 fn home_in(
     base: impl AsRef<Path>,
     extra: &str,
     accounts: &[&str],
 ) -> (tempfile::TempDir, std::path::PathBuf) {
     let temp = tempfile::Builder::new()
-        .prefix("ar-provider-")
+        .prefix("ar-")
         .tempdir_in(base)
         .unwrap();
     let root = temp.path().canonicalize().unwrap();
@@ -4888,18 +4889,28 @@ fn read_until(pipe: &mut std::process::ChildStdout, needle: &str) -> String {
 /// escape removed.
 /// Two runtime threads keep the actual fixture writer socket serving while the
 /// viewer's deliberately blocking pipe reader waits for live transcript data.
+/// Readiness must arrive within 20 seconds and before the execution terminates.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn follow_viewer_spans_attempts_and_survives_interrupt() {
     let (_temp, home) = codex_home(["exhausted", "ok-hold"]);
     let id = codex_admit(&home, "viewer-1").await;
     let mut child = supervisor(&home, &id).await;
+    let ready_deadline = std::time::Instant::now() + Duration::from_secs(20);
     let root = loop {
-        let root = agent_run_store::fixture::open(&home)
+        let row = agent_run_store::fixture::open(&home)
             .unwrap()
             .get(&id)
-            .unwrap()
-            .identity
-            .unwrap()["runtime_home"]
+            .unwrap();
+        assert!(
+            !row.status.terminal(),
+            "fixture ended before readiness: {:?}",
+            row.failure_text
+        );
+        assert!(
+            std::time::Instant::now() < ready_deadline,
+            "fixture readiness deadline exceeded"
+        );
+        let root = row.identity.unwrap()["runtime_home"]
             .as_str()
             .map(std::path::PathBuf::from);
         if let Some(root) = root.filter(|root| root.join("fixture-held").exists()) {

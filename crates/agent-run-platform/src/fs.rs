@@ -229,7 +229,10 @@ fn entry_of(status: &libc::stat) -> Entry {
         inode: status.st_ino,
         socket: kind == libc::S_IFSOCK,
         modified: status.st_mtime as f64 + status.st_mtime_nsec as f64 / 1e9,
+        #[cfg(target_os = "macos")]
         mode: (status.st_mode & 0o7777) as u32,
+        #[cfg(not(target_os = "macos"))]
+        mode: status.st_mode & 0o7777,
     }
 }
 

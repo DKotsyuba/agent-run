@@ -122,6 +122,24 @@
           "type": "array",
           "uniqueItems": true
         },
+        "required_mcp": {
+          "additionalProperties": {
+            "items": {
+              "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+              "type": "string"
+            },
+            "maxItems": 32,
+            "type": "array",
+            "uniqueItems": true
+          },
+          "description": "Non-grant assertion on frozen selected MCP servers and exact unprefixed tools. Empty lists require server presence. Omitted or empty map adds no condition; null and duplicates are invalid.",
+          "maxProperties": 8,
+          "propertyNames": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+            "type": "string"
+          },
+          "type": "object"
+        },
         "task": {
           "type": "string"
         },
@@ -629,6 +647,24 @@
                     "type": "array",
                     "uniqueItems": true
                   },
+                  "required_mcp": {
+                    "additionalProperties": {
+                      "items": {
+                        "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+                        "type": "string"
+                      },
+                      "maxItems": 32,
+                      "type": "array",
+                      "uniqueItems": true
+                    },
+                    "description": "Non-grant assertion on frozen selected MCP servers and exact unprefixed tools. Empty lists require server presence. Omitted or empty map adds no condition; null and duplicates are invalid.",
+                    "maxProperties": 8,
+                    "propertyNames": {
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+                      "type": "string"
+                    },
+                    "type": "object"
+                  },
                   "task": {
                     "type": "string"
                   },
@@ -839,6 +875,24 @@
                   "type": "array",
                   "uniqueItems": true
                 },
+                "required_mcp": {
+                  "additionalProperties": {
+                    "items": {
+                      "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+                      "type": "string"
+                    },
+                    "maxItems": 32,
+                    "type": "array",
+                    "uniqueItems": true
+                  },
+                  "description": "Non-grant assertion on frozen selected MCP servers and exact unprefixed tools. Empty lists require server presence. Omitted or empty map adds no condition; null and duplicates are invalid.",
+                  "maxProperties": 8,
+                  "propertyNames": {
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
                 "task": {
                   "type": "string"
                 },
@@ -956,5 +1010,32 @@
       "type": "object"
     },
     "name": "list_pools"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "Operator/service-only read of one exact execution and its native communication observation. Omitted sequence pins latest once. An observed address proves identity only, never idle, membership, or delivery. No worker capability exposes this operation.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        },
+        "sequence": {
+          "maximum": 4294967295,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "agent_id"
+      ],
+      "type": "object"
+    },
+    "name": "agent_integration"
   }
 ]

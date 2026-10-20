@@ -940,7 +940,7 @@ fn add(
 }
 
 /// Detects secret-looking assignments without preserving values, excluding only
-/// a successfully parsed/validated Bridge credential-file reference; invalid
+/// successfully parsed/validated Bridge credential-file references; invalid
 /// references and other token fields remain findings. No credential is read.
 fn plaintext_secrets(path: &Path, findings: &mut Vec<Finding>) {
     /// Parser-owned source location of the actual credential reference, ignoring unrelated config.
@@ -960,11 +960,13 @@ fn plaintext_secrets(path: &Path, findings: &mut Vec<Finding>) {
     struct BridgeLocation {
         /// Original value span; never inferred from header-like text inside strings.
         token_file: Option<toml::Spanned<String>>,
+        /// Separate observer credential reference, with the same span-only exemption.
+        observation_token_file: Option<toml::Spanned<String>>,
     }
     let Ok(text) = fs::read_to_string(path) else {
         return;
     };
-    let bridge_reference = toml::from_str::<toml::Value>(&text)
+    let bridge_references = toml::from_str::<toml::Value>(&text)
         .ok()
         .and_then(|document| {
             let bridge = document.get("delivery")?.get("bridge")?.clone();
@@ -973,7 +975,21 @@ fn plaintext_secrets(path: &Path, findings: &mut Vec<Finding>) {
             Some(bridge.token_file)
         })
         .and_then(|_| toml::from_str::<ReferenceLocation>(&text).ok())
-        .and_then(|document| Some(document.delivery?.bridge?.token_file?.span()));
+        .and_then(|document| document.delivery?.bridge)
+        .map(|bridge| {
+            bridge
+                .token_file
+                .into_iter()
+                .map(|reference| ("token_file", reference.span()))
+                .chain(
+                    bridge
+                        .observation_token_file
+                        .into_iter()
+                        .map(|reference| ("observation_token_file", reference.span())),
+                )
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let mut byte_offset = 0;
     for (index, line) in text.split_inclusive('\n').take(10_000).enumerate() {
         let start = byte_offset;
@@ -981,11 +997,9 @@ fn plaintext_secrets(path: &Path, findings: &mut Vec<Finding>) {
         let key = line
             .split_once('=')
             .map(|(key, _)| key.trim().to_ascii_lowercase());
-        if bridge_reference
-            .as_ref()
-            .is_some_and(|span| span.start >= start && span.end <= byte_offset)
-            && key.as_deref() == Some("token_file")
-        {
+        if bridge_references.iter().any(|(name, span)| {
+            span.start >= start && span.end <= byte_offset && key.as_deref() == Some(*name)
+        }) {
             continue;
         }
         if key.is_some_and(|key| {
@@ -1981,6 +1995,31 @@ mod tests {
             super::plaintext_secrets(&config, &mut invalid);
             assert_eq!(invalid.len(), 1, "invalid reference was hidden: {field}");
         }
+    }
+    /// A validated observer file reference is not plaintext; an unrelated field
+    /// with the same spelling stays a finding and malformed references refuse.
+    #[test]
+    fn bridge_observation_token_reference_is_not_plaintext_secret() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("config.toml");
+        let prefix = "[delivery.bridge]\nregistration_socket='/protected/a.sock'\ncore_socket='/protected/c.sock'\nhost_id='local'\ncodex_store='main'\ntoken_file='/protected/delivery'\n";
+        std::fs::write(&config,format!("{prefix}observation_token_file='/protected/observer'\n[environments.test.variables]\nobservation_token_file='INLINE_SECRET'\n")).unwrap();
+        let mut findings = Vec::new();
+        super::plaintext_secrets(&config, &mut findings);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].component, "config:9");
+        std::fs::write(
+            &config,
+            format!("{prefix}observation_token_file='INLINE_SECRET'\n"),
+        )
+        .unwrap();
+        let mut findings = Vec::new();
+        super::plaintext_secrets(&config, &mut findings);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.component == "config:7")
+        );
     }
     /// A valid multiline environment value cannot impersonate the parsed Bridge field's source location.
     #[test]

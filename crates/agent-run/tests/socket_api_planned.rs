@@ -558,7 +558,7 @@ async fn python_successful_tool_round_trip() {
 
 /// Mirrors `tests/test_api_socket.py::ApiSocketTests::test_surface_is_dispatch_tools_plus_control_methods`.
 /// The current shared surface additionally exposes the compact delegation guide
-/// and the five cooperative-pool operator tools, including read-only discovery.
+/// and the five cooperative-pool operator tools plus the native integration read.
 #[test]
 fn python_socket_surface_is_shared_tools_plus_controls() {
     let names = agent_run::dispatch::tools()
@@ -582,7 +582,7 @@ fn python_socket_surface_is_shared_tools_plus_controls() {
         .map(|tool| tool.name.clone())
         .collect();
     assert_eq!(names, registry, "the socket surface is the shared table");
-    assert_eq!(names.len(), 15);
+    assert_eq!(names.len(), 16);
     assert!(!names.contains("models"));
     assert!(!names.contains("capacity_order"));
 }

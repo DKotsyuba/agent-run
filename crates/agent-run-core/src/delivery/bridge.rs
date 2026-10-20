@@ -80,9 +80,17 @@ fn params(intent: &BridgeIntent) -> std::result::Result<PublishParams, ClientErr
 /// The opened parent and regular file must belong to this UID and be owner-only.
 /// No credential, filesystem path or low-level error is exposed in diagnostics.
 fn client(config: &BridgeDelivery) -> std::result::Result<(Client, String), ClientError> {
+    client_with_token(config, &config.token_file)
+}
+
+/// Opens the explicit protected credential for one caller-selected Bridge role.
+/// Reads at most 16 KiB; never falls back to another file or expands a grant.
+pub(crate) fn client_with_token(
+    config: &BridgeDelivery,
+    token_file: &Path,
+) -> std::result::Result<(Client, String), ClientError> {
     let load = || -> Result<String> {
-        let parent = config
-            .token_file
+        let parent = token_file
             .parent()
             .ok_or_else(|| invalid("Bridge credential parent missing"))?;
         let relative = parent
@@ -90,8 +98,7 @@ fn client(config: &BridgeDelivery) -> std::result::Result<(Client, String), Clie
             .map_err(|_| invalid("Bridge credential path must be absolute"))?;
         let directory = Dir::open(Path::new("/"))?.subdir(relative)?;
         let entry = directory.entry(None)?;
-        let name = config
-            .token_file
+        let name = token_file
             .file_name()
             .ok_or_else(|| invalid("Bridge credential name missing"))?;
         let file = directory.open_file(Path::new(name))?;
@@ -346,6 +353,7 @@ mod tests {
             registration_socket: directory.join("a.sock"),
             core_socket: directory.join("c.sock"),
             token_file: token,
+            observation_token_file: None,
             host_id: "host/part".into(),
             codex_store: Some("store%name".into()),
             claude_store: Some("claude-main".into()),
@@ -427,6 +435,7 @@ mod tests {
             registration_socket: directory.join("a.sock"),
             core_socket: directory.join("c.sock"),
             token_file: token.clone(),
+            observation_token_file: None,
             host_id: "local".into(),
             codex_store: Some("codex-main".into()),
             claude_store: None,
@@ -440,5 +449,21 @@ mod tests {
         std::fs::rename(&token, directory.join("real-token")).unwrap();
         std::os::unix::fs::symlink("real-token", &token).unwrap();
         assert!(client(&config).is_err());
+    }
+
+    /// Observer references are explicitly separate and absent from historical
+    /// serialization; no delivery credential is automatically granted reads.
+    #[test]
+    fn observation_credential_is_additive_and_separate() {
+        let original = serde_json::json!({"registration_socket":"/private/a.sock","core_socket":"/private/c.sock","token_file":"/private/delivery","host_id":"local","codex_store":"main","claude_store":null});
+        let mut config: BridgeDelivery = serde_json::from_value(original.clone()).unwrap();
+        config.validate().unwrap();
+        assert_eq!(serde_json::to_value(&config).unwrap(), original);
+        config.observation_token_file = Some(config.token_file.clone());
+        assert!(config.validate().is_err());
+        config.observation_token_file = Some("relative".into());
+        assert!(config.validate().is_err());
+        config.observation_token_file = Some("/private/observer".into());
+        config.validate().unwrap();
     }
 }

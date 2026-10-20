@@ -140,6 +140,24 @@
           "default": true,
           "description": "New admissions default to explicit callback completion: turn completion waits for events; only private finish ends the run. False selects legacy compatibility. No lifetime timeout."
         },
+        "required_mcp": {
+          "type": "object",
+          "maxProperties": 8,
+          "propertyNames": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+          },
+          "additionalProperties": {
+            "type": "array",
+            "maxItems": 32,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.-]{1,128}$"
+            }
+          },
+          "description": "Non-grant assertion on frozen selected MCP servers and exact unprefixed tools. Empty lists require server presence. Omitted or empty map adds no condition; null and duplicates are invalid."
+        },
         "idle_ping": {
           "type": "string",
           "enum": [
@@ -717,6 +735,24 @@
                     "default": true,
                     "description": "New admissions default to explicit callback completion: turn completion waits for events; only private finish ends the run. False selects legacy compatibility. No lifetime timeout."
                   },
+                  "required_mcp": {
+                    "type": "object",
+                    "maxProperties": 8,
+                    "propertyNames": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+                    },
+                    "additionalProperties": {
+                      "type": "array",
+                      "maxItems": 32,
+                      "uniqueItems": true,
+                      "items": {
+                        "type": "string",
+                        "pattern": "^[A-Za-z0-9_.-]{1,128}$"
+                      }
+                    },
+                    "description": "Non-grant assertion on frozen selected MCP servers and exact unprefixed tools. Empty lists require server presence. Omitted or empty map adds no condition; null and duplicates are invalid."
+                  },
                   "idle_ping": {
                     "type": "string",
                     "enum": [
@@ -920,6 +956,24 @@
                   "default": true,
                   "description": "New admissions default to explicit callback completion: turn completion waits for events; only private finish ends the run. False selects legacy compatibility. No lifetime timeout."
                 },
+                "required_mcp": {
+                  "type": "object",
+                  "maxProperties": 8,
+                  "propertyNames": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+                  },
+                  "additionalProperties": {
+                    "type": "array",
+                    "maxItems": 32,
+                    "uniqueItems": true,
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9_.-]{1,128}$"
+                    }
+                  },
+                  "description": "Non-grant assertion on frozen selected MCP servers and exact unprefixed tools. Empty lists require server presence. Omitted or empty map adds no condition; null and duplicates are invalid."
+                },
                 "idle_ping": {
                   "type": "string",
                   "enum": [
@@ -1050,6 +1104,35 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false
+    }
+  },
+  {
+    "name": "agent_integration",
+    "description": "Operator/service-only read of one exact execution and its native communication observation. Omitted sequence pins latest once. An observed address proves identity only, never idle, membership, or delivery. No worker capability exposes this operation.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        }
+      },
+      "required": [
+        "agent_id"
+      ]
+    },
+    "outputSchema": null,
+    "resultShape": null,
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true
     }
   }
 ]

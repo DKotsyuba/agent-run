@@ -8,6 +8,7 @@ pub mod error;
 pub mod fsm;
 /// Frozen ping policy and private model response contracts.
 pub mod health;
+pub mod integration;
 mod legacy_provider;
 pub mod pool;
 mod provider_connection;

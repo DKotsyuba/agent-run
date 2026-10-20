@@ -1303,6 +1303,8 @@ async fn verify_sealed_home<B: crate::runtime_storage::LayoutBackend>(
 /// worker capability. Preparation, execution, cleanup and durable-store failures propagate;
 /// an unconfirmed cleanup keeps ownership reserved for recovery. Native-owner settings
 /// are filtered against the frozen role and actual v2 adapter before process preparation.
+/// Spawn records the actual canonical native store beside the process fence when
+/// available; only adapter-observed session events complete that private evidence.
 async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Result<()> {
     if store.cancel_pending(id)? {
         if !persist::attempt_never_spawned(&store.conn, id)? {
@@ -1664,7 +1666,18 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             process
                 .observing(async {
                     fixture_hold(home, "provider-process").await;
-                    store.provider_process(id, &attempt_id, &leader).await
+                    let integration =
+                        history_root(identity.authority.harness, &planned.launch.environment)
+                            .and_then(|root| root.canonicalize().ok())
+                            .map(|store| agent_run_domain::integration::NativeIntegration {
+                                harness: identity.authority.harness,
+                                store,
+                                session: None,
+                            })
+                            .filter(|evidence| evidence.validate().is_ok());
+                    store
+                        .provider_process(id, &attempt_id, &leader, integration)
+                        .await
                 })
                 .await?;
             process

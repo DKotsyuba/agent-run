@@ -310,9 +310,12 @@ pub(crate) fn run_remote(store: &mut Store, op: RemoteOp) -> Result<Value> {
         R::ProviderSpawnFailed(op) => {
             out(store.provider_spawn_failed(&op.target.execution, &op.target.attempt)?)
         }
-        R::ProviderProcess(op) => {
-            out(store.provider_process(&op.target.execution, &op.target.attempt, &op.leader)?)
-        }
+        R::ProviderProcess(op) => out(store.provider_process_evidence(
+            &op.target.execution,
+            &op.target.attempt,
+            &op.leader,
+            op.integration.as_ref(),
+        )?),
         R::ProviderCleanup(op) => {
             out(store.provider_cleanup(&op.target.execution, &op.target.attempt, &op.proof)?)
         }

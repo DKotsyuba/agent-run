@@ -4,14 +4,15 @@ use agent_run_domain::{ArgumentDefault, registry, tool, tools_json};
 use serde_json::Value;
 
 /// Tools added after the frozen Python table: the guide read and the five
-/// cooperative-pool operator tools, pinned by their own tests.
-const ADDITIVE: [&str; 6] = [
+/// cooperative-pool operator tools and native integration read, pinned separately.
+const ADDITIVE: [&str; 7] = [
     "delegation_guide",
     "start_pool",
     "pool_post",
     "pool_replace",
     "pool",
     "list_pools",
+    "agent_integration",
 ];
 
 /// Parses the captured Python discovery payload shared by all registry assertions.
@@ -34,7 +35,7 @@ fn registry_matches_python_golden_field_by_field() {
         .map(|definition| serde_json::to_value(definition).unwrap())
         .filter(|tool| !ADDITIVE.contains(&tool["name"].as_str().unwrap_or_default()))
         .collect();
-    assert_eq!(tools_json().len(), 15);
+    assert_eq!(tools_json().len(), 16);
     for (name, canonical) in [("models", "delegation_guide"), ("capacity_order", "limits")] {
         assert_eq!(tool(name).unwrap().legacy_for.as_deref(), Some(canonical));
         assert!(!tools_json().iter().any(|entry| entry["name"] == name));
@@ -91,6 +92,12 @@ fn registry_matches_python_golden_field_by_field() {
         // optional human-label input is the exact additive delta below.
         if definition.name == "start" {
             rename_runtime_to_provider(&mut expected);
+            expected["inputSchema"]["properties"]["required_mcp"] = serde_json::json!({
+                "type":"object","maxProperties":8,
+                "propertyNames":{"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"},
+                "additionalProperties":{"type":"array","maxItems":32,"uniqueItems":true,"items":{"type":"string","pattern":"^[A-Za-z0-9_.-]{1,128}$"}},
+                "description":"Non-grant assertion on frozen selected MCP servers and exact unprefixed tools. Empty lists require server presence. Omitted or empty map adds no condition; null and duplicates are invalid."
+            });
             // The reviewed completion-mode delta has a true admission default;
             // every other frozen property remains compared unchanged.
             expected["inputSchema"]["properties"]["explicit_finish"] = serde_json::json!({
@@ -304,7 +311,14 @@ fn annotations_preserve_effect_and_worker_boundaries() {
         assert_eq!(hints.idempotent_hint, !unkeyed, "{}", definition.name);
         let external = matches!(
             definition.name.as_str(),
-            "start" | "resume" | "cancel" | "steer" | "models" | "start_pool" | "pool_replace"
+            "start"
+                | "resume"
+                | "cancel"
+                | "steer"
+                | "models"
+                | "start_pool"
+                | "pool_replace"
+                | "agent_integration"
         );
         assert_eq!(hints.open_world_hint, external, "{}", definition.name);
         if write && !unkeyed {
@@ -505,4 +519,23 @@ fn pool_tools_are_strict_registry_entries() {
         (members["minItems"].as_i64(), members["maxItems"].as_i64()),
         (Some(2), Some(5))
     );
+}
+
+/// Integration has one stable selector and a positive exact receipt; no private
+/// process tuple or worker capability can be supplied through this operator tool.
+#[test]
+fn agent_integration_is_read_only_and_absent_from_worker_catalog() {
+    let definition = tool("agent_integration").unwrap();
+    assert_eq!(
+        definition.input_schema,
+        serde_json::json!({"type":"object","additionalProperties":false,"properties":{"agent_id":{"type":"string"},"sequence":{"type":"integer","minimum":1,"maximum":4294967295_u64}},"required":["agent_id"]})
+    );
+    assert!(definition.annotations.read_only_hint);
+    assert!(!definition.annotations.destructive_hint);
+    assert!(
+        !agent_run_domain::tools::worker_registry()
+            .iter()
+            .any(|tool| tool.name == "agent_integration")
+    );
+    assert!(!definition.error_classes().is_empty());
 }

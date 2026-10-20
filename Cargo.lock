@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-run"
-version = "0.28.7"
+version = "0.28.8"
 dependencies = [
  "agent-run-adapters",
  "agent-run-config",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-adapters"
-version = "0.28.7"
+version = "0.28.8"
 dependencies = [
  "agent-run-config",
  "agent-run-domain",
@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-config"
-version = "0.28.7"
+version = "0.28.8"
 dependencies = [
  "agent-run-domain",
  "agent-run-platform",
@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-core"
-version = "0.28.7"
+version = "0.28.8"
 dependencies = [
  "agent-run-adapters",
  "agent-run-config",
@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-domain"
-version = "0.28.7"
+version = "0.28.8"
 dependencies = [
  "chrono",
  "jsonschema",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-platform"
-version = "0.28.7"
+version = "0.28.8"
 dependencies = [
  "agent-run-domain",
  "libc",
@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-store"
-version = "0.28.7"
+version = "0.28.8"
 dependencies = [
  "agent-run-config",
  "agent-run-core",
@@ -140,7 +140,7 @@ dependencies = [
 
 [[package]]
 name = "agent-run-tui"
-version = "0.28.7"
+version = "0.28.8"
 dependencies = [
  "agent-run",
  "agent-run-domain",
@@ -315,8 +315,8 @@ checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
 
 [[package]]
 name = "bridge-protocol"
-version = "0.2.0"
-source = "git+https://github.com/DKotsyuba/agent-bridge.git?rev=28b876144099cad3636f523424ed5b1de293645d#28b876144099cad3636f523424ed5b1de293645d"
+version = "0.3.1"
+source = "git+https://github.com/DKotsyuba/agent-bridge.git?rev=ae32d1c3c012cc1e40c6d60c9adcad7005298688#ae32d1c3c012cc1e40c6d60c9adcad7005298688"
 dependencies = [
  "serde",
  "serde_json",
@@ -325,13 +325,14 @@ dependencies = [
 
 [[package]]
 name = "bridge-sdk"
-version = "0.2.0"
-source = "git+https://github.com/DKotsyuba/agent-bridge.git?rev=28b876144099cad3636f523424ed5b1de293645d#28b876144099cad3636f523424ed5b1de293645d"
+version = "0.3.1"
+source = "git+https://github.com/DKotsyuba/agent-bridge.git?rev=ae32d1c3c012cc1e40c6d60c9adcad7005298688#ae32d1c3c012cc1e40c6d60c9adcad7005298688"
 dependencies = [
  "bridge-protocol",
  "serde",
  "serde_json",
  "socket2",
+ "tokio",
 ]
 
 [[package]]
@@ -2268,7 +2269,7 @@ dependencies = [
 
 [[package]]
 name = "sqlite-access"
-version = "0.28.7"
+version = "0.28.8"
 dependencies = [
  "fs2",
  "libc",
@@ -3026,7 +3027,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xtask"
-version = "0.28.7"
+version = "0.28.8"
 dependencies = [
  "agent-run-config",
  "agent-run-domain",

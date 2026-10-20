@@ -802,7 +802,7 @@ fn budget(tool: &str) -> Budget {
             rows: 8,
             content: 0,
         },
-        "list_agents" | "limits" => Budget {
+        "list_agents" | "limits" | "agent_integration" => Budget {
             bytes: 8192,
             rows: 20,
             content: 0,
@@ -1264,6 +1264,28 @@ fn validate_enrollment(value: &Value) -> Result<()> {
 fn validate_result(tool: &str, value: &Value) -> Result<()> {
     let policy = budget(tool);
     match tool {
+        "agent_integration" => {
+            if value["schema_version"] != 1 {
+                return Err(shape_error());
+            }
+            validate_agent(&value["agent"])?;
+            positive_counter(&value["agent"], "sequence")?;
+            let communication: agent_run_domain::integration::Communication =
+                serde_json::from_value(value["communication"].clone())
+                    .map_err(|_| shape_error())?;
+            if let agent_run_domain::integration::Communication::Observed {
+                address,
+                sampled_at_ms,
+            } = communication
+                && (address.is_empty()
+                    || address.len() > 4096
+                    || address.chars().any(char::is_control)
+                    || sampled_at_ms == 0
+                    || sampled_at_ms > i64::MAX as u64)
+            {
+                return Err(shape_error());
+            }
+        }
         "start" | "resume" => {
             required_reference(value, "agent_id")?;
             required_bool(value, "created")?;
@@ -1766,6 +1788,29 @@ fn label(text: &str) -> String {
 /// JSON is confined to the dynamic broker adapter/projection boundary.
 fn render(name: &str, value: &Value, limit: usize) -> Result<String> {
     match name {
+        "agent_integration" => {
+            let communication: agent_run_domain::integration::Communication =
+                serde_json::from_value(value["communication"].clone())
+                    .map_err(|_| shape_error())?;
+            let observation = match communication {
+                agent_run_domain::integration::Communication::Observed {
+                    address,
+                    sampled_at_ms,
+                } => format!("observed {} at {sampled_at_ms} ms", exact_display(&address)),
+                agent_run_domain::integration::Communication::Unknown { reason } => {
+                    format!("unknown {}", serde_json::to_value(reason)?)
+                }
+                agent_run_domain::integration::Communication::Unsupported { reason } => {
+                    format!("unsupported {}", serde_json::to_value(reason)?)
+                }
+            };
+            let text = format!(
+                "Agent {} execution {}\nCommunication: {observation}\nObservation proves identity only; it does not prove idle state or delivery.\n",
+                exact_display(required_reference(&value["agent"], "agent_id")?),
+                value["agent"]["sequence"]
+            );
+            render_view("doc", &ExcerptTextView { text: &text }, limit)
+        }
         "start" | "resume" => render_view(
             name,
             &projected::<AdmissionTextView>(start_context(value))?,
@@ -3262,6 +3307,25 @@ mod tests {
         let page = content[0]["text"].as_str().unwrap().to_owned();
         assert_eq!(result.is_error, Some(false), "{tool}: {page}");
         (page, result)
+    }
+
+    /// Integration renders only its public identity/observation, with finite
+    /// unknown states and no process, credential or arbitrary-agent-field dump.
+    #[test]
+    fn agent_integration_text_preserves_safe_observation() {
+        let mut value = json!({"schema_version":1,"agent":{"agent_id":"ag-1","sequence":2,"runtime":"p","model":"m","profile":"code","status":"running","delivery":null,"private":"SECRET_CANARY"},"communication":{"state":"observed","address":"local/codex/private/session","sampled_at_ms":1}});
+        let (page, result) = public_text("agent_integration", &value);
+        assert!(
+            page.contains("ag-1")
+                && page.contains("execution 2")
+                && page.contains("local/codex/private/session")
+        );
+        assert!(!page.contains("SECRET_CANARY"));
+        assert!(result.structured_content.is_none());
+        value["communication"] = json!({"state":"unknown","reason":"identity_changed"});
+        let (page, _) = public_text("agent_integration", &value);
+        assert!(page.contains("identity_changed"));
+        assert!(!page.contains("local/codex/private/session"));
     }
 
     /// Every operator pool tool renders one compact page with all its facts;

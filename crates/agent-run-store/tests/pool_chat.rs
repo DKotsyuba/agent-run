@@ -25,7 +25,9 @@ use agent_run_store::{
 };
 use serde_json::{Value, json};
 
-/// Issues one worker capability and returns (run, attempt, token).
+/// Issues one fixture worker capability and returns (run, attempt, token).
+/// Call once per distinct admitted agent in a fixture database. The complete
+/// agent identity names its running attempt; no engine or external work starts.
 fn capability(store: &mut Store, id: &AgentId) -> (AgentId, String, String) {
     store
         .conn
@@ -36,11 +38,9 @@ fn capability(store: &mut Store, id: &AgentId) -> (AgentId, String, String) {
         .unwrap();
     store.event(id, "status", &json!({})).unwrap();
     let token = format!("{}{}", "a".repeat(32), "1".repeat(32));
-    let attempt = format!(
-        "att_{}{}",
-        "b".repeat(20),
-        id.as_str()[24..28].to_lowercase()
-    );
+    // The whole agent id names the attempt: a truncated suffix collides
+    // across concurrently live fixtures (UNIQUE(attempts.id)).
+    let attempt = format!("att_{}", id.as_str());
     store
         .conn
         .execute(
@@ -516,6 +516,44 @@ fn authentication_and_membership_gate_every_write() {
             .pool_write(run2, attempt2, token2, message("d", "x"))
             .is_err()
     );
+}
+
+/// Fixture attempt ids derive from the whole agent identity: two agents whose
+/// legacy truncated suffix deliberately collides keep distinct, simultaneously
+/// live attempts instead of violating UNIQUE(attempts.id).
+#[test]
+fn capability_attempts_stay_distinct_when_legacy_suffixes_collide() {
+    let home = common::Home::new();
+    let first: AgentId = "ag-20260101-000000-1111100001".parse().unwrap();
+    let second: AgentId = "ag-20260101-000000-2222200001".parse().unwrap();
+    assert_eq!(
+        first.as_str()[24..28],
+        second.as_str()[24..28],
+        "the legacy fixture suffix must collide on purpose"
+    );
+    let mut store = home.store();
+    for id in [&first, &second] {
+        store
+            .conn
+            .execute(
+                "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision) \
+                 VALUES(?,'mock','fixture','review','fixture task','fixture task',?,'{}','running',1.0,'cfg')",
+                rusqlite::params![id.as_str(), home.path.to_str().unwrap()],
+            )
+            .unwrap();
+    }
+    let (_, first_attempt, _) = capability(&mut store, &first);
+    let (_, second_attempt, _) = capability(&mut store, &second);
+    assert_ne!(first_attempt, second_attempt);
+    let live: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM attempts WHERE ownership_active=1 AND finished_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(live, 2);
 }
 
 /// Votes need the current proposal; ready needs exact criterion coverage;

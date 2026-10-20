@@ -173,6 +173,14 @@ impl ToolDefinition {
                 MachineCode::IOError,
                 MachineCode::StorageError,
             ],
+            "agent_integration" => &[
+                MachineCode::ValidationError,
+                MachineCode::AgentNotFound,
+                MachineCode::AnswerIntegrityError,
+                MachineCode::RuntimeError,
+                MachineCode::IOError,
+                MachineCode::StorageError,
+            ],
             "list_agents" | "transcript" => &[
                 MachineCode::ValidationError,
                 MachineCode::AgentNotFound,

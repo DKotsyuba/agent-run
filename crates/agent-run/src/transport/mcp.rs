@@ -28,18 +28,56 @@ const BROKER_UNAVAILABLE: &str =
 /// leaving the presenter's 4 KiB envelope reserve ample room for the SDK wrapper.
 const MAX_RPC_ID_BYTES: usize = 1024;
 
-/// Checks only the echoed transport identifier, leaving malformed JSON and
-/// business/protocol validation to the SDK. Oversized IDs close the stream before
-/// any frame bytes reach dispatch; their untrusted contents are never reported.
-fn validate_frame_id(frame: &[u8]) -> std::io::Result<()> {
-    if let Ok(value) = serde_json::from_slice::<Value>(frame)
-        && value["id"].is_string()
+/// Checks echoed IDs before SDK allocation and preserves strict start decoding.
+/// The SDK's generic JSON object would erase duplicate required_mcp keys, so an
+/// invalid typed start is converted to an explicitly invalid argument object and
+/// follows its ordinary -32602 path. It can never become a normalized valid start.
+/// Oversized IDs close the stream; untrusted contents are never reported.
+fn validate_frame_id(frame: &mut Vec<u8>) -> std::io::Result<()> {
+    let Ok(mut value) = serde_json::from_slice::<Value>(frame) else {
+        return Ok(());
+    };
+    if value["id"].is_string()
         && serde_json::to_vec(&value["id"]).is_ok_and(|id| id.len() > MAX_RPC_ID_BYTES)
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "MCP request identifier exceeds maximum size",
         ));
+    }
+    /// Original SDK request envelope, inspecting only typed tool arguments.
+    #[derive(serde::Deserialize)]
+    struct Frame<T> {
+        /// Original tool-call parameter object.
+        params: Params<T>,
+    }
+    /// Tool parameters whose arguments must survive strict typed decoding.
+    #[derive(serde::Deserialize)]
+    struct Params<T> {
+        /// Typed start intent; all other SDK metadata remains untouched.
+        arguments: T,
+    }
+    let valid = if value["method"] != "tools/call" {
+        true
+    } else {
+        match value["params"]["name"].as_str() {
+            Some("start") => {
+                serde_json::from_slice::<Frame<agent_run_domain::ProviderStartRequest>>(frame)
+                    .map(|frame| frame.params.arguments)
+                    .is_ok()
+            }
+            Some("start_pool") => {
+                serde_json::from_slice::<Frame<agent_run_domain::pool::PoolStartRequest>>(frame)
+                    .map(|frame| frame.params.arguments)
+                    .is_ok()
+            }
+            _ => true,
+        }
+    };
+    if !valid {
+        value["params"]["arguments"] = json!({"invalid_start_frame":true});
+        *frame = serde_json::to_vec(&value).map_err(std::io::Error::other)?;
+        frame.push(b'\n');
     }
     Ok(())
 }
@@ -111,7 +149,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedReader<R> {
                 Poll::Ready(Ok(())) => {
                     if chunk.filled().is_empty() {
                         self.eof = true;
-                        validate_frame_id(&self.frame)?;
+                        validate_frame_id(&mut self.frame)?;
                         self.ready = std::mem::take(&mut self.frame);
                         continue;
                     }
@@ -124,7 +162,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedReader<R> {
                         }
                         self.frame.push(*byte);
                         if *byte == b'\n' {
-                            validate_frame_id(&self.frame)?;
+                            validate_frame_id(&mut self.frame)?;
                             let frame = std::mem::take(&mut self.frame);
                             self.ready.extend_from_slice(&frame);
                         }
@@ -549,6 +587,25 @@ mod tests {
     }
 
     use super::{BoundedReader, MAX_FRAME_BYTES};
+    /// Original duplicate server keys must become invalid SDK arguments, never
+    /// the lossy last-value-wins map. The request correlation remains intact.
+    #[test]
+    fn required_mcp_duplicate_mcp_keys_cannot_reach_admission() {
+        let mut frame = br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"start","arguments":{"provider":"p","model":"m","profile":"review","task":"t","workdir":"/gone","required_mcp":{"pool":[],"pool":[]}}}}"#.to_vec();
+        super::validate_frame_id(&mut frame).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(value["id"], 7);
+        assert_eq!(
+            value["params"]["arguments"],
+            json!({"invalid_start_frame":true})
+        );
+        assert!(
+            serde_json::from_value::<agent_run_domain::ProviderStartRequest>(
+                value["params"]["arguments"].clone()
+            )
+            .is_err()
+        );
+    }
     use crate::cli::{CliBroker, CliFuture};
     use serde_json::json;
     use std::sync::{

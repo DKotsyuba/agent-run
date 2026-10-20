@@ -1292,7 +1292,7 @@ async fn profile_symlink_escape_keeps_path_escape_error_on_every_transport() {
     assert_eq!(malformed.public().kind, "ValidationError");
 }
 
-/// One isolated broker and real raw MCP exchanges prove fifteen advertised
+/// One isolated broker and real raw MCP exchanges prove sixteen advertised
 /// tools, filtered guidance, typed errors, diagnostic privacy/numbers, and
 /// unchanged structured CLI/socket compatibility aliases without provider turns.
 #[tokio::test]
@@ -1313,12 +1313,12 @@ async fn consolidated_routing_discovery_and_legacy_aliases_work_live() {
         discovery["result"]["tools"]
     );
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 15, "{discovery}");
+    assert_eq!(tools.len(), 16, "{discovery}");
     for name in ["models", "capacity_order"] {
         assert!(!tools.iter().any(|tool| tool["name"] == name));
     }
     let socket_tools = client.call("tools", Some(json!({}))).await.unwrap();
-    assert_eq!(socket_tools.as_array().unwrap().len(), 15);
+    assert_eq!(socket_tools.as_array().unwrap().len(), 16);
     let filtered_cli = cli(
         &broker.home,
         &[

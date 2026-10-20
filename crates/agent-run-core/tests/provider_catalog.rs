@@ -120,6 +120,81 @@ fn footprint(root: &Path) -> Vec<i64> {
     .collect()
 }
 
+/// Assertions only test the frozen intersection: missing/capped/restricted
+/// grants have no durable effects; exact replay survives deleted directories.
+#[tokio::test]
+async fn required_mcp_checks_frozen_grants_before_effects_and_replays_without_workdir() {
+    let temp = home();
+    let root = temp.path().canonicalize().unwrap();
+    let config_path = root.join("config.toml");
+    let mut config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("/bin/true", "/usr/bin/true");
+    config.push_str("\n[mcp.pool]\ntransport='stdio'\ncommand='/usr/bin/true'\nglobal=true\nallowed_tools=['join','read','write']\n[mcp.empty]\ntransport='stdio'\ncommand='/usr/bin/true'\nglobal=true\nallowed_tools=[]\n");
+    fs::write(&config_path, config).unwrap();
+    fs::write(root.join("profiles/code.md"), "+++\nrevision='mcp-test'\nwrite=true\nnetwork=false\nallow_external_read_roots=false\nskills=[]\nmcp=[{name='pool',allowed_tools=['join','read']}]\nrequired_constraints=[]\n+++\nCode.\n").unwrap();
+    fs::write(root.join("profiles/research.md"), "+++\nrevision='research-test'\nwrite=false\nnetwork=true\nallow_external_read_roots=false\nskills=[]\nmcp=[]\nrequired_constraints=['research_tools_only']\n+++\nResearch.\n").unwrap();
+    let writer = common::writer::Harness::start(&root);
+    let service = Service::new(root.clone()).with_writer(writer.broker());
+    let workdir = root.join("work");
+    fs::create_dir(&workdir).unwrap();
+    let request = |id: &str, required: Value| -> agent_run_domain::ProviderStartRequest {
+        serde_json::from_value(json!({"provider":"glm","model":"glm-5.3","profile":"code","task":"task","workdir":workdir,"request_id":id,"required_mcp":required})).unwrap()
+    };
+    let before = footprint(&root);
+    for required in [
+        json!({"absent":[]}),
+        json!({"pool":["write"]}),
+        json!({"empty":["join"]}),
+    ] {
+        let error = service
+            .admit_provider(request("refused", required))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("required MCP"), "{error}");
+        assert_eq!(footprint(&root), before);
+    }
+    let mut restricted = request("restricted", json!({"pool":[]}));
+    restricted.provider = "codex".parse().unwrap();
+    restricted.model = "gpt-main".into();
+    restricted.profile = "research".into();
+    assert!(service.admit_provider(restricted).await.is_err());
+    assert_eq!(footprint(&root), before);
+    let first = service
+        .admit_provider(request(
+            "durable",
+            json!({"pool":["read","join"],"empty":[]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first["created"], true);
+    let admitted = footprint(&root);
+    fs::remove_dir(&workdir).unwrap();
+    let replay = service
+        .admit_provider(request(
+            "durable",
+            json!({"empty":[],"pool":["join","read"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay["created"], false);
+    assert_eq!(replay["agent_id"], first["agent_id"]);
+    assert_eq!(footprint(&root), admitted);
+    assert!(matches!(
+        service
+            .admit_provider(request("durable", json!({"pool":["join"]})))
+            .await,
+        Err(agent_run_domain::Error::Conflict)
+    ));
+    assert!(
+        service
+            .admit_provider(request("new-missing", json!({})))
+            .await
+            .is_err()
+    );
+    assert_eq!(footprint(&root), admitted);
+}
+
 /// The unfiltered catalog is one revisioned, account-free snapshot in
 /// provider order with explicit offerings, grants, and cached standing.
 #[tokio::test]
@@ -1128,5 +1203,45 @@ async fn cross_source_latch_survives_small_retention_and_releases_only_on_covera
             "{second:?}: fresh covering positive"
         );
         assert_ne!(status("m-a"), "exhausted", "{second:?}");
+    }
+}
+
+/// Current schema-2 provider advice survives a missing writer, retains exact
+/// cached quota standing and privacy, then resumes normal per-session deduplication.
+#[tokio::test]
+async fn advisory_provider_context_survives_writer_failure_for_both_clients() {
+    use agent_run_core::hooks::context;
+    for transport in ["codex_queue", "claude_uds"] {
+        let home = home();
+        let reference = agent_run_domain::domain::OrchestratorRef {
+            transport: transport.into(),
+            external_session_id: "provider-context".into(),
+            external_turn_id: None,
+        };
+        let fallback = context::build_for_hook(home.path(), &reference, None)
+            .await
+            .unwrap();
+        assert!(fallback.injected);
+        assert!(fallback.text.starts_with("Provider capacity order"));
+        assert!(fallback.text.contains("\"glm-5.3\":available"));
+        for private in [
+            "private-codex-label",
+            "acct-codex",
+            "acct-glm",
+            "secret-glm",
+            "secret-codex",
+        ] {
+            assert!(!fallback.text.contains(private));
+        }
+        let writer = common::writer::Harness::start(home.path());
+        let _socket = writer.serve_unix(home.path());
+        let first = context::build_for_hook(home.path(), &reference, None)
+            .await
+            .unwrap();
+        assert_eq!(first.text, fallback.text);
+        let repeated = context::build_for_hook(home.path(), &reference, None)
+            .await
+            .unwrap();
+        assert!(!repeated.injected);
     }
 }

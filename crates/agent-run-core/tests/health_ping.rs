@@ -127,7 +127,8 @@ async fn run_native_fixture(
         r#"read initial
 printf '%s\n' '{TURN}'
 read wake
-printf '%s\n' "$wake" > wake.json
+printf '%s\n' "$wake" > wake.pending
+mv wake.pending wake.json
 printf '%s\n' '{{"type":"assistant","session_id":"s","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"health-call","name":"mcp__agent_run_worker__health_reply","input":{{"ping_id":"{ping_id}","state":"working"}}}}]}}}}'
 while test ! -f health-receipt; do sleep 0.01; done
 printf '%s\n' '{{"type":"user","session_id":"s","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"health-call","content":"accepted"}}]}}}}'
@@ -200,7 +201,10 @@ printf '%s\n' "$unexpected" > unexpected.json
             if background {
                 observed(|| home.path.join("wake.json").exists()).await;
                 let wake = std::fs::read_to_string(home.path.join("wake.json")).unwrap();
-                assert!(wake.contains("agent-run/native-job-completed"));
+                assert!(
+                    wake.contains("agent-run/native-job-completed"),
+                    "unexpected synthetic wake: {wake}"
+                );
                 assert!(wake.contains("BACKGROUND_PASS"));
                 std::fs::write(home.path.join("health-receipt"), "release").unwrap();
                 observed(|| {
@@ -378,7 +382,8 @@ printf '%s\n' "$unexpected" > unexpected.json
 /// waits for the driver's release file after the first real idle boundary.
 /// `fulfilled` adds a matched foreground command and groups both returns in
 /// standard Promise result wrappers. Returns shell source and environment data;
-/// the shell never evaluates env data.
+/// the shell never evaluates env data. Wake receipts are renamed into place only
+/// after their complete write, so an existence observer never reads an empty file.
 fn codex_fixture(
     grant: &agent_run_core::codex::Grant,
     background: Option<bool>,
@@ -447,7 +452,7 @@ mkdir -p "$(dirname "$HISTORY")"
 printf '%s\n' '{"type":"session_meta","payload":{"id":"thread"}}' > "$HISTORY"
 fi
 printf '%s\n' "$turns" > turns.txt
-if test "$turns" -gt 1; then printf '%s\n' "$line" > wake.json; fi
+if test "$turns" -gt 1; then printf '%s\n' "$line" > wake.pending; mv wake.pending wake.json; fi
 printf '{"id":%s,"result":{"turn":{"id":"turn-%s"}}}\n' "$id" "$turns"
 if test "$turns" -eq 1 && test -n "$JOB_STARTED"; then
 printf '%s\n' "$JOB_STARTED"

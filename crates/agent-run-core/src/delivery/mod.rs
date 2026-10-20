@@ -1,5 +1,5 @@
 //! Durable external-notice outbox; Bridge custody and native delivery stay distinct.
-mod bridge;
+pub(crate) mod bridge;
 
 use crate::{
     Result,

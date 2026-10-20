@@ -383,6 +383,10 @@ pub struct ProviderProcess {
     pub target: AttemptTarget,
     /// Leader identity.
     pub leader: Identity,
+    /// Optional supervisor-recorded native store; absent on historical writers.
+    /// Session must remain absent until the adapter observes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<agent_run_domain::integration::NativeIntegration>,
 }
 
 /// 22 — provider attempt cleanup proof recorded.

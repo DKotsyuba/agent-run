@@ -308,10 +308,22 @@ pub fn order(
 ) -> Result<Value> {
     let store = Store::open(home)?;
     let _read = store.conn.unchecked_transaction()?;
-    let catalog = resolve(config, &store)?;
+    order_from_store(&store, config, revision, query)
+}
+
+/// Ranks providers from the caller's committed read snapshot and validated
+/// config revision. Opens no connection or transaction; the caller owns SQL
+/// limits. Model validation and storage errors retain the public order contract.
+pub(crate) fn order_from_store(
+    store: &Store,
+    config: &ProviderConfig,
+    revision: &str,
+    query: &CapacityOrderQuery,
+) -> Result<Value> {
+    let catalog = resolve(config, store)?;
     check_model(&catalog, query.model.as_deref())?;
     let order = provider_ranking::provider_order_filtered_at(
-        &store,
+        store,
         &catalog,
         &BTreeSet::new(),
         &|_, offering| {
