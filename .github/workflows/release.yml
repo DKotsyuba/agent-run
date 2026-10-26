@@ -26,7 +26,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
       - name: Restore check dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: agent-run-check-v2-macos-15-arm64
           cache-bin: false
@@ -95,7 +95,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
       - name: Restore package dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: agent-run-package-v1-macos-15-arm64
           cache-bin: false
@@ -138,7 +138,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Restore package dependencies read-only
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: agent-run-package-v1-macos-15-arm64
           cache-bin: false
