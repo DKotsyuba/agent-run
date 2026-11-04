@@ -372,10 +372,12 @@ esac
     }
 
     /// Spawns the actual xtask binary with only local fixture routes.
+    /// CI identity is opt-in because this source tree is synthetic.
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_xtask"));
         command
             .current_dir(&self.root)
+            .env_remove("GITHUB_ACTIONS")
             .env(
                 "PATH",
                 format!(
