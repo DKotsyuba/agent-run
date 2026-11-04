@@ -173,6 +173,19 @@ async fn system_route_is_frozen_and_handoff_never_falls_back() {
     use agent_run_domain::catalog::HarnessId;
     let temp = home();
     let root = temp.path().canonicalize().unwrap();
+    // This test never starts the binary; use its own verified executable
+    // instead of assuming a platform-specific path to `true`.
+    let config_path = root.join("config.toml");
+    let original = fs::read_to_string(&config_path).unwrap();
+    let executable = toml::Value::String(
+        std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let portable = original.replace("\"/bin/true\"", &executable.to_string());
+    assert_ne!(portable, original);
+    fs::write(&config_path, portable).unwrap();
     let writer = common::writer::Harness::start(&root);
     let launches = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let route = SystemRoute {

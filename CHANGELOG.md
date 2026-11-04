@@ -8,6 +8,16 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 - fix(claude): temporarily skip an ordered account for one hour after a
   confirmed billing or quota failure, including for subsequent executions.
+- feat(linux): add a shared systemd service with account-owned workers and
+  native x86-64 release artifacts alongside macOS Apple Silicon artifacts.
+- feat(claude): continue verified sessions across an ordered API-to-native
+  account queue, with owner-UID preflight and current-policy checks.
+- fix(mcp): return verified references and retrieval metadata for large
+  answers, with bounded previews for oversized transcript blocks.
+- fix(macos): preserve buffered Unix-socket frames when a peer closes while
+  retaining bounded deadlines and safe nonblocking I/O.
+- fix(runtime): make version probes race-safe, support jq 1.6 in the Codex
+  collector, and retain OpenCode compatibility and dependency security fixes.
 
 ## 0.29.2
 
