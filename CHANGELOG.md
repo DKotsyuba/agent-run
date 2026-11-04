@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.29.3
+
 - fix(claude): temporarily skip an ordered account for one hour after a
   confirmed billing or quota failure, including for subsequent executions.
 
