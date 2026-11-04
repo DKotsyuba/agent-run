@@ -420,9 +420,24 @@ async fn shared_worker_runs_a_real_supervisor_with_a_fake_engine() {
     drop(reader);
     fs::write(&config_path, original_config).unwrap();
 
+    // The previous billing failure still cools the API binding; later
+    // independent fixture scenarios must use the unaffected native account.
+    let blocked_api = socket::client_at(
+        &api,
+        broker_uid,
+        "start",
+        serde_json::json!({
+            "provider":"claude", "model":"fixture", "profile":"review", "explicit_finish":false,
+            "task":"fixture:answer", "workdir":root, "account":"fixture", "request_id":"cooled-api-refusal"
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(blocked_api.to_string().contains("binding_cooldown"));
+
     let callback_request = serde_json::json!({
         "provider":"claude", "model":"fixture", "profile":"review", "explicit_finish":true,
-        "task":"fixture:worker-finish", "workdir":root, "account":"fixture", "request_id":"worker-finish-fixture"
+        "task":"fixture:worker-finish", "workdir":root, "account":"reserve", "request_id":"worker-finish-fixture"
     });
     let started = socket::client_at(&api, broker_uid, "start", callback_request)
         .await
@@ -476,7 +491,7 @@ async fn shared_worker_runs_a_real_supervisor_with_a_fake_engine() {
     assert!(context.is_object());
     let request = serde_json::json!({
         "provider":"claude", "model":"fixture", "profile":"review", "explicit_finish":false,
-        "task":"fixture:load-barrier:answer", "workdir":root, "account":"fixture", "request_id":"shared-worker-fixture"
+        "task":"fixture:load-barrier:answer", "workdir":root, "account":"reserve", "request_id":"shared-worker-fixture"
     });
     let result = socket::client_at(&api, broker_uid, "start", request)
         .await
@@ -505,7 +520,7 @@ async fn shared_worker_runs_a_real_supervisor_with_a_fake_engine() {
     );
     let blocked = serde_json::json!({
         "provider":"claude", "model":"fixture", "profile":"review", "explicit_finish":false,
-        "task":"fixture:answer", "workdir":root, "account":"fixture", "request_id":"drain-refusal"
+        "task":"fixture:answer", "workdir":root, "account":"reserve", "request_id":"drain-refusal"
     });
     assert!(
         socket::client_at(&api, broker_uid, "start", blocked)
