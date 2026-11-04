@@ -20,6 +20,10 @@ a tenant boundary, a read-only observer role, or a per-provider permission
 policy. Use separate brokers and state directories when those boundaries are
 required.
 
+The broker is trusted with launch-secret values received in memory from a
+verified worker session to prevent those values from appearing in completion
+results. It does not need filesystem access to the worker's credential file.
+
 Linux enforces access to the local sockets and files by UID, GID, directory
 search permission and file mode. Agent Run also retains per-execution
 capabilities and process-identity checks for its internal supervisor protocol;
