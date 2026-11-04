@@ -432,9 +432,9 @@ esac
         }
     }
 
-    /// Gives normal identity/integrity fixtures a finite ten-second observation budget.
+    /// Bounds normal identity/integrity fixtures while allowing concurrent tool startup.
     fn wait(&self, result: &Path, notify: Option<&Path>) -> Output {
-        self.wait_for(result, notify, "10")
+        self.wait_for(result, notify, "30")
     }
 
     /// Uses an explicit deadline; the timeout boundary fixture alone requests one second.
@@ -593,8 +593,9 @@ fn dual_platform_observer_checks_linux_archive() {
     let first = fixture.wait(&fixture.temp.path().join("dual-ok.json"), None);
     assert!(
         first.status.success(),
-        "{}",
-        String::from_utf8_lossy(&first.stderr)
+        "stderr={} stdout={}",
+        String::from_utf8_lossy(&first.stderr),
+        String::from_utf8_lossy(&first.stdout)
     );
     let linux = fixture
         .manifest
