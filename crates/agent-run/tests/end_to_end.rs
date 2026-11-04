@@ -590,6 +590,34 @@ async fn scripted_pool_completes_with_one_correlated_common_notice() {
         .iter()
         .map(|m| serde_json::from_value(m["agent_id"].clone()).unwrap())
         .collect();
+    // Both vote replies follow the transactions that enqueue peer pushes.
+    // Keep the synthetic engines alive until those inputs have been handled.
+    let drain_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let markers_ready = h.home.join("pool-script-lead.txt").exists()
+            && h.home.join("pool-script-peer.txt").exists();
+        if markers_ready {
+            let store = agent_run_store::fixture::open(&h.home).unwrap();
+            let (votes, pending): (i64, i64) = store
+                .conn
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM pool_entries WHERE pool_id=? AND kind='vote'), \
+                     (SELECT COUNT(*) FROM commands WHERE agent_id IN (?,?) AND kind='pool' AND state<>'completed')",
+                    rusqlite::params![pool_id, ids[0].as_str(), ids[1].as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            if votes == 2 && pending == 0 {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < drain_deadline,
+            "pool fixture inputs did not drain"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    std::fs::write(h.home.join("pool-script-release"), b"").unwrap();
     for id in &ids {
         let answer = h.terminal(id).await;
         let row = agent_run_store::fixture::open(&h.home)

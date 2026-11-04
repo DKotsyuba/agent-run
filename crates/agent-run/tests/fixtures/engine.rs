@@ -579,6 +579,12 @@ fn main() {
     }
     if task.contains("fixture:pool-script") {
         pool_script(&args, task.contains("fixture:pool-script lead"));
+        // The test releases both workers only after their pool inputs drain.
+        wait_marker("pool-script-release");
+        assert!(
+            std::path::Path::new("pool-script-release").exists(),
+            "pool fixture was not released"
+        );
     }
     if task == "fixture:worker-notify" {
         worker_report(&args);
