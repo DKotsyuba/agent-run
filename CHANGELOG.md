@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.29.2
+
 - fix(system): recheck automatic account fallback through the broker and verify
   resumed runtime assets under their owning worker's Unix account.
 - fix(mcp): return a verified artifact reference and retrieval metadata for
