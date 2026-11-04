@@ -557,8 +557,8 @@ mod tests {
     #[test]
     fn answer_sequence_refuses_changed_proof() {
         let answer = serde_json::json!({
-            "agent_id":"ag-20261104-182921-bede60ade1", "status":"succeeded",
-            "available":true, "path":"/srv/agents/ag-20261104-182921-bede60ade1/answer.md",
+            "agent_id":"ag-20200101-000000-0000000001", "status":"succeeded",
+            "available":true, "path":"/srv/agents/ag-20200101-000000-0000000001/answer.md",
             "size_bytes":16078, "sha256":"a".repeat(64), "relative_path":"answer.md",
             "kind":"agent_answer", "media_type":"text/markdown", "proof_version":2
         });

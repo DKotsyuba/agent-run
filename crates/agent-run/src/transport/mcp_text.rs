@@ -2531,7 +2531,7 @@ mod tests {
     /// A long verified answer keeps its proof and existing file without inline overflow.
     #[test]
     fn large_answer_presents_existing_file_and_retrieval_proof() {
-        let id = "ag-20261104-182921-bede60ade1";
+        let id = "ag-20200101-000000-0000000001";
         let body = "я".repeat(8_000);
         let digest = agent_run_platform::fs::sha256(body.as_bytes());
         let path = format!("/srv/agent run/agents/{id}/answer.md");
@@ -2577,7 +2577,7 @@ mod tests {
     #[test]
     fn oversized_answer_without_valid_proof_fails_closed() {
         let value = serde_json::json!({
-            "agent_id":"ag-20261104-182921-bede60ade1", "status":"succeeded",
+            "agent_id":"ag-20200101-000000-0000000001", "status":"succeeded",
             "available":true, "inline_complete":true, "content":"x".repeat(16_000),
             "path":"/srv/unsafe/answer.md", "relative_path":"answer.md", "size_bytes":16_000,
             "sha256":"not-a-digest", "kind":"agent_answer", "proof_version":2
@@ -2591,7 +2591,7 @@ mod tests {
     #[test]
     fn oversized_transcript_block_keeps_its_navigation() {
         let value = serde_json::json!({
-            "agent_id":"ag-20261104-182921-bede60ade1", "view":"blocks",
+            "agent_id":"ag-20200101-000000-0000000001", "view":"blocks",
             "direction":"backward", "next_cursor":null, "previous_cursor":3,
             "complete":false, "messages":[{"seq":5,"first_seq":3,"last_seq":5,
             "role":"tool_call","name":"finish","content":"я".repeat(8_000),
