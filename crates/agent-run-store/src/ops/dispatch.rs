@@ -428,7 +428,13 @@ pub(crate) fn run_remote(store: &mut Store, op: RemoteOp) -> Result<Value> {
         )?)),
         R::ProviderHistory(op) => {
             let metadata = history_value(&op.metadata)?;
-            out(store.provider_history(&op.target.execution, &op.target.attempt, &metadata)?)
+            out(store.provider_history_with_cooldown(
+                &op.target.execution,
+                &op.target.attempt,
+                &metadata,
+                op.metadata.cooldown_reason,
+                agent_run_domain::domain::now(),
+            )?)
         }
         R::CompleteTerminalCommands(op) => {
             out(store.complete_terminal_commands(&op.execution, op.at)?)
@@ -741,6 +747,9 @@ fn history_value(metadata: &ProviderHistoryMetadata) -> Result<Value> {
     }
     if let Some(failure) = &metadata.native_failure {
         value.insert("native_failure".into(), failure.clone());
+    }
+    if let Some(reason) = metadata.cooldown_reason {
+        value.insert("binding_cooldown_recorded".into(), json!(reason));
     }
     Ok(Value::Object(value))
 }

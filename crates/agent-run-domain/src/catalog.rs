@@ -1168,6 +1168,26 @@ impl QuotaCandidateSet {
     }
 }
 
+/// A structured native failure that temporarily excludes one ordered binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingCooldownReason {
+    /// A custom API reported a billing failure.
+    BillingUnavailable,
+    /// The selected account reported native quota exhaustion.
+    QuotaExhausted,
+}
+
+impl BindingCooldownReason {
+    /// Stable closed spelling used in storage and public errors.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BillingUnavailable => "billing_unavailable",
+            Self::QuotaExhausted => "quota_exhausted",
+        }
+    }
+}
+
 /// The typed verdicts transactional admission can return instead of admitting.
 ///
 /// These are admission outcomes, not provider exhaustion observations, except
@@ -1208,6 +1228,19 @@ pub enum QuotaAdmissionError {
         /// The last candidate the exhaustion fact is attached to.
         account: AccountId,
     },
+    /// A confirmed native failure temporarily excludes this provider binding.
+    BindingCooldown {
+        /// Provider whose binding is temporarily unavailable.
+        provider: ProviderId,
+        /// Model requested by the caller.
+        model: String,
+        /// Account whose failure caused the cooldown.
+        account: AccountId,
+        /// The structured failure that caused the cooldown.
+        reason: BindingCooldownReason,
+        /// Whole seconds until this recorded cooldown expires, rounded up.
+        retry_after_seconds: u64,
+    },
 }
 
 impl QuotaAdmissionError {
@@ -1218,6 +1251,7 @@ impl QuotaAdmissionError {
             Self::SelectionBusy { .. } => "selection_busy",
             Self::NoEligibleAccount { .. } => "no_eligible_account",
             Self::QuotaExhausted { .. } => "quota_exhausted",
+            Self::BindingCooldown { .. } => "binding_cooldown",
         }
     }
 }
@@ -1251,6 +1285,17 @@ impl fmt::Display for QuotaAdmissionError {
             } => write!(
                 formatter,
                 "quota_exhausted (provider {provider}, model {model}, account {account})"
+            ),
+            Self::BindingCooldown {
+                provider,
+                model,
+                account,
+                reason,
+                retry_after_seconds,
+            } => write!(
+                formatter,
+                "binding_cooldown (provider {provider}, model {model}, account {account}, reason {}; retry after {retry_after_seconds} seconds)",
+                reason.as_str(),
             ),
         }
     }

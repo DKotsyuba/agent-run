@@ -582,6 +582,7 @@ impl Store<'_> {
              OR EXISTS(SELECT 1 FROM pools p WHERE {releasable})
              OR EXISTS(SELECT 1 FROM capacity_samples WHERE observed_at < ?1)
              OR EXISTS(SELECT 1 FROM capacity_route_snapshots WHERE valid_until < ?1)
+             OR EXISTS(SELECT 1 FROM binding_cooldowns WHERE blocked_until < ?1)
              OR EXISTS(SELECT 1 FROM managed_service_generations
                 WHERE state='stopped' AND COALESCE(checked_at,created_at) < ?1)
              OR EXISTS(SELECT 1 FROM orchestrator_sessions s WHERE s.last_seen_at < ?1
@@ -861,6 +862,10 @@ impl Store<'_> {
         )?;
         deleted += tx.execute(
             "DELETE FROM capacity_route_snapshots WHERE valid_until < ?",
+            [cutoff],
+        )?;
+        deleted += tx.execute(
+            "DELETE FROM binding_cooldowns WHERE blocked_until < ?",
             [cutoff],
         )?;
         tx.execute(

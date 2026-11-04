@@ -843,6 +843,25 @@ fn quota_admission_verdicts_are_typed_and_stable() {
     // from active-slot capacity exhaustion.
     let public = agent_run_domain::Error::QuotaAdmission(exhausted.clone()).public();
     assert_eq!(public.kind, "quota_exhausted");
+    let cooldown = QuotaAdmissionError::BindingCooldown {
+        provider: ProviderId::from_str("claude").unwrap(),
+        model: "fixture".into(),
+        account: AccountId::from_str("acct-api").unwrap(),
+        reason: agent_run_domain::catalog::BindingCooldownReason::BillingUnavailable,
+        retry_after_seconds: 21,
+    };
+    assert_eq!(cooldown.kind(), "binding_cooldown");
+    let public = agent_run_domain::Error::QuotaAdmission(cooldown.clone()).public();
+    assert_eq!(public.kind, "binding_cooldown");
+    assert!(public.message.contains("billing_unavailable"));
+    assert!(public.message.contains("21 seconds"));
+    assert_eq!(
+        serde_json::from_value::<QuotaAdmissionError>(
+            serde_json::to_value(cooldown.clone()).unwrap()
+        )
+        .unwrap(),
+        cooldown
+    );
     assert_eq!(
         agent_run_domain::Error::Capacity.public().kind,
         "CapacityExhausted"
@@ -858,6 +877,7 @@ fn quota_admission_verdicts_are_typed_and_stable() {
         "selection_busy",
         "no_eligible_account",
         "quota_exhausted",
+        "binding_cooldown",
         "RequestConflict",
     ] {
         assert_eq!(broker(Some(code)).public().kind, code);

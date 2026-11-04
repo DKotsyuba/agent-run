@@ -2095,8 +2095,20 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             store.event(id, "native_failure", &data).await?;
             state["native_failure"] = data;
         }
+        let cooldown_reason = if ordered_claude && result.outcome.status == Status::Failed {
+            use agent_run_domain::catalog::BindingCooldownReason;
+            if billing {
+                Some(BindingCooldownReason::BillingUnavailable)
+            } else if quota {
+                Some(BindingCooldownReason::QuotaExhausted)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         store
-            .provider_history(id, &attempt_id, history_metadata(&state))
+            .provider_history(id, &attempt_id, history_metadata(&state, cooldown_reason))
             .await?;
         let history_recorded = std::time::Instant::now();
         if (quota || billing)
@@ -2349,7 +2361,10 @@ fn inject_native_failure(
 }
 /// The typed continuation metadata of a history state value: the sealed history,
 /// or its bounded unavailable reason (1..512 bytes), and the typed native failure.
-fn history_metadata(state: &serde_json::Value) -> ops::ProviderHistoryMetadata {
+fn history_metadata(
+    state: &serde_json::Value,
+    cooldown_reason: Option<agent_run_domain::catalog::BindingCooldownReason>,
+) -> ops::ProviderHistoryMetadata {
     let unavailable = state
         .get("native_history_unavailable")
         .and_then(serde_json::Value::as_str)
@@ -2367,6 +2382,7 @@ fn history_metadata(state: &serde_json::Value) -> ops::ProviderHistoryMetadata {
         native_history: state.get("native_history").cloned(),
         native_history_unavailable: unavailable,
         native_failure: state.get("native_failure").cloned(),
+        cooldown_reason,
     }
 }
 

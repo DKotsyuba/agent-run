@@ -248,10 +248,56 @@ fn group_client() {
             assert_eq!(answer["content"], "fixture final answer\n");
         }
         if failover {
+            // The next independent request must skip the failed API binding,
+            // not repeat the failed provider call before switching again.
+            let next = socket::client_at(
+                &api,
+                1000,
+                "start",
+                serde_json::json!({
+                    "provider":"claude", "model":"fixture", "profile":"review",
+                    "explicit_finish":false, "task":"fixture:answer", "workdir":work,
+                    "request_id":"real-uid-after-billing"
+                }),
+            )
+            .await
+            .unwrap();
+            let next: AgentId = next["agent_id"].as_str().unwrap().parse().unwrap();
+            let done = socket::client_at(&api, 1000, "wait", serde_json::json!({"agent_id":next}))
+                .await
+                .unwrap();
+            assert_eq!(done["status"], "succeeded", "next run failed: {done}");
+            let state = PathBuf::from(std::env::var_os("AR_UID_STATE").unwrap());
+            let reader = agent_run_store::writer::StoreReader::open(&state).unwrap();
+            let accounts: Vec<String> = reader
+                .conn()
+                .prepare(
+                    "SELECT selected_account_id FROM attempts WHERE agent_id=? ORDER BY number",
+                )
+                .unwrap()
+                .query_map([next.as_str()], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(accounts, ["fixture-sub"]);
+            drop(reader);
+            let pinned_error = socket::client_at(
+                &api,
+                1000,
+                "start",
+                serde_json::json!({
+                    "provider":"claude", "model":"fixture", "profile":"review",
+                    "explicit_finish":false, "task":"fixture:answer", "workdir":work,
+                    "account":"fixture", "request_id":"real-uid-cooled-pin"
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert!(pinned_error.to_string().contains("binding_cooldown"));
+
             // Another group member can reach the worker socket, but cannot
             // invoke the broker-only private-file preflight even with the
             // genuine stored parent and route fingerprint.
-            let state = PathBuf::from(std::env::var_os("AR_UID_STATE").unwrap());
             let worker = PathBuf::from(std::env::var_os("AR_UID_WORKER").unwrap());
             let row = agent_run_store::writer::StoreReader::open(&state)
                 .unwrap()

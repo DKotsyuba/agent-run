@@ -342,6 +342,29 @@ fn ordered_billing_fallback_requires_matching_custom_attempt() {
         )
         .unwrap();
     assert_eq!(admitted.account_id.as_str(), "acct-a");
+    // A second request can already be in flight when the first failure lands.
+    let concurrent_request = provider_request(home.path(), "ordered-billing-concurrent");
+    let concurrent = store
+        .admit_provider(
+            &concurrent_request,
+            &concurrent_request.storage_projection(),
+            &catalog,
+            &authority,
+            &candidates(
+                store.quota_capacity_revision().unwrap(),
+                &[("acct-a", 0), ("acct-c", 1)],
+            ),
+            &ordered_identity(&concurrent_request, &authority, &catalog),
+            8,
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(concurrent.account_id.as_str(), "acct-a");
+    store.conn.execute(
+        "UPDATE attempts SET phase='cleanup_complete',cleanup_proof_json='{\"confirmed\":true}' WHERE id=?",
+        [&concurrent.attempt_id],
+    ).unwrap();
     store.conn.execute(
         "UPDATE attempts SET phase='cleanup_complete',cleanup_proof_json='{\"confirmed\":true}' WHERE id=?",
         [admitted.attempt_id.as_str()],
@@ -384,7 +407,7 @@ fn ordered_billing_fallback_requires_matching_custom_attempt() {
                 .is_err(),
             "{field}"
         );
-        assert_eq!(ownership(&store, &admitted.agent_id), (1, 1, 1));
+        assert_eq!(ownership(&store, &admitted.agent_id), (1, 2, 1));
     }
     let mut unproven = evidence.clone();
     unproven["native_history"]["task_proven"] = json!(false);
@@ -401,7 +424,7 @@ fn ordered_billing_fallback_requires_matching_custom_attempt() {
             .allocate_next_attempt(&admitted.agent_id, &catalog, &offered)
             .is_err()
     );
-    assert_eq!(ownership(&store, &admitted.agent_id), (1, 1, 1));
+    assert_eq!(ownership(&store, &admitted.agent_id), (1, 2, 1));
     store
         .conn
         .execute(
@@ -409,6 +432,166 @@ fn ordered_billing_fallback_requires_matching_custom_attempt() {
             rusqlite::params![evidence.to_string(), admitted.attempt_id],
         )
         .unwrap();
+    let at = agent_run_domain::domain::now();
+    let before_revision = store.quota_capacity_revision().unwrap();
+    for class in ["throttled", "auth", "network", "context_window", "other"] {
+        let mut invalid = evidence.clone();
+        invalid["native_failure"]["class"] = json!(class);
+        invalid["binding_cooldown_recorded"] = json!("billing_unavailable");
+        assert!(
+            store
+                .provider_history_with_cooldown(
+                    &admitted.agent_id,
+                    &admitted.attempt_id,
+                    &invalid,
+                    Some(agent_run_domain::catalog::BindingCooldownReason::BillingUnavailable),
+                    at,
+                )
+                .is_err(),
+            "{class} is not a billing refusal"
+        );
+    }
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM binding_cooldowns", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(store.quota_capacity_revision().unwrap(), before_revision);
+    let mut cooled = evidence.clone();
+    cooled["binding_cooldown_recorded"] = json!("billing_unavailable");
+    store
+        .provider_history_with_cooldown(
+            &admitted.agent_id,
+            &admitted.attempt_id,
+            &cooled,
+            Some(agent_run_domain::catalog::BindingCooldownReason::BillingUnavailable),
+            at,
+        )
+        .unwrap();
+    assert_eq!(
+        store.quota_capacity_revision().unwrap(),
+        before_revision + 1
+    );
+    let mut older = cooled.clone();
+    older["native_failure"]["attempt"] = json!(concurrent.attempt_id);
+    store
+        .provider_history_with_cooldown(
+            &concurrent.agent_id,
+            &concurrent.attempt_id,
+            &older,
+            Some(agent_run_domain::catalog::BindingCooldownReason::BillingUnavailable),
+            at - 100.0,
+        )
+        .unwrap();
+    assert_eq!(
+        store.quota_capacity_revision().unwrap(),
+        before_revision + 1,
+        "a late older failure must not shorten the current cooldown"
+    );
+    // Retrying the same attempt must not extend its original one-hour window.
+    store
+        .provider_history_with_cooldown(
+            &admitted.agent_id,
+            &admitted.attempt_id,
+            &cooled,
+            Some(agent_run_domain::catalog::BindingCooldownReason::BillingUnavailable),
+            at + 1200.0,
+        )
+        .unwrap();
+    assert_eq!(
+        store.quota_capacity_revision().unwrap(),
+        before_revision + 1
+    );
+    let provider = "glm-user".parse().unwrap();
+    let account = "acct-a".parse().unwrap();
+    assert_eq!(
+        agent_run_store::provider_admission::binding_cooldown(
+            &store.conn,
+            &provider,
+            &account,
+            at + 3599.1
+        )
+        .unwrap(),
+        Some((
+            agent_run_domain::catalog::BindingCooldownReason::BillingUnavailable,
+            1
+        ))
+    );
+    assert_eq!(
+        agent_run_store::provider_admission::binding_cooldown(
+            &store.conn,
+            &provider,
+            &account,
+            at + 3600.0
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(
+        agent_run_store::provider_admission::binding_cooldown(
+            &store.conn,
+            &"glm-alias".parse().unwrap(),
+            &account,
+            at
+        )
+        .unwrap(),
+        None
+    );
+    let stale = candidates(before_revision, &[("acct-c", 0)]);
+    assert!(matches!(
+        store.allocate_next_attempt(&admitted.agent_id, &catalog, &stale),
+        Err(Error::QuotaAdmission(
+            QuotaAdmissionError::SelectionStale { .. }
+        ))
+    ));
+    assert_eq!(ownership(&store, &admitted.agent_id), (1, 2, 1));
+    let automatic = provider_request(home.path(), "cooldown-auto");
+    let forged = candidates(
+        store.quota_capacity_revision().unwrap(),
+        &[("acct-a", 0), ("acct-c", 1)],
+    );
+    let selected = store
+        .admit_provider(
+            &automatic,
+            &automatic.storage_projection(),
+            &catalog,
+            &authority,
+            &forged,
+            &ordered_identity(&automatic, &authority, &catalog),
+            8,
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        selected.account_id.as_str(),
+        "acct-c",
+        "transaction must recheck cooldown even for a stale ranking"
+    );
+    let mut pinned = provider_request(home.path(), "cooldown-pinned");
+    pinned.account = Some("api".parse().unwrap());
+    let mut pinned_set = candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+    pinned_set.intent = SelectionIntent::Pinned(account.clone());
+    let refusal = store
+        .admit_provider(
+            &pinned,
+            &pinned.storage_projection(),
+            &catalog,
+            &authority,
+            &pinned_set,
+            &ordered_identity(&pinned, &authority, &catalog),
+            8,
+            None,
+            Some(&account),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        refusal,
+        Error::QuotaAdmission(QuotaAdmissionError::BindingCooldown { .. })
+    ));
     let offered = candidates(
         store.quota_capacity_revision().unwrap(),
         &[("acct-b", 0), ("acct-c", 1)],
@@ -459,6 +642,104 @@ fn ordered_billing_fallback_requires_matching_custom_attempt() {
     assert_eq!(
         count, 2,
         "native billing trouble cannot create another attempt"
+    );
+    let mut wrong = native_failure.clone();
+    wrong["binding_cooldown_recorded"] = json!("billing_unavailable");
+    assert!(
+        store
+            .provider_history_with_cooldown(
+                &admitted.agent_id,
+                &next.attempt_id,
+                &wrong,
+                Some(agent_run_domain::catalog::BindingCooldownReason::BillingUnavailable),
+                at,
+            )
+            .is_err(),
+        "native subscription billing is not an API billing cooldown"
+    );
+    let subscription = "acct-c".parse().unwrap();
+    assert_eq!(
+        agent_run_store::provider_admission::binding_cooldown(
+            &store.conn,
+            &provider,
+            &subscription,
+            at
+        )
+        .unwrap(),
+        None
+    );
+    let mut quota = native_failure;
+    quota["native_failure"]["class"] = json!("quota_exhausted");
+    quota["native_failure"]["signal"] = json!("claude.rate_limit_event.rejected");
+    quota["native_failure"]["window"] = json!("five_hour");
+    quota["binding_cooldown_recorded"] = json!("quota_exhausted");
+    store
+        .provider_history_with_cooldown(
+            &admitted.agent_id,
+            &next.attempt_id,
+            &quota,
+            Some(agent_run_domain::catalog::BindingCooldownReason::QuotaExhausted),
+            at,
+        )
+        .unwrap();
+    assert_eq!(
+        agent_run_store::provider_admission::binding_cooldown(
+            &store.conn,
+            &provider,
+            &subscription,
+            at
+        )
+        .unwrap(),
+        Some((
+            agent_run_domain::catalog::BindingCooldownReason::QuotaExhausted,
+            3600
+        ))
+    );
+}
+
+/// Historical attempts without provider identity can still record cleanup history.
+#[test]
+fn legacy_history_without_provider_identity_remains_writable() {
+    let home = home();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
+    let catalog = catalog(&store);
+    let request = provider_request(home.path(), "legacy-history");
+    let authority = authority(&catalog, home.path());
+    let offered = candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+    let admitted = store
+        .admit_provider(
+            &request,
+            &request.storage_projection(),
+            &catalog,
+            &authority,
+            &offered,
+            &identity(&request, &authority),
+            8,
+            None,
+            None,
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET identity_json=NULL WHERE id=?",
+            [admitted.agent_id.as_str()],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE attempts SET phase='cleanup_complete' WHERE id=?",
+            [&admitted.attempt_id],
+        )
+        .unwrap();
+    let state = json!({"native_history_unavailable":"legacy"});
+    store
+        .provider_history(&admitted.agent_id, &admitted.attempt_id, &state)
+        .unwrap();
+    assert_eq!(
+        store.latest_attempt_state(&admitted.agent_id).unwrap(),
+        state.to_string()
     );
 }
 

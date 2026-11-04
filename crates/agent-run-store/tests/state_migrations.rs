@@ -140,6 +140,57 @@ fn every_historical_version_migrates_to_a_schema_indistinguishable_from_fresh() 
     }
 }
 
+/// Schema 32 upgrades without changing history; a colliding table rolls back
+/// the 32→33 step and retains the pre-migration SQLite backup.
+#[test]
+fn v32_binding_cooldown_upgrade_and_failed_step_recovery() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("state.db");
+    let conn = build_fixture(&path, 32);
+    let before = agent_count(&conn);
+    drop(conn);
+    assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
+    let upgraded = open_ro(&path);
+    assert_eq!(user_version(&upgraded), 33);
+    assert_eq!(agent_count(&upgraded), before);
+    assert_eq!(
+        upgraded
+            .query_row("SELECT COUNT(*) FROM binding_cooldowns", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        upgraded
+            .pragma_query_value(None, "integrity_check", |row| row.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    assert_eq!(schema_objects(&upgraded), fresh_schema_objects());
+    drop(upgraded);
+
+    let failed_home = tempfile::tempdir().unwrap();
+    let failed_path = failed_home.path().join("state.db");
+    let conn = build_fixture(&failed_path, 32);
+    let before = agent_count(&conn);
+    conn.execute_batch("CREATE TABLE binding_cooldowns(wrong TEXT)")
+        .unwrap();
+    drop(conn);
+    assert!(migrations::migrate(&failed_path).is_err());
+    let backup = migrations::backup_path(&failed_path, 33);
+    assert!(backup.is_file());
+    for path in [&failed_path, &backup] {
+        let conn = open_ro(path);
+        assert_eq!(user_version(&conn), 32);
+        assert_eq!(agent_count(&conn), before);
+        assert_eq!(
+            conn.pragma_query_value(None, "integrity_check", |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+    }
+}
+
 /// A schema-31 upgrade adds the producer lookup index without changing durable
 /// receipt identity/content or producer ordering watermarks.
 #[test]

@@ -424,6 +424,9 @@ pub struct ProviderHistoryMetadata {
     pub native_history_unavailable: Option<String>,
     /// Closed native failure facts.
     pub native_failure: Option<Value>,
+    /// Confirmed failed native outcome eligible for an ordered binding cooldown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_reason: Option<agent_run_domain::catalog::BindingCooldownReason>,
 }
 
 /// 23 — record continuation metadata after cleanup.

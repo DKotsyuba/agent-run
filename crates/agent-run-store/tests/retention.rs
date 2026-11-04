@@ -446,6 +446,41 @@ fn retention_keeps_service_recovery_and_account_quota_latches() {
     integrity(&store);
 }
 
+/// An active binding cooldown survives agent-history pruning and a reopened
+/// store; a cooldown long past expiry is removed by normal maintenance.
+#[test]
+fn retention_preserves_active_binding_cooldown_without_its_attempt() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let old = NOW - HISTORY_SECONDS - 1.0;
+    let id = agent(&home, &mut store, "succeeded", Some(old));
+    store
+        .conn
+        .execute(
+            "INSERT INTO provider_accounts VALUES ('account','fixture','env:TEST','enabled',0,0)",
+            [],
+        )
+        .unwrap();
+    for (provider, observed, until) in [
+        ("active", NOW - 3000.0, NOW + 600.0),
+        ("expired", old - 3601.0, old - 1.0),
+    ] {
+        store.conn.execute(
+            "INSERT INTO binding_cooldowns(provider_id,account_id,reason,observed_at,blocked_until,attempt_id) VALUES(?1,'account','billing_unavailable',?2,?3,?4)",
+            params![provider, observed, until, id.as_str()],
+        ).unwrap();
+    }
+    drain(&mut store, 16);
+    assert!(store.get(&id).is_err());
+    assert_eq!(count(&store, "binding_cooldowns"), 1);
+    drop(store);
+    let reopened = Store::open(&home.path).unwrap();
+    let until: f64 = reopened.conn.query_row(
+        "SELECT blocked_until FROM binding_cooldowns WHERE provider_id='active' AND account_id='account'", [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(until, NOW + 600.0);
+}
+
 /// Retention's foreign-key checks use indexes instead of scanning other agents' full journals.
 #[test]
 fn retention_deletes_do_not_scan_unrelated_journals() {

@@ -161,12 +161,20 @@ mode is limited to Claude custom Messages providers with
 account never switches. Existing executions retain their frozen configuration.
 
 A structured Claude billing error on a custom binding, or an authoritative
-quota rejection, can advance an automatic execution after verified cleanup and
-history/input proof. Billing failure is not a confirmed zero balance and does
-not create a quota latch. With no collector, each new execution tries the
-highest-priority eligible binding again. Generic throttling, authentication and
-network errors do not authorize the switch. An unresolved tool call or uncertain
-history stops it; the original task is not resent. See
+quota rejection on an ordered binding, temporarily excludes that provider/account
+binding for one hour. New automatic executions select the next eligible binding
+immediately. The cooldown survives a broker restart and is separate from quota
+measurements: a billing error does not establish a zero balance. After one hour,
+the normal priority order applies again, subject to any independently known quota.
+An explicitly pinned account is never redirected; while it is cooling down the
+request is refused with `binding_cooldown` and the remaining wait in seconds.
+Executions already admitted before the failure are not cancelled or retroactively
+moved to another account.
+
+The current execution can advance after verified cleanup and history/input proof.
+Generic throttling, authentication and network errors do not authorize a switch
+or a cooldown. An unresolved tool call or uncertain history stops continuation;
+the original task is not resent. See
 [session continuity](session-continuity.md) for evidence and limits.
 
 ## MCP selection and tool caps

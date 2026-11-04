@@ -4569,6 +4569,45 @@ async fn ordered_claude_billing_continues_the_same_session() {
     assert_eq!(attempts(&home, &child_id)[0].1, "acct-sub");
 }
 
+/// A structured Claude quota refusal cools only the failed ordered binding;
+/// a later automatic request selects the other account without a quota sample.
+#[tokio::test]
+async fn ordered_claude_quota_cools_only_the_failed_binding() {
+    let (_temp, home) = ordered_claude_home();
+    let service = fixture_service(home.clone()).await;
+    let mut request = request(&home);
+    request.task = "fixture:quota".into();
+    request.account = None;
+    request.request_id = Some("claude-quota-cooldown".into());
+    let admitted = service.admit_provider(request.clone()).await.unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    run_to_end(&home, &id).await;
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    let row = store.get(&id).unwrap();
+    assert_eq!(row.status, Status::Succeeded, "{:?}", row.failure_text);
+    let attempt_rows = attempts(&home, &id);
+    assert_eq!(attempt_rows.len(), 2);
+    assert_eq!(attempt_rows[0].1, "acct-work");
+    assert_eq!(attempt_rows[1].1, "acct-sub");
+    let reason: String = store.conn.query_row(
+        "SELECT reason FROM binding_cooldowns WHERE provider_id='glm-user' AND account_id='acct-work'", [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(reason, "quota_exhausted");
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM quota_exhaustion", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    request.task = "fixture:answer".into();
+    request.request_id = Some("claude-quota-next".into());
+    let next = service.admit_provider(request).await.unwrap();
+    let next_id: AgentId = serde_json::from_value(next["agent_id"].clone()).unwrap();
+    assert_eq!(attempts(&home, &next_id)[0].1, "acct-sub");
+}
+
 /// A later explicit turn still starts on the preferred API account and can
 /// switch to the frozen subscription if that new turn hits a billing error.
 #[tokio::test]

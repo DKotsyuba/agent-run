@@ -16,6 +16,8 @@ pub enum MachineCode {
     /// Every eligible account is authoritatively quota-exhausted until a
     /// known reset; distinct from active-slot `CapacityExhausted`.
     QuotaExhausted,
+    /// A provider binding is temporarily excluded after a native failure.
+    BindingCooldown,
     /// The caller supplied an invalid public value.
     ValidationError,
     /// A derived path escaped its declared owned root.
@@ -56,6 +58,7 @@ impl MachineCode {
             Self::SelectionBusy => "selection_busy",
             Self::NoEligibleAccount => "no_eligible_account",
             Self::QuotaExhausted => "quota_exhausted",
+            Self::BindingCooldown => "binding_cooldown",
             Self::ValidationError => "ValidationError",
             Self::PathEscapeError => "PathEscapeError",
             Self::AgentNotFound => "AgentNotFound",
@@ -75,11 +78,12 @@ impl MachineCode {
     }
 
     /// Every public machine code, in declaration order.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::SelectionStale,
         Self::SelectionBusy,
         Self::NoEligibleAccount,
         Self::QuotaExhausted,
+        Self::BindingCooldown,
         Self::ValidationError,
         Self::PathEscapeError,
         Self::AgentNotFound,
@@ -419,6 +423,9 @@ impl Error {
             }
             Self::QuotaAdmission(QuotaAdmissionError::QuotaExhausted { .. }) => {
                 MachineCode::QuotaExhausted
+            }
+            Self::QuotaAdmission(QuotaAdmissionError::BindingCooldown { .. }) => {
+                MachineCode::BindingCooldown
             }
             Self::Validation(_) | Self::Json(_) => MachineCode::ValidationError,
             Self::PathEscape(_) => MachineCode::PathEscapeError,

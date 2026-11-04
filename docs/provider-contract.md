@@ -519,12 +519,18 @@ records the failure and history seal and may continue on another account:
   `failover_blocked: <reason>`. A billing error is not a measured zero balance.
   A history with an unresolved tool call is refused; completed external effects
   cannot be made idempotent by the transcript alone.
+- A confirmed billing failure on an ordered custom Claude binding, or an
+  authoritative quota rejection on an ordered binding, also cools down that
+  provider/account binding for one hour. Other providers and accounts are not
+  affected. The persisted cooldown is rechecked at admission and expires after
+  a restart as well. A pinned binding is refused with `binding_cooldown` rather
+  than silently redirected; automatic selection uses another eligible binding.
 - Exhaustion feeds the durable latch only when `collector.exhaustion_windows`
   explicitly identifies the physical pool for that native window. The mapping
   governs the account's eligible model lanes and is journaled under
-  `native-quota-exhaustion`. Windowless or unmapped failures exclude the account
-  for that run without inventing a shared pool. Ranking consumes the stored
-  per-window model membership.
+  `native-quota-exhaustion`. Windowless or unmapped failures do not invent a
+  shared quota pool. Ranking consumes the stored per-window model membership;
+  ordered Claude bindings additionally use the separate one-hour cooldown above.
 
 ### Unlimited executions, handoff serialization and recovery
 

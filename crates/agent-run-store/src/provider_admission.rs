@@ -4,8 +4,9 @@ use crate::{ACTIVE_SQL, Record, Store, admission, lineage, tx_event};
 use agent_run_domain::{
     Error, ProviderStartRequest, Result, canonical,
     catalog::{
-        AccountId, AttemptCredentials, ProviderCatalog, ProviderDefinition, QuotaAdmissionError,
-        QuotaCandidateSet, ResolvedLaunchAuthority, SelectionIntent,
+        AccountId, AttemptCredentials, BindingCooldownReason, ProviderBinding, ProviderCatalog,
+        ProviderConnection, ProviderDefinition, QuotaAdmissionError, QuotaCandidateSet,
+        ResolvedLaunchAuthority, SelectionIntent,
     },
     domain::{AgentId, StartRequest, Status, now},
     error::invalid,
@@ -26,6 +27,9 @@ pub(crate) const NEVER_SPAWNED: &str = "t.ownership_active=1 AND t.phase='prepar
      AND (SELECT COUNT(*) FROM attempts u WHERE u.agent_id=t.agent_id AND u.ownership_active=1)=1 \
      AND NOT EXISTS(SELECT 1 FROM process_ownership o WHERE o.owner_kind='attempt' AND o.owner_id=t.id) \
      AND NOT EXISTS(SELECT 1 FROM process_members m WHERE m.owner_kind='attempt' AND m.owner_id=t.id)";
+
+/// Duration of a confirmed ordered-binding failure, in seconds.
+pub const BINDING_COOLDOWN_SECONDS: f64 = 3600.0;
 
 /// One durable first-attempt selection, including an idempotent replay.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -295,7 +299,123 @@ impl Store<'_> {
     /// `native_history_unavailable` reason) in its adapter state, only after
     /// its cleanup proof; the value is metadata, never credential material.
     pub fn provider_history(&self, id: &AgentId, attempt: &str, state: &Value) -> Result<()> {
-        let changed = self.conn.execute(
+        self.provider_history_with_cooldown(id, attempt, state, None, now())
+    }
+
+    /// Records cleanup-bound history and, for a verified ordered-binding failure,
+    /// atomically records its one-hour cooldown and advances the capacity revision.
+    /// `at` is the writer's observation time, in Unix seconds. Identical attempt
+    /// evidence is idempotent and cannot extend a previously recorded cooldown.
+    pub fn provider_history_with_cooldown(
+        &self,
+        id: &AgentId,
+        attempt: &str,
+        state: &Value,
+        cooldown: Option<BindingCooldownReason>,
+        at: f64,
+    ) -> Result<()> {
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
+        let (identity, account, previous): (Option<String>, Option<String>, String) = tx
+            .query_row(
+                "SELECT a.identity_json,t.selected_account_id,t.adapter_state_json \
+             FROM agents a JOIN attempts t ON t.agent_id=a.id \
+             WHERE a.id=?1 AND t.id=?2 AND t.phase='cleanup_complete'",
+                params![id.as_str(), attempt],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        let previous: Value = serde_json::from_str(&previous)
+            .map_err(|_| Error::Integrity("attempt history is malformed".into()))?;
+        let old_reason = previous.get("binding_cooldown_recorded");
+        if state.get("binding_cooldown_recorded").is_some() != cooldown.is_some() {
+            return Err(invalid("binding cooldown evidence is malformed"));
+        }
+        if old_reason.is_some() && old_reason != state.get("binding_cooldown_recorded") {
+            return Err(Error::Conflict);
+        }
+        if let Some(reason) = cooldown {
+            if !at.is_finite() || at < 0.0 || !(at + BINDING_COOLDOWN_SECONDS).is_finite() {
+                return Err(invalid("invalid binding cooldown time"));
+            }
+            if state["binding_cooldown_recorded"] != json!(reason) {
+                return Err(invalid("binding cooldown evidence is malformed"));
+            }
+            let identity =
+                identity.ok_or_else(|| Error::Integrity("provider identity is missing".into()))?;
+            let identity: Value = serde_json::from_str(&identity)
+                .map_err(|_| Error::Integrity("provider identity is malformed".into()))?;
+            let authority: ResolvedLaunchAuthority =
+                serde_json::from_value(identity["authority"].clone())
+                    .map_err(|_| Error::Integrity("provider authority is malformed".into()))?;
+            let account: AccountId = account
+                .ok_or_else(|| invalid("attempt account is missing"))?
+                .parse()?;
+            let provider = &identity["provider_config"]["providers"][authority.provider.as_str()];
+            let connection: ProviderConnection =
+                serde_json::from_value(provider["connection"].clone())
+                    .map_err(|_| Error::Integrity("provider connection is malformed".into()))?;
+            let bindings: Vec<ProviderBinding> =
+                serde_json::from_value(provider["bindings"].clone())
+                    .map_err(|_| Error::Integrity("provider bindings are malformed".into()))?;
+            let mut selected = bindings.iter().filter(|binding| {
+                binding.account == account
+                    && binding
+                        .models
+                        .as_ref()
+                        .is_none_or(|models| models.contains(&authority.model))
+            });
+            let binding = selected
+                .next()
+                .ok_or_else(|| invalid("attempt binding is unavailable"))?;
+            let native = &state["native_failure"];
+            if selected.next().is_some()
+                || identity["provider_identity_version"] != 2
+                || provider["ordered_accounts"] != true
+                || authority.harness != agent_run_domain::catalog::HarnessId::ClaudeCode
+                || provider["harness"] != authority.harness.as_str()
+                || connection != authority.connection
+                || !authority.eligible_accounts.contains(&account)
+                || native["class"] != reason.as_str()
+                || native["attempt"] != attempt
+                || native["account"] != account.as_str()
+                || native["provider"] != authority.provider.as_str()
+                || native["model"] != authority.model
+                || (reason == BindingCooldownReason::BillingUnavailable
+                    && !matches!(
+                        binding.connection.as_ref().unwrap_or(&connection),
+                        ProviderConnection::Custom { .. }
+                    ))
+                || (reason == BindingCooldownReason::QuotaExhausted
+                    && (native["signal"] != "claude.rate_limit_event.rejected"
+                        || !matches!(
+                            native["window"].as_str(),
+                            Some(
+                                "five_hour"
+                                    | "seven_day"
+                                    | "seven_day_opus"
+                                    | "seven_day_sonnet"
+                                    | "seven_day_overage_included"
+                                    | "overage"
+                            )
+                        )))
+            {
+                return Err(invalid(
+                    "binding cooldown does not match the frozen attempt",
+                ));
+            }
+            if old_reason.is_none() {
+                let changed = tx.execute(
+                    "INSERT INTO binding_cooldowns(provider_id,account_id,reason,observed_at,blocked_until,attempt_id) \
+                     VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(account_id,provider_id) DO UPDATE SET \
+                     reason=excluded.reason,observed_at=excluded.observed_at,blocked_until=excluded.blocked_until,attempt_id=excluded.attempt_id \
+                     WHERE excluded.blocked_until > binding_cooldowns.blocked_until",
+                    params![authority.provider.as_str(), account.as_str(), reason.as_str(), at, at + BINDING_COOLDOWN_SECONDS, attempt],
+                )?;
+                if changed != 0 {
+                    Store::advance_quota_capacity_revision(&tx)?;
+                }
+            }
+        }
+        let changed = tx.execute(
             "UPDATE attempts SET adapter_state_json=? \
              WHERE id=? AND agent_id=? AND phase='cleanup_complete'",
             params![serde_json::to_string(state)?, attempt, id.as_str()],
@@ -303,6 +423,7 @@ impl Store<'_> {
         if changed != 1 {
             return Err(Error::Conflict);
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -807,6 +928,8 @@ fn choose<'a>(
             .collect::<std::collections::BTreeMap<_, _>>()
     });
     let mut chosen = None;
+    let mut blocked = None;
+    let at = now();
     for candidate in &candidates.candidates {
         if pinned.is_some_and(|account| &candidate.account != account)
             || exclude.contains(&candidate.account)
@@ -835,6 +958,17 @@ fn choose<'a>(
         {
             continue;
         }
+        if let Some((reason, retry_after_seconds)) =
+            binding_cooldown(tx, provider, &candidate.account, at)?
+        {
+            if blocked
+                .as_ref()
+                .is_none_or(|(_, _, seconds)| retry_after_seconds < *seconds)
+            {
+                blocked = Some((candidate.account.clone(), reason, retry_after_seconds));
+            }
+            continue;
+        }
         let active = Store::active_attempt_counts_in(tx, std::slice::from_ref(&candidate.account))?
             [candidate.account.as_str()];
         let reserved = Store::active_reservation_counts_in(tx, &candidate.physical_keys)?;
@@ -853,13 +987,48 @@ fn choose<'a>(
             chosen = Some((key, candidate));
         }
     }
-    chosen.map(|(_, candidate)| candidate).ok_or_else(|| {
-        QuotaAdmissionError::NoEligibleAccount {
-            provider: provider.clone(),
-            model: model.to_owned(),
+    chosen
+        .map(|(_, candidate)| candidate)
+        .ok_or_else(|| match blocked {
+            Some((account, reason, retry_after_seconds)) => QuotaAdmissionError::BindingCooldown {
+                provider: provider.clone(),
+                model: model.to_owned(),
+                account,
+                reason,
+                retry_after_seconds,
+            }
+            .into(),
+            None => QuotaAdmissionError::NoEligibleAccount {
+                provider: provider.clone(),
+                model: model.to_owned(),
+            }
+            .into(),
+        })
+}
+
+/// Reads an active provider/account cooldown from the caller's transaction.
+pub fn binding_cooldown(
+    conn: &rusqlite::Connection,
+    provider: &agent_run_domain::catalog::ProviderId,
+    account: &AccountId,
+    at: f64,
+) -> Result<Option<(BindingCooldownReason, u64)>> {
+    if !at.is_finite() || at < 0.0 {
+        return Err(invalid("invalid binding cooldown time"));
+    }
+    let row: Option<(String, f64)> = conn.query_row(
+        "SELECT reason,blocked_until FROM binding_cooldowns WHERE provider_id=?1 AND account_id=?2 AND blocked_until>?3",
+        params![provider.as_str(), account.as_str(), at], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    row.map(|(value, until)| {
+        if !until.is_finite() {
+            return Err(Error::Integrity("binding cooldown is malformed".into()));
         }
-        .into()
+        let reason = serde_json::from_value(json!(value))
+            .map_err(|_| Error::Integrity("binding cooldown is malformed".into()))?;
+        Ok((reason, ((until - at).ceil() as u64).max(1)))
     })
+    .transpose()
 }
 
 /// The next attempt allocated on an existing logical agent.

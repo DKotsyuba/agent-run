@@ -143,6 +143,118 @@ fn none_ineligible() -> BTreeSet<AccountId> {
     BTreeSet::new()
 }
 
+/// Binding cooldowns affect only their provider/account, expire exactly at the
+/// recorded instant, and report the nearest retry without calling it quota.
+#[test]
+fn binding_cooldowns_scope_selection_and_report_nearest_expiry() {
+    let home = home(&[("acct-a", "A"), ("acct-b", "B"), ("acct-c", "C")]);
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
+    let catalog = catalog(&store);
+    for (account, reason, until) in [
+        ("acct-a", "billing_unavailable", AT + 3599.25),
+        ("acct-b", "quota_exhausted", AT + 20.1),
+        ("acct-c", "billing_unavailable", AT + 3000.0),
+    ] {
+        store.conn.execute(
+            "INSERT INTO binding_cooldowns(provider_id,account_id,reason,observed_at,blocked_until,attempt_id) VALUES('glm-user',?1,?2,?3,?4,'fixture-attempt')",
+            rusqlite::params![account, reason, AT, until],
+        ).unwrap();
+    }
+    let provider = "glm-user".parse().unwrap();
+    let error = provider_candidates_at(
+        &store,
+        &catalog,
+        &provider,
+        "fixture",
+        None,
+        &none_ineligible(),
+        AT,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, Error::QuotaAdmission(QuotaAdmissionError::BindingCooldown {
+        account, reason: agent_run_domain::catalog::BindingCooldownReason::QuotaExhausted,
+        retry_after_seconds: 21, ..
+    }) if account.as_str() == "acct-b")
+    );
+    let pinned = provider_candidates_at(
+        &store,
+        &catalog,
+        &provider,
+        "fixture",
+        Some("alpha"),
+        &none_ineligible(),
+        AT,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(pinned, Error::QuotaAdmission(QuotaAdmissionError::BindingCooldown {
+        account, reason: agent_run_domain::catalog::BindingCooldownReason::BillingUnavailable,
+        retry_after_seconds: 3600, ..
+    }) if account.as_str() == "acct-a")
+    );
+    let other = provider_candidates_at(
+        &store,
+        &catalog,
+        &"glm-alias".parse().unwrap(),
+        "fixture",
+        None,
+        &none_ineligible(),
+        AT,
+    )
+    .unwrap();
+    assert_eq!(other.candidates[0].account.as_str(), "acct-a");
+    store
+        .conn
+        .execute(
+            "DELETE FROM binding_cooldowns WHERE provider_id='glm-user' AND account_id='acct-b'",
+            [],
+        )
+        .unwrap();
+    latch(&store, "acct-b", "fixture", Some(AT + 5.0));
+    let mixed = provider_candidates_at(
+        &store,
+        &catalog,
+        &provider,
+        "fixture",
+        None,
+        &none_ineligible(),
+        AT,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(mixed, Error::QuotaAdmission(QuotaAdmissionError::QuotaExhausted { account, .. }) if account.as_str() == "acct-b")
+    );
+    store
+        .conn
+        .execute("DELETE FROM quota_exhaustion WHERE account_id='acct-b'", [])
+        .unwrap();
+    store.conn.execute(
+        "INSERT INTO binding_cooldowns(provider_id,account_id,reason,observed_at,blocked_until,attempt_id) VALUES('glm-user','acct-b','quota_exhausted',?1,?2,'fixture-attempt')",
+        rusqlite::params![AT, AT + 20.1],
+    ).unwrap();
+    let after = provider_candidates_at(
+        &store,
+        &catalog,
+        &provider,
+        "fixture",
+        None,
+        &none_ineligible(),
+        AT + 20.1,
+    )
+    .unwrap();
+    assert_eq!(after.candidates.len(), 1);
+    assert_eq!(after.candidates[0].account.as_str(), "acct-b");
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM quota_exhaustion", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
 /// Produces candidates for the main provider at the fixed clock.
 fn candidates(
     store: &Store,
