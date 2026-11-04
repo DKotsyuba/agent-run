@@ -26,6 +26,10 @@ pub const WORKFLOW_PATH: &str = ".github/workflows/release.yml";
 pub const MANIFEST: &str = "release-manifest.json";
 /// Scoped check evidence, hashed as an ordinary manifest artifact.
 pub const ACCEPTANCE: &str = "acceptance.json";
+/// Native release targets built and tested by separate CI jobs.
+pub const MAC_TARGET: &str = "aarch64-apple-darwin";
+/// Supported native Linux target; no local cross-compilation is assumed.
+pub const LINUX_TARGET: &str = "x86_64-unknown-linux-gnu";
 /// Best-effort cancellation shared by the foreground observer and owned tools.
 pub(crate) static CANCELLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -107,6 +111,10 @@ pub struct Acceptance {
     /// Exact bundle whose disposable installation/smoke was actually observed.
     #[serde(default)]
     pub payload: Option<Artifact>,
+    /// Exact Linux payload independently built and smoke-tested in the same run.
+    /// Absent in historical macOS-only evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_payload: Option<Artifact>,
 }
 
 /// One exact named payload in the external inventory.
@@ -389,7 +397,7 @@ pub fn identity(root: &Path, accepted: &str) -> Result<Identity, String> {
         repository_id: REPOSITORY_ID,
         commit: accepted.into(),
         workflow: None,
-        target: "aarch64-apple-darwin".into(),
+        target: MAC_TARGET.into(),
         toolchain: toolchain["toolchain"]["channel"]
             .as_str()
             .ok_or("toolchain channel missing")?
@@ -458,6 +466,41 @@ pub fn identity(root: &Path, accepted: &str) -> Result<Identity, String> {
     Ok(id)
 }
 
+/// Selects an explicitly declared native producer target and checks the real host.
+/// The default preserves historical macOS source/evidence identity.
+pub(crate) fn identity_for_target(
+    root: &Path,
+    accepted: &str,
+    target: Option<&str>,
+) -> Result<Identity, String> {
+    let mut id = identity(root, accepted)?;
+    let Some(target) = target else { return Ok(id) };
+    let expected_host = match target {
+        MAC_TARGET => ("macos", "aarch64"),
+        LINUX_TARGET => ("linux", "x86_64"),
+        _ => return Err("unsupported native release target".into()),
+    };
+    if (std::env::consts::OS, std::env::consts::ARCH) != expected_host {
+        return Err("native release target does not match this host".into());
+    }
+    let family: toml::Value = toml::from_str(
+        &fs::read_to_string(root.join("family.toml")).map_err(|_| "family unavailable")?,
+    )
+    .map_err(|_| "invalid family")?;
+    if !["qualified_targets", "candidate_targets"]
+        .iter()
+        .any(|kind| {
+            family["compatibility"][*kind]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(target)))
+        })
+    {
+        return Err("native release target is not declared".into());
+    }
+    id.target = target.into();
+    Ok(id)
+}
+
 /// Atomically publishes create-new private JSON after file fsync, then fsyncs
 /// its directory. Existing files/symlinks are refused without replacing bytes.
 pub(crate) fn create_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
@@ -494,12 +537,13 @@ pub fn accept(
     root: &Path,
     output: &Path,
     accepted: &str,
+    target: Option<&str>,
     command: &[String],
 ) -> Result<(), String> {
-    let id = identity(root, accepted)?;
+    let id = identity_for_target(root, accepted, target)?;
     let (program, args) = command.split_first().ok_or("check argv required")?;
     let (code, stdout, stderr) = run(program, args, root, Duration::from_secs(3600))?;
-    if identity(root, accepted)? != id {
+    if identity_for_target(root, accepted, target)? != id {
         return Err("check changed accepted source identity".into());
     }
     let mut evidence = if output.exists() {
@@ -522,6 +566,7 @@ pub fn accept(
             checks: Vec::new(),
             qualified_hosts: Vec::new(),
             payload: None,
+            linux_payload: None,
         }
     };
     if evidence.checks.len() >= 64 {
@@ -571,11 +616,12 @@ pub(crate) fn validate(manifest: &Manifest) -> Result<(), String> {
     if w.id != WORKFLOW_ID || w.run_id == 0 || w.run_attempt == 0 || w.path != WORKFLOW_PATH {
         return Err("invalid workflow identity".into());
     }
-    if manifest.artifacts.len() != 4 {
-        return Err("release requires bundle/source/installer/evidence inventory".into());
+    if ![4, 5].contains(&manifest.artifacts.len()) {
+        return Err("release requires native bundles and source/installer/evidence".into());
     }
     let mut names = BTreeSet::new();
     let mut kinds = BTreeSet::new();
+    let mut targets = BTreeSet::new();
     for a in &manifest.artifacts {
         if a.name.is_empty()
             || !a
@@ -583,7 +629,7 @@ pub(crate) fn validate(manifest: &Manifest) -> Result<(), String> {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
             || !names.insert(&a.name)
-            || !kinds.insert(&a.kind)
+            || (a.kind != "bundle" && !kinds.insert(a.kind.as_str()))
             || a.size == 0
             || a.size > 512 * 1024 * 1024
             || a.sha256.len() != 64
@@ -595,7 +641,13 @@ pub(crate) fn validate(manifest: &Manifest) -> Result<(), String> {
             return Err("unsafe/duplicate release inventory".into());
         }
         let fixed_name = match a.kind.as_str() {
-            "bundle" => format!("agent-run-{}-aarch64-apple-darwin.tar.gz", id.version),
+            "bundle" => {
+                let target = a.target.as_deref().ok_or("bundle target missing")?;
+                if ![MAC_TARGET, LINUX_TARGET].contains(&target) || !targets.insert(target) {
+                    return Err("unsupported/duplicate bundle target".into());
+                }
+                format!("agent-run-{}-{target}.tar.gz", id.version)
+            }
             "source" => format!("agent-run-{}-source.tar", id.version),
             "installer" => "install.sh".into(),
             "evidence" => ACCEPTANCE.into(),
@@ -604,20 +656,10 @@ pub(crate) fn validate(manifest: &Manifest) -> Result<(), String> {
         if a.name != fixed_name || (a.kind != "bundle" && a.target.is_some()) {
             return Err("artifact name/target layout mismatch".into());
         }
-        if a.kind == "bundle"
-            && (a.target.as_deref() != Some("aarch64-apple-darwin")
-                || a.name != format!("agent-run-{}-aarch64-apple-darwin.tar.gz", id.version))
-        {
-            return Err("bundle identity mismatch".into());
-        }
     }
-    if kinds
-        != BTreeSet::from([
-            &"bundle".to_owned(),
-            &"source".to_owned(),
-            &"installer".to_owned(),
-            &"evidence".to_owned(),
-        ])
+    if kinds != BTreeSet::from(["source", "installer", "evidence"])
+        || (targets != BTreeSet::from([MAC_TARGET])
+            && targets != BTreeSet::from([MAC_TARGET, LINUX_TARGET]))
     {
         return Err("release inventory kinds mismatch".into());
     }
@@ -633,6 +675,7 @@ pub fn create(root: &Path, directory: &Path, accepted: &str) -> Result<(), Strin
             .map_err(|_| "invalid acceptance")?;
     if evidence.identity != id
         || !evidence_ready(&evidence)
+        || !linux_evidence_ready(&evidence)
         || evidence.checks.iter().any(|c| c.exit_code != 0)
         || !evidence.qualified_hosts.is_empty()
     {
@@ -641,8 +684,12 @@ pub fn create(root: &Path, directory: &Path, accepted: &str) -> Result<(), Strin
     let mut artifacts = Vec::new();
     for (name, kind) in [
         (
-            format!("agent-run-{}-aarch64-apple-darwin.tar.gz", id.version),
+            format!("agent-run-{}-{MAC_TARGET}.tar.gz", id.version),
             "bundle",
+        ),
+        (
+            format!("agent-run-{}-{LINUX_TARGET}.tar.gz", id.version),
+            "linux-bundle",
         ),
         (format!("agent-run-{}-source.tar", id.version), "source"),
         ("install.sh".into(), "installer"),
@@ -655,11 +702,16 @@ pub fn create(root: &Path, directory: &Path, accepted: &str) -> Result<(), Strin
         }
         artifacts.push(Artifact {
             name,
-            kind: kind.into(),
-            target: if kind == "bundle" {
-                Some(id.target.clone())
+            kind: if kind == "linux-bundle" {
+                "bundle"
             } else {
-                None
+                kind
+            }
+            .into(),
+            target: match kind {
+                "bundle" => Some(MAC_TARGET.into()),
+                "linux-bundle" => Some(LINUX_TARGET.into()),
+                _ => None,
             },
             size: metadata.len(),
             sha256: digest(&path).map_err(|_| "payload hash failed")?,
@@ -801,8 +853,18 @@ pub(crate) fn verify_until(
                 "local"
             }
         || !evidence_ready(&evidence)
-        || evidence.payload.as_ref() != manifest.artifacts.iter().find(|a| a.kind == "bundle")
-        || evidence.identity.target != "aarch64-apple-darwin"
+        || evidence.payload.as_ref()
+            != manifest
+                .artifacts
+                .iter()
+                .find(|a| a.target.as_deref() == Some(MAC_TARGET))
+        || evidence.linux_payload.as_ref()
+            != manifest
+                .artifacts
+                .iter()
+                .find(|a| a.target.as_deref() == Some(LINUX_TARGET))
+        || (evidence.linux_payload.is_some() && !linux_evidence_ready(&evidence))
+        || evidence.identity.target != MAC_TARGET
         || evidence.identity.toolchain.is_empty()
         || evidence.checks.len() > 64
         || evidence.checks.iter().any(|c| {
@@ -870,6 +932,24 @@ fn evidence_ready(evidence: &Acceptance) -> bool {
     })
 }
 
+/// Requires the independent Linux job's observed checks and exact payload.
+fn linux_evidence_ready(evidence: &Acceptance) -> bool {
+    evidence.linux_payload.is_some()
+        && [
+            "linux-workspace",
+            "linux-integration",
+            "linux-native-build",
+            "linux-exact-payload",
+        ]
+        .iter()
+        .all(|id| {
+            evidence
+                .checks
+                .iter()
+                .any(|c| c.check_id == *id && c.exit_code == 0)
+        })
+}
+
 /// Produces a fixed public check category plus a digest of exact private argv.
 /// Custom argv never become command declarations or unbounded public strings.
 pub(crate) fn check_record(
@@ -932,11 +1012,25 @@ pub fn command(root: &Path, args: &[String]) -> Result<(), String> {
         return crate::release_ops::verify_archive(root, Path::new(&field("--artifact")?));
     }
     let commit = field("--accepted-commit")?;
+    let options_end = args
+        .iter()
+        .position(|value| value == "--")
+        .unwrap_or(args.len());
+    let options = &args[..options_end];
+    let target_values: Vec<_> = options
+        .windows(2)
+        .filter(|pair| pair[0] == "--target")
+        .map(|pair| pair[1].as_str())
+        .collect();
+    if target_values.len() > 1 || options.last().is_some_and(|value| value == "--target") {
+        return Err("--target requires one value".into());
+    }
+    let target = target_values.first().copied();
     if args.first().map(String::as_str) == Some("merge-evidence") {
         return crate::release_ops::merge_evidence(root, args, &commit);
     }
     if args.first().map(String::as_str) == Some("smoke") {
-        return crate::release_ops::smoke(root, Path::new(&field("--directory")?), &commit);
+        return crate::release_ops::smoke(root, Path::new(&field("--directory")?), &commit, target);
     }
     match args.first().map(String::as_str) {
         Some("accept") => {
@@ -948,6 +1042,7 @@ pub fn command(root: &Path, args: &[String]) -> Result<(), String> {
                 root,
                 Path::new(&field("--output")?),
                 &commit,
+                target,
                 &args[split + 1..],
             )
         }
@@ -1088,6 +1183,7 @@ mod tests {
             checks: vec![],
             qualified_hosts: vec![],
             payload: None,
+            linux_payload: None,
         };
         let value = serde_json::to_value(evidence).unwrap();
         assert!(value["identity"]["workflow"].is_null());
@@ -1138,6 +1234,77 @@ mod tests {
         assert!(read_regular(&root.path().join("link"), 65536).is_err());
     }
 
+    /// Dual-platform inventories require one exact archive and smoke proof per target;
+    /// historical macOS-only manifests remain readable.
+    #[test]
+    fn dual_platform_inventory_and_evidence_are_unambiguous() {
+        let id = fixture_identity();
+        let artifact = |kind: &str, name: String, target: Option<&str>| Artifact {
+            name,
+            kind: kind.into(),
+            target: target.map(str::to_owned),
+            size: 1,
+            sha256: "b".repeat(64),
+        };
+        let mac = artifact(
+            "bundle",
+            format!("agent-run-{}-{MAC_TARGET}.tar.gz", id.version),
+            Some(MAC_TARGET),
+        );
+        let linux = artifact(
+            "bundle",
+            format!("agent-run-{}-{LINUX_TARGET}.tar.gz", id.version),
+            Some(LINUX_TARGET),
+        );
+        let manifest = Manifest::from_identity(
+            &id,
+            vec![
+                mac.clone(),
+                linux.clone(),
+                artifact(
+                    "source",
+                    format!("agent-run-{}-source.tar", id.version),
+                    None,
+                ),
+                artifact("installer", "install.sh".into(), None),
+                artifact("evidence", ACCEPTANCE.into(), None),
+            ],
+        )
+        .unwrap();
+        validate(&manifest).unwrap();
+        let mut duplicate = manifest.clone();
+        duplicate.artifacts[1].target = Some(MAC_TARGET.into());
+        assert!(validate(&duplicate).is_err());
+        let mut mismatched = manifest;
+        mismatched.artifacts[1].name = format!("agent-run-{}-{MAC_TARGET}.tar.gz", id.version);
+        assert!(validate(&mismatched).is_err());
+
+        let check = |name: &str| Check {
+            check_id: name.into(),
+            argv_sha256: "a".repeat(64),
+            stdout_sha256: "b".repeat(64),
+            stderr_sha256: "c".repeat(64),
+            exit_code: 0,
+        };
+        let mut evidence = Acceptance {
+            schema_version: 1,
+            identity: id,
+            scope: "github-actions".into(),
+            checks: ["linux-workspace", "linux-integration", "linux-native-build"]
+                .into_iter()
+                .map(check)
+                .collect(),
+            qualified_hosts: vec![],
+            payload: Some(mac),
+            linux_payload: Some(linux),
+        };
+        assert!(!linux_evidence_ready(&evidence));
+        evidence.checks.push(check("linux-exact-payload"));
+        assert!(linux_evidence_ready(&evidence));
+        evidence.checks.last_mut().unwrap().exit_code = 1;
+        assert!(!linux_evidence_ready(&evidence));
+    }
+
     /// Secret/private argv and arbitrary output are hashed, never made public;
     /// the actual custom exit code is preserved and cannot qualify packaging.
     #[test]
@@ -1170,6 +1337,7 @@ mod tests {
             checks: vec![check],
             qualified_hosts: vec![],
             payload: None,
+            linux_payload: None,
         };
         assert!(!evidence_ready(&evidence));
     }

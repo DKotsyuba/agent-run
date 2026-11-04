@@ -435,7 +435,7 @@ fn multiplier_one() -> PositiveFinite {
 ///
 /// `models` is `None` to inherit the provider's full explicit model set, or a
 /// subset that must be contained in it. `multiplier` scales this binding's
-/// quota score and defaults to one.
+/// quota score, or fixes its order for an ordered provider, and defaults to one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderBinding {
@@ -446,7 +446,10 @@ pub struct ProviderBinding {
     /// Optional explicit model subset; `None` inherits the provider set.
     #[serde(default)]
     pub models: Option<Vec<String>>,
-    /// Positive finite quota score multiplier, defaulting to one.
+    /// Optional account-specific connection; absence inherits the provider's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<ProviderConnection>,
+    /// Positive finite quota multiplier, or ordering weight for an ordered provider.
     #[serde(
         default = "multiplier_one",
         rename = "priority_multiplier",
@@ -553,7 +556,7 @@ impl CollectorBinding {
     }
 }
 
-/// A provider: one harness and connection, explicit models and bindings.
+/// A provider: one harness, a default connection, explicit models and bindings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderDefinition {
@@ -580,13 +583,14 @@ pub struct ProviderDefinition {
     pub models: Vec<ProviderModel>,
     /// Account alias bindings; duplicate labels are rejected.
     pub bindings: Vec<ProviderBinding>,
+    /// Select eligible bindings by descending multiplier, retaining declaration order on ties.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ordered_accounts: bool,
 }
 
 impl ProviderDefinition {
-    /// Validates self-containment: unique model ids, unique binding labels,
-    /// every declared binding model subset contained in the model set, and a
-    /// `codex_appserver` limits source only on the codex harness with a
-    /// native connection.
+    /// Validates unique models and labels, model scopes, connection overrides,
+    /// ordered-account uniqueness, and supported harness/collector combinations.
     pub fn validate(&self) -> Result<()> {
         if self.models.is_empty() {
             return Err(invalid("provider must offer at least one model"));
@@ -607,6 +611,21 @@ impl ProviderDefinition {
             nonblank("provider recommendation", advice)?;
         }
         self.connection.validate(self.harness)?;
+        if self.ordered_accounts
+            && (self.harness != HarnessId::ClaudeCode
+                || self.limits_source != LimitsSource::None
+                || !matches!(
+                    &self.connection,
+                    ProviderConnection::Custom {
+                        protocol: ProviderProtocol::Messages,
+                        ..
+                    }
+                ))
+        {
+            return Err(invalid(
+                "ordered accounts require Claude Code, a custom Messages connection and no quota collector",
+            ));
+        }
         // The app-server probe reads only a native Codex login; no other
         // harness or connection can ever produce its observations.
         if self.limits_source == LimitsSource::CodexAppserver
@@ -632,9 +651,20 @@ impl ProviderDefinition {
             }
         }
         let mut labels = std::collections::BTreeSet::new();
+        let mut ordered_accounts = std::collections::BTreeSet::new();
         for binding in &self.bindings {
             if !labels.insert(binding.label.as_str()) {
                 return Err(invalid("provider binding labels must be unique"));
+            }
+            if binding.connection.as_ref().is_some_and(|connection| {
+                !self.ordered_accounts || *connection != ProviderConnection::Native
+            }) {
+                return Err(invalid(
+                    "binding connection override requires ordered accounts and a native connection",
+                ));
+            }
+            if self.ordered_accounts && !ordered_accounts.insert(&binding.account) {
+                return Err(invalid("ordered provider accounts must be unique"));
             }
             if let Some(subset) = &binding.models {
                 let mut seen = std::collections::BTreeSet::new();
@@ -656,6 +686,44 @@ impl ProviderDefinition {
     /// Returns the binding with `label`, or `None` when the alias is absent.
     pub fn binding(&self, label: &str) -> Option<&ProviderBinding> {
         self.bindings.iter().find(|b| b.label.as_str() == label)
+    }
+
+    /// Returns the configured connection for a model-bound account, or `None`
+    /// when the account or model is not offered by this validated provider.
+    pub fn connection_for(&self, account: &AccountId, model: &str) -> Option<&ProviderConnection> {
+        if !self.models.iter().any(|offering| offering.id == model) {
+            return None;
+        }
+        self.bindings
+            .iter()
+            .find(|binding| {
+                &binding.account == account
+                    && binding
+                        .models
+                        .as_ref()
+                        .is_none_or(|models| models.iter().any(|id| id == model))
+            })
+            .map(|binding| binding.connection.as_ref().unwrap_or(&self.connection))
+    }
+
+    /// Returns model-bound bindings by descending weight; equal weights retain
+    /// the order declared by the provider.
+    pub fn ordered_bindings(&self, model: &str) -> Vec<&ProviderBinding> {
+        if !self.models.iter().any(|offering| offering.id == model) {
+            return Vec::new();
+        }
+        let mut bindings: Vec<_> = self
+            .bindings
+            .iter()
+            .filter(|binding| {
+                binding
+                    .models
+                    .as_ref()
+                    .is_none_or(|models| models.iter().any(|id| id == model))
+            })
+            .collect();
+        bindings.sort_by(|a, b| b.multiplier.get().total_cmp(&a.multiplier.get()));
+        bindings
     }
 }
 
@@ -843,18 +911,19 @@ pub use crate::quota_snapshot::{
 /// The immutable launch authority frozen at admission, before any attempt.
 ///
 /// Everything a launch must not change across retries lives here: provider,
-/// harness, connection, explicit model and effort, role profile, workdir,
+/// harness, default connection, explicit model and effort, role profile, workdir,
 /// a sealed operative role document, the tool-assets digest, and the frozen eligible
-/// account scope. Raw harness-native settings can never override these owned
-/// fields. Per-attempt choices deliberately do not appear here; they belong to
-/// [`AttemptCredentials`].
+/// account scope. An ordered provider may resolve an account's connection from
+/// the separately frozen configuration. Raw harness-native settings can never
+/// override these owned fields. Per-attempt choices deliberately do not appear
+/// here; they belong to [`AttemptCredentials`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedLaunchAuthority {
     /// Provider whose catalog entry froze this authority.
     pub provider: ProviderId,
     /// Harness the provider binds to.
     pub harness: HarnessId,
-    /// Native or custom connection captured from the provider definition.
+    /// Default native or custom connection captured from the provider definition.
     pub connection: ProviderConnection,
     /// The explicit model id requested and validated against the catalog.
     pub model: String,
@@ -943,7 +1012,8 @@ impl SecretHandle {
 ///
 /// Each attempt selects exactly one global account and holds its credential
 /// lease for the attempt's lifetime. Only this selection may change between
-/// attempts of one logical agent; the [`ResolvedLaunchAuthority`] may not.
+/// attempts of one logical agent; the [`ResolvedLaunchAuthority`] may not. For
+/// ordered providers, the selection also resolves a frozen binding connection.
 #[derive(Debug, Clone)]
 pub struct AttemptCredentials {
     /// The global account selected for this attempt.

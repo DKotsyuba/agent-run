@@ -3,7 +3,7 @@
 use crate::{Error, Result, fs, service::ProviderLaunchIdentity, state::Store};
 use agent_run_config::role_plan::ResolvedRolePlan;
 use agent_run_domain::worker::{SaveReportReceipt, SaveReportRequest, WorkerToolCall};
-use std::path::Path;
+use std::{io::Read, os::unix::fs::MetadataExt, path::Path};
 
 /// Saves one report only for an authenticated, running research attempt.
 /// The directory is frozen workdir authority, never a model argument. Every
@@ -49,10 +49,7 @@ pub(crate) fn save(
             "report directory must be existing, canonical and without symlink aliases".into(),
         ));
     }
-    let directory = fs::Dir::open(Path::new("/"))?.subdir(
-        root.strip_prefix("/")
-            .map_err(|_| Error::Validation("invalid report directory".into()))?,
-    )?;
+    let directory = fs::Dir::open_searchable(root)?;
     // SAFETY: geteuid reads this process's effective identity and has no side effects.
     if directory.entry(None)?.uid != unsafe { libc::geteuid() } {
         return Err(Error::Validation(
@@ -101,21 +98,51 @@ pub(crate) fn save(
     Ok(receipt)
 }
 
-/// Verifies an existing owned regular file against the desired content digest
-/// through no-follow descriptors. Refuses any overwrite or raced symlink; no
-/// existing bytes are returned to the model or included in errors.
+/// Verifies owner, type and digest through the same no-follow file descriptor.
+/// Refuses an unsafe or different file; existing bytes never enter errors.
 fn require_identical(directory: &fs::Dir, name: &Path, digest: &str) -> Result<()> {
-    let entry = directory.entry(Some(name))?;
-    // SAFETY: geteuid reads process identity without mutation.
-    let uid = unsafe { libc::geteuid() };
-    if entry.kind != fs::EntryType::File
-        || entry.uid != uid
-        || fs::sha256(&directory.read(name, 65536)?) != digest
-    {
-        return Err(Error::Validation(
+    verify_opened(directory.open_file(name)?, digest)
+}
+
+/// Verifies the exact descriptor even if its previous pathname is replaced.
+fn verify_opened(file: std::fs::File, digest: &str) -> Result<()> {
+    let metadata = file.metadata()?;
+    let unsafe_target = || {
+        Error::Validation(
             "report target exists with different content or an unsafe type; overwrite refused"
                 .into(),
-        ));
+        )
+    };
+    // SAFETY: geteuid reads process identity without mutation.
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.is_file() || metadata.uid() != uid || metadata.len() > 65536 {
+        return Err(unsafe_target());
+    }
+    let mut bytes = Vec::new();
+    file.take(65537).read_to_end(&mut bytes)?;
+    if bytes.len() > 65536 || fs::sha256(&bytes) != digest {
+        return Err(unsafe_target());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Replacing a pathname after open cannot change which file is verified.
+    #[test]
+    fn duplicate_check_pins_the_open_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = fs::Dir::open(temp.path()).unwrap();
+        directory
+            .write(Path::new("report.md"), b"original", 0o600)
+            .unwrap();
+        let opened = directory.open_file(Path::new("report.md")).unwrap();
+        std::fs::rename(temp.path().join("report.md"), temp.path().join("old.md")).unwrap();
+        std::os::unix::fs::symlink("old.md", temp.path().join("report.md")).unwrap();
+        let digest = fs::sha256(b"original");
+        verify_opened(opened, &digest).unwrap();
+        assert!(require_identical(&directory, Path::new("report.md"), &digest).is_err());
+    }
 }

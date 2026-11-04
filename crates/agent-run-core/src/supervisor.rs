@@ -172,6 +172,7 @@ async fn launch_owned(program: &Path, home: &Path, id: &AgentId, lane: &BrokerLa
             ops::RecordStartupOwner {
                 execution: id.clone(),
                 identity: evidence,
+                system_fence: None,
             },
             BROKER_BUDGET,
         )
@@ -238,7 +239,9 @@ fn launch_error(error: launch::LaunchError) -> Error {
 /// class without persisting task text or credentials, including errors whose
 /// owned process prevents finish.
 pub async fn run(home: &Path, id: &AgentId, fds: [i32; 3], capability_fd: i32) -> Result<()> {
-    crate::logging::configure(home, "supervisor");
+    if std::env::var_os("AGENT_RUN_SYSTEM_WRITER_SOCKET").is_none() {
+        crate::logging::configure(home, "supervisor");
+    }
     let [ready_fd, identity_fd, error_fd] = fds;
     if let Err(error) = launch::report_identity(identity_fd, error_fd) {
         let message = if error.to_string().trim().is_empty() {
@@ -289,15 +292,67 @@ async fn bootstrap(home: &Path, id: &AgentId, capability_fd: i32) -> Result<Pers
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         })
         .ok_or_else(|| invalid("launch capability is malformed"))?;
-    let logical = StoreReader::open_with(home, Duration::from_millis(250))?
-        .get(id)?
-        .root_agent_id;
-    let producer = persist::Producer::connect(
-        &home.join("writer.sock"),
-        persist::supervisor_hello(&logical, id, capability),
-        persist::supervisor_producer_id(id),
-    );
-    let mut persist = Persist::open(home, id, producer)?;
+    let row = StoreReader::open_with(home, Duration::from_millis(250))?.get(id)?;
+    // Decode only the route needed to authenticate the fixed writer endpoint.
+    // Full provider/role validation follows durable ownership, so a changed
+    // snapshot can be recorded as a failed run without launching an engine.
+    let system_route = row
+        .identity
+        .as_ref()
+        .and_then(|value| {
+            (value["provider_identity_version"] == 2)
+                .then(|| value.get("system_route"))
+                .flatten()
+                .filter(|route| !route.is_null())
+        })
+        .map(|value| {
+            let route: crate::system_launch::SystemRoute = serde_json::from_value(value.clone())
+                .map_err(|_| invalid("system route is malformed"))?;
+            route.validate_for(&route.provider, route.harness)?;
+            Ok::<_, Error>(route)
+        })
+        .transpose()?;
+    let hello = persist::supervisor_hello(&row.root_agent_id, id, capability);
+    let producer_id = persist::supervisor_producer_id(id);
+    let producer = match &system_route {
+        None => {
+            if std::env::var_os("AGENT_RUN_SYSTEM_WRITER_SOCKET").is_some()
+                || std::env::var_os("AGENT_RUN_SYSTEM_OPERATOR_SOCKET").is_some()
+            {
+                return Err(invalid("ordinary execution cannot use a system writer"));
+            }
+            persist::Producer::connect(&home.join("writer.sock"), hello, producer_id)
+        }
+        Some(route) => {
+            use std::os::unix::fs::MetadataExt as _;
+            let broker_uid = std::fs::metadata(home)?.uid();
+            let socket = std::env::var_os("AGENT_RUN_SYSTEM_WRITER_SOCKET")
+                .map(PathBuf::from)
+                .filter(|path| {
+                    path.is_absolute()
+                        && !path
+                            .components()
+                            .any(|part| matches!(part, std::path::Component::ParentDir))
+                })
+                .ok_or_else(|| invalid("system writer socket is unavailable"))?;
+            let operator = std::env::var_os("AGENT_RUN_SYSTEM_OPERATOR_SOCKET")
+                .map(PathBuf::from)
+                .ok_or_else(|| invalid("system operator socket is unavailable"))?;
+            if home != route.state_home
+                || socket != route.writer_socket
+                || operator != route.operator_socket
+            {
+                return Err(Error::Integrity(
+                    "supervisor UID does not match its frozen route".into(),
+                ));
+            }
+            persist::Producer::connect_system(&socket, broker_uid, hello, producer_id)
+        }
+    };
+    let mut persist = match &system_route {
+        None => Persist::open(home, id, producer)?,
+        Some(route) => Persist::open_system(home, id, producer, route)?,
+    };
     let owner = process::inspect(std::process::id() as i32)?;
     persist.record_owner(&owner, None).await?;
     Ok(persist)
@@ -414,6 +469,19 @@ fn discovery_ownership(
 /// SQL/native work: recovery must recheck the database and native identities.
 /// It contains no environment, credentials, SQL or original error messages.
 /// The candidate is already redacted; its hash alone cannot establish success.
+/// Seals one answer using the execution's checked private or system directory.
+fn seal_execution_answer(
+    agent_dir: &Path,
+    path: &Path,
+    text: &str,
+    system: bool,
+) -> Result<verify::Proof> {
+    if system {
+        return verify::seal_system(agent_dir, path, text);
+    }
+    verify::seal(agent_dir, path, text)
+}
+
 /// Atomic no-follow writes use the existing agent-directory durability guard.
 /// Candidate sealing failure still writes cleanup evidence, then returns the
 /// original error; optional answer handling cannot discard required proof.
@@ -424,6 +492,7 @@ fn retain_cleanup_evidence(
     cleanup: &Result<agent_run_platform::process::Cleanup>,
     execution: &Result<adapters::EngineResult>,
     exit: Option<i32>,
+    system: bool,
 ) -> Result<()> {
     let candidate = match execution {
         Ok(result) => result
@@ -434,10 +503,11 @@ fn retain_cleanup_evidence(
     };
     let candidate = candidate
         .map(|text| {
-            verify::seal(
+            seal_execution_answer(
                 agent_dir,
                 Path::new(&format!("recovery.{attempt}.answer.md")),
                 text,
+                system,
             )
         })
         .transpose();
@@ -453,11 +523,14 @@ fn retain_cleanup_evidence(
         "native_status":execution.as_ref().ok().map(|result|result.outcome.status),
         "candidate":candidate.as_ref().ok().and_then(|proof|proof.as_ref()),
         "candidate_diagnostic":candidate_diagnostic,"exit_code":exit,"diagnostic":diagnostic});
-    fs::Dir::open(agent_dir)?.write(
-        Path::new(&format!("recovery.{attempt}.json")),
-        &fs::canonical_json(&data)?,
-        0o600,
-    )?;
+    let directory = fs::Dir::open(agent_dir)?;
+    let path = PathBuf::from(format!("recovery.{attempt}.json"));
+    let bytes = fs::canonical_json(&data)?;
+    if system {
+        directory.write(&path, &bytes, 0o660)?;
+    } else {
+        directory.write(&path, &bytes, 0o600)?;
+    }
     candidate.map(|_| ())
 }
 
@@ -772,6 +845,7 @@ async fn execute(home: &Path, id: &AgentId, store: &mut Persist) -> Result<()> {
         &cleanup,
         &execution,
         exit,
+        false,
     )?;
     if let Err(error) = process
         .checkpoint_ownership_ready(agent_run_domain::OwnershipStage::Final)
@@ -873,6 +947,7 @@ async fn install_shared_assets<B: crate::runtime_storage::LayoutBackend>(
     expected: &str,
     owner: &AgentId,
     codex_grant: Option<&crate::codex::Grant>,
+    environment: &BTreeMap<String, String>,
 ) -> Result<()> {
     let scope = managed_scope();
     let Some(layout) =
@@ -880,7 +955,7 @@ async fn install_shared_assets<B: crate::runtime_storage::LayoutBackend>(
     else {
         return Ok(());
     };
-    shared_publication_root(app_home, codex_grant)?;
+    shared_publication_root_with_environment(app_home, codex_grant, environment)?;
     crate::runtime_storage::install_on(store, app_home, &layout, Some(owner)).await
 }
 
@@ -890,7 +965,8 @@ async fn install_shared_assets<B: crate::runtime_storage::LayoutBackend>(
 /// The store directory is created owner-only when absent and must be an
 /// existing absolute real directory whose canonical form equals its path, so no
 /// symlinked component can alias it. For Codex the grant must also keep the
-/// store outside every admitted writable and temporary root. There is no
+/// store outside every admitted writable and this process's temporary root;
+/// planned children use `shared_publication_root_with_environment` instead. There is no
 /// OS-level write denial for the launched harness: the store's immutability
 /// rests on owner-only modes plus digest verification before each launch, and a
 /// same-UID process can still alter it between verifications. The returned path
@@ -900,11 +976,34 @@ pub fn shared_publication_root(
     app_home: &Path,
     codex_grant: Option<&crate::codex::Grant>,
 ) -> Result<PathBuf> {
+    validate_shared_publication_root(app_home, codex_grant, None)
+}
+
+/// Validates a publication against the environment of the planned child.
+/// Only its effective `TMPDIR` is inspected; the environment is never logged.
+fn shared_publication_root_with_environment(
+    app_home: &Path,
+    codex_grant: Option<&crate::codex::Grant>,
+    environment: &BTreeMap<String, String>,
+) -> Result<PathBuf> {
+    validate_shared_publication_root(app_home, codex_grant, Some(environment))
+}
+
+/// Returns the canonical publication witness after the selected grant check.
+fn validate_shared_publication_root(
+    app_home: &Path,
+    codex_grant: Option<&crate::codex::Grant>,
+    environment: Option<&BTreeMap<String, String>>,
+) -> Result<PathBuf> {
     let root = crate::runtime_storage::store_root(app_home)?;
     fs::private_dir(&root)?;
     let root = agent_run_platform::shared_assets::validated_root(&root)?;
     if let Some(grant) = codex_grant {
-        grant.admits_shared_root(&root)?;
+        if let Some(environment) = environment {
+            grant.admits_shared_root_with_environment(&root, environment)?;
+        } else {
+            grant.admits_shared_root(&root)?;
+        }
     }
     Ok(root)
 }
@@ -916,7 +1015,7 @@ pub fn shared_publication_root(
 /// home whose sealed record, configuration, role or credentials no longer
 /// plan is refused, and derives the Codex grant from it. The harness binary and
 /// workdir are not stat'ed or executed here; their absence surfaces at launch.
-/// [`shared_publication_root`] then validates the store against that grant. A
+/// The planned child environment and grant then validate the store. A
 /// failure means the home stays private: no anchor, no shared link, nothing
 /// published.
 pub fn native_publication_root(
@@ -968,7 +1067,11 @@ pub fn native_publication_root(
     } else {
         None
     };
-    shared_publication_root(home, codex_grant.as_ref())
+    shared_publication_root_with_environment(
+        home,
+        codex_grant.as_ref(),
+        &preliminary.launch.environment,
+    )
 }
 
 /// The result of one operator-driven relocation of a retained sealed home.
@@ -1093,6 +1196,7 @@ pub async fn relocate_retained_home_on<B: crate::runtime_storage::LayoutBackend>
         identity.authority.assets_sha256.as_str(),
         agent,
         codex_grant.as_ref(),
+        &preliminary.launch.environment,
     )
     .await
     {
@@ -1296,6 +1400,12 @@ async fn verify_sealed_home<B: crate::runtime_storage::LayoutBackend>(
     Ok(())
 }
 
+/// Opens the account-private home selected by the frozen worker route.
+fn system_private_home(route: &crate::system_launch::SystemRoute) -> Result<PathBuf> {
+    fs::Dir::open(&route.private_home)?;
+    Ok(route.private_home.clone())
+}
+
 /// Runs an admitted provider attempt through fenced process ownership and the terminal outbox.
 /// After the durable outcome, logs only public execution identity and numeric
 /// per-stage completion durations; logging never changes that outcome.
@@ -1314,6 +1424,15 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
     }
     let mut row = store.get(id)?;
     let mut identity = ProviderLaunchIdentity::read(&row)?;
+    let app_home = match &identity.system_route {
+        Some(route) => {
+            let private_home = system_private_home(route)?;
+            crate::logging::configure(&private_home, "supervisor");
+            private_home
+        }
+        None => home.to_path_buf(),
+    };
+    let app_home = app_home.as_path();
     let config = identity.provider_config.clone();
     let catalog = config.resolve_catalog(store.list_accounts()?)?;
     // `continuing` is set only after an in-flight account switch: the native
@@ -1335,7 +1454,11 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             .clone()
             .unwrap_or_else(|| harness.home.join("runs").join(id.as_str()));
         let agent_dir = home.join("agents").join(id.as_str());
-        fs::private_dir(&agent_dir)?;
+        if identity.system_route.is_some() {
+            fs::Dir::open(&agent_dir)?;
+        } else {
+            fs::private_dir(&agent_dir)?;
+        }
         store
             .event(id, "phase", &json!({"phase":"preparing"}))
             .await?;
@@ -1343,7 +1466,11 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         // every frozen remote plugin parent, because the native store
         // rewrites those in place and a frozen parent must be private again
         // before anything can write to it.
-        crate::runtime_cache::prepare_native(home, &runtime_home, identity.runtime_home.is_some())?;
+        crate::runtime_cache::prepare_native(
+            app_home,
+            &runtime_home,
+            identity.runtime_home.is_some(),
+        )?;
         if identity.runtime_home.is_none() {
             let role = ResolvedRolePlan::from_payload(&identity.authority.role_payload)?;
             let (_, digest) = adapters::provider::materialize_selected(
@@ -1355,7 +1482,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 &role,
                 &identity.authority.workdir,
                 &runtime_home,
-                home,
+                app_home,
             )?;
             identity.authority.assets_sha256 = digest.clone();
             identity.snapshot_sha256 = Some(digest.as_str().into());
@@ -1380,7 +1507,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 &identity.authority,
                 &account,
                 &runtime_home,
-                home,
+                app_home,
                 &host,
                 &adapters::authorized_request::SystemCredentialReader,
                 identity.provider_request.task.as_str(),
@@ -1396,24 +1523,25 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                     &preliminary.runtime,
                     &row.request,
                     &preliminary.profile,
-                    home,
+                    app_home,
                 )?)
             } else {
                 None
             };
             install_shared_assets(
                 store,
-                home,
+                app_home,
                 &runtime_home,
                 digest.as_str(),
                 id,
                 codex_grant.as_ref(),
+                &preliminary.launch.environment,
             )
             .await?;
         } else {
             verify_sealed_home(
                 store,
-                home,
+                app_home,
                 &runtime_home,
                 identity.authority.assets_sha256.as_str(),
             )
@@ -1425,7 +1553,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         // permissions. A committed shared layout joins the plan through its
         // verified registry mapping; anything still pending was recovered or
         // refused above.
-        let shared_assets = launch_shared_assets(store, home, &runtime_home)?;
+        let shared_assets = launch_shared_assets(store, app_home, &runtime_home)?;
         if store.cancel_pending(id)? {
             if !persist::attempt_never_spawned(&store.conn, id)? {
                 return Err(invalid("provider attempt was already spawning"));
@@ -1439,10 +1567,46 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             .as_ref()
             .map(|(session, _)| session.as_str())
             .or(row.resume_of_runtime_session_id.as_deref());
+        let ordered_claude = identity.authority.harness == HarnessId::ClaudeCode
+            && config
+                .providers
+                .get(&identity.authority.provider)
+                .is_some_and(|provider| provider.ordered_accounts);
+        // A named Claude login uses a different auth directory. For an
+        // explicitly ordered provider, resume the previously sealed transcript
+        // by path while keeping the native session UUID as the logical identity.
+        let mut recorded_history = None;
+        let mut continuation_root = None;
+        let mut resume_path = None;
+        if let Some(session) = resume_session {
+            let recorded = match (&continuing, &row.parent_agent_id) {
+                (Some((_, state)), _) => state.clone(),
+                (None, Some(parent)) => store.latest_attempt_state(parent)?,
+                (None, None) => {
+                    return Err(invalid("a resumed attempt has no recorded history source"));
+                }
+            };
+            if ordered_claude {
+                let seal =
+                    crate::service::verify_recorded_history(&recorded, &identity, None, session)?;
+                let path = seal.root.join(&seal.relative);
+                resume_path = Some(
+                    path.to_str()
+                        .ok_or_else(|| invalid("Claude history path is not UTF-8"))?
+                        .to_owned(),
+                );
+                continuation_root = Some(seal.root);
+            }
+            recorded_history = Some(recorded);
+        }
         // A switched attempt never resends the original task: it continues
         // the native thread with one explicit internal control turn.
         let task = if continuing.is_some() {
-            CONTINUATION_CONTROL
+            if ordered_claude {
+                CLAUDE_CONTINUATION_CONTROL
+            } else {
+                CONTINUATION_CONTROL
+            }
         } else {
             identity.provider_request.task.as_str()
         };
@@ -1464,11 +1628,11 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             &identity.authority,
             &account,
             &runtime_home,
-            home,
+            app_home,
             &host,
             &adapters::authorized_request::SystemCredentialReader,
             task,
-            resume_session,
+            resume_path.as_deref().or(resume_session),
             adapters::provider::LaunchOptions {
                 fast: row.request.fast,
                 output_schema: identity.provider_request.output_schema.as_ref(),
@@ -1480,10 +1644,21 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         // profile can write and outside the temporary directories the native
         // sandbox grants. The live app-server grant echo is still verified in
         // the runner.
-        if identity.authority.harness == HarnessId::Codex {
-            crate::codex::Grant::new(&planned.runtime, &row.request, &planned.profile, home)?
-                .admits_shared_root(&shared_assets.store_root)?;
-        }
+        let codex_grant = if identity.authority.harness == HarnessId::Codex {
+            let grant = crate::codex::Grant::new(
+                &planned.runtime,
+                &row.request,
+                &planned.profile,
+                app_home,
+            )?;
+            grant.admits_shared_root_with_environment(
+                &shared_assets.store_root,
+                &planned.launch.environment,
+            )?;
+            Some(grant)
+        } else {
+            None
+        };
         if planned.role.worker_mcp {
             // This attempt-only capability is never part of the sealed home or
             // argv. New attempts receive a new token; the broker checks durable
@@ -1508,8 +1683,18 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 }
                 .into(),
             );
+            let worker_endpoint = if let Some(route) = &identity.system_route {
+                use std::os::unix::fs::MetadataExt as _;
+                let socket = route
+                    .operator_socket
+                    .to_str()
+                    .ok_or_else(|| invalid("system operator socket is not UTF-8"))?;
+                format!("system:{}:{socket}", std::fs::metadata(home)?.uid())
+            } else {
+                home.to_string_lossy().into_owned()
+            };
             let values = [
-                home.to_string_lossy().into_owned(),
+                worker_endpoint,
                 id.as_str().to_owned(),
                 attempt_id.clone(),
                 token,
@@ -1542,17 +1727,13 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                     "continuation_unavailable: the launch plan names no native storage".into(),
                 )
             })?;
-            let recorded = match (&continuing, &row.parent_agent_id) {
-                (Some((_, state)), _) => state.clone(),
-                (None, Some(parent)) => store.latest_attempt_state(parent)?,
-                (None, None) => {
-                    return Err(invalid("a resumed attempt has no recorded history source"));
-                }
-            };
+            let recorded = recorded_history
+                .as_deref()
+                .ok_or_else(|| invalid("a resumed attempt has no recorded history source"))?;
             crate::service::verify_recorded_history(
-                &recorded,
+                recorded,
                 &identity,
-                Some(&planned_root),
+                (!ordered_claude).then_some(planned_root.as_path()),
                 session,
             )?;
         }
@@ -1569,19 +1750,17 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         // A switched attempt re-checks, at the handoff itself, that its
         // selected account is still enabled and the current configuration
         // still permits the frozen execution; otherwise it never spawns.
-        if continuing.is_some()
+        if (continuing.is_some() || (ordered_claude && resume_session.is_some()))
             && let Some(blocker) = handoff_blocker(home, store, &account, &identity)?
         {
-            if !persist::attempt_never_spawned(&store.conn, id)? {
-                return Err(invalid("provider attempt was already spawning"));
-            }
-            store
-                .event(id, "failover_blocked", &json!({"reason":blocker}))
-                .await?;
-            let mut outcome = Outcome::failure("quota_exhausted");
-            outcome.failure_text = Some(format!("failover_blocked: {blocker}"));
-            store.finish(id, &outcome, None, None).await?;
-            return commands::complete_terminal_persisted(store, id).await;
+            return finish_blocked_handoff(
+                store,
+                id,
+                blocker,
+                continuing.is_some(),
+                recorded_history.as_deref(),
+            )
+            .await;
         }
         if !config.services.is_empty() {
             store
@@ -1637,6 +1816,48 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         store
             .event(id, "phase", &json!({"phase":"spawning"}))
             .await?;
+        #[cfg(feature = "test-fixtures")]
+        fixture_hold(home, "pre-spawn-validation").await;
+        // Recheck after all launch-environment changes and asynchronous gates.
+        // No child exists yet, so a refusal returns this claim to prepared.
+        if let Some(grant) = &codex_grant
+            && let Err(error) = grant.admits_shared_root_with_environment(
+                &shared_assets.store_root,
+                &planned.launch.environment,
+            )
+        {
+            store.provider_spawn_failed(id, &attempt_id).await?;
+            return Err(error);
+        }
+        if ordered_claude && let Some(session) = resume_session {
+            let recorded = recorded_history
+                .as_deref()
+                .ok_or_else(|| invalid("a resumed attempt has no recorded history source"))?;
+            if let Err(error) =
+                crate::service::verify_recorded_history(recorded, &identity, None, session)
+            {
+                store.provider_spawn_failed(id, &attempt_id).await?;
+                return finish_blocked_handoff(
+                    store,
+                    id,
+                    &error.to_string(),
+                    continuing.is_some(),
+                    recorded_history.as_deref(),
+                )
+                .await;
+            }
+            if let Some(blocker) = handoff_blocker(home, store, &account, &identity)? {
+                store.provider_spawn_failed(id, &attempt_id).await?;
+                return finish_blocked_handoff(
+                    store,
+                    id,
+                    blocker,
+                    continuing.is_some(),
+                    recorded_history.as_deref(),
+                )
+                .await;
+            }
+        }
         // Process::spawn yields Io only when the OS refused Command::spawn,
         // before a child exists; other failures retain ownership for recovery.
         let spawned = if identity.authority.harness == HarnessId::OpenCode {
@@ -1757,6 +1978,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             &cleanup,
             &execution,
             exit,
+            identity.system_route.is_some(),
         )?;
         #[cfg(feature = "test-fixtures")]
         fixture_barrier(home, &attempt_id, store, "terminal")?;
@@ -1824,12 +2046,27 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             &attempt_id,
             &identity,
             &planned.launch.environment,
+            continuation_root.as_deref(),
         );
         let history_captured = std::time::Instant::now();
         let quota = matches!(
-            result.native_failure,
+            result.native_failure.as_ref(),
             Some(adapters::native_failure::NativeFailure::QuotaExhausted { .. })
         );
+        let billing = ordered_claude
+            && matches!(
+                result.native_failure.as_ref(),
+                Some(adapters::native_failure::NativeFailure::BillingUnavailable)
+            )
+            && catalog
+                .provider(&identity.authority.provider)
+                .and_then(|provider| provider.connection_for(&account, &identity.authority.model))
+                .is_some_and(|connection| {
+                    matches!(
+                        connection,
+                        agent_run_domain::catalog::ProviderConnection::Custom { .. }
+                    )
+                });
         if let Some(failure) = &result.native_failure {
             let mut data = serde_json::to_value(failure)?;
             data["attempt"] = json!(attempt_id);
@@ -1860,7 +2097,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             .provider_history(id, &attempt_id, history_metadata(&state))
             .await?;
         let history_recorded = std::time::Instant::now();
-        if quota
+        if (quota || billing)
             && !cancelled
             && result.outcome.status == Status::Failed
             && store.worker_finish_intent(id, false)?.is_none()
@@ -1875,13 +2112,21 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                     continuing = Some((session, state.to_string()));
                     continue;
                 }
-                Err(blocker) => {
+                Err(FailoverError::Blocked(blocker)) => {
                     store
                         .event(id, "failover_blocked", &json!({"reason":blocker}))
                         .await?;
-                    result.outcome.failure_kind = Some("quota_exhausted".into());
+                    result.outcome.failure_kind = Some(
+                        if billing {
+                            "billing_unavailable"
+                        } else {
+                            "quota_exhausted"
+                        }
+                        .into(),
+                    );
                     result.outcome.failure_text = Some(format!("failover_blocked: {blocker}"));
                 }
+                Err(FailoverError::Persistence(error)) => return Err(error),
             }
         }
         if row.request.explicit_finish {
@@ -1891,9 +2136,12 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         }
         let answer_started = std::time::Instant::now();
         let proof = match result.answer.as_deref() {
-            Some(text) if !text.trim().is_empty() => {
-                Some(verify::seal(&agent_dir, Path::new("answer.md"), text)?)
-            }
+            Some(text) if !text.trim().is_empty() => Some(seal_execution_answer(
+                &agent_dir,
+                Path::new("answer.md"),
+                text,
+                identity.system_route.is_some(),
+            )?),
             _ => None,
         };
         let answer_sealed = std::time::Instant::now();
@@ -1943,12 +2191,34 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
 /// summary or synthesized history.
 pub const CONTINUATION_CONTROL: &str = "The previous turn stopped because the account's usage limit was reached. Continue the same task from where it stopped, without repeating completed steps.";
 
-/// Moves an exhausted run to its next account, or names why it cannot.
+/// Billing failures need not mean an exhausted quota; continue without
+/// asserting a balance or resending the original task.
+pub const CLAUDE_CONTINUATION_CONTROL: &str = "The previous turn stopped before completion. Continue the same task from where it stopped, without repeating completed steps.";
+
+/// A denied switch is terminal; a writer failure may have committed and must
+/// propagate without being converted into a definite refusal or retried.
+enum FailoverError {
+    Blocked(String),
+    Persistence(Error),
+}
+
+impl From<String> for FailoverError {
+    fn from(value: String) -> Self {
+        Self::Blocked(value)
+    }
+}
+
+impl From<&str> for FailoverError {
+    fn from(value: &str) -> Self {
+        Self::Blocked(value.to_owned())
+    }
+}
+
+/// Moves an exhausted or billing-blocked run to its next account.
 ///
-/// Only Codex continues across accounts (its conversation lives in the
-/// run's own `CODEX_HOME`); Claude Code keeps history per login, so cross-
-/// account continuation is refused. The current configuration must still
-/// permit the frozen execution, the run must be automatic and not
+/// Codex uses its run-owned `CODEX_HOME`; explicitly ordered Claude providers
+/// use the verified absolute transcript path across account logins. The
+/// current configuration must still permit the frozen execution, the run must be automatic and not
 /// cancelled, and the next account comes from trusted ranker candidates
 /// (frozen scope ∩ current bindings, never an account tried before) through
 /// the atomic store allocation, with bounded stale-revision recomputes.
@@ -1958,9 +2228,15 @@ async fn failover(
     id: &AgentId,
     store: &mut Persist,
     identity: &ProviderLaunchIdentity,
-) -> std::result::Result<serde_json::Value, String> {
+) -> std::result::Result<serde_json::Value, FailoverError> {
     let authority = &identity.authority;
-    if authority.harness != HarnessId::Codex {
+    let ordered_claude = authority.harness == HarnessId::ClaudeCode
+        && identity
+            .provider_config
+            .providers
+            .get(&authority.provider)
+            .is_some_and(|provider| provider.ordered_accounts);
+    if authority.harness != HarnessId::Codex && !ordered_claude {
         return Err("cross_account_continuation_unverified".into());
     }
     if store
@@ -2032,7 +2308,10 @@ async fn failover(
             Err(Error::QuotaAdmission(
                 agent_run_domain::catalog::QuotaAdmissionError::NoEligibleAccount { .. },
             )) => return Err("no_eligible_account".into()),
-            Err(error) => return Err(error.to_string()),
+            Err(error @ (Error::Persistence { .. } | Error::WriterFailure(_))) => {
+                return Err(FailoverError::Persistence(error));
+            }
+            Err(error) => return Err(error.to_string().into()),
         }
     }
     Err("selection_busy".into())
@@ -2094,8 +2373,8 @@ fn history_metadata(state: &serde_json::Value) -> ops::ProviderHistoryMetadata {
 }
 
 /// Seals the finished attempt's native history at its cleanup boundary, in
-/// the storage root the attempt's own environment named (`CODEX_HOME`, or
-/// `CLAUDE_CONFIG_DIR` falling back to `$HOME/.claude`). Returns the adapter
+/// its previously verified continuation root when supplied, otherwise the
+/// storage root named by the attempt's environment. Returns the adapter
 /// state to record: `native_history` with the seal bound to provider, assets
 /// and attempt, or `native_history_unavailable` with the reason. Never fails
 /// the finished task itself.
@@ -2105,12 +2384,16 @@ fn history_evidence(
     attempt: &str,
     identity: &ProviderLaunchIdentity,
     environment: &BTreeMap<String, String>,
+    continuation_root: Option<&Path>,
 ) -> serde_json::Value {
     let session = match store.get(id).map(|row| row.runtime_session_id) {
         Ok(Some(session)) => session,
         _ => return json!({"native_history_unavailable":"no native session was recorded"}),
     };
-    let Some(root) = history_root(identity.authority.harness, environment) else {
+    let Some(root) = continuation_root
+        .map(Path::to_path_buf)
+        .or_else(|| history_root(identity.authority.harness, environment))
+    else {
         return json!({"native_history_unavailable":"the attempt named no native storage"});
     };
     match crate::continuity::seal(identity.authority.harness, &root, &session) {
@@ -2282,6 +2565,36 @@ fn governed_lanes(
         .collect()
 }
 
+/// Completes one refused handoff only after proving its attempt never spawned.
+async fn finish_blocked_handoff(
+    store: &mut Persist,
+    id: &AgentId,
+    blocker: &str,
+    retry: bool,
+    recorded: Option<&str>,
+) -> Result<()> {
+    if !persist::attempt_never_spawned(&store.conn, id)? {
+        return Err(invalid("provider attempt was already spawning"));
+    }
+    store
+        .event(id, "failover_blocked", &json!({"reason":blocker}))
+        .await?;
+    let failure = if !retry {
+        "continuation_unavailable"
+    } else if recorded
+        .and_then(|state| serde_json::from_str::<serde_json::Value>(state).ok())
+        .is_some_and(|state| state["native_failure"]["class"] == "billing_unavailable")
+    {
+        "billing_unavailable"
+    } else {
+        "quota_exhausted"
+    };
+    let mut outcome = Outcome::failure(failure);
+    outcome.failure_text = Some(format!("failover_blocked: {blocker}"));
+    store.finish(id, &outcome, None, None).await?;
+    commands::complete_terminal_persisted(store, id).await
+}
+
 /// Why a switched attempt must not spawn after all: its account is no longer
 /// enabled (`account_revoked_at_handoff`), the current configuration no
 /// longer permits the frozen execution including its harness and connection
@@ -2310,7 +2623,60 @@ fn handoff_blocker(
     if !current_bindings(&current, &identity.authority).contains(account) {
         return Ok(Some("account_unbound_at_handoff"));
     }
+    if !ordered_binding_unchanged(&current, account, identity) {
+        return Ok(Some("current_policy_refused"));
+    }
     Ok(None)
+}
+
+/// An ordered switch may only use the same frozen label and connection under
+/// current policy; removing the queue or redirecting a binding revokes it.
+fn ordered_binding_unchanged(
+    current: &agent_run_config::provider_config::ProviderConfig,
+    account: &agent_run_domain::catalog::AccountId,
+    identity: &ProviderLaunchIdentity,
+) -> bool {
+    let Some(frozen) = identity
+        .provider_config
+        .providers
+        .get(&identity.authority.provider)
+    else {
+        return false;
+    };
+    if !frozen.ordered_accounts {
+        return true;
+    }
+    let Some(now) = current.providers.get(&identity.authority.provider) else {
+        return false;
+    };
+    if !now.ordered_accounts {
+        return false;
+    }
+    /// Finds the selected account's binding for this frozen model.
+    fn binding<'a>(
+        provider: &'a agent_run_config::provider_config::ProviderSettings,
+        account: &agent_run_domain::catalog::AccountId,
+        model: &str,
+    ) -> Option<&'a agent_run_domain::catalog::ProviderBinding> {
+        provider.bindings.iter().find(|binding| {
+            &binding.account == account
+                && binding
+                    .models
+                    .as_ref()
+                    .is_none_or(|models| models.iter().any(|item| item == model))
+        })
+    }
+    match (
+        binding(frozen, account, &identity.authority.model),
+        binding(now, account, &identity.authority.model),
+    ) {
+        (Some(before), Some(after)) => {
+            before.label == after.label
+                && before.connection.as_ref().unwrap_or(&frozen.connection)
+                    == after.connection.as_ref().unwrap_or(&now.connection)
+        }
+        _ => false,
+    }
 }
 
 /// The global accounts the current configuration still binds to the frozen
@@ -2340,12 +2706,11 @@ fn current_bindings(
         .unwrap_or_default()
 }
 
-/// Test-only: while `<home>/fixture-hold-<phase>` exists, the first durable
-/// write after the engine was spawned stays pending (it announces
-/// `fixture-held-<phase>` and waits, without blocking the executor, up to
-/// twenty seconds for `fixture-release-<phase>`). It models a held writer so a
-/// test can prove the engine keeps being observed meanwhile. Absent in
-/// production.
+/// Test-only finite hold at a named checkpoint: while the hold marker exists,
+/// announce `fixture-held-<phase>` and wait up to twenty seconds for its
+/// release marker without blocking the executor. Post-spawn checkpoints model
+/// a held writer; `pre-spawn-validation` stops before the final grant check.
+/// Absent in production.
 #[cfg(feature = "test-fixtures")]
 async fn fixture_hold(home: &Path, phase: &str) {
     if !home.join(format!("fixture-hold-{phase}")).exists() {

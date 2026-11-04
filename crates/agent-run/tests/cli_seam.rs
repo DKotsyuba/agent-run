@@ -138,6 +138,73 @@ fn dependencies(
     }
 }
 
+/// Additive observation commands forward strict schemas to the broker and keep
+/// the exact structured result; they never route through local answer display.
+#[tokio::test]
+async fn observation_cli_uses_shared_broker_methods() {
+    let hash = "a".repeat(64);
+    for (argv, method, expected) in [
+        (vec!["capabilities"], "capabilities", json!({})),
+        (
+            vec![
+                "answer-chunk",
+                AGENT_ID,
+                "--sequence",
+                "1",
+                "--expected-sha256",
+                &hash,
+                "--offset-bytes",
+                "0",
+            ],
+            "answer_chunk",
+            json!({"agent_id":AGENT_ID,"sequence":1,"expected_sha256":hash,"offset_bytes":0,"max_bytes":65536}),
+        ),
+    ] {
+        let response = json!({"observation":"exact"});
+        let broker = Arc::new(FakeBroker::new(vec![response.clone()]));
+        let output = Arc::new(Mutex::new(Vec::new()));
+        agent_run::cli::run_with(
+            parse(&argv),
+            dependencies(
+                Arc::new(FakeService::new(vec![], false)),
+                broker.clone(),
+                output.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            broker.calls.lock().unwrap().as_slice(),
+            &[(method.into(), expected)]
+        );
+        assert_eq!(output.lock().unwrap().as_slice(), &[response]);
+    }
+    let broker = Arc::new(FakeBroker::new(vec![]));
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let result = agent_run::cli::run_with(
+        parse(&[
+            "answer-chunk",
+            AGENT_ID,
+            "--sequence",
+            "1",
+            "--expected-sha256",
+            &hash,
+            "--offset-bytes",
+            "0",
+            "--max-bytes",
+            "0",
+        ]),
+        dependencies(
+            Arc::new(FakeService::new(vec![], false)),
+            broker.clone(),
+            output,
+        ),
+    )
+    .await;
+    assert!(matches!(result, Err(agent_run::Error::Validation(_))));
+    assert!(broker.calls.lock().unwrap().is_empty());
+}
+
 /// Both CLI discovery spellings forward validated pages through the broker;
 /// default output preserves JSON and --text reuses the compact MCP presentation.
 #[tokio::test]
@@ -556,6 +623,7 @@ async fn test_transcript_follow_polls_without_duplicates_until_terminal_and_drai
         vec![
             (0, json!({"messages":[{"seq":1}],"complete":false})),
             (1, json!({"messages":[{"seq":2}],"complete":true})),
+            (2, json!({"messages":[],"complete":true})),
         ],
         true,
     ));
@@ -1134,6 +1202,7 @@ async fn test_transcript_text_follow_drains_without_duplicates() {
                         1,
                         json!({"messages":[{"seq":2,"role":"assistant","content":"two","raw_ref":"item-2"}],"complete":true}),
                     ),
+                    (2, json!({"messages":[],"complete":true})),
                 ],
                 true,
             )),
@@ -1213,6 +1282,7 @@ async fn test_transcript_text_streams_fragments_across_pages() {
                     (0, json!({"messages":[rows(1,"Hello")],"complete":false})),
                     (1, json!({"messages":[rows(2," ")],"complete":false})),
                     (2, json!({"messages":[rows(3,"world")],"complete":true})),
+                    (3, json!({"messages":[],"complete":true})),
                 ],
                 true,
             )),
@@ -1261,6 +1331,7 @@ async fn test_transcript_text_renders_two_claude_messages_distinctly() {
                         3,
                         json!({"messages":[row(4," message","msg_two")],"complete":true}),
                     ),
+                    (4, json!({"messages":[],"complete":true})),
                 ],
                 true,
             )),
@@ -1299,6 +1370,7 @@ async fn test_transcript_text_consumes_escape_splits_across_pages() {
                         1,
                         json!({"messages":[row(2,"1mred\u{1b}[0m ok")],"complete":true}),
                     ),
+                    (2, json!({"messages":[],"complete":true})),
                 ],
                 true,
             )),
@@ -1336,7 +1408,9 @@ impl CliService for PausingService {
         Ok(json!({"agent_id":id,"status":"succeeded"}))
     }
     fn transcript(&self, _id: &AgentId, cursor: i64, _limit: usize) -> agent_run::Result<Value> {
-        if cursor >= 1 {
+        if cursor >= 2 {
+            Ok(json!({"messages":[],"complete":true}))
+        } else if cursor >= 1 {
             self.release
                 .lock()
                 .unwrap()

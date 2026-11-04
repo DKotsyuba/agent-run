@@ -4,7 +4,10 @@ use agent_run_config::{config::Runtime, profiles::Profile};
 use agent_run_core::codex::Grant;
 use agent_run_domain::domain::StartRequest;
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+};
 
 /// Returns the baseline read-only grant used by the app-server echo tests.
 fn read_only_grant() -> Grant {
@@ -19,6 +22,59 @@ fn read_only_grant() -> Grant {
         network_access: false,
         permission_profile: None,
     }
+}
+
+/// Linux must accept a safe shared root without requiring macOS-only paths.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_read_only_grant_accepts_a_safe_shared_root() {
+    read_only_grant()
+        .admits_shared_root_with_environment(std::path::Path::new("/usr"), &BTreeMap::new())
+        .expect("a readable root outside the granted temporary directories is safe");
+}
+
+/// A child's TMPDIR, including symlink aliases and invalid paths, determines
+/// whether a shared root is protected independently of the supervisor's TMPDIR.
+#[test]
+fn shared_root_uses_the_effective_child_tmpdir() {
+    let grant = read_only_grant();
+    let root = Path::new("/usr");
+    let mut environment = BTreeMap::new();
+    for path in ["/usr", "/usr/bin", "/", "relative", "", "/etc/passwd"] {
+        environment.insert("TMPDIR".into(), path.into());
+        assert!(
+            grant
+                .admits_shared_root_with_environment(root, &environment)
+                .is_err(),
+            "the child TMPDIR {path:?} must be refused"
+        );
+    }
+    let missing = tempfile::tempdir().unwrap().path().join("missing");
+    environment.insert("TMPDIR".into(), missing.to_string_lossy().into_owned());
+    assert!(
+        grant
+            .admits_shared_root_with_environment(root, &environment)
+            .is_err()
+    );
+
+    let temporary = tempfile::tempdir().unwrap();
+    let alias = temporary.path().join("alias");
+    std::os::unix::fs::symlink(root, &alias).unwrap();
+    environment.insert("TMPDIR".into(), alias.to_string_lossy().into_owned());
+    assert!(
+        grant
+            .admits_shared_root_with_environment(root, &environment)
+            .is_err()
+    );
+
+    environment.insert("TMPDIR".into(), "/etc".into());
+    grant
+        .admits_shared_root_with_environment(root, &environment)
+        .expect("a safe child override is accepted");
+    environment.clear();
+    grant
+        .admits_shared_root_with_environment(root, &environment)
+        .expect("an unset child TMPDIR uses /tmp");
 }
 
 /// Returns an app-server thread echo, with caller-provided compatibility fields.
@@ -211,13 +267,13 @@ fn python_test_codex_app_server_sandbox_beta_object_echo_unknown_type_is_refused
 fn python_test_codex_app_server_live_read_only_echo_shape_passes() {
     let mut grant = read_only_grant();
     grant.model = "gpt-5.6-luna".into();
-    grant.cwd = "/Users/pluto/projects/agent-run".into();
+    grant.cwd = "/Users/example/projects/agent-run".into();
     grant.roots = vec![grant.cwd.clone()];
     let actual = json!({
         "thread": {"id": "thread"},
         "model": "gpt-5.6-luna",
         "cwd": grant.cwd,
-        "runtimeWorkspaceRoots": ["/Users/pluto/projects/agent-run"],
+        "runtimeWorkspaceRoots": ["/Users/example/projects/agent-run"],
         "approvalPolicy": "never",
         "sandbox": {"type": "readOnly", "networkAccess": false},
     });
@@ -227,7 +283,7 @@ fn python_test_codex_app_server_live_read_only_echo_shape_passes() {
 /// Mirrors `test_codex_app_server.py::test_live_workspace_write_echo_shape_passes`.
 #[test]
 fn python_test_codex_app_server_live_workspace_write_echo_shape_passes() {
-    let cwd = "/Users/pluto/projects/agent-run";
+    let cwd = "/Users/example/projects/agent-run";
     let grant = Grant {
         model: "gpt-5.6-luna".into(),
         cwd: cwd.into(),

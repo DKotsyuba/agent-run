@@ -29,13 +29,18 @@ fn pro_response(account: &str) -> serde_json::Value {
     })
 }
 
-/// Builds one shell command that emits bounded stdout and then exits.
-fn capture_script(output: &str, status: &str) -> (std::path::PathBuf, Vec<String>) {
+/// Builds an output fixture that waits until its process owner has been captured.
+fn capture_script(output: &str, status: &str, gate: &Path) -> (std::path::PathBuf, Vec<String>) {
     (
         std::path::PathBuf::from("/bin/sh"),
         vec![
             "-c".into(),
-            format!("printf '%s' '{}' ; exit {}", output, status),
+            "while [ ! -f \"$1\" ]; do /bin/sleep 0.01; done; printf '%s' \"$2\"; exit \"$3\""
+                .into(),
+            "fixture".into(),
+            gate.to_string_lossy().into_owned(),
+            output.into(),
+            status.into(),
         ],
     )
 }
@@ -729,12 +734,21 @@ fn python_test_capacity_codex_appserver_probe_identity_does_not_enter_payload() 
 }
 
 // Mirrors `tests/test_capacity_codex_appserver.py::FetchRateLimitsTests::test_returns_direct_result_and_terminates`
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn python_test_capacity_codex_appserver_capture_returns_direct_output() {
-    let (binary, args) = capture_script("capacity", "0");
-    let bytes = capture(&binary, &args, 2, &empty_environment())
-        .await
-        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let gate = directory.path().join("release");
+    let (binary, args) = capture_script("capacity", "0", &gate);
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        started.send(()).unwrap();
+        capture(&binary, &args, 5, &empty_environment()).await
+    });
+    // On this single-threaded runtime, the capture task reaches its first
+    // await only after capturing ownership of the waiting child.
+    ready.await.unwrap();
+    std::fs::write(gate, b"ready").unwrap();
+    let bytes = task.await.unwrap().unwrap();
     assert_eq!(bytes, b"capacity");
 }
 

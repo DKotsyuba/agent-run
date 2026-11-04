@@ -343,6 +343,108 @@ pub async fn sweep_on<B: crate::runtime_storage::LayoutBackend>(
     now: f64,
     store: &mut B,
 ) -> Result<usize> {
+    sweep_inner(home, now, store, false).await
+}
+
+/// Runs the same retention proof for group-shared execution artifacts, letting
+/// the filesystem decide whether files created by another account are removable.
+pub async fn sweep_shared_on<B: crate::runtime_storage::LayoutBackend>(
+    home: &Path,
+    now: f64,
+    store: &mut B,
+) -> Result<usize> {
+    sweep_inner(home, now, store, true).await
+}
+
+/// Reclaims expired run homes owned by this worker using shared-store evidence.
+///
+/// `configured_paths` comes from the current validated broker configuration;
+/// resolving it again under this account protects private symlink targets.
+/// Invalid path evidence or incomplete store evidence stops the pass.
+pub fn sweep_account_runtime(
+    home: &Path,
+    now: f64,
+    store: &Store,
+    configured_paths: &[PathBuf],
+) -> Result<usize> {
+    if !now.is_finite() || now < STORAGE_SECONDS {
+        return Err(invalid("filesystem retention requires a finite Unix time"));
+    }
+    let root = fs::Dir::open(home)?;
+    let identity = root.entry(None)?;
+    if identity.kind != fs::EntryType::Directory || identity.uid != euid() {
+        return Err(invalid("runtime retention requires an owned directory"));
+    }
+    let mut proof = store.storage_protection_snapshot()?;
+    for path in configured_paths {
+        let Some(text) = path.to_str().filter(|path| Path::new(path).is_absolute()) else {
+            return Err(invalid("invalid configured path evidence"));
+        };
+        proof.protect_path(text);
+        protect_existing_ancestor(&mut proof, path);
+    }
+    let mut pass = Pass::new(home, &root)?;
+    if let Some(runs) = open_owned(&root, "runs")
+        && let Some(names) = pass.list(&runs, "account-runs")
+    {
+        for name in names {
+            if pass.roots == 0 {
+                break;
+            }
+            let Some(id) = name.to_str() else { continue };
+            let Some(created) = run_id_created(id) else {
+                continue;
+            };
+            if !older_than(created, now, STORAGE_SECONDS)
+                && !count_retired(store, proof.count_boundary(), id, created)
+            {
+                continue;
+            }
+            let candidate = home.join("runs").join(id);
+            if proof.retains(id, &candidate) {
+                continue;
+            }
+            remove_root(&runs, id, false, &mut pass, false);
+        }
+    }
+    let more = pass.finish()?;
+    Ok(pass.removed + usize::from(more && pass.removed == 0))
+}
+
+/// Protects a missing configured leaf through its nearest resolvable ancestor.
+fn protect_existing_ancestor(proof: &mut StorageProtection, path: &Path) {
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut resolved) => {
+                for component in suffix.into_iter().rev() {
+                    resolved.push(component);
+                }
+                if let Some(path) = resolved.to_str() {
+                    proof.protect_path(path);
+                }
+                return;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let (Some(name), Some(parent)) = (ancestor.file_name(), ancestor.parent()) else {
+                    return;
+                };
+                suffix.push(name.to_os_string());
+                ancestor = parent;
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// Runs one bounded retention pass with its selected execution-artifact policy.
+async fn sweep_inner<B: crate::runtime_storage::LayoutBackend>(
+    home: &Path,
+    now: f64,
+    store: &mut B,
+    shared: bool,
+) -> Result<usize> {
     if !now.is_finite() || now < LOG_SECONDS {
         return Err(invalid("filesystem retention requires a finite Unix time"));
     }
@@ -358,7 +460,7 @@ pub async fn sweep_on<B: crate::runtime_storage::LayoutBackend>(
         .ok_or_else(|| invalid("current configuration cannot prove filesystem retention safety"))?;
     collect_config_paths(&config, &mut proof);
     let mut pass = Pass::new(home, &root)?;
-    run_directories(home, &root, now, &proof, store.reader(), &mut pass);
+    run_directories(home, &root, now, &proof, store.reader(), &mut pass, shared);
     standalone_backups(home, &root, now, &proof, &mut pass);
     migration_snapshots(home, &root, now, &proof, &mut pass);
     config_profile_backups(home, &root, now, &config, &proof, &mut pass);
@@ -441,7 +543,7 @@ fn collect_config_paths(value: &toml::Value, proof: &mut StorageProtection) {
 /// configuration that exists but cannot be read or parsed is **not** proof of
 /// an empty set — it is uncertainty, returned as an error so the caller
 /// retains everything and retries.
-pub(crate) fn config_paths(home: &Path) -> Result<Vec<PathBuf>> {
+pub fn config_paths(home: &Path) -> Result<Vec<PathBuf>> {
     let root = fs::Dir::open(home)?;
     let bytes = root
         .optional(Path::new("config.toml"), 1024 * 1024)?
@@ -513,6 +615,7 @@ fn run_directories(
     proof: &StorageProtection,
     store: &Store,
     pass: &mut Pass,
+    shared: bool,
 ) {
     let boundary = proof.count_boundary();
     let Some(agents) = open_owned(root, "agents") else {
@@ -543,7 +646,7 @@ fn run_directories(
         if proof.retains(id, &home.join("agents").join(id)) {
             continue;
         }
-        remove_root(&agents, id, false, pass);
+        remove_root(&agents, id, false, pass, shared);
     }
     let Some(runtimes) = open_owned(root, "runtimes") else {
         return;
@@ -599,7 +702,7 @@ fn run_directories(
                 ) {
                     continue;
                 }
-                remove_root(&runs, id, false, pass);
+                remove_root(&runs, id, false, pass, false);
             }
         }
     }
@@ -704,7 +807,7 @@ fn standalone_backups(
         if proof.retains("", &home.join("standalone/backups").join(name)) {
             continue;
         }
-        remove_root(&backups, name, false, pass);
+        remove_root(&backups, name, false, pass, false);
     }
 }
 
@@ -773,7 +876,7 @@ fn migration_snapshots(
                                 complete.kind == fs::EntryType::File && complete.uid == euid()
                             }))
                 {
-                    remove_root(&migrations, marker, true, pass);
+                    remove_root(&migrations, marker, true, pass, false);
                 }
             }
             // The snapshot is already gone; finish by removing its marker.
@@ -953,7 +1056,13 @@ fn remove_owned_file(dir: &fs::Dir, name: &str, now: f64, window: f64, pass: &mu
 /// stays recognizable but harmless. When the unlink budget runs out the tree
 /// remains partially removed and eligible again on the next pass, because
 /// eligibility never depends on timestamps this removal changes.
-fn remove_root(parent: &fs::Dir, name: &str, preserve_complete: bool, pass: &mut Pass) {
+fn remove_root(
+    parent: &fs::Dir,
+    name: &str,
+    preserve_complete: bool,
+    pass: &mut Pass,
+    shared: bool,
+) {
     if pass.roots == 0 || pass.unlinks == 0 {
         return;
     }
@@ -972,10 +1081,10 @@ fn remove_root(parent: &fs::Dir, name: &str, preserve_complete: bool, pass: &mut
     pass.roots -= 1;
     // Owner-read-only snapshot directories need write permission to unlink
     // their contents; this fchmod can only ever affect this owned descriptor.
-    if dir.permit_owner_write().is_err() {
+    if !shared && dir.permit_owner_write().is_err() {
         return;
     }
-    if !drain(&dir, preserve_complete, 0, pass) {
+    if !drain(&dir, preserve_complete, 0, pass, shared) {
         return;
     }
     match parent.entry(Some(rel)) {
@@ -993,7 +1102,13 @@ fn remove_root(parent: &fs::Dir, name: &str, preserve_complete: bool, pass: &mut
 }
 
 /// Unlinks every entry of `dir` under the pass budget; true when it became empty.
-fn drain(dir: &fs::Dir, preserve_complete: bool, depth: usize, pass: &mut Pass) -> bool {
+fn drain(
+    dir: &fs::Dir,
+    preserve_complete: bool,
+    depth: usize,
+    pass: &mut Pass,
+    shared: bool,
+) -> bool {
     if depth >= 32 || Instant::now() >= pass.deadline {
         pass.failed = true;
         return false;
@@ -1014,7 +1129,9 @@ fn drain(dir: &fs::Dir, preserve_complete: bool, depth: usize, pass: &mut Pass) 
         let Ok(entry) = dir.entry(Some(&rel)) else {
             return false;
         };
-        if entry.uid != euid() {
+        if entry.uid != euid()
+            && !(shared && matches!(entry.kind, fs::EntryType::File | fs::EntryType::Symlink))
+        {
             return false;
         }
         match entry.kind {
@@ -1048,10 +1165,10 @@ fn drain(dir: &fs::Dir, preserve_complete: bool, depth: usize, pass: &mut Pass) 
                     _ => return false,
                 }
                 // Nested owner-read-only directories relax the same narrow way.
-                if child.permit_owner_write().is_err() {
+                if !shared && child.permit_owner_write().is_err() {
                     return false;
                 }
-                if !drain(&child, false, depth + 1, pass) {
+                if !drain(&child, false, depth + 1, pass, shared) {
                     empty = false;
                     continue;
                 }
@@ -1236,7 +1353,15 @@ mod tests {
         std::fs::write(tree.join("live"), "fixture").unwrap();
         let root = fs::Dir::open(home.path()).unwrap();
         let mut pass = Pass::new(home.path(), &root).unwrap();
-        run_directories(home.path(), &root, at + 0.9, &stale, &store, &mut pass);
+        run_directories(
+            home.path(),
+            &root,
+            at + 0.9,
+            &stale,
+            &store,
+            &mut pass,
+            false,
+        );
         assert!(
             tree.join("live").exists(),
             "fresh admission wins over stale protection"

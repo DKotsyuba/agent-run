@@ -52,7 +52,19 @@ fn is_path_escape(error: &Error) -> bool {
         _ => false,
     }
 }
+/// Seals an answer in the ordinary owner-private artifact directory.
 pub fn seal(root: &Path, relative: &Path, text: &str) -> Result<Proof> {
+    seal_with_mode(root, relative, text, false)
+}
+
+/// Seals a shared answer using the process umask and filesystem permissions.
+/// The caller must first select the correct execution directory.
+pub fn seal_system(root: &Path, relative: &Path, text: &str) -> Result<Proof> {
+    seal_with_mode(root, relative, text, true)
+}
+
+/// Seals marker, exact payload and proof using the requested private or group mode.
+fn seal_with_mode(root: &Path, relative: &Path, text: &str, system: bool) -> Result<Proof> {
     if text.is_empty() {
         return Err(invalid("cannot seal an empty answer"));
     }
@@ -81,11 +93,18 @@ pub fn seal(root: &Path, relative: &Path, text: &str) -> Result<Proof> {
         sha256: proof.sha256.clone(),
     };
     // Commit marker first. A crash at any following stage cannot downgrade to legacy.
-    dir.write(&parent.join(".answer-format"), b"2\n", 0o600)?;
-    dir.write(relative, text.as_bytes(), 0o600)?;
+    let write = |path: &Path, bytes: &[u8]| {
+        if system {
+            dir.write(path, bytes, 0o660)
+        } else {
+            dir.write(path, bytes, 0o600)
+        }
+    };
+    write(&parent.join(".answer-format"), b"2\n")?;
+    write(relative, text.as_bytes())?;
     let mut data = serde_json::to_vec(&sidecar)?;
     data.push(b'\n');
-    dir.write(&parent.join(format!("{name}.proof.json")), &data, 0o600)?;
+    write(&parent.join(format!("{name}.proof.json")), &data)?;
     Ok(proof)
 }
 /// Read one optional no-follow metadata file bounded to
@@ -201,6 +220,22 @@ pub fn load_sidecar(
 /// bound (Python's `max_bytes` in every production call site); `inline_limit`
 /// only decides whether the verified text is retained in the return value.
 pub fn read(root: &Path, proof: &Proof, inline_limit: usize) -> Result<(u32, Option<String>)> {
+    let (version, text) = read_payload(root, proof)?;
+    let content = (text.len() <= inline_limit).then(|| {
+        if version == 1 {
+            text[..text.len() - LEGACY_FRAME.len()].to_owned()
+        } else {
+            text
+        }
+    });
+    Ok((version, content))
+}
+
+/// Reads at most 16 MiB through owned no-follow descriptors and validates the
+/// recorded size, SHA-256, UTF-8 and seal/legacy framing. Returns format version
+/// and exact artifact text, retaining the legacy frame for byte/hash fidelity.
+/// Paths escaping root, corrupt evidence and filesystem failures remain typed.
+pub fn read_payload(root: &Path, proof: &Proof) -> Result<(u32, String)> {
     let relative = proof
         .path
         .strip_prefix(root)
@@ -246,7 +281,7 @@ pub fn read(root: &Path, proof: &Proof, inline_limit: usize) -> Result<(u32, Opt
             "answer artifact hash does not match its recorded proof".into(),
         ));
     }
-    let text = std::str::from_utf8(&bytes)
+    let text = String::from_utf8(bytes)
         .map_err(|_| Error::AnswerIntegrity("answer artifact is not valid UTF-8".into()))?;
     let name = relative
         .file_name()
@@ -256,7 +291,7 @@ pub fn read(root: &Path, proof: &Proof, inline_limit: usize) -> Result<(u32, Opt
     let version = match load_sidecar(&dir, parent, name, proof.bytes, &proof.sha256)? {
         Some(_) => 2,
         None => {
-            if !bytes.ends_with(LEGACY_FRAME) {
+            if !text.as_bytes().ends_with(LEGACY_FRAME) {
                 return Err(Error::AnswerIntegrity(
                     "legacy answer lacks its exact terminal frame".into(),
                 ));
@@ -264,16 +299,7 @@ pub fn read(root: &Path, proof: &Proof, inline_limit: usize) -> Result<(u32, Opt
             1
         }
     };
-    let content = if bytes.len() <= inline_limit {
-        Some(if version == 1 {
-            text[..text.len() - LEGACY_FRAME.len()].to_owned()
-        } else {
-            text.to_owned()
-        })
-    } else {
-        None
-    };
-    Ok((version, content))
+    Ok((version, text))
 }
 /// Only bounded, unmistakable error-only payloads are classified as provider errors.
 pub fn error_only(text: &str) -> Option<&'static str> {

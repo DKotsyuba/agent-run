@@ -16,5 +16,6 @@ pub mod migrate;
 /// Exclusive offline authority over a home's database.
 pub mod offline;
 pub mod storage_admin;
+pub mod system;
 pub mod transcript;
 pub mod transport;

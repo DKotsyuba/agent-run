@@ -44,9 +44,7 @@ Probe commands receive `AGENT_RUN_SERVICE_PID`, `AGENT_RUN_SERVICE_ID` and
 `AGENT_RUN_SERVICE_GENERATION`. Their zero exit must mean the intended backend
 is ready; output is discarded. Process ownership is separately checked by
 native PID/start-token evidence. `doctor` reports service health without starting
-backends. The native archive includes an external `services/codegraph-probe.cjs`
-example qualified for CodeGraph 1.6.0, using that version's private daemon entry.
-Keep CodeGraph's ordinary `serve --mcp --path <project>` client in the agent role.
+backends.
 
 ## Codex workspace and destructive guard
 

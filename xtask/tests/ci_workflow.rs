@@ -8,7 +8,7 @@ fn repository_file(path: &str) -> String {
         .unwrap_or_else(|error| panic!("cannot read {path}: {error}"))
 }
 
-/// Ensures primary CI gates macOS releases while retaining visible Linux validation.
+/// Ensures primary CI gates both native platforms and desktop transport.
 #[test]
 fn ci_checks_native_release_and_desktop_transport() {
     let workflow = repository_file(".github/workflows/ci.yml");
@@ -18,19 +18,23 @@ fn ci_checks_native_release_and_desktop_transport() {
         "cargo xtask release build-native",
         "cargo xtask release verify",
         "- os: macos-15\n            label: supported-macos-arm64\n            target: aarch64-apple-darwin\n            architecture: arm64",
-        "- os: ubuntu-latest\n            label: validation-only-linux-x86_64-unqualified\n            target: x86_64-unknown-linux-gnu\n            architecture: x86_64",
-        "continue-on-error: ${{ matrix.continue_on_error }}",
-        "continue_on_error: false",
-        "continue_on_error: true",
+        "- os: ubuntu-22.04\n            label: supported-linux-x86_64\n            target: x86_64-unknown-linux-gnu\n            architecture: x86_64",
         "test \"$(uname -m)\" = \"${{ matrix.architecture }}\"",
         "node --test scripts/check-desktop-transport.cjs",
-        "validation-only-linux-x86_64-unqualified",
+        "supported-linux-x86_64",
+        "temporary=\"$root/agent-run-tmp\"",
+        "fixtures=\"$root/agent-run-fixtures\"",
+        "Prepare protected Linux socket fixture root",
     ] {
         assert!(workflow.contains(required), "CI is missing {required:?}");
     }
     assert!(
         !workflow.contains("macos-latest"),
         "CI must pin the arm64 runner"
+    );
+    assert!(
+        !workflow.contains("continue-on-error"),
+        "Linux failures must block CI"
     );
     let (matrix_job, release_contract) = workflow
         .split_once("\n  release-contract:")
@@ -92,7 +96,7 @@ fn rust_dependency_cache_policy_preserves_trust_and_runner_boundaries() {
             .count(),
         2
     );
-    assert_eq!(release.matches("save-if: false").count(), 3);
+    assert_eq!(release.matches("save-if: false").count(), 4);
     assert!(!release.contains("actions/cache/save@"));
     assert!(!release.contains("save-if: ${{"));
     for workflow in [&ci, &release] {
@@ -119,14 +123,15 @@ fn rust_dependency_cache_policy_preserves_trust_and_runner_boundaries() {
     assert!(ci.contains("if: runner.os != 'macOS'"));
 }
 
-/// Publisher fans in independently checked source and one exact macOS payload;
+/// Publisher fans in independently checked source and two exact native payloads;
 /// cache hits never replace gates, draft verification or post-publication checks.
 #[test]
 fn release_publishes_checksummed_native_assets() {
     let workflow = repository_file(".github/workflows/release.yml");
     let (header, jobs) = workflow.split_once("\njobs:").unwrap();
     let (gate, rest) = jobs.split_once("\n  native:").unwrap();
-    let (native, publish) = rest.split_once("\n  publish:").unwrap();
+    let (native, rest) = rest.split_once("\n  native-linux:").unwrap();
+    let (linux, publish) = rest.split_once("\n  publish:").unwrap();
     assert!(header.contains("group: agent-run-release-publisher"));
     assert!(header.contains("cancel-in-progress: false"));
     assert!(
@@ -134,7 +139,11 @@ fn release_publishes_checksummed_native_assets() {
         "default single pending run would cancel older queued tags"
     );
     assert!(header.contains("permissions:\n  contents: read"));
-    assert!(!gate.contains("contents: write") && !native.contains("contents: write"));
+    assert!(
+        !gate.contains("contents: write")
+            && !native.contains("contents: write")
+            && !linux.contains("contents: write")
+    );
     assert!(!native.contains("needs:"));
     assert!(!native.contains("cargo xtask check"));
     assert!(gate.contains("-- cargo xtask check"));
@@ -143,7 +152,7 @@ fn release_publishes_checksummed_native_assets() {
         workflow
             .matches("-- cargo xtask release build-native")
             .count(),
-        1
+        2
     );
     assert_eq!(
         workflow
@@ -153,7 +162,21 @@ fn release_publishes_checksummed_native_assets() {
     );
     assert!(native.contains("cargo xtask package smoke"));
     assert!(native.contains("COPYFILE_DISABLE=1 tar --format=ustar"));
-    assert!(publish.contains("needs: [gate, native]"));
+    for required in [
+        "runs-on: ubuntu-22.04",
+        "x86_64-unknown-linux-gnu",
+        "-- cargo xtask check",
+        "cargo xtask package smoke",
+        "--target \"$target\"",
+        "fixtures=\"$root/agent-run-fixtures\"",
+        "Prepare protected Linux socket fixture root",
+    ] {
+        assert!(
+            linux.contains(required),
+            "Linux producer is missing {required}"
+        );
+    }
+    assert!(publish.contains("needs: [gate, native, native-linux]"));
     assert!(!publish.contains("release build-native"));
     for permission in [
         "contents: write",
@@ -179,7 +202,7 @@ fn release_publishes_checksummed_native_assets() {
     assert!(
         publish.find("package verify").unwrap() < publish.find("Stage verify publish").unwrap()
     );
-    assert!(!workflow.contains("x86_64-unknown-linux-gnu") && !workflow.contains("macos-latest"));
+    assert!(!workflow.contains("macos-latest"));
     let publisher = repository_file("xtask/src/release_publish.rs");
     for invariant in [
         "existing draft requires manual reconciliation",

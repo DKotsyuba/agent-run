@@ -140,6 +140,328 @@ fn identity(request: &ProviderStartRequest, authority: &ResolvedLaunchAuthority)
     })
 }
 
+/// Adds a normalized frozen provider document and its digest to a fixture identity.
+fn ordered_identity(
+    request: &ProviderStartRequest,
+    authority: &ResolvedLaunchAuthority,
+    catalog: &ProviderCatalog,
+) -> Value {
+    let mut provider = serde_json::to_value(catalog.provider(&request.provider).unwrap()).unwrap();
+    provider.as_object_mut().unwrap().remove("id");
+    let mut identity = identity(request, authority);
+    identity["provider_config"] = json!({
+        "schema_version":2, "harnesses":{}, "providers":{"glm-user":provider}
+    });
+    identity["provider_config_snapshot"] =
+        agent_run_config::provider_config::ProviderConfig::snapshot_document(
+            &identity["provider_config"],
+        )
+        .unwrap();
+    identity
+}
+
+/// The writer enforces frozen order even when the trusted producer's ranks
+/// would select another account, including after a cleaned-up attempt.
+#[test]
+fn ordered_selection_is_frozen_and_rechecked_by_the_writer() {
+    let home = home();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
+    store
+        .register_account(&AccountRecord {
+            account_id: "acct-c".parse().unwrap(),
+            auth_family: "anthropic".parse().unwrap(),
+            secret_ref: "named:claude-code:fixture".parse().unwrap(),
+            status: AccountStatus::Enabled,
+        })
+        .unwrap();
+    let mut provider = catalog(&store)
+        .provider(&"glm-user".parse().unwrap())
+        .unwrap()
+        .clone();
+    provider.ordered_accounts = true;
+    provider.bindings = serde_json::from_value(json!([
+        {"label":"api", "account":"acct-a", "priority_multiplier":10.0},
+        {"label":"next", "account":"acct-b", "priority_multiplier":5.0},
+        {"label":"native", "account":"acct-c", "priority_multiplier":1.0, "connection":{"kind":"native"}}
+    ])).unwrap();
+    let catalog =
+        ProviderCatalog::new(store.list_accounts().unwrap(), vec![provider.clone()]).unwrap();
+    let request = provider_request(home.path(), "ordered-start");
+    let mut authority = authority(&catalog, home.path());
+    authority.eligible_accounts.push("acct-c".parse().unwrap());
+    let frozen = ordered_identity(&request, &authority, &catalog);
+    let revision = store.quota_capacity_revision().unwrap();
+    let offered = candidates(revision, &[("acct-c", 0), ("acct-b", 1), ("acct-a", 2)]);
+    let admitted = store
+        .admit_provider(
+            &request,
+            &request.storage_projection(),
+            &catalog,
+            &authority,
+            &offered,
+            &frozen,
+            8,
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(admitted.account_id.as_str(), "acct-a");
+    store.conn.execute(
+        "UPDATE attempts SET phase='cleanup_complete',cleanup_proof_json='{\"confirmed\":true}',adapter_state_json=? WHERE id=?",
+        rusqlite::params![json!({"native_history":{"seal":{"session":"s"},"task_proven":true},"native_failure":{"class":"quota_exhausted"}}).to_string(), admitted.attempt_id],
+    ).unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='running' WHERE id=?",
+            [admitted.agent_id.as_str()],
+        )
+        .unwrap();
+    let revision = store.quota_capacity_revision().unwrap();
+    let offered_next = candidates(revision, &[("acct-c", 0), ("acct-b", 1)]);
+
+    // Supplying a different catalog cannot disable or reorder the frozen queue.
+    let mut spoofed = provider.clone();
+    spoofed.ordered_accounts = false;
+    spoofed.bindings[2].connection = None;
+    let spoofed = ProviderCatalog::new(store.list_accounts().unwrap(), vec![spoofed]).unwrap();
+    assert!(
+        store
+            .allocate_next_attempt(&admitted.agent_id, &spoofed, &offered_next)
+            .is_err()
+    );
+    assert_eq!(ownership(&store, &admitted.agent_id), (1, 1, 1));
+    let next = store
+        .allocate_next_attempt(&admitted.agent_id, &catalog, &offered_next)
+        .unwrap();
+    assert_eq!(next.account_id.as_str(), "acct-b");
+    assert_eq!(next.number, 2);
+    assert_eq!(ownership(&store, &admitted.agent_id), (1, 0, 2));
+
+    // Exact replay returns the original admission, not the current attempt.
+    let replay = store
+        .admit_provider(
+            &request,
+            &request.storage_projection(),
+            &catalog,
+            &authority,
+            &offered,
+            &frozen,
+            1,
+            None,
+            None,
+        )
+        .unwrap();
+    assert!(!replay.created);
+    assert_eq!(replay.attempt_id, admitted.attempt_id);
+
+    // A pinned request remains pinned even if other ordered candidates exist.
+    let mut pinned_request = provider_request(home.path(), "ordered-pinned");
+    pinned_request.account = Some("native".parse().unwrap());
+    let pinned_id: AccountId = "acct-c".parse().unwrap();
+    let mut pinned_candidates = candidates(
+        store.quota_capacity_revision().unwrap(),
+        &[("acct-a", 0), ("acct-c", 1)],
+    );
+    pinned_candidates.intent = SelectionIntent::Pinned(pinned_id.clone());
+    let pinned = store
+        .admit_provider(
+            &pinned_request,
+            &pinned_request.storage_projection(),
+            &catalog,
+            &authority,
+            &pinned_candidates,
+            &ordered_identity(&pinned_request, &authority, &catalog),
+            8,
+            None,
+            Some(&pinned_id),
+        )
+        .unwrap();
+    assert_eq!(pinned.account_id, pinned_id);
+    store.conn.execute(
+        "UPDATE attempts SET phase='cleanup_complete',cleanup_proof_json='{\"confirmed\":true}',adapter_state_json=? WHERE id=?",
+        rusqlite::params![json!({"native_history":{"seal":{"session":"s"},"task_proven":true},"native_failure":{"class":"quota_exhausted"}}).to_string(), pinned.attempt_id],
+    ).unwrap();
+    let offered = candidates(
+        store.quota_capacity_revision().unwrap(),
+        &[("acct-a", 0), ("acct-b", 1)],
+    );
+    assert!(matches!(
+        store.allocate_next_attempt(&pinned.agent_id, &catalog, &offered),
+        Err(Error::QuotaAdmission(
+            QuotaAdmissionError::NoEligibleAccount { .. }
+        ))
+    ));
+}
+
+/// Billing fallback is limited to the exact cleaned custom Claude attempt;
+/// it preserves quota facts and never mistakes billing trouble for exhaustion.
+#[test]
+fn ordered_billing_fallback_requires_matching_custom_attempt() {
+    let home = home();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
+    store
+        .register_account(&AccountRecord {
+            account_id: "acct-c".parse().unwrap(),
+            auth_family: "anthropic".parse().unwrap(),
+            secret_ref: "named:claude-code:fixture".parse().unwrap(),
+            status: AccountStatus::Enabled,
+        })
+        .unwrap();
+    let mut provider = catalog(&store)
+        .provider(&"glm-user".parse().unwrap())
+        .unwrap()
+        .clone();
+    provider.ordered_accounts = true;
+    provider.bindings = serde_json::from_value(json!([
+        {"label":"api", "account":"acct-a", "priority_multiplier":10.0},
+        {"label":"native", "account":"acct-c", "priority_multiplier":5.0, "connection":{"kind":"native"}},
+        {"label":"later", "account":"acct-b", "priority_multiplier":1.0}
+    ]))
+    .unwrap();
+    let catalog = ProviderCatalog::new(store.list_accounts().unwrap(), vec![provider]).unwrap();
+    let request = provider_request(home.path(), "ordered-billing");
+    let mut authority = authority(&catalog, home.path());
+    authority.eligible_accounts.push("acct-c".parse().unwrap());
+    let frozen = ordered_identity(&request, &authority, &catalog);
+    let offered = candidates(
+        store.quota_capacity_revision().unwrap(),
+        &[("acct-a", 0), ("acct-c", 1), ("acct-b", 2)],
+    );
+    let admitted = store
+        .admit_provider(
+            &request,
+            &request.storage_projection(),
+            &catalog,
+            &authority,
+            &offered,
+            &frozen,
+            8,
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(admitted.account_id.as_str(), "acct-a");
+    store.conn.execute(
+        "UPDATE attempts SET phase='cleanup_complete',cleanup_proof_json='{\"confirmed\":true}' WHERE id=?",
+        [admitted.attempt_id.as_str()],
+    ).unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='running' WHERE id=?",
+            [admitted.agent_id.as_str()],
+        )
+        .unwrap();
+    let evidence = json!({
+        "native_history":{"seal":{"session":"s"},"task_proven":true},
+        "native_failure":{"class":"billing_unavailable","attempt":admitted.attempt_id,
+            "account":"acct-a","provider":"glm-user","model":"fixture"}
+    });
+    for (field, value) in [
+        ("attempt", json!("foreign-attempt")),
+        ("account", json!("acct-c")),
+        ("provider", json!("foreign-provider")),
+        ("model", json!("other")),
+        ("class", json!("throttled")),
+    ] {
+        let mut invalid = evidence.clone();
+        invalid["native_failure"][field] = value;
+        store
+            .conn
+            .execute(
+                "UPDATE attempts SET adapter_state_json=? WHERE id=?",
+                rusqlite::params![invalid.to_string(), admitted.attempt_id],
+            )
+            .unwrap();
+        let offered = candidates(
+            store.quota_capacity_revision().unwrap(),
+            &[("acct-c", 0), ("acct-b", 1)],
+        );
+        assert!(
+            store
+                .allocate_next_attempt(&admitted.agent_id, &catalog, &offered)
+                .is_err(),
+            "{field}"
+        );
+        assert_eq!(ownership(&store, &admitted.agent_id), (1, 1, 1));
+    }
+    let mut unproven = evidence.clone();
+    unproven["native_history"]["task_proven"] = json!(false);
+    store
+        .conn
+        .execute(
+            "UPDATE attempts SET adapter_state_json=? WHERE id=?",
+            rusqlite::params![unproven.to_string(), admitted.attempt_id],
+        )
+        .unwrap();
+    let offered = candidates(store.quota_capacity_revision().unwrap(), &[("acct-c", 0)]);
+    assert!(
+        store
+            .allocate_next_attempt(&admitted.agent_id, &catalog, &offered)
+            .is_err()
+    );
+    assert_eq!(ownership(&store, &admitted.agent_id), (1, 1, 1));
+    store
+        .conn
+        .execute(
+            "UPDATE attempts SET adapter_state_json=? WHERE id=?",
+            rusqlite::params![evidence.to_string(), admitted.attempt_id],
+        )
+        .unwrap();
+    let offered = candidates(
+        store.quota_capacity_revision().unwrap(),
+        &[("acct-b", 0), ("acct-c", 1)],
+    );
+    let next = store
+        .allocate_next_attempt(&admitted.agent_id, &catalog, &offered)
+        .unwrap();
+    assert_eq!(next.account_id.as_str(), "acct-c");
+    let closed: String = store
+        .conn
+        .query_row(
+            "SELECT state FROM attempts WHERE id=?",
+            [admitted.attempt_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(closed, "failed");
+    let latches: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM quota_exhaustion", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(latches, 0);
+    let native_failure = json!({
+        "native_history":{"seal":{"session":"s"},"task_proven":true},
+        "native_failure":{"class":"billing_unavailable","attempt":next.attempt_id,
+            "account":"acct-c","provider":"glm-user","model":"fixture"}
+    });
+    store.conn.execute(
+        "UPDATE attempts SET phase='cleanup_complete',cleanup_proof_json='{\"confirmed\":true}',adapter_state_json=? WHERE id=?",
+        rusqlite::params![native_failure.to_string(), next.attempt_id],
+    ).unwrap();
+    let offered = candidates(store.quota_capacity_revision().unwrap(), &[("acct-b", 0)]);
+    assert!(
+        store
+            .allocate_next_attempt(&admitted.agent_id, &catalog, &offered)
+            .is_err()
+    );
+    let count: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM attempts WHERE agent_id=?",
+            [admitted.agent_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 2,
+        "native billing trouble cannot create another attempt"
+    );
+}
+
 /// A provider start from OpenCode retains one execution and session across request replay.
 #[test]
 fn opencode_orchestrator_provider_replay_preserves_one_admission() {

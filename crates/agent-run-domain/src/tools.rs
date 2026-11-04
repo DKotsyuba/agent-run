@@ -168,6 +168,19 @@ impl ToolDefinition {
                 MachineCode::IOError,
                 MachineCode::StorageError,
             ],
+            "answer_chunk" => &[
+                MachineCode::ValidationError,
+                MachineCode::AgentNotFound,
+                MachineCode::ExecutionChanged,
+                MachineCode::AnswerHashMismatch,
+                MachineCode::AnswerUnavailable,
+                MachineCode::AnswerIntegrityError,
+                MachineCode::PathEscapeError,
+                MachineCode::RuntimeError,
+                MachineCode::IOError,
+                MachineCode::StorageError,
+            ],
+            "capabilities" => &[MachineCode::ValidationError],
             "list_pools" => &[
                 MachineCode::ValidationError,
                 MachineCode::IOError,
@@ -306,6 +319,7 @@ fn argument_default(tool: &str, argument: &str) -> Option<ArgumentDefault> {
         }
         ("list_pools", "state") => Some(ArgumentDefault::Null),
         ("list_pools", "limit") => Some(ArgumentDefault::Integer(50)),
+        ("answer_chunk", "max_bytes") => Some(ArgumentDefault::Integer(65536)),
         ("list_pools" | "list_agents", "offset") | ("transcript", "cursor") => {
             Some(ArgumentDefault::Integer(0))
         }

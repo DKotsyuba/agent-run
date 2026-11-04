@@ -1037,5 +1037,203 @@
       "type": "object"
     },
     "name": "agent_integration"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read compiled product version, transport limits, and authoritative read method schemas. Source revision is null without verified build provenance. Does not inspect providers, collect quota, start work or change state. Keep ping/tools fallback for older brokers.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "capabilities",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "limits": {
+          "additionalProperties": false,
+          "properties": {
+            "answer_chunk_default_bytes": {
+              "const": 65536
+            },
+            "answer_chunk_max_bytes": {
+              "const": 131072
+            },
+            "answer_max_bytes": {
+              "const": 16777216
+            },
+            "socket_max_frame_bytes": {
+              "const": 1048576
+            }
+          },
+          "required": [
+            "socket_max_frame_bytes",
+            "answer_max_bytes",
+            "answer_chunk_default_bytes",
+            "answer_chunk_max_bytes"
+          ],
+          "type": "object"
+        },
+        "product": {
+          "const": "agent-run"
+        },
+        "read_methods": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "input_schema": {
+                "type": "object"
+              },
+              "name": {
+                "type": "string"
+              },
+              "result_shape": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "name",
+              "input_schema",
+              "result_shape"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "source_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "transports": {
+          "items": {
+            "enum": [
+              "cli",
+              "mcp",
+              "unix_socket"
+            ]
+          },
+          "type": "array"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "product",
+        "version",
+        "source_revision",
+        "transports",
+        "limits",
+        "read_methods"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read exact sealed artifact UTF-8 bytes, fenced to the current execution sequence and SHA-256. No caller path is accepted; every read verifies ownership, no-symlink paths, full hash and seal. Offset must be a UTF-8 byte boundary within the artifact. max_bytes defaults to 65536 and accepts 1..131072; the end rounds down to a character boundary, and a budget too small for the next character rejects. EOF returns empty content and complete=true; beyond EOF rejects. Legacy terminal framing is retained so reconstructed bytes match the artifact SHA-256. Changed executions, hash mismatches, unavailable answers and corrupt evidence remain typed errors. Does not change lifecycle or collect providers.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_id": {
+          "description": "Stable agent ID returned by start; remains unchanged across resumes.",
+          "type": "string"
+        },
+        "expected_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "max_bytes": {
+          "default": 65536,
+          "maximum": 131072,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "offset_bytes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sequence": {
+          "maximum": 4294967295,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "agent_id",
+        "sequence",
+        "expected_sha256",
+        "offset_bytes"
+      ],
+      "type": "object"
+    },
+    "name": "answer_chunk",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_id": {
+          "description": "Stable agent ID returned by start; remains unchanged across resumes.",
+          "type": "string"
+        },
+        "complete": {
+          "type": "boolean"
+        },
+        "content": {
+          "type": "string"
+        },
+        "next_offset": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offset_bytes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sequence": {
+          "maximum": 4294967295,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "total_bytes": {
+          "maximum": 16777216,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "agent_id",
+        "sequence",
+        "sha256",
+        "total_bytes",
+        "offset_bytes",
+        "next_offset",
+        "content",
+        "complete"
+      ],
+      "type": "object"
+    }
   }
 ]

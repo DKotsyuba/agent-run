@@ -9,7 +9,9 @@
 
 use super::{peer::peer_identity, socket::bind_private};
 use crate::Result;
-use agent_run_core::writer_server::{PeerIdentity, WriterEndpoint, serve_connection};
+use agent_run_core::writer_server::{
+    PeerIdentity, WriterEndpoint, serve_connection, serve_system_supervisor_connection,
+};
 use std::{future::Future, path::Path, sync::Arc, time::Duration};
 use tokio::{net::UnixListener, task::JoinSet};
 
@@ -46,6 +48,42 @@ pub async fn serve_listener(
     endpoint: WriterEndpoint,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
+    serve_listeners(listener, None, endpoint, shutdown).await
+}
+
+/// Serves one private writer and a separate system-supervisor writer with the
+/// same bounded pools. Filesystem permissions control access to the group socket.
+pub async fn serve_system_listeners(
+    private: UnixListener,
+    system: UnixListener,
+    endpoint: WriterEndpoint,
+    shutdown: impl Future<Output = ()>,
+) -> Result<()> {
+    serve_listeners(private, Some(system), endpoint, shutdown).await
+}
+
+/// Accepts either writer endpoint while retaining their distinct peer policies.
+async fn accept_writer(
+    private: &UnixListener,
+    system: Option<&UnixListener>,
+) -> std::io::Result<(tokio::net::UnixStream, bool)> {
+    if let Some(system) = system {
+        tokio::select! {
+            accepted = private.accept() => accepted.map(|(stream, _)| (stream, false)),
+            accepted = system.accept() => accepted.map(|(stream, _)| (stream, true)),
+        }
+    } else {
+        private.accept().await.map(|(stream, _)| (stream, false))
+    }
+}
+
+/// Runs the shared writer lifecycle and authorizes each endpoint separately.
+async fn serve_listeners(
+    listener: UnixListener,
+    system: Option<UnixListener>,
+    endpoint: WriterEndpoint,
+    shutdown: impl Future<Output = ()>,
+) -> Result<()> {
     // Test candidates may raise the soft limit (common R9 section 9); production
     // never changes a host limit and instead refuses to serve when the limit
     // cannot hold the configured connection pools.
@@ -68,8 +106,8 @@ pub async fn serve_listener(
     loop {
         tokio::select! {
             () = &mut shutdown => break,
-            accepted = listener.accept() => {
-                let (stream, _) = match accepted {
+            accepted = accept_writer(&listener, system.as_ref()) => {
+                let (stream, system_peer) = match accepted {
                     Ok(accepted) => accepted,
                     // Descriptor or memory exhaustion and aborted handshakes are
                     // transient: back off and keep serving. Anything else ends
@@ -85,20 +123,23 @@ pub async fn serve_listener(
                     continue;
                 };
                 // The kernel, not the peer, names the connecting process.
-                let Ok(super::peer::PeerIdentity { uid, process }) = peer_identity(&stream) else {
+                let peer = if system_peer {
+                    super::peer::system_supervisor_peer_identity(&stream)
+                } else {
+                    peer_identity(&stream)
+                };
+                let Ok(super::peer::PeerIdentity { uid, process }) = peer else {
                     continue;
                 };
                 let endpoint = endpoint.clone();
                 let slots = slots.clone();
                 connections.spawn(async move {
-                    let _ = serve_connection(
-                        stream,
-                        PeerIdentity { uid, process },
-                        endpoint,
-                        slots,
-                        permit,
-                    )
-                    .await;
+                    let peer = PeerIdentity { uid, process };
+                    if system_peer {
+                        let _ = serve_system_supervisor_connection(stream, peer, endpoint, slots, permit).await;
+                    } else {
+                        let _ = serve_connection(stream, peer, endpoint, slots, permit).await;
+                    }
                 });
             }
             Some(_) = connections.join_next(), if !connections.is_empty() => {}

@@ -567,6 +567,7 @@ fn python_socket_surface_is_shared_tools_plus_controls() {
         .collect::<std::collections::BTreeSet<_>>();
     assert!(names.contains("start") && names.contains("list_agents"));
     assert!(names.contains("delegation_guide"));
+    assert!(names.contains("capabilities") && names.contains("answer_chunk"));
     for pool in [
         "start_pool",
         "pool_post",
@@ -582,7 +583,7 @@ fn python_socket_surface_is_shared_tools_plus_controls() {
         .map(|tool| tool.name.clone())
         .collect();
     assert_eq!(names, registry, "the socket surface is the shared table");
-    assert_eq!(names.len(), 16);
+    assert_eq!(names.len(), 18);
     assert!(!names.contains("models"));
     assert!(!names.contains("capacity_order"));
 }

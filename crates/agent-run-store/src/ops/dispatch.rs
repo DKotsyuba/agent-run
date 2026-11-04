@@ -469,7 +469,13 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
         L::RecordSupervisorLaunch(op) => {
             out(store.record_supervisor_launch(&op.execution, &op.capability_sha256)?)
         }
-        L::RecordStartupOwner(op) => out(store.record_startup_owner(&op.execution, &op.identity)?),
+        L::RecordStartupOwner(op) => {
+            if let Some(fence) = &op.system_fence {
+                out(store.record_system_startup_owner(&op.execution, &op.identity, fence)?)
+            } else {
+                out(store.record_startup_owner(&op.execution, &op.identity)?)
+            }
+        }
         L::BeginSupervisorHandoff(op) => out(store.begin_supervisor_handoff_with(&op)?),
         L::SetOwner(op) => out(store.set_owner(&op.execution, op.pid, &op.identity, op.birth)?),
         L::RegisterWorkerCatalog(op) => out(store.register_worker_catalog(&op.proof, op.at)?),

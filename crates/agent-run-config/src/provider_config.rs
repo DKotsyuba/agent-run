@@ -79,6 +79,9 @@ pub struct ProviderSettings {
     pub models: Vec<ProviderModel>,
     /// Provider-local labels referring to global account identities.
     pub bindings: Vec<ProviderBinding>,
+    /// Select eligible account bindings in descending configured weight order.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ordered_accounts: bool,
     /// Plain-text provider advice, never a model classification.
     #[serde(default)]
     pub recommendations: Vec<String>,
@@ -446,6 +449,7 @@ impl ProviderConfig {
             collector: provider.collector.clone(),
             models: provider.models.clone(),
             bindings: provider.bindings.clone(),
+            ordered_accounts: provider.ordered_accounts,
         }
     }
 }

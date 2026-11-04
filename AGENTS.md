@@ -16,9 +16,9 @@ evidence, process ownership, and secret safety are product requirements.
   Configured quota commands use the bounded external collector runner; shipped
   collectors query metadata without starting model turns.
 - Preserve unrelated work and never weaken lifecycle assertions to hide flakes.
-- Release workflows publish only the qualified macOS Apple-silicon artifact.
-  Linux x86-64 remains visible as non-blocking validation; its release and
-  qualification are deferred.
+- Release workflows build macOS Apple-silicon and Linux x86-64 artifacts on
+  their native runners. Both platform checks gate publication; do not claim
+  qualification or publication without the corresponding observed evidence.
 
 ## Invariants
 

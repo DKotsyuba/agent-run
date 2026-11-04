@@ -205,8 +205,8 @@ pub fn profile(role: &ResolvedRolePlan) -> Profile {
     profile
 }
 
-/// Validates an enabled model-bound account's reference against the actual
-/// native/custom launch contract without opening credentials or spawning.
+/// Validates an enabled model-bound account's reference against its selected
+/// native/custom connection without opening credentials or spawning.
 /// Returns its parsed nonsecret reference; rejects mismatched harnesses,
 /// connection types and unsupported Codex authorization headers. Admission,
 /// materialization and execution call this same check; live auth is read later.
@@ -246,7 +246,10 @@ pub fn credential_reference(
             ));
         }
     }
-    match (&definition.connection, &reference) {
+    let connection = definition
+        .connection_for(account, model)
+        .ok_or_else(|| invalid("account is not bound to the provider model"))?;
+    match (connection, &reference) {
         (
             ProviderConnection::Native,
             CredentialRef::Environment(_) | CredentialRef::File(_) | CredentialRef::Keychain { .. },
@@ -304,7 +307,10 @@ pub fn materialize_selected(
         .find(|offering| offering.id == model)
         .ok_or_else(|| invalid("provider model is unavailable"))?;
     let reference = credential_reference(catalog, provider, model, account)?;
-    let native = matches!(definition.connection, ProviderConnection::Native);
+    let native = matches!(
+        definition.connection_for(account, model),
+        Some(ProviderConnection::Native)
+    );
     let role = ResolvedRolePlan::from_payload(&role.to_payload())?;
     if !offering
         .restrictions
@@ -511,6 +517,8 @@ pub fn plan_selected(
 /// model, grants, connection, binary, or assets. `reader` resolves custom
 /// credentials only into the child environment. Custom Claude bearer launches
 /// explicitly blank the API-key variable to prevent native credential fallback.
+/// An ordered native Claude binding refuses MCP environment grants that would
+/// redirect its authentication, rather than silently changing those grants.
 /// `shared` names the
 /// committed shared-store placement of the home's managed trees, when the
 /// registry recorded one; without it the sealed home verifies strictly as a
@@ -550,6 +558,9 @@ pub fn plan_selected_with(
     if definition.harness != authority.harness || definition.connection != authority.connection {
         return Err(invalid("provider connection changed since admission"));
     }
+    let connection = definition
+        .connection_for(account, &authority.model)
+        .ok_or_else(|| invalid("account is not bound to the provider model"))?;
     let reference = credential_reference(catalog, &authority.provider, &authority.model, account)?;
     if !sealed
         .restrictions
@@ -591,6 +602,36 @@ pub fn plan_selected_with(
     ]) {
         environment.remove(name);
     }
+    if definition.ordered_accounts
+        && sealed.harness == HarnessId::ClaudeCode
+        && matches!(connection, ProviderConnection::Native)
+    {
+        let provider_environment = [
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+        ];
+        if environment_profile.mcp.iter().any(|server| {
+            config.mcp.get(server).is_some_and(|mcp| {
+                mcp.env_from
+                    .iter()
+                    .any(|name| provider_environment.contains(&name.as_str()))
+            })
+        }) {
+            return Err(invalid(
+                "native Claude authentication conflicts with selected MCP environment",
+            ));
+        }
+        for name in provider_environment {
+            environment.remove(name);
+        }
+    }
     let host_home = host
         .get("HOME")
         .cloned()
@@ -604,7 +645,7 @@ pub fn plan_selected_with(
             home.to_string_lossy().into_owned()
         },
     );
-    match (&sealed.connection, &reference, sealed.harness) {
+    match (connection, &reference, sealed.harness) {
         (
             ProviderConnection::Native,
             CredentialRef::Environment(_) | CredentialRef::File(_) | CredentialRef::Keychain { .. },
@@ -661,7 +702,7 @@ pub fn plan_selected_with(
         }
     }
     if sealed.harness == HarnessId::Codex {
-        if matches!(sealed.connection, ProviderConnection::Native) {
+        if matches!(connection, ProviderConnection::Native) {
             bind_native_codex(&reference, home, app_home, host)?;
         }
         environment.insert("CODEX_HOME".into(), home.to_string_lossy().into_owned());

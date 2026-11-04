@@ -208,6 +208,7 @@ pub fn plan_v1(
             label: "global".parse()?,
             account: mapped.global_account.clone(),
             models: None,
+            connection: None,
             multiplier: PositiveFinite::try_from(1.0)?,
         }];
         for (label, account) in &mapped.labelled_accounts {
@@ -220,6 +221,7 @@ pub fn plan_v1(
                 label: label.parse()?,
                 account: account.clone(),
                 models: None,
+                connection: None,
                 multiplier: PositiveFinite::try_from(weight / runtime.priority_multiplier)?,
             });
         }
@@ -249,6 +251,7 @@ pub fn plan_v1(
             auth_family: mapped.auth_family.clone(),
             models,
             bindings,
+            ordered_accounts: false,
             recommendations: mapped.recommendations.clone(),
             priority_multiplier: provider_weight,
             limits_source: mapped.limits_source,

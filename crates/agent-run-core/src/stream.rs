@@ -214,7 +214,8 @@ pub fn plan_with_environment(
     })
 }
 /// Associates native terminal frames with inputs issued during this attempt.
-/// IDs stay in memory; a replay batch can contain several coalesced inputs.
+/// Correlation stays in memory; a supported initial task also has a durable
+/// UUID/hash record. A replay batch can contain several coalesced inputs.
 #[derive(Default)]
 struct ResultInputs {
     /// IDs written by this runner; unknown native correlations fail closed.
@@ -554,6 +555,11 @@ fn result_failure_kind(subtype: &str, text: Option<&str>) -> &'static str {
 /// `record` carries native input metadata; `logical_record` preserves the exact
 /// admitted request for owner authorization. Mixed execution, sequence or frozen
 /// identity is rejected before native input, without normalizing the authority.
+/// A single-text user frame matching this execution's admitted task first commits
+/// its UUID and exact UTF-8 text hash, including the explicit-resume boundary;
+/// this is submission intent, not delivery proof. Cancellation observed after
+/// that commit prevents sending; a failed or partial input write closes stdin and is never
+/// retried. Legacy or unsupported input shapes carry no continuation proof.
 pub async fn run(
     process: &mut Process,
     store: &mut Persist,
@@ -574,7 +580,42 @@ pub async fn run(
         {
             let id = uuid::Uuid::new_v4().to_string();
             frame["uuid"] = json!(id);
-            process.text(&format!("{frame}\n")).await?;
+            if let Some(digest) = initial_text_sha256(&frame, record, logical_record)
+                && first_task_attempt(store, logical_record)?
+            {
+                process
+                    .observing(store.event_durable(
+                        &record.id,
+                        "native_turn_started",
+                        &json!({"turn":id,"input_sha256":digest}),
+                    ))
+                    .await?;
+            }
+            // Observation during the journal wait may have retained an ownership
+            // failure; do not send native input until that fence is confirmed.
+            process
+                .checkpoint_ownership_ready(agent_run_domain::OwnershipStage::Streaming)
+                .await?;
+            if store.cancel_pending(&record.id)? {
+                process.input.take();
+                return Ok(EngineResult {
+                    native_failure: None,
+                    outcome: Outcome {
+                        status: Status::Cancelled,
+                        exit_code: None,
+                        failure_kind: None,
+                        failure_text: None,
+                        runtime_session_id: None,
+                    },
+                    answer: None,
+                    usage: None,
+                });
+            }
+            if let Err(error) = process.text(&format!("{frame}\n")).await {
+                // The frame may be partially written; its UUID must not be retried.
+                process.input.take();
+                return Err(error);
+            }
             inputs.sent(id, true);
         } else {
             // Historical text fixtures remain one-shot; they provide no correlation.
@@ -1426,6 +1467,54 @@ pub async fn run(
             }
             _ => {}
         }
+    }
+}
+
+/// Hashes a single text block only when it matches the admitted task and native
+/// input metadata. The supervisor's exact explicit-resume prefix is permitted;
+/// other task substitutions remain sendable for compatibility but prove nothing.
+fn initial_text_sha256(frame: &Value, record: &Record, logical: &Record) -> Option<String> {
+    if frame["type"] != "user" || frame["message"]["role"] != "user" {
+        return None;
+    }
+    let [block] = frame["message"]["content"].as_array()?.as_slice() else {
+        return None;
+    };
+    if block["type"] != "text" {
+        return None;
+    }
+    let text = block["text"].as_str()?;
+    if text != record.request.task
+        || record.resume_of_runtime_session_id != logical.resume_of_runtime_session_id
+    {
+        return None;
+    }
+    let admitted = &logical.request.task;
+    let explicit_resume = logical.request.explicit_finish
+        && logical.parent_agent_id.is_some()
+        && logical.resume_of_runtime_session_id.is_some()
+        && text
+            .strip_prefix(agent_run_domain::worker::EXPLICIT_RESUME_BOUNDARY)
+            .and_then(|suffix| suffix.strip_prefix("\n\n"))
+            == Some(admitted.as_str());
+    (text == admitted || explicit_resume).then(|| crate::fs::sha256(text.as_bytes()))
+}
+
+/// Only an execution's first attempt may originate its admitted-task proof.
+/// Later automatic attempts carry the previous proof, even if their control text
+/// happens to equal the admitted task. Unbound legacy streams remain compatible;
+/// a provider stream without an attempt cannot originate an attributable proof.
+fn first_task_attempt(store: &Persist, logical: &Record) -> Result<bool> {
+    match store.bound_attempt() {
+        Some(attempt) => Ok(store.conn.query_row(
+            "SELECT number=1 FROM attempts WHERE id=? AND agent_id=?",
+            rusqlite::params![attempt, logical.id.as_str()],
+            |row| row.get(0),
+        )?),
+        None => Ok(logical
+            .identity
+            .as_ref()
+            .is_none_or(|identity| identity["provider_identity_version"] != 2)),
     }
 }
 

@@ -93,10 +93,7 @@ pub(crate) fn client_with_token(
         let parent = token_file
             .parent()
             .ok_or_else(|| invalid("Bridge credential parent missing"))?;
-        let relative = parent
-            .strip_prefix("/")
-            .map_err(|_| invalid("Bridge credential path must be absolute"))?;
-        let directory = Dir::open(Path::new("/"))?.subdir(relative)?;
+        let directory = Dir::open_searchable(parent)?;
         let entry = directory.entry(None)?;
         let name = token_file
             .file_name()
@@ -443,12 +440,31 @@ mod tests {
             opencode_plugin: None,
         };
         assert!(client(&config).is_ok());
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(client(&config).is_err());
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o644)).unwrap();
         let error = client(&config).unwrap_err();
         assert!(!format!("{error:?}").contains("synthetic-private-producer-credential"));
         std::fs::rename(&token, directory.join("real-token")).unwrap();
         std::os::unix::fs::symlink("real-token", &token).unwrap();
         assert!(client(&config).is_err());
+        std::fs::remove_file(&token).unwrap();
+        std::fs::write(&token, vec![b'x'; 16_385]).unwrap();
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(client(&config).is_err());
+        std::fs::write(&token, "synthetic-private-producer-credential").unwrap();
+        assert!(client(&config).is_ok());
+
+        let link = directory.parent().unwrap().join(format!(
+            "{}-link",
+            directory.file_name().unwrap().to_string_lossy()
+        ));
+        std::os::unix::fs::symlink(&directory, &link).unwrap();
+        let mut linked = config;
+        linked.token_file = link.join("token");
+        assert!(client(&linked).is_err());
+        std::fs::remove_file(link).unwrap();
     }
 
     /// Observer references are explicitly separate and absent from historical

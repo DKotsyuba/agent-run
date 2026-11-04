@@ -223,9 +223,20 @@ fn python_codex_limits_bound_newest_rollout_files() {
     let temporary = root();
     let home = temporary.path();
     let now = 1_780_000_000.0;
-    rollout(home, "old", &rollout_event("2026-06-01T00:00:00Z"));
+    // Filesystems may give multiple rapid writes the same modification time.
+    // Set the age explicitly so the old fixture cannot win the path tie-break.
+    let old = rollout(home, "old", &rollout_event("2026-06-01T00:00:00Z"));
+    let old_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    std::fs::File::open(old)
+        .unwrap()
+        .set_modified(old_time)
+        .unwrap();
     for index in 0..24 {
-        rollout(home, &format!("new-{index}"), "malformed");
+        let newer = rollout(home, &format!("new-{index}"), "malformed");
+        std::fs::File::open(newer)
+            .unwrap()
+            .set_modified(old_time + Duration::from_secs(120))
+            .unwrap();
     }
     assert!(limits::rollout_limits(home, &models(), now).is_empty());
 }

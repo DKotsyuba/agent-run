@@ -194,6 +194,102 @@ fn summary(set: &agent_run_domain::catalog::QuotaCandidateSet) -> Vec<(String, u
         .collect()
 }
 
+/// Ordered bindings outrank quota knowledge, preserve declaration ties, and
+/// still exclude exhausted or disabled accounts and honor a pinned label.
+#[test]
+fn ordered_accounts_use_configured_order_across_quota_states() {
+    let home = home(&[
+        ("acct-a", "FAKE_A"),
+        ("acct-b", "FAKE_B"),
+        ("acct-c", "FAKE_C"),
+    ]);
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
+    let mut provider = catalog(&store)
+        .provider(&"glm-user".parse().unwrap())
+        .unwrap()
+        .clone();
+    provider.ordered_accounts = true;
+    provider.bindings = serde_json::from_value(json!([
+        {"label":"beta", "account":"acct-b", "priority_multiplier":1.0},
+        {"label":"gamma", "account":"acct-c", "priority_multiplier":1.0},
+        {"label":"alpha", "account":"acct-a", "priority_multiplier":3.0}
+    ]))
+    .unwrap();
+    let catalog =
+        ProviderCatalog::new(store.list_accounts().unwrap(), vec![provider.clone()]).unwrap();
+    sample(&store, "acct-b", "fixture", 80.0);
+    assert_eq!(
+        summary(&candidates(&store, &catalog, "fixture")),
+        vec![
+            ("acct-a".into(), 0, 3.0, false),
+            ("acct-b".into(), 1, 1.0, true),
+            ("acct-c".into(), 2, 1.0, false),
+        ]
+    );
+    let pinned = provider_candidates_at(
+        &store,
+        &catalog,
+        &"glm-user".parse().unwrap(),
+        "fixture",
+        Some("beta"),
+        &none_ineligible(),
+        AT,
+    )
+    .unwrap();
+    assert_eq!(
+        pinned.intent,
+        SelectionIntent::Pinned("acct-b".parse().unwrap())
+    );
+    assert_eq!(pinned.candidates.len(), 1);
+    assert_eq!(pinned.candidates[0].account.as_str(), "acct-b");
+
+    // A finite ordering weight is not multiplied into quota score: even a
+    // large weight cannot overflow and wrongly remove a known account.
+    provider.bindings[2].multiplier = f64::MAX.try_into().unwrap();
+    let large_weight =
+        ProviderCatalog::new(store.list_accounts().unwrap(), vec![provider]).unwrap();
+    sample(&store, "acct-a", "fixture", 80.0);
+    assert_eq!(
+        candidates(&store, &large_weight, "fixture").candidates[0]
+            .account
+            .as_str(),
+        "acct-a"
+    );
+
+    latch(&store, "acct-a", "fixture", Some(AT + 100.0));
+    assert_eq!(
+        candidates(&store, &catalog, "fixture")
+            .candidates
+            .iter()
+            .map(|candidate| candidate.account.as_str())
+            .collect::<Vec<_>>(),
+        vec!["acct-b", "acct-c"]
+    );
+    store.disable_account(&"acct-b".parse().unwrap()).unwrap();
+    assert_eq!(
+        candidates(&store, &catalog, "fixture")
+            .candidates
+            .iter()
+            .map(|candidate| candidate.account.as_str())
+            .collect::<Vec<_>>(),
+        vec!["acct-c"]
+    );
+    let error = provider_candidates_at(
+        &store,
+        &catalog,
+        &"glm-user".parse().unwrap(),
+        "fixture",
+        Some("beta"),
+        &none_ineligible(),
+        AT,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::QuotaAdmission(QuotaAdmissionError::NoEligibleAccount { .. })
+    ));
+}
+
 /// Governing-window scores multiply by binding weights, the provider
 /// multiplier scales the order view, and unknown capacity never outranks
 /// known capacity regardless of weight.

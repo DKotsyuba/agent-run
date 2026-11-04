@@ -97,3 +97,60 @@ fn an_exited_child_is_dead_before_and_after_reaping() {
     child.wait().unwrap();
     assert_eq!(observe(), ProcessState::Dead);
 }
+
+/// A missing old leader cannot grant ownership of a later group's live member.
+#[cfg(target_os = "linux")]
+#[test]
+fn missing_old_leader_does_not_adopt_unverified_group_member() {
+    use std::os::unix::process::CommandExt;
+
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let mut leader = OwnedChild(
+        Command::new("/bin/sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    let leader_pid = leader.0.id() as i32;
+    let helper = OwnedChild(
+        Command::new("/bin/sleep")
+            .arg("60")
+            .process_group(leader_pid)
+            .spawn()
+            .unwrap(),
+    );
+    let helper_pid = helper.0.id() as i32;
+    assert_eq!(process::inspect(helper_pid).unwrap().group, leader_pid);
+
+    let mut old_identity = process::inspect(leader_pid).unwrap();
+    old_identity.token = "linux:00000000-0000-0000-0000-000000000000:1".into();
+    leader.0.kill().unwrap();
+    leader.0.wait().unwrap();
+
+    let mut owner = process::OwnedProcess::adopt(old_identity);
+    owner.refresh();
+    let captured = owner
+        .snapshot()
+        .unwrap()
+        .members
+        .iter()
+        .any(|member| member.pid == helper_pid);
+    let signal_permitted = owner.signal_descendants(0);
+    assert!(!owner.gone(), "a live group cannot be confirmed gone");
+    assert!(
+        !captured,
+        "a group member with unverified ownership was captured"
+    );
+    assert!(
+        !signal_permitted,
+        "a signal was allowed to an unverified member"
+    );
+}

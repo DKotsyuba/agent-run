@@ -244,7 +244,17 @@ fn python_written_artifacts_verify_for_both_formats() {
             .unwrap_or_else(|e| panic!("case {name} should verify: {e}"));
         assert_eq!(got_version, version, "case {name}");
         let content = content.expect("small fixture reads back inline");
+        let (raw_version, raw) = verify::read_payload(&root, &proof).unwrap();
+        assert_eq!(raw_version, version);
+        assert_eq!(raw.len() as u64, proof.bytes);
+        assert_eq!(agent_run_platform::fs::sha256(raw.as_bytes()), proof.sha256);
         if frame_stripped {
+            assert!(raw.as_bytes().ends_with(verify::LEGACY_FRAME));
+            assert_eq!(
+                raw.strip_suffix(std::str::from_utf8(verify::LEGACY_FRAME).unwrap())
+                    .unwrap(),
+                content
+            );
             assert!(
                 !content.contains("<<<agent-run:complete>>>"),
                 "case {name}: legacy frame should be stripped"

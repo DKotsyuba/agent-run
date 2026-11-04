@@ -144,14 +144,15 @@ fn existing_seal_checks_still_hold() {
 }
 
 /// Child-process entry for the bounded FIFO checks: when the parent sets
-/// `AGENT_RUN_FIFO_RELEASE` it verifies that release and prints the outcome;
+/// `AGENT_RUN_FIFO_RELEASE` it verifies that release and prints the outcome on
+/// its own line even when serial libtest first prints the test-name prefix;
 /// otherwise this is a no-op, so a normal run does nothing here.
 #[test]
 fn fifo_child_entry() {
     let Some(release) = std::env::var_os("AGENT_RUN_FIFO_RELEASE") else {
         return;
     };
-    println!("OUTCOME:{:?}", verify(Path::new(&release)));
+    println!("\nOUTCOME:{:?}", verify(Path::new(&release)));
 }
 
 /// Verifies `release` in a child copy of this test executable and returns its

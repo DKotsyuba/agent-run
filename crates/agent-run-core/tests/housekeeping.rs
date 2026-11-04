@@ -17,6 +17,52 @@ fn run_tree(home: &common::Home, id: &str) {
     std::fs::write(dir.join("answer.md"), "fixture").unwrap();
 }
 
+/// Per-account runtime cleanup needs both durable and current-config proof.
+#[test]
+fn account_runtime_retains_live_and_configured_runs() {
+    let home = common::Home::new();
+    let base = home.path.join("private-runtime");
+    let orphan = "ag-20260101-000000-0000000011";
+    let live = "ag-20260101-000000-0000000012";
+    let configured = "ag-20260101-000000-0000000013";
+    let recent = "ag-20350101-000000-0000000014";
+    for id in [orphan, live, configured, recent] {
+        let run = base.join("runs").join(id);
+        fs::private_dir(&run).unwrap();
+        std::fs::write(run.join("data"), "fixture").unwrap();
+    }
+    let store = home.store();
+    retained(&store, live, "{}");
+    let alias = home.path.join("configured-alias");
+    std::os::unix::fs::symlink(base.join("runs").join(configured), &alias).unwrap();
+    let protected = [alias.join("not-yet-created")];
+    for _ in 0..4 {
+        agent_run_core::housekeeping::sweep_account_runtime(&base, NOW, &store, &protected)
+            .unwrap();
+    }
+    assert!(!base.join("runs").join(orphan).exists());
+    for id in [live, configured, recent] {
+        assert!(base.join("runs").join(id).exists());
+    }
+
+    let uncertain = home.path.join("uncertain-runtime");
+    let run = uncertain.join("runs").join(orphan);
+    fs::private_dir(&run).unwrap();
+    assert!(
+        agent_run_core::housekeeping::sweep_account_runtime(
+            &uncertain,
+            NOW,
+            &store,
+            &["relative-and-untrusted".into()]
+        )
+        .is_err()
+    );
+    assert!(
+        run.exists(),
+        "invalid configuration evidence retains the run"
+    );
+}
+
 /// Inserts a retained row whose structured identity may reference another run path.
 fn retained(store: &agent_run_store::Store, id: &str, identity: &str) {
     store
@@ -548,10 +594,16 @@ fn collection_follows_database_convergence_to_the_cap() {
         })
         .unwrap();
     assert_eq!(gone, 0, "the count-expired session's row is gone");
-    // Filesystem collection follows at exactly the cap, not only above it.
-    for _ in 0..4 {
-        sweep(&home.path, NOW, &mut store).unwrap();
+    // A pass scans only a bounded batch, in filesystem-dependent order.
+    // Allow a complete round and require the collector to become idle.
+    let mut idle = false;
+    for _ in 0..16 {
+        if sweep(&home.path, NOW, &mut store).unwrap() == 0 {
+            idle = true;
+            break;
+        }
     }
+    assert!(idle, "filesystem collection must finish its scan");
     assert!(
         !home.path.join("agents").join(&oldest).exists(),
         "the pruned session's tree reclaims at the cap"

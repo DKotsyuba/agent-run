@@ -61,7 +61,8 @@ fn reply_reader(stdout: std::process::ChildStdout) -> std::sync::mpsc::Receiver<
 
 /// Spawns the real `agent-run api serve` broker and one real `_worker-mcp`
 /// child wired to it through the inherited environment, then returns the
-/// child's stdin/stdout pair.
+/// child's stdin/stdout pair. Removes ambient completion/research selectors so
+/// this legacy fixture always uses its asserted fixed pool catalog.
 fn spawn_worker() -> (
     BrokerGuard,
     Worker,
@@ -183,6 +184,8 @@ fn spawn_worker() -> (
         .env("AGENT_RUN_WORKER_RUN_ID", run.as_str())
         .env("AGENT_RUN_WORKER_ATTEMPT_ID", &attempt)
         .env("AGENT_RUN_WORKER_TOKEN", &token)
+        .env_remove(agent_run_domain::worker::FINISH_ENV)
+        .env_remove(agent_run_domain::worker::RESEARCH_ENV)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

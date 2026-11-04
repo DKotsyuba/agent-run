@@ -13,6 +13,56 @@ fn argument(args: &[String], name: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1))
         .cloned()
 }
+
+/// Completes a synthetic attempt through the real worker MCP and emits the
+/// matching native tool-use and receipt frames for supervisor observation.
+fn worker_finish(args: &[String], session: &str) {
+    let config: Value = serde_json::from_slice(
+        &std::fs::read(argument(args, "--mcp-config").expect("worker config path")).unwrap(),
+    )
+    .unwrap();
+    let server = &config["mcpServers"]["agent_run_worker"];
+    emit(
+        json!({"type":"assistant","session_id":session,"message":{"role":"assistant","content":[
+            {"type":"tool_use","id":"fixture-finish","name":"mcp__agent_run_worker__finish",
+             "input":{"summary":"fixture callback answer"}}
+        ]}}),
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let receipt = runtime.block_on(async {
+        use agent_run::transport::{frame, socket};
+        use tokio::io::BufReader;
+        use std::process::Stdio;
+        let mut child = tokio::process::Command::new(server["command"].as_str().unwrap())
+            .args(server["args"].as_array().unwrap().iter().map(|arg| arg.as_str().unwrap()))
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+            .kill_on_drop(true).spawn().unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let text = tokio::time::timeout(Duration::from_secs(10), async {
+            frame::write(&mut input, &json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+                "params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"finish-fixture","version":"1"}}}), socket::MAX_FRAME).await.unwrap();
+            frame::read(&mut output, socket::MAX_FRAME).await.unwrap().unwrap();
+            frame::write(&mut input, &json!({"jsonrpc":"2.0","method":"notifications/initialized"}), socket::MAX_FRAME).await.unwrap();
+            frame::write(&mut input, &json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{"name":"finish","arguments":{"summary":"fixture callback answer","status":"done"}}}), socket::MAX_FRAME).await.unwrap();
+            let reply: Value = serde_json::from_slice(&frame::read(&mut output, socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
+            assert_ne!(reply["result"]["isError"], true, "fixture worker refused finish");
+            reply["result"]["content"][0]["text"].as_str().expect("finish receipt").to_owned()
+        }).await.expect("bounded finish callback");
+        drop(input);
+        assert!(tokio::time::timeout(Duration::from_secs(5), child.wait()).await.unwrap().unwrap().success());
+        text
+    });
+    emit(
+        json!({"type":"user","session_id":session,"message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"fixture-finish","content":receipt}
+        ]}}),
+    );
+}
 /// Exercise the sealed worker MCP using only inherited capability names. The
 /// child has a six-second deadline and kill-on-drop; no provider or Desktop
 /// is contacted. Persist only the nonsecret tool response for the owning test.
@@ -276,7 +326,18 @@ fn main() {
         std::thread::sleep(Duration::from_millis(600));
         return;
     }
-    let session = argument(&args, "--resume")
+    let resume = argument(&args, "--resume");
+    let resume_path = resume.as_deref().and_then(|value| {
+        let path = std::path::Path::new(value);
+        (path.is_absolute() && path.extension().is_some_and(|ext| ext == "jsonl"))
+            .then(|| path.to_path_buf())
+    });
+    let session = resume_path
+        .as_deref()
+        .and_then(|path| path.file_stem())
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .or(resume)
         .or_else(|| argument(&args, "--session-id"))
         .unwrap_or_else(|| "fixture-session".into());
     let (task, input) = if let Some(task) = argument(&args, "-p") {
@@ -308,6 +369,7 @@ fn main() {
         .and_then(|input| input.get("uuid"))
         .cloned()
         .unwrap_or(Value::Null);
+    let initial_input_id = result_input.clone();
     // Pool fixtures record the exact first-turn text this child received, as
     // proof that every peer identity was already committed when it started.
     if task.contains("fixture:pool-observe") {
@@ -527,6 +589,12 @@ fn main() {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+    if task == "fixture:worker-finish"
+        || (resume_path.is_some()
+            && std::env::var(agent_run_domain::worker::FINISH_ENV).as_deref() == Ok("1"))
+    {
+        worker_finish(&args, &session);
+    }
     if task == "fixture:follow-tools" {
         // Phase one waits for the driver's marker, then one native tool
         // invocation is streamed so a follow viewer observes a tool-count
@@ -544,12 +612,34 @@ fn main() {
         );
         wait_marker("follow-release");
     }
-    native_history(&session, &task);
+    native_history(&session, &task, &initial_input_id, resume_path.as_deref());
     // A Claude Code 2.1.280 protocol frame rejecting a usage window, and the
     // same JSON merely quoted in assistant text (which must not count).
     let quota_frame = json!({"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":agent_run::domain::now() + 3600.0},"uuid":"fixture-uuid","session_id":session});
     if task == "fixture:quota" || task.starts_with("fixture:quota-then-") {
         emit(quota_frame.clone());
+    }
+    if task.starts_with("fixture:billing") {
+        emit(
+            json!({"type":"assistant","session_id":session,"parent_tool_use_id":null,
+            "error":"billing_error","message":{"content":[]}}),
+        );
+    }
+    match task.as_str() {
+        "fixture:auth-failure" | "fixture:temporary-limit" => {
+            let error = if task == "fixture:auth-failure" {
+                "authentication_failed"
+            } else {
+                "rate_limit"
+            };
+            emit(
+                json!({"type":"assistant","session_id":session,"parent_tool_use_id":null,
+                "error":error,"message":{"content":[]}}),
+            );
+        }
+        "fixture:fake-billing-text" => emit(json!({"type":"assistant","session_id":session,
+            "message":{"content":[{"type":"text","text":"billing_error"}]}})),
+        _ => {}
     }
     // A model-scoped weekly window (no exact physical pool mapping).
     if task == "fixture:quota-opus" {
@@ -584,6 +674,10 @@ fn main() {
     }
     let failed = task == "fixture:error"
         || task == "fixture:ambiguous-then-error"
+        || task.starts_with("fixture:billing")
+        || task == "fixture:auth-failure"
+        || task == "fixture:temporary-limit"
+        || task == "fixture:fake-billing-text"
         || task == "fixture:quota"
         || task == "fixture:quota-opus"
         || task.starts_with("fixture:quota-then-");
@@ -626,25 +720,53 @@ fn main() {
 
 /// Appends this turn to a Claude-shaped native transcript, as the real
 /// harness does before its result: `$CLAUDE_CONFIG_DIR/projects/
-/// -fixture-workdir/<session>.jsonl` with the user task, one completed tool
-/// call and the assistant text. Nothing is written without a config dir.
-fn native_history(session: &str, task: &str) {
+/// -fixture-workdir/<session>.jsonl` or an explicitly resumed fixture path.
+/// Records the input UUID and task, and can model an unrecorded input or an
+/// unfinished tool. Nothing is written without a config dir.
+fn native_history(
+    session: &str,
+    task: &str,
+    input_id: &Value,
+    resume_path: Option<&std::path::Path>,
+) {
     let Some(root) = std::env::var_os("CLAUDE_CONFIG_DIR") else {
         return;
     };
-    let dir = std::path::Path::new(&root).join("projects/-fixture-workdir");
-    std::fs::create_dir_all(&dir).expect("fixture history dir");
-    let path = dir.join(format!("{session}.jsonl"));
+    let path = if let Some(path) = resume_path {
+        let workdir = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let resolved = path.canonicalize().expect("fixture resume transcript");
+        assert!(
+            resolved.starts_with(workdir),
+            "fixture resume must stay inside its workdir"
+        );
+        if std::path::Path::new(&root)
+            .to_string_lossy()
+            .contains("/accounts/claude/")
+        {
+            assert!(
+                std::env::var_os("ANTHROPIC_BASE_URL").is_none(),
+                "native fallback must not inherit the API endpoint"
+            );
+        }
+        resolved
+    } else {
+        let dir = std::path::Path::new(&root).join("projects/-fixture-workdir");
+        std::fs::create_dir_all(&dir).expect("fixture history dir");
+        dir.join(format!("{session}.jsonl"))
+    };
     let turn = std::fs::read_to_string(&path)
         .map(|text| text.lines().count())
         .unwrap_or(0);
     let tool = format!("toolu-fixture-{turn}");
-    let lines = [
-        json!({"sessionId":session,"type":"user","message":{"role":"user","content":[{"type":"text","text":task}]}}),
-        json!({"sessionId":session,"type":"assistant","message":{"content":[{"type":"tool_use","id":tool}]}}),
-        json!({"sessionId":session,"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":tool}]}}),
-        json!({"sessionId":session,"type":"assistant","message":{"content":[{"type":"text","text":"fixture final answer"}]}}),
-    ];
+    let mut lines = Vec::new();
+    if task != "fixture:billing-no-input" {
+        lines.push(json!({"sessionId":session,"type":"user","uuid":input_id,"message":{"role":"user","content":[{"type":"text","text":task}]}}));
+        lines.push(json!({"sessionId":session,"type":"assistant","message":{"content":[{"type":"tool_use","id":tool}]}}));
+        if task != "fixture:billing-pending" {
+            lines.push(json!({"sessionId":session,"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":tool}]}}));
+        }
+    }
+    lines.push(json!({"sessionId":session,"type":"assistant","message":{"content":[{"type":"text","text":"fixture final answer"}]}}));
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

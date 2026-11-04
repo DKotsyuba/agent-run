@@ -524,12 +524,11 @@ pub fn provider_candidates(
 ///
 /// Reads only the store (registry status, account-bound sample history,
 /// durable latches, capacity revision) inside one deferred transaction and
-/// writes nothing. Known usable candidates precede unknown fallbacks
-/// regardless of weights; exhausted, disabled, and hard-ineligible accounts
-/// are never revived by any multiplier. Rank groups follow the shared
-/// ranker's priority order with only exactly equal priorities sharing a
-/// rank; ties inside a group are left to admission's active-count/id
-/// tie-break. The returned set carries the same committed
+/// writes nothing. Normally known usable candidates precede unknown fallbacks;
+/// ordered providers instead use binding weight and declaration order for all
+/// usable accounts. Exhausted, disabled, and hard-ineligible accounts are never
+/// revived. Normal rank ties use admission's active-count/id tie-break. The
+/// returned set carries the same committed
 /// `capacity_revision` the scores were computed against.
 ///
 /// Errors distinguish invalid input (unknown provider, unoffered model,
@@ -603,7 +602,24 @@ pub fn provider_candidates_at(
         }
         None => (SelectionIntent::Auto, usable),
     };
-    let ordering = score_lane(&snapshot.facts, &accounts, &lane, at)?;
+    // Ordered weights express sequence, not quota-score multipliers. Use
+    // neutral weights to classify capacity without overflowing a score and
+    // exclude only the same exhausted/unavailable evidence as usual.
+    let neutral: BTreeMap<_, _> = if definition.ordered_accounts {
+        accounts
+            .keys()
+            .cloned()
+            .map(|account| (account, 1.0))
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+    let scoring = if definition.ordered_accounts {
+        &neutral
+    } else {
+        &accounts
+    };
+    let ordering = score_lane(&snapshot.facts, scoring, &lane, at)?;
     let mut candidates: Vec<QuotaCandidate> = Vec::new();
     let mut rank: u32 = 0;
     let mut previous_priority: Option<f64> = None;
@@ -668,6 +684,27 @@ pub fn provider_candidates_at(
             model: model.to_owned(),
         }
         .into());
+    }
+    if definition.ordered_accounts {
+        let order: BTreeMap<_, _> = definition
+            .ordered_bindings(model)
+            .iter()
+            .enumerate()
+            .map(|(index, binding)| (binding.account.clone(), index))
+            .collect();
+        if candidates
+            .iter()
+            .any(|candidate| !order.contains_key(&candidate.account))
+        {
+            return Err(invalid(
+                "ordered account is outside the provider model scope",
+            ));
+        }
+        candidates.sort_by_key(|candidate| order[&candidate.account]);
+        for (index, candidate) in candidates.iter_mut().enumerate() {
+            candidate.rank =
+                u32::try_from(index).map_err(|_| invalid("too many ordered provider accounts"))?;
+        }
     }
     let set = QuotaCandidateSet {
         provider: provider.clone(),

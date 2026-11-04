@@ -467,6 +467,227 @@ fn run_fake(plan: &agent_run_adapters::LaunchPlan) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+/// An ordered Claude provider keeps API and named-login credentials bound to
+/// their own connection while retaining one sealed role and runtime home.
+#[test]
+fn ordered_claude_bindings_keep_connections_and_credentials_separate() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let binary = fake_engine(&root);
+    let config = ProviderConfig::parse(
+        &format!(
+            r#"
+schema_version = 2
+[harnesses.codex]
+binary = "{binary}"
+home = "{root}/codex"
+[harnesses.claude-code]
+binary = "{binary}"
+home = "{root}/claude"
+[providers.claude-queue]
+harness = "claude-code"
+connection = {{ kind = "custom", endpoint = "https://gateway.example/api", protocol = "messages" }}
+auth_family = "anthropic"
+limits_source = "none"
+ordered_accounts = true
+[[providers.claude-queue.models]]
+id = "sonnet"
+[[providers.claude-queue.bindings]]
+label = "api"
+account = "acct-api"
+priority_multiplier = 2.0
+[[providers.claude-queue.bindings]]
+label = "subscription"
+account = "acct-sub"
+connection = {{ kind = "native" }}
+"#,
+            root = root.display()
+        ),
+        &root,
+    )
+    .unwrap();
+    let accounts = [
+        ("acct-api", "env:FAKE_TOKEN"),
+        ("acct-sub", "named:claude-code:subscription"),
+    ]
+    .into_iter()
+    .map(|(id, reference)| AccountRecord {
+        account_id: id.parse().unwrap(),
+        auth_family: "anthropic".parse().unwrap(),
+        secret_ref: reference.parse().unwrap(),
+        status: AccountStatus::Enabled,
+    })
+    .collect();
+    let catalog = config.resolve_catalog(accounts).unwrap();
+    let provider: ProviderId = "claude-queue".parse().unwrap();
+    let api = "acct-api".parse().unwrap();
+    let subscription: agent_run_domain::catalog::AccountId = "acct-sub".parse().unwrap();
+    let role = role(&root, false);
+    let home = root.join("run");
+    let (_, digest) = materialize_selected(
+        &config, &catalog, &provider, "sonnet", &api, &role, &root, &home, &root,
+    )
+    .unwrap();
+    let mut authority = make_authority(
+        &catalog, &provider, "sonnet", &role, &root, digest, "acct-api",
+    );
+    authority.eligible_accounts.push(subscription.clone());
+    let host = BTreeMap::from([
+        ("HOME".into(), root.display().to_string()),
+        ("ANTHROPIC_BASE_URL".into(), "https://stale.example".into()),
+        ("ANTHROPIC_MODEL".into(), "stale-model".into()),
+        ("ANTHROPIC_API_KEY".into(), "stale-api-key".into()),
+        ("ANTHROPIC_AUTH_TOKEN".into(), "stale-auth-token".into()),
+        ("ANTHROPIC_CUSTOM_HEADERS".into(), "stale-header".into()),
+        ("CLAUDE_CODE_USE_BEDROCK".into(), "1".into()),
+    ]);
+    let plan = |account| {
+        plan_selected(
+            &config,
+            &catalog,
+            &authority,
+            account,
+            &home,
+            &root,
+            &host,
+            &FakeReader,
+            "fixture task",
+            None,
+        )
+        .unwrap()
+    };
+    let api_plan = plan(&api);
+    assert_eq!(
+        api_plan.launch.environment["ANTHROPIC_BASE_URL"],
+        "https://gateway.example/api"
+    );
+    assert_eq!(
+        api_plan.launch.environment["ANTHROPIC_AUTH_TOKEN"],
+        "synthetic-secret"
+    );
+    let native_plan = plan(&subscription);
+    assert_eq!(
+        native_plan.launch.environment["CLAUDE_CONFIG_DIR"],
+        root.join("accounts/claude/subscription/claude-config")
+            .display()
+            .to_string()
+    );
+    for name in [
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_CUSTOM_HEADERS",
+        "CLAUDE_CODE_USE_BEDROCK",
+    ] {
+        assert!(!native_plan.launch.environment.contains_key(name), "{name}");
+    }
+    assert!(
+        agent_run_adapters::authorized_request::AuthorizedRequest::new(
+            &catalog,
+            &provider,
+            "sonnet",
+            &subscription
+        )
+        .is_err()
+    );
+    assert!(
+        agent_run_adapters::authorized_request::AuthorizedRequest::new(
+            &catalog, &provider, "sonnet", &api
+        )
+        .is_ok()
+    );
+
+    // A selected MCP that explicitly needs the same API variable cannot be
+    // silently broken or allowed to redirect the subscription's authentication.
+    let mut conflict_config = config.clone();
+    conflict_config.mcp.insert(
+        "needs-api".into(),
+        agent_run_config::config::Mcp {
+            transport: "stdio".into(),
+            command: "/bin/true".into(),
+            args: vec![],
+            env_from: vec!["ANTHROPIC_API_KEY".into()],
+            approval_mode: "auto".into(),
+            global: false,
+            allowed_tools: None,
+        },
+    );
+    let conflict_catalog = conflict_config
+        .resolve_catalog(vec![
+            catalog.account(&api).unwrap().clone(),
+            catalog.account(&subscription).unwrap().clone(),
+        ])
+        .unwrap();
+    let profile = Profile {
+        name: "review".into(),
+        body: "Review safely.".into(),
+        write: false,
+        network: false,
+        revision: "1".into(),
+        canonical: true,
+        allow_external_read_roots: false,
+        read_roots: vec![],
+        skills: vec![],
+        mcp: vec!["needs-api".into()],
+        mcp_tools: Default::default(),
+        required_constraints: BTreeSet::from([Constraint::WebToolsDisabled]),
+    };
+    let conflict_role = resolve_role_plan(
+        &profile,
+        &root,
+        &conflict_config.mcp,
+        "account",
+        Some("api"),
+    )
+    .unwrap();
+    let conflict_home = root.join("conflict-run");
+    let (_, digest) = materialize_selected(
+        &conflict_config,
+        &conflict_catalog,
+        &provider,
+        "sonnet",
+        &api,
+        &conflict_role,
+        &root,
+        &conflict_home,
+        &root,
+    )
+    .unwrap();
+    let mut conflict_authority = make_authority(
+        &conflict_catalog,
+        &provider,
+        "sonnet",
+        &conflict_role,
+        &root,
+        digest,
+        "acct-api",
+    );
+    conflict_authority
+        .eligible_accounts
+        .push(subscription.clone());
+    let error = plan_selected(
+        &conflict_config,
+        &conflict_catalog,
+        &conflict_authority,
+        &subscription,
+        &conflict_home,
+        &root,
+        &host,
+        &FakeReader,
+        "fixture task",
+        None,
+    )
+    .err()
+    .expect("conflicting MCP credentials must refuse");
+    assert!(
+        error
+            .to_string()
+            .contains("conflicts with selected MCP environment"),
+        "{error}"
+    );
+}
+
 /// Named native Codex retains its auth bridge and never selects API-key mode.
 #[test]
 fn native_provider_keeps_login_and_model_alias() {
@@ -1088,12 +1309,16 @@ fn opencode_launch_isolates_ambient_state_and_selected_credentials() {
         if name == "key" {
             let package = root.join("bridge-package");
             fs::create_dir(&package).unwrap();
-            fs::write(package.join("package.json"), r#"{"name":"@agent-bridge/opencode","main":"index.js","type":"module","agentBridge":{"protocol":1,"mode":"lifecycle"}}"#).unwrap();
+            fs::set_permissions(&package, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(package.join("package.json"), r#"{"name":"@agent-bridge/opencode","main":"index.js","type":"module","agentBridge":{"protocol":2,"mode":"native-context"}}"#).unwrap();
             fs::write(
                 package.join("index.js"),
                 "export default {id:'agent-bridge'};\n",
             )
             .unwrap();
+            for name in ["package.json", "index.js"] {
+                fs::set_permissions(package.join(name), fs::Permissions::from_mode(0o600)).unwrap();
+            }
             config.delivery.bridge = Some(serde_json::from_value(serde_json::json!({
                 "registration_socket":root.join("bridge.sock"),"core_socket":root.join("core.sock"),
                 "token_file":root.join("credential"),"host_id":"local","codex_store":"main",
@@ -1187,6 +1412,15 @@ fn opencode_launch_isolates_ambient_state_and_selected_credentials() {
             } else {
                 None
             }
+        );
+        assert!(home.join("opencode-data").is_dir());
+        assert_eq!(
+            fs::metadata(home.join("opencode-data"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
         );
         let native = fs::read_to_string(home.join("opencode.json")).unwrap();
         let rendered: serde_json::Value = serde_json::from_str(&native).unwrap();

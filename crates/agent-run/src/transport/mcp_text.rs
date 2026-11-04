@@ -893,6 +893,14 @@ pub fn success_result_with_request(
     value: &Value,
     request_id: Option<&str>,
 ) -> CallToolResult {
+    if matches!(tool, "capabilities" | "answer_chunk") {
+        return observation_result(tool, value).unwrap_or_else(|_| {
+            error_result(
+                "RuntimeError",
+                "observation response is invalid or exceeds wire budget",
+            )
+        });
+    }
     let receipt = ExecutionReceipt::capture(tool, value, request_id);
     let request_line = receipt
         .request_id
@@ -928,6 +936,50 @@ pub fn success_result_with_request(
         result.structured_content = binding;
     }
     result
+}
+
+/// Preserves the two additive machine-readable reads as structured MCP results
+/// with a fixed text summary. Typed allowlists discard no bytes or proof facts;
+/// the entire encoded result must fit the existing wire reserve before publish.
+/// Existing text-first tool presentation and binding receipts are unchanged.
+fn observation_result(tool: &str, value: &Value) -> Result<CallToolResult> {
+    let content = if tool == "answer_chunk" {
+        let chunk: agent_run_domain::observation::AnswerChunkView =
+            serde_json::from_value(value.clone()).map_err(|_| shape_error())?;
+        if chunk.sequence == 0
+            || chunk
+                .sha256
+                .parse::<agent_run_domain::Sha256Digest>()
+                .is_err()
+            || chunk.content.len() > agent_run_domain::observation::MAX_CHUNK_BYTES
+            || chunk.total_bytes > agent_run_platform::verify::MAX_ANSWER as u64
+            || chunk.offset_bytes > chunk.next_offset
+            || chunk.next_offset > chunk.total_bytes
+            || chunk.next_offset - chunk.offset_bytes != chunk.content.len() as u64
+            || chunk.complete != (chunk.next_offset == chunk.total_bytes)
+            || (chunk.content.is_empty() && !chunk.complete)
+        {
+            return Err(shape_error());
+        }
+        serde_json::to_value(chunk)?
+    } else {
+        let capabilities: agent_run_domain::observation::CapabilitiesView =
+            serde_json::from_value(value.clone()).map_err(|_| shape_error())?;
+        if capabilities.schema_version != 1 || capabilities.product != "agent-run" {
+            return Err(shape_error());
+        }
+        serde_json::to_value(capabilities)?
+    };
+    let mut result = CallToolResult::success(vec![ContentBlock::text(format!(
+        "agent-run {tool}: complete result in structuredContent."
+    ))]);
+    result.structured_content = Some(content);
+    let mut wire = BoundedWriter {
+        bytes: Vec::new(),
+        limit: MAX_RESULT_WIRE_BYTES,
+    };
+    serde_json::to_writer(&mut wire, &result).map_err(|_| shape_error())?;
+    Ok(result)
 }
 
 /// Preserves uncertain writes and expected business failures without deriving
@@ -975,7 +1027,8 @@ pub fn list_pools_text(value: &Value) -> Result<String> {
     render("list_pools", value, budget("list_pools").bytes)
 }
 
-/// Presents one operator result through the correct public template.
+/// Presents one operator result through shared text views or the two additive
+/// typed structured observation views.
 #[must_use]
 pub fn public_success_result(tool: &str, value: &Value) -> CallToolResult {
     public_success_result_with_request(tool, value, None)
@@ -983,6 +1036,7 @@ pub fn public_success_result(tool: &str, value: &Value) -> CallToolResult {
 
 /// Keeps operator pool formatting and retry receipts independent of presentation.
 /// The public pool_post uses its own framing; start_pool retains the binding id.
+/// Observation methods retain their complete typed structured content.
 #[must_use]
 pub fn public_success_result_with_request(
     tool: &str,

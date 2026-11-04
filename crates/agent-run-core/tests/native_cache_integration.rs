@@ -158,6 +158,7 @@ fn fixture(account: &str, payload: &[u8]) -> Fixture {
         provider_config: config,
         provider_config_snapshot: serde_json::json!({}),
         authority,
+        system_route: None,
         runtime_home: Some(home.clone()),
         snapshot_sha256: Some(digest.as_str().into()),
     };

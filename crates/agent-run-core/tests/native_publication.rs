@@ -1,10 +1,10 @@
 //! Shared-store root validation for native cache publication and global
 //! launches.
 //!
-//! Every test drives the real [`supervisor::shared_publication_root`] body: the
-//! canonical store-root validation plus the Codex grant overlap check. No
-//! OS-level write denial exists for the launched harness, so these tests assert
-//! only what agent-run itself enforces.
+//! These tests exercise canonical store-root validation and the Codex grant
+//! overlap check, including one frozen provider launch plan. No OS-level write
+//! denial exists for the launched harness, so they assert only what agent-run
+//! itself enforces.
 #![cfg(feature = "test-fixtures")]
 
 use agent_run_config::{config::Runtime, profiles::Profile};
@@ -195,6 +195,103 @@ fn codex_publication_refuses_overlapping_store_before_publication() {
     );
 }
 
+/// Native cache publication must use the actual frozen provider launch plan,
+/// including its TMPDIR override, before a witness can authorize consolidation.
+#[test]
+fn native_publication_checks_the_frozen_provider_environment() {
+    let target_temp = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .canonicalize()
+        .expect("Cargo target temporary directory must exist");
+    let fixed_temp = stdfs::canonicalize("/tmp").unwrap();
+    let override_temp = stdfs::canonicalize("/usr").unwrap();
+    assert!(
+        !target_temp.starts_with(&fixed_temp) && !target_temp.starts_with(&override_temp),
+        "CARGO_TARGET_TMPDIR must be outside /tmp and the safe /usr override"
+    );
+    for safe in [false, true] {
+        let temporary = tempfile::tempdir_in(&target_temp).unwrap();
+        let app_home = temporary.path().canonicalize().unwrap();
+        let shared = store_root(&app_home);
+        let seed_home = app_home.join("seed-home");
+        stdfs::create_dir_all(&seed_home).unwrap();
+        let mut identity = fixture_identity(&app_home, &seed_home);
+        identity
+            .provider_config
+            .harnesses
+            .get_mut(&HarnessId::Codex)
+            .unwrap()
+            .environment = Some("child-temp".into());
+        let mut environment = agent_run_config::config::Environment::default();
+        environment.variables.insert(
+            "TMPDIR".into(),
+            if safe {
+                "/usr".into()
+            } else {
+                shared.display().to_string()
+            },
+        );
+        identity
+            .provider_config
+            .environments
+            .insert("child-temp".into(), environment);
+
+        let mut store = agent_run_store::fixture::initialize(&app_home).unwrap();
+        let account: agent_run_domain::AccountId = "acct-work".parse().unwrap();
+        store
+            .register_account(&agent_run_domain::catalog::AccountRecord {
+                account_id: account.clone(),
+                auth_family: "openai".parse().unwrap(),
+                secret_ref: "named:codex:work".parse().unwrap(),
+                status: agent_run_domain::catalog::AccountStatus::Enabled,
+            })
+            .unwrap();
+        let auth_home = app_home.join("accounts/codex/work");
+        stdfs::create_dir_all(&auth_home).unwrap();
+        stdfs::write(auth_home.join("auth.json"), "{}\n").unwrap();
+        let catalog = identity
+            .provider_config
+            .resolve_catalog(store.list_accounts().unwrap())
+            .unwrap();
+        let role = agent_run_config::role_plan::ResolvedRolePlan::from_payload(
+            &identity.authority.role_payload,
+        )
+        .unwrap();
+        let runtime_home = app_home.join("planned-home");
+        let (_, digest) = agent_run_adapters::provider::materialize_selected(
+            &identity.provider_config,
+            &catalog,
+            &identity.authority.provider,
+            &identity.authority.model,
+            &account,
+            &role,
+            &app_home,
+            &runtime_home,
+            &app_home,
+        )
+        .unwrap();
+        identity.authority.assets_sha256 = digest.clone();
+        identity.runtime_home = Some(runtime_home.clone());
+        identity.snapshot_sha256 = Some(digest.as_str().to_owned());
+        let result = supervisor::native_publication_root(
+            &store,
+            &app_home,
+            &identity,
+            &account,
+            &runtime_home,
+            &request(&app_home, false),
+        );
+        if safe {
+            assert_eq!(result.expect("safe planned TMPDIR"), shared);
+        } else {
+            assert!(
+                result.unwrap_err().to_string().contains("temporary"),
+                "unsafe planned TMPDIR must prevent publication"
+            );
+        }
+        assert!(stdfs::read_dir(&shared).unwrap().next().is_none());
+    }
+}
+
 /// Publication requires the validated witness root: any other root is
 /// refused without touching the store, so an unvalidated caller cannot
 /// masquerade as a validated one.
@@ -351,6 +448,7 @@ fn fixture_identity(
             assets_sha256: digest.parse().unwrap(),
             eligible_accounts: vec!["acct-work".parse().unwrap()],
         },
+        system_route: None,
         runtime_home: Some(home.to_path_buf()),
         snapshot_sha256: Some(digest.as_str().into()),
     }

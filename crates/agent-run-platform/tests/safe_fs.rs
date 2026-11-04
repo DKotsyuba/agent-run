@@ -11,6 +11,53 @@ fn tempdir() -> tempfile::TempDir {
         .expect("tempdir")
 }
 
+/// Linux credential traversal accepts search-only ancestors but rejects missing
+/// search permission, symlink components and parent traversal.
+#[cfg(target_os = "linux")]
+#[test]
+fn searchable_credential_parent_respects_unix_traversal() {
+    use std::{os::unix::fs::symlink, path::PathBuf};
+    /// Restores the fixture's owner permissions before temporary cleanup.
+    struct Restore(PathBuf);
+    impl Drop for Restore {
+        /// Restores only the fixture directory created by this test.
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let root = tempdir();
+    let gate = root.path().join("search-only");
+    let private = gate.join("private");
+    std::fs::create_dir(&gate).unwrap();
+    std::fs::create_dir(&private).unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(private.join("token"), b"fixture").unwrap();
+    let _restore = Restore(gate.clone());
+    std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o100)).unwrap();
+    let dir = fs::Dir::open_searchable(&private).unwrap();
+    assert_eq!(dir.read(Path::new("token"), 32).unwrap(), b"fixture");
+    dir.write(Path::new("report"), b"fixture report", 0o600)
+        .unwrap();
+    assert_eq!(
+        dir.read(Path::new("report"), 32).unwrap(),
+        b"fixture report"
+    );
+    assert!(
+        fs::Dir::open(Path::new("/"))
+            .unwrap()
+            .subdir(private.strip_prefix("/").unwrap())
+            .is_err()
+    );
+    std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(fs::Dir::open_searchable(&private).is_err());
+    std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o100)).unwrap();
+    symlink(&gate, root.path().join("link")).unwrap();
+    assert!(fs::Dir::open_searchable(&root.path().join("link/private")).is_err());
+    symlink(&private, root.path().join("final-link")).unwrap();
+    assert!(fs::Dir::open_searchable(&root.path().join("final-link")).is_err());
+    assert!(fs::Dir::open_searchable(&root.path().join("search-only/../private")).is_err());
+}
+
 /// Mirrors `tests/test_verify.py`'s no-follow-open cases: a symlink swapped
 /// in for a managed file must never be read through.
 #[test]
@@ -392,6 +439,25 @@ fn replacement_is_published_only_after_its_own_bytes_are_durable() {
 /// Mirrors `tests/test_adapter_home.py::AdapterHomeTests::test_rejected_parent_and_temp_creation_close_every_descriptor`
 #[test]
 fn rejected_parent_and_temp_creation_close_every_descriptor() {
+    // Counts are process-wide, so run this test alone in a child test process.
+    if std::env::var_os("AGENT_RUN_TEST_FD_ISOLATED").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "rejected_parent_and_temp_creation_close_every_descriptor",
+                "--nocapture",
+            ])
+            .env("AGENT_RUN_TEST_FD_ISOLATED", "1")
+            .output()
+            .expect("run isolated descriptor test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("running 1 test"),
+            "isolated descriptor test failed: {stdout} {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let root = tempdir();
     let outside = tempdir();
     let dir = fs::Dir::open(root.path()).unwrap();
@@ -402,17 +468,13 @@ fn rejected_parent_and_temp_creation_close_every_descriptor() {
             .expect("descriptor list")
             .count()
     };
-    // Descriptor counts are process-global and the sibling tests in this binary
-    // open and close files on other threads, so this bounds growth across many
-    // rejections instead of demanding exact equality: one descriptor leaked per
-    // rejection would add 200, which no amount of sibling noise accounts for.
-    let noise = 16;
+    // The child process has no sibling tests opening or closing descriptors.
     let baseline = open_descriptors();
     for _ in 0..200 {
         assert!(dir.write(Path::new("linked/file"), b"no", 0o600).is_err());
     }
     assert!(
-        open_descriptors() <= baseline + noise,
+        open_descriptors() == baseline,
         "a rejected parent must not retain a descriptor"
     );
 
@@ -425,7 +487,7 @@ fn rejected_parent_and_temp_creation_close_every_descriptor() {
         assert!(dir.write(Path::new("locked/file"), b"no", 0o600).is_err());
     }
     assert!(
-        open_descriptors() <= baseline + noise,
+        open_descriptors() == baseline,
         "a failed temporary creation must not retain a descriptor"
     );
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();

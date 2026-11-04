@@ -1,4 +1,5 @@
 //! Run-bound subagent MCP. No operator tools, recipient selection or Desktop relay.
+use crate::cli::CliFuture;
 use crate::{
     Error, Result,
     cli::{CliBroker, SocketBroker},
@@ -17,6 +18,7 @@ use rmcp::{
     service::{RequestContext, RoleServer},
 };
 use serde_json::{Value, json};
+use std::path::Component;
 use std::{
     path::PathBuf,
     sync::{
@@ -402,13 +404,70 @@ fn inherited(name: &str) -> Result<String> {
         .ok_or_else(|| invalid("worker MCP requires supervisor-provided context"))
 }
 
+/// A worker's inherited local endpoint, parsed before any capability is sent.
+#[derive(Debug, PartialEq, Eq)]
+enum WorkerEndpoint {
+    Private(PathBuf),
+    System { socket: PathBuf, broker_uid: u32 },
+}
+
+impl WorkerEndpoint {
+    /// Refuses malformed or nonabsolute endpoints and invalid system UIDs.
+    fn parse(value: &str) -> Result<Self> {
+        if let Some(encoded) = value.strip_prefix("system:") {
+            let (uid, path) = encoded
+                .split_once(':')
+                .ok_or_else(|| invalid("invalid system worker endpoint"))?;
+            let broker_uid = uid
+                .parse::<u32>()
+                .ok()
+                .ok_or_else(|| invalid("invalid system worker broker UID"))?;
+            let socket = PathBuf::from(path);
+            if !socket.is_absolute()
+                || socket
+                    .components()
+                    .any(|part| matches!(part, Component::ParentDir))
+            {
+                return Err(invalid("system worker socket must be absolute"));
+            }
+            return Ok(Self::System { socket, broker_uid });
+        }
+        let home = PathBuf::from(value);
+        if !home.is_absolute() {
+            return Err(invalid("worker MCP home must be absolute"));
+        }
+        Ok(Self::Private(home))
+    }
+}
+
+/// Worker client for the shared endpoint; the kernel peer UID is checked before send.
+struct SystemWorkerBroker {
+    socket: PathBuf,
+    broker_uid: u32,
+}
+
+impl CliBroker for SystemWorkerBroker {
+    /// Sends a worker request only to the expected broker identity.
+    fn call<'a>(&'a self, method: &'a str, params: Value) -> CliFuture<'a> {
+        Box::pin(super::socket::client_at(
+            &self.socket,
+            self.broker_uid,
+            method,
+            params,
+        ))
+    }
+}
+
 /// Serve until stdin EOF using only inherited attempt context and bounded frames.
 /// Never opens SQLite, loads config, starts a broker or invokes the Desktop host.
 pub async fn serve_from_env() -> Result<()> {
-    let home = PathBuf::from(inherited(ENV_NAMES[0])?);
-    if !home.is_absolute() {
-        return Err(invalid("worker MCP home must be absolute"));
-    }
+    let endpoint = WorkerEndpoint::parse(&inherited(ENV_NAMES[0])?)?;
+    let broker: Arc<dyn CliBroker> = match endpoint {
+        WorkerEndpoint::Private(home) => Arc::new(SocketBroker { home }),
+        WorkerEndpoint::System { socket, broker_uid } => {
+            Arc::new(SystemWorkerBroker { socket, broker_uid })
+        }
+    };
     let run_id = inherited(ENV_NAMES[1])?
         .parse()
         .map_err(|_| invalid("invalid worker run identity"))?;
@@ -421,7 +480,7 @@ pub async fn serve_from_env() -> Result<()> {
     super::mcp_text::initialize()?;
     tools().map_err(|_| Error::Runtime("worker registry initialization failed".into()))?;
     let proxy = WorkerProxy {
-        broker: Arc::new(SocketBroker { home }),
+        broker,
         run_id,
         attempt_id,
         token,
@@ -448,6 +507,33 @@ pub async fn serve_from_env() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Private homes keep their existing shape; Linux system endpoints require
+    /// an absolute socket and numeric broker UID before capability transmission.
+    #[test]
+    fn worker_endpoint_rejects_invalid_locations() {
+        assert_eq!(
+            WorkerEndpoint::parse("/home/example").unwrap(),
+            WorkerEndpoint::Private("/home/example".into())
+        );
+        assert!(WorkerEndpoint::parse("relative/home").is_err());
+        {
+            assert_eq!(
+                WorkerEndpoint::parse("system:1000:/run/agent-run/api.sock").unwrap(),
+                WorkerEndpoint::System {
+                    socket: "/run/agent-run/api.sock".into(),
+                    broker_uid: 1000
+                }
+            );
+            for bad in [
+                "system:1000:relative",
+                "system:1000:/run/../api.sock",
+                "system:no:/run/api.sock",
+            ] {
+                assert!(WorkerEndpoint::parse(bad).is_err(), "{bad}");
+            }
+        }
+    }
 
     /// Completion mode adds finish and health_reply; research adds its confined report
     /// writer. No mode exposes operator launches, shell or arbitrary writes.

@@ -138,14 +138,15 @@ fn remote(
         .tempdir_in(root.join("target/release-publisher"))
         .map_err(|_| "publisher scratch unavailable")?
         .keep();
-    release_wait::download(root, &manifest.tag, &dir, deadline, true).map_err(|e| e.reason)?;
+    release_wait::download(root, &manifest.tag, &dir, deadline, None).map_err(|e| e.reason)?;
     let bytes = delivery::read_regular(&dir.join(MANIFEST), 65536)?;
     let actual: Manifest = serde_json::from_slice(&bytes).map_err(|_| "remote manifest invalid")?;
     if &actual != manifest {
         return Err("existing release identity/attempt conflicts; no overwrite".into());
     }
     release_wait::inventory(expected, manifest, bytes.len() as u64).map_err(|e| e.reason)?;
-    release_wait::download(root, &manifest.tag, &dir, deadline, false).map_err(|e| e.reason)?;
+    release_wait::download(root, &manifest.tag, &dir, deadline, Some(manifest))
+        .map_err(|e| e.reason)?;
     delivery::verify_until(&dir, &manifest.commit, Some(&manifest.workflow), deadline)?;
     for artifact in &manifest.artifacts {
         attestation(root, &dir.join(&artifact.name), manifest, deadline)?;

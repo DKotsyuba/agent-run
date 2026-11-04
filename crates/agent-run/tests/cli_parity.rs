@@ -159,9 +159,14 @@ fn python_cli_spec_command_surface_is_present() {
         // provider instead of a runtime, catalog reads take exact filters,
         // stable agent operations can pin an exact historical execution,
         // admissions accept a display label and bounded health policy but no lifetime limit, and transcript pages
-        // offer the bounded block view. Doctor now accepts an explicit JSON
-        // selector while retaining JSON as its default; the oracle stays frozen.
+        // offer the bounded block view. Explicit broker/operator endpoints and
+        // shared worker configuration are additive; the oracle stays frozen.
         let (removed, added): (&[&str], &[&str]) = match path {
+            "agent-run" => (&[], &["--broker-socket", "--broker-uid"]),
+            "api serve" => (
+                &[],
+                &["--operator-socket", "--operator-gid", "--shared-config"],
+            ),
             "doctor" => (&[], &["--json"]),
             "start" => (
                 &["--runtime", "--timeout"],

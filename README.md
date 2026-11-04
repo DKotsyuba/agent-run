@@ -5,15 +5,18 @@ GLM coding agents. It runs children as durable asynchronous jobs, records
 verified outcomes in SQLite, tracks provider capacity, and exposes the same
 tool surface through its CLI, MCP stdio server, and Unix-socket JSON-RPC API.
 
-The broker and its release artifact do not require Python. Engine CLIs remain
-external dependencies and must be installed and authenticated separately.
+The native Agent Run binaries and per-user installer do not require Python.
+The optional shared systemd wrapper uses Python 3 for readiness checks. Engine
+CLIs remain external dependencies and must be installed and authenticated separately.
 
 ## Release targets
 
-Native releases are published only for macOS Apple silicon
-(`aarch64-apple-darwin`), the qualified release platform. Linux x86-64 remains
-an unqualified, non-blocking validation target; its release and qualification
-are deferred. Keychain and launchd integration remain macOS-only.
+The release workflow builds and verifies native archives for macOS Apple silicon
+(`aarch64-apple-darwin`) and Linux x86-64 (`x86_64-unknown-linux-gnu`). Both
+native checks must pass before publication. Existing releases may contain only
+the macOS archive; Linux availability begins with a release built by the updated
+workflow. The Linux binary is built on Ubuntu 22.04 and requires a compatible
+glibc environment. Keychain and launchd integration remain macOS-only.
 
 ## Family standard
 
@@ -43,6 +46,8 @@ wget -qO- https://github.com/DKotsyuba/agent-run/releases/latest/download/instal
 
 **Availability:** the installer is included starting with 0.14.0.
 Releases through 0.13.3 do not contain its script/helper.
+An older macOS-only release cannot install on Linux; the bootstrap reports when
+the selected release does not contain the Linux archive.
 
 The current bootstrap requires trusted `gh`, `jq`, `tar` and a SHA-256 utility.
 `curl` and `wget` can download the entrypoint or payload, but GitHub CLI still
@@ -150,9 +155,12 @@ agent-run api launchd --binary "$(command -v agent-run)" \
 launchctl bootstrap "gui/$(id -u)" "$plist"
 ```
 
-Future Linux builds can run the same `agent-run api serve` command under an
-external service manager such as systemd. Linux is not a qualified or published
-release platform, and agent-run does not generate systemd units.
+Linux can run the same broker under systemd. An optional shared-service example
+in [`scripts/systemd`](scripts/systemd/) runs one broker and account-owned
+launch workers under one unit; the host configures its users, groups and socket
+permissions. See the [shared-service plan](docs/linux-system-service-plan.md).
+The [Linux access guide](docs/linux-access-control.md) explains account, group,
+socket, credential and shared-service setup for other installations.
 
 ## Use the CLI
 

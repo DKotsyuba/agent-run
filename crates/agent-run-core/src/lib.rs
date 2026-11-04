@@ -30,6 +30,7 @@ pub mod native_cache;
 pub mod native_owner;
 /// Freeze/thaw lifecycle for native Codex directory caches in retained homes.
 pub mod native_tree_cache;
+pub mod observation;
 /// Owned OpenCode v2 native runner.
 pub mod opencode;
 /// Persistence facade of processes other than the resident broker.
@@ -49,6 +50,8 @@ pub mod storage_gc;
 pub mod storage_wire;
 pub mod stream;
 pub mod supervisor;
+/// Frozen routes and launch boundary for the optional system broker.
+pub mod system_launch;
 pub mod worker_finish;
 /// The single resident writer service and its submission handle.
 pub mod writer;

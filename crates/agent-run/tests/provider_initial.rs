@@ -1517,6 +1517,65 @@ async fn provider_supervisor_refuses_tampered_config_snapshot() {
     assert_eq!((active, process), (0, None));
 }
 
+/// A shared worker records a changed provider snapshot as a failed run after
+/// authenticating the fixed writer, without starting an engine.
+#[tokio::test]
+async fn shared_supervisor_finalizes_tampered_config_snapshot() {
+    let (_temp, home) = home();
+    let service = fixture_service(home.clone()).await;
+    let admitted = service
+        .admit_provider_trusted(request(&home), candidates(committed(&home)))
+        .await
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    let writer = home.join("writer.sock");
+    let operator = home.join("api.sock");
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    let mut identity = store.get(&id).unwrap().identity.unwrap();
+    identity["system_route"] = serde_json::json!({
+        "provider":"glm-user", "harness":"claude-code", "state_home":home,
+        "private_home":home, "operator_socket":operator, "writer_socket":writer,
+        "worker_socket":home.join("worker.sock"), "fingerprint":"a".repeat(64)
+    });
+    identity["provider_config"]["providers"]["glm-user"]["models"][0]["native_model"] =
+        serde_json::json!("different-native-model");
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET identity_json=? WHERE id=?",
+            rusqlite::params![identity.to_string(), id.as_str()],
+        )
+        .unwrap();
+    fs::create_dir_all(home.join("agents").join(id.as_str())).unwrap();
+    let mut child = test_broker::spawn_supervisor_with_env(
+        env!("CARGO_BIN_EXE_agent-run"),
+        &home,
+        &id,
+        &[
+            ("HOME", home.as_os_str()),
+            ("FAKE_TOKEN", std::ffi::OsStr::new("synthetic-token")),
+            ("AGENT_RUN_SYSTEM_WRITER_SOCKET", writer.as_os_str()),
+            ("AGENT_RUN_SYSTEM_OPERATOR_SOCKET", operator.as_os_str()),
+        ],
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    assert_eq!(store.get(&id).unwrap().status, Status::Failed);
+    let (active, process): (i64, Option<String>) = store
+        .conn
+        .query_row(
+            "SELECT ownership_active,process_identity FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((active, process), (0, None));
+}
+
 /// A binary disappearing after valid admission is rechecked before launch.
 /// The owned attempt proves no child existed and is released without pretending
 /// that a process was cleaned; preflight cannot eliminate mutable file races.
@@ -3142,8 +3201,19 @@ fn codex_home(auth: [&str; 2]) -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 /// [`codex_home`] with one disposable fake account per `auth` entry,
-/// labelled `a`, `b`, `c`, … in that order.
+/// labelled `a`, `b`, `c`, … in that order. A configured short test root keeps
+/// the fixture's Unix sockets within the platform path limit.
 fn codex_home_with(auth: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
+    let base = std::env::var_os("AGENT_RUN_TEST_TMP")
+        .unwrap_or_else(|| env!("CARGO_TARGET_TMPDIR").into());
+    codex_home_with_in(auth, base)
+}
+
+/// Creates the same Codex fixture below an explicit short, test-owned root.
+fn codex_home_with_in(
+    auth: &[&str],
+    base: impl AsRef<Path>,
+) -> (tempfile::TempDir, std::path::PathBuf) {
     let labels = ["a", "b", "c"];
     let mut extra = "[providers.codex-user]\nharness = \"codex\"\nconnection = { kind = \"native\" }\nauth_family = \"openai\"\nlimits_source = \"none\"\n[[providers.codex-user.models]]\nid = \"fixture\"\n".to_owned();
     for label in &labels[..auth.len()] {
@@ -3151,7 +3221,7 @@ fn codex_home_with(auth: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
             "[[providers.codex-user.bindings]]\nlabel = \"{label}\"\naccount = \"acct-cx-{label}\"\n"
         ));
     }
-    let (temp, home) = home_in(env!("CARGO_TARGET_TMPDIR"), &extra, &[]);
+    let (temp, home) = home_in(base, &extra, &[]);
     let mut store = agent_run_store::fixture::open(&home).unwrap();
     for (label, content) in labels.into_iter().zip(auth.iter().copied()) {
         let account = format!("acct-cx-{label}");
@@ -3169,6 +3239,136 @@ fn codex_home_with(auth: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
             .unwrap();
     }
     (temp, home)
+}
+
+/// A child TMPDIR that becomes unsafe after the spawn claim is refused by the
+/// final check. No engine starts; terminal failure proves never-spawned cleanup
+/// and releases the physical quota reservation.
+#[tokio::test]
+async fn codex_late_temporary_root_refusal_releases_the_attempt() {
+    let base = std::env::var_os("AGENT_RUN_TEST_TMP")
+        .unwrap_or_else(|| env!("CARGO_TARGET_TMPDIR").into());
+    let (_temp, home) = codex_home_with_in(&["ok"], base);
+    let child_tmp = home.join("child-tmp");
+    fs::create_dir(&child_tmp).unwrap();
+    let mut config = agent_run_config::provider_config::ProviderConfig::load(&home)
+        .unwrap()
+        .0;
+    config
+        .harnesses
+        .get_mut(&agent_run_domain::HarnessId::Codex)
+        .unwrap()
+        .environment = Some("child-temp".into());
+    let mut environment = agent_run_config::config::Environment::default();
+    environment
+        .variables
+        .insert("TMPDIR".into(), child_tmp.display().to_string());
+    config.environments.insert("child-temp".into(), environment);
+    fs::write(home.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
+
+    let service = fixture_service(home.clone()).await;
+    let account: AccountId = "acct-cx-a".parse().unwrap();
+    let physical_key = agent_run_domain::PhysicalQuotaKey::new(&account, "tokens").unwrap();
+    let candidates = QuotaCandidateSet {
+        provider: "codex-user".parse().unwrap(),
+        model: "fixture".into(),
+        intent: SelectionIntent::Pinned(account.clone()),
+        candidates: vec![QuotaCandidate {
+            account,
+            rank: 0,
+            physical_keys: vec![physical_key],
+            multiplier: PositiveFinite::try_from(1.0).unwrap(),
+            quota_known: true,
+        }],
+        capacity_revision: committed(&home),
+    };
+    let admitted = service
+        .admit_provider_trusted(
+            request_for(&home, "codex-user", "late-tmpdir", Some("a")),
+            candidates,
+        )
+        .await
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    fs::write(home.join("fixture-hold-pre-spawn-validation"), "").unwrap();
+    let mut child = supervisor(&home, &id).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !home.join("fixture-held-pre-spawn-validation").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("supervisor reached the final validation barrier");
+
+    let reservation_count = |store: &Store| -> i64 {
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM attempt_quota_keys k JOIN attempts a ON a.id=k.attempt_id WHERE a.agent_id=? AND a.ownership_active=1",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    let (phase, process): (String, Option<String>) = store
+        .conn
+        .query_row(
+            "SELECT phase,process_identity FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(phase, "spawning");
+    assert!(process.is_none());
+    assert_eq!(reservation_count(&store), 1);
+    drop(store);
+
+    let shared = home.join("shared-assets/v1");
+    assert!(shared.is_dir());
+    fs::remove_dir(&child_tmp).unwrap();
+    std::os::unix::fs::symlink(&shared, &child_tmp).unwrap();
+    fs::write(home.join("fixture-release-pre-spawn-validation"), "").unwrap();
+    let exit = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !exit.success(),
+        "unsafe temporary root must refuse the launch"
+    );
+
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    let row = store.get(&id).unwrap();
+    assert_eq!(row.status, Status::Failed);
+    assert_eq!(row.failure_kind.as_deref(), Some("preparation_rejected"));
+    assert!(
+        row.failure_text
+            .unwrap_or_default()
+            .contains("temporary writable root")
+    );
+    let (active, phase, proof, process, birth): (
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<f64>,
+    ) = store
+        .conn
+        .query_row(
+            "SELECT ownership_active,phase,cleanup_proof_json,process_identity,process_birth_time FROM attempts WHERE agent_id=?",
+            [id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(active, 0);
+    assert_eq!(phase, "cleanup_complete");
+    assert_eq!(proof.as_deref(), Some("{\"never_spawned\":true}"));
+    assert!(process.is_none() && birth.is_none());
+    assert_eq!(reservation_count(&store), 0);
+    drop(store);
+    drop(service);
+    child.finish().await;
 }
 
 /// Start/pool admission and real Codex launch use the same grant compiler:
@@ -4254,6 +4454,485 @@ async fn claude_exhaustion_never_switches_accounts() {
             .contains("cross_account_continuation_unverified")
     );
     assert_eq!(attempts(&home, &id).len(), 1);
+}
+
+/// Creates a fake ordered Claude provider with API first and a separate named
+/// native login second; neither reference contains or accesses real credentials.
+fn ordered_claude_home() -> (tempfile::TempDir, std::path::PathBuf) {
+    let (temp, home) = home();
+    let path = home.join("config.toml");
+    let config = fs::read_to_string(&path).unwrap().replace(
+        "[providers.glm-user]\n",
+        "[providers.glm-user]\nordered_accounts = true\n",
+    );
+    fs::write(
+        &path,
+        format!("{config}\n[[providers.glm-user.bindings]]\nlabel = \"reserve\"\naccount = \"acct-sub\"\npriority_multiplier = 0.5\nconnection = {{ kind = \"native\" }}\n"),
+    )
+    .unwrap();
+    let mut store = agent_run_store::fixture::open(&home).unwrap();
+    store
+        .register_account(&AccountRecord {
+            account_id: "acct-sub".parse().unwrap(),
+            auth_family: "anthropic".parse().unwrap(),
+            secret_ref: "named:claude-code:reserve".parse().unwrap(),
+            status: AccountStatus::Enabled,
+        })
+        .unwrap();
+    agent_run::fs::private_dir(&home.join("accounts/claude/reserve/claude-config")).unwrap();
+    (temp, home)
+}
+
+/// A billing failure continues the sealed Claude transcript on the named
+/// native binding, keeping one logical task and one completion delivery.
+#[tokio::test]
+async fn ordered_claude_billing_continues_the_same_session() {
+    let (_temp, home) = ordered_claude_home();
+    let service = fixture_service(home.clone()).await;
+    let mut request = request(&home);
+    request.task = "fixture:billing".into();
+    request.account = None;
+    request.request_id = Some("claude-billing-switch".into());
+    let admitted = service.admit_provider(request).await.unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    run_to_end(&home, &id).await;
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    let row = store.get(&id).unwrap();
+    assert_eq!(row.status, Status::Succeeded, "{:?}", row.failure_text);
+    let attempt_rows = attempts(&home, &id);
+    assert_eq!(attempt_rows.len(), 2, "{attempt_rows:?}");
+    assert_eq!(
+        (
+            attempt_rows[0].1.as_str(),
+            attempt_rows[0].2.as_str(),
+            attempt_rows[0].3
+        ),
+        ("acct-work", "failed", 0)
+    );
+    assert_eq!(
+        (attempt_rows[1].1.as_str(), attempt_rows[1].3),
+        ("acct-sub", 0)
+    );
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM messages WHERE agent_id=? AND role='user'",
+            &id
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM deliveries WHERE agent_id=?",
+            &id
+        ),
+        1
+    );
+    let states: Vec<serde_json::Value> = store
+        .conn
+        .prepare("SELECT adapter_state_json FROM attempts WHERE agent_id=? ORDER BY number")
+        .unwrap()
+        .query_map([id.as_str()], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
+        .collect();
+    assert_eq!(states[0]["native_history"]["task_proven"], true);
+    assert_eq!(states[1]["native_history"]["task_proven"], true);
+    assert_eq!(
+        states[0]["native_history"]["seal"]["session"],
+        states[1]["native_history"]["seal"]["session"]
+    );
+    assert_eq!(
+        states[0]["native_history"]["seal"]["root"],
+        states[1]["native_history"]["seal"]["root"]
+    );
+
+    // A later explicit continuation must keep the subscription and reopen
+    // the same original transcript even though its auth directory differs.
+    let child = service
+        .admit_provider_resume(
+            &row,
+            "fixture:answer".into(),
+            Some("claude-after-switch".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let child_id: AgentId = serde_json::from_value(child["agent_id"].clone()).unwrap();
+    run_to_end(&home, &child_id).await;
+    let child = store.get(&child_id).unwrap();
+    assert_eq!(child.status, Status::Succeeded, "{:?}", child.failure_text);
+    assert_eq!(child.runtime_session_id, row.runtime_session_id);
+    assert_eq!(attempts(&home, &child_id)[0].1, "acct-sub");
+}
+
+/// A later explicit turn still starts on the preferred API account and can
+/// switch to the frozen subscription if that new turn hits a billing error.
+#[tokio::test]
+async fn ordered_claude_explicit_resume_can_switch_after_billing() {
+    let (_temp, home) = ordered_claude_home();
+    let service = fixture_service(home.clone()).await;
+    let mut request = request(&home);
+    request.account = None;
+    request.request_id = Some("claude-before-resume".into());
+    let admitted = service.admit_provider(request).await.unwrap();
+    let parent_id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    run_to_end(&home, &parent_id).await;
+    let parent = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&parent_id)
+        .unwrap();
+    assert_eq!(parent.status, Status::Succeeded);
+    let resumed = service
+        .admit_provider_resume(
+            &parent,
+            "fixture:billing".into(),
+            Some("claude-resume-billing".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let child_id: AgentId = serde_json::from_value(resumed["agent_id"].clone()).unwrap();
+    run_to_end(&home, &child_id).await;
+    let child = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&child_id)
+        .unwrap();
+    assert_eq!(child.status, Status::Succeeded, "{:?}", child.failure_text);
+    assert_eq!(child.runtime_session_id, parent.runtime_session_id);
+    let rows = attempts(&home, &child_id);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(
+        (rows[0].1.as_str(), rows[1].1.as_str()),
+        ("acct-work", "acct-sub")
+    );
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM messages WHERE agent_id=? AND role='user'",
+            &child_id
+        ),
+        1
+    );
+}
+
+/// Callback completion on the fallback uses the new attempt's capability and
+/// publishes exactly one verified answer after the API attempt failed.
+#[tokio::test]
+async fn ordered_claude_billing_keeps_explicit_finish() {
+    use agent_run::transport::socket;
+    let (_temp, home) = ordered_claude_home();
+    let mut broker = resident_broker(&home);
+    broker_ready(&home, &mut broker).await;
+    let mut request = request(&home);
+    request.task = "fixture:billing".into();
+    request.account = None;
+    request.explicit_finish = true;
+    request.request_id = Some("claude-billing-finish".into());
+    let admitted = socket::client(&home, "start", serde_json::to_value(request).unwrap())
+        .await
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let row = agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap();
+        if row.status.terminal() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fixture did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    let row = store.get(&id).unwrap();
+    assert_eq!(row.status, Status::Succeeded, "{:?}", row.failure_text);
+    assert_eq!(attempts(&home, &id).len(), 2);
+    let answer = socket::client(&home, "answer", serde_json::json!({"agent_id":id}))
+        .await
+        .unwrap();
+    assert_eq!(answer["content"], "fixture callback answer");
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM deliveries WHERE agent_id=?",
+            &id
+        ),
+        1
+    );
+    broker.kill().await.unwrap();
+}
+
+/// A missing original input or a pending tool must stop the queue before a
+/// second account can run, even after an authoritative billing failure.
+#[tokio::test]
+async fn ordered_claude_billing_refuses_unproven_history() {
+    for task in ["fixture:billing-no-input", "fixture:billing-pending"] {
+        let (_temp, home) = ordered_claude_home();
+        let service = fixture_service(home.clone()).await;
+        let mut request = request(&home);
+        request.task = task.into();
+        request.account = None;
+        request.request_id = Some("refuse-billing".into());
+        let admitted = service.admit_provider(request).await.unwrap();
+        let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+        run_to_end(&home, &id).await;
+        let row = agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap();
+        assert_eq!(row.status, Status::Failed, "{task}: {:?}", row.failure_text);
+        assert_eq!(row.failure_kind.as_deref(), Some("billing_unavailable"));
+        assert_eq!(attempts(&home, &id).len(), 1, "{task}");
+    }
+}
+
+/// Authentication failures, ordinary throttling and text mentioning billing
+/// are not the structured billing signal that authorizes a fallback attempt.
+#[tokio::test]
+async fn ordered_claude_does_not_switch_for_unrelated_failures() {
+    for task in [
+        "fixture:auth-failure",
+        "fixture:temporary-limit",
+        "fixture:fake-billing-text",
+    ] {
+        let (_temp, home) = ordered_claude_home();
+        let service = fixture_service(home.clone()).await;
+        let mut request = request(&home);
+        request.task = task.into();
+        request.account = None;
+        request.request_id = Some("unrelated-failure".into());
+        let admitted = service.admit_provider(request).await.unwrap();
+        let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+        run_to_end(&home, &id).await;
+        let row = agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap();
+        assert_eq!(row.status, Status::Failed, "{task}: {:?}", row.failure_text);
+        assert_eq!(attempts(&home, &id).len(), 1, "{task}");
+    }
+}
+
+/// A committed allocation with a lost acknowledgement must never start a
+/// second native process or repeat the allocation under a new operation ID.
+#[tokio::test]
+async fn ordered_claude_unknown_allocation_does_not_spawn_a_retry() {
+    let (_temp, home) = ordered_claude_home();
+    fs::write(home.join("fixture-unknown-allocation-reply"), "").unwrap();
+    let service = fixture_service(home.clone()).await;
+    let mut request = request(&home);
+    request.task = "fixture:billing".into();
+    request.account = None;
+    request.request_id = Some("claude-unknown-allocation".into());
+    let admitted = service.admit_provider(request.clone()).await.unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    let mut child = supervisor(&home, &id).await;
+    let exit = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!exit.success());
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    let row = store.get(&id).unwrap();
+    assert_ne!(row.status, Status::Succeeded);
+    let rows = attempts(&home, &id);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(
+        (rows[0].1.as_str(), rows[1].1.as_str()),
+        ("acct-work", "acct-sub")
+    );
+    let (process, cleanup, owned): (Option<String>, Option<String>, i64) = store
+        .conn
+        .query_row(
+            "SELECT process_identity,cleanup_proof_json,ownership_active FROM attempts WHERE agent_id=? AND number=2",
+            [id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert!(process.is_none(), "uncertain allocation must not spawn");
+    assert_eq!(cleanup.as_deref(), Some("{\"never_spawned\":true}"));
+    assert_eq!(owned, 0);
+    let receipts: (i64, i64) = store.conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(outcome='committed'),0) FROM operation_receipts WHERE op_kind='allocate_next_attempt'",
+        [], |r| Ok((r.get(0)?, r.get(1)?)),
+    ).unwrap();
+    assert_eq!(receipts, (1, 1));
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='account_switched'",
+            &id
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='continuation_control'",
+            &id
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM messages WHERE agent_id=? AND role='user'",
+            &id
+        ),
+        1
+    );
+    assert!(row.status.terminal());
+    assert_eq!(service.answer(&id).unwrap()["available"], false);
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM deliveries WHERE agent_id=?",
+            &id
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='execution_failure_v1' AND json_extract(data_json,'$.outcome')='unknown'",
+            &id
+        ),
+        1
+    );
+    let replay = service.admit_provider(request).await.unwrap();
+    assert_eq!(replay["created"], false);
+    assert_eq!(attempts(&home, &id).len(), 2);
+    assert!(service.reconcile().await.is_ok());
+    assert!(service.reconcile().await.is_ok());
+    assert_eq!(attempts(&home, &id).len(), 2);
+}
+
+/// Cancellation, account revocation, binding changes and transcript tampering
+/// while the next attempt is held must prevent its native process from spawning.
+#[tokio::test]
+async fn ordered_claude_handoff_rechecks_binding_and_history() {
+    for case in ["binding", "history", "cancel", "revoke"] {
+        let (_temp, home) = ordered_claude_home();
+        let service = fixture_service(home.clone()).await;
+        let mut request = request(&home);
+        request.task = "fixture:billing".into();
+        request.account = None;
+        request.request_id = Some("claude-handoff".into());
+        let admitted = service.admit_provider(request).await.unwrap();
+        let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+        fs::write(home.join("fixture-pause-spawn-2"), "").unwrap();
+        let mut child = supervisor(&home, &id).await;
+        for _ in 0..400 {
+            if home.join("fixture-paused-spawn-2").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(home.join("fixture-paused-spawn-2").exists(), "{case}");
+        match case {
+            "binding" => edit_config(&home, |config| {
+                config["providers"]["glm-user"]["bindings"][1]
+                    .as_table_mut()
+                    .unwrap()
+                    .remove("connection");
+            }),
+            "history" => {
+                fs::write(home.join("fixture-hold-pre-spawn-validation"), "").unwrap();
+            }
+            "cancel" => {
+                service.cancel(&id).await.unwrap();
+            }
+            "revoke" => agent_run_store::fixture::open(&home)
+                .unwrap()
+                .disable_account(&"acct-sub".parse().unwrap())
+                .unwrap(),
+            _ => unreachable!(),
+        }
+        fs::write(home.join("fixture-resume-spawn-2"), "").unwrap();
+        if case == "history" {
+            for _ in 0..400 {
+                if home.join("fixture-held-pre-spawn-validation").exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(home.join("fixture-held-pre-spawn-validation").exists());
+            let store = agent_run_store::fixture::open(&home).unwrap();
+            let raw: String = store
+                .conn
+                .query_row(
+                    "SELECT adapter_state_json FROM attempts WHERE agent_id=? AND number=1",
+                    [id.as_str()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let state: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let seal = &state["native_history"]["seal"];
+            let path =
+                Path::new(seal["root"].as_str().unwrap()).join(seal["relative"].as_str().unwrap());
+            std::io::Write::write_all(
+                &mut fs::OpenOptions::new().append(true).open(path).unwrap(),
+                b" ",
+            )
+            .unwrap();
+            fs::write(home.join("fixture-release-pre-spawn-validation"), "").unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(20), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        let store = agent_run_store::fixture::open(&home).unwrap();
+        let row = store.get(&id).unwrap();
+        assert_eq!(
+            row.status,
+            if case == "cancel" {
+                Status::Cancelled
+            } else {
+                Status::Failed
+            },
+            "{case}: {:?}",
+            row.failure_text
+        );
+        let (process, proof, owned): (Option<String>, String, i64) = store.conn.query_row(
+            "SELECT process_identity,cleanup_proof_json,ownership_active FROM attempts WHERE agent_id=? AND number=2",
+            [id.as_str()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert!(process.is_none(), "{case}: fallback must not spawn");
+        assert!(proof.contains("never_spawned"), "{case}: {proof}");
+        assert_eq!(owned, 0, "{case}");
+        let reason = match case {
+            "binding" => Some("current_policy_refused"),
+            "history" => Some("changed since it was sealed"),
+            "revoke" => Some("account_revoked_at_handoff"),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            assert!(
+                row.failure_text
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(reason),
+                "{case}: {:?}",
+                row.failure_text
+            );
+        }
+        assert_eq!(
+            count(
+                &home,
+                "SELECT COUNT(*) FROM deliveries WHERE agent_id=?",
+                &id
+            ),
+            1
+        );
+    }
 }
 
 /// A supervisor killed while the switched attempt B is running leaves one

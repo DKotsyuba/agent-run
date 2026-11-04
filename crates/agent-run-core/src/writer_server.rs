@@ -68,7 +68,7 @@ const OPERATOR_IDLE: Duration = Duration::from_secs(60);
 /// Kernel-attested identity of the process on the other end of a connection.
 #[derive(Debug, Clone)]
 pub struct PeerIdentity {
-    /// Effective user id of the peer, equal to this process's user.
+    /// Kernel-attested effective user id of the peer.
     pub uid: u32,
     /// Live identity (pid, birth, token, group) of the peer process.
     pub process: Identity,
@@ -154,6 +154,36 @@ pub async fn serve_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    serve_connection_with_policy(stream, peer, endpoint, slots, preauth, false).await
+}
+
+/// Serves a group-accessible writer connection, restricted to existing
+/// capability-bound supervisor operations.
+pub async fn serve_system_supervisor_connection<S>(
+    stream: S,
+    peer: PeerIdentity,
+    endpoint: Arc<WriterEndpoint>,
+    slots: ConnectionSlots,
+    preauth: SlotPermit,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    serve_connection_with_policy(stream, peer, endpoint, slots, preauth, true).await
+}
+
+/// Shares framing, quotas and lifecycle while keeping socket trust policies explicit.
+async fn serve_connection_with_policy<S>(
+    stream: S,
+    peer: PeerIdentity,
+    endpoint: Arc<WriterEndpoint>,
+    slots: ConnectionSlots,
+    preauth: SlotPermit,
+    system_supervisor: bool,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (mut input, mut output) = tokio::io::split(stream);
     // Hello: bounded in time and size, before any other frame is considered.
     let Some(header) = tokio::time::timeout(
@@ -174,6 +204,9 @@ where
         .map_err(frame_io)?;
     let hello: Hello = serde_json::from_slice(&body)
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+    if system_supervisor && hello.role != "supervisor" {
+        return Ok(());
+    }
     // Shape and kernel identity first; the reserved owner slot is taken only
     // after the recorded capability and process identity were verified against
     // the store, so an unverified peer never occupies protected capacity.

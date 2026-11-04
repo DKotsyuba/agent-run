@@ -11,8 +11,7 @@ use crate::{
     process,
     profiles::{self, Profile},
     state::{Record, Store},
-    supervisor,
-    verify::{self, Proof},
+    supervisor, verify,
 };
 use agent_run_config::provider_config::ProviderConfig;
 use agent_run_config::role_plan;
@@ -102,6 +101,9 @@ pub struct ProviderLaunchIdentity {
     pub provider_config_snapshot: Value,
     /// Frozen provider/model/role/scope; asset digest seals before spawning.
     pub authority: ResolvedLaunchAuthority,
+    /// Root-approved system route, absent for ordinary per-user executions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_route: Option<crate::system_launch::SystemRoute>,
     /// Per-lineage generated home once sealed.
     pub runtime_home: Option<PathBuf>,
     /// Runtime asset index digest once sealed.
@@ -193,6 +195,13 @@ impl ProviderLaunchIdentity {
                 "stored provider authority contradicts request".into(),
             ));
         }
+        if let Some(route) = &identity.system_route {
+            route
+                .validate_for(&identity.authority.provider, identity.authority.harness)
+                .map_err(|_| {
+                    Error::Integrity("stored system route contradicts provider authority".into())
+                })?;
+        }
         Ok(identity)
     }
 }
@@ -231,6 +240,8 @@ pub struct Service {
     /// Producer lanes of the resident writer; `None` until the broker attaches
     /// its writer (a service without one cannot mutate durable state).
     writer: Option<BrokerWriter>,
+    /// Optional root-coordinated launcher; ordinary per-user services keep `None`.
+    system_launcher: Option<Arc<dyn crate::system_launch::SystemLauncher>>,
     /// Bounded empty-read episodes shared by service clones; no credential data.
     pub(crate) pool_reads: Arc<std::sync::Mutex<crate::dispatch::PoolReadGuards>>,
 }
@@ -330,6 +341,7 @@ impl Service {
             home,
             config: Arc::new(RwLock::new(None)),
             writer: None,
+            system_launcher: None,
             pool_reads: Arc::default(),
         }
     }
@@ -339,6 +351,55 @@ impl Service {
     pub fn with_writer(mut self, writer: BrokerWriter) -> Self {
         self.writer = Some(writer);
         self
+    }
+
+    /// Selects a configured external launcher for new provider executions.
+    /// Every admitted provider must have a matching route.
+    #[must_use]
+    pub fn with_system_launcher(
+        mut self,
+        launcher: Arc<dyn crate::system_launch::SystemLauncher>,
+    ) -> Self {
+        self.system_launcher = Some(launcher);
+        self
+    }
+
+    /// Freezes the configured system route into a provider admission, if enabled.
+    fn bind_system_route(&self, prepared: &mut Prepared) -> Result<()> {
+        if let Some(launcher) = &self.system_launcher {
+            let route = launcher.route(&prepared.authority.provider, prepared.authority.harness)?;
+            route.validate_for(&prepared.authority.provider, prepared.authority.harness)?;
+            let identity = prepared.identity.as_object_mut().ok_or_else(|| {
+                Error::Integrity("provider launch identity is not an object".into())
+            })?;
+            identity.insert("system_route".into(), serde_json::to_value(route)?);
+        }
+        Ok(())
+    }
+
+    /// Uses only the launcher matching the execution's durable system route.
+    async fn launch_provider_supervisor(&self, id: &AgentId, lane: &BrokerLane) -> Result<()> {
+        let lookup = id.clone();
+        let row = self.read(move |store| store.get(&lookup)).await?;
+        let identity = ProviderLaunchIdentity::read(&row)?;
+        match (&self.system_launcher, identity.system_route) {
+            (None, None) => supervisor::launch(&self.home, id, lane).await,
+            (Some(launcher), Some(route)) => {
+                route.validate_for(&identity.authority.provider, identity.authority.harness)?;
+                let current =
+                    launcher.route(&identity.authority.provider, identity.authority.harness)?;
+                if current != route {
+                    return Err(Error::ExecutionChanged);
+                }
+                let future = launcher.launch(self.home.clone(), id.clone(), route, lane.clone());
+                tokio::spawn(future).await.map_err(|error| {
+                    Error::Runtime(format!("system supervisor launch task failed: {error}"))
+                })?
+            }
+            _ => Err(Error::Unsupported(
+                "execution belongs to a different launcher mode".into(),
+            )),
+        }
     }
 
     /// The broker lane of one subsystem.
@@ -557,6 +618,8 @@ impl Service {
         let (config, revision) = self.current_provider_config()?;
         let accounts = Store::open(&self.home)?.list_accounts()?;
         let catalog = config.resolve_catalog(accounts)?;
+        let mut prepared = prepare_provider(&config, &revision, &catalog, request)?;
+        self.bind_system_route(&mut prepared)?;
         let Prepared {
             request,
             effective,
@@ -564,7 +627,7 @@ impl Service {
             identity,
             cap,
             pinned,
-        } = prepare_provider(&config, &revision, &catalog, request)?;
+        } = prepared;
         let global_cap = config.core.max_active_agents;
         let mut submission = 0;
         let admission = loop {
@@ -641,7 +704,7 @@ impl Service {
         if result["created"] == true {
             let id: AgentId = serde_json::from_value(result["agent_id"].clone())?;
             let lane = self.lane("admission")?;
-            if let Err(error) = supervisor::launch(&self.home, &id, &lane).await {
+            if let Err(error) = self.launch_provider_supervisor(&id, &lane).await {
                 lane.event(
                     &id,
                     "supervisor_handoff_error",
@@ -853,7 +916,9 @@ impl Service {
                 }
                 start.orchestrator = binding.clone();
                 start.validate()?;
-                prepared.push(Some(prepare_provider(&config, &revision, &catalog, start)?));
+                let mut member = prepare_provider(&config, &revision, &catalog, start)?;
+                self.bind_system_route(&mut member)?;
+                prepared.push(Some(member));
             } else {
                 prepared.push(None);
             }
@@ -1174,7 +1239,8 @@ impl Service {
                 start.explicit_finish,
             )?;
             start.validate()?;
-            let prepared = prepare_provider(&config, &revision, &catalog, start)?;
+            let mut prepared = prepare_provider(&config, &revision, &catalog, start)?;
+            self.bind_system_route(&mut prepared)?;
             let candidates = produce(&store, &catalog, &prepared.request, submission)?;
             let replacement = agent_run_store::ops::ReplacePoolMember {
                 pool_id: request.pool_id.clone(),
@@ -1369,6 +1435,11 @@ impl Service {
                     json!({"agent_id":row.id,"created":false,"agent":self.view(&store,&row)?}),
                 );
             }
+        }
+        if self.system_launcher.is_some() {
+            return Err(Error::Unsupported(
+                "system execution requires a provider configuration".into(),
+            ));
         }
         let config = self.current_config()?;
         let runtime = config.runtime(&request.runtime)?;
@@ -1584,6 +1655,11 @@ impl Service {
                 );
             }
         }
+        if self.system_launcher.is_some() {
+            return Err(Error::Unsupported(
+                "system execution cannot resume a legacy run".into(),
+            ));
+        }
         if matches!(self.active_config()?.value, CachedConfigValue::Providers(_)) {
             return Err(Error::Unsupported(
                 "legacy_continuation_unavailable: a schema-1 run cannot be continued under schema 2; its history remains readable".into(),
@@ -1720,6 +1796,20 @@ impl Service {
                 "created":false,"agent":self.view(&store,&row)?}),
             );
         }
+        match (&self.system_launcher, &frozen.system_route) {
+            (None, None) => {}
+            (Some(launcher), Some(route)) => {
+                route.validate_for(&frozen.authority.provider, frozen.authority.harness)?;
+                if launcher.route(&frozen.authority.provider, frozen.authority.harness)? != *route {
+                    return Err(Error::ExecutionChanged);
+                }
+            }
+            _ => {
+                return Err(Error::Unsupported(
+                    "execution belongs to a different launcher mode".into(),
+                ));
+            }
+        }
         request.validate()?;
         // A parent that already has a child is refused for that reason (the
         // child's own turns legitimately changed the parent's sealed history);
@@ -1812,9 +1902,16 @@ impl Service {
             .map(|binding| binding.account.clone())
             .collect();
         let mut child_authority = authority.clone();
+        let ordered_claude = authority.harness == agent_run_domain::catalog::HarnessId::ClaudeCode
+            && frozen
+                .provider_config
+                .providers
+                .get(&authority.provider)
+                .is_some_and(|provider| provider.ordered_accounts);
         child_authority.eligible_accounts.retain(|account| {
             bound.contains(account)
                 && (authority.harness == agent_run_domain::catalog::HarnessId::Codex
+                    || ordered_claude
                     || *account == prefer)
         });
         let frozen_catalog = frozen.provider_config.resolve_catalog(accounts)?;
@@ -1861,6 +1958,7 @@ impl Service {
             provider_config: frozen.provider_config.clone(),
             provider_config_snapshot: frozen.provider_config_snapshot.clone(),
             authority: child_authority.clone(),
+            system_route: frozen.system_route.clone(),
             runtime_home: Some(runtime_home),
             snapshot_sha256: frozen.snapshot_sha256.clone(),
         })?;
@@ -1967,6 +2065,9 @@ impl Service {
             )
             .await
     }
+    /// Reads a pinned execution's answer using the shared sealed-proof verifier.
+    /// Unavailable answers retain their metadata envelope; verified inline text
+    /// keeps the historical 1 MiB CLI cutoff independently of transport budgets.
     pub fn answer(&self, id: &AgentId) -> Result<Value> {
         let row = Store::open(&self.home)?.get(id)?;
         let Some(path) = &row.answer_path else {
@@ -1974,16 +2075,7 @@ impl Service {
                 json!({"agent_id":id,"status":row.status,"available":false,"path":null,"size_bytes":null,"sha256":null,"content":null,"inline_complete":false,"relative_path":null,"kind":null,"media_type":null,"proof_version":null}),
             );
         };
-        let proof = Proof {
-            path: path.clone(),
-            bytes: row
-                .answer_bytes
-                .ok_or_else(|| Error::Integrity("answer size evidence is missing".into()))?,
-            sha256: row
-                .answer_sha256
-                .ok_or_else(|| Error::Integrity("answer digest is missing".into()))?,
-            proof_version: 2,
-        };
+        let proof = crate::observation::answer_proof(&row)?;
         let root = self.home.join("agents").join(id.as_str());
         let (version, content) = verify::read(&root, &proof, verify::INLINE_ANSWER)?;
         Ok(
@@ -2349,6 +2441,18 @@ pub(crate) fn current_policy_permits(
     {
         return refuse("harness or connection");
     }
+    if frozen
+        .provider_config
+        .providers
+        .get(&authority.provider)
+        .is_some_and(|provider| provider.ordered_accounts)
+        && current
+            .providers
+            .get(&authority.provider)
+            .is_none_or(|provider| !provider.ordered_accounts)
+    {
+        return refuse("account queue");
+    }
     if now.native_model.as_deref().unwrap_or(&now.id)
         != then.native_model.as_deref().unwrap_or(&then.id)
     {
@@ -2471,16 +2575,15 @@ pub(crate) fn current_policy_permits(
 
 /// Verifies the native-history seal the supervisor recorded in the parent's
 /// last attempt (`adapter_state_json.native_history`) against the file it
-/// names. The seal must exist, be bound to the parent's session, harness and
-/// assets digest, name `expected_root` (when given) as its storage root, and
-/// the file must still have the exact sealed bytes. A missing seal fails closed: history is never
-/// adopted for the first time here.
+/// names. The returned seal must be bound to the parent's session, harness and
+/// assets digest, name `expected_root` (when given), and still match the file's
+/// exact bytes. A missing seal fails closed; history is never adopted here.
 pub(crate) fn verify_recorded_history(
     adapter_state: &str,
     frozen: &ProviderLaunchIdentity,
     expected_root: Option<&std::path::Path>,
     session: &str,
-) -> Result<()> {
+) -> Result<crate::continuity::HistorySeal> {
     let unavailable =
         |reason: &str| Error::Unsupported(format!("continuation_unavailable: {reason}"));
     let state: Value = serde_json::from_str(adapter_state)
@@ -2507,7 +2610,8 @@ pub(crate) fn verify_recorded_history(
             "native history seal names another storage root",
         ));
     }
-    crate::continuity::verify(&seal, frozen.authority.harness, session)
+    crate::continuity::verify(&seal, frozen.authority.harness, session)?;
+    Ok(seal)
 }
 
 /// Everything the store needs to admit one provider request, derived without
@@ -2701,6 +2805,7 @@ pub(crate) fn prepare_provider(
         provider_config: config.clone(),
         provider_config_snapshot: config.snapshot()?,
         authority: authority.clone(),
+        system_route: None,
         runtime_home: None,
         snapshot_sha256: None,
     };

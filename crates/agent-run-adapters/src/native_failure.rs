@@ -31,7 +31,8 @@
 //!   `cloud_credential_error`. [`ClaudeSignals`] tracks both in order: a
 //!   later `allowed`/`allowed_warning` (or malformed) rate-limit event clears
 //!   a rejection, and a later assistant error of another class is the
-//!   terminal cause instead.
+//!   terminal cause instead. `billing_error` is a billing problem, not proof
+//!   of a particular balance or quota window.
 //!
 //! Account, provider, model and attempt are never taken from these payloads;
 //! the supervisor attaches them from its own trusted context.
@@ -57,6 +58,8 @@ pub enum NativeFailure {
     Throttled,
     /// Authentication or authorization failure.
     Auth,
+    /// Claude Code reported a billing problem; this does not prove zero balance.
+    BillingUnavailable,
     /// The conversation exceeded the model's context window.
     ContextWindow,
     /// Transport or stream connectivity failure.
@@ -182,6 +185,7 @@ impl ClaudeSignals {
                 | "account_on_hold"
                 | "verification_required"
                 | "cloud_credential_error" => NativeFailure::Auth,
+                "billing_error" => NativeFailure::BillingUnavailable,
                 "overloaded" => NativeFailure::Throttled,
                 _ => NativeFailure::Other,
             }),
@@ -321,6 +325,14 @@ mod tests {
         assert_eq!(
             run(&[&rejected, &error("server_error")]),
             Some(NativeFailure::Other)
+        );
+        assert_eq!(
+            run(&[&error("billing_error")]),
+            Some(NativeFailure::BillingUnavailable)
+        );
+        assert_eq!(
+            run(&[&rejected, &error("billing_error")]),
+            Some(NativeFailure::BillingUnavailable)
         );
         assert_eq!(run(&[&error("rate_limit")]), Some(NativeFailure::Throttled));
         assert!(matches!(

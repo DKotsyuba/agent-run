@@ -161,6 +161,7 @@ impl Store<'_> {
     /// Reads raw compatible history or bounded blocks according to shared
     /// validated options. lineage selects the stable root; false pins execution.
     /// Invalid inputs reject before reads. No journal or spool file is modified.
+    /// Block reads reuse a caller's transaction, or own a read snapshot when absent.
     pub fn transcript_query(
         &self,
         id: &AgentId,
@@ -195,9 +196,13 @@ impl Store<'_> {
         } else {
             FIELDS.to_owned()
         };
-        let tx = self.conn.unchecked_transaction()?;
-        let excluded = neighbor(&tx, selection, selected, cursor, reverse)?;
-        let mut statement = tx.prepare(&format!(
+        let tx = self
+            .conn
+            .is_autocommit()
+            .then(|| self.conn.unchecked_transaction())
+            .transpose()?;
+        let excluded = neighbor(&self.conn, selection, selected, cursor, reverse)?;
+        let mut statement = self.conn.prepare(&format!(
             "SELECT {fields} FROM messages WHERE {selection} AND seq{comparison}?2 ORDER BY seq {order} LIMIT ?3"
         ))?;
         let mut rows = statement.query(params![
@@ -292,7 +297,9 @@ impl Store<'_> {
             "previous_cursor":if reverse && !complete {first} else {None},
             "resume_cursor":last,"complete":complete,
         });
-        tx.commit()?;
+        if let Some(tx) = tx {
+            tx.commit()?;
+        }
         Ok(result)
     }
 }

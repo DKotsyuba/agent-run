@@ -55,7 +55,7 @@ is `assets/worker_tools.json`; it never imports the operator registry.
 | Item | Status |
 |---|---|
 | `aarch64-apple-darwin` | Historically qualified through published native releases, including 0.20.x; each release re-runs the native gate |
-| Linux x86-64 | Unqualified, non-blocking CI validation lane only |
+| Linux x86-64 | Candidate: CI and the release workflow require its native checks; qualification awaits hosted release evidence |
 | MCP protocol revision | Legacy initialize and modern `2026-07-28` discovery/per-request catalog paths have separate raw/fixture checks; this does not qualify a particular host |
 | Hosts (Codex CLI, Claude Code, GLM, Desktop relay v1–v4) | Integration-tested through fixtures and transport tests; **no formal family host-matrix qualification** — `qualified_hosts` stays empty until one is run |
 | Compiler/SDK baseline | `rust-macos-2026-09-candidate1`: Rust 1.98.1 pinned, rmcp `=3.4.0`, MiniJinja `=2.24.0` |

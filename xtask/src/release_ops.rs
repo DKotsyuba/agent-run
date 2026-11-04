@@ -289,36 +289,98 @@ pub fn tag(root: &Path, args: &[String]) -> Result<(), String> {
     )
 }
 
-/// Merges separately observed source/build jobs only when all source/run fields
-/// match. The create-new output cannot silently replace another attempt's proof.
+/// Merges source, macOS and Linux evidence only for the same source/run and
+/// separately observed native payloads. Existing output is never replaced.
 pub fn merge_evidence(root: &Path, args: &[String], accepted: &str) -> Result<(), String> {
     let id = delivery::identity(root, accepted)?;
-    let mut merged: Option<Acceptance> = None;
-    for option in ["--gate", "--native"] {
-        let value: Acceptance = serde_json::from_slice(&delivery::read_regular(
+    let read = |option| -> Result<Acceptance, String> {
+        serde_json::from_slice(&delivery::read_regular(
             Path::new(&field(args, option)?),
             262144,
         )?)
-        .map_err(|_| "producer evidence invalid")?;
+        .map_err(|_| "producer evidence invalid".into())
+    };
+    let merged = merge_observations(&id, read("--gate")?, read("--native")?, read("--linux")?)?;
+    delivery::create_json(
+        &Path::new(&field(args, "--directory")?).join(ACCEPTANCE),
+        &merged,
+    )
+}
+
+/// Validates each producer's identity, required checks and target-bound payload.
+fn merge_observations(
+    id: &delivery::Identity,
+    gate: Acceptance,
+    mac: Acceptance,
+    linux: Acceptance,
+) -> Result<Acceptance, String> {
+    let mut merged: Option<Acceptance> = None;
+    for (option, mut value) in [("--gate", gate), ("--native", mac), ("--linux", linux)] {
+        let mut expected = id.clone();
+        if option == "--linux" {
+            expected.target = delivery::LINUX_TARGET.into();
+        }
         if value.schema_version != 1
-            || value.identity != id
+            || value.identity != expected
             || value.scope != "github-actions"
             || !value.qualified_hosts.is_empty()
+            || value.linux_payload.is_some()
             || value.checks.iter().any(|c| c.exit_code != 0)
         {
             return Err("producer evidence identity/outcome conflict".into());
         }
+        let expected_payload = match option {
+            "--gate" => None,
+            "--native" => Some(delivery::MAC_TARGET),
+            "--linux" => Some(delivery::LINUX_TARGET),
+            _ => unreachable!(),
+        };
+        if value
+            .payload
+            .as_ref()
+            .map(|payload| payload.target.as_deref())
+            != expected_payload.map(Some)
+        {
+            return Err("producer payload target mismatch".into());
+        }
+        let required: &[&str] = match option {
+            "--gate" => &[
+                "workspace",
+                "source-archive",
+                "integration",
+                "dependency-policy",
+            ],
+            "--native" => &["native-build", "exact-payload"],
+            "--linux" => &["workspace", "integration", "native-build", "exact-payload"],
+            _ => unreachable!(),
+        };
+        if required.iter().any(|name| {
+            !value
+                .checks
+                .iter()
+                .any(|check| check.check_id == *name && check.exit_code == 0)
+        }) {
+            return Err("producer is missing a required native check".into());
+        }
         if let Some(output) = &mut merged {
+            if option == "--linux" {
+                for check in &mut value.checks {
+                    check.check_id = format!("linux-{}", check.check_id);
+                }
+                output.linux_payload = value.payload;
+            } else {
+                output.payload = value.payload;
+            }
             output.checks.extend(value.checks);
-            output.payload = value.payload;
         } else {
             merged = Some(value);
         }
     }
-    delivery::create_json(
-        &Path::new(&field(args, "--directory")?).join(ACCEPTANCE),
-        &merged.ok_or("evidence absent")?,
-    )
+    let merged = merged.ok_or("evidence absent")?;
+    if merged.checks.len() > 64 {
+        return Err("merged evidence check count limit exceeded".into());
+    }
+    Ok(merged)
 }
 
 /// Thin local archive alias over bounded pre-extraction checks and the legacy
@@ -345,17 +407,24 @@ pub fn verify_archive(root: &Path, archive: &Path) -> Result<(), String> {
 
 /// Installs the exact already-built archive twice into disposable paths, observes
 /// its --version and records the archive bytes. It never declares host certification.
-pub fn smoke(root: &Path, directory: &Path, accepted: &str) -> Result<(), String> {
-    let id = delivery::identity(root, accepted)?;
+pub fn smoke(
+    root: &Path,
+    directory: &Path,
+    accepted: &str,
+    target: Option<&str>,
+) -> Result<(), String> {
+    let id = delivery::identity_for_target(root, accepted, target)?;
+    // Even the historical default must execute on the payload's native host.
+    delivery::identity_for_target(root, accepted, Some(&id.target))?;
     let mut evidence: Acceptance = serde_json::from_slice(&delivery::read_regular(
         &directory.join(ACCEPTANCE),
         262144,
     )?)
     .map_err(|_| "invalid acceptance")?;
-    if evidence.identity != id || evidence.payload.is_some() {
+    if evidence.identity != id || evidence.payload.is_some() || evidence.linux_payload.is_some() {
         return Err("payload evidence identity/conflict".into());
     }
-    let name = format!("agent-run-{}-aarch64-apple-darwin.tar.gz", id.version);
+    let name = format!("agent-run-{}-{}.tar.gz", id.version, id.target);
     let archive = directory.join(&name);
     crate::tar_guard::inspect(&archive, true)?;
     let temp = tempfile::tempdir().map_err(|_| "smoke scratch unavailable")?;
@@ -457,6 +526,93 @@ pub fn smoke(root: &Path, directory: &Path, accepted: &str) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Linux payload cannot be merged without matching source identity,
+    /// native target and every independently observed Linux gate.
+    #[test]
+    fn merge_requires_independent_matching_linux_evidence() {
+        use crate::delivery::{Check, Identity, Workflow};
+        let id = Identity {
+            product: "agent-run".into(),
+            version: "1.0.0".into(),
+            tag: "v1.0.0".into(),
+            repository: delivery::REPOSITORY.into(),
+            repository_id: delivery::REPOSITORY_ID,
+            commit: "a".repeat(40),
+            workflow: Some(Workflow {
+                id: delivery::WORKFLOW_ID,
+                path: delivery::WORKFLOW_PATH.into(),
+                run_id: 1,
+                run_attempt: 1,
+            }),
+            target: delivery::MAC_TARGET.into(),
+            toolchain: "1.98.1".into(),
+            standard_version: "fixture".into(),
+            devkit_version: "fixture".into(),
+            baseline: "fixture".into(),
+        };
+        let evidence = |target: &str, checks: &[&str], payload: bool| Acceptance {
+            schema_version: 1,
+            identity: Identity {
+                target: target.into(),
+                ..id.clone()
+            },
+            scope: "github-actions".into(),
+            qualified_hosts: vec![],
+            linux_payload: None,
+            payload: payload.then(|| Artifact {
+                name: format!("agent-run-1.0.0-{target}.tar.gz"),
+                kind: "bundle".into(),
+                target: Some(target.into()),
+                size: 1,
+                sha256: "b".repeat(64),
+            }),
+            checks: checks
+                .iter()
+                .map(|name| Check {
+                    check_id: (*name).into(),
+                    argv_sha256: "a".repeat(64),
+                    stdout_sha256: "b".repeat(64),
+                    stderr_sha256: "c".repeat(64),
+                    exit_code: 0,
+                })
+                .collect(),
+        };
+        let gate = evidence(
+            delivery::MAC_TARGET,
+            &[
+                "workspace",
+                "source-archive",
+                "integration",
+                "dependency-policy",
+            ],
+            false,
+        );
+        let mac = evidence(
+            delivery::MAC_TARGET,
+            &["native-build", "exact-payload"],
+            true,
+        );
+        let linux = evidence(
+            delivery::LINUX_TARGET,
+            &["workspace", "integration", "native-build", "exact-payload"],
+            true,
+        );
+        let merged = merge_observations(&id, gate.clone(), mac.clone(), linux.clone()).unwrap();
+        assert_eq!(
+            merged.linux_payload.unwrap().target.as_deref(),
+            Some(delivery::LINUX_TARGET)
+        );
+        let mut missing = linux.clone();
+        missing.checks.retain(|check| check.check_id != "workspace");
+        assert!(merge_observations(&id, gate.clone(), mac.clone(), missing).is_err());
+        let mut foreign = linux.clone();
+        foreign.identity.commit = "d".repeat(40);
+        assert!(merge_observations(&id, gate.clone(), mac.clone(), foreign).is_err());
+        let mut wrong = linux;
+        wrong.payload.as_mut().unwrap().target = Some(delivery::MAC_TARGET.into());
+        assert!(merge_observations(&id, gate, mac, wrong).is_err());
+    }
     /// Cargo planning preserves neighboring inline tables, comments and key order.
     #[test]
     fn version_edit_is_narrow_and_versions_are_strict() {

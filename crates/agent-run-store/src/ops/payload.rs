@@ -229,6 +229,20 @@ pub struct RecordStartupOwner {
     pub execution: AgentId,
     /// Inspected process identity evidence (pid, birth, token, spawn backend).
     pub identity: Value,
+    /// Additional compare-and-swap fence for an externally launched supervisor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_fence: Option<SystemStartupFence>,
+}
+
+/// Immutable route, capability and admitting broker identity for one external launch.
+#[derive(Debug, Clone, Serialize)]
+pub struct SystemStartupFence {
+    /// SHA-256 of the not-yet-released supervisor capability.
+    pub capability_sha256: String,
+    /// Frozen route fingerprint.
+    pub route_fingerprint: String,
+    /// Admitting broker's process identity.
+    pub broker_identity: Value,
 }
 
 /// 10 — renew a startup handoff to a new launch (broker).

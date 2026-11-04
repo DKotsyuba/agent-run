@@ -58,7 +58,7 @@ pub struct CacheConsolidation {
 /// and its actually selected internal account identity.
 ///
 /// The preimage is the frozen harness identity, the frozen harness's native
-/// settings, the frozen provider connection (endpoint, protocol and header
+/// settings, the frozen account connection (endpoint, protocol and header
 /// style) and the internal account id — never a mutable label, never a
 /// credential, and never the account's token material, which this module
 /// cannot even see. Identical content under different domains never
@@ -92,12 +92,22 @@ pub fn native_domain(identity: &ProviderLaunchIdentity, account: &AccountId) -> 
         .providers
         .get(&authority.provider)
         .ok_or_else(|| invalid("frozen provider is unavailable for the native domain"))?;
+    let connection = provider
+        .bindings
+        .iter()
+        .find(|binding| {
+            &binding.account == account
+                && binding
+                    .models
+                    .as_ref()
+                    .is_none_or(|models| models.contains(&authority.model))
+        })
+        .map(|binding| binding.connection.as_ref().unwrap_or(&provider.connection))
+        .ok_or_else(|| invalid("frozen account is unavailable for the native domain"))?;
     preimage.push('\n');
     preimage.push_str(
-        &String::from_utf8(fs::canonical_json(&serde_json::to_value(
-            &provider.connection,
-        )?)?)
-        .map_err(|_| invalid("provider connection is not canonical text"))?,
+        &String::from_utf8(fs::canonical_json(&serde_json::to_value(connection)?)?)
+            .map_err(|_| invalid("provider connection is not canonical text"))?,
     );
     preimage.push('\n');
     preimage.push_str(account.as_str());

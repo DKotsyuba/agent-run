@@ -10,6 +10,7 @@ pub mod fsm;
 pub mod health;
 pub mod integration;
 mod legacy_provider;
+pub mod observation;
 pub mod pool;
 mod provider_connection;
 pub mod provider_start;

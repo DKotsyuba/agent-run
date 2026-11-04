@@ -49,6 +49,13 @@ revisions are recorded independently of host qualification in `family.toml`.
 
 ## Presentation policy
 
+The additive `capabilities` and `answer_chunk` observation methods return typed
+full `structuredContent` plus a fixed text summary. Their registered output
+schemas describe the same CLI/socket values. They do not duplicate answer text
+in both channels. Chunk content is capped at 128 KiB before escaping; the complete
+encoded MCP result still passes the existing wire reserve check. Existing tools
+retain the text-first presentation policy below.
+
 MiniJinja 2.24.0 uses only serde and fuel features. A closed embedded environment
 is parsed before forwarding work, with strict undefined values, plain text,
 recursion limit 16, 50,000 VM instructions and one explicitly registered pure

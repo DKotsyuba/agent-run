@@ -159,6 +159,18 @@ impl Producer {
         )
     }
 
+    /// Connects a system supervisor only after checking the broker's kernel UID.
+    pub fn connect_system(socket: &Path, broker_uid: u32, hello: Hello, id: ProducerId) -> Self {
+        Self::with_dial(
+            crate::storage_client::SystemUnixDial {
+                path: socket.to_path_buf(),
+                broker_uid,
+            },
+            hello,
+            id,
+        )
+    }
+
     /// A producer over an arbitrary dialer (tests and alternate transports).
     pub fn with_dial(dial: impl Dial, hello: Hello, id: ProducerId) -> Self {
         Self {
@@ -286,16 +298,28 @@ pub type IdentityHook = Box<dyn FnOnce(&OperationId, &PayloadDigest) -> Result<(
 pub struct RecoveryLog {
     /// The execution's own directory.
     directory: std::path::PathBuf,
-}
-
-/// The recovery log of `execution` under `home`.
-fn recovery_log(home: &Path, execution: &AgentId) -> RecoveryLog {
-    RecoveryLog {
-        directory: home.join("agents").join(execution.as_str()),
-    }
+    /// Whether the directory is shared using operating-system permissions.
+    shared: bool,
 }
 
 impl RecoveryLog {
+    /// Opens the owning private directory or the checked shared execution directory.
+    fn open_directory(&self) -> Result<std::fs::File> {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        if !self.shared {
+            crate::fs::private_dir(&self.directory)?;
+        }
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(&self.directory)?;
+        // SAFETY: geteuid only reads this process's effective user id.
+        if !self.shared && directory.metadata()?.uid() != unsafe { libc::geteuid() } {
+            return Err(Error::Integrity("recovery directory is not owned".into()));
+        }
+        Ok(directory)
+    }
+
     /// Appends one JSON line, flushed to stable storage. The file is created
     /// mode 0600 and opened without following links; it must be a regular file
     /// of this user with exactly mode 0600 and no other hard link. The append
@@ -305,20 +329,13 @@ impl RecoveryLog {
         use std::{
             io::Write as _,
             os::fd::{AsRawFd as _, FromRawFd as _},
-            os::unix::fs::{MetadataExt as _, OpenOptionsExt as _},
+            os::unix::fs::MetadataExt as _,
         };
         let mut bytes = serde_json::to_vec(line)?;
         bytes.push(b'\n');
-        crate::fs::private_dir(&self.directory)?;
-        let directory = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
-            .open(&self.directory)?;
+        let directory = self.open_directory()?;
         // SAFETY: geteuid only reads this process's effective user id.
         let uid = unsafe { libc::geteuid() };
-        if directory.metadata()?.uid() != uid {
-            return Err(Error::Integrity("recovery directory is not owned".into()));
-        }
         let name = std::ffi::CString::new(RECOVERY_LOG).expect("fixed file name has no NUL");
         // SAFETY: the held directory descriptor and fixed name remain live;
         // O_NOFOLLOW refuses links and O_NONBLOCK prevents a FIFO from stalling.
@@ -410,6 +427,8 @@ pub struct Persist {
     home: std::path::PathBuf,
     /// The execution this supervisor owns.
     execution: AgentId,
+    /// Whether the execution uses group-shared artifacts.
+    system_artifacts: bool,
     /// Attempt that journal rows and session records are attributed to.
     attempt: Option<String>,
     /// Coalesced journal rows.
@@ -482,12 +501,30 @@ impl Persist {
             reader: StoreReader::open_with(home, Duration::from_millis(250))?,
             home: home.to_path_buf(),
             execution: execution.clone(),
+            system_artifacts: false,
             attempt: None,
             pending: Pending::default(),
             recoveries: Vec::new(),
             recovery_seq: 0,
             finish_guard_sent: None,
         })
+    }
+
+    /// Opens a supervisor facade bound to the pre-created directory of its
+    /// frozen system route. Writer authentication remains the caller's duty.
+    pub fn open_system(
+        home: &Path,
+        execution: &AgentId,
+        producer: Producer,
+        route: &crate::system_launch::SystemRoute,
+    ) -> Result<Self> {
+        let mut persist = Self::open(home, execution, producer)?;
+        if persist.home != route.state_home {
+            return Err(Error::Integrity("system artifact route mismatch".into()));
+        }
+        crate::fs::Dir::open(&persist.home.join("agents").join(persist.execution.as_str()))?;
+        persist.system_artifacts = true;
+        Ok(persist)
     }
 
     /// The execution this facade writes for.
@@ -763,6 +800,40 @@ impl Persist {
         Ok(())
     }
 
+    /// Prepares a transcript fragment using this execution's artifact policy.
+    fn message_fragment(
+        &self,
+        id: &AgentId,
+        role: &str,
+        text: &str,
+        name: Option<&str>,
+        raw_ref: Option<&str>,
+        error: Option<(bool, &str)>,
+    ) -> Result<JournalFragment> {
+        if self.system_artifacts {
+            return agent_run_store::journal::prepare_system_message_fragment(
+                &self.home,
+                id,
+                role,
+                text,
+                name,
+                raw_ref,
+                self.attempt.as_deref(),
+                error,
+            );
+        }
+        agent_run_store::journal::prepare_message_fragment(
+            &self.home,
+            id,
+            role,
+            text,
+            name,
+            raw_ref,
+            self.attempt.as_deref(),
+            error,
+        )
+    }
+
     /// Buffers one transcript row.
     pub async fn message_with_error(
         &mut self,
@@ -774,16 +845,7 @@ impl Persist {
         error: Option<(bool, &str)>,
     ) -> Result<()> {
         self.own(id)?;
-        let fragment = agent_run_store::journal::prepare_message_fragment(
-            &self.home,
-            id,
-            role,
-            text,
-            name,
-            raw_ref,
-            self.attempt.as_deref(),
-            error,
-        )?;
+        let fragment = self.message_fragment(id, role, text, name, raw_ref, error)?;
         self.push(fragment).await
     }
 
@@ -803,16 +865,7 @@ impl Persist {
         marker: Value,
     ) -> Result<()> {
         self.own(id)?;
-        let fragment = agent_run_store::journal::prepare_message_fragment(
-            &self.home,
-            id,
-            role,
-            text,
-            name,
-            raw_ref,
-            self.attempt.as_deref(),
-            error,
-        )?;
+        let fragment = self.message_fragment(id, role, text, name, raw_ref, error)?;
         self.flush().await?;
         self.producer
             .call(
@@ -928,7 +981,7 @@ impl Persist {
         .await
     }
 
-    /// Records that the OS refused the spawn.
+    /// Returns a claimed attempt to prepared after a pre-child validation or OS spawn refusal.
     pub async fn provider_spawn_failed(&mut self, id: &AgentId, attempt: &str) -> Result<()> {
         self.own(id)?;
         self.critical(ops::ProviderSpawnFailed {
@@ -1226,12 +1279,15 @@ impl Persist {
     /// directory, a mode-0600 regular file opened without following links, and
     /// the line flushed to stable storage before returning.
     fn append_recovery(&self, line: &Value) -> Result<()> {
-        recovery_log(&self.home, &self.execution).append(line)
+        self.recovery_log_writer().append(line)
     }
 
     /// A detached writer of identity lines for the producer's envelope builder.
     fn recovery_log_writer(&self) -> RecoveryLog {
-        recovery_log(&self.home, &self.execution)
+        RecoveryLog {
+            directory: self.home.join("agents").join(self.execution.as_str()),
+            shared: self.system_artifacts,
+        }
     }
 
     /// Logs a confirmed entry's resolution durably before dropping it. An
@@ -1431,7 +1487,15 @@ impl Persist {
         op: ops::AllocateNextAttempt,
     ) -> Result<ops::NextAttemptOutput> {
         self.own(&op.execution)?;
-        self.critical(op).await
+        let allocated = self.critical(op).await?;
+        // Fixture-only lost acknowledgement after the real writer committed.
+        #[cfg(feature = "test-fixtures")]
+        if self.home.join("fixture-unknown-allocation-reply").is_file() {
+            return into_result(SubmitResult::Unknown(
+                agent_run_domain::storage::UnknownCause::Transport,
+            ));
+        }
+        Ok(allocated)
     }
 
     /// Writes the terminal outcome. `Unknown` is returned as an error; the

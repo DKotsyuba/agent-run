@@ -4,6 +4,30 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- feat(claude): support an explicit ordered API-to-native-login queue that
+  continues a verified session after an eligible billing or quota failure.
+- feat(linux): support an optional shared systemd service with account-owned
+  Codex and Claude workers and Unix-controlled access; document deployment and
+  credentials for external operators.
+- feat(release): require native macOS arm64 and Linux x86-64 checks and ship
+  separately verified archives through the existing attested installer.
+- fix(linux): respect search-only ancestor permissions for protected Bridge
+  credentials and report directories while retaining no-follow checks.
+- fix(runtime): capture a version probe's process identity before execution,
+  preventing fast commands from being reported unavailable after they exit.
+- feat(observation): retrieve large verified answers in execution-fenced chunks.
+- fix(opencode): restore compatibility with Bridge native-context ABI 2 and
+  preserve the permission-checked tool context for native execution.
+- fix(dependencies): update Tokio, certificate verification and root bundles
+  to address RUSTSEC-2026-0381, RUSTSEC-2026-0382 and RUSTSEC-2026-0386.
+
+## 0.28.9
+
+- fix(opencode): restore compatibility with deployed Bridge native-context ABI 2
+  components after the 0.28.8 regression rejected their launches. Preserve actual
+  MCP ToolContext through the original permission-checked executor and create
+  the private native store before spawn so immediate observation is available.
+
 ## 0.28.8
 
 - fix(hooks): keep optional prompt context nonblocking for Codex and Claude,

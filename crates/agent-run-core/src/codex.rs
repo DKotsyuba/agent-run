@@ -505,14 +505,35 @@ impl Grant {
     /// The Codex app-server runs its own nested executor sandbox and cannot be
     /// wrapped whole, so a shared layout relies on the native read rules of the
     /// unchanged managed profile. That is safe only while no writable root —
-    /// nor `/tmp`, `/private/tmp` or the process temporary directory, which
-    /// native temporary-path grants make effectively writable — covers the
+    /// nor `/tmp`, macOS `/private/tmp`, or the process temporary directory,
+    /// which native temporary-path grants make effectively writable — covers the
     /// store root or lies inside it. The root must resolve to a real readable
     /// directory, and every writable root must resolve: an unresolved,
     /// unreadable or overlapping root is a refusal, never a guess. Read-only
     /// roots and the profile itself are untouched, so no permission is widened
     /// by this check.
+    ///
+    /// Uses this process's temporary directory; launch plans must use
+    /// [`Self::admits_shared_root_with_environment`] for their own environment.
     pub fn admits_shared_root(&self, root: &Path) -> Result<()> {
+        self.admits_shared_root_with_temp(root, &std::env::temp_dir())
+    }
+
+    /// Checks the effective child `TMPDIR`, defaulting to `/tmp` when unset.
+    /// The planned environment is inspected only for `TMPDIR` and is never logged.
+    pub fn admits_shared_root_with_environment(
+        &self,
+        root: &Path,
+        environment: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let temporary = environment
+            .get("TMPDIR")
+            .map_or(Path::new("/tmp"), |value| Path::new(value));
+        self.admits_shared_root_with_temp(root, temporary)
+    }
+
+    /// Rejects overlapping or unprovable writable and effective temporary roots.
+    fn admits_shared_root_with_temp(&self, root: &Path, tempdir: &Path) -> Result<()> {
         let refused = |why: &str| {
             invalid(format!(
                 "shared asset store is not launchable under the admitted Codex grant: {why}"
@@ -524,10 +545,21 @@ impl Grant {
         if !canonical.is_dir() || std::fs::read_dir(&canonical).is_err() {
             return Err(refused("store root is not a readable directory"));
         }
-        let mut temporary = vec![PathBuf::from("/tmp"), PathBuf::from("/private/tmp")];
-        if let Ok(tempdir) = std::env::temp_dir().canonicalize() {
-            temporary.push(tempdir);
+        if !tempdir.is_absolute() {
+            return Err(refused(
+                "temporary directory is not an absolute real directory",
+            ));
         }
+        let tempdir = tempdir
+            .canonicalize()
+            .map_err(|_| refused("temporary directory does not resolve"))?;
+        if !tempdir.is_dir() {
+            return Err(refused("temporary directory is not a directory"));
+        }
+        let mut temporary = vec![PathBuf::from("/tmp")];
+        #[cfg(target_os = "macos")]
+        temporary.push(PathBuf::from("/private/tmp"));
+        temporary.push(tempdir);
         let overlaps = |candidate: &Path| -> Result<bool> {
             let resolved = candidate.canonicalize().map_err(|_| {
                 refused(&format!(
@@ -539,17 +571,23 @@ impl Grant {
                 || resolved.starts_with(&canonical)
                 || canonical.starts_with(&resolved))
         };
-        for writable in self
-            .writable_roots
-            .iter()
-            .map(Path::new)
-            .chain(temporary.iter().map(Path::new))
-        {
+        for writable in self.writable_roots.iter().map(Path::new) {
             if overlaps(writable)? {
                 return Err(refused(&format!(
                     "store root overlaps writable root {}",
                     writable.display()
                 )));
+            }
+        }
+        for temporary in &temporary {
+            let resolved = temporary
+                .canonicalize()
+                .map_err(|_| refused("temporary directory does not resolve"))?;
+            if resolved == canonical
+                || resolved.starts_with(&canonical)
+                || canonical.starts_with(&resolved)
+            {
+                return Err(refused("store root overlaps a temporary writable root"));
             }
         }
         Ok(())

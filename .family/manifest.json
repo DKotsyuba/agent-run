@@ -8,13 +8,13 @@
       "path": "family.toml",
       "role": "declaration",
       "origin": "product",
-      "sha256": "514e0dfe1f5d2f0c6905b0e75ec5f9cbebca2f4401ffdf5eea3b37e0a4c7679a"
+      "sha256": "48bda88868f43b59ed373af175e03d4e8d9c9a37f62fa40dabe79bee4458e932"
     },
     {
       "path": "docs/family-standard.md",
       "role": "boundary-summary",
       "origin": "product",
-      "sha256": "0734763a11de536c87203fb05975b78c794237c3cd9db94015f49f616c682a42"
+      "sha256": "ce4c31476714ce2fdb35d5695b8772b0b26ae46d3b35c42bf39ab594b622582f"
     },
     {
       "path": ".family/baseline/scaffold-family.toml",
