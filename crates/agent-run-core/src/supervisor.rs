@@ -1750,17 +1750,18 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         // A switched attempt re-checks, at the handoff itself, that its
         // selected account is still enabled and the current configuration
         // still permits the frozen execution; otherwise it never spawns.
-        if (continuing.is_some() || (ordered_claude && resume_session.is_some()))
-            && let Some(blocker) = handoff_blocker(home, store, &account, &identity)?
-        {
-            return finish_blocked_handoff(
-                store,
-                id,
-                blocker,
-                continuing.is_some(),
-                recorded_history.as_deref(),
-            )
-            .await;
+        if continuing.is_some() || (ordered_claude && resume_session.is_some()) {
+            let policy = current_account_policy(home, id, &identity).await;
+            if let Some(blocker) = handoff_blocker(store, &account, policy)? {
+                return finish_blocked_handoff(
+                    store,
+                    id,
+                    blocker,
+                    continuing.is_some(),
+                    recorded_history.as_deref(),
+                )
+                .await;
+            }
         }
         if !config.services.is_empty() {
             store
@@ -1846,7 +1847,8 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 )
                 .await;
             }
-            if let Some(blocker) = handoff_blocker(home, store, &account, &identity)? {
+            let policy = current_account_policy(home, id, &identity).await;
+            if let Some(blocker) = handoff_blocker(store, &account, policy)? {
                 store.provider_spawn_failed(id, &attempt_id).await?;
                 return finish_blocked_handoff(
                     store,
@@ -2256,12 +2258,8 @@ async fn failover(
     if intent != "auto" {
         return Err("pinned_account".into());
     }
-    let (current, _) = agent_run_config::provider_config::ProviderConfig::load(home)
-        .map_err(|_| "current_config_unavailable".to_owned())?;
-    crate::service::current_policy_permits(&current, identity, &identity.provider_request)
-        .map_err(|_| "current_policy_refused".to_owned())?;
+    let (bound, _) = current_account_policy(home, id, identity).await?;
     let accounts = store.list_accounts().map_err(|error| error.to_string())?;
-    let bound = current_bindings(&current, authority);
     let frozen = identity
         .provider_config
         .resolve_catalog(accounts)
@@ -2595,16 +2593,83 @@ async fn finish_blocked_handoff(
     commands::complete_terminal_persisted(store, id).await
 }
 
+/// Bound and unchanged accounts from one validated policy read.
+type AccountPolicy = std::result::Result<
+    (
+        std::collections::BTreeSet<AccountId>,
+        std::collections::BTreeSet<AccountId>,
+    ),
+    String,
+>;
+
+/// Returns only current binding decisions for the frozen eligible accounts.
+/// System workers ask the broker; ordinary supervisors retain their local
+/// validated config read. Any inaccessible or inconsistent policy fails closed.
+async fn current_account_policy(
+    home: &Path,
+    id: &AgentId,
+    identity: &ProviderLaunchIdentity,
+) -> AccountPolicy {
+    let eligible = &identity.authority.eligible_accounts;
+    if let Some(route) = &identity.system_route {
+        use crate::system_launch::CurrentPolicy;
+        let policy = crate::system_launch::current_policy(home, route, id)
+            .await
+            .map_err(|_| "current_config_unavailable".to_owned())?;
+        return match policy {
+            CurrentPolicy::Unavailable => Err("current_config_unavailable".into()),
+            CurrentPolicy::Refused => Err("current_policy_refused".into()),
+            CurrentPolicy::Allowed {
+                authority_sha256,
+                bound,
+                unchanged,
+            } => {
+                let authority = serde_json::to_value(&identity.authority)
+                    .map_err(|_| "current_policy_refused".to_owned())?;
+                if authority_sha256 != agent_run_domain::canonical::sha256_hex(&authority, true)
+                    || bound.len() != eligible.len()
+                    || unchanged.len() != eligible.len()
+                {
+                    return Err("current_policy_refused".into());
+                }
+                Ok((
+                    eligible
+                        .iter()
+                        .zip(bound)
+                        .filter_map(|(id, yes)| yes.then_some(id.clone()))
+                        .collect(),
+                    eligible
+                        .iter()
+                        .zip(unchanged)
+                        .filter_map(|(id, yes)| yes.then_some(id.clone()))
+                        .collect(),
+                ))
+            }
+        };
+    }
+    let (current, _) = agent_run_config::provider_config::ProviderConfig::load(home)
+        .map_err(|_| "current_config_unavailable".to_owned())?;
+    crate::service::current_policy_permits(&current, identity, &identity.provider_request)
+        .map_err(|_| "current_policy_refused".to_owned())?;
+    Ok((
+        current_bindings(&current, &identity.authority),
+        eligible
+            .iter()
+            .filter(|account| ordered_binding_unchanged(&current, account, identity))
+            .cloned()
+            .collect(),
+    ))
+}
+
 /// Why a switched attempt must not spawn after all: its account is no longer
 /// enabled (`account_revoked_at_handoff`), the current configuration no
 /// longer permits the frozen execution including its harness and connection
 /// (`current_policy_refused`), or the account is no longer bound to the
 /// provider for the model (`account_unbound_at_handoff`).
 fn handoff_blocker(
-    home: &Path,
     store: &Store,
     account: &agent_run_domain::catalog::AccountId,
-    identity: &ProviderLaunchIdentity,
+    policy: AccountPolicy,
 ) -> Result<Option<&'static str>> {
     let enabled = store
         .account(account)?
@@ -2612,18 +2677,13 @@ fn handoff_blocker(
     if !enabled {
         return Ok(Some("account_revoked_at_handoff"));
     }
-    let Ok((current, _)) = agent_run_config::provider_config::ProviderConfig::load(home) else {
+    let Ok((bound, unchanged)) = policy else {
         return Ok(Some("current_policy_refused"));
     };
-    if crate::service::current_policy_permits(&current, identity, &identity.provider_request)
-        .is_err()
-    {
-        return Ok(Some("current_policy_refused"));
-    }
-    if !current_bindings(&current, &identity.authority).contains(account) {
+    if !bound.contains(account) {
         return Ok(Some("account_unbound_at_handoff"));
     }
-    if !ordered_binding_unchanged(&current, account, identity) {
+    if !unchanged.contains(account) {
         return Ok(Some("current_policy_refused"));
     }
     Ok(None)
@@ -2631,7 +2691,7 @@ fn handoff_blocker(
 
 /// An ordered switch may only use the same frozen label and connection under
 /// current policy; removing the queue or redirecting a binding revokes it.
-fn ordered_binding_unchanged(
+pub(crate) fn ordered_binding_unchanged(
     current: &agent_run_config::provider_config::ProviderConfig,
     account: &agent_run_domain::catalog::AccountId,
     identity: &ProviderLaunchIdentity,
@@ -2683,7 +2743,7 @@ fn ordered_binding_unchanged(
 /// provider for the frozen model (a binding without a model subset binds
 /// every model). Empty when the provider is no longer configured. Current
 /// bindings only narrow the frozen authority; they never add an account.
-fn current_bindings(
+pub(crate) fn current_bindings(
     current: &agent_run_config::provider_config::ProviderConfig,
     authority: &agent_run_domain::catalog::ResolvedLaunchAuthority,
 ) -> std::collections::BTreeSet<agent_run_domain::catalog::AccountId> {

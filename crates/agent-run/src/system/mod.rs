@@ -23,7 +23,11 @@ pub async fn serve_worker(home: &std::path::Path, socket: &std::path::Path) -> c
     use tokio::task::JoinSet;
 
     let (listener, _guard) = crate::transport::socket::bind_shared(socket).await?;
-    let worker = Arc::new(Worker::new(std::env::current_exe()?, home.to_path_buf())?);
+    let worker = Arc::new(Worker::new(
+        std::env::current_exe()?,
+        home.to_path_buf(),
+        socket.to_path_buf(),
+    )?);
     let maintenance = std::env::var_os("AGENT_RUN_SYSTEM_OPERATOR_SOCKET").map(|socket| {
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(account_retention(
@@ -41,10 +45,12 @@ pub async fn serve_worker(home: &std::path::Path, socket: &std::path::Path) -> c
             _ = term.recv() => break,
             accepted = listener.accept(), if tasks.len() < 64 => {
                 let (stream, _) = accepted?;
+                let Ok(credentials) = stream.peer_cred() else { continue };
+                let peer_uid = credentials.uid();
                 let stream = stream.into_std()?;
                 stream.set_nonblocking(false)?;
                 let worker = worker.clone();
-                tasks.spawn_blocking(move || worker.serve_one(stream));
+                tasks.spawn_blocking(move || worker.serve_one(stream, peer_uid));
             }
             Some(result) = tasks.join_next(), if !tasks.is_empty() => {
                 if let Ok(Err(error)) = result {

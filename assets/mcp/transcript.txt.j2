@@ -9,7 +9,7 @@ raw_ref: {{ message.raw_ref }} (opaque)
 partial block: {% if message.partial_before %}earlier fragments omitted from this page{% endif %}{% if message.partial_before and message.partial_after %}; {% endif %}{% if message.partial_after %}later fragments continue{% endif %}
 {% endif %}
 {% if message.content_complete == false %}
-inline content incomplete{% if message.omitted_bytes %}: {{ message.omitted_bytes }} bytes omitted{% endif %}; request raw view at cursor {{ message.first_seq - 1 if message.first_seq else message.seq - 1 }} or inspect the opaque raw_ref
+inline content incomplete{% if message.omitted_bytes %}: {{ message.omitted_bytes }} bytes omitted{% endif %}; request raw view at cursor {{ message.first_seq - 1 if message.first_seq else message.seq - 1 }}; if the row exceeds the MCP budget, use the CLI/API transcript or answer for a completed result
 {% endif %}
 {% endfor %}
 {% if not complete %}

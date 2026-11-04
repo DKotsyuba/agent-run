@@ -4,6 +4,12 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- fix(system): recheck automatic account fallback through the broker and verify
+  resumed runtime assets under their owning worker's Unix account.
+- fix(mcp): return a verified artifact reference and retrieval metadata for
+  oversized answers, and a bounded preview for a single oversized transcript block.
+- fix(notices): explain provider billing failures without assuming a balance.
+
 ## 0.29.1
 
 - fix(macos): preserve buffered coordinator frames when a peer closes the Unix

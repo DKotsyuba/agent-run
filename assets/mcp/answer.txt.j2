@@ -1,6 +1,9 @@
 agent-run answer for {{ agent_id }}
 
 - Status: {{ status }}
+{% if sequence is not none %}
+- Execution sequence: {{ sequence }}
+{% endif %}
 {% if sha256 is not none %}
 - SHA-256: {{ sha256 }}
 {% endif %}
@@ -9,6 +12,11 @@ agent-run answer for {{ agent_id }}
 {% endif %}
 {% if available %}
 - Answer: available (verified){% if inline_complete %}, complete inline text below{% else %}; inline text absent or partial — full artifact: {{ kind }}{% if media_type %} ({{ media_type }}){% endif %}{% if path %} at {{ path }}{% endif %}{% if size_bytes %}, {{ size_bytes }} bytes{% endif %}{{ "" }}
+{% if sequence is not none and sha256 is not none %}
+- Retrieve via answer_chunk using this agent ID, sequence and SHA-256; start at offset_bytes=0.
+{% elif sequence is none %}
+- Execution sequence is temporarily unavailable; retry answer to retrieve it for answer_chunk.
+{% endif %}
 {% endif %}
 {% if content is not none %}
 {% if content == "" %}

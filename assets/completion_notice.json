@@ -18,6 +18,10 @@
     }
   },
   "failure_guidance": {
+    "billing_unavailable": {
+      "reason": "The selected account's provider reported a billing problem; its current balance is not established by this notice.",
+      "advice": "Check billing for that account and the recorded fallback status before retrying or continuing the task."
+    },
     "auth_failed": {
       "reason": "No usable runtime credential was available.",
       "advice": "Renew or log in to the runtime credential, verify auth with one canary, then retry with a fresh ID."

@@ -554,6 +554,7 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
                 crate::provider_admission::ProviderResume {
                     parent: &op.parent,
                     prefer: &op.prefer,
+                    preflight_digest: op.preflight_digest.as_deref(),
                 },
             )?)
         }

@@ -21,6 +21,30 @@ pub(super) struct Start {
     pub capability_sha256: String,
 }
 
+/// Read-only continuation proof for one stored parent and frozen route.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ResumePreflight {
+    pub operation: PreflightOperation,
+    pub parent: AgentId,
+    pub route_fingerprint: String,
+}
+
+/// The worker accepts no caller-supplied private path or snapshot contents.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum PreflightOperation {
+    ResumePreflight,
+}
+
+/// Existing start frames stay wire-compatible with the read-only request.
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub(super) enum Request {
+    Start(Start),
+    ResumePreflight(ResumePreflight),
+}
+
 /// The broker permits release only after its startup-owner write is durable.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,6 +61,12 @@ pub(super) enum Reply {
         backend: Backend,
     },
     Ready,
+    ResumeVerified {
+        digest: String,
+    },
+    ResumeRefused {
+        reason: agent_run_core::system_launch::ResumePreflightFailure,
+    },
     Refused {
         reason: String,
     },

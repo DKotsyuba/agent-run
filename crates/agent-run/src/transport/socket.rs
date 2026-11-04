@@ -640,7 +640,23 @@ const CLI_READ_METHODS: &[&str] = &[
     "_hook_context",
     "_hook_bind",
     "_runtime_retention",
+    "_system_policy",
 ];
+
+/// Returns only the broker's fixed policy verdict for a stored execution.
+/// No caller-supplied file path, credential or configuration is accepted.
+fn system_policy(service: &Service, params: Value) -> Result<Value> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Request {
+        execution: crate::domain::AgentId,
+    }
+    let request: Request = serde_json::from_value(params)
+        .map_err(|_| crate::error::invalid("invalid system policy request"))?;
+    Ok(serde_json::to_value(
+        service.system_current_policy(&request.execution),
+    )?)
+}
 
 /// Exposes configured runtime roots and path references, but no file contents.
 /// An invalid or unreadable configuration never authorizes account-local cleanup.
@@ -740,6 +756,7 @@ async fn respond_with_access(service: &Service, v: Value, access: SocketAccess) 
     ]
     .contains(&method);
     let known = known
+        && (method != "_system_policy" || matches!(access, SocketAccess::SystemGroup))
         && match access {
             SocketAccess::Private => true,
             SocketAccess::Operator => !worker_method,
@@ -750,6 +767,8 @@ async fn respond_with_access(service: &Service, v: Value, access: SocketAccess) 
     } else {
         let result = if method == "_runtime_retention" {
             runtime_retention_config(service, &params)
+        } else if method == "_system_policy" {
+            system_policy(service, params)
         } else {
             dispatch::call(service, method, params).await
         };

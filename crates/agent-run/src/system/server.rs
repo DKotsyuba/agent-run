@@ -1,6 +1,6 @@
 //! Unprivileged worker that launches only the existing supervisor.
 
-use super::wire::{self, Release, Reply, Start};
+use super::wire::{self, Release, Reply, Request};
 use agent_run_platform::{
     fs,
     launch::{self, StartedLaunch, Timeouts},
@@ -11,7 +11,7 @@ use std::path::Path;
 use std::{
     ffi::OsStr,
     io,
-    os::unix::net::UnixStream,
+    os::unix::{fs::MetadataExt, net::UnixStream},
     path::PathBuf,
     thread,
     time::{Duration, Instant},
@@ -21,24 +21,49 @@ use std::{
 pub struct Worker {
     program: PathBuf,
     home: PathBuf,
+    socket: PathBuf,
 }
 
 impl Worker {
-    /// Binds the fixed supervisor executable and shared state home for this worker.
-    pub fn new(program: PathBuf, home: PathBuf) -> io::Result<Self> {
-        if !program.is_absolute() || !home.is_absolute() {
+    /// Binds the supervisor, shared state and this worker's configured socket.
+    pub fn new(program: PathBuf, home: PathBuf, socket: PathBuf) -> io::Result<Self> {
+        if !program.is_absolute() || !home.is_absolute() || !socket.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "worker paths must be absolute",
             ));
         }
-        Ok(Self { program, home })
+        Ok(Self {
+            program,
+            home,
+            socket,
+        })
     }
 
     /// Handles one launch. The OS controls socket access. The broker must record
     /// the capability and spawned identity before it releases this child.
-    pub fn serve_one(&self, mut stream: UnixStream) -> io::Result<()> {
-        let start: Start = wire::read(&mut stream)?;
+    pub fn serve_one(&self, mut stream: UnixStream, peer_uid: u32) -> io::Result<()> {
+        let start = match wire::read(&mut stream)? {
+            Request::Start(start) => start,
+            Request::ResumePreflight(request) => {
+                let wire::PreflightOperation::ResumePreflight = request.operation;
+                let broker_uid = std::fs::metadata(&self.home)?.uid();
+                let verified = if peer_uid == broker_uid {
+                    agent_run_core::service::system_resume_preflight(
+                        &self.home,
+                        &request.parent,
+                        &self.socket,
+                        &request.route_fingerprint,
+                    )
+                } else {
+                    Err(agent_run_core::system_launch::ResumePreflightFailure::AccessDenied)
+                };
+                return match verified {
+                    Ok(digest) => wire::write(&mut stream, &Reply::ResumeVerified { digest }),
+                    Err(reason) => wire::write(&mut stream, &Reply::ResumeRefused { reason }),
+                };
+            }
+        };
         if !wire::lowercase_hex64(&start.capability_sha256) {
             return wire::write(
                 &mut stream,

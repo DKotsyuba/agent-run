@@ -56,6 +56,13 @@ in both channels. Chunk content is capped at 128 KiB before escaping; the comple
 encoded MCP result still passes the existing wire reserve check. Existing tools
 retain the text-first presentation policy below.
 
+An oversized verified `answer` instead returns bounded metadata, including its
+execution sequence and answer SHA-256, and links the existing local artifact
+when its managed path is recognizable. The file link requires host filesystem
+access; `answer_chunk` retrieves the same verified bytes over MCP. No new file
+or separate retention policy is introduced. A single oversized transcript block
+is marked incomplete and carries a bounded UTF-8 preview and its cursor.
+
 MiniJinja 2.24.0 uses only serde and fuel features. A closed embedded environment
 is parsed before forwarding work, with strict undefined values, plain text,
 recursion limit 16, 50,000 VM instructions and one explicitly registered pure
@@ -91,13 +98,14 @@ are text byte limits, not token counts. Pool pages retain a larger justified
 profile for exact shared messages and proposal snapshots. The presenter also
 serializes privately through a bounded writer to check the encoded MCP result,
 reserving 4096 bytes within the one-MiB frame for protocol framing. JSON escaping
-can exceed the wire budget even when text fits: the whole read then fails safely,
-with no rows or cursor published. Confirmed writes retain their receipt fallback.
+can exceed the wire budget even when text fits: a read fails safely when no
+bounded representation is available. Confirmed writes retain their receipt fallback.
 No tokenizer savings are claimed.
 
 Pages are budgeted before projection, then rendered into a bounded private
 writer. Every page row is displayed in source order or the entire page is
-refused. No partial buffer, shortened critical value or upstream continuation
+refused, except for the explicitly marked single-block transcript preview.
+No partial buffer, shortened critical value or upstream continuation
 for undisplayed rows is published. Narrow delegation guidance with exact
 provider/model/profile filters (also retained by the call-only models method);
 request smaller list/transcript limits; use CLI/socket for full documents or

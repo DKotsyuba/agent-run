@@ -137,6 +137,16 @@ impl agent_run_core::system_launch::SystemLauncher for RoutedFixture {
         Ok(self.route.lock().unwrap().clone())
     }
 
+    fn preflight_resume(
+        &self,
+        _parent: agent_run_domain::domain::AgentId,
+        _route: agent_run_core::system_launch::SystemRoute,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = agent_run_domain::Result<String>> + Send + 'static>,
+    > {
+        Box::pin(async { Err(agent_run_domain::Error::ExecutionChanged) })
+    }
+
     fn launch(
         &self,
         _home: std::path::PathBuf,

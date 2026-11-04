@@ -111,6 +111,9 @@ pub struct AdmitProviderResume {
     pub parent: AgentId,
     /// Account the parent's last attempt used.
     pub prefer: AccountId,
+    /// Optional digest of the parent and attempt verified by a system worker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preflight_digest: Option<String>,
 }
 
 /// Owned pool member admission source.

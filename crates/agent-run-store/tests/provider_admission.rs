@@ -1187,6 +1187,7 @@ fn prepared_storage_layout_gates_provider_resume_only() {
             ProviderResume {
                 parent: &admitted.agent_id,
                 prefer: &"acct-a".parse().unwrap(),
+                preflight_digest: None,
             },
         )
         .unwrap_err();
@@ -1226,6 +1227,49 @@ fn prepared_storage_layout_gates_provider_resume_only() {
             &prepared.layout_sha256,
         )
         .unwrap();
+    let stale = agent_run_store::provider_admission::resume_preflight_digest(
+        &store.conn,
+        &admitted.agent_id,
+    )
+    .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE attempts SET adapter_state_json='{\"changed\":true}' WHERE id=?",
+            [&admitted.attempt_id],
+        )
+        .unwrap();
+    let refused = store.admit_provider_resume(
+        &resume_request,
+        &resume_request.storage_projection(),
+        &catalog,
+        &authority,
+        &candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]),
+        &resume_identity,
+        8,
+        None,
+        None,
+        ProviderResume {
+            parent: &admitted.agent_id,
+            prefer: &"acct-a".parse().unwrap(),
+            preflight_digest: Some(&stale),
+        },
+    );
+    assert!(matches!(refused, Err(Error::ExecutionChanged)));
+    let children: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM agents WHERE parent_agent_id=?",
+            [admitted.agent_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(children, 0);
+    let current = agent_run_store::provider_admission::resume_preflight_digest(
+        &store.conn,
+        &admitted.agent_id,
+    )
+    .unwrap();
     let resumed = store
         .admit_provider_resume(
             &resume_request,
@@ -1240,8 +1284,29 @@ fn prepared_storage_layout_gates_provider_resume_only() {
             ProviderResume {
                 parent: &admitted.agent_id,
                 prefer: &"acct-a".parse().unwrap(),
+                preflight_digest: Some(&current),
             },
         )
         .unwrap();
     assert!(resumed.created);
+    let replay = store
+        .admit_provider_resume(
+            &resume_request,
+            &resume_request.storage_projection(),
+            &catalog,
+            &authority,
+            &candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]),
+            &resume_identity,
+            8,
+            None,
+            None,
+            ProviderResume {
+                parent: &admitted.agent_id,
+                prefer: &"acct-a".parse().unwrap(),
+                preflight_digest: Some(&stale),
+            },
+        )
+        .unwrap();
+    assert!(!replay.created);
+    assert_eq!(replay.agent_id, resumed.agent_id);
 }

@@ -261,6 +261,22 @@ fn observation_live_mcp_and_cli_preserve_structured_read_results() {
             None,
         )
         .unwrap();
+    let (medium_id, _) = store.admit(&request, &config, &json!({}), None).unwrap();
+    let medium_root = harness.home.join("agents").join(medium_id.as_str());
+    agent_run_platform::fs::private_dir(&medium_root).unwrap();
+    let medium_text = "a".repeat(16_000);
+    let medium_proof =
+        agent_run_platform::verify::seal(&medium_root, Path::new("answer.md"), &medium_text)
+            .unwrap();
+    store.running(&medium_id, 43).unwrap();
+    store
+        .finish(
+            &medium_id,
+            &agent_run_domain::domain::Outcome::success(None),
+            Some(&medium_proof),
+            None,
+        )
+        .unwrap();
     let revision = store.revision().unwrap();
     drop(store);
     harness.start_broker();
@@ -280,6 +296,44 @@ fn observation_live_mcp_and_cli_preserve_structured_read_results() {
     assert_eq!(
         serde_json::from_slice::<Value>(&cli_caps.stdout).unwrap(),
         *caps
+    );
+    // The normal answer RPC returns recovery facts instead of dropping a
+    // verified inline answer that exceeds the MCP presentation budget.
+    let answer = mcp.send(json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"answer","arguments":{"agent_id":medium_id}}})).unwrap();
+    assert_ne!(answer["result"]["isError"], true, "{answer}");
+    let metadata = &answer["result"]["structuredContent"];
+    assert_eq!(metadata["sequence"], 1);
+    assert_eq!(metadata["sha256"], medium_proof.sha256);
+    assert_eq!(metadata["size_bytes"], medium_text.len());
+    assert!(
+        answer["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "resource_link")
+    );
+    let mut medium = String::new();
+    let mut medium_offset = 0;
+    loop {
+        let args = json!({"agent_id":medium_id,"sequence":metadata["sequence"],"expected_sha256":metadata["sha256"],"offset_bytes":medium_offset,"max_bytes":4096});
+        let response = mcp.send(json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"answer_chunk","arguments":args}})).unwrap();
+        assert_ne!(response["result"]["isError"], true, "{response}");
+        let chunk = &response["result"]["structuredContent"];
+        medium.push_str(chunk["content"].as_str().unwrap());
+        medium_offset = chunk["next_offset"].as_u64().unwrap();
+        if chunk["complete"] == true {
+            break;
+        }
+    }
+    assert_eq!(medium, medium_text);
+    // The socket may itself omit inline text when JSON escaping exceeds its
+    // frame budget; MCP must still return the same verified recovery facts.
+    let large_answer = mcp.send(json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"answer","arguments":{"agent_id":id}}})).unwrap();
+    assert_ne!(large_answer["result"]["isError"], true, "{large_answer}");
+    assert_eq!(large_answer["result"]["structuredContent"]["sequence"], 1);
+    assert_eq!(
+        large_answer["result"]["structuredContent"]["sha256"],
+        proof.sha256
     );
     let mut offset = 0;
     let mut full = String::new();

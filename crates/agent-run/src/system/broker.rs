@@ -44,6 +44,15 @@ impl SystemLauncher for BrokerLauncher {
         self.config.route(&self.home, provider, harness)
     }
 
+    /// Runs the private-file preflight under the selected worker's UID.
+    fn preflight_resume(
+        &self,
+        parent: AgentId,
+        route: SystemRoute,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'static>> {
+        Box::pin(async move { super::client::preflight_resume(&parent, &route).await })
+    }
+
     /// Records the launch, requests one supervisor, and releases its capability
     /// only after the broker and frozen-route ownership fence is durable.
     fn launch(

@@ -693,6 +693,17 @@ mod tests {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
+    /// Billing failures name the provider issue without claiming a known balance.
+    #[test]
+    fn billing_guidance_does_not_report_an_unknown_failure() {
+        let (_, reason, advice) =
+            super::guidance(crate::domain::Status::Failed, Some("billing_unavailable"))
+                .unwrap()
+                .unwrap();
+        assert!(reason.contains("billing problem") && reason.contains("not established"));
+        assert!(advice.contains("fallback status"));
+    }
+
     /// Known persistence categories must not fall back to an unknown failure
     /// or turn a failed checkpoint write into a claim of lost process ownership.
     #[test]

@@ -442,6 +442,8 @@ struct TranscriptTextView {
 struct AnswerTextView {
     /// Exact stable identity.
     agent_id: String,
+    /// Current execution receipt when the broker can provide it.
+    sequence: Option<u32>,
     /// Validated lifecycle, independent of artifact availability.
     status: crate::domain::Status,
     /// Whether a sealed verified answer exists.
@@ -877,6 +879,132 @@ fn projected<T: serde::de::DeserializeOwned>(value: Value) -> Result<T> {
 /// for the JSON-RPC envelope. Checked before any result bytes reach stdout.
 const MAX_RESULT_WIRE_BYTES: usize = 1024 * 1024 - 4096;
 
+/// True when an answer needs retrieval metadata instead of a complete text page.
+pub(super) fn answer_needs_metadata(value: &Value) -> bool {
+    value["available"] == true
+        && (value["inline_complete"] == false
+            || validate_result("answer", value)
+                .and_then(|()| render("answer", value, budget("answer").bytes))
+                .is_err())
+}
+
+/// Drops only an oversized verified answer's inline bytes, retaining its proof.
+fn compact_answer(value: &Value) -> Option<Value> {
+    if value["available"] != true
+        || value["inline_complete"] != true
+        || !value["content"].is_string()
+    {
+        return None;
+    }
+    let size = value["size_bytes"].as_u64()?;
+    if size == 0 || size > agent_run_platform::verify::MAX_ANSWER as u64 {
+        return None;
+    }
+    if !matches!(value["proof_version"].as_u64(), Some(1 | 2)) {
+        return None;
+    }
+    value["sha256"]
+        .as_str()?
+        .parse::<agent_run_domain::Sha256Digest>()
+        .ok()?;
+    value["path"].as_str()?;
+    let compact = json!({
+        "agent_id": value["agent_id"], "sequence": value["sequence"],
+        "status": value["status"], "available": true, "inline_complete": false,
+        "content": null, "path": value["path"], "relative_path": value["relative_path"],
+        "size_bytes": size, "sha256": value["sha256"], "kind": value["kind"],
+        "media_type": value["media_type"], "proof_version": value["proof_version"],
+    });
+    validate_result("answer", &compact).ok()?;
+    Some(compact)
+}
+
+/// Keeps a single oversized transcript block visible with an explicit preview.
+fn compact_transcript(value: &Value) -> Option<Value> {
+    let messages = value["messages"].as_array()?;
+    if messages.len() != 1 {
+        return None;
+    }
+    let message = &messages[0];
+    let content = message["content"].as_str()?;
+    if content.len() <= budget("transcript").content {
+        return None;
+    }
+    let mut end = content.len().min(4096);
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    let omitted = u64::try_from(content.len() - end).ok()?;
+    let known_omitted = match (
+        message["content_complete"].as_bool(),
+        message["omitted_bytes"].as_u64(),
+    ) {
+        (_, Some(previous)) => Some(previous.checked_add(omitted)?),
+        (Some(true), None) => Some(omitted),
+        _ => None,
+    };
+    let mut compact = value.clone();
+    compact["messages"][0]["content"] = json!(&content[..end]);
+    compact["messages"][0]["content_complete"] = json!(false);
+    compact["messages"][0]["omitted_bytes"] = json!(known_omitted);
+    validate_result("transcript", &compact).ok()?;
+    Some(compact)
+}
+
+/// Links only the existing verified answer file, without creating another copy.
+fn answer_file_resource(value: &Value) -> Option<rmcp::model::Resource> {
+    use std::path::{Component, Path};
+
+    if value["available"] != true || value["inline_complete"] != false {
+        return None;
+    }
+    let size = value["size_bytes"].as_u64()?;
+    if size == 0 || size > agent_run_platform::verify::MAX_ANSWER as u64 {
+        return None;
+    }
+    if !matches!(value["proof_version"].as_u64(), Some(1 | 2)) {
+        return None;
+    }
+    value["sha256"]
+        .as_str()?
+        .parse::<agent_run_domain::Sha256Digest>()
+        .ok()?;
+    let raw = value["path"].as_str()?;
+    let path = Path::new(raw);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+        || value["relative_path"].as_str()? != "answer.md"
+        || path.file_name()?.to_str()? != "answer.md"
+    {
+        return None;
+    }
+    let run = path.parent()?;
+    run.file_name()?
+        .to_str()?
+        .parse::<crate::domain::AgentId>()
+        .ok()?;
+    if run.parent()?.file_name()?.to_str()? != "agents" {
+        return None;
+    }
+    let mut uri = String::from("file://");
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~') {
+            uri.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut uri, "%{byte:02X}").ok()?;
+        }
+    }
+    Some(
+        rmcp::model::Resource::new(uri, "answer.md")
+            .with_description("Existing Agent Run answer; access follows host permissions.")
+            .with_mime_type("text/markdown")
+            .with_size(size),
+    )
+}
+
 /// Builds a reply from successful broker JSON at the real transport boundary.
 /// Receipt capture precedes all projection and formatting; writes never replay.
 #[must_use]
@@ -908,16 +1036,42 @@ pub fn success_result_with_request(
         .map(|id| format!("Request: {id}\n"))
         .unwrap_or_default();
     let limit = budget(tool).bytes.saturating_sub(request_line.len());
-    let rendered = validate_result(tool, value)
+    let mut rendered = validate_result(tool, value)
         .and_then(|()| render(tool, value, limit))
         .map(|mut text| {
             text.push_str(&request_line);
             text
         });
+    let mut compact = None;
+    if rendered.is_err() {
+        compact = match tool {
+            "answer" => compact_answer(value),
+            "transcript" => compact_transcript(value),
+            _ => None,
+        };
+        if let Some(page) = compact.as_ref() {
+            rendered = render(tool, page, limit).map(|mut text| {
+                text.push_str(&request_line);
+                text
+            });
+        }
+    }
     let mut result = match rendered {
         Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
         Err(_) => receipt.fallback(tool),
     };
+    let displayed = compact.as_ref().unwrap_or(value);
+    if tool == "answer"
+        && result.is_error != Some(true)
+        && let Some(resource) = answer_file_resource(displayed)
+    {
+        result.structured_content = Some(json!({
+            "agent_id": displayed["agent_id"], "sequence": displayed["sequence"],
+            "size_bytes": displayed["size_bytes"], "sha256": displayed["sha256"],
+            "path": displayed["path"], "inline_complete": false,
+        }));
+        result.content.push(ContentBlock::resource_link(resource));
+    }
     if matches!(tool, "start" | "resume")
         && let (Some(id), Some(sequence)) = (&receipt.identity, receipt.sequence)
     {
@@ -2110,7 +2264,7 @@ fn transcript_context(value: &Value) -> Value {
 /// Answer context: availability plus the full inline text or retrieval facts.
 fn answer_context(value: &Value) -> Value {
     json!({
-        "agent_id": value["agent_id"], "status": value["status"],
+        "agent_id": value["agent_id"], "sequence": value["sequence"].as_u64(), "status": value["status"],
         "available": value["available"],
         "inline_complete": value["inline_complete"],
         "content": value["content"].as_str(),
@@ -2374,6 +2528,84 @@ fn exact_display(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A long verified answer keeps its proof and existing file without inline overflow.
+    #[test]
+    fn large_answer_presents_existing_file_and_retrieval_proof() {
+        let id = "ag-20261104-182921-bede60ade1";
+        let body = "я".repeat(8_000);
+        let digest = agent_run_platform::fs::sha256(body.as_bytes());
+        let path = format!("/srv/agent run/agents/{id}/answer.md");
+        let value = serde_json::json!({
+            "agent_id":id, "sequence":1, "status":"succeeded", "available":true,
+            "inline_complete":true, "content":body, "path":path,
+            "relative_path":"answer.md", "size_bytes":16_000, "sha256":digest,
+            "kind":"agent_answer", "media_type":"text/markdown; charset=utf-8", "proof_version":2
+        });
+        let result = super::success_result("answer", &value);
+        assert_ne!(result.is_error, Some(true));
+        let wire = serde_json::to_value(&result).unwrap();
+        let text = wire["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Execution sequence: 1") && text.contains(&digest));
+        assert!(text.contains("answer_chunk") && !text.contains(&"я".repeat(100)));
+        assert_eq!(wire["structuredContent"]["sha256"], digest);
+        assert_eq!(wire["structuredContent"]["size_bytes"], 16_000);
+        assert_eq!(wire["content"][1]["type"], "resource_link");
+        assert!(
+            wire["content"][1]["uri"]
+                .as_str()
+                .unwrap()
+                .contains("agent%20run")
+        );
+        assert!(serde_json::to_vec(&result).unwrap().len() < 16 * 1024);
+
+        // A transient failure to retrieve supplemental sequence metadata must
+        // leave the artifact reference available and explain how to retry.
+        let mut without_sequence = value;
+        without_sequence.as_object_mut().unwrap().remove("sequence");
+        let result = super::success_result("answer", &without_sequence);
+        assert_ne!(result.is_error, Some(true));
+        let wire = serde_json::to_value(&result).unwrap();
+        assert!(
+            wire["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("retry answer")
+        );
+    }
+
+    /// Missing or malformed proof cannot be transformed into a verified file link.
+    #[test]
+    fn oversized_answer_without_valid_proof_fails_closed() {
+        let value = serde_json::json!({
+            "agent_id":"ag-20261104-182921-bede60ade1", "status":"succeeded",
+            "available":true, "inline_complete":true, "content":"x".repeat(16_000),
+            "path":"/srv/unsafe/answer.md", "relative_path":"answer.md", "size_bytes":16_000,
+            "sha256":"not-a-digest", "kind":"agent_answer", "proof_version":2
+        });
+        let result = super::success_result("answer", &value);
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(result.content.len(), 1);
+    }
+
+    /// One large block keeps its cursor and reports an explicit UTF-8-safe omission.
+    #[test]
+    fn oversized_transcript_block_keeps_its_navigation() {
+        let value = serde_json::json!({
+            "agent_id":"ag-20261104-182921-bede60ade1", "view":"blocks",
+            "direction":"backward", "next_cursor":null, "previous_cursor":3,
+            "complete":false, "messages":[{"seq":5,"first_seq":3,"last_seq":5,
+            "role":"tool_call","name":"finish","content":"я".repeat(8_000),
+            "raw_ref":"opaque-ref","content_complete":true,"omitted_bytes":0}]
+        });
+        let result = super::success_result("transcript", &value);
+        assert_ne!(result.is_error, Some(true));
+        let wire = serde_json::to_value(&result).unwrap();
+        let text = wire["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("previous_cursor: 3") && text.contains("opaque-ref"));
+        assert!(text.contains("11904 bytes omitted") && text.contains("CLI/API transcript"));
+        assert!(text.len() < 16 * 1024);
+    }
+
     /// Malformed broker identities cannot forge plain-text structure through any
     /// public result family; write uncertainty keeps only the original retry key.
     #[test]

@@ -161,6 +161,12 @@ is transport metadata, not another agent identifier; orchestrators use only
 keep the structured contracts documented here.
 The additive `capabilities` and `answer_chunk` methods return their exact
 structured result in MCP `structuredContent`, with a fixed text summary.
+When an answer exceeds the MCP text budget, `answer` returns a bounded summary
+with the verified artifact size, SHA-256 and execution sequence, plus a link to
+the existing local answer file where its managed path permits one. Access to
+that file follows operating-system permissions; `answer_chunk` provides the
+content over MCP without direct filesystem access. The artifact remains subject
+to the existing history retention policy.
 
 The current MCP contract, byte/row budgets, protocol-versus-business error
 channels, and status-preserving presentation fallback are documented in

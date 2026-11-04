@@ -33,6 +33,12 @@ schema-version-1 product facts, transport limits and actual read-method schemas.
 Source revision is null without verified build provenance. Retain `ping`/`tools`
 fallback for older brokers; discovery starts no provider collection or work.
 
+When an answer is too large for the MCP text budget, `answer` returns the
+existing verified artifact's path, size, SHA-256 and execution sequence. A file
+link follows the host's normal permissions. No extra answer copy is created;
+the existing history retention also governs this file. If the path is not
+accessible, retrieve the answer through `answer_chunk`.
+
 For complete large answers, `answer_chunk` (CLI `answer-chunk`) requires the
 current `agent_id`, positive `sequence`, verified `expected_sha256` and UTF-8
 `offset_bytes`. Continue with returned `next_offset` and the same fences; the

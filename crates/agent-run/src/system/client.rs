@@ -1,6 +1,6 @@
 //! Broker half of the one-shot launch handshake.
 
-use super::wire::{self, Backend, Release, Reply, Start};
+use super::wire::{self, Backend, PreflightOperation, Release, Reply, ResumePreflight, Start};
 use agent_run_domain::domain::AgentId;
 use agent_run_platform::{
     fs,
@@ -11,9 +11,71 @@ use std::{
     fmt,
     future::Future,
     io,
-    os::unix::net::UnixStream,
+    os::unix::{
+        fs::{FileTypeExt, MetadataExt},
+        net::UnixStream,
+    },
     time::{Duration, Instant},
 };
+
+/// Ask the configured account worker to verify a stored parent without
+/// admitting work. Only its socket owner's kernel UID is accepted as a peer.
+pub(super) async fn preflight_resume(
+    parent: &AgentId,
+    route: &agent_run_core::system_launch::SystemRoute,
+) -> agent_run_domain::Result<String> {
+    use agent_run_core::system_launch::ResumePreflightFailure as Failure;
+    let metadata = std::fs::symlink_metadata(&route.worker_socket).map_err(preflight_io_error)?;
+    if !metadata.file_type().is_socket() {
+        return Err(preflight_error(Failure::WorkerUnavailable));
+    }
+    let stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::UnixStream::connect(&route.worker_socket),
+    )
+    .await
+    .map_err(|_| preflight_error(Failure::WorkerTimeout))?
+    .map_err(preflight_io_error)?;
+    if stream.peer_cred().map_err(preflight_io_error)?.uid() != metadata.uid() {
+        return Err(preflight_error(Failure::AccessDenied));
+    }
+    let mut stream = stream.into_std().map_err(preflight_io_error)?;
+    let request = ResumePreflight {
+        operation: PreflightOperation::ResumePreflight,
+        parent: parent.clone(),
+        route_fingerprint: route.fingerprint.as_str().to_owned(),
+    };
+    let reply = tokio::task::spawn_blocking(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        wire::write_until(&mut stream, &request, deadline)?;
+        wire::read_until::<Reply>(&mut stream, deadline)
+    })
+    .await
+    .map_err(|_| preflight_error(Failure::WorkerUnavailable))?
+    .map_err(preflight_io_error)?;
+    match reply {
+        Reply::ResumeVerified { digest } if wire::lowercase_hex64(&digest) => Ok(digest),
+        Reply::ResumeRefused { reason } => Err(preflight_error(reason)),
+        _ => Err(preflight_error(Failure::WorkerUnavailable)),
+    }
+}
+
+/// Keeps native I/O errors out of the public continuation response.
+fn preflight_io_error(error: io::Error) -> agent_run_domain::Error {
+    use agent_run_core::system_launch::ResumePreflightFailure as Failure;
+    preflight_error(match error.kind() {
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => Failure::WorkerTimeout,
+        io::ErrorKind::PermissionDenied => Failure::AccessDenied,
+        _ => Failure::WorkerUnavailable,
+    })
+}
+
+/// Maps a closed worker reason into the existing typed domain error.
+fn preflight_error(
+    reason: agent_run_core::system_launch::ResumePreflightFailure,
+) -> agent_run_domain::Error {
+    agent_run_domain::Error::Unsupported(format!("continuation_unavailable: {}", reason.code()))
+}
 
 /// Failure classes for a launch; none authorizes retrying the same execution.
 #[derive(Debug)]
@@ -221,4 +283,24 @@ impl PendingLaunch {
 /// Produce a nonsecret invalid-protocol error.
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// I/O refusals keep a stable class without rendering native error details.
+    #[test]
+    fn preflight_io_failures_are_classified_without_source_text() {
+        for (kind, code) in [
+            (io::ErrorKind::NotFound, "worker_unavailable"),
+            (io::ErrorKind::TimedOut, "worker_timeout"),
+            (io::ErrorKind::PermissionDenied, "access_denied"),
+        ] {
+            let error = preflight_io_error(io::Error::new(kind, "PRIVATE_PATH_AND_TOKEN"));
+            let text = error.to_string();
+            assert!(text.contains(code));
+            assert!(!text.contains("PRIVATE_PATH_AND_TOKEN"));
+        }
+    }
 }

@@ -48,6 +48,45 @@ pub struct ProviderResume<'a> {
     /// Account the parent's last attempt used; an automatic resume keeps it
     /// while it is still a valid candidate and switches only when it is not.
     pub prefer: &'a AccountId,
+    /// Read-only system-worker proof of the unchanged parent and last attempt.
+    pub preflight_digest: Option<&'a str>,
+}
+
+/// Fingerprints the exact parent and last-attempt evidence used by a system
+/// resume preflight, without exposing the stored request, paths or history.
+pub fn resume_preflight_digest(conn: &rusqlite::Connection, parent: &AgentId) -> Result<String> {
+    type ParentAttempt = (
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        String,
+        String,
+        Option<String>,
+        String,
+        i64,
+    );
+    let row: ParentAttempt = conn.query_row(
+        "SELECT a.request_json,a.identity_json,a.status,a.runtime_session_id,\
+         t.id,t.adapter_state_json,t.selected_account_id,t.phase,t.ownership_active \
+         FROM agents a JOIN attempts t ON t.agent_id=a.id \
+         WHERE a.id=?1 ORDER BY t.number DESC LIMIT 1",
+        [parent.as_str()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+            ))
+        },
+    )?;
+    Ok(canonical::sha256_hex(&serde_json::to_value(row)?, true))
 }
 
 /// Returns an existing v2 admission before consulting mutable configuration,
@@ -423,6 +462,11 @@ impl Store<'_> {
         let lineage = match resume {
             Some(resume) => {
                 let lineage = lineage::resume_parent(&tx, resume.parent)?;
+                if let Some(expected) = resume.preflight_digest
+                    && resume_preflight_digest(&tx, resume.parent)? != expected
+                {
+                    return Err(Error::ExecutionChanged);
+                }
                 let uncleaned: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM attempts WHERE agent_id=? \
                      AND (cleanup_proof_json IS NULL OR phase!='cleanup_complete')",

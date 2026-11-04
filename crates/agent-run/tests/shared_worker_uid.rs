@@ -5,7 +5,7 @@ use agent_run::{domain::AgentId, transport::socket};
 use agent_run_domain::catalog::{AccountRecord, AccountStatus};
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     os::unix::{
         fs::{MetadataExt, PermissionsExt, chown},
         process::CommandExt,
@@ -111,6 +111,7 @@ fn prepare_state() {
     let engine = std::env::var("AR_UID_ENGINE").unwrap();
     let codex = std::env::var_os("AR_UID_CODEX").is_some();
     let live = std::env::var_os("AR_UID_REAL").is_some();
+    let failover = std::env::var_os("AR_UID_FAILOVER").is_some();
     let (provider, harness, model, connection, family, credential) = if codex {
         (
             "codex",
@@ -144,12 +145,17 @@ fn prepare_state() {
     } else {
         ""
     };
+    let ordering = if failover {
+        "ordered_accounts=true\n"
+    } else {
+        ""
+    };
     agent_run_store::fixture::initialize(&state).unwrap();
     fs::create_dir(state.join("agents")).unwrap();
     fs::create_dir(state.join("profiles")).unwrap();
     fs::write(state.join("profiles/review.md"), "+++\nrevision='1'\nwrite=false\nnetwork=false\nallow_external_read_roots=false\nskills=[]\nmcp=[]\nrequired_constraints=[]\n+++\nReview safely.\n").unwrap();
     fs::write(state.join("config.toml"), format!(
-        "schema_version=2\n[harnesses.codex]\nbinary='{engine}'\nhome='{0}/codex'\n[harnesses.claude-code]\nbinary='{engine}'\nhome='{0}/claude'\n[providers.{provider}]\nharness='{harness}'\nconnection={connection}\nauth_family='{family}'\nlimits_source='none'\n[[providers.{provider}.models]]\nid='{model}'\n{model_params}[[providers.{provider}.bindings]]\nlabel='fixture'\naccount='fixture-account'\n", private.display())).unwrap();
+        "schema_version=2\n[harnesses.codex]\nbinary='{engine}'\nhome='{0}/codex'\n[harnesses.claude-code]\nbinary='{engine}'\nhome='{0}/claude'\n[providers.{provider}]\nharness='{harness}'\nconnection={connection}\nauth_family='{family}'\nlimits_source='none'\n{ordering}[[providers.{provider}.models]]\nid='{model}'\n{model_params}[[providers.{provider}.bindings]]\nlabel='fixture'\naccount='fixture-account'\n", private.display())).unwrap();
     agent_run_store::fixture::open(&state)
         .unwrap()
         .register_account(&AccountRecord {
@@ -159,6 +165,19 @@ fn prepare_state() {
             status: AccountStatus::Enabled,
         })
         .unwrap();
+    if failover {
+        writeln!(fs::OpenOptions::new().append(true).open(state.join("config.toml")).unwrap(),
+            "\n[[providers.claude.bindings]]\nlabel='reserve'\naccount='fixture-sub'\npriority_multiplier=0.5\nconnection={{kind='native'}}").unwrap();
+        agent_run_store::fixture::open(&state)
+            .unwrap()
+            .register_account(&AccountRecord {
+                account_id: "fixture-sub".parse().unwrap(),
+                auth_family: "anthropic".parse().unwrap(),
+                secret_ref: "named:claude-code:reserve".parse().unwrap(),
+                status: AccountStatus::Enabled,
+            })
+            .unwrap();
+    }
 }
 
 /// Starts and observes one run solely through the group-authorized API.
@@ -171,6 +190,7 @@ fn group_client() {
     let codex = std::env::var_os("AR_UID_CODEX").is_some();
     let live = std::env::var_os("AR_UID_REAL").is_some();
     let finish = std::env::var_os("AR_UID_FINISH").is_some();
+    let failover = std::env::var_os("AR_UID_FAILOVER").is_some();
     let (provider, model, task) = if codex {
         (
             "codex",
@@ -183,6 +203,8 @@ fn group_client() {
             "claude-haiku-4-5-20251001",
             "Reply with exactly OK. Do not use tools.",
         )
+    } else if failover {
+        ("claude", "fixture", "fixture:billing")
     } else if finish {
         ("claude", "fixture", "fixture:worker-finish")
     } else {
@@ -196,6 +218,9 @@ fn group_client() {
         let mut request = serde_json::json!({"provider":provider,"model":model,"profile":"review",
             "explicit_finish":finish,"task":task,"workdir":work,
             "account":"fixture","request_id":"real-uid-fixture"});
+        if failover {
+            request.as_object_mut().unwrap().remove("account");
+        }
         if codex {
             request["effort"] = serde_json::json!("low");
         }
@@ -221,6 +246,59 @@ fn group_client() {
             assert_eq!(answer["content"], "fixture callback answer");
         } else {
             assert_eq!(answer["content"], "fixture final answer\n");
+        }
+        if failover {
+            // Another group member can reach the worker socket, but cannot
+            // invoke the broker-only private-file preflight even with the
+            // genuine stored parent and route fingerprint.
+            let state = PathBuf::from(std::env::var_os("AR_UID_STATE").unwrap());
+            let worker = PathBuf::from(std::env::var_os("AR_UID_WORKER").unwrap());
+            let row = agent_run_store::writer::StoreReader::open(&state)
+                .unwrap()
+                .get(&id)
+                .unwrap();
+            let fingerprint = row.identity.unwrap()["system_route"]["fingerprint"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let request = serde_json::to_vec(&serde_json::json!({
+                "operation":"resume_preflight","parent":id,"route_fingerprint":fingerprint
+            }))
+            .unwrap();
+            let mut stream = std::os::unix::net::UnixStream::connect(worker).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .write_all(&(request.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(&request).unwrap();
+            let mut header = [0_u8; 4];
+            stream.read_exact(&mut header).unwrap();
+            let length = u32::from_be_bytes(header) as usize;
+            assert!(length <= 4096);
+            let mut bytes = vec![0; length];
+            stream.read_exact(&mut bytes).unwrap();
+            let refusal: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                refusal,
+                serde_json::json!({"kind":"resume_refused","reason":"access_denied"})
+            );
+            let child = socket::client_at(
+                &api,
+                1000,
+                "resume",
+                serde_json::json!({
+                    "agent_id":id,"task":"fixture:answer","request_id":"real-uid-resume"
+                }),
+            )
+            .await
+            .unwrap();
+            let child: AgentId = child["agent_id"].as_str().unwrap().parse().unwrap();
+            let done = socket::client_at(&api, 1000, "wait", serde_json::json!({"agent_id":child}))
+                .await
+                .unwrap();
+            assert_eq!(done["status"], "succeeded", "continuation failed: {done}");
         }
     });
 }
@@ -267,6 +345,7 @@ async fn real_uid_shared_worker() {
     let live = std::env::var_os("AR_UID_REAL").is_some();
     let codex = std::env::var_os("AR_UID_CODEX").is_some();
     let finish = std::env::var_os("AR_UID_FINISH").is_some();
+    let failover = !live && !codex && !finish;
     let live_engine = (live || codex).then(|| fixture_path_env("AR_UID_LIVE_ENGINE"));
     let live_credential = (live && !codex).then(|| fixture_path_env("AR_UID_LIVE_CREDENTIAL_FILE"));
     let codex_home = codex.then(|| fixture_path_env("AR_UID_CODEX_HOME"));
@@ -359,6 +438,9 @@ async fn real_uid_shared_worker() {
     if codex {
         setup.env("AR_UID_CODEX", "1");
     }
+    if failover {
+        setup.env("AR_UID_FAILOVER", "1");
+    }
     assert!(setup.status().await.unwrap().success());
     let runtime = private.join(if codex { "codex" } else { "claude" });
     let runs = runtime.join("runs");
@@ -383,6 +465,17 @@ async fn real_uid_shared_worker() {
         configured_runtime.join("fixture").display()
     )
     .unwrap();
+    // Match production's broker-private config while keeping all data synthetic.
+    fs::set_permissions(state.join("config.toml"), fs::Permissions::from_mode(0o600)).unwrap();
+    if failover {
+        let mut directory = private.clone();
+        for name in ["accounts", "claude", "reserve", "claude-config"] {
+            directory.push(name);
+            fs::create_dir(&directory).unwrap();
+            chown(&directory, Some(target_uid), Some(target_uid)).unwrap();
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
     for path in [state.clone(), state.join("agents")] {
         chown(&path, Some(1000), Some(GROUP)).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o2750)).unwrap();
@@ -486,8 +579,15 @@ async fn real_uid_shared_worker() {
     client_command
         .args(["--ignored", "--exact", "group_client", "--nocapture"])
         .env("AR_UID_API", &api)
-        .env("AR_UID_WORK", &work)
+        // The fake engine confines its resumed history to its test workdir;
+        // this disposable root contains both the work and worker-private home.
+        .env("AR_UID_WORK", if failover { root } else { &work })
         .env("AR_UID_ID", &id_file);
+    if failover {
+        client_command
+            .env("AR_UID_STATE", &state)
+            .env("AR_UID_WORKER", &worker);
+    }
     if live {
         client_command.env("AR_UID_REAL", "1");
     }
@@ -496,6 +596,9 @@ async fn real_uid_shared_worker() {
     }
     if finish {
         client_command.env("AR_UID_FINISH", "1");
+    }
+    if failover {
+        client_command.env("AR_UID_FAILOVER", "1");
     }
     let client = client_command.spawn().unwrap();
     let status = tokio::time::timeout(Duration::from_secs(90), client.wait_with_output())
@@ -511,6 +614,18 @@ async fn real_uid_shared_worker() {
         );
     }
     let id = fs::read_to_string(id_file).unwrap();
+    if failover {
+        let reader = agent_run_store::writer::StoreReader::open(&state).unwrap();
+        let accounts: Vec<String> = reader
+            .conn()
+            .prepare("SELECT selected_account_id FROM attempts WHERE agent_id=? ORDER BY number")
+            .unwrap()
+            .query_map([&id], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(accounts, ["fixture-account", "fixture-sub"]);
+    }
     let answer = fs::metadata(state.join("agents").join(id).join("answer.md")).unwrap();
     assert_eq!((answer.uid(), answer.gid()), (target_uid, GROUP));
     assert_ne!(

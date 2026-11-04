@@ -492,6 +492,53 @@ impl Service {
             .ok_or_else(|| invalid("provider start requires schema_version 2"))
     }
 
+    /// Evaluates current policy for a stored system execution without returning
+    /// configuration, private paths, account identifiers or credential data.
+    pub fn system_current_policy(&self, id: &AgentId) -> crate::system_launch::CurrentPolicy {
+        use crate::system_launch::CurrentPolicy;
+        let frozen = Store::open(&self.home)
+            .and_then(|store| store.get(id))
+            .and_then(|row| ProviderLaunchIdentity::read(&row));
+        let Ok(frozen) = frozen else {
+            return CurrentPolicy::Refused;
+        };
+        let (Some(launcher), Some(route)) = (&self.system_launcher, &frozen.system_route) else {
+            return CurrentPolicy::Refused;
+        };
+        if route.state_home != self.home
+            || launcher
+                .route(&frozen.authority.provider, frozen.authority.harness)
+                .ok()
+                .as_ref()
+                != Some(route)
+        {
+            return CurrentPolicy::Refused;
+        }
+        let Ok((current, _)) = self.current_provider_config() else {
+            return CurrentPolicy::Unavailable;
+        };
+        if current_policy_permits(&current, &frozen, &frozen.provider_request).is_err() {
+            return CurrentPolicy::Refused;
+        }
+        let bound = supervisor::current_bindings(&current, &frozen.authority);
+        let accounts = &frozen.authority.eligible_accounts;
+        let authority = match serde_json::to_value(&frozen.authority) {
+            Ok(value) => value,
+            Err(_) => return CurrentPolicy::Refused,
+        };
+        CurrentPolicy::Allowed {
+            authority_sha256: agent_run_domain::canonical::sha256_hex(&authority, true),
+            bound: accounts
+                .iter()
+                .map(|account| bound.contains(account))
+                .collect(),
+            unchanged: accounts
+                .iter()
+                .map(|account| supervisor::ordered_binding_unchanged(&current, account, &frozen))
+                .collect(),
+        }
+    }
+
     /// Admits a strict provider request, choosing its account mechanically
     /// from persisted quota evidence; nothing is spawned.
     ///
@@ -1840,17 +1887,48 @@ impl Service {
         // shared layout verifies the same original index through its bound
         // trees, and a still-prepared row refuses — the parent's history is
         // never rebuilt from changed live sources.
-        crate::runtime_storage::verify(
-            &Store::open(&self.home)?,
-            &self.home,
-            &runtime_home,
-            frozen.authority.assets_sha256.as_str(),
-        )
-        .map_err(|_| {
-            Error::Unsupported(
-                "continuation_unavailable: parent runtime assets no longer verify".into(),
-            )
-        })?;
+        let preflight_digest =
+            if let (Some(launcher), Some(route)) = (&self.system_launcher, &frozen.system_route) {
+                // Bind the worker's read-only proof to the same parent snapshot
+                // that admission will use; the writer compares it again in its
+                // transaction after replay and lineage checks.
+                let expected = {
+                    let store = Store::open(&self.home)?;
+                    store.conn.execute_batch("BEGIN")?;
+                    let current = store.get(&parent.id)?;
+                    if current.identity != parent.identity
+                        || current.request != parent.request
+                        || current.runtime_session_id != parent.runtime_session_id
+                        || current.status != parent.status
+                    {
+                        return Err(Error::ExecutionChanged);
+                    }
+                    agent_run_store::provider_admission::resume_preflight_digest(
+                        &store.conn,
+                        &parent.id,
+                    )?
+                };
+                let actual = launcher
+                    .preflight_resume(parent.id.clone(), route.clone())
+                    .await?;
+                if actual != expected {
+                    return Err(Error::ExecutionChanged);
+                }
+                Some(expected)
+            } else {
+                crate::runtime_storage::verify(
+                    &Store::open(&self.home)?,
+                    &self.home,
+                    &runtime_home,
+                    frozen.authority.assets_sha256.as_str(),
+                )
+                .map_err(|_| {
+                    Error::Unsupported(
+                        "continuation_unavailable: parent runtime assets no longer verify".into(),
+                    )
+                })?;
+                None
+            };
         let (prefer, intent, pinned_id, adapter_state): (String, String, Option<String>, String) =
             Store::open(&self.home)?.conn.query_row(
                 "SELECT t.selected_account_id,a.selection_intent,a.requested_account_id,t.adapter_state_json \
@@ -1889,7 +1967,9 @@ impl Service {
         // handoff binds every harness to the launch plan's actual root.
         let expected_root = (authority.harness == agent_run_domain::catalog::HarnessId::Codex)
             .then_some(runtime_home.as_path());
-        verify_recorded_history(&adapter_state, &frozen, expected_root, session)?;
+        if preflight_digest.is_none() {
+            verify_recorded_history(&adapter_state, &frozen, expected_root, session)?;
+        }
         let bound: std::collections::BTreeSet<_> = offered
             .bindings
             .iter()
@@ -1987,6 +2067,7 @@ impl Service {
                         catalog: frozen_catalog.clone(),
                         parent: parent.id.clone(),
                         prefer: prefer.clone(),
+                        preflight_digest: preflight_digest.clone(),
                         inputs: agent_run_store::ops::AdmissionSpec {
                             request: request.clone(),
                             effective: effective.clone(),
@@ -2571,6 +2652,63 @@ pub(crate) fn current_policy_permits(
         return refuse("harness policy");
     }
     Ok(())
+}
+
+/// Verifies a system parent's assets and native history as its account-owned
+/// worker, returning only a digest of the unchanged parent and attempt rows.
+/// The worker socket and route fingerprint must match the stored route; no
+/// caller-supplied path is used to select the files being verified.
+pub fn system_resume_preflight(
+    home: &std::path::Path,
+    parent: &AgentId,
+    worker_socket: &std::path::Path,
+    route_fingerprint: &str,
+) -> std::result::Result<String, crate::system_launch::ResumePreflightFailure> {
+    use crate::system_launch::ResumePreflightFailure as Failure;
+    let store = Store::open(home).map_err(|_| Failure::ParentUnverifiable)?;
+    let before = agent_run_store::provider_admission::resume_preflight_digest(&store.conn, parent)
+        .map_err(|_| Failure::ParentUnverifiable)?;
+    let row = store.get(parent).map_err(|_| Failure::ParentUnverifiable)?;
+    let frozen = ProviderLaunchIdentity::read(&row).map_err(|_| Failure::ParentUnverifiable)?;
+    let route = frozen.system_route.as_ref().ok_or(Failure::RouteChanged)?;
+    if route.state_home != home
+        || route.worker_socket != worker_socket
+        || route.fingerprint.as_str() != route_fingerprint
+    {
+        return Err(Failure::RouteChanged);
+    }
+    if !row.status.terminal() {
+        return Err(Failure::ParentChanged);
+    }
+    let runtime_home = frozen
+        .runtime_home
+        .as_deref()
+        .ok_or(Failure::AssetsUnverifiable)?;
+    let session = row
+        .runtime_session_id
+        .as_deref()
+        .ok_or(Failure::HistoryUnverifiable)?;
+    crate::runtime_storage::verify(
+        &store,
+        &route.private_home,
+        runtime_home,
+        frozen.authority.assets_sha256.as_str(),
+    )
+    .map_err(|_| Failure::AssetsUnverifiable)?;
+    let state = store
+        .latest_attempt_state(parent)
+        .map_err(|_| Failure::HistoryUnverifiable)?;
+    let expected_root = (frozen.authority.harness == agent_run_domain::catalog::HarnessId::Codex)
+        .then_some(runtime_home);
+    verify_recorded_history(&state, &frozen, expected_root, session)
+        .map_err(|_| Failure::HistoryUnverifiable)?;
+    if agent_run_store::provider_admission::resume_preflight_digest(&store.conn, parent)
+        .map_err(|_| Failure::ParentUnverifiable)?
+        != before
+    {
+        return Err(Failure::ParentChanged);
+    }
+    Ok(before)
 }
 
 /// Verifies the native-history seal the supervisor recorded in the parent's

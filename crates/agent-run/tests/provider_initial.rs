@@ -2960,6 +2960,7 @@ async fn resume_selector_keeps_the_parent_account_until_it_is_unavailable() {
                 ProviderResume {
                     parent: &id,
                     prefer: &work,
+                    preflight_digest: None,
                 },
             );
         match expected {
