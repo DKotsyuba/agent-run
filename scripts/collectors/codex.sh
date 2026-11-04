@@ -4,8 +4,8 @@
 set -euo pipefail
 directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 context=$(cat)
-binary=$(printf '%s' "$context" | jq -er 'select(.version == 1) | .harness.command | select(type == "string" and startswith("/") and (contains("\u0000") | not))')
-login=$(printf '%s' "$context" | jq -er '.auth | select(.kind == "native_login") | .directory | select(type == "string" and startswith("/") and (contains("\u0000") | not))')
+binary=$(printf '%s' "$context" | jq -er 'select(.version == 1) | .harness.command | select(type == "string" and startswith("/") and ((explode | index(0)) == null))')
+login=$(printf '%s' "$context" | jq -er '.auth | select(.kind == "native_login") | .directory | select(type == "string" and startswith("/") and ((explode | index(0)) == null))')
 metadata=$(printf '%s' "$context" | jq -ec '{models,now}')
 umask 077
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/agent-run-quota.XXXXXXXX")

@@ -17,6 +17,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   credentials and report directories while retaining no-follow checks.
 - fix(runtime): capture a version probe's process identity before execution,
   preventing fast commands from being reported unavailable after they exit.
+- fix(collectors): accept valid Codex paths with jq 1.6 while still rejecting
+  embedded NUL characters before launching a collector.
 - feat(observation): retrieve large verified answers in execution-fenced chunks.
 - fix(opencode): restore compatibility with Bridge native-context ABI 2 and
   preserve the permission-checked tool context for native execution.

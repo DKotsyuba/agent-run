@@ -46,6 +46,57 @@ done
     path
 }
 
+/// NUL in either collector path is rejected before the native command runs.
+#[test]
+fn codex_collector_rejects_nul_paths_before_spawn() {
+    use std::{io::Write, process::Stdio};
+
+    let root = tempdir().unwrap();
+    let binary = root.path().join("fake-codex");
+    let login = root.path().join("login");
+    let marker = root.path().join("executed");
+    fs::create_dir(&login).unwrap();
+    fs::write(
+        &binary,
+        "#!/bin/sh\nprintf ran > \"$HOME/executed\"\nprintf '%s\\n' '{\"id\":1,\"result\":{}}' '{\"id\":2,\"result\":{\"rateLimitsByLimitId\":{}}}'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    let collector = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/collectors/codex.sh");
+    for corrupt_command in [true, false] {
+        let suffix = |corrupt| if corrupt { "\0" } else { "" };
+        let context = serde_json::json!({
+            "version": 1,
+            "harness": {"command": format!("{}{}", binary.display(), suffix(corrupt_command))},
+            "auth": {"kind": "native_login", "directory": format!("{}{}", login.display(), suffix(!corrupt_command))},
+            "models": [],
+            "now": 0,
+        });
+        let mut child = std::process::Command::new("/bin/bash")
+            .arg(&collector)
+            .env_clear()
+            .env("HOME", root.path())
+            .env("TMPDIR", root.path())
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(context.to_string().as_bytes())
+            .unwrap();
+        assert!(!child.wait().unwrap().success());
+        assert!(
+            !marker.exists(),
+            "a rejected path must not start the command"
+        );
+    }
+}
+
 /// Returns `(lane, window, remaining, payload)` rows stored for `account`.
 fn stored(home: &Path, account: &str) -> Vec<(String, String, f64, String)> {
     let conn = Connection::open(home.join("state.db")).unwrap();
