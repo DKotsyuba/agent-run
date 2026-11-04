@@ -796,11 +796,22 @@ fn operator_cli_rejects_untrusted_uid_before_writing() {
     let listener = UnixListener::bind(&fixture.socket).unwrap();
     let server = thread::spawn(move || {
         let mut stream = accept(&listener);
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
+        stream.set_nonblocking(true).unwrap();
         let mut byte = [0];
-        assert_eq!(stream.read(&mut byte).unwrap(), 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match stream.read(&mut byte) {
+                Ok(read) => {
+                    assert_eq!(read, 0);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "client did not close the socket");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("mock broker read failed: {error}"),
+            }
+        }
     });
     let output = fixture
         .operator(Some(uid().wrapping_add(1)))

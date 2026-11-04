@@ -849,35 +849,45 @@ fn long_rpc_ids_are_rejected_before_tool_dispatch() {
     let stop = stopped.clone();
     let broker = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+        'connections: while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(2)))
-                        .unwrap();
+                    stream.set_nonblocking(true).unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = Vec::new();
+                    let read_deadline = (Instant::now() + Duration::from_secs(2)).min(deadline);
+                    loop {
+                        match reader.read_until(b'\n', &mut line) {
+                            Ok(0) if line.is_empty() => continue 'connections,
+                            Ok(_) if line.last() == Some(&b'\n') => break,
+                            Ok(_) => panic!("fixture broker received a partial request"),
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                if Instant::now() >= read_deadline {
+                                    assert!(
+                                        line.is_empty(),
+                                        "fixture broker received a partial request"
+                                    );
+                                    continue 'connections;
+                                }
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(error)
+                                if line.is_empty()
+                                    && error.kind() == std::io::ErrorKind::ConnectionReset =>
+                            {
+                                continue 'connections;
+                            }
+                            Err(error) => panic!("fixture broker read: {error}"),
+                        }
+                    }
+                    let call: Value = serde_json::from_slice(&line).unwrap();
+                    assert_eq!(call["method"], "doc");
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_write_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
-                    let mut line = String::new();
-                    match BufReader::new(stream.try_clone().unwrap()).read_line(&mut line) {
-                        Ok(0) => continue,
-                        Err(error)
-                            if line.is_empty()
-                                && matches!(
-                                    error.kind(),
-                                    std::io::ErrorKind::WouldBlock
-                                        | std::io::ErrorKind::TimedOut
-                                        | std::io::ErrorKind::ConnectionReset
-                                ) =>
-                        {
-                            continue;
-                        }
-                        Ok(_) => {}
-                        Err(error) => panic!("fixture broker read: {error}"),
-                    }
-                    let call: Value = serde_json::from_str(&line).unwrap();
-                    assert_eq!(call["method"], "doc");
-                    seen.fetch_add(1, Ordering::SeqCst);
                     let response = json!({"jsonrpc":"2.0","id":call["id"],"result":{"text":"guide\n".repeat(1024)}});
                     writeln!(stream, "{response}").unwrap();
                 }
