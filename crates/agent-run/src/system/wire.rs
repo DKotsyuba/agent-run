@@ -4,7 +4,7 @@ use agent_run_domain::domain::AgentId;
 use agent_run_platform::process::Identity;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
-    io::{self, Read, Write},
+    io,
     os::{fd::AsRawFd, unix::net::UnixStream},
     time::{Duration, Instant},
 };
@@ -111,31 +111,59 @@ pub(super) fn read_until<T: DeserializeOwned>(
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-/// Read each partial chunk against the same deadline, including on nonblocking streams.
+/// Read each partial chunk against the same deadline without changing socket options.
+/// Per-call nonblocking I/O also permits draining buffered data after the peer closes.
 fn read_bytes(stream: &mut UnixStream, mut bytes: &mut [u8], deadline: Instant) -> io::Result<()> {
     while !bytes.is_empty() {
         wait_ready(stream, libc::POLLIN, deadline)?;
-        stream.set_read_timeout(Some(remaining(deadline)?))?;
-        match stream.read(bytes) {
-            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
-            Ok(read) => bytes = &mut bytes[read..],
-            Err(error) if retryable(&error) => continue,
-            Err(error) => return Err(error),
+        // SAFETY: the borrowed socket stays live and bytes is exclusively writable
+        // for its full length; recv neither retains the pointer nor exceeds that length.
+        let read = unsafe {
+            libc::recv(
+                stream.as_raw_fd(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        match read {
+            0 => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            read if read > 0 => bytes = &mut bytes[read as usize..],
+            _ => {
+                let error = io::Error::last_os_error();
+                if !retryable(&error) {
+                    return Err(error);
+                }
+            }
         }
     }
     Ok(())
 }
 
-/// Write each partial chunk against the same deadline, including on nonblocking streams.
+/// Write each partial chunk against the same deadline without changing socket options.
+/// A closed peer returns an I/O error instead of delivering SIGPIPE to this process.
 fn write_bytes(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
     while !bytes.is_empty() {
         wait_ready(stream, libc::POLLOUT, deadline)?;
-        stream.set_write_timeout(Some(remaining(deadline)?))?;
-        match stream.write(bytes) {
-            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
-            Ok(written) => bytes = &bytes[written..],
-            Err(error) if retryable(&error) => continue,
-            Err(error) => return Err(error),
+        // SAFETY: the borrowed socket and initialized byte slice outlive send;
+        // send only reads the supplied length and does not retain the pointer.
+        let written = unsafe {
+            libc::send(
+                stream.as_raw_fd(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        match written {
+            0 => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+            written if written > 0 => bytes = &bytes[written as usize..],
+            _ => {
+                let error = io::Error::last_os_error();
+                if !retryable(&error) {
+                    return Err(error);
+                }
+            }
         }
     }
     Ok(())
@@ -198,7 +226,100 @@ pub(super) fn lowercase_hex64(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{sync::mpsc, thread};
+    use std::{io::Write, sync::mpsc, thread};
+
+    /// A complete buffered frame survives peer closure, then the stream reports EOF.
+    #[test]
+    fn buffered_frame_remains_readable_after_peer_closes() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        write(&mut writer, &Reply::Ready).unwrap();
+        drop(writer);
+        assert!(matches!(read::<Reply>(&mut reader).unwrap(), Reply::Ready));
+        assert_eq!(
+            read::<serde_json::Value>(&mut reader).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    /// A closed peer with an incomplete header or body reports EOF, not a timeout.
+    #[test]
+    fn truncated_frame_after_peer_closes_reports_eof() {
+        for bytes in [&[0_u8, 0][..], &[0, 0, 0, 2, b'{'][..]] {
+            let (mut reader, mut writer) = UnixStream::pair().unwrap();
+            writer.write_all(bytes).unwrap();
+            drop(writer);
+            assert_eq!(
+                read::<serde_json::Value>(&mut reader).unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        }
+    }
+
+    /// MSG_NOSIGNAL protects even a process whose SIGPIPE disposition is the default.
+    #[test]
+    fn closed_peer_write_returns_broken_pipe_without_sigpipe() {
+        const CHILD: &str = "AGENT_RUN_WIRE_SIGPIPE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "system::wire::tests::closed_peer_write_returns_broken_pipe_without_sigpipe",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "child result: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("SIGPIPE_DEFAULT_VERIFIED"),
+                "child did not exercise the write: {output:?}"
+            );
+            return;
+        }
+
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            let disabled: libc::c_int = 0;
+            // SAFETY: writer is live and disabled is a correctly sized, initialized
+            // socket option. Clear any inherited suppression before closing the peer.
+            let result = unsafe {
+                libc::setsockopt(
+                    writer.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_NOSIGPIPE,
+                    (&disabled as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&disabled) as libc::socklen_t,
+                )
+            };
+            assert_eq!(result, 0);
+        }
+        drop(reader);
+        // SAFETY: only this isolated subprocess changes SIGPIPE. Both signal calls
+        // use a valid signal/disposition; the second verifies the installed default.
+        unsafe {
+            assert_ne!(libc::signal(libc::SIGPIPE, libc::SIG_DFL), libc::SIG_ERR);
+            assert_eq!(libc::signal(libc::SIGPIPE, libc::SIG_DFL), libc::SIG_DFL);
+        }
+        // SAFETY: sigemptyset initializes the valid output storage before use;
+        // sigaddset and pthread_sigmask borrow that initialized set only for each call.
+        unsafe {
+            let mut mask = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+            assert_eq!(libc::sigemptyset(mask.as_mut_ptr()), 0);
+            let mut mask = mask.assume_init();
+            assert_eq!(libc::sigaddset(&mut mask, libc::SIGPIPE), 0);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &mask, std::ptr::null_mut()),
+                0
+            );
+        }
+        assert_eq!(
+            write(&mut writer, &Reply::Ready).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        println!("SIGPIPE_DEFAULT_VERIFIED");
+    }
 
     /// A peer sending one byte repeatedly cannot renew the whole-frame deadline.
     #[test]

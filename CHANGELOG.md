@@ -4,8 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
-## 0.29.0
-
+- fix(macos): preserve buffered coordinator frames when a peer closes the Unix
+  socket, while keeping frame deadlines and bounded nonblocking I/O.
 - feat(claude): support an explicit ordered API-to-native-login queue that
   continues a verified session after an eligible billing or quota failure.
 - feat(linux): support an optional shared systemd service with account-owned
