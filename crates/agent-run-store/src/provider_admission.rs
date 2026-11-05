@@ -580,6 +580,7 @@ impl Store<'_> {
             tx.commit()?;
             return Ok(replay);
         }
+        crate::maintenance::require_admissions_open(&tx)?;
         let lineage = match resume {
             Some(resume) => {
                 let lineage = lineage::resume_parent(&tx, resume.parent)?;

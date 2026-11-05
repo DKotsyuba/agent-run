@@ -308,7 +308,7 @@ fn v32_shared_home_upgrade_and_paired_rollback_preserve_mode() {
         false,
     );
     assert!(ok, "{result}");
-    assert_eq!(version(&home.root), 33);
+    assert_eq!(version(&home.root), agent_run::state::VERSION as u32);
     assert_eq!(fs::metadata(&home.root).unwrap().mode() & 0o7777, 0o2750);
     let snapshot = result["snapshot"].as_str().unwrap();
     let (ok, result) = run(

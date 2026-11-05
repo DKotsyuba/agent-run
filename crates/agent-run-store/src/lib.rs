@@ -19,6 +19,22 @@ pub mod incidents;
 pub mod journal;
 /// Resume-parent proof and one-child lineage admission helpers.
 pub mod lineage;
+/// Admission-only durable maintenance epochs and immutable cohort capture.
+pub mod maintenance;
+/// Explicit parked cancellation after an exact broker-side death observation.
+pub mod maintenance_cancel;
+/// Staged exact-attempt checkpoint intent; never a terminal completion.
+pub mod maintenance_checkpoint;
+/// Pre-cleanup fence for a settled maintenance checkpoint.
+pub mod maintenance_closing;
+/// Proof-gated nonterminal parking; no production operation is exposed.
+pub mod maintenance_park;
+/// Exact never-spawned target ownership recovery without another allocation.
+pub mod maintenance_prepared;
+/// Same-agent maintenance allocation without any native process launch.
+pub mod maintenance_resume;
+/// Explicit cancellation of a dead supervisor's never-spawned successor.
+pub mod maintenance_target_cancel;
 /// Managed service generation, lease, gate and probe units of the sole writer.
 pub mod managed_services;
 pub mod migrations;
@@ -960,7 +976,7 @@ impl Store<'_> {
         let from: Status = s.parse()?;
         from.transition(Status::Running)?;
         tx.execute(
-            "UPDATE agents SET status='running',started_at=?,process_group_id=? WHERE id=?",
+            "UPDATE agents SET status='running',started_at=COALESCE(started_at,?),process_group_id=? WHERE id=?",
             params![now(), pgid, id.as_str()],
         )?;
         let provider: bool = tx.query_row(

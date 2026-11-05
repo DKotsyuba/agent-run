@@ -262,7 +262,8 @@ fn migration_28_to_29_preserves_legacy_requests() {
     store
         .conn
         .execute_batch(
-            "DROP TABLE binding_cooldowns; \
+            "DROP TABLE maintenance_resumes; DROP TABLE maintenance_parks; DROP TABLE maintenance_checkpoints; DROP TABLE maintenance_recipients; DROP TABLE maintenance_cohort; DROP TABLE maintenance_fences; \
+             DROP TABLE binding_cooldowns; \
              DROP TABLE worker_native_wakes; DROP TABLE worker_lifecycle; \
              DROP TABLE operation_receipts; DROP TABLE writer_producers; DROP TABLE writer_authority; \
              DROP TABLE bridge_delivery_intents; \

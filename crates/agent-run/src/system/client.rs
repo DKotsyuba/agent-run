@@ -60,6 +60,54 @@ pub(super) async fn preflight_resume(
     }
 }
 
+/// Ask the original account worker to inspect a fixed parked source. This is
+/// read-only; response hashes never grant a launch or replace current policy.
+pub(super) async fn preflight_maintenance_resume(
+    request: agent_run_core::system_launch::MaintenancePreflightRequest,
+    route: &agent_run_core::system_launch::SystemRoute,
+) -> agent_run_domain::Result<agent_run_core::system_launch::MaintenancePreflightResult> {
+    use agent_run_core::system_launch::ResumePreflightFailure as Failure;
+    request.validate()?;
+    let metadata = std::fs::symlink_metadata(&route.worker_socket).map_err(preflight_io_error)?;
+    if !metadata.file_type().is_socket() {
+        return Err(preflight_error(Failure::WorkerUnavailable));
+    }
+    let stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::UnixStream::connect(&route.worker_socket),
+    )
+    .await
+    .map_err(|_| preflight_error(Failure::WorkerTimeout))?
+    .map_err(preflight_io_error)?;
+    if stream.peer_cred().map_err(preflight_io_error)?.uid() != metadata.uid() {
+        return Err(preflight_error(Failure::AccessDenied));
+    }
+    let mut stream = stream.into_std().map_err(preflight_io_error)?;
+    let message = wire::MaintenancePreflight {
+        operation: wire::MaintenanceOperation::MaintenancePreflight,
+        request: request.clone(),
+        route_fingerprint: route.fingerprint.as_str().into(),
+    };
+    let reply = tokio::task::spawn_blocking(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        wire::write_until(&mut stream, &message, deadline)?;
+        wire::read_until::<Reply>(&mut stream, deadline)
+    })
+    .await
+    .map_err(|_| preflight_error(Failure::WorkerUnavailable))?
+    .map_err(preflight_io_error)?;
+    match reply {
+        Reply::MaintenanceVerified { result } => {
+            result
+                .validate_for(&request)
+                .map_err(|_| preflight_error(Failure::ParentChanged))?;
+            Ok(result)
+        }
+        Reply::ResumeRefused { reason } => Err(preflight_error(reason)),
+        _ => Err(preflight_error(Failure::WorkerUnavailable)),
+    }
+}
+
 /// Keeps native I/O errors out of the public continuation response.
 fn preflight_io_error(error: io::Error) -> agent_run_domain::Error {
     use agent_run_core::system_launch::ResumePreflightFailure as Failure;
@@ -288,6 +336,64 @@ fn invalid(message: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real local socket carries only the bounded source IDs/route hash;
+    /// replies must bind that exact source and a proven-dead owner generation.
+    #[tokio::test]
+    async fn maintenance_preflight_reply_is_exact_and_content_free() {
+        use agent_run_core::system_launch::{
+            MaintenancePreflightRequest, MaintenancePreflightResult, SystemRoute,
+        };
+        for matched in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let socket = temp.path().join("w");
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let request = MaintenancePreflightRequest {
+                epoch: 1,
+                execution: "ag-20261010-000000-0123456789".parse().unwrap(),
+                source_attempt_id: "attempt".into(),
+                source_proof_sha256: "a".repeat(64),
+            };
+            let expected = request.clone();
+            let thread = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let message: wire::MaintenancePreflight = wire::read(&mut stream).unwrap();
+                assert_eq!(message.request, expected);
+                let encoded = serde_json::to_string(&message).unwrap();
+                assert!(encoded.len() < 4096);
+                assert!(!encoded.contains("private_home"));
+                assert!(!encoded.contains("checkpoint"));
+                wire::write(
+                    &mut stream,
+                    &Reply::MaintenanceVerified {
+                        result: MaintenancePreflightResult {
+                            source_proof_sha256: if matched {
+                                "a".repeat(64)
+                            } else {
+                                "b".repeat(64)
+                            },
+                            verified_history_sha256: "c".repeat(64),
+                            supervisor_state: process::ProcessState::Dead,
+                        },
+                    },
+                )
+                .unwrap();
+            });
+            let route = SystemRoute {
+                provider: "codex".parse().unwrap(),
+                harness: agent_run_domain::catalog::HarnessId::Codex,
+                state_home: temp.path().into(),
+                private_home: temp.path().join("private"),
+                operator_socket: temp.path().join("operator"),
+                writer_socket: temp.path().join("writer"),
+                worker_socket: socket,
+                fingerprint: "d".repeat(64).parse().unwrap(),
+            };
+            let result = preflight_maintenance_resume(request, &route).await;
+            assert_eq!(result.is_ok(), matched);
+            thread.join().unwrap();
+        }
+    }
 
     /// I/O refusals keep a stable class without rendering native error details.
     #[test]

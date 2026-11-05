@@ -13,8 +13,8 @@ use agent_run_domain::{
 };
 use agent_run_store::{
     ops::{
-        AcceptWorkerFinish, NotifyOrchestrator, PoolOutcome, PoolWrite, PoolWriteSpec,
-        RegisterWorkerCatalog,
+        AcceptMaintenanceCheckpoint, AcceptWorkerFinish, NotifyOrchestrator, PoolOutcome,
+        PoolWrite, PoolWriteSpec, RegisterWorkerCatalog,
     },
     writer::{CatalogPreflight, StoreReader},
 };
@@ -49,6 +49,20 @@ struct Id {
     /// Exact execution within that lineage; omission selects the latest.
     #[serde(default)]
     run_id: Option<AgentId>,
+}
+
+/// Operator request to capture an idempotent planned-maintenance cohort.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceBegin {
+    request_id: String,
+}
+
+/// Exact open epoch for a deferral request.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceEpoch {
+    epoch: i64,
 }
 
 /// Socket-only CLI answer page and the opaque fence from the initial selection.
@@ -582,6 +596,38 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
             .await
             .map_err(|_| crate::Error::Runtime("CLI transcript status read failed".into()))?
         }
+        "_cli_maintenance_status" => {
+            let _: Empty = args(raw)?;
+            let service = service.clone();
+            // A stalled read may outlive the response timeout, but its
+            // read-only connection cannot mutate state or create work.
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::task::spawn_blocking(move || service.maintenance_status()),
+            )
+            .await
+            .map_err(|_| crate::Error::Runtime("maintenance status read timed out".into()))?
+            .map_err(|_| crate::Error::Runtime("maintenance status read failed".into()))?
+        }
+        "_cli_maintenance_begin" => {
+            let request: MaintenanceBegin = args(raw)?;
+            Ok(serde_json::to_value(
+                service.begin_maintenance(&request.request_id).await?,
+            )?)
+        }
+        "_cli_maintenance_defer" => {
+            let request: MaintenanceEpoch = args(raw)?;
+            crate::maintenance_controller::defer(service, request.epoch).await?;
+            service.maintenance_status()
+        }
+        "_cli_maintenance_epoch" => {
+            let request: MaintenanceEpoch = args(raw)?;
+            let fence = service
+                .read(move |store| store.maintenance_fence(request.epoch))
+                .await?
+                .ok_or_else(|| invalid("unknown maintenance epoch"))?;
+            Ok(serde_json::to_value(fence)?)
+        }
         "start_pool" => {
             service
                 .start_pool(args::<agent_run_domain::pool::PoolStartRequest>(raw)?)
@@ -785,6 +831,28 @@ async fn worker_tool_call(
                 .local_as(
                     worker_authority(&call.run_id, &call.attempt_id),
                     AcceptWorkerFinish {
+                        execution: call.run_id,
+                        attempt: call.attempt_id,
+                        token: call.token,
+                        input,
+                        at: crate::domain::now(),
+                        // The writer handle replaces this with its pre-SQL verdict.
+                        guard: agent_run_domain::worker::FinishGuard::Unavailable,
+                    },
+                    BROKER_BUDGET,
+                )
+                .await?;
+            Ok(serde_json::to_value(receipt)?)
+        }
+        WorkerTool::MaintenancePause => {
+            let input: agent_run_domain::worker::MaintenancePauseRequest =
+                serde_json::from_value(call.input)
+                    .map_err(|_| invalid("invalid maintenance checkpoint arguments"))?;
+            let receipt = service
+                .lane("workers")?
+                .local_as(
+                    worker_authority(&call.run_id, &call.attempt_id),
+                    AcceptMaintenanceCheckpoint {
                         execution: call.run_id,
                         attempt: call.attempt_id,
                         token: call.token,

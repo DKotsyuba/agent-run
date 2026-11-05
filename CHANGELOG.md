@@ -6,6 +6,11 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## 0.29.3
 
+- feat(runtime): prepare a planned restart by fencing new work, notifying
+  orchestrators, and resuming verified Codex and Claude sessions after restart.
+  Unverified background work defers the restart instead of interrupting it.
+- feat(quotas): support optional account-owned subscription probes for the
+  shared Linux broker without sharing login credentials.
 - fix(claude): temporarily skip an ordered account for one hour after a
   confirmed billing or quota failure, including for subsequent executions.
 - feat(linux): add a shared systemd service with account-owned workers and

@@ -4,6 +4,40 @@
 mod common;
 use serde_json::json;
 
+/// A settlement event receives its own durable sequence after all buffered
+/// journal rows, so a later park can refer to the exact evidence.
+#[tokio::test]
+async fn maintenance_settlement_event_returns_exact_ordered_sequence() {
+    let home = common::Home::new();
+    let (id, _) = home
+        .store()
+        .admit(&home.request(), &home.config, &json!({}), None)
+        .unwrap();
+    let mut store = home.store();
+    let prep = common::writer::prepare_supervisor(&mut store, &id);
+    drop(store);
+    let harness = common::writer::Harness::start(&home.path);
+    let mut persist = harness.supervisor(&home.path, prep, &id).await;
+    persist
+        .event(&id, "before_fixture", &json!({}))
+        .await
+        .unwrap();
+    let seq = persist
+        .event_durable_seq(
+            &id,
+            "maintenance_native_settled_v1",
+            &json!({"fixture":true}),
+        )
+        .await
+        .unwrap();
+    let rows: Vec<(i64, String)> = persist.conn.prepare(
+        "SELECT seq,kind FROM events WHERE agent_id=? AND kind IN ('before_fixture','maintenance_native_settled_v1') ORDER BY seq",
+    ).unwrap().query_map([id.as_str()], |r| Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].1, "before_fixture");
+    assert_eq!(rows[1], (seq, "maintenance_native_settled_v1".into()));
+}
+
 /// A transcript whose chunks are all control characters encodes six times
 /// larger than it is long: 32 valid 16 KiB chunks exceed the 2 MiB decoded
 /// bound of one `AppendJournal`, so they must be cut into several batches and

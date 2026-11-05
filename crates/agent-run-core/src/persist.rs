@@ -749,6 +749,34 @@ impl Persist {
         self.flush().await
     }
 
+    /// Persists one attempt-bound event and returns its exact sequence. An
+    /// uncertain result must be reconciled by operation identity, never by
+    /// reissuing the event under a fresh identity.
+    pub async fn event_durable_seq(
+        &mut self,
+        id: &AgentId,
+        kind: &str,
+        data: &Value,
+    ) -> Result<i64> {
+        self.own(id)?;
+        let seqs: Vec<i64> = self
+            .critical(ops::AppendJournal {
+                execution: id.clone(),
+                fragments: vec![JournalFragment::Event {
+                    kind: kind.into(),
+                    data: data.clone(),
+                    attempt: self.attempt.clone(),
+                }],
+            })
+            .await?;
+        match seqs.as_slice() {
+            [seq] => Ok(*seq),
+            _ => Err(crate::Error::Integrity(
+                "event sequence receipt is invalid".into(),
+            )),
+        }
+    }
+
     /// Buffers transcript text in bounded UTF-8 chunks without altering it.
     /// Bodies above the inline bound are spooled to the private agent
     /// directory first (filesystem work stays off the writer thread).
@@ -1470,6 +1498,78 @@ impl Persist {
         self.own(id)?;
         self.critical(ops::ObserveWorkerFinishReceipt {
             execution: id.clone(),
+        })
+        .await
+    }
+
+    /// Records the native receipt for this exact pinned maintenance attempt.
+    /// A receipt is not, by itself, proof of a settled turn or safe cleanup.
+    pub async fn observe_maintenance_checkpoint(
+        &mut self,
+        id: &AgentId,
+        epoch: i64,
+        attempt: &str,
+        challenge_id: &str,
+        receipt_sha256: &str,
+    ) -> Result<bool> {
+        self.own(id)?;
+        if self.bound_attempt() != Some(attempt) {
+            return Err(crate::error::invalid("maintenance attempt is not pinned"));
+        }
+        self.critical(ops::ObserveMaintenanceCheckpoint {
+            epoch,
+            execution: id.clone(),
+            attempt: attempt.into(),
+            challenge_id: challenge_id.into(),
+            receipt_sha256: receipt_sha256.into(),
+        })
+        .await
+    }
+
+    /// Establishes the durable pre-cleanup boundary for this pinned attempt.
+    /// An uncertain result must be reconciled before stopping native work.
+    pub async fn begin_maintenance_closing(
+        &mut self,
+        id: &AgentId,
+        epoch: i64,
+        attempt: &str,
+        native_event_seq: i64,
+        at: f64,
+    ) -> Result<bool> {
+        self.own(id)?;
+        if self.bound_attempt() != Some(attempt) {
+            return Err(crate::error::invalid("maintenance attempt is not pinned"));
+        }
+        self.critical(ops::BeginMaintenanceClosing {
+            epoch,
+            execution: id.clone(),
+            attempt: attempt.into(),
+            native_event_seq,
+            at,
+        })
+        .await
+    }
+
+    /// Persists a nonterminal park after the native, cleanup and history
+    /// evidence has already been recorded for this exact pinned attempt.
+    pub async fn park_maintenance_attempt(
+        &mut self,
+        id: &AgentId,
+        epoch: i64,
+        attempt: &str,
+        native_event_seq: i64,
+        at: f64,
+    ) -> Result<agent_run_store::maintenance_park::MaintenancePark> {
+        self.own(id)?;
+        if self.bound_attempt() != Some(attempt) {
+            return Err(crate::error::invalid("maintenance attempt is not pinned"));
+        }
+        self.critical(ops::ParkMaintenanceAttempt {
+            epoch,
+            execution: id.clone(),
+            attempt: attempt.into(),
+            native_event_seq,
+            at,
         })
         .await
     }

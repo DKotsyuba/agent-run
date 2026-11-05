@@ -46,6 +46,7 @@ fn release_creates_safe_modes_without_changing_input() {
     release::verify(&staged).unwrap();
     assert!(staged.join("systemd/agent-run.service").is_file());
     assert!(staged.join("systemd/agent-run-service.sh").is_file());
+    assert!(staged.join("services/agent-run-restart.sh").is_file());
     for version in [".", "..", "nested/", "nested/../other"] {
         assert!(release::build(fixture.path(), version, &binary).is_err());
     }

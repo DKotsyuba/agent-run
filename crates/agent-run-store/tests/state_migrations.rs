@@ -151,7 +151,7 @@ fn v32_binding_cooldown_upgrade_and_failed_step_recovery() {
     drop(conn);
     assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
     let upgraded = open_ro(&path);
-    assert_eq!(user_version(&upgraded), 33);
+    assert_eq!(user_version(&upgraded), VERSION);
     assert_eq!(agent_count(&upgraded), before);
     assert_eq!(
         upgraded

@@ -1,4 +1,8 @@
 //! Separate executable process per admitted run. READY precedes authentication/materialization.
+mod maintenance;
+#[cfg(test)]
+#[path = "supervisor/maintenance_tests.rs"]
+mod maintenance_tests;
 use crate::{
     Error, Result,
     adapters::{self, io::Process, materialize},
@@ -394,6 +398,12 @@ async fn finish_failed_run(
     }
     let row = store.get(id)?;
     if !row.status.terminal() {
+        // An allocated continuation may already have submitted native input.
+        // Preparation or storage failure cannot turn that uncertainty into a
+        // terminal result or permission to launch the task again.
+        if crate::maintenance_execution::resume_unconfirmed(&store.conn, id)? {
+            return maintenance::hold_unstarted(id, store).await;
+        }
         if let Ok((attempt, _)) = store.provider_attempt(id)
             && !crate::lifecycle::reconcile::cleanup_mcp_discovery(store, &attempt)?
         {
@@ -1442,6 +1452,15 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
     let mut continuing: Option<(String, String)> = None;
     loop {
         let (attempt_id, account) = store.provider_attempt(id)?;
+        let maintenance_resume = store.maintenance_continuation(id, &attempt_id)?;
+        if let Some(resume) = &maintenance_resume {
+            if continuing.is_some() {
+                return Err(Error::Integrity(
+                    "maintenance continuation was already selected".into(),
+                ));
+            }
+            continuing = Some((resume.session.clone(), resume.history.clone()));
+        }
         // Everything this supervisor journals originates from this attempt,
         // including final and cleanup records written after ownership ends.
         store.repin(&attempt_id).await?;
@@ -1601,7 +1620,13 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         }
         // A switched attempt never resends the original task: it continues
         // the native thread with one explicit internal control turn.
-        let task = if continuing.is_some() {
+        let maintenance_control = maintenance_resume
+            .as_ref()
+            .map(|resume| crate::maintenance_control::prepare(&resume.checkpoint, &BTreeMap::new()))
+            .transpose()?;
+        let task = if let Some(control) = &maintenance_control {
+            control.as_str()
+        } else if continuing.is_some() {
             if ordered_claude {
                 CLAUDE_CONTINUATION_CONTROL
             } else {
@@ -1676,7 +1701,14 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 .await?;
             planned.launch.environment.insert(
                 agent_run_domain::worker::FINISH_ENV.into(),
-                if row.request.explicit_finish {
+                if row.request.explicit_finish
+                    && matches!(
+                        identity.authority.harness,
+                        HarnessId::Codex | HarnessId::ClaudeCode
+                    )
+                {
+                    agent_run_domain::worker::MAINTENANCE_PAUSE_ENV_VALUE
+                } else if row.request.explicit_finish {
                     "1"
                 } else {
                     "0"
@@ -1710,6 +1742,19 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             );
             for (name, value) in agent_run_domain::worker::ENV_NAMES.into_iter().zip(values) {
                 planned.launch.environment.insert(name.into(), value);
+            }
+        }
+        if let Some(resume) = &maintenance_resume {
+            // The complete environment now includes account credentials and
+            // the attempt capability. Never send a checkpoint containing one.
+            let checked = crate::maintenance_control::prepare(
+                &resume.checkpoint,
+                &planned.launch.environment,
+            )?;
+            if maintenance_control.as_ref().map(|input| input.as_str()) != Some(checked.as_str()) {
+                return Err(Error::Integrity(
+                    "maintenance control changed during preparation".into(),
+                ));
             }
         }
         // Any continuation re-verifies its recorded history seal at the
@@ -1753,6 +1798,11 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         if continuing.is_some() || (ordered_claude && resume_session.is_some()) {
             let policy = current_account_policy(home, id, &identity).await;
             if let Some(blocker) = handoff_blocker(store, &account, policy)? {
+                if maintenance_resume.is_some() {
+                    return Err(Error::Unsupported(format!(
+                        "maintenance continuation unavailable: {blocker}"
+                    )));
+                }
                 return finish_blocked_handoff(
                     store,
                     id,
@@ -1771,6 +1821,14 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         let service_gate = crate::managed_services::wait_for_gate(home, id).await;
         service_gate?;
         if identity.authority.harness == HarnessId::ClaudeCode && !store.cancel_pending(id)? {
+            let discovery_marker = maintenance_resume.as_ref().map(|resume| {
+                json!({"epoch":resume.epoch,"source_attempt_id":resume.source_attempt_id,"target_attempt_id":resume.target_attempt_id})
+            });
+            if let Some(marker) = &discovery_marker {
+                store
+                    .event_durable_seq(id, "maintenance_discovery_started_v1", marker)
+                    .await?;
+            }
             // Discovery children are owned by this attempt: each snapshot is one
             // journal event submitted through the same ordered lane, so the
             // rows buffered so far are written first.
@@ -1783,6 +1841,11 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                     discovery_ownership(&producer, &ownership_agent, &ownership_attempt, snapshot)
                 });
             discovery.await?;
+            if let Some(marker) = &discovery_marker {
+                store
+                    .event_durable_seq(id, "maintenance_discovery_settled_v1", marker)
+                    .await?;
+            }
         }
         let owner_supported = matches!(
             planned.runtime.kind()?,
@@ -1838,6 +1901,9 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 crate::service::verify_recorded_history(recorded, &identity, None, session)
             {
                 store.provider_spawn_failed(id, &attempt_id).await?;
+                if maintenance_resume.is_some() {
+                    return Err(error);
+                }
                 return finish_blocked_handoff(
                     store,
                     id,
@@ -1850,6 +1916,11 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             let policy = current_account_policy(home, id, &identity).await;
             if let Some(blocker) = handoff_blocker(store, &account, policy)? {
                 store.provider_spawn_failed(id, &attempt_id).await?;
+                if maintenance_resume.is_some() {
+                    return Err(Error::Unsupported(format!(
+                        "maintenance continuation unavailable: {blocker}"
+                    )));
+                }
                 return finish_blocked_handoff(
                     store,
                     id,
@@ -1875,7 +1946,25 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             }
             Err(error) => return Err(error),
         };
-        let switched = continuing.is_some();
+        let switched = continuing.is_some() && maintenance_resume.is_none();
+        let resume_boundary = maintenance_resume.as_ref().map(|resume| {
+            crate::maintenance_execution::ResumeBoundary {
+                epoch: resume.epoch,
+                source_attempt_id: resume.source_attempt_id.clone(),
+                target_attempt_id: resume.target_attempt_id.clone(),
+            }
+        });
+        let finish_mode = planned
+            .launch
+            .environment
+            .get(agent_run_domain::worker::FINISH_ENV)
+            .map(String::as_str)
+            .unwrap_or(if row.request.explicit_finish {
+                "1"
+            } else {
+                "0"
+            });
+        let allow_maintenance_pause = finish_mode == "5";
         let execution = async {
             // The spawned engine is observed (exit, descendants, escalation)
             // while every durable write below is pending, from the first one
@@ -1923,15 +2012,17 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 process
                     .observing(store.running(id, process.owner.pid))
                     .await?;
-                process
-                    .observing(store.journal(
-                        id,
-                        "user",
-                        &identity.provider_request.task,
-                        None,
-                        None,
-                    ))
-                    .await?;
+                if maintenance_resume.is_none() {
+                    process
+                        .observing(store.journal(
+                            id,
+                            "user",
+                            &identity.provider_request.task,
+                            None,
+                            None,
+                        ))
+                        .await?;
+                }
             }
             let mut native_row = row.clone();
             native_row.request.task = task.to_owned();
@@ -1946,9 +2037,10 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                     &runtime_home,
                 )
                 .await
+                .map(crate::maintenance_execution::EngineExit::Finished)
             } else if identity.authority.harness == HarnessId::Codex {
                 native_row.request.model = planned.native_model.clone();
-                crate::codex::run(
+                crate::codex::run_maintenance_resume(
                     &mut process,
                     store,
                     &native_row,
@@ -1956,20 +2048,111 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                     &planned.runtime,
                     &planned.profile,
                     &runtime_home,
+                    allow_maintenance_pause,
+                    finish_mode,
+                    resume_boundary.as_ref(),
                 )
                 .await
             } else {
-                crate::stream::run(
+                crate::stream::run_maintenance_resume(
                     &mut process,
                     store,
                     &native_row,
                     &row,
                     planned.launch.initial_input.as_deref(),
+                    allow_maintenance_pause,
+                    resume_boundary.as_ref(),
                 )
                 .await
             }
         };
-        let execution = execution.await;
+        let execution = match execution.await {
+            Ok(crate::maintenance_execution::EngineExit::Finished(result)) => {
+                let explicitly_cancelled = result.outcome.status == Status::Cancelled
+                    && matches!(store.cancel_pending(id), Ok(true));
+                if let Some(resume) = &maintenance_resume
+                    && !explicitly_cancelled
+                    && crate::maintenance_execution::resume_unconfirmed(&store.conn, id)
+                        .unwrap_or(true)
+                {
+                    let context = maintenance::PauseContext {
+                        id,
+                        attempt: &attempt_id,
+                        epoch: resume.epoch,
+                        native_event_seq: 0,
+                        agent_dir: &agent_dir,
+                        identity: &identity,
+                        environment: &planned.launch.environment,
+                        continuation_root: continuation_root.as_deref(),
+                    };
+                    return maintenance::hold_unconfirmed(&context, store, &mut process).await;
+                }
+                Ok(result)
+            }
+            Ok(crate::maintenance_execution::EngineExit::MaintenanceUnconfirmed) => {
+                let Some(resume) = &maintenance_resume else {
+                    return Err(Error::Integrity(
+                        "unexpected maintenance continuation hold".into(),
+                    ));
+                };
+                let context = maintenance::PauseContext {
+                    id,
+                    attempt: &attempt_id,
+                    epoch: resume.epoch,
+                    native_event_seq: 0,
+                    agent_dir: &agent_dir,
+                    identity: &identity,
+                    environment: &planned.launch.environment,
+                    continuation_root: continuation_root.as_deref(),
+                };
+                return maintenance::hold_unconfirmed(&context, store, &mut process).await;
+            }
+            Ok(crate::maintenance_execution::EngineExit::MaintenancePause {
+                epoch,
+                attempt_id: paused_attempt,
+                native_event_seq,
+            }) => {
+                let context = maintenance::PauseContext {
+                    id,
+                    attempt: &attempt_id,
+                    epoch,
+                    native_event_seq,
+                    agent_dir: &agent_dir,
+                    identity: &identity,
+                    environment: &planned.launch.environment,
+                    continuation_root: continuation_root.as_deref(),
+                };
+                if paused_attempt != attempt_id {
+                    return maintenance::hold_closed(
+                        &context,
+                        store,
+                        &mut process,
+                        "attempt_changed",
+                    )
+                    .await;
+                }
+                return maintenance::finalize_pause(context, store, &mut process).await;
+            }
+            Err(error) => {
+                if let Some(resume) = &maintenance_resume
+                    && crate::maintenance_execution::resume_unconfirmed(&store.conn, id)
+                        .unwrap_or(true)
+                {
+                    let context = maintenance::PauseContext {
+                        id,
+                        attempt: &attempt_id,
+                        epoch: resume.epoch,
+                        native_event_seq: 0,
+                        agent_dir: &agent_dir,
+                        identity: &identity,
+                        environment: &planned.launch.environment,
+                        continuation_root: continuation_root.as_deref(),
+                    };
+                    return maintenance::hold_unconfirmed(&context, store, &mut process).await;
+                }
+                Err(error)
+            }
+        };
         let cleanup = process.owner.cleanup(Duration::from_secs(2)).await;
         let cleanup_ended = std::time::Instant::now();
         let exit = process.reap().await;
@@ -2116,6 +2299,32 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             && result.outcome.status == Status::Failed
             && store.worker_finish_intent(id, false)?.is_none()
         {
+            if state["native_history"]["task_proven"] != true {
+                let maintenance_epoch: Option<i64> = store.conn.query_row(
+                    "SELECT MAX(epoch) FROM maintenance_resumes WHERE agent_id=?",
+                    [id.as_str()],
+                    |row| row.get(0),
+                )?;
+                if let Some(epoch) = maintenance_epoch {
+                    let context = maintenance::PauseContext {
+                        id,
+                        attempt: &attempt_id,
+                        epoch,
+                        native_event_seq: 0,
+                        agent_dir: &agent_dir,
+                        identity: &identity,
+                        environment: &planned.launch.environment,
+                        continuation_root: continuation_root.as_deref(),
+                    };
+                    return maintenance::hold_closed(
+                        &context,
+                        store,
+                        &mut process,
+                        "continuation_history_unverified",
+                    )
+                    .await;
+                }
+            }
             match failover(home, id, store, &identity).await {
                 Ok(next) => {
                     store.event(id, "account_switched", &next).await?;
@@ -2447,6 +2656,9 @@ fn task_proof(
     attempt: &str,
     seal: &crate::continuity::HistorySeal,
 ) -> Result<Option<serde_json::Value>> {
+    if !maintenance_inputs_recorded(store, id, attempt, seal)? {
+        return Ok(None);
+    }
     let prior: Option<Option<String>> = store
         .conn
         .query_row(
@@ -2487,6 +2699,77 @@ fn task_proof(
         crate::continuity::admitted_turn_recorded(seal, turn, digest)?
             .then(|| json!({"turn": turn, "input_sha256": digest})),
     )
+}
+
+/// Verify every earlier maintenance control in the current sealed history.
+/// A missing or ambiguous marker cannot authorize a later account switch or
+/// another pause, even when the original task is still present.
+fn maintenance_inputs_recorded(
+    store: &Store,
+    id: &AgentId,
+    attempt: &str,
+    seal: &crate::continuity::HistorySeal,
+) -> Result<bool> {
+    let missing: bool = store.conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM maintenance_resumes r LEFT JOIN attempts t ON t.id=r.target_attempt_id AND t.agent_id=r.agent_id WHERE r.agent_id=? AND t.id IS NULL)",
+        [id.as_str()], |row| row.get(0),
+    )?;
+    if missing {
+        return Ok(false);
+    }
+    let current_number: u32 = store.conn.query_row(
+        "SELECT number FROM attempts WHERE id=? AND agent_id=?",
+        rusqlite::params![attempt, id.as_str()],
+        |row| row.get(0),
+    )?;
+    let mut statement = store.conn.prepare(
+        "SELECT r.epoch,r.source_attempt_id,r.target_attempt_id,e.data_json \
+         FROM maintenance_resumes r JOIN attempts t ON t.id=r.target_attempt_id AND t.agent_id=r.agent_id \
+         LEFT JOIN events e ON e.agent_id=r.agent_id AND e.attempt_id=r.target_attempt_id AND e.kind='maintenance_resume_confirmed_v1' \
+         WHERE r.agent_id=? AND t.number<=? \
+         ORDER BY r.epoch,e.seq",
+    )?;
+    let rows = statement
+        .query_map(rusqlite::params![id.as_str(), current_number], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut controls = BTreeMap::<(i64, String), Option<(String, String)>>::new();
+    for (epoch, source, target, raw) in rows {
+        let entry = controls.entry((epoch, target.clone())).or_default();
+        let Some(marker) = raw.and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        else {
+            continue;
+        };
+        let (Some(turn), Some(digest)) = (marker["turn"].as_str(), marker["input_sha256"].as_str())
+        else {
+            continue;
+        };
+        if marker["epoch"] != epoch
+            || marker["source_attempt_id"] != source
+            || marker["target_attempt_id"] != target
+            || marker["session"] != seal.session
+            || turn.is_empty()
+            || turn.len() > 1024
+            || turn.chars().any(char::is_control)
+            || digest.parse::<agent_run_domain::Sha256Digest>().is_err()
+        {
+            continue;
+        }
+        if entry.replace((turn.into(), digest.into())).is_some() {
+            return Ok(false);
+        }
+    }
+    let proofs: Option<Vec<_>> = controls.into_values().collect();
+    let Some(proofs) = proofs else {
+        return Ok(false);
+    };
+    crate::continuity::maintenance_turns_recorded(seal, &proofs)
 }
 /// The native history storage root a launch environment selects: `CODEX_HOME`
 /// for Codex; `CLAUDE_CONFIG_DIR`, else `$HOME/.claude`, for Claude Code.

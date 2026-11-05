@@ -12,6 +12,126 @@ use agent_run_platform::{fs, verify};
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::Path, time::Duration};
 
+/// Status reads one captured cohort snapshot without mutating the database or
+/// exposing task content, session details, or restart-readiness claims.
+#[tokio::test]
+async fn maintenance_status_is_read_only_and_counts_captured_execution_states() {
+    let home = common::Home::new();
+    let service = Service::new(home.path.clone());
+    let mut store = home.store();
+    let inactive = json!({"state":"inactive","phase":null,"epoch":null,"captured":0,"active":0,"parked":0,"terminal":0,"unavailable":0});
+    assert_eq!(service.maintenance_status().unwrap(), inactive);
+    assert_eq!(
+        agent_run_core::dispatch::call(&service, "_cli_maintenance_status", json!({}))
+            .await
+            .unwrap(),
+        inactive
+    );
+    assert!(
+        agent_run_core::dispatch::call(&service, "_cli_maintenance_status", json!({"extra":true}))
+            .await
+            .is_err()
+    );
+    for id in [
+        "ag-20261101-000000-0000000001",
+        "ag-20261101-000000-0000000002",
+        "ag-20261101-000000-0000000003",
+    ] {
+        store.conn.execute(
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) \
+             VALUES(?,'mock','fixture','review','private task text','private task text','/fixture','{}','running',1,'fixture',?)",
+            rusqlite::params![id,id],
+        ).unwrap();
+    }
+    let fence = store
+        .begin_maintenance_fence("fixture-maintenance", 5.0)
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='succeeded' WHERE id='ag-20261101-000000-0000000002'",
+            [],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET sequence=2 WHERE id='ag-20261101-000000-0000000003'",
+            [],
+        )
+        .unwrap();
+    store.conn.execute(
+        "INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES('status-parked','ag-20261101-000000-0000000001',1,'maintenance_parked','{}',1,1)", [],
+    ).unwrap();
+    let before: i64 = store
+        .conn
+        .pragma_query_value(None, "data_version", |row| row.get(0))
+        .unwrap();
+    let expected = json!({"state":"fenced","phase":"preparing","epoch":fence.epoch,"captured":3,"active":1,"parked":1,"terminal":1,"unavailable":1});
+    let observed = agent_run_core::dispatch::call(&service, "_cli_maintenance_status", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(observed, expected);
+    assert!(!observed.to_string().contains("private task text"));
+    assert_eq!(
+        store
+            .conn
+            .pragma_query_value(None, "data_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        before
+    );
+    store.conn.execute("DELETE FROM maintenance_cohort WHERE epoch=? AND agent_id='ag-20261101-000000-0000000001'",[fence.epoch]).unwrap();
+    assert!(matches!(
+        service.maintenance_status(),
+        Err(Error::Integrity(_))
+    ));
+}
+
+/// Broker calls capture the same cohort on identical retries and cannot queue
+/// a pause for an unsupported historical worker.
+#[tokio::test]
+async fn maintenance_broker_fence_replays_and_refuses_legacy_pause() {
+    let home = common::Home::new();
+    let (id, _) = home
+        .store()
+        .admit(&home.request(), &home.config, &json!({}), None)
+        .unwrap();
+    let writer = common::writer::Harness::start(&home.path);
+    let service = Service::new(home.path.clone()).with_writer(writer.broker());
+    let first = service
+        .begin_maintenance("maintenance-service-fixture")
+        .await
+        .unwrap();
+    let replay = service
+        .begin_maintenance("maintenance-service-fixture")
+        .await
+        .unwrap();
+    assert_eq!(first, replay);
+    assert_eq!(first.member_count, 1);
+    assert!(
+        service
+            .request_maintenance_pause(first.epoch, &id, "legacy-attempt")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        home.store()
+            .conn
+            .query_row("SELECT COUNT(*) FROM commands", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+/// Missing state is unknown, not an inactive fence, and never creates a home.
+#[test]
+fn maintenance_status_does_not_create_missing_home_or_database() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("missing-home");
+    assert!(Service::new(missing.clone()).maintenance_status().is_err());
+    assert!(!missing.exists());
+}
+
 /// Proves content-based configuration refresh skips identical bytes, accepts a
 /// valid changed revision, and rejects an invalid changed revision.
 #[test]

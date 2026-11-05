@@ -79,6 +79,41 @@ fn fake_plan() -> LaunchPlan {
     }
 }
 
+/// Emits a resumed-thread usage event without a turn id, including unsafe
+/// credential-shaped fields alongside the native numeric counters.
+fn resumed_usage_plan() -> LaunchPlan {
+    let mut plan = fake_plan();
+    let event = json!({"method":"thread/tokenUsage/updated","params":{
+        "threadId":"thread","inputTokens":999,
+        "authorization":{"value":"hidden-auth"},
+        "tokenUsage":{
+            "total":{
+                "inputTokens":100,"outputTokens":20,"cachedInputTokens":10,
+                "cacheWriteInputTokens":4,"reasoningOutputTokens":5,"totalTokens":120,
+                "accessToken":"hidden-token","password":{"value":"hidden-object"},
+                "numericToken":1234,"inputTokensAsString":"hidden-string"
+            },
+            "last":{"inputTokens":7,"outputTokens":3},
+            "credential":{"value":"hidden-nested-object"},
+            "tokenUsage":{"value":"hidden-nested-usage"}
+        }
+    }});
+    plan.environment
+        .insert("USAGE_EVENT".into(), event.to_string());
+    plan.environment.insert(
+        "OTHER_EVENT".into(),
+        json!({"method":"other/diagnostic","params":{"threadId":"thread","tokenUsage":{"total":{"inputTokens":999}}}}).to_string(),
+    );
+    let old = r#"printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread","turnId":"turn","item":{"type":"commandExecution"}}}';"#;
+    let script = plan.args[1].replace(
+        old,
+        &format!("printf '%s\\n' \"$USAGE_EVENT\" \"$OTHER_EVENT\"; {old}"),
+    );
+    assert_ne!(script, plan.args[1]);
+    plan.args[1] = script;
+    plan
+}
+
 /// A native server missing research controls fails before a thread or turn.
 /// The ordinary fixture deliberately returns a roster instead of config/read;
 /// absence is rejected, and the owned fixture process is closed and reaped.
@@ -308,6 +343,72 @@ async fn python_test_codex_app_server_unknown_item_completion_is_durable() {
             .expect("read forwarded event"),
         Some(json!({"threadId":"thread","turnId":"turn","item":{"type":"commandExecution"}}))
     );
+    drop(process.input.take());
+    process.reap().await;
+}
+
+/// A resumed notification without a turn id remains usable for usage
+/// accounting, but credential-shaped strings and objects are never retained.
+#[tokio::test]
+async fn codex_resume_usage_event_preserves_numeric_counters_only() {
+    let fixture = common::Home::new();
+    let mut request = fixture.request();
+    request.workdir = PathBuf::from(scratch());
+    let (id, _) = fixture
+        .store()
+        .admit(&request, &fixture.config, &json!({}), None)
+        .unwrap();
+    let mut store = fixture.store();
+    let mut record = store.get(&id).unwrap();
+    record.resume_of_runtime_session_id = Some("thread".into());
+    let prep = common::writer::prepare_supervisor(&mut store, &id);
+    let harness = common::writer::Harness::start(&fixture.path);
+    let mut persist = harness.supervisor(&fixture.path, prep, &id).await;
+    let app_home = fixture.path.join("codex-home");
+    fs::private_dir(&app_home).unwrap();
+    let mut process = Process::spawn(&resumed_usage_plan()).unwrap();
+    let result = codex::run(
+        &mut process,
+        &mut persist,
+        &record,
+        &record,
+        &runtime(fixture.path.join("runtime")),
+        &profile(),
+        &app_home,
+    )
+    .await
+    .unwrap();
+    persist.flush().await.unwrap();
+    assert_eq!(result.outcome.status, Status::Succeeded);
+
+    let event = store
+        .last_event(&id, "thread/tokenUsage/updated")
+        .unwrap()
+        .unwrap();
+    let total = &event["tokenUsage"]["total"];
+    assert_eq!(total["inputTokens"], 100);
+    assert_eq!(total["outputTokens"], 20);
+    assert_eq!(total["cachedInputTokens"], 10);
+    assert_eq!(total["cacheWriteInputTokens"], 4);
+    assert_eq!(total["reasoningOutputTokens"], 5);
+    assert_eq!(total["totalTokens"], 120);
+    assert_eq!(event["tokenUsage"]["last"]["inputTokens"], 7);
+    assert_eq!(event["tokenUsage"]["last"]["outputTokens"], 3);
+    for name in [
+        "accessToken",
+        "password",
+        "numericToken",
+        "inputTokensAsString",
+    ] {
+        assert_eq!(total[name], "<omitted>");
+    }
+    assert_eq!(event["authorization"], "<omitted>");
+    assert_eq!(event["inputTokens"], "<omitted>");
+    assert_eq!(event["tokenUsage"]["credential"], "<omitted>");
+    assert_eq!(event["tokenUsage"]["tokenUsage"], "<omitted>");
+    assert!(!event.to_string().contains("hidden-"));
+    let other = store.last_event(&id, "other/diagnostic").unwrap().unwrap();
+    assert_eq!(other["tokenUsage"], "<omitted>");
     drop(process.input.take());
     process.reap().await;
 }
@@ -808,6 +909,620 @@ async fn codex_tool_evidence_journals_once_with_native_flags() {
     assert_eq!(counts.calls, Some(3));
     assert_eq!(counts.failed, None, "one unknown result keeps failed null");
     assert_eq!(counts.unknown_results, Some(1));
+    drop(process.input.take());
+    process.reap().await;
+}
+
+/// Emits interleaved tool events, including late and missing inputs, without
+/// allowing the shell fixture to interpret any event payload.
+fn tool_input_plan() -> LaunchPlan {
+    let event = |method: &str, item: serde_json::Value| json!({"method":method,"params":{"threadId":"thread","turnId":"turn","item":item}});
+    let deep = format!(
+        "{}{{\"password\":\"hidden-deep\"}}{}",
+        "{\"nested\":".repeat(150),
+        "}".repeat(150)
+    );
+    let double_encoded =
+        serde_json::to_string("{\"environment\":{\"MODE\":\"hidden-double\"}}").unwrap();
+    let events = vec![
+        event(
+            "item/started",
+            json!({"type":"commandExecution","id":"a","command":"echo synthetic-secret"}),
+        ),
+        event("item/started", json!({"type":"commandExecution","id":"b"})),
+        event(
+            "item/started",
+            json!({"type":"commandExecution","id":"c","command":"echo c"}),
+        ),
+        json!({"method":"item/completed","params":{"threadId":"thread","turnId":"foreign","item":{"type":"commandExecution","id":"b","command":"foreign command"}}}),
+        event(
+            "item/completed",
+            json!({"type":"commandExecution","id":"b","command":"printf late","aggregatedOutput":"late output","exitCode":0}),
+        ),
+        event(
+            "item/completed",
+            json!({"type":"commandExecution","id":"b","command":"printf late","aggregatedOutput":"late output","exitCode":0}),
+        ),
+        event(
+            "item/completed",
+            json!({"type":"commandExecution","id":"a","command":"ignore changed input","aggregatedOutput":"output synthetic-secret","exitCode":0}),
+        ),
+        event(
+            "item/completed",
+            json!({"type":"commandExecution","id":"c","command":"also ignored","aggregatedOutput":"c output","exitCode":0}),
+        ),
+        event(
+            "item/completed",
+            json!({"type":"commandExecution","id":"d","command":"printf completed-only","aggregatedOutput":"d output","exitCode":0}),
+        ),
+        event(
+            "item/started",
+            json!({"type":"commandExecution","id":"d","command":"late start"}),
+        ),
+        event("item/started", json!({"type":"commandExecution","id":"e"})),
+        event(
+            "item/completed",
+            json!({"type":"commandExecution","id":"e","aggregatedOutput":"e output","exitCode":0}),
+        ),
+        event(
+            "item/completed",
+            json!({"type":"mcpToolCall","id":"mcp","server":"srv","tool":"lookup","arguments":{"path":"README.md","token":"opaque-credential","environment":{"MODE":"hidden-environment"},"nested":"{\"password\":\"embedded-credential\",\"query\":\"safe\"}","malformed":"{\"password\":\"hidden-malformed\"","deep":deep,"double":double_encoded},"result":{"content":[{"type":"text","text":"mcp output"}]},"status":"completed"}),
+        ),
+        event(
+            "item/started",
+            json!({"type":"dynamicToolCall","id":"dynamic","tool":"inspect","arguments":{"query":"visible","headers":{"Authorization":"hidden-auth"},"password":{"value":"hidden-password"}}}),
+        ),
+        event(
+            "item/completed",
+            json!({"type":"dynamicToolCall","id":"dynamic","tool":"inspect"}),
+        ),
+        event(
+            "item/started",
+            json!({"type":"commandExecution","id":"long","command":"é".repeat(9000)}),
+        ),
+        event(
+            "item/completed",
+            json!({"type":"commandExecution","id":"long","exitCode":0}),
+        ),
+        event(
+            "item/started",
+            json!({"type":"fileChange","id":"file","changes":[
+                {"path":"src/safe.rs","kind":{"type":"update"},"diff":"@@\n+ visible text\n+ let value = 3;","unknown":"hidden object"},
+                {"path":"src/escaped.rs","kind":{"type":"update"},"diff":"@@\n+const value = \"synthetic-\\u0073ecret\";"},
+                {"path":"src/inline.rs","kind":{"type":"update"},"diff":"@@\n+const config = {\"password\":\"unlisted-credential\"};"},
+                {"path":"src/split.rs","kind":{"type":"update"},"diff":"@@\n+\"password\":\n+\"unlisted-credential\""},
+                {"path":"src/deleted-header.rs","kind":{"type":"update"},"diff":"@@\n-Authorization: Bearer unlisted-value"},
+                {"path":"src/deleted-env.rs","kind":{"type":"update"},"diff":"@@\n-environment: unlisted-value"},
+                {"path":"src/prefixed.rs","kind":{"type":"update"},"diff":"@@\n+basic_authorization = unlisted-value"},
+                {"path":"src/camel-authorization.rs","kind":{"type":"update"},"diff":"@@\n+basicAuthorization = unlisted-value"},
+                {"path":"src/camel-auth.rs","kind":{"type":"update"},"diff":"@@\n+basicAuth = unlisted-value"},
+                {"path":"src/camel-cookie.rs","kind":{"type":"update"},"diff":"@@\n+requestCookie = unlisted-value"},
+                {"path":"src/camel-environment.rs","kind":{"type":"update"},"diff":"@@\n+customEnvironment = unlisted-value"}
+            ]}),
+        ),
+        event(
+            "item/completed",
+            json!({"type":"fileChange","id":"file","changes":[{"path":"src/lib.rs","kind":{"type":"update"}}]}),
+        ),
+        event(
+            "item/started",
+            json!({"type":"fileChange","id":"file-late"}),
+        ),
+        event(
+            "item/completed",
+            json!({"type":"fileChange","id":"file-late","changes":[{"path":"src/new.rs","kind":{"type":"add"},"diff":"+ later change"}]}),
+        ),
+        event(
+            "item/started",
+            json!({"type":"dynamicToolCall","id":"mismatch","tool":"original"}),
+        ),
+        event(
+            "item/completed",
+            json!({"type":"commandExecution","id":"mismatch","command":"wrong identity"}),
+        ),
+        event(
+            "item/completed",
+            json!({"type":"commandExecution","command":"idless command","environment":{"MODE":"idless environment"}}),
+        ),
+    ];
+    let mut plan = fake_plan();
+    plan.environment
+        .insert("AGENT_RUN_PROVIDER_TOKEN".into(), "synthetic-secret".into());
+    let mut variables = Vec::new();
+    for (index, event) in events.into_iter().enumerate() {
+        let name = format!("EVENT_{index}");
+        plan.environment.insert(name.clone(), event.to_string());
+        variables.push(format!("\"${name}\""));
+    }
+    let old = r#"printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread","turnId":"turn","item":{"type":"commandExecution"}}}';"#;
+    let replacement = format!("printf '%s\\n' {};", variables.join(" "));
+    let script = plan.args[1].replace(old, &replacement);
+    assert_ne!(script, plan.args[1]);
+    plan.args[1] = script;
+    plan
+}
+
+/// Input is bound to the original invocation even when starts interleave,
+/// arrives only at completion, is missing, or a terminal event is duplicated.
+#[tokio::test]
+async fn codex_tool_input_captures_supported_fields_without_mispairing() {
+    let fixture = common::Home::new();
+    let mut request = fixture.request();
+    request.workdir = PathBuf::from(scratch());
+    let (id, _) = fixture
+        .store()
+        .admit(&request, &fixture.config, &json!({}), None)
+        .unwrap();
+    let mut store = fixture.store();
+    let record = store.get(&id).unwrap();
+    let prep = common::writer::prepare_supervisor(&mut store, &id);
+    let harness = common::writer::Harness::start(&fixture.path);
+    let mut persist = harness.supervisor(&fixture.path, prep, &id).await;
+    let app_home = fixture.path.join("codex-home");
+    fs::private_dir(&app_home).unwrap();
+    let mut process = Process::spawn(&tool_input_plan()).unwrap();
+    let result = codex::run(
+        &mut process,
+        &mut persist,
+        &record,
+        &record,
+        &runtime(fixture.path.join("runtime")),
+        &profile(),
+        &app_home,
+    )
+    .await
+    .unwrap();
+    persist.flush().await.unwrap();
+    assert_eq!(result.outcome.status, Status::Succeeded);
+
+    let page = store.transcript(&id, 0, 1000).unwrap();
+    let messages = page["messages"].as_array().unwrap();
+    let contents = |role: &str, id: &str| {
+        messages
+            .iter()
+            .filter(|row| row["role"] == role && row["raw_ref"] == id)
+            .map(|row| row["content"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(contents("tool_call", "a"), ["echo <redacted>"]);
+    assert_eq!(contents("tool_result", "a"), ["output <redacted>"]);
+    assert_eq!(contents("tool_call", "b"), ["", "printf late"]);
+    assert_eq!(contents("tool_result", "b"), ["late output"]);
+    assert_eq!(contents("tool_call", "c"), ["echo c"]);
+    assert_eq!(contents("tool_call", "d"), ["printf completed-only"]);
+    assert_eq!(contents("tool_call", "e"), [""]);
+    assert_eq!(contents("tool_call", "mismatch"), [""]);
+    let args = &contents("tool_call", "mcp")[0];
+    assert!(
+        args.contains("README.md") && args.contains("<redacted>"),
+        "{args}"
+    );
+    let changes = &contents("tool_call", "file")[0];
+    let changes: serde_json::Value = serde_json::from_str(changes).unwrap();
+    let changes = changes["changes"].as_array().unwrap();
+    assert_eq!(changes[0]["path"], "src/safe.rs");
+    assert_eq!(changes[0]["kind"], "update");
+    assert_eq!(changes[0]["diff"], "@@\n+ visible text\n+ let value = 3;");
+    assert_eq!(changes.len(), 11);
+    for change in &changes[1..] {
+        assert_eq!(
+            change["diff"],
+            "[diff omitted: sensitive or escaped content]"
+        );
+    }
+    let late_change = contents("tool_call", "file-late");
+    assert_eq!(late_change[0], "");
+    assert!(late_change[1].contains("src/new.rs") && late_change[1].contains("later change"));
+    assert!(contents("tool_call", "dynamic")[0].contains("visible"));
+    let long = contents("tool_call", "long");
+    assert_eq!(long.len(), 2);
+    assert!(long.iter().all(|fragment| fragment.len() <= 16 * 1024));
+    assert_eq!(long.concat(), "é".repeat(9000));
+    let transcript = page.to_string();
+    for omitted in [
+        "synthetic-secret",
+        "opaque-credential",
+        "hidden-environment",
+        "embedded-credential",
+        "hidden-malformed",
+        "hidden-deep",
+        "hidden-double",
+        "unlisted-credential",
+        "unlisted-value",
+        "hidden-auth",
+        "hidden-password",
+        "foreign command",
+        "hidden object",
+        "wrong identity",
+    ] {
+        assert!(
+            !transcript.contains(omitted),
+            "persisted {omitted}: {transcript}"
+        );
+    }
+    let event = store
+        .last_event(&id, "item/completed")
+        .unwrap()
+        .unwrap()
+        .to_string();
+    assert!(
+        !event.contains("idless command") && !event.contains("idless environment"),
+        "{event}"
+    );
+    let mut events = store
+        .conn
+        .prepare("SELECT data_json FROM events WHERE agent_id=? AND kind='item/completed'")
+        .unwrap();
+    let events = events
+        .query_map([id.as_str()], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap()
+        .join("\n");
+    assert!(!events.contains("foreign command"), "{events}");
+    drop(process.input.take());
+    process.reap().await;
+}
+
+/// Malformed and deeply nested JSON-like arguments are omitted even when no
+/// launch-secret literals exist for the ordinary process redactor to match.
+#[tokio::test]
+async fn codex_tool_input_omits_unparseable_json_without_launch_secrets() {
+    let fixture = common::Home::new();
+    let mut request = fixture.request();
+    request.workdir = PathBuf::from(scratch());
+    let (id, _) = fixture
+        .store()
+        .admit(&request, &fixture.config, &json!({}), None)
+        .unwrap();
+    let mut store = fixture.store();
+    let record = store.get(&id).unwrap();
+    let prep = common::writer::prepare_supervisor(&mut store, &id);
+    let harness = common::writer::Harness::start(&fixture.path);
+    let mut persist = harness.supervisor(&fixture.path, prep, &id).await;
+    let app_home = fixture.path.join("codex-home");
+    fs::private_dir(&app_home).unwrap();
+    let mut plan = tool_input_plan();
+    plan.environment.remove("AGENT_RUN_PROVIDER_TOKEN");
+    assert!(
+        plan.environment
+            .keys()
+            .all(|name| !agent_run_adapters::redact::is_secret_name(name))
+    );
+    let mut process = Process::spawn(&plan).unwrap();
+    let result = codex::run(
+        &mut process,
+        &mut persist,
+        &record,
+        &record,
+        &runtime(fixture.path.join("runtime")),
+        &profile(),
+        &app_home,
+    )
+    .await
+    .unwrap();
+    persist.flush().await.unwrap();
+    assert_eq!(result.outcome.status, Status::Succeeded);
+
+    let page = store.transcript(&id, 0, 1000).unwrap();
+    let call = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["role"] == "tool_call" && row["raw_ref"] == "mcp")
+        .unwrap();
+    let args: serde_json::Value = serde_json::from_str(call["content"].as_str().unwrap()).unwrap();
+    assert_eq!(args["path"], "README.md");
+    assert_eq!(args["malformed"], "<omitted>");
+    assert_eq!(args["deep"], "<omitted>");
+    assert_eq!(args["double"], "<omitted>");
+    drop(process.input.take());
+    process.reap().await;
+}
+
+/// A fake server with interleaved command deltas and terminal items.
+fn command_delta_plan() -> LaunchPlan {
+    let item = |method: &str, value: serde_json::Value| json!({"method":method,"params":{"threadId":"thread","turnId":"turn","item":value}});
+    let delta = |id: &str, value: &str| json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread","turnId":"turn","itemId":id,"delta":value}});
+    let large = "é".repeat(32 * 1024);
+    let mut events = vec![
+        item(
+            "item/started",
+            json!({"type":"commandExecution","id":"delta","command":"delta"}),
+        ),
+        delta("delta", "before synthetic-"),
+        delta("delta", "secret after"),
+        item(
+            "item/completed",
+            json!({"type":"commandExecution","id":"delta","aggregatedOutput":null,"exitCode":0}),
+        ),
+        delta("delta", "late output"),
+        item(
+            "item/completed",
+            json!({"type":"commandExecution","id":"delta","aggregatedOutput":null,"exitCode":0}),
+        ),
+        item(
+            "item/started",
+            json!({"type":"commandExecution","id":"aggregate","command":"aggregate"}),
+        ),
+        delta("aggregate", "stale partial"),
+        item(
+            "item/completed",
+            json!({"type":"commandExecution","id":"aggregate","aggregatedOutput":"complete synthetic-secret","exitCode":0}),
+        ),
+        item(
+            "item/started",
+            json!({"type":"commandExecution","id":"empty-aggregate","command":"empty-aggregate"}),
+        ),
+        delta("empty-aggregate", "use deltas"),
+        item(
+            "item/completed",
+            json!({"type":"commandExecution","id":"empty-aggregate","aggregatedOutput":"","exitCode":0}),
+        ),
+        item(
+            "item/started",
+            json!({"type":"commandExecution","id":"log","command":"log"}),
+        ),
+        delta("log", "[INFO] ready"),
+        item(
+            "item/completed",
+            json!({"type":"commandExecution","id":"log","aggregatedOutput":null,"exitCode":0}),
+        ),
+        item(
+            "item/started",
+            json!({"type":"commandExecution","id":"multiline-log","command":"multiline-log"}),
+        ),
+        delta("multiline-log", "[INFO] first\n[INFO] second"),
+        item(
+            "item/completed",
+            json!({"type":"commandExecution","id":"multiline-log","aggregatedOutput":null,"exitCode":0}),
+        ),
+        item(
+            "item/started",
+            json!({"type":"commandExecution","id":"progress","command":"progress"}),
+        ),
+        delta(
+            "progress",
+            "[1/2] Building CXX object foo.o\n[ 50%] Built target app",
+        ),
+        item(
+            "item/completed",
+            json!({"type":"commandExecution","id":"progress","aggregatedOutput":null,"exitCode":0}),
+        ),
+        item(
+            "item/started",
+            json!({"type":"commandExecution","id":"progress-secret","command":"progress-secret"}),
+        ),
+        delta("progress-secret", "[1/2] synthetic-\\u0073ecret"),
+        item(
+            "item/completed",
+            json!({"type":"commandExecution","id":"progress-secret","aggregatedOutput":null,"exitCode":0}),
+        ),
+        item(
+            "item/started",
+            json!({"type":"commandExecution","id":"quoted","command":"quoted"}),
+        ),
+        delta("quoted", "\"service ready\" now"),
+        item(
+            "item/completed",
+            json!({"type":"commandExecution","id":"quoted","aggregatedOutput":null,"exitCode":0}),
+        ),
+        item(
+            "item/started",
+            json!({"type":"commandExecution","id":"quoted-secret","command":"quoted-secret"}),
+        ),
+        delta("quoted-secret", "\"synthetic-\\u00"),
+        delta("quoted-secret", "73ecret\" ready"),
+        item(
+            "item/completed",
+            json!({"type":"commandExecution","id":"quoted-secret","aggregatedOutput":null,"exitCode":0}),
+        ),
+        item(
+            "item/started",
+            json!({"type":"commandExecution","id":"quoted-escaped-safe","command":"quoted-escaped-safe"}),
+        ),
+        delta("quoted-escaped-safe", "\"service\\u0020ready\" now"),
+        item(
+            "item/completed",
+            json!({"type":"commandExecution","id":"quoted-escaped-safe","aggregatedOutput":null,"exitCode":0}),
+        ),
+        item(
+            "item/started",
+            json!({"type":"commandExecution","id":"log-json","command":"log-json"}),
+        ),
+        delta(
+            "log-json",
+            "[INFO] {\"password\":\"hidden-logged-password\"}",
+        ),
+        item(
+            "item/completed",
+            json!({"type":"commandExecution","id":"log-json","aggregatedOutput":null,"exitCode":0}),
+        ),
+        item(
+            "item/started",
+            json!({"type":"commandExecution","id":"quoted-json","command":"quoted-json"}),
+        ),
+        delta("quoted-json", "\"password\":\"hidden-quoted-password"),
+        item(
+            "item/completed",
+            json!({"type":"commandExecution","id":"quoted-json","aggregatedOutput":null,"exitCode":0}),
+        ),
+        delta("owner", "before start"),
+        item(
+            "item/started",
+            json!({"type":"commandExecution","id":"owner","command":"owner"}),
+        ),
+        delta("unknown", "foreign id"),
+        json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"foreign","turnId":"turn","itemId":"owner","delta":"foreign thread"}}),
+        json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread","turnId":"foreign","itemId":"owner","delta":"foreign turn"}}),
+        json!({"method":"item/commandExecution/outputDelta","params":{"turnId":"turn","itemId":"owner","delta":"missing thread"}}),
+        delta("owner", "owned output"),
+        item(
+            "item/completed",
+            json!({"type":"commandExecution","id":"owner","exitCode":0}),
+        ),
+        item(
+            "item/started",
+            json!({"type":"commandExecution","id":"json","command":"json"}),
+        ),
+        delta(
+            "json",
+            "{\"password\":\"hidden-output-password\",\"environment\":{\"MODE\":\"hidden-output-env\"},\"value\":\"visible\"}",
+        ),
+        item(
+            "item/completed",
+            json!({"type":"commandExecution","id":"json","aggregatedOutput":null,"exitCode":0}),
+        ),
+        item(
+            "item/started",
+            json!({"type":"commandExecution","id":"malformed","command":"malformed"}),
+        ),
+        delta("malformed", "{\"password\":\"hidden-invalid-output\""),
+        item(
+            "item/completed",
+            json!({"type":"commandExecution","id":"malformed","aggregatedOutput":null,"exitCode":0}),
+        ),
+        item(
+            "item/started",
+            json!({"type":"commandExecution","id":"error","command":"error"}),
+        ),
+        delta("error", "partial output"),
+        item(
+            "item/completed",
+            json!({"type":"commandExecution","id":"error","aggregatedOutput":null,"status":"failed","error":{"message":"failure reason"}}),
+        ),
+        item(
+            "item/started",
+            json!({"type":"commandExecution","id":"large","command":"large"}),
+        ),
+    ];
+    events.extend((0..5).map(|_| delta("large", &large)));
+    events.push(item(
+        "item/completed",
+        json!({"type":"commandExecution","id":"large","aggregatedOutput":null,"exitCode":0}),
+    ));
+    for index in 0..65 {
+        let id = format!("stream-{index}");
+        events.push(item(
+            "item/started",
+            json!({"type":"commandExecution","id":&id,"command":"stream"}),
+        ));
+        events.push(delta(&id, "stream output"));
+    }
+    for index in (0..65).rev() {
+        events.push(item("item/completed", json!({"type":"commandExecution","id":format!("stream-{index}"),"aggregatedOutput":null,"exitCode":0})));
+    }
+    events.extend([
+        item(
+            "item/started",
+            json!({"type":"commandExecution","id":"unfinished","command":"unfinished"}),
+        ),
+        delta("unfinished", "unfinished output"),
+    ]);
+    let mut plan = fake_plan();
+    plan.environment
+        .insert("AGENT_RUN_PROVIDER_TOKEN".into(), "synthetic-secret".into());
+    let mut variables = Vec::new();
+    for (index, event) in events.into_iter().enumerate() {
+        let name = format!("EVENT_{index}");
+        plan.environment.insert(name.clone(), event.to_string());
+        variables.push(format!("\"${name}\""));
+    }
+    let old = r#"printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread","turnId":"turn","item":{"type":"commandExecution"}}}';"#;
+    let replacement = format!("printf '%s\\n' {};", variables.join(" "));
+    let script = plan.args[1].replace(old, &replacement);
+    assert_ne!(script, plan.args[1]);
+    plan.args[1] = script;
+    plan
+}
+
+/// Delta-only output is redacted, bounded and tied to the original command;
+/// an aggregate wins without duplication and an unfinished job stays open.
+#[tokio::test]
+async fn codex_command_deltas_fallback_safely_without_duplicate_results() {
+    let fixture = common::Home::new();
+    let mut request = fixture.request();
+    request.workdir = PathBuf::from(scratch());
+    let (id, _) = fixture
+        .store()
+        .admit(&request, &fixture.config, &json!({}), None)
+        .unwrap();
+    let mut store = fixture.store();
+    let record = store.get(&id).unwrap();
+    let prep = common::writer::prepare_supervisor(&mut store, &id);
+    let harness = common::writer::Harness::start(&fixture.path);
+    let mut persist = harness.supervisor(&fixture.path, prep, &id).await;
+    let app_home = fixture.path.join("codex-home");
+    fs::private_dir(&app_home).unwrap();
+    let mut process = Process::spawn(&command_delta_plan()).unwrap();
+    let result = codex::run(
+        &mut process,
+        &mut persist,
+        &record,
+        &record,
+        &runtime(fixture.path.join("runtime")),
+        &profile(),
+        &app_home,
+    )
+    .await
+    .unwrap();
+    persist.flush().await.unwrap();
+    assert_eq!(result.outcome.status, Status::Succeeded);
+    let output = |key: &str| -> String {
+        store.conn.query_row("SELECT COALESCE(GROUP_CONCAT(content,''),'') FROM (SELECT content FROM messages WHERE agent_id=?1 AND role='tool_result' AND raw_ref=?2 ORDER BY seq)", [id.as_str(), key], |row| row.get(0)).unwrap()
+    };
+    assert_eq!(output("delta"), "before <redacted> after");
+    assert_eq!(output("aggregate"), "complete <redacted>");
+    assert_eq!(output("empty-aggregate"), "use deltas");
+    assert_eq!(output("log"), "[INFO] ready");
+    assert_eq!(output("multiline-log"), "[INFO] first\n[INFO] second");
+    assert_eq!(
+        output("progress"),
+        "[1/2] Building CXX object foo.o\n[ 50%] Built target app"
+    );
+    assert_eq!(output("progress-secret"), "<omitted>");
+    assert_eq!(output("quoted"), "\"service ready\" now");
+    assert_eq!(output("quoted-secret"), "<omitted>");
+    assert_eq!(output("quoted-escaped-safe"), "\"service\\u0020ready\" now");
+    assert_eq!(output("log-json"), "<omitted>");
+    assert_eq!(output("quoted-json"), "<omitted>");
+    assert_eq!(output("owner"), "owned output");
+    let structured: serde_json::Value = serde_json::from_str(&output("json")).unwrap();
+    assert_eq!(structured["value"], "visible");
+    assert_eq!(structured["password"], "<redacted>");
+    assert_eq!(structured["environment"], "<redacted>");
+    assert_eq!(output("malformed"), "<omitted>");
+    assert_eq!(output("error"), "partial output\nfailure reason");
+    assert_eq!(
+        output("large"),
+        format!("{}\n[command output truncated]", "é".repeat(128 * 1024))
+    );
+    assert_eq!(output("stream-0"), "stream output");
+    assert_eq!(output("stream-64"), "\n[command output truncated]");
+    let unfinished: i64 = store.conn.query_row("SELECT COUNT(*) FROM messages WHERE agent_id=? AND role='tool_result' AND raw_ref='unfinished'", [id.as_str()], |row| row.get(0)).unwrap();
+    assert_eq!(unfinished, 0);
+    let result_count: i64 = store.conn.query_row("SELECT COUNT(*) FROM messages WHERE agent_id=? AND role='tool_result' AND raw_ref='delta'", [id.as_str()], |row| row.get(0)).unwrap();
+    assert_eq!(result_count, 1);
+    let persisted: String = store
+        .conn
+        .query_row(
+            "SELECT COALESCE(GROUP_CONCAT(data_json,''),'') FROM events WHERE agent_id=?",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    for omitted in [
+        "synthetic-",
+        "foreign id",
+        "foreign thread",
+        "foreign turn",
+        "missing thread",
+        "before start",
+        "late output",
+        "hidden-invalid-output",
+    ] {
+        assert!(!persisted.contains(omitted), "leaked {omitted}");
+    }
     drop(process.input.take());
     process.reap().await;
 }

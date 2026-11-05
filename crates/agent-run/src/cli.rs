@@ -535,6 +535,11 @@ pub enum Command {
         #[command(subcommand)]
         command: StorageCommand,
     },
+    /// Read the broker's maintenance admission-fence status.
+    Maintenance {
+        #[command(subcommand)]
+        command: MaintenanceCommand,
+    },
     /// Manage global account references without invoking native login.
     Accounts {
         #[command(subcommand)]
@@ -1012,6 +1017,38 @@ pub enum StorageCommand {
     },
     /// Roll interrupted shared-storage relocations forward, offline.
     Recover,
+}
+
+/// Planned restart preparation and safe deferral through the resident broker.
+#[derive(Subcommand, Debug)]
+pub enum MaintenanceCommand {
+    /// Show the current fence and captured execution counts.
+    Status,
+    /// Pause eligible agents and wait until the service can be restarted.
+    Prepare {
+        /// Maximum preparation time in seconds, from 1 to 600.
+        #[arg(long, default_value_t = 600)]
+        timeout_seconds: u64,
+        /// Stable intent ID for retrying an uncertain request.
+        #[arg(long)]
+        request_id: Option<String>,
+        /// Print only the ready epoch for a service-manager wrapper.
+        #[arg(long)]
+        epoch_only: bool,
+    },
+    /// Defer a preparation when a restart is known not to have been requested.
+    Defer {
+        /// Exact current maintenance epoch.
+        epoch: i64,
+    },
+    /// Wait for the exact epoch to complete after the service manager restarts.
+    Wait {
+        /// Exact maintenance epoch returned by preparation.
+        epoch: i64,
+        /// Maximum wait in seconds, from 1 to 600.
+        #[arg(long, default_value_t = 600)]
+        timeout_seconds: u64,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1678,7 +1715,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
     }
     if matches!(
         &cli.command,
-        Command::Doctor { .. } | Command::DoctorCanary { .. }
+        Command::Doctor { .. } | Command::DoctorCanary { .. } | Command::Maintenance { .. }
     ) {
         return run_with(cli, CliDependencies::production(home)).await;
     }
@@ -1719,6 +1756,7 @@ fn client_command(command: &Command) -> bool {
             | Command::PoolReplace { .. }
             | Command::Pool { .. }
             | Command::Pools { .. }
+            | Command::Maintenance { .. }
             | Command::Capabilities
             | Command::AnswerChunk { .. }
             | Command::Doc { .. }
@@ -2275,6 +2313,25 @@ async fn view_transcript(
     Ok(())
 }
 
+/// Request one bounded deferral after a known-unrequested service restart.
+/// A timeout stays unknown and is not followed by another mutation.
+async fn defer_preparation(broker: &dyn CliBroker, epoch: i64, output: &CliOutput) -> Result<i32> {
+    match tokio::time::timeout(
+        Duration::from_secs(3),
+        broker.call("_cli_maintenance_defer", json!({"epoch":epoch})),
+    )
+    .await
+    {
+        Ok(Ok(status)) => {
+            (output)(&status)?;
+            Ok(2)
+        }
+        _ => Err(Error::Runtime(format!(
+            "maintenance deferral outcome is unknown for epoch {epoch}; inspect maintenance status"
+        ))),
+    }
+}
+
 /// Executes existing broker-only CLI operations with their original payloads and output sinks.
 /// The MCP home is metadata only: operator mode passes an empty path and never resolves a home.
 async fn run_client_command(
@@ -2285,6 +2342,123 @@ async fn run_client_command(
     home: PathBuf,
 ) -> Result<i32> {
     match command {
+        Command::Maintenance {
+            command: MaintenanceCommand::Status,
+        } => (output)(&broker.call("_cli_maintenance_status", json!({})).await?)?,
+        Command::Maintenance {
+            command: MaintenanceCommand::Defer { epoch },
+        } => (output)(
+            &broker
+                .call("_cli_maintenance_defer", json!({"epoch":epoch}))
+                .await?,
+        )?,
+        Command::Maintenance {
+            command:
+                MaintenanceCommand::Prepare {
+                    timeout_seconds,
+                    request_id,
+                    epoch_only,
+                },
+        } => {
+            if !(1..=600).contains(&timeout_seconds) {
+                return Err(invalid(
+                    "maintenance timeout must be between 1 and 600 seconds",
+                ));
+            }
+            let request_id = request_id
+                .unwrap_or_else(|| format!("maintenance-{}", uuid::Uuid::new_v4().simple()));
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
+            let begun = match tokio::time::timeout_at(
+                deadline,
+                broker.call("_cli_maintenance_begin", json!({"request_id":&request_id})),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(Error::Runtime(format!(
+                        "maintenance start outcome is unknown; inspect status or retry with --request-id {request_id}"
+                    )));
+                }
+            };
+            let epoch = begun["epoch"]
+                .as_i64()
+                .filter(|epoch| *epoch > 0)
+                .ok_or_else(|| invalid("maintenance broker returned an invalid epoch"))?;
+            if !begun["ended_at"].is_null() {
+                return Err(invalid("maintenance request has already completed"));
+            }
+            loop {
+                if tokio::time::Instant::now() >= deadline {
+                    return defer_preparation(broker.as_ref(), epoch, &output).await;
+                }
+                let status = match tokio::time::timeout_at(
+                    deadline,
+                    broker.call("_cli_maintenance_status", json!({})),
+                )
+                .await
+                {
+                    Ok(Ok(status)) => status,
+                    _ => return defer_preparation(broker.as_ref(), epoch, &output).await,
+                };
+                if status["state"] == "inactive" || status["phase"] == "deferring" {
+                    (output)(&status)?;
+                    return Ok(2);
+                }
+                if status["epoch"].as_i64() != Some(epoch) {
+                    return Err(Error::Integrity(
+                        "maintenance epoch changed while preparing".into(),
+                    ));
+                }
+                if status["phase"] == "ready" {
+                    if epoch_only {
+                        (text_output)(&format!("{epoch}\n"))?;
+                    } else {
+                        (output)(&status)?;
+                    }
+                    return Ok(0);
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+        Command::Maintenance {
+            command:
+                MaintenanceCommand::Wait {
+                    epoch,
+                    timeout_seconds,
+                },
+        } => {
+            if epoch <= 0 || !(1..=600).contains(&timeout_seconds) {
+                return Err(invalid("invalid maintenance epoch or timeout"));
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
+            let mut last = json!({"epoch":epoch,"state":"unknown"});
+            loop {
+                if let Ok(Ok(fence)) = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    broker.call("_cli_maintenance_epoch", json!({"epoch":epoch})),
+                )
+                .await
+                {
+                    if fence["epoch"].as_i64() != Some(epoch) {
+                        return Err(Error::Integrity(
+                            "maintenance epoch changed while waiting".into(),
+                        ));
+                    }
+                    if fence["phase"] == "complete" {
+                        let completed = fence["outcome"] == "completed";
+                        (output)(&fence)?;
+                        return Ok(if completed { 0 } else { 2 });
+                    }
+                    last = fence;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    (output)(&last)?;
+                    return Ok(2);
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
         Command::Hook { command } => {
             let (bind, transport) = match command {
                 Hook::Context(transport) => (false, transport.transport),

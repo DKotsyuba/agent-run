@@ -30,6 +30,23 @@ pub(super) struct ResumePreflight {
     pub route_fingerprint: String,
 }
 
+/// Read-only parked-source proof under the worker's original account. All
+/// filesystem paths still come from the frozen stored execution, never callers.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct MaintenancePreflight {
+    pub operation: MaintenanceOperation,
+    pub request: agent_run_core::system_launch::MaintenancePreflightRequest,
+    pub route_fingerprint: String,
+}
+
+/// Distinct operation spelling preserves the ordinary terminal resume contract.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum MaintenanceOperation {
+    MaintenancePreflight,
+}
+
 /// The worker accepts no caller-supplied private path or snapshot contents.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -43,6 +60,7 @@ pub(super) enum PreflightOperation {
 pub(super) enum Request {
     Start(Start),
     ResumePreflight(ResumePreflight),
+    MaintenancePreflight(MaintenancePreflight),
 }
 
 /// The broker permits release only after its startup-owner write is durable.
@@ -63,6 +81,9 @@ pub(super) enum Reply {
     Ready,
     ResumeVerified {
         digest: String,
+    },
+    MaintenanceVerified {
+        result: agent_run_core::system_launch::MaintenancePreflightResult,
     },
     ResumeRefused {
         reason: agent_run_core::system_launch::ResumePreflightFailure,

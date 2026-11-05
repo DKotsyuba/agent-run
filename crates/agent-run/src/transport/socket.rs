@@ -637,6 +637,10 @@ const CLI_READ_METHODS: &[&str] = &[
     "_cli_transcript_select",
     "_cli_transcript_page",
     "_cli_transcript_status",
+    "_cli_maintenance_status",
+    "_cli_maintenance_begin",
+    "_cli_maintenance_defer",
+    "_cli_maintenance_epoch",
     "_hook_context",
     "_hook_bind",
     "_runtime_retention",
@@ -1664,6 +1668,11 @@ async fn serve_endpoints(
             if let Err(error) = reconciler.reconcile().await {
                 maintenance_diagnostic("reconcile", "queued", &error);
             }
+            if let Err(error) =
+                agent_run_core::maintenance_controller::recovery_tick(&reconciler).await
+            {
+                maintenance_diagnostic("planned_restart", "recovery", &error);
+            }
         }
     });
     let checker = service.clone();
@@ -1703,20 +1712,37 @@ async fn serve_endpoints(
     loop {
         tokio::select! {
             _=tokio::signal::ctrl_c()=>{
-                if !system_group { break; }
-                writer_service.handle().close_admissions("shared service stopping");
+                writer_service.handle().close_admissions("service stopping");
+                match agent_run_core::maintenance_controller::commit_stop(&service).await {
+                    Ok(agent_run_core::maintenance_controller::StopDisposition::Committed) => break,
+                    Ok(agent_run_core::maintenance_controller::StopDisposition::NoFence) if !system_group => break,
+                    Err(error) => maintenance_diagnostic("planned_restart", "stop", &error),
+                    _ => {}
+                }
                 draining = true;
             },
             _=term.recv()=>{
-                if !system_group { break; }
-                writer_service.handle().close_admissions("shared service stopping");
+                writer_service.handle().close_admissions("service stopping");
+                match agent_run_core::maintenance_controller::commit_stop(&service).await {
+                    Ok(agent_run_core::maintenance_controller::StopDisposition::Committed) => break,
+                    Ok(agent_run_core::maintenance_controller::StopDisposition::NoFence) if !system_group => break,
+                    Err(error) => maintenance_diagnostic("planned_restart", "stop", &error),
+                    _ => {}
+                }
                 draining = true;
             },
             _=drain_tick.tick(), if draining => {
-                match shared_service_idle(drain_home.clone()).await {
-                    Ok(true) => break,
-                    Ok(false) => {},
-                    Err(error) => maintenance_diagnostic("shutdown", "drain", &error),
+                match agent_run_core::maintenance_controller::commit_stop(&service).await {
+                    Ok(agent_run_core::maintenance_controller::StopDisposition::Committed) => break,
+                    Ok(agent_run_core::maintenance_controller::StopDisposition::NoFence) => {
+                        match shared_service_idle(drain_home.clone()).await {
+                            Ok(true) => break,
+                            Ok(false) => {},
+                            Err(error) => maintenance_diagnostic("shutdown", "drain", &error),
+                        }
+                    },
+                    Ok(agent_run_core::maintenance_controller::StopDisposition::Waiting) => {},
+                    Err(error) => maintenance_diagnostic("planned_restart", "stop", &error),
                 }
             },
             ended = writer_task.as_mut().expect("held while selectable"), if writer_task.is_some() => {
@@ -2060,6 +2086,29 @@ mod tests {
                 &service,
                 json!({"jsonrpc":"2.0","id":1,"method":method,"params":{}}),
                 SocketAccess::Operator,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response["error"]["code"], -32602);
+        }
+    }
+
+    /// Maintenance status is a strict read on both authenticated socket types,
+    /// and does not become an advertised worker or MCP tool.
+    #[tokio::test]
+    async fn maintenance_status_is_socket_only_and_rejects_arguments() {
+        let service = Service::new("/unused-maintenance-fixture".into());
+        let method = "_cli_maintenance_status";
+        assert!(!dispatch::is_tool(method));
+        for access in [
+            SocketAccess::Private,
+            SocketAccess::Operator,
+            SocketAccess::SystemGroup,
+        ] {
+            let response = respond_with_access(
+                &service,
+                json!({"jsonrpc":"2.0","id":1,"method":method,"params":{"extra":true}}),
+                access,
             )
             .await
             .unwrap();

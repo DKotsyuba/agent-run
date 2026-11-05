@@ -6,7 +6,7 @@ three expose the same operator tool surface through one shared dispatcher
 (`crates/agent-run-core/src/dispatch.rs`), so a tool that exists in MCP exists here
 under the same name with the same parameters.
 
-Workers use a [separate fixed five-tool MCP surface](worker-mcp.md):
+Workers use a [separate MCP surface](worker-mcp.md) whose base tools are
 `notify_orchestrator`, `pool_post`, `pool_read`, `pool_propose` and `pool_vote`.
 Pool actions require live authenticated membership. Private worker broker routes are not in operator
 discovery and requires the current run/attempt capability on every call.
@@ -75,6 +75,69 @@ paths, then run `systemctl --user enable --now agent-run.service`.
 - `SIGTERM`/`SIGINT` shut the server down and remove the socket file.
 - Startup takes a couple of seconds (service construction); wait for the
   socket file to appear before connecting.
+
+To inspect an existing maintenance admission fence, run:
+
+```bash
+agent-run maintenance status
+```
+
+This read-only command reports `inactive` or `fenced`, the fence epoch, and
+counts of captured, active, parked, terminal and unavailable executions. Parked
+executions are included in the active count. It does not
+start the broker or create a state database. A fenced status does not, by
+itself, establish that agents are paused or that a restart is safe.
+
+## Planned restart without discarding tasks
+
+Use the bundled `services/agent-run-restart.sh` with the same global arguments
+you use to reach the broker. It prepares the captured agents, invokes the host
+service manager, then waits for that exact maintenance epoch to recover:
+
+```sh
+AGENT_RUN_BINARY=/path/to/agent-run /path/to/services/agent-run-restart.sh \
+  --broker-socket /run/agent-run/operator/api.sock --broker-uid 1000
+```
+
+The example targets a shared Linux broker; substitute the actual socket and
+broker UID. The caller must have the normal operating-system permission to
+restart the configured systemd unit. On macOS, omit the shared-socket options
+for a per-user broker and run the script as the account owning its launchd job.
+`AGENT_RUN_SYSTEMD_UNIT` and `AGENT_RUN_LAUNCHD_TARGET` select non-default service
+names. A launchd job must be configured to restart after receiving `SIGTERM`.
+
+Preparation blocks new admissions and requests a checkpoint from compatible
+Codex and Claude workers using explicit completion. Older, incompatible or
+non-cooperating workers are allowed to finish normally. If a safe boundary is
+not established within ten minutes, preparation is deferred after any in-flight
+check settles. Bound orchestrators
+receive durable before/after notices through their configured Bridge route;
+the Bridge publisher must allow the `agent-run.maintenance` kind. An accepted
+notice is not evidence that its recipient read it. A pending or unknown Bridge
+outcome can delay preparation.
+
+Claude's built-in file tools and foreground Bash calls are eligible after their
+matching native results; background or ambiguous commands and unsupported tools
+still prevent automatic checkpointing. Codex commands likewise need native exit
+evidence. A continuation from a verified maintenance pause can be paused again;
+an ordinary resumed session lacks inherited background-work evidence and must
+finish normally or cause preparation to be deferred.
+
+The checkpoint resumes the same logical execution and native session, under
+the original account and permissions. Agent Run verifies foreground native
+activity, process cleanup and history before continuing. It cannot prove that
+arbitrary detached processes or external side effects have finished. An
+unverifiable or uncertain handoff is retained for inspection and is not sent
+again automatically. `agent-run maintenance status` reports the current phase.
+
+For manual service-manager integration, `agent-run maintenance prepare`
+returns success only when the broker is ready to stop; `--epoch-only` prints
+the epoch for a script. After the manager restarts the service,
+`agent-run maintenance wait EPOCH` reports the outcome of that exact epoch.
+If a restart was definitely never requested, `agent-run maintenance defer EPOCH`
+restores already paused work before reopening admission. If the service
+manager's outcome is unknown, inspect the status before deciding whether to
+defer: the original restart request could still complete.
 
 ## Wire protocol
 

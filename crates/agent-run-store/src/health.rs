@@ -126,7 +126,7 @@ impl Store<'_> {
     }
 
     /// Select at most `limit` due attempts in oldest-check order. Historical,
-    /// terminal, closing and cancellation-pending attempts are excluded. This
+    /// terminal, closing, cancellation-pending and maintenance-pausing attempts are excluded. This
     /// bounded indexed event lookup never reads task text or tool arguments.
     pub fn health_due(&self, at: f64, limit: usize) -> Result<Vec<AgentId>> {
         if !at.is_finite() || at < 0.0 || !(1..=100).contains(&limit) {
@@ -134,7 +134,8 @@ impl Store<'_> {
         }
         let mut stmt=self.conn.prepare("SELECT a.id FROM agents a JOIN attempts t ON t.agent_id=a.id JOIN worker_lifecycle l ON l.attempt_id=t.id \
             JOIN events e ON e.seq=(SELECT MAX(x.seq) FROM events x WHERE x.agent_id=a.id AND x.attempt_id=t.id AND x.kind='worker_ping_state_v1') \
-            WHERE a.status='running' AND a.finished_at IS NULL AND t.ownership_active=1 AND t.finished_at IS NULL AND l.finish_json IS NULL \
+            WHERE a.status='running' AND a.finished_at IS NULL AND t.ownership_active=1 AND t.finished_at IS NULL AND t.state!='maintenance_parked' AND l.finish_json IS NULL \
+            AND NOT EXISTS(SELECT 1 FROM maintenance_checkpoints m JOIN maintenance_fences f ON f.epoch=m.epoch WHERE m.attempt_id=t.id AND m.command_id IS NOT NULL AND f.ended_at IS NULL) \
             AND (json_extract(e.data_json,'$.checked_at')<=? OR json_extract(e.data_json,'$.checked_at')>?) \
             AND NOT EXISTS(SELECT 1 FROM commands c WHERE c.agent_id=a.id AND c.kind='cancel' AND c.state IN ('pending','claimed')) \
             ORDER BY json_extract(e.data_json,'$.checked_at'),a.id LIMIT ?")?;
@@ -592,15 +593,18 @@ impl Store<'_> {
         ))
     }
 
-    /// True only for the new explicit catalog which declares read-loop guard
-    /// side effects. Older frozen catalogs retain their original read contract.
+    /// True for v4/v5 explicit catalogs which declare read-loop guard side
+    /// effects. Older frozen catalogs retain their original read contract.
     /// The subsequent read/report still authenticates the actual bearer token.
     pub fn pool_read_guard_enabled(&self, run: &AgentId, attempt: &str) -> Result<bool> {
         let proof:Option<(u32,String)>=self.conn.query_row("SELECT c.pool_catalog_version,c.pool_catalog_digest FROM worker_capabilities c JOIN attempts t ON t.id=c.attempt_id WHERE c.attempt_id=?1 AND t.agent_id=?2 AND c.pool_catalog_version IS NOT NULL AND c.pool_catalog_digest IS NOT NULL",params![attempt,run.as_str()],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         Ok(self.get(run)?.request.explicit_finish
             && proof.is_some_and(|(version, digest)| {
-                version == agent_run_domain::worker::FINISH_CATALOG_VERSION
-                    && agent_run_domain::worker::known_pool_catalog(version, &digest)
+                matches!(
+                    version,
+                    agent_run_domain::worker::FINISH_CATALOG_VERSION
+                        | agent_run_domain::worker::MAINTENANCE_PAUSE_CATALOG_VERSION
+                ) && agent_run_domain::worker::known_pool_catalog(version, &digest)
             }))
     }
 
@@ -695,10 +699,11 @@ impl Store<'_> {
         Ok(())
     }
 
-    /// Resolve the usable current attempt with finish and cancellation fences.
+    /// Resolve the usable current attempt with finish, cancellation and maintenance fences.
     fn health_attempt(&self, run: &AgentId) -> Result<Option<(String, String, f64, u64)>> {
         Ok(self.conn.query_row("SELECT t.id,l.phase,l.transition_at,l.turn_count FROM attempts t JOIN agents a ON a.id=t.agent_id JOIN worker_lifecycle l ON l.attempt_id=t.id \
-            WHERE t.agent_id=? AND t.ownership_active=1 AND t.finished_at IS NULL AND a.status='running' AND a.finished_at IS NULL AND l.finish_json IS NULL \
+            WHERE t.agent_id=? AND t.ownership_active=1 AND t.finished_at IS NULL AND t.state!='maintenance_parked' AND a.status='running' AND a.finished_at IS NULL AND l.finish_json IS NULL \
+            AND NOT EXISTS(SELECT 1 FROM maintenance_checkpoints m JOIN maintenance_fences f ON f.epoch=m.epoch WHERE m.attempt_id=t.id AND m.command_id IS NOT NULL AND f.ended_at IS NULL) \
             AND NOT EXISTS(SELECT 1 FROM commands c WHERE c.agent_id=a.id AND c.kind='cancel' AND c.state IN ('pending','claimed'))",[run.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?)
     }
 
@@ -745,10 +750,10 @@ impl Store<'_> {
         Ok(covered && self.health_catalog_ready(attempt)?)
     }
 
-    /// Only the current explicit health-capable catalog can answer challenges;
-    /// recognizing a historical pool catalog is not proof it has health_reply.
+    /// The v4/v5 explicit health-capable catalogs can answer challenges;
+    /// recognizing an older pool catalog is not proof of current health policy.
     fn health_catalog_ready(&self, attempt: &str) -> Result<bool> {
-        Ok(self.conn.query_row("SELECT pool_catalog_version=? AND length(pool_catalog_digest)=64 FROM worker_capabilities WHERE attempt_id=?",params![agent_run_domain::worker::FINISH_CATALOG_VERSION,attempt],|r|r.get::<_,Option<bool>>(0))?.unwrap_or(false))
+        Ok(self.conn.query_row("SELECT pool_catalog_version IN (?,?) AND length(pool_catalog_digest)=64 FROM worker_capabilities WHERE attempt_id=?",params![agent_run_domain::worker::FINISH_CATALOG_VERSION,agent_run_domain::worker::MAINTENANCE_PAUSE_CATALOG_VERSION,attempt],|r|r.get::<_,Option<bool>>(0))?.unwrap_or(false))
     }
 
     /// The latest real running boundary precedes these tool facts. Critical

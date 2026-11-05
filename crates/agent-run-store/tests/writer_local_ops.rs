@@ -135,6 +135,81 @@ fn admission_commits_and_replays_by_request() {
     assert_eq!(second.agent_id, output.agent_id);
 }
 
+/// A prepared admission cannot slip behind the durable fence. Its rejection
+/// replays by writer operation id; retrying the public request through a NEW
+/// operation after release succeeds. Only the broker may create/lift fences.
+#[test]
+fn maintenance_fence_serializes_queued_admission_and_operation_replay() {
+    use agent_run_domain::storage::RejectCode;
+    use agent_run_store::{
+        maintenance::MaintenanceFence,
+        ops::{BeginMaintenanceFence, EndMaintenanceFence},
+    };
+    let mut f = Fixture::new();
+    let mut request = f.home.request();
+    request.request_id = Some("queued-before-fence".into());
+    let admission = LocalOp::from(AdmitStart {
+        request,
+        config: f.home.config.clone(),
+        config_revision: "cfg".into(),
+        identity: json!({}),
+        parent: None,
+    });
+    let (id, mut producer, ordinal, deadline) = f.header();
+    producer.instance = "already-queued-producer".into();
+    let queued = LocalEnvelope::new(id, producer, ordinal, deadline, admission.clone()).unwrap();
+    let begin = LocalOp::from(BeginMaintenanceFence {
+        request_id: "maintenance".into(),
+        at: 1.0,
+    });
+    let denied = f.local(begin.clone());
+    let authority = WriteAuthority::Cli {
+        uid: 0,
+        pid: 1,
+        birth: 1.0,
+        token: "untrusted".into(),
+    };
+    assert!(
+        matches!(f.writer.apply_local(&authority, &denied), SubmitResult::Rejected(r) if r.code == RejectCode::Unauthorized)
+    );
+    assert!(f.home.store().active_maintenance_fence().unwrap().is_none());
+    let fence: MaintenanceFence = serde_json::from_value(f.commit_local(begin)).unwrap();
+    assert_eq!(fence.member_count, 0);
+    assert!(
+        matches!(f.writer.apply_local(&WriteAuthority::Broker, &queued), SubmitResult::Rejected(r) if r.durable)
+    );
+    assert!(
+        f.home
+            .store()
+            .maintenance_cohort(fence.epoch)
+            .unwrap()
+            .is_empty()
+    );
+    f.commit_local(
+        EndMaintenanceFence {
+            epoch: fence.epoch,
+            at: 2.0,
+        }
+        .into(),
+    );
+    assert!(
+        matches!(f.writer.apply_local(&WriteAuthority::Broker, &queued), SubmitResult::Rejected(r) if r.durable)
+    );
+    let accepted: AdmitStartOutput =
+        serde_json::from_value(f.commit_local(admission.clone())).unwrap();
+    assert!(!accepted.replayed);
+    f.commit_local(
+        BeginMaintenanceFence {
+            request_id: "second-maintenance".into(),
+            at: 3.0,
+        }
+        .into(),
+    );
+    let replay: AdmitStartOutput = serde_json::from_value(f.commit_local(admission)).unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.agent_id, accepted.agent_id);
+}
+
 /// A stale watermark of a producer the scheduler reports live (unfinished
 /// work) is never pruned; the report is consumed by that one batch, after
 /// which the watermark is pruned like any other.
@@ -635,6 +710,16 @@ fn reconciliation_is_ownership_exact_and_proof_gated() {
         f.count("SELECT COUNT(*) FROM agents WHERE status='lost'"),
         0
     );
+    f.sql(
+        "UPDATE attempts SET state='maintenance_parked' WHERE id=?",
+        [&attempt],
+    );
+    assert_eq!(f.commit_local(lost("t")), json!(false));
+    assert_eq!(
+        f.count("SELECT COUNT(*) FROM agents WHERE status='lost'"),
+        0
+    );
+    f.sql("UPDATE attempts SET state='running' WHERE id=?", [&attempt]);
     assert_eq!(f.commit_local(lost("t")), json!(true));
     assert_eq!(
         f.count("SELECT COUNT(*) FROM agents WHERE status='lost'"),

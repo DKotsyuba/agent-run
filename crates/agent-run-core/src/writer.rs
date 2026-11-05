@@ -13,7 +13,7 @@ use agent_run_domain::{
 };
 use agent_run_domain::{domain::AgentId, worker::FinishGuard};
 use agent_run_store::{
-    ops::{AcceptWorkerFinish, LocalEnvelope, LocalOp, MaintenanceOp, OpKindRef, WriteEnvelope},
+    ops::{LocalEnvelope, LocalOp, MaintenanceOp, OpKindRef, WriteEnvelope},
     writer::{StoreWriter, WriterLease, queued::QueuedWriter},
 };
 use std::{
@@ -211,30 +211,33 @@ impl WriterHandle {
         }
     }
 
-    /// Pre-SQL verdict on one finish callback for its claimed attempt; the
-    /// store still authenticates the capability and answers exact replays.
-    fn finish_guard(&self, op: &AcceptWorkerFinish) -> FinishGuard {
+    /// Pre-SQL verdict on callback text for its exact supervisor-owned attempt.
+    /// The store still authenticates the capability and answers exact replays.
+    fn callback_guard(&self, execution: &AgentId, attempt: &str, text: &str) -> FinishGuard {
         let guards = self.finish_guards.lock().unwrap_or_else(|e| e.into_inner());
-        match guards.get(&(op.execution.clone(), op.attempt.clone())) {
+        match guards.get(&(execution.clone(), attempt.to_owned())) {
             None => FinishGuard::Unavailable,
-            Some(guard) if guard.redactor.contains_secret(&op.input.summary) => FinishGuard::Secret,
+            Some(guard) if guard.redactor.contains_secret(text) => FinishGuard::Secret,
             Some(_) => FinishGuard::Clean,
         }
     }
 
     /// Submit a typed broker-local unit through the same connection and bounds.
     /// An admission seal refuses new starts but still resolves exact durable replays
-    /// and accepts evidence for already-running executions. A finish callback
-    /// first receives this handle's launch-secret verdict, so no submitter can
-    /// create a first finish intent without its supervisor's installed context.
+    /// and accepts evidence for already-running executions. Finish and
+    /// maintenance callbacks first receive this handle's launch-secret verdict,
+    /// so no first intent is written without its supervisor's installed context.
     pub async fn local(
         &self,
         authority: WriteAuthority,
         mut envelope: LocalEnvelope,
     ) -> SubmitResult {
         if let LocalOp::AcceptWorkerFinish(op) = envelope.op() {
-            let guard = self.finish_guard(op);
+            let guard = self.callback_guard(&op.execution, &op.attempt, &op.input.summary);
             envelope.set_finish_guard(guard);
+        } else if let LocalOp::AcceptMaintenanceCheckpoint(op) = envelope.op() {
+            let guard = self.callback_guard(&op.execution, &op.attempt, &op.input.checkpoint);
+            envelope.set_maintenance_guard(guard);
         }
         if self.admissions_closed.load(Ordering::Acquire)
             && matches!(
@@ -244,6 +247,7 @@ impl WriterHandle {
                     | OpKindRef::AdmitProviderResume
                     | OpKindRef::AdmitPool
                     | OpKindRef::ReplacePoolMember
+                    | OpKindRef::BeginMaintenanceFence
             )
         {
             let header = envelope.header();

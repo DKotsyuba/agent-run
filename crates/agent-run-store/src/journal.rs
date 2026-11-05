@@ -25,6 +25,24 @@ pub const MAX_INLINE_MESSAGE_BYTES: usize = 32 * 1024;
 /// Number of Unicode scalar values retained at the front of an oversized stub.
 pub const INLINE_STUB_HEAD_CHARS: usize = 4096;
 
+/// A maintenance steer is claimable only by its still-current attempt while
+/// the original fence and challenge remain live. Ordinary commands are not
+/// affected. Both the read-only preflight and the writer claim use this rule.
+pub(crate) const MAINTENANCE_COMMAND_ELIGIBLE: &str = "((c.kind='cancel' OR NOT EXISTS ( \
+    SELECT 1 FROM maintenance_checkpoints z JOIN attempts owned ON owned.id=z.attempt_id AND owned.agent_id=z.agent_id \
+    WHERE z.agent_id=c.agent_id AND z.closing_event_seq IS NOT NULL AND owned.ownership_active=1 AND owned.finished_at IS NULL)) \
+    AND (json_extract(c.payload_json,'$.maintenance_epoch') IS NULL OR EXISTS ( \
+    SELECT 1 FROM maintenance_checkpoints m JOIN maintenance_fences f ON f.epoch=m.epoch \
+    JOIN attempts t ON t.id=m.attempt_id AND t.agent_id=m.agent_id \
+    JOIN agents a ON a.id=m.agent_id JOIN worker_lifecycle l ON l.attempt_id=t.id \
+    WHERE m.command_id=c.id AND m.agent_id=c.agent_id AND m.checkpoint_json IS NULL \
+      AND m.epoch=json_extract(c.payload_json,'$.maintenance_epoch') \
+      AND m.attempt_id=json_extract(c.payload_json,'$.maintenance_attempt') \
+      AND m.challenge_id=json_extract(c.payload_json,'$.maintenance_challenge') \
+      AND f.ended_at IS NULL AND f.phase='preparing' AND a.status='running' AND a.finished_at IS NULL \
+      AND t.state='running' AND t.ownership_active=1 AND t.finished_at IS NULL AND l.finish_json IS NULL \
+      AND NOT EXISTS (SELECT 1 FROM commands q WHERE q.agent_id=c.agent_id AND q.kind='cancel' AND q.state IN ('pending','claimed')))))";
+
 /// Rejects a raw transcript reference that could escape the owning agent directory.
 fn valid_raw_ref(raw_ref: &str) -> bool {
     !raw_ref.is_empty()
@@ -304,16 +322,16 @@ impl Store<'_> {
                 // Idle control reads never contend for the single WAL writer. Eligibility
                 // is rechecked inside the immediate claim transaction when work exists.
                 let pending: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM commands WHERE agent_id=? AND state='pending' AND (? OR kind='cancel' OR COALESCE(json_extract(payload_json,'$.native_completion'),0)<>1))",
+            &format!("SELECT EXISTS(SELECT 1 FROM commands c WHERE c.agent_id=? AND c.state='pending' AND (? OR c.kind='cancel' OR COALESCE(json_extract(c.payload_json,'$.native_completion'),0)<>1) AND {MAINTENANCE_COMMAND_ELIGIBLE})"),
             params![id.as_str(), allow_native_wake], |row| row.get(0),
         )?;
                 if !pending {
                     return Ok(None);
                 }
                 let tx = crate::writer::WriteTx::begin(&self.conn)?;
-                let row = tx.query_row("SELECT id,kind,payload_json FROM commands WHERE agent_id=? AND state='pending' \
-            AND (? OR kind='cancel' OR COALESCE(json_extract(payload_json,'$.native_completion'),0)<>1) \
-            ORDER BY CASE kind WHEN 'cancel' THEN 0 WHEN 'steer' THEN 1 ELSE 2 END,id LIMIT 1", params![id.as_str(),allow_native_wake], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))).optional()?;
+                let row = tx.query_row(&format!("SELECT c.id,c.kind,c.payload_json FROM commands c WHERE c.agent_id=? AND c.state='pending' \
+            AND (? OR c.kind='cancel' OR COALESCE(json_extract(c.payload_json,'$.native_completion'),0)<>1) AND {MAINTENANCE_COMMAND_ELIGIBLE} \
+            ORDER BY CASE c.kind WHEN 'cancel' THEN 0 WHEN 'steer' THEN 1 ELSE 2 END,c.id LIMIT 1"), params![id.as_str(),allow_native_wake], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))).optional()?;
                 let Some((command_id, kind, payload)) = row else {
                     tx.commit()?;
                     return Ok(None);
@@ -541,7 +559,7 @@ impl Store<'_> {
     /// completion time. Claimed commands are untouched: replaying them could
     /// duplicate an engine action. A nonterminal execution is a transition
     /// error; an unknown one is `NotFound`. Returns the number completed.
-    pub fn complete_terminal_commands(&mut self, id: &AgentId, at: f64) -> Result<u64> {
+    pub fn complete_terminal_commands(&self, id: &AgentId, at: f64) -> Result<u64> {
         if !at.is_finite() || at < 0.0 {
             return Err(invalid("completion time must be finite and nonnegative"));
         }

@@ -68,7 +68,7 @@ pub fn finish(
 /// Once all attempts have confirmed cleanup, a bounded process summary replaces
 /// detailed ownership evidence in this same transaction.
 pub fn commit_terminal(
-    store: &mut Store,
+    store: &Store,
     id: &AgentId,
     outcome: &Outcome,
     proof: Option<&Proof>,

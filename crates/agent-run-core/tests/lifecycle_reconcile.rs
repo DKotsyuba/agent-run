@@ -492,6 +492,38 @@ fn python_test_state_outbox_reaped_supervisor_reconciles_only_active_rows() {
     );
 }
 
+/// A reaped supervisor is expected after a confirmed maintenance park; it is
+/// not evidence that the logical agent was lost.
+#[test]
+fn maintenance_parked_attempt_is_not_reconciled_as_lost() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = admitted(&home, &mut store);
+    active(&store, &id, 100, "fixture-owner", 1.0);
+    store.conn.execute(
+        "INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES('parked-fixture',?,1,'maintenance_parked','{}',1,1)",
+        [id.as_str()],
+    ).unwrap();
+    let at = agent_run_core::domain::now() + 1.0;
+    assert!(!reconcile_reaped_agent(&mut store, &id, 100, at).unwrap());
+    assert!(
+        reconcile_with(&mut store, 10, |_, _, _| panic!(
+            "parked work must not be probed"
+        ))
+        .unwrap()
+        .is_empty()
+    );
+    assert_eq!(store.get(&id).unwrap().status, Status::Running);
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM deliveries", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
 /// Mirrors `tests/test_state_outbox.py::test_reaped_agent_closes_the_pre_identity_starting_window`.
 #[test]
 fn python_test_state_outbox_reaped_agent_closes_pre_identity_starting_window() {

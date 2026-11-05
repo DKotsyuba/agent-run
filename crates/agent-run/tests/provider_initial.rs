@@ -55,8 +55,10 @@ mod test_broker;
 /// child before the explicit disposable home and fixture credential are
 /// installed.
 async fn supervisor(home: &Path, id: &AgentId) -> test_broker::Supervised {
+    let binary = std::env::var("AGENT_RUN_QUALIFICATION_BINARY")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_agent-run").to_owned());
     test_broker::spawn_supervisor_with_env(
-        env!("CARGO_BIN_EXE_agent-run"),
+        &binary,
         home,
         id,
         &[
@@ -801,6 +803,15 @@ fn home_in(
     let root = temp.path().canonicalize().unwrap();
     agent_run::fs::private_dir(&root).unwrap();
     agent_run_store::fixture::initialize(&root).unwrap();
+    // Managed-service fixtures use their own disposable home as cwd, never a
+    // shared system temporary directory.
+    let extra = extra.replace(
+        "cwd=\"/tmp\"",
+        &format!(
+            "cwd={}",
+            toml::Value::String(root.to_string_lossy().into_owned())
+        ),
+    );
     fs::create_dir_all(root.join("profiles")).unwrap();
     fs::write(root.join("profiles/review.md"),
         "+++\nrevision = \"1\"\nwrite = false\nnetwork = false\nallow_external_read_roots = false\nskills = []\nmcp = []\nrequired_constraints = []\n+++\nReview safely.\n").unwrap();
@@ -4657,6 +4668,81 @@ async fn ordered_claude_explicit_resume_can_switch_after_billing() {
         ),
         1
     );
+}
+
+/// Existing runs keep their frozen order when the live fallback weights tie.
+#[tokio::test]
+async fn ordered_claude_weight_change_preserves_running_fallback_and_resume() {
+    let (_temp, home) = ordered_claude_home();
+    let service = fixture_service(home.clone()).await;
+    let mut request = request(&home);
+    request.account = None;
+    request.task = "fixture:billing".into();
+    request.request_id = Some("claude-frozen-weight".into());
+    let admitted = service.admit_provider(request).await.unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+
+    let config_path = home.join("config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    assert_eq!(config.matches("priority_multiplier = 0.5").count(), 1);
+    fs::write(
+        &config_path,
+        config.replace("priority_multiplier = 0.5", "priority_multiplier = 1.0"),
+    )
+    .unwrap();
+    run_to_end(&home, &id).await;
+    let parent = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&id)
+        .unwrap();
+    assert_eq!(
+        parent.status,
+        Status::Succeeded,
+        "{:?}",
+        parent.failure_text
+    );
+    let rows = attempts(&home, &id);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(
+        (rows[0].1.as_str(), rows[1].1.as_str()),
+        ("acct-work", "acct-sub")
+    );
+
+    let child = service
+        .admit_provider_resume(
+            &parent,
+            "fixture:answer".into(),
+            Some("claude-after-weight-change".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let child_id: AgentId = serde_json::from_value(child["agent_id"].clone()).unwrap();
+    run_to_end(&home, &child_id).await;
+    let child = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .get(&child_id)
+        .unwrap();
+    assert_eq!(child.status, Status::Succeeded, "{:?}", child.failure_text);
+    assert_eq!(child.runtime_session_id, parent.runtime_session_id);
+    assert_eq!(attempts(&home, &child_id)[0].1, "acct-sub");
+
+    let (_other_temp, other_home) = ordered_claude_home();
+    let other_config = other_home.join("config.toml");
+    let text = fs::read_to_string(&other_config).unwrap();
+    fs::write(
+        &other_config,
+        text.replace("priority_multiplier = 0.5", "priority_multiplier = 1.0"),
+    )
+    .unwrap();
+    let other_service = fixture_service(other_home.clone()).await;
+    let mut fresh = self::request(&other_home);
+    fresh.account = None;
+    fresh.request_id = Some("claude-equal-weights".into());
+    let fresh = other_service.admit_provider(fresh).await.unwrap();
+    let fresh_id: AgentId = serde_json::from_value(fresh["agent_id"].clone()).unwrap();
+    assert_eq!(attempts(&other_home, &fresh_id)[0].1, "acct-work");
 }
 
 /// Callback completion on the fallback uses the new attempt's capability and

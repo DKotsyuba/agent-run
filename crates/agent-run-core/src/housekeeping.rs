@@ -1284,24 +1284,37 @@ pub fn compact_process_artifacts(
         let name = PathBuf::from(format!("recovery.{attempt}.json"));
         match directory.entry(Some(&name)) {
             Ok(entry) if entry.kind == fs::EntryType::File && entry.uid == euid() => {
+                let mut keep_candidate = false;
                 if failed {
                     let mut receipt: serde_json::Value =
                         serde_json::from_reader(directory.open_file(&name)?)?;
                     if !receipt["candidate"].is_null() {
+                        keep_candidate = true;
                         if let Some(object) = receipt.as_object_mut()
                             && object.remove("ownership").is_some()
                         {
                             directory.write(&name, &fs::canonical_json(&receipt)?, 0o600)?;
                             removed += 1;
                         }
-                        continue;
                     }
                 }
-                directory.remove(&name)?;
-                removed += 1;
+                if !keep_candidate {
+                    directory.remove(&name)?;
+                    removed += 1;
+                }
             }
             Err(crate::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
             _ => {}
+        }
+        if removed < budget {
+            let cancellation = PathBuf::from(format!("recovery.{attempt}.maintenance-cancel.json"));
+            if let Ok(entry) = directory.entry(Some(&cancellation))
+                && entry.kind == fs::EntryType::File
+                && entry.uid == euid()
+            {
+                directory.remove(&cancellation)?;
+                removed += 1;
+            }
         }
     }
     Ok(removed)

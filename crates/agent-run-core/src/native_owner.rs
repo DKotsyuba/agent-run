@@ -91,6 +91,15 @@ pub fn refusal(
     if store.cancel_pending(&record.id)? {
         return Ok(Some("cancelled"));
     }
+    let maintenance_closing: bool = store.conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM maintenance_checkpoints m JOIN attempts t ON t.id=m.attempt_id AND t.agent_id=m.agent_id \
+         WHERE m.agent_id=? AND m.closing_event_seq IS NOT NULL AND t.ownership_active=1 AND t.finished_at IS NULL)",
+        [record.id.as_str()],
+        |row| row.get(0),
+    )?;
+    if maintenance_closing {
+        return Ok(Some("not_idle"));
+    }
     if !idle {
         return Ok(Some("not_idle"));
     }

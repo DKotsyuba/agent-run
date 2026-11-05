@@ -102,6 +102,7 @@ pub fn admit_with_config_revision(
         return Ok((found.id, false));
     }
 
+    crate::maintenance::require_admissions_open(&tx)?;
     let global: i64 = tx.query_row(
         &format!("SELECT COUNT(*) FROM agents WHERE status IN {ACTIVE_SQL}"),
         [],

@@ -45,6 +45,8 @@ pub struct WorkerProxy {
     research: bool,
     /// Native completion catalog selected by frozen supervisor admission.
     explicit_finish: bool,
+    /// Explicit opt-in to the v5 maintenance surface; existing supervisors omit it.
+    maintenance_pause: bool,
 }
 
 /// Converts every domain-owned worker definition through the pinned SDK.
@@ -59,13 +61,25 @@ fn tools() -> std::result::Result<Vec<Tool>, ErrorData> {
         .collect()
 }
 
+/// Decode only the supervisor-selected completion marker; all other values
+/// retain the legacy catalog. The existing supervisor sets only `0` or `1`.
+fn finish_mode(value: &str) -> (bool, bool) {
+    let maintenance = value == agent_run_domain::worker::MAINTENANCE_PAUSE_ENV_VALUE;
+    (value == "1" || maintenance, maintenance)
+}
+
 impl WorkerProxy {
     /// Returns the role-bound embedded surface. Research adds only the report
     /// writer; legacy ordinary workers retain their exact five-tool inventory.
-    /// Explicit mode adds only finish, with no additional role authority.
+    /// Explicit mode adds finish; only the opt-in v5 surface adds maintenance.
     fn tools(&self) -> std::result::Result<Vec<Tool>, ErrorData> {
         if self.explicit_finish {
-            return agent_run_domain::worker::finish_tools_json(self.research)
+            let catalog = if self.maintenance_pause {
+                agent_run_domain::worker::maintenance_pause_tools_json(self.research)
+            } else {
+                agent_run_domain::worker::finish_tools_json(self.research)
+            };
+            return catalog
                 .into_iter()
                 .map(|tool| {
                     serde_json::from_value(tool).map_err(|_| {
@@ -99,12 +113,16 @@ impl WorkerProxy {
             run_id: self.run_id.clone(),
             attempt_id: self.attempt_id.clone(),
             token: self.token.clone(),
-            version: if self.explicit_finish {
+            version: if self.explicit_finish && self.maintenance_pause {
+                agent_run_domain::worker::MAINTENANCE_PAUSE_CATALOG_VERSION
+            } else if self.explicit_finish {
                 agent_run_domain::worker::FINISH_CATALOG_VERSION
             } else {
                 agent_run_domain::worker::POOL_CATALOG_VERSION
             },
-            digest: if self.explicit_finish {
+            digest: if self.explicit_finish && self.maintenance_pause {
+                agent_run_domain::worker::maintenance_pause_catalog_digest(self.research)
+            } else if self.explicit_finish {
                 agent_run_domain::worker::finish_catalog_digest(self.research)
             } else if self.research {
                 agent_run_domain::worker::research_catalog_digest()
@@ -142,6 +160,13 @@ impl WorkerProxy {
         // The broker repeats these strict domain checks authoritatively.
         use agent_run_domain::pool::{PoolMessage, PoolPropose, PoolReadRequest, PoolVote};
         use agent_run_domain::worker::WorkerTool;
+        if tool == WorkerTool::MaintenancePause && !(self.explicit_finish && self.maintenance_pause)
+        {
+            return super::mcp_text::error_result(
+                "unknown_tool",
+                "worker MCP exposes only its fixed tool catalog",
+            );
+        }
         let validated = match tool {
             WorkerTool::HealthReply => validated_input(
                 arguments,
@@ -152,6 +177,11 @@ impl WorkerProxy {
                 arguments,
                 name,
                 agent_run_domain::worker::FinishRequest::validate,
+            ),
+            WorkerTool::MaintenancePause => validated_input(
+                arguments,
+                name,
+                agent_run_domain::worker::MaintenancePauseRequest::validate,
             ),
             WorkerTool::Notify => validated_input(arguments, name, NotifyRequest::validate),
             WorkerTool::SaveReport => validated_input(
@@ -228,6 +258,22 @@ impl WorkerProxy {
                 Err(_) => super::mcp_text::error_result(
                     "invalid_finish_receipt",
                     "Finish receipt is uncertain; retry the exact same payload.",
+                ),
+            };
+        }
+        if tool == agent_run_domain::worker::WorkerTool::MaintenancePause {
+            return match serde_json::from_value::<agent_run_domain::worker::MaintenancePauseReceipt>(value)
+                .ok()
+                .filter(|receipt| receipt.validate().is_ok())
+            {
+                Some(receipt) => rmcp::model::CallToolResult::success(vec![
+                    rmcp::model::ContentBlock::text(
+                        serde_json::to_string(&receipt).unwrap_or_default(),
+                    ),
+                ]),
+                None => super::mcp_text::error_result(
+                    "invalid_maintenance_receipt",
+                    "Maintenance checkpoint receipt is uncertain; retry the exact same payload.",
                 ),
             };
         }
@@ -479,6 +525,8 @@ pub async fn serve_from_env() -> Result<()> {
     }
     super::mcp_text::initialize()?;
     tools().map_err(|_| Error::Runtime("worker registry initialization failed".into()))?;
+    let mode = std::env::var(agent_run_domain::worker::FINISH_ENV).unwrap_or_default();
+    let (explicit_finish, maintenance_pause) = finish_mode(&mode);
     let proxy = WorkerProxy {
         broker,
         run_id,
@@ -487,8 +535,8 @@ pub async fn serve_from_env() -> Result<()> {
         catalog_registered: Arc::new(AtomicBool::new(false)),
         research: std::env::var(agent_run_domain::worker::RESEARCH_ENV)
             .is_ok_and(|value| value == "1"),
-        explicit_finish: std::env::var(agent_run_domain::worker::FINISH_ENV)
-            .is_ok_and(|value| value == "1"),
+        explicit_finish,
+        maintenance_pause,
     };
     proxy.register_catalog().await;
     let service = proxy
@@ -547,6 +595,7 @@ mod tests {
             catalog_registered: Arc::new(AtomicBool::new(false)),
             research: false,
             explicit_finish: false,
+            maintenance_pause: false,
         };
         let ordinary = proxy.tools().unwrap();
         assert_eq!(ordinary.len(), 5);
@@ -587,6 +636,7 @@ mod tests {
             catalog_registered: Arc::new(AtomicBool::new(false)),
             research: false,
             explicit_finish: false,
+            maintenance_pause: false,
         };
         for (tool, input) in [
             (
@@ -636,6 +686,106 @@ mod tests {
     use super::*;
     use crate::cli::CliFuture;
     use std::sync::Mutex;
+
+    /// In-process proof/callback double; it never opens a socket or invokes a model.
+    #[derive(Default)]
+    struct MaintenanceBroker(Mutex<Vec<(String, Value)>>);
+    impl CliBroker for MaintenanceBroker {
+        /// Record the private envelope and return only a content-free receipt.
+        fn call<'a>(&'a self, method: &'a str, params: Value) -> CliFuture<'a> {
+            Box::pin(async move {
+                self.0.lock().unwrap().push((method.into(), params));
+                if method == agent_run_domain::worker::CATALOG_METHOD {
+                    Ok(json!({"registered":true}))
+                } else {
+                    Ok(json!({"sha256":"c".repeat(64),"duplicate":false}))
+                }
+            })
+        }
+    }
+
+    /// Only explicit marker 5 advertises/calls v5; capability and role remain
+    /// broker-bound, arguments carry no epoch, and receipts never echo secrets.
+    #[tokio::test]
+    async fn maintenance_pause_is_opt_in_with_role_bound_proof() {
+        for (value, expected) in [
+            ("", (false, false)),
+            ("0", (false, false)),
+            ("1", (true, false)),
+            ("5", (true, true)),
+            ("other", (false, false)),
+        ] {
+            assert_eq!(finish_mode(value), expected);
+        }
+        let broker = Arc::new(MaintenanceBroker::default());
+        let mut proxy = WorkerProxy {
+            broker: broker.clone(),
+            run_id: "ag-20260928-000000-0000000001".parse().unwrap(),
+            attempt_id: "attempt".into(),
+            token: "a".repeat(64),
+            catalog_registered: Arc::new(AtomicBool::new(false)),
+            research: false,
+            explicit_finish: true,
+            maintenance_pause: false,
+        };
+        let input = json!({"challenge_id":"b".repeat(64),"checkpoint":"fixture checkpoint"});
+        assert!(proxy.get_tool("maintenance_pause").is_none());
+        assert_eq!(
+            proxy
+                .call("maintenance_pause", input.clone())
+                .await
+                .is_error,
+            Some(true)
+        );
+        assert!(broker.0.lock().unwrap().is_empty());
+        proxy.maintenance_pause = true;
+        assert!(proxy.get_tool("maintenance_pause").is_some());
+        proxy.register_catalog().await;
+        {
+            let calls = broker.0.lock().unwrap();
+            assert_eq!(calls[0].1["version"], 5);
+            assert_eq!(
+                calls[0].1["digest"],
+                agent_run_domain::worker::maintenance_pause_catalog_digest(false)
+            );
+        }
+        let mut bad = input.clone();
+        bad["epoch"] = json!(1);
+        assert_eq!(
+            proxy.call("maintenance_pause", bad).await.is_error,
+            Some(true)
+        );
+        let reply = proxy.call("maintenance_pause", input.clone()).await;
+        assert_eq!(reply.is_error, Some(false));
+        let text = serde_json::to_string(&reply).unwrap();
+        assert!(!text.contains(&proxy.token) && !text.contains("fixture checkpoint"));
+        {
+            let calls = broker.0.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[1].0, agent_run_domain::worker::TOOL_METHOD);
+            assert_eq!(calls[1].1["input"], input);
+            assert!(calls[1].1["input"].get("epoch").is_none());
+        }
+        proxy.research = true;
+        proxy.catalog_registered.store(false, Ordering::Release);
+        proxy.register_catalog().await;
+        assert!(proxy.get_tool("save_report").is_some());
+        assert_eq!(
+            broker.0.lock().unwrap().last().unwrap().1["digest"],
+            agent_run_domain::worker::maintenance_pause_catalog_digest(true)
+        );
+        let invalid = proxy.render(
+            agent_run_domain::worker::WorkerTool::MaintenancePause,
+            json!({"sha256":"z".repeat(64),"duplicate":false}),
+            None,
+        );
+        assert_eq!(invalid.is_error, Some(true));
+        assert!(
+            serde_json::to_string(&invalid)
+                .unwrap()
+                .contains("retry the exact same payload")
+        );
+    }
 
     /// Records broker calls without executing a run or touching production state.
     #[derive(Default)]
@@ -693,6 +843,7 @@ mod tests {
             catalog_registered: Arc::new(AtomicBool::new(false)),
             research: false,
             explicit_finish: false,
+            maintenance_pause: false,
         };
         for _ in 0..3 {
             proxy.register_catalog().await;
@@ -718,6 +869,7 @@ mod tests {
             catalog_registered: Arc::new(AtomicBool::new(false)),
             research: false,
             explicit_finish: false,
+            maintenance_pause: false,
         };
         let names: Vec<_> = tools()
             .unwrap()
@@ -786,6 +938,7 @@ mod tests {
             catalog_registered: Arc::new(AtomicBool::new(false)),
             research: false,
             explicit_finish: false,
+            maintenance_pause: false,
         };
         let (mut input_writer, input_reader) = tokio::io::duplex(64 * 1024);
         let (output_writer, output_reader) = tokio::io::duplex(64 * 1024);

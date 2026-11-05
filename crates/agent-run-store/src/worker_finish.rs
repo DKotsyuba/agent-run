@@ -91,6 +91,14 @@ impl Store<'_> {
         if !admissible {
             return Err(invalid("worker attempt is not running"));
         }
+        let closing: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM maintenance_checkpoints WHERE agent_id=? AND attempt_id=? AND closing_event_seq IS NOT NULL)",
+            params![run.as_str(), attempt],
+            |row| row.get(0),
+        )?;
+        if closing {
+            return Err(invalid("maintenance pause is already closing this attempt"));
+        }
         let request: String = tx.query_row(
             "SELECT request_json FROM agents WHERE id=?",
             [run.as_str()],

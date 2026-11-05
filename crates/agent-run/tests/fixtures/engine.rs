@@ -597,7 +597,10 @@ fn main() {
     }
     if task == "fixture:worker-finish"
         || (resume_path.is_some()
-            && std::env::var(agent_run_domain::worker::FINISH_ENV).as_deref() == Ok("1"))
+            && matches!(
+                std::env::var(agent_run_domain::worker::FINISH_ENV).as_deref(),
+                Ok("1" | "5")
+            ))
     {
         worker_finish(&args, &session);
     }

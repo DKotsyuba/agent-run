@@ -338,6 +338,8 @@ struct Claim {
     policy: Delivery,
     /// Previously frozen Bridge ownership/content, independent of current configuration.
     bridge_intent: Option<agent_run_domain::bridge::BridgeIntent>,
+    /// Accepted pre-notice intent, needed to retain its exact destination and owner.
+    maintenance_predecessor: Option<agent_run_domain::bridge::BridgeIntent>,
     /// Sticky possible custody effect; a later refusal cannot erase it.
     bridge_unknown: bool,
 }
@@ -352,6 +354,48 @@ enum Payload {
     Pool(agent_run_domain::pool::PoolNotice),
     /// Broker-authored enrollment failure, with no completion/lifecycle claim.
     PoolAttention(agent_run_domain::pool::PoolNotice),
+    /// Broker-authored maintenance facts; stage ordering belongs to its controller.
+    Maintenance(agent_run_store::delivery::MaintenanceNotice),
+}
+
+/// Render only validated maintenance facts; the controller must establish that
+/// after/deferred facts are true before it queues the corresponding event.
+fn maintenance_message(notice: &agent_run_store::delivery::MaintenanceNotice) -> Result<String> {
+    use agent_run_store::delivery::MaintenanceNotice;
+    notice.validate()?;
+    let (epoch, message) = match notice {
+        MaintenanceNotice::Pre { maintenance_epoch } => (
+            maintenance_epoch,
+            "Agent Run started preparing agents to pause for this maintenance. New task admissions were blocked for this maintenance epoch. No action is required from the orchestrator."
+                .to_owned(),
+        ),
+        MaintenanceNotice::After {
+            maintenance_epoch,
+            resumed,
+            completed,
+            failed,
+            cancelled,
+            held,
+        } => {
+            let mut message = format!(
+                "Agent Run completed this maintenance and reopened task admissions.\nExecutions: resumed {resumed}; completed {completed}; failed {failed}; cancelled {cancelled}; held {held}."
+            );
+            if *held > 0 || *failed > 0 {
+                message.push_str("\nAttention required: review failed or held executions.");
+            } else {
+                message.push_str("\nNo action is required.");
+            }
+            (maintenance_epoch, message)
+        }
+        MaintenanceNotice::Deferred { maintenance_epoch } => (
+            maintenance_epoch,
+            "Agent Run deferred this maintenance and reopened task admissions. Existing work was allowed to continue. No action is required."
+                .to_owned(),
+        ),
+    };
+    Ok(format!(
+        "agent-run/maintenance\n\n{message}\nMaintenance epoch: {epoch}"
+    ))
 }
 
 /// Counts one bounded outbox drain and reports whether another process owns it.
@@ -456,6 +500,9 @@ async fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
         }
         Some("pool") => Payload::Pool(pool_notice(&notice)?),
         Some("pool_attention") => Payload::PoolAttention(pool_notice(&notice)?),
+        Some("maintenance") => {
+            Payload::Maintenance(agent_run_store::delivery::maintenance_notice(notice)?)
+        }
         _ => return Err(invalid("invalid claimed delivery payload")),
     };
     Ok(Some(Claim {
@@ -472,6 +519,10 @@ async fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
         bridge_intent: claimed["bridge_intent"]
             .as_object()
             .map(|_| serde_json::from_value(claimed["bridge_intent"].clone()))
+            .transpose()?,
+        maintenance_predecessor: claimed["maintenance_predecessor"]
+            .as_object()
+            .map(|_| serde_json::from_value(claimed["maintenance_predecessor"].clone()))
             .transpose()?,
         bridge_unknown: claimed["bridge_unknown"].as_bool().unwrap_or(false),
     }))
@@ -774,6 +825,69 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored_run, child);
+    }
+
+    /// An outbox claim reaches the structured maintenance variant without
+    /// opening Bridge credentials or contacting an external recipient.
+    #[tokio::test]
+    async fn maintenance_event_claim_routes_without_external_delivery() {
+        let home = tempfile::tempdir().unwrap();
+        let store = agent_run_store::fixture::initialize(home.path()).unwrap();
+        std::fs::write(home.path().join("config.toml"), "schema_version = 2\n").unwrap();
+        let agent = "ag-20260925-000000-0000000001";
+        store.conn.execute(
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) \
+             VALUES(?1,'mock','fixture','review','task','task','/tmp','{}','running',?2,'fixture',?1)",
+            params![agent, now()],
+        ).unwrap();
+        store.conn.execute(
+            "INSERT INTO orchestrator_sessions(id,transport,external_session_id,created_at,last_seen_at) VALUES('session','codex_queue','external',?1,?1)",
+            [now()],
+        ).unwrap();
+        let notice = serde_json::json!({"maintenance_epoch":7,"stage":"after","resumed":2,"completed":1,"cancelled":0,"held":1});
+        store.conn.execute(
+            "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?1,?2,'maintenance_notice_v1',?3)",
+            params![agent,now(),notice.to_string()],
+        ).unwrap();
+        let event = store.conn.last_insert_rowid();
+        store.conn.execute(
+            "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,terminal_event_seq,state,next_attempt_at) VALUES('maintenance',?1,'session',?2,'pending',0)",
+            params![agent,event],
+        ).unwrap();
+        store.conn.execute(
+            "INSERT INTO maintenance_fences(epoch,request_id,created_at,member_count) VALUES(7,'fixture-maintenance',1,1)",
+            [],
+        ).unwrap();
+        store.conn.execute(
+            "INSERT INTO maintenance_cohort(epoch,agent_id,status,sequence,orchestrator_session_id,attempts_json) VALUES(7,?,'running',1,'session','[]')",
+            [agent],
+        ).unwrap();
+        store.conn.execute(
+            "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?1,?2,'maintenance_notice_v1',?3)",
+            params![agent, now(), serde_json::json!({"maintenance_epoch":7,"stage":"pre"}).to_string()],
+        ).unwrap();
+        let before_event = store.conn.last_insert_rowid();
+        store.conn.execute(
+            "INSERT INTO deliveries(id,agent_id,orchestrator_session_id,terminal_event_seq,state) VALUES('maintenance-before',?1,'session',?2,'delivered')",
+            params![agent, before_event],
+        ).unwrap();
+        store.conn.execute(
+            "INSERT INTO bridge_delivery_intents(delivery_id,intent_json,custody_state) VALUES('maintenance-before',?,'custody_accepted')",
+            [serde_json::json!({"owner":{"registration_socket":"/fixture/register","core_socket":"/fixture/core","token_file":"/fixture/token","credential_sha256":"a".repeat(64),"producer":"agent-run"},"request_id":"fixture-request","event_id":"fixture-event","address":"host/codex/store/session","kind":"agent-run.maintenance","message":"fixture","intent_hash":"b".repeat(64)}).to_string()],
+        ).unwrap();
+        store.conn.execute(
+            "INSERT INTO maintenance_recipients(epoch,orchestrator_session_id,transport,external_session_id,anchor_agent_id,before_delivery_id,after_delivery_id) VALUES(7,'session','codex_queue','external',?,'maintenance-before','maintenance')",
+            [agent],
+        ).unwrap();
+        let writer = crate::writer_test_harness::Harness::start(home.path());
+        let _socket = writer.serve_unix(home.path());
+        let claimed = claim(home.path(), "test-owner").await.unwrap().unwrap();
+        let Payload::Maintenance(notice) = claimed.payload else {
+            panic!("expected maintenance notice");
+        };
+        let message = super::maintenance_message(&notice).unwrap();
+        assert!(message.contains("resumed 2; completed 1; failed 0; cancelled 0; held 1"));
+        assert!(message.contains("Attention required"));
     }
 
     /// A child that inherited the held dispatcher descriptor (blocked on its

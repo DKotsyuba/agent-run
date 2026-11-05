@@ -402,6 +402,15 @@ impl Drop for Owner {
 mod tests {
     //! Pure one-effect, identity and finite capacity controls; real engines/stores are never used.
     use super::*;
+
+    /// Keep test socket paths short when a dedicated socket root is configured.
+    fn socket_root() -> tempfile::TempDir {
+        let base = std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        tempfile::tempdir_in(base.canonicalize().unwrap()).unwrap()
+    }
+
     /// One exact typed owner request with fixed synthetic process identity.
     fn request() -> Request {
         Request {
@@ -473,7 +482,7 @@ mod tests {
     }
     /// Private real-kernel channel fixture; its accept loop owns no model or engine input.
     struct Fixture {
-        /// All paths remain in the configured project-specific TMPDIR.
+        /// All paths remain under the configured test socket or temporary root.
         root: tempfile::TempDir,
         /// Current same-user protected-channel owner; shutdown aborts this test-only listener.
         channel: JoinHandle<()>,
@@ -481,10 +490,10 @@ mod tests {
         environment: BTreeMap<String, String>,
     }
     impl Fixture {
-        /// Create a protected channel under canonical TMPDIR with this process as the actual daemon peer.
+        /// Create a protected channel with this process as the actual daemon peer.
         fn new() -> Self {
             use std::os::unix::fs::PermissionsExt;
-            let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+            let root = socket_root();
             std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
             let path = root.path().join("c.sock");
             let listener = UnixListener::bind(&path).unwrap();
@@ -787,7 +796,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use std::process::Stdio;
         use tokio::io::{AsyncBufReadExt, BufReader};
-        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let root = socket_root();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let channel = root.path().join("c.sock");
         let exe = std::env::current_exe().unwrap().canonicalize().unwrap();

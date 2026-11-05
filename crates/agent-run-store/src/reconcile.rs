@@ -94,6 +94,34 @@ fn same_ownership(expected: &crate::ops::ExpectedOwnership, current: &Ownership)
         && expected.startup_birth_time == current.startup_birth_time
 }
 
+/// A parked attempt or a possibly delivered pause instruction must never be
+/// mistaken for ordinary loss. Missing or uncertain handoff evidence leaves
+/// the execution held for inspection, not automatically retried or finished.
+pub fn has_maintenance_handoff(conn: &rusqlite::Connection, id: &AgentId) -> Result<bool> {
+    Ok(conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM attempts WHERE agent_id=?1 AND state='maintenance_parked' AND finished_at IS NULL) \
+         OR EXISTS(SELECT 1 FROM maintenance_checkpoints m JOIN maintenance_fences f ON f.epoch=m.epoch \
+            JOIN attempts t ON t.id=m.attempt_id AND t.agent_id=m.agent_id \
+            JOIN commands c ON c.id=m.command_id AND c.agent_id=m.agent_id \
+            WHERE m.agent_id=?1 AND f.ended_at IS NULL AND t.ownership_active=1 AND t.finished_at IS NULL \
+              AND ({} OR m.checkpoint_json IS NOT NULL)) \
+         OR EXISTS(SELECT 1 FROM maintenance_resumes r JOIN agents a ON a.id=r.agent_id \
+            LEFT JOIN attempts t ON t.id=r.target_attempt_id AND t.agent_id=a.id \
+            WHERE r.agent_id=?1 AND a.status IN ('created','starting','running','cancelling') \
+              AND (t.id IS NULL OR NOT EXISTS( \
+                SELECT 1 FROM events e WHERE e.agent_id=r.agent_id AND e.attempt_id=r.target_attempt_id \
+                  AND e.kind='maintenance_resume_confirmed_v1' AND json_extract(e.data_json,'$.epoch')=r.epoch \
+                  AND json_extract(e.data_json,'$.source_attempt_id')=r.source_attempt_id \
+                  AND json_extract(e.data_json,'$.target_attempt_id')=r.target_attempt_id \
+                  AND json_type(e.data_json,'$.session')='text' AND json_extract(e.data_json,'$.session')=a.runtime_session_id \
+                  AND json_type(e.data_json,'$.turn')='text' AND length(CAST(json_extract(e.data_json,'$.turn') AS BLOB)) BETWEEN 1 AND 1024 \
+                  AND json_type(e.data_json,'$.input_sha256')='text' AND length(json_extract(e.data_json,'$.input_sha256'))=64 \
+                  AND json_extract(e.data_json,'$.input_sha256') NOT GLOB '*[^0-9a-f]*')))", crate::maintenance::COMMAND_MAY_HAVE_EFFECT),
+        [id.as_str()],
+        |row| row.get(0),
+    )?)
+}
+
 impl Store<'_> {
     /// Advances one reconciliation cursor (row 59).
     pub fn advance_reconcile_cursor(&self, op: &crate::ops::ReconcileReapedAgent) -> Result<()> {
@@ -289,6 +317,7 @@ impl Store<'_> {
         };
         if !same_ownership(&op.expected, &current)
             || current.status.terminal()
+            || has_maintenance_handoff(&tx, id)?
             || (op.expected.supervisor_pid.is_some()
                 && current
                     .heartbeat_at

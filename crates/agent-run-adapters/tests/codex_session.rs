@@ -472,6 +472,10 @@ async fn python_test_codex_app_server_rpc_buffers_interleaved_notifications() {
         json!({"ok":true})
     );
     assert!(
+        process.has_buffered_events(),
+        "interleaved native work must remain visible"
+    );
+    assert!(
         matches!(process.next().await, agent_run_adapters::io::Event::Json(v) if v["method"] == "turn/started")
     );
     process.reap().await;

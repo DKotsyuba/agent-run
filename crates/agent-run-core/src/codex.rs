@@ -1,3 +1,7 @@
+/// Conservative maintenance-only native event correlation; no lifecycle action.
+pub mod maintenance;
+/// Exact command/attempt binding and supervisor receipt persistence.
+pub mod maintenance_receipt;
 /// Model-visible pending-handle evidence shared by fresh and resumed native turns.
 mod native_returns;
 use crate::commands;
@@ -83,31 +87,66 @@ async fn flush_pending_assistant(
     Ok(())
 }
 
-/// Removes arbitrary text fields from unhandled native events; those fields
-/// have no transcript contract and may split a secret across notifications.
-fn omit_native_text(value: &mut Value) {
+/// Identifies credential and environment fields whose values are not journaled.
+fn sensitive_tool_field(name: &str) -> bool {
+    agent_run_adapters::redact::is_secret_name(name)
+        || matches!(
+            name.to_ascii_lowercase().as_str(),
+            "env"
+                | "environment"
+                | "env_vars"
+                | "envvars"
+                | "environment_variables"
+                | "environmentvariables"
+                | "authorization"
+                | "proxy-authorization"
+                | "auth"
+                | "cookie"
+                | "set-cookie"
+        )
+}
+
+/// Removes uncontracted tool inputs, credential fields and arbitrary text from
+/// unhandled native events. Only a usage event's root `tokenUsage` object and
+/// its known numeric counters bypass the credential-shaped name filter.
+fn omit_native_text(value: &mut Value, allow_usage: bool, inside_usage: bool) {
     match value {
         Value::Object(object) => {
             for (name, nested) in object {
-                if matches!(
-                    name.as_str(),
-                    "text"
-                        | "delta"
-                        | "content"
-                        | "aggregatedOutput"
-                        | "output"
-                        | "stdout"
-                        | "stderr"
-                        | "raw"
-                ) && nested.is_string()
+                let usage_container = allow_usage && name == "tokenUsage" && nested.is_object();
+                let usage_counter = inside_usage
+                    && nested.is_number()
+                    && matches!(
+                        name.as_str(),
+                        "inputTokens"
+                            | "outputTokens"
+                            | "cachedInputTokens"
+                            | "cacheWriteInputTokens"
+                            | "reasoningOutputTokens"
+                            | "totalTokens"
+                    );
+                if (sensitive_tool_field(name) && !usage_container && !usage_counter)
+                    || matches!(name.as_str(), "command" | "arguments" | "changes" | "raw")
+                    || (matches!(
+                        name.as_str(),
+                        "text"
+                            | "delta"
+                            | "content"
+                            | "aggregatedOutput"
+                            | "output"
+                            | "stdout"
+                            | "stderr"
+                    ) && nested.is_string())
                 {
                     *nested = Value::String("<omitted>".into());
                 } else {
-                    omit_native_text(nested);
+                    omit_native_text(nested, false, inside_usage || usage_container);
                 }
             }
         }
-        Value::Array(values) => values.iter_mut().for_each(omit_native_text),
+        Value::Array(values) => values
+            .iter_mut()
+            .for_each(|value| omit_native_text(value, false, inside_usage)),
         _ => {}
     }
 }
@@ -121,7 +160,7 @@ async fn record_native_event(
     value: &Value,
 ) -> Result<()> {
     let mut safe = process.redact_value(value);
-    omit_native_text(&mut safe);
+    omit_native_text(&mut safe, method == "thread/tokenUsage/updated", false);
     process
         .observing(store.event(id, &process.redact(method), &safe))
         .await
@@ -737,11 +776,169 @@ pub async fn run(
     role: &Profile,
     home: &Path,
 ) -> Result<EngineResult> {
+    let mode = if record.request.explicit_finish {
+        "1"
+    } else {
+        "0"
+    };
+    run_maintenance(
+        process,
+        store,
+        record,
+        logical_record,
+        runtime,
+        role,
+        home,
+        false,
+        mode,
+    )
+    .await?
+    .require_finished()
+}
+
+/// Run with a typed pause outcome. `finish_mode` must come from the exact
+/// supervisor-owned launch environment, never from native output. The default
+/// runner keeps v4; only the explicit staged value selects the v5 inventory.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Preserves the native runner inputs and explicit maintenance boundary."
+)]
+pub async fn run_maintenance(
+    process: &mut Process,
+    store: &mut Persist,
+    record: &Record,
+    logical_record: &Record,
+    runtime: &Runtime,
+    role: &Profile,
+    home: &Path,
+    allow_pause: bool,
+    finish_mode: &str,
+) -> Result<crate::maintenance_execution::EngineExit> {
+    run_maintenance_resume(
+        process,
+        store,
+        record,
+        logical_record,
+        runtime,
+        role,
+        home,
+        allow_pause,
+        finish_mode,
+        None,
+    )
+    .await
+}
+
+/// Run with an optional attempt-pinned continuation handoff from the supervisor.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Preserves the native runner inputs and explicit maintenance boundary."
+)]
+pub(crate) async fn run_maintenance_resume(
+    process: &mut Process,
+    store: &mut Persist,
+    record: &Record,
+    logical_record: &Record,
+    runtime: &Runtime,
+    role: &Profile,
+    home: &Path,
+    allow_pause: bool,
+    finish_mode: &str,
+    boundary: Option<&crate::maintenance_execution::ResumeBoundary>,
+) -> Result<crate::maintenance_execution::EngineExit> {
+    let staged_catalog = maintenance_catalog_mode(record.request.explicit_finish, finish_mode)?;
+    run_engine(
+        process,
+        store,
+        record,
+        logical_record,
+        runtime,
+        role,
+        home,
+        allow_pause && staged_catalog,
+        staged_catalog,
+        boundary,
+    )
+    .await
+}
+
+/// Exercise the native continuation boundary without exposing it in production builds.
+#[cfg(feature = "test-fixtures")]
+#[doc(hidden)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Preserves the native runner inputs and explicit maintenance boundary."
+)]
+pub async fn fixture_run_maintenance_resume(
+    process: &mut Process,
+    store: &mut Persist,
+    record: &Record,
+    logical_record: &Record,
+    runtime: &Runtime,
+    role: &Profile,
+    home: &Path,
+    allow_pause: bool,
+    finish_mode: &str,
+    boundary: &crate::maintenance_execution::ResumeBoundary,
+) -> Result<crate::maintenance_execution::EngineExit> {
+    run_maintenance_resume(
+        process,
+        store,
+        record,
+        logical_record,
+        runtime,
+        role,
+        home,
+        allow_pause,
+        finish_mode,
+        Some(boundary),
+    )
+    .await
+}
+
+/// Check the supervisor-selected worker catalog without trusting native output.
+fn maintenance_catalog_mode(explicit_finish: bool, mode: &str) -> Result<bool> {
+    match (explicit_finish, mode) {
+        (false, "0") | (true, "1") => Ok(false),
+        (true, agent_run_domain::worker::MAINTENANCE_PAUSE_ENV_VALUE) => Ok(true),
+        _ => Err(invalid(
+            "worker launch catalog mode does not match admission",
+        )),
+    }
+}
+
+/// Run one Codex attempt using the already checked launch catalog mode.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Preserves the native runner inputs and explicit maintenance boundary."
+)]
+async fn run_engine(
+    process: &mut Process,
+    store: &mut Persist,
+    record: &Record,
+    logical_record: &Record,
+    runtime: &Runtime,
+    role: &Profile,
+    home: &Path,
+    allow_pause: bool,
+    staged_catalog: bool,
+    boundary: Option<&crate::maintenance_execution::ResumeBoundary>,
+) -> Result<crate::maintenance_execution::EngineExit> {
+    use crate::maintenance_execution::EngineExit;
     if record.id != logical_record.id
         || record.sequence != logical_record.sequence
         || record.identity != logical_record.identity
     {
         return Err(invalid("native input and logical authority do not match"));
+    }
+    if boundary.is_some_and(|boundary| {
+        store.bound_attempt() != Some(boundary.target_attempt_id.as_str())
+            || record
+                .resume_of_runtime_session_id
+                .as_deref()
+                .is_none_or(str::is_empty)
+    }) {
+        return Ok(EngineExit::MaintenanceUnconfirmed);
     }
     agent_run_adapters::validate_role(runtime, role)?;
     initialize(process).await?;
@@ -818,6 +1015,9 @@ pub async fn run(
             .pointer("/thread/status/type")
             .or_else(|| thread.pointer("/thread/status"))
             .and_then(Value::as_str);
+        if boundary.is_some() && status != Some("idle") {
+            return Ok(EngineExit::MaintenanceUnconfirmed);
+        }
         if matches!(status, Some("active") | Some("running")) {
             return Err(invalid("native thread is already active"));
         }
@@ -829,8 +1029,24 @@ pub async fn run(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| invalid("thread start did not return an id"))?
         .to_owned();
+    if boundary.is_some() {
+        let expected = record
+            .resume_of_runtime_session_id
+            .as_deref()
+            .expect("checked resume session");
+        if tid != expected
+            || thread
+                .get("threadId")
+                .is_some_and(|id| id.as_str() != Some(expected))
+            || thread
+                .pointer("/thread/id")
+                .is_some_and(|id| id.as_str() != Some(expected))
+        {
+            return Ok(EngineExit::MaintenanceUnconfirmed);
+        }
+    }
     if record.request.explicit_finish {
-        finish_inventory_ready(process, &tid, role.research_tools_only()).await?;
+        finish_inventory_ready(process, &tid, role.research_tools_only(), staged_catalog).await?;
     }
     if role.research_tools_only() {
         let status = process
@@ -844,7 +1060,9 @@ pub async fn run(
             .get("data")
             .and_then(Value::as_array)
             .ok_or_else(|| invalid("native research MCP inventory is missing"))?;
-        let expected = if record.request.explicit_finish {
+        let expected = if record.request.explicit_finish && staged_catalog {
+            agent_run_domain::worker::maintenance_pause_tools_json(true)
+        } else if record.request.explicit_finish {
             agent_run_domain::worker::finish_tools_json(true)
         } else {
             agent_run_domain::worker::research_tools_json()
@@ -915,7 +1133,35 @@ pub async fn run(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| invalid("turn start did not return an id"))?
         .to_owned();
+    if boundary.is_some()
+        && (!agent_run_adapters::native_owner::valid_id(&turn_id)
+            || response
+                .get("threadId")
+                .is_some_and(|id| id.as_str() != Some(tid.as_str()))
+            || response
+                .pointer("/thread/id")
+                .is_some_and(|id| id.as_str() != Some(tid.as_str()))
+            || response
+                .pointer("/turn/threadId")
+                .is_some_and(|id| id.as_str() != Some(tid.as_str())))
+    {
+        return Ok(EngineExit::MaintenanceUnconfirmed);
+    }
     session.turn_started(&turn_id)?;
+    if let Some(boundary) = boundary {
+        let input = crate::maintenance_execution::ResumeInputEvidence {
+            session: &tid,
+            turn: &turn_id,
+            input_sha256: &input_sha256,
+        };
+        if !crate::maintenance_execution::confirm_resume(
+            process, store, &record.id, boundary, &input,
+        )
+        .await
+        {
+            return Ok(EngineExit::MaintenanceUnconfirmed);
+        }
+    }
     // Attempt-bound provenance for continuation: this attempt's own turn id
     // and the digest of the input it admitted (never the text itself).
     process
@@ -937,6 +1183,17 @@ pub async fn run(
         .await?;
     let mut tools_started = BTreeSet::new();
     let mut tools_completed = BTreeSet::new();
+    // Only a verified maintenance continuation inherits the parked boundary;
+    // an ordinary resume still has unknown inherited foreground work.
+    let mut maintenance_observer = maintenance::Observer::new(
+        &tid,
+        record.resume_of_runtime_session_id.is_some() && boundary.is_none(),
+    );
+    let mut maintenance_control = None;
+    let mut maintenance_hold = false;
+    let mut held_stream_ended = false;
+    let mut missing_tool_inputs: BTreeMap<String, MissingToolInput> = BTreeMap::new();
+    let mut command_outputs = CommandOutputs::default();
     let mut pending_jobs: BTreeMap<String, PendingNativeJob> = BTreeMap::new();
     let mut return_gap_reported = false;
     let mut completed: BTreeMap<String, String> = BTreeMap::new();
@@ -949,8 +1206,16 @@ pub async fn run(
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        if record.request.explicit_finish && store.worker_finish_intent(&record.id, true)?.is_some()
-        {
+        let finished = if record.request.explicit_finish {
+            match store.worker_finish_intent(&record.id, true) {
+                Ok(intent) => intent.is_some(),
+                Err(_) if maintenance_hold => false,
+                Err(error) => return Err(error),
+            }
+        } else {
+            false
+        };
+        if finished {
             if closing_at.is_none() {
                 closing_at = Some(tokio::time::Instant::now());
                 if !idle {
@@ -961,27 +1226,35 @@ pub async fn run(
                             Duration::from_millis(500),
                         )
                         .await;
-                    process
+                    let recorded = process
                         .observing(store.event(
                             &record.id,
                             "finish_interrupt_v1",
                             &json!({"exchange_returned":interrupted.is_ok()}),
                         ))
-                        .await?;
+                        .await;
+                    if !maintenance_hold {
+                        recorded?;
+                    }
                 }
             }
             if closing_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(2)) {
-                process
+                let recorded = process
                     .observing(store.event(
                         &record.id,
                         "finish_usage_incomplete_v1",
                         &json!({"protocol":"codex"}),
                     ))
-                    .await?;
-                if let Some(result) =
-                    crate::worker_finish::result(process, store, record, Some(tid.clone()), None)?
+                    .await;
+                if !maintenance_hold {
+                    recorded?;
+                }
+                match crate::worker_finish::result(process, store, record, Some(tid.clone()), None)
                 {
-                    return Ok(result);
+                    Ok(Some(result)) => return Ok(EngineExit::Finished(result)),
+                    Ok(None) => {}
+                    Err(_) if maintenance_hold => {}
+                    Err(error) => return Err(error),
                 }
             }
         }
@@ -991,6 +1264,7 @@ pub async fn run(
                 use agent_run_adapters::{native_owner::Reply,io::RpcDisposition};
                 let id=call.request.call_id.clone();
                 if let Err(reply)=native_calls.reserve(&call.request) {call.answer(reply);continue;}
+                if maintenance_hold {let reply=Reply::unsent(&id,"maintenance_boundary_unavailable");native_calls.finish(reply.clone());call.answer(reply);continue;}
                 let refusal=crate::native_owner::refusal(process,store,logical_record,&call,Some(&tid),idle,closing_at.is_some()).unwrap_or(Some("unavailable"));
                 if let Some(reason)=refusal {let reply=Reply::unsent(&id,reason);native_calls.finish(reply.clone());call.answer(reply);continue;}
                 let old_turn=turn_id.clone();
@@ -1006,18 +1280,22 @@ pub async fn run(
                 if accepted {process.observing(store.worker_turn(&record.id,false,crate::domain::now())).await?;}
                 continue;
             }
-            event = process.next() => Some(event),
+            event = process.next(), if !held_stream_ended => Some(event),
             _ = tick.tick() => None,
         };
         // Journal rows wait at most one flush age while frames keep arriving and
         // are written at once when the engine goes quiet.
-        if event.is_some() {
-            process.observing(store.flush_due()).await?;
+        let flushed = if event.is_some() {
+            process.observing(store.flush_due()).await
         } else {
-            process.observing(store.flush()).await?;
+            process.observing(store.flush()).await
+        };
+        if !maintenance_hold {
+            flushed?;
         }
         let Some(event) = event else {
-            if closing_at.is_none()
+            if !maintenance_hold
+                && closing_at.is_none()
                 && pending_jobs
                     .values()
                     .any(|job| job.kind == "commandExecution")
@@ -1037,6 +1315,7 @@ pub async fn run(
                     || (idle && native_returns.as_ref().is_some_and(|h| !h.ready())))
                     && !return_gap_reported
                 {
+                    maintenance_observer.unavailable(maintenance::Gap::AsyncCoverageUnavailable);
                     process
                         .observing(store.event(
                             &record.id,
@@ -1045,6 +1324,17 @@ pub async fn run(
                         ))
                         .await?;
                     return_gap_reported = true;
+                }
+                if pending_jobs.values().any(|job| {
+                    job.process_id.as_deref().is_some_and(|handle| {
+                        native_returns
+                            .as_ref()
+                            .is_some_and(|history| history.pending(&job.turn, handle))
+                    })
+                }) {
+                    // A returned handle may schedule a later model wake. Until
+                    // that complete pipeline is fenced, it cannot prove pause.
+                    maintenance_observer.unavailable(maintenance::Gap::AsyncCoverageUnavailable);
                 }
                 let ambiguous = flush_native_jobs(
                     process,
@@ -1056,6 +1346,7 @@ pub async fn run(
                 )
                 .await?;
                 if ambiguous && !return_gap_reported {
+                    maintenance_observer.unavailable(maintenance::Gap::AsyncCoverageUnavailable);
                     process
                         .observing(store.event(
                             &record.id,
@@ -1071,15 +1362,57 @@ pub async fn run(
                 if started.elapsed() >= Duration::from_secs_f64(commands::COMMAND_PAGE_SECONDS) {
                     break;
                 }
-                let Some((cid, kind, payload)) = process
+                if maintenance_hold {
+                    let pending:rusqlite::Result<bool>=store.conn().query_row(
+                        "SELECT EXISTS(SELECT 1 FROM commands WHERE agent_id=? AND kind='cancel' AND state='pending')",
+                        [record.id.as_str()],|row|row.get(0));
+                    if !matches!(pending, Ok(true)) {
+                        break;
+                    }
+                }
+                let claimed = process
                     .observing(store.claim_command_for_turn(
                         &record.id,
                         !record.request.explicit_finish || idle,
                     ))
-                    .await?
-                else {
+                    .await;
+                let claimed = match claimed {
+                    Ok(value) => value,
+                    Err(_) if maintenance_hold => break,
+                    Err(error) => return Err(error),
+                };
+                let Some((cid, kind, payload)) = claimed else {
                     break;
                 };
+                if maintenance_hold {
+                    if kind != "cancel" {
+                        break;
+                    }
+                    match process
+                        .observing(store.complete_command(
+                            &record.id,
+                            cid,
+                            &json!({"accepted":true}),
+                        ))
+                        .await
+                    {
+                        Ok(()) => {
+                            return Ok(EngineExit::Finished(EngineResult {
+                                native_failure: None,
+                                outcome: Outcome {
+                                    status: Status::Cancelled,
+                                    exit_code: None,
+                                    failure_kind: None,
+                                    failure_text: None,
+                                    runtime_session_id: Some(tid.clone()),
+                                },
+                                answer: None,
+                                usage,
+                            }));
+                        }
+                        Err(_) => break,
+                    }
+                }
                 if crate::health::command(process, store, &record.id, (cid, &kind, &payload), idle)
                     .await?
                 {
@@ -1144,7 +1477,7 @@ pub async fn run(
                         &mut redactors,
                     )
                     .await?;
-                    return Ok(EngineResult {
+                    return Ok(EngineExit::Finished(EngineResult {
                         native_failure: None,
                         outcome: Outcome {
                             status: Status::Cancelled,
@@ -1155,10 +1488,81 @@ pub async fn run(
                         },
                         answer: None,
                         usage,
-                    });
+                    }));
                 }
                 if kind == "steer" {
                     if let Some(text) = commands::steer_text(&payload) {
+                        if maintenance_receipt::marked(&payload) {
+                            let binding = store
+                                .bound_attempt()
+                                .map(|attempt| {
+                                    maintenance_receipt::claimed_control(
+                                        store, &record.id, attempt, cid, &payload,
+                                    )
+                                })
+                                .transpose();
+                            let binding = match binding {
+                                Ok(Some(Some(binding))) => binding,
+                                _ => {
+                                    let _ = process.observing(store.complete_command(
+                                        &record.id, cid, &json!({"accepted":false,"reason":"maintenance_binding_unavailable"}),
+                                    )).await;
+                                    maintenance_observer.unavailable(
+                                        maintenance::Gap::ReceiptPersistenceUnavailable,
+                                    );
+                                    continue;
+                                }
+                            };
+                            // Maintenance input is never retried. Any uncertain
+                            // native outcome or failed write holds only the pause.
+                            let exchange = turn_input(
+                                process,
+                                &mut session,
+                                &tid,
+                                &mut turn_id,
+                                &mut idle,
+                                text,
+                                record.request.effort.as_deref(),
+                                tokio::time::Instant::now() + Duration::from_secs(30),
+                            )
+                            .await;
+                            let result = maintenance_receipt::send_result(exchange);
+                            let accepted = result["accepted"] == true;
+                            let persisted = if accepted {
+                                match store.user_fragments(
+                                    &record.id,
+                                    "Agent Run requested a maintenance checkpoint.",
+                                ) {
+                                    Ok(fragments) => process
+                                        .observing(store.observed_command_result(
+                                            &record.id,
+                                            cid,
+                                            &result,
+                                            "native_accepted",
+                                            Some(false),
+                                            fragments,
+                                        ))
+                                        .await
+                                        .map(|_| ()),
+                                    Err(error) => Err(error),
+                                }
+                            } else {
+                                process
+                                    .observing(store.complete_command(&record.id, cid, &result))
+                                    .await
+                            };
+                            if accepted && persisted.is_ok() {
+                                maintenance_control = Some(binding.accepted_turn(&turn_id));
+                            } else {
+                                maintenance_observer
+                                    .unavailable(maintenance::Gap::ReceiptPersistenceUnavailable);
+                                if let Some(logger) = crate::logging::configured() {
+                                    logger.log(crate::logging::Level::Warning,
+                                        "maintenance input was not confirmed; automatic pause held without replay");
+                                }
+                            }
+                            continue;
+                        }
                         let exchange = turn_input(
                             process,
                             &mut session,
@@ -1189,6 +1593,11 @@ pub async fn run(
                                 json!({"accepted":false,"reason":"backlog_pressure_unsent"})
                             }
                             Ok(agent_run_adapters::io::RpcDisposition::Uncertain(reason)) => {
+                                // The input may have reached the native turn;
+                                // later silence or a late RPC reply cannot prove
+                                // that its side effects settled for maintenance.
+                                maintenance_observer
+                                    .unavailable(maintenance::Gap::AsyncCoverageUnavailable);
                                 if let agent_run_adapters::io::RpcUncertain::Transport(kind) =
                                     reason
                                 {
@@ -1273,10 +1682,19 @@ pub async fn run(
                                 commands::pool_result("unsent", "backlog_pressure_unsent")
                             }
                             Ok(agent_run_adapters::io::RpcDisposition::Uncertain(reason)) => {
+                                maintenance_observer
+                                    .unavailable(maintenance::Gap::AsyncCoverageUnavailable);
                                 commands::pool_result("unknown", reason.reason())
                             }
                             // Only pre-send validation returns Err.
-                            Err(_) => commands::pool_result("unsent", "exchange_not_sent"),
+                            Err(_) => {
+                                // The idle wake helper may map an uncertain
+                                // native response to an error; never infer that
+                                // background work is absent from it.
+                                maintenance_observer
+                                    .unavailable(maintenance::Gap::AsyncCoverageUnavailable);
+                                commands::pool_result("unsent", "exchange_not_sent")
+                            }
                         },
                         Err(refusal) => refusal,
                     };
@@ -1309,6 +1727,20 @@ pub async fn run(
             tick.reset();
             continue;
         };
+        if maintenance_hold {
+            match event {
+                Event::Json(frame) => {
+                    maintenance_receipt::observe_held_frame(
+                        process, store, record, &tid, &turn_id, &frame,
+                    )
+                    .await
+                }
+                Event::OwnershipFailure(_) | Event::Eof | Event::Failure(_) => {
+                    held_stream_ended = true
+                }
+            }
+            continue;
+        }
         let v = match event {
             Event::Json(v) => v,
             Event::OwnershipFailure(error) => {
@@ -1349,10 +1781,10 @@ pub async fn run(
                         Some(tid.clone()),
                         None,
                     )? {
-                        return Ok(result);
+                        return Ok(EngineExit::Finished(result));
                     }
                 }
-                return Ok(EngineResult {
+                return Ok(EngineExit::Finished(EngineResult {
                     native_failure: None,
                     outcome: Outcome::failure(if record.request.explicit_finish {
                         "ended_without_finish"
@@ -1361,7 +1793,7 @@ pub async fn run(
                     }),
                     answer: None,
                     usage,
-                });
+                }));
             }
             Event::Failure(e) => {
                 flush_pending_assistant(
@@ -1373,14 +1805,26 @@ pub async fn run(
                     &mut redactors,
                 )
                 .await?;
-                return Ok(EngineResult {
+                return Ok(EngineExit::Finished(EngineResult {
                     native_failure: None,
                     outcome: Outcome::failure(e),
                     answer: None,
                     usage,
-                });
+                }));
             }
         };
+        // Maintenance uses stricter identity and ordering than normal legacy
+        // transcript handling, so observe before any permissive filtering.
+        maintenance_observer.observe(&v, &turn_id);
+        let maintenance_receipt_result = process
+            .observing(maintenance_receipt::observe(
+                store,
+                &record.id,
+                maintenance_control.as_ref(),
+                &mut maintenance_observer,
+            ))
+            .await;
+        maintenance_receipt::receipt_outcome(&mut maintenance_observer, maintenance_receipt_result);
         if v.get("method").is_some() && v.get("id").is_some() {
             process.deny_request(&v).await?;
             continue;
@@ -1416,6 +1860,10 @@ pub async fn run(
             continue;
         };
         let p = v.get("params").unwrap_or(&Value::Null);
+        if method == "item/commandExecution/outputDelta" {
+            command_outputs.delta(process, &tid, p);
+            continue;
+        }
         if p.get("threadId")
             .and_then(Value::as_str)
             .is_some_and(|id| id != tid)
@@ -1433,11 +1881,22 @@ pub async fn run(
         {
             let key = item["id"].as_str().expect("matched native item");
             if item["type"] == "commandExecution" {
-                let job = pending_jobs.get_mut(key).expect("owned started item");
-                if job.completion.is_some() {
+                if pending_jobs[key].completion.is_some() {
                     continue;
                 }
-                let text = native_job_text(process, item);
+                journal_missing_tool_input(
+                    process,
+                    store,
+                    &record.id,
+                    &mut missing_tool_inputs,
+                    event_turn.expect("owned turn"),
+                    item,
+                )
+                .await?;
+                let text = command_outputs
+                    .complete(process, item, event_turn.expect("owned turn"))
+                    .map(|text| process.redact(&text))
+                    .unwrap_or_else(|| native_job_text(process, item));
                 process
                     .observing(store.journal_with_error(
                         &record.id,
@@ -1448,6 +1907,7 @@ pub async fn run(
                         tool_error(item),
                     ))
                     .await?;
+                let job = pending_jobs.get_mut(key).expect("owned started item");
                 job.process_id = item["processId"]
                     .as_str()
                     .filter(|id| !id.is_empty())
@@ -1463,6 +1923,15 @@ pub async fn run(
             }
             pending_jobs.remove(key);
             if idle || event_turn != Some(turn_id.as_str()) {
+                journal_missing_tool_input(
+                    process,
+                    store,
+                    &record.id,
+                    &mut missing_tool_inputs,
+                    event_turn.expect("owned turn"),
+                    item,
+                )
+                .await?;
                 native_job_completion(
                     process,
                     store,
@@ -1556,6 +2025,9 @@ pub async fn run(
                         .get("id")
                         .and_then(Value::as_str)
                         .filter(|id| !id.is_empty());
+                    if key.is_some_and(|key| tools_completed.contains(key)) {
+                        continue;
+                    }
                     if record.request.explicit_finish
                         && matches!(
                             item.get("type").and_then(Value::as_str),
@@ -1566,9 +2038,9 @@ pub async fn run(
                             && item.get("tool").and_then(Value::as_str) == Some("finish"))
                         && let Some(key) = key
                     {
-                        pending_jobs.insert(
-                            key.to_owned(),
-                            PendingNativeJob {
+                        pending_jobs
+                            .entry(key.to_owned())
+                            .or_insert_with(|| PendingNativeJob {
                                 turn: turn_id.clone(),
                                 kind: item["type"].as_str().expect("supported kind").to_owned(),
                                 name: name.clone(),
@@ -1577,15 +2049,32 @@ pub async fn run(
                                     .filter(|id| !id.is_empty())
                                     .map(str::to_owned),
                                 completion: None,
-                            },
-                        );
+                            });
                     }
                     if key.is_none_or(|key| tools_started.insert(key.to_owned())) {
+                        if item.get("type").and_then(Value::as_str) == Some("commandExecution")
+                            && let Some(key) = key
+                        {
+                            command_outputs.start(key, &turn_id);
+                        }
+                        let text = native_tool_input(process, item);
+                        if text.is_empty()
+                            && let Some(key) = key
+                        {
+                            missing_tool_inputs.insert(
+                                key.to_owned(),
+                                MissingToolInput {
+                                    turn: turn_id.clone(),
+                                    kind: item["type"].as_str().unwrap_or_default().to_owned(),
+                                    name: name.clone(),
+                                },
+                            );
+                        }
                         process
                             .observing(store.journal_with_error(
                                 &record.id,
                                 "tool_call",
-                                "",
+                                &text,
                                 Some(&process.redact(&name)),
                                 key,
                                 None,
@@ -1647,28 +2136,44 @@ pub async fn run(
                     }
                     let name = process.redact(&name);
                     if native_id.is_none_or(|key| tools_started.insert(key.to_owned())) {
+                        let text = native_tool_input(process, item);
                         process
                             .observing(store.journal_with_error(
                                 &record.id,
                                 "tool_call",
-                                "",
+                                &text,
                                 Some(&name),
                                 native_id,
                                 None,
                             ))
                             .await?;
+                    } else {
+                        journal_missing_tool_input(
+                            process,
+                            store,
+                            &record.id,
+                            &mut missing_tool_inputs,
+                            &turn_id,
+                            item,
+                        )
+                        .await?;
                     }
-                    let text = item
-                        .get("aggregatedOutput")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                        .or_else(|| item.pointer("/result/content").map(Value::to_string))
-                        .or_else(|| {
-                            item.pointer("/error/message")
-                                .and_then(Value::as_str)
-                                .map(str::to_owned)
-                        })
-                        .unwrap_or_default();
+                    let text = (item.get("type").and_then(Value::as_str)
+                        == Some("commandExecution"))
+                    .then(|| command_outputs.complete(process, item, &turn_id))
+                    .flatten()
+                    .or_else(|| {
+                        item.get("aggregatedOutput")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .or_else(|| item.pointer("/result/content").map(Value::to_string))
+                    .or_else(|| {
+                        item.pointer("/error/message")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_default();
                     if item.get("type").and_then(Value::as_str) == Some("mcpToolCall")
                         && item.get("server").and_then(Value::as_str)
                             == Some(agent_run_domain::worker::SERVER_NAME)
@@ -1696,6 +2201,7 @@ pub async fn run(
                         item.get("type").and_then(Value::as_str),
                         Some("reasoning" | "plan" | "userMessage" | "contextCompaction")
                     ) {
+                        maintenance_observer.unavailable(maintenance::Gap::UnsupportedToolCoverage);
                         process
                             .observing(store.event(
                                 &record.id,
@@ -1764,7 +2270,7 @@ pub async fn run(
                         usage.clone(),
                     )?
                 {
-                    return Ok(result);
+                    return Ok(EngineExit::Finished(result));
                 }
                 let mut outcome = match turn.get("status").and_then(Value::as_str) {
                     Some("completed") => Outcome::success(Some(tid.clone())),
@@ -1808,6 +2314,51 @@ pub async fn run(
                         .observing(store.worker_turn(&record.id, true, crate::domain::now()))
                         .await?;
                     idle = true;
+                    if allow_pause
+                        && outcome.status == Status::Succeeded
+                        && pending_jobs.is_empty()
+                        && maintenance_observer.assessment() == maintenance::Assessment::Settled
+                        && let Some(binding) = maintenance_control.as_ref()
+                    {
+                        match maintenance_receipt::native_settlement(
+                            store,
+                            &record.id,
+                            binding,
+                            &maintenance_observer,
+                        ) {
+                            Ok(Some(proof)) => {
+                                // A possibly committed closing must never be retried
+                                // or followed by another native input.
+                                maintenance_hold = true;
+                                let committed = process
+                                    .observing(maintenance_receipt::commit_settlement(
+                                        store, &record.id, &proof,
+                                    ))
+                                    .await;
+                                if let Ok(native_event_seq) = committed
+                                    && drain_maintenance_frames(
+                                        process, store, &record.id, &tid, &turn_id, &mut usage,
+                                    )
+                                    .await
+                                {
+                                    return Ok(EngineExit::MaintenancePause {
+                                        epoch: proof.maintenance_epoch,
+                                        attempt_id: proof.attempt_id,
+                                        native_event_seq,
+                                    });
+                                }
+                                maintenance_observer
+                                    .unavailable(maintenance::Gap::ActivityAfterCheckpoint);
+                            }
+                            Ok(None) => maintenance_observer
+                                .unavailable(maintenance::Gap::InvalidCheckpoint),
+                            Err(_) => {
+                                maintenance_hold = true;
+                                maintenance_observer
+                                    .unavailable(maintenance::Gap::InvalidCheckpoint);
+                            }
+                        }
+                    }
                     streamed.clear();
                     emitted.clear();
                     completed.clear();
@@ -1817,16 +2368,120 @@ pub async fn run(
                     tools_completed.clear();
                     continue;
                 }
-                return Ok(EngineResult {
+                return Ok(EngineExit::Finished(EngineResult {
                     native_failure,
                     outcome,
                     answer: final_answer.map(|text| process.redact(&text)),
                     usage,
-                });
+                }));
             }
             _ => record_native_event(process, store, &record.id, method, p).await?,
         }
     }
+}
+
+/// Project only existing numeric Codex usage counters into the existing
+/// cumulative usage event, keeping arbitrary native fields out of storage.
+fn maintenance_usage(value: &Value) -> Option<Value> {
+    let total = value.pointer("/tokenUsage/total")?.as_object()?;
+    let mut safe = serde_json::Map::new();
+    for key in [
+        "inputTokens",
+        "outputTokens",
+        "cachedInputTokens",
+        "cacheWriteInputTokens",
+        "reasoningOutputTokens",
+        "totalTokens",
+    ] {
+        if let Some(number) = total.get(key).filter(|value| value.is_number()) {
+            safe.insert(key.into(), number.clone());
+        }
+    }
+    Some(token_usage_event(&Value::Object(safe)))
+}
+
+/// Admit only a same-thread usage notification or an identifiable old RPC
+/// response. Unknown envelopes, new work and foreign turns invalidate closing.
+fn maintenance_buffered_frame(
+    process: &Process,
+    thread: &str,
+    turn: &str,
+    frame: &Value,
+) -> Option<Option<Value>> {
+    let object = frame.as_object()?;
+    if object
+        .get("jsonrpc")
+        .is_some_and(|version| version != "2.0")
+    {
+        return None;
+    }
+    if frame["method"] == "thread/tokenUsage/updated"
+        && !object.contains_key("id")
+        && object
+            .keys()
+            .all(|key| matches!(key.as_str(), "jsonrpc" | "method" | "params"))
+        && frame["params"]["threadId"] == thread
+        && frame["params"]
+            .get("turnId")
+            .is_none_or(|id| id.is_null() || id == turn)
+    {
+        return maintenance_usage(&frame["params"]).map(Some);
+    }
+    if process.rpc_reply_id(frame).is_some()
+        && object
+            .keys()
+            .all(|key| matches!(key.as_str(), "jsonrpc" | "id" | "result" | "error"))
+        && object.contains_key("result") != object.contains_key("error")
+    {
+        return Some(None);
+    }
+    None
+}
+
+/// Drain a bounded set of delivered harmless frames after closing, retaining
+/// the latest cumulative usage through its ordinary durable event. Any unknown
+/// frame, persistence uncertainty or cancellation leaves the attempt held.
+async fn drain_maintenance_frames(
+    process: &mut Process,
+    store: &mut Persist,
+    id: &AgentId,
+    thread: &str,
+    turn: &str,
+    usage: &mut Option<Value>,
+) -> bool {
+    let mut dirty = usage.is_some();
+    for _ in 0..64 {
+        if process.has_buffered_events() {
+            match process.next().await {
+                agent_run_adapters::io::Event::Json(frame) => {
+                    match maintenance_buffered_frame(process, thread, turn, &frame) {
+                        Some(Some(observed)) => {
+                            *usage = Some(observed);
+                            dirty = true;
+                        }
+                        Some(None) => {}
+                        None => return false,
+                    }
+                }
+                _ => return false,
+            }
+            continue;
+        }
+        if dirty {
+            dirty = false;
+            if let Some(observed) = usage.as_ref().and_then(maintenance_usage)
+                && process
+                    .observing(store.event_durable(id, "thread/tokenUsage/updated", &observed))
+                    .await
+                    .is_err()
+            {
+                return false;
+            }
+            continue;
+        }
+        return matches!(store.cancel_pending(id), Ok(false));
+    }
+    false
 }
 
 /// Append trusted completion semantics to the effective native developer
@@ -1851,9 +2506,18 @@ fn finish_developer_instructions(config: &Value) -> Result<String> {
 /// first-party callback server is connected with the exact admitted catalog.
 /// The 30-second setup allowance never limits an admitted worker's lifetime.
 /// Other selected role servers remain governed by the existing native grant.
-async fn finish_inventory_ready(process: &mut Process, thread: &str, research: bool) -> Result<()> {
+async fn finish_inventory_ready(
+    process: &mut Process,
+    thread: &str,
+    research: bool,
+    staged: bool,
+) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let catalog = agent_run_domain::worker::finish_tools_json(research);
+    let catalog = if staged {
+        agent_run_domain::worker::maintenance_pause_tools_json(research)
+    } else {
+        agent_run_domain::worker::finish_tools_json(research)
+    };
     let expected: BTreeSet<&str> = catalog.iter().filter_map(|t| t["name"].as_str()).collect();
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1905,6 +2569,386 @@ struct PendingNativeJob {
     process_id: Option<String>,
     /// Already journaled, redacted result capped at4096bytes, awaiting return proof.
     completion: Option<Value>,
+}
+
+/// Identity of a started call whose input was absent from its first event.
+struct MissingToolInput {
+    /// Origin turn prevents a later invocation from supplying this call's input.
+    turn: String,
+    /// Native item type must agree with the original call.
+    kind: String,
+    /// Native tool name must agree with the original call.
+    name: String,
+}
+
+/// Maximum retained redacted delta output per command and across the run.
+const COMMAND_OUTPUT_LIMIT: usize = 256 * 1024;
+const COMMAND_OUTPUT_TOTAL_LIMIT: usize = 8 * 1024 * 1024;
+/// Bounds simultaneous streaming redactors and their withheld secret tails.
+const COMMAND_OUTPUT_STREAM_LIMIT: usize = 64;
+const COMMAND_OUTPUT_TRUNCATED: &str = "\n[command output truncated]";
+
+/// Redacted fallback output for an exactly identified started native command.
+struct CommandOutput {
+    /// Origin turn must match every delta and terminal item.
+    turn: String,
+    /// Only already-redacted fragments are retained here.
+    text: String,
+    /// Withholds a possible secret suffix across delta boundaries.
+    redactor: Option<StreamingRedactor>,
+    /// Further output was discarded because a bound was reached.
+    truncated: bool,
+}
+
+/// Buffers bounded command deltas until a matching terminal item selects them.
+#[derive(Default)]
+struct CommandOutputs {
+    items: BTreeMap<String, CommandOutput>,
+    bytes: usize,
+    streams: usize,
+}
+
+impl CommandOutputs {
+    /// Records the accepted start without replacing an existing invocation.
+    fn start(&mut self, id: &str, turn: &str) {
+        self.items
+            .entry(id.to_owned())
+            .or_insert_with(|| CommandOutput {
+                turn: turn.to_owned(),
+                text: String::new(),
+                redactor: None,
+                truncated: false,
+            });
+    }
+
+    /// Keeps only deltas with exact thread, origin-turn and started-item ownership.
+    fn delta(&mut self, process: &Process, thread: &str, params: &Value) {
+        if params.get("threadId").and_then(Value::as_str) != Some(thread) {
+            return;
+        }
+        let (Some(id), Some(turn), Some(delta)) = (
+            params.get("itemId").and_then(Value::as_str),
+            params.get("turnId").and_then(Value::as_str),
+            params.get("delta").and_then(Value::as_str),
+        ) else {
+            return;
+        };
+        let Some(output) = self.items.get_mut(id) else {
+            return;
+        };
+        if output.turn != turn || output.truncated || delta.is_empty() {
+            return;
+        }
+        if output.redactor.is_none() {
+            if self.streams == COMMAND_OUTPUT_STREAM_LIMIT {
+                output.truncated = true;
+                return;
+            }
+            output.redactor = Some(process.stream_redactor());
+            self.streams += 1;
+        }
+        let safe = output
+            .redactor
+            .as_mut()
+            .expect("stream initialized")
+            .feed(delta);
+        Self::append(output, &mut self.bytes, &safe);
+        if output.truncated {
+            // A withheld secret prefix is discarded with the redactor, never
+            // flushed into a prefix whose remaining bytes were dropped.
+            drop(output.redactor.take());
+            self.streams -= 1;
+        }
+    }
+
+    /// Appends safe UTF-8 through both bounds and marks any omitted suffix.
+    fn append(output: &mut CommandOutput, bytes: &mut usize, safe: &str) {
+        let available = COMMAND_OUTPUT_LIMIT
+            .saturating_sub(output.text.len())
+            .min(COMMAND_OUTPUT_TOTAL_LIMIT.saturating_sub(*bytes));
+        let end = safe.floor_char_boundary(safe.len().min(available));
+        output.text.push_str(&safe[..end]);
+        *bytes += end;
+        output.truncated |= end < safe.len();
+    }
+
+    /// Retires the matching start and returns deltas only if no aggregate is
+    /// supplied. Incomplete calls are never converted into terminal results.
+    fn complete(&mut self, process: &Process, item: &Value, turn: &str) -> Option<String> {
+        let id = item.get("id")?.as_str()?;
+        if self.items.get(id)?.turn != turn {
+            return None;
+        }
+        let mut output = self.items.remove(id)?;
+        let observed = output.redactor.is_some() || output.truncated;
+        let mut redactor = output.redactor.take();
+        if redactor.is_some() {
+            self.streams -= 1;
+        }
+        let has_aggregate = item
+            .get("aggregatedOutput")
+            .and_then(Value::as_str)
+            .is_some_and(|output| !output.is_empty());
+        if !has_aggregate && let Some(redactor) = redactor.as_mut() {
+            Self::append(&mut output, &mut self.bytes, &redactor.finish());
+        }
+        self.bytes -= output.text.len();
+        if has_aggregate || !observed {
+            return None;
+        }
+        // Full JSON output gets structural credential/environment redaction;
+        // malformed or truncated JSON-like output cannot be inspected safely.
+        let mut value = Value::String(output.text);
+        if !value
+            .as_str()
+            .is_some_and(|text| plain_command_output(process, text))
+        {
+            sanitize_tool_arguments(&mut value, false);
+        }
+        let mut text = value.as_str().unwrap_or_default().to_owned();
+        if output.truncated {
+            text.push_str(COMMAND_OUTPUT_TRUNCATED);
+        }
+        if let Some(error) = item.pointer("/error/message").and_then(Value::as_str)
+            && !error.is_empty()
+        {
+            let mut error = Value::String(error.to_owned());
+            sanitize_tool_arguments(&mut error, false);
+            if let Some(error) = error.as_str()
+                && !text.contains(error)
+            {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(error);
+            }
+        }
+        Some(text)
+    }
+}
+
+/// Allows ordinary multiline log, progress and quoted text while leaving
+/// JSON-like content and decoded launch secrets for fail-closed sanitization.
+fn plain_command_output(process: &Process, text: &str) -> bool {
+    let mut lines = text.trim_start().lines();
+    let Some(first) = lines.next() else {
+        return false;
+    };
+    plain_command_line(process, first)
+        && lines.all(|line| {
+            let line = line.trim_start();
+            if line.starts_with(['[', '"']) {
+                plain_command_line(process, line)
+            } else {
+                plain_output_tail(line)
+            }
+        })
+}
+
+/// Rejects tails that could append JSON fields, containers or quoted values.
+fn plain_output_tail(tail: &str) -> bool {
+    !tail.trim_start().starts_with(':') && !tail.contains(['{', '[', '"', '\\'])
+}
+
+/// Validates one common prefix and checks decoded quoted text for secrets.
+fn plain_command_line(process: &Process, text: &str) -> bool {
+    let text = text.trim_start();
+    if let Some(rest) = text.strip_prefix('[')
+        && let Some((level, tail)) = rest.split_once(']')
+    {
+        let number = |text: &str| {
+            let text = text.trim();
+            !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+        };
+        let progress = level
+            .split_once('/')
+            .is_some_and(|(current, total)| number(current) && number(total))
+            || level.trim().strip_suffix('%').is_some_and(number);
+        return (matches!(
+            level,
+            "TRACE" | "DEBUG" | "INFO" | "WARN" | "WARNING" | "ERROR" | "FATAL" | "NOTICE"
+        ) || progress)
+            && plain_output_tail(tail);
+    }
+    if !text.starts_with('"') {
+        return false;
+    }
+    let mut escaped = false;
+    for (index, character) in text.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            let end = index + character.len_utf8();
+            return serde_json::from_str::<String>(&text[..end]).is_ok_and(|quoted| {
+                if quoted.contains(['{', '[', '"']) {
+                    return false;
+                }
+                let quoted = Value::String(quoted);
+                process.redact_value(&quoted) == quoted
+            }) && plain_output_tail(&text[end..]);
+        }
+    }
+    false
+}
+
+/// Removes environment and credential-shaped argument fields before journaling.
+/// Embedded JSON is sanitized once; deeper or malformed JSON-like text is omitted.
+fn sanitize_tool_arguments(value: &mut Value, embedded: bool) {
+    match value {
+        Value::Object(object) => {
+            for (name, value) in object {
+                if sensitive_tool_field(name) {
+                    *value = Value::String("<redacted>".into());
+                } else {
+                    sanitize_tool_arguments(value, embedded);
+                }
+            }
+        }
+        Value::Array(values) => values
+            .iter_mut()
+            .for_each(|value| sanitize_tool_arguments(value, embedded)),
+        Value::String(text) => {
+            let json_like = text.trim_start().starts_with(['{', '[', '"']);
+            if json_like {
+                match serde_json::from_str::<Value>(text) {
+                    Ok(mut nested @ (Value::Object(_) | Value::Array(_))) if !embedded => {
+                        sanitize_tool_arguments(&mut nested, true);
+                        *text = nested.to_string();
+                    }
+                    Ok(Value::String(nested))
+                        if !nested.trim_start().starts_with(['{', '[', '"']) => {}
+                    _ => *text = "<omitted>".into(),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Retains a diff only when it has neither escaping nor credential-shaped
+/// markers. Callers still redact known launch literals after projection.
+fn sanitize_file_diff(diff: &str) -> String {
+    if diff.contains('\\')
+        || diff
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .filter(|part| !part.is_empty())
+            .any(|part| {
+                let lower = part.to_ascii_lowercase();
+                sensitive_tool_field(part)
+                    || ["authorization", "auth", "cookie", "environment"]
+                        .iter()
+                        .any(|suffix| lower.ends_with(*suffix))
+            })
+    {
+        "[diff omitted: sensitive or escaped content]".into()
+    } else {
+        diff.to_owned()
+    }
+}
+
+/// Projects only recognized native tool input, redacting it before persistence.
+/// Unknown items and absent inputs are empty; file changes retain only native
+/// paths, kinds and diffs. The native frame limit bounds the redacted input.
+fn native_tool_input(process: &Process, item: &Value) -> String {
+    let text = match item.get("type").and_then(Value::as_str) {
+        Some("commandExecution") => item
+            .get("command")
+            .and_then(Value::as_str)
+            .filter(|command| !command.trim().is_empty())
+            .map(|command| process.redact(command)),
+        Some("mcpToolCall" | "dynamicToolCall") => item
+            .get("arguments")
+            .filter(|value| !value.is_null() && value.as_str() != Some(""))
+            .map(|value| {
+                let mut value = value.clone();
+                sanitize_tool_arguments(&mut value, false);
+                process.redact_value(&value).to_string()
+            }),
+        Some("fileChange") => item
+            .get("changes")
+            .and_then(Value::as_array)
+            .map(|changes| {
+                changes
+                    .iter()
+                    .filter_map(|change| {
+                        let path = change.get("path")?.as_str()?;
+                        let mut projection = json!({"path":path});
+                        if let Some(kind) = change.get("kind").and_then(Value::as_str) {
+                            projection["kind"] = json!(kind);
+                        } else if let Some(kind) =
+                            change.pointer("/kind/type").and_then(Value::as_str)
+                        {
+                            projection["kind"] = json!(kind);
+                            if let Some(path) =
+                                change.pointer("/kind/movePath").and_then(Value::as_str)
+                            {
+                                projection["movePath"] = json!(path);
+                            }
+                        }
+                        if let Some(diff) = change.get("diff").and_then(Value::as_str) {
+                            projection["diff"] = json!(sanitize_file_diff(diff));
+                        }
+                        Some(projection)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|changes| !changes.is_empty())
+            .map(|changes| {
+                process
+                    .redact_value(&json!({"changes":changes}))
+                    .to_string()
+            }),
+        _ => None,
+    };
+    let mut text = text.unwrap_or_default();
+    if text.len() > agent_run_adapters::io::ENGINE_FRAME {
+        let suffix = "\n[tool input truncated]";
+        let limit = agent_run_adapters::io::ENGINE_FRAME - suffix.len();
+        text.truncate(text.floor_char_boundary(limit));
+        text.push_str(suffix);
+    }
+    text
+}
+
+/// Appends late input once only when turn, item kind and tool name match the
+/// previously journaled empty call. A missing or mismatched identity cannot
+/// attach input to another invocation, and completion retires the placeholder.
+async fn journal_missing_tool_input(
+    process: &mut Process,
+    store: &mut Persist,
+    id: &AgentId,
+    missing: &mut BTreeMap<String, MissingToolInput>,
+    turn: &str,
+    item: &Value,
+) -> Result<()> {
+    let Some(key) = item.get("id").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let Some(original) = missing.remove(key) else {
+        return Ok(());
+    };
+    if original.turn != turn
+        || item.get("type").and_then(Value::as_str) != Some(original.kind.as_str())
+        || tool_name(item).as_deref() != Some(original.name.as_str())
+    {
+        return Ok(());
+    }
+    let text = native_tool_input(process, item);
+    if !text.is_empty() {
+        process
+            .observing(store.journal_with_error(
+                id,
+                "tool_call",
+                &text,
+                Some(&process.redact(&original.name)),
+                Some(key),
+                None,
+            ))
+            .await?;
+    }
+    Ok(())
 }
 
 /// Read a terminal native item's output and apply the process's secret redactor.
@@ -2122,7 +3166,7 @@ fn tool_error(item: &Value) -> Option<(bool, &'static str)> {
     }
 }
 
-/// Names known native invocation variants without retaining commands/arguments.
+/// Names known native invocation variants independently of their input content.
 /// Other known invocation kinds count calls but keep errors unknown until their
 /// protocol-specific evidence is supported; unknown item kinds are not guessed.
 fn tool_name(item: &Value) -> Option<String> {
@@ -2228,6 +3272,46 @@ async fn turn_steer(
 
 #[cfg(test)]
 mod tests {
+    /// Only the trusted explicit-mode launch marker selects the staged catalog.
+    #[test]
+    fn maintenance_catalog_mode_preserves_v4_and_requires_explicit_v5() {
+        assert!(!super::maintenance_catalog_mode(false, "0").unwrap());
+        assert!(!super::maintenance_catalog_mode(true, "1").unwrap());
+        assert!(super::maintenance_catalog_mode(true, "5").unwrap());
+        for (explicit, mode) in [
+            (false, "5"),
+            (false, "1"),
+            (true, "0"),
+            (true, "unexpected"),
+        ] {
+            assert!(super::maintenance_catalog_mode(explicit, mode).is_err());
+        }
+        for research in [false, true] {
+            let v4 = agent_run_domain::worker::finish_tools_json(research);
+            let v5 = agent_run_domain::worker::maintenance_pause_tools_json(research);
+            assert!(v4.iter().all(|tool| tool["name"] != "maintenance_pause"));
+            assert_eq!(
+                v5.iter()
+                    .filter(|tool| tool["name"] == "maintenance_pause")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    /// The shared output budget never splits UTF-8 and reports omitted data.
+    #[test]
+    fn command_delta_shared_budget_marks_truncation() {
+        let mut outputs = super::CommandOutputs::default();
+        outputs.start("job", "turn");
+        outputs.bytes = super::COMMAND_OUTPUT_TOTAL_LIMIT - 1;
+        let output = outputs.items.get_mut("job").unwrap();
+        super::CommandOutputs::append(output, &mut outputs.bytes, "é");
+        assert!(output.text.is_empty());
+        assert!(output.truncated);
+        assert_eq!(outputs.bytes, super::COMMAND_OUTPUT_TOTAL_LIMIT - 1);
+    }
+
     /// Runtime semantics append to configured policy, never to peer/task data;
     /// malformed effective policy cannot silently disappear.
     #[test]

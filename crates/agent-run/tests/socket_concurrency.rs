@@ -414,6 +414,86 @@ async fn python_sigterm_completes_admitted_requests_and_releases_the_store() {
     assert!(agent_run_store::fixture::open(temp.path()).is_ok());
 }
 
+/// A real broker with an empty cohort records readiness, seals the stop on
+/// SIGTERM, and completes the same epoch after a new broker obtains the writer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn planned_restart_recovers_exact_epoch_after_real_broker_exit() {
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    cli::init(temp.path()).unwrap();
+    let start = || {
+        ChildGuard(
+            Command::new(env!("CARGO_BIN_EXE_agent-run"))
+                .arg("--home")
+                .arg(temp.path())
+                .args(["api", "serve"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let mut first = start();
+    let path = temp.path().join("api.sock");
+    wait_for_socket(&path).await;
+    let started = request(&path, json!({"jsonrpc":"2.0","id":1,"method":"_cli_maintenance_begin","params":{"request_id":"restart-test"}})).await;
+    let epoch = started["result"]["epoch"].as_i64().unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = request(
+            &path,
+            json!({"jsonrpc":"2.0","id":2,"method":"_cli_maintenance_status","params":{}}),
+        )
+        .await;
+        if status["result"]["phase"] == "ready" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "preparation did not become ready: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        // SAFETY: the PID belongs to this test's own broker child.
+        unsafe { libc::kill(first.0.id() as libc::pid_t, libc::SIGTERM) },
+        0
+    );
+    let status = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(status) = first.0.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("broker did not stop");
+    assert!(status.success());
+    let _second = start();
+    wait_for_socket(&path).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = request(&path, json!({"jsonrpc":"2.0","id":3,"method":"_cli_maintenance_epoch","params":{"epoch":epoch}})).await;
+        if status["result"]["phase"] == "complete" {
+            assert_eq!(status["result"]["outcome"], "completed");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "recovery did not complete: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Waits for the real test listener to publish without using a global socket.
 async fn wait_for_socket(path: &std::path::Path) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);

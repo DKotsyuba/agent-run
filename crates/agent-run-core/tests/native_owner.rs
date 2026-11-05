@@ -586,6 +586,25 @@ async fn owner_lifetime_and_durable_phase_refuse_before_effect() {
             [id.as_str()],
         )
         .unwrap();
+    let fence = store
+        .begin_maintenance_fence("owner-closing-fixture", 103.0)
+        .unwrap();
+    store.conn.execute(
+        "INSERT INTO maintenance_checkpoints(epoch,agent_id,attempt_id,challenge_id,requested_at,closing_event_seq,closing_event_sha256,closing_at) VALUES(?,?,'attempt',?,104,1,?,105)",
+        rusqlite::params![fence.epoch, id.as_str(), "b".repeat(64), "c".repeat(64)],
+    ).unwrap();
+    assert_eq!(
+        refusal(&process, &persist, &row, &call, Some("s"), true, false).unwrap(),
+        Some("not_idle")
+    );
+    store
+        .conn
+        .execute(
+            "DELETE FROM maintenance_checkpoints WHERE epoch=?",
+            [fence.epoch],
+        )
+        .unwrap();
+    store.end_maintenance_fence(fence.epoch, 106.0).unwrap();
     call.deadline = tokio::time::Instant::now() - Duration::from_millis(1);
     assert_eq!(
         refusal(&process, &persist, &row, &call, Some("s"), true, false).unwrap(),

@@ -129,6 +129,69 @@ fn candidates(revision: i64, items: &[(&str, u32)]) -> QuotaCandidateSet {
     }
 }
 
+/// Maintenance refuses fresh provider allocations before quota mutation while
+/// preserving original request replay, account reservations and active attempts.
+#[test]
+fn maintenance_provider_fence_preserves_replay_and_reservations() {
+    let home = home();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
+    let catalog = catalog(&store);
+    let request = provider_request(home.path(), "before-maintenance");
+    let authority = authority(&catalog, home.path());
+    let frozen = identity(&request, &authority);
+    let offered = candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+    let first = store
+        .admit_provider(
+            &request,
+            &request.storage_projection(),
+            &catalog,
+            &authority,
+            &offered,
+            &frozen,
+            8,
+            None,
+            None,
+        )
+        .unwrap();
+    let revision = store.quota_capacity_revision().unwrap();
+    let fence = store.begin_maintenance_fence("maintenance", 1.0).unwrap();
+    let replay = store
+        .admit_provider(
+            &request,
+            &request.storage_projection(),
+            &catalog,
+            &authority,
+            &offered,
+            &frozen,
+            8,
+            None,
+            None,
+        )
+        .unwrap();
+    assert!(!replay.created);
+    assert_eq!(replay.attempt_id, first.attempt_id);
+    let next = provider_request(home.path(), "after-maintenance");
+    assert!(matches!(
+        store.admit_provider(
+            &next,
+            &next.storage_projection(),
+            &catalog,
+            &authority,
+            &offered,
+            &identity(&next, &authority),
+            8,
+            None,
+            None
+        ),
+        Err(Error::Transition(_))
+    ));
+    assert_eq!(store.quota_capacity_revision().unwrap(), revision);
+    let cohort = store.maintenance_cohort(fence.epoch).unwrap();
+    assert_eq!(cohort.len(), 1);
+    assert_eq!(cohort[0].attempts[0].id, first.attempt_id);
+    assert!(cohort[0].attempts[0].ownership_active);
+}
+
 /// Supplies the explicit identity hash checked by replay before mutable state.
 fn identity(request: &ProviderStartRequest, authority: &ResolvedLaunchAuthority) -> Value {
     json!({

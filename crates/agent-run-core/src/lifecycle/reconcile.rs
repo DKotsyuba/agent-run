@@ -544,9 +544,10 @@ fn unowned_sql() -> &'static str {
      AND process_group_id IS NULL AND supervisor_identity IS NULL"
 }
 
-/// Fixed query for the complete active lifecycle set, matching Python's sweep.
+/// Fixed query for active lifecycle work that is not intentionally parked.
 fn active_sql() -> &'static str {
-    "SELECT * FROM agents WHERE status IN ('created','starting','running','cancelling')"
+    "SELECT * FROM agents WHERE status IN ('created','starting','running','cancelling') \
+     AND NOT EXISTS (SELECT 1 FROM attempts t WHERE t.agent_id=agents.id AND t.state='maintenance_parked' AND t.finished_at IS NULL)"
 }
 
 /// Return and advance one persisted fair keyset window for a fixed candidate query.
@@ -662,6 +663,7 @@ fn guarded_lost(
     };
     if !same_ownership(expected, &current)
         || current.status.terminal()
+        || agent_run_store::reconcile::has_maintenance_handoff(&tx, &expected.id)?
         || (expected.supervisor_pid.is_some()
             && current
                 .heartbeat_at

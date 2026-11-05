@@ -19,9 +19,11 @@ use agent_run_domain::{
 use agent_run_platform::process::{Identity, OwnershipSnapshot};
 use agent_run_store::{
     ops::{
-        AttemptTarget, BootstrapServiceProcess, ClaimServiceProcessIdentity, EnqueueNativeWake,
-        FinishAttempt, LatchNativeExhaustion, ObserveWorkerFinishReceipt, ProviderSpawning,
-        RecordSupervisorOwner, RememberProcesses, RemoteOp, WorkerTurn, WriteEnvelope,
+        AttemptTarget, BeginMaintenanceClosing, BootstrapServiceProcess,
+        ClaimServiceProcessIdentity, EnqueueNativeWake, FinishAttempt, LatchNativeExhaustion,
+        ObserveMaintenanceCheckpoint, ObserveWorkerFinishReceipt, ParkMaintenanceAttempt,
+        ProviderSpawning, RecordSupervisorOwner, RememberProcesses, RemoteOp, WorkerTurn,
+        WriteEnvelope,
     },
     writer::{StoreWriter, WriterLease},
 };
@@ -528,6 +530,40 @@ fn derived_owned_attempt_must_be_the_pinned_attempt() {
     }
     let current = supervisor(&a, Some(format!("{a}:2")), 1.0);
     for op in rows() {
+        in_scope(&f.apply(&current, op));
+    }
+    let maintenance = |attempt: String| {
+        [
+            RemoteOp::from(ObserveMaintenanceCheckpoint {
+                epoch: 1,
+                execution: a.clone(),
+                attempt: attempt.clone(),
+                challenge_id: "a".repeat(64),
+                receipt_sha256: "b".repeat(64),
+            }),
+            RemoteOp::from(ParkMaintenanceAttempt {
+                epoch: 1,
+                execution: a.clone(),
+                attempt: attempt.clone(),
+                native_event_seq: 1,
+                at: 2.0,
+            }),
+            RemoteOp::from(BeginMaintenanceClosing {
+                epoch: 1,
+                execution: a.clone(),
+                attempt,
+                native_event_seq: 1,
+                at: 2.0,
+            }),
+        ]
+    };
+    for op in maintenance(format!("{a}:2")) {
+        refused(f.apply(&stale, op), RejectCode::Unauthorized);
+    }
+    for op in maintenance(format!("{a}:1")) {
+        refused(f.apply(&current, op), RejectCode::Unauthorized);
+    }
+    for op in maintenance(format!("{a}:2")) {
         in_scope(&f.apply(&current, op));
     }
 }

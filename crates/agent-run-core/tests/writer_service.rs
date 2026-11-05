@@ -196,11 +196,18 @@ async fn sealed_admissions_resolve_old_receipts_but_refuse_new_starts() {
     assert!(
         matches!(replay, SubmitResult::Committed(ref stored) if stored.commit_seq == receipt.commit_seq)
     );
+    let refused = handle
+        .local(WriteAuthority::Broker, admission(&home, 2))
+        .await;
     assert_eq!(
-        handle
-            .local(WriteAuthority::Broker, admission(&home, 2))
-            .await,
+        refused,
         SubmitResult::NotEnqueued(NotEnqueuedReason::AdmissionsClosed)
+    );
+    let error = agent_run_core::persist::into_result::<()>(refused).unwrap_err();
+    assert_eq!(error.public().kind, "RuntimeError");
+    assert_eq!(
+        error.public().message,
+        "Agent Run is temporarily not accepting new agents. Retry with the same request ID when the service is ready."
     );
     assert_eq!(
         home.store()

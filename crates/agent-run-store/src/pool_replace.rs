@@ -339,6 +339,7 @@ impl Store<'_> {
             tx.commit()?;
             return Ok(found);
         }
+        crate::maintenance::require_admissions_open(&tx)?;
         let pool = input.pool_id.as_str();
         if let Some(denied) = refusal(&tx, pool, input.old)? {
             return Ok(Err(denied));

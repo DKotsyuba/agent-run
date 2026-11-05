@@ -10,6 +10,15 @@ never advertises or dispatches operator tools such as `start`, `resume`, `cancel
 `steer` or the operator pool tools.
 Configured work MCPs remain available according to the frozen role. Restricted research excludes configured work MCPs and adds only `save_report`; see [research permissions](research-permissions.md).
 
+For current Codex and Claude runs with explicit completion, the worker also
+advertises `health_reply`, `finish` and `maintenance_pause`. The last tool is
+used only in response to an Agent Run maintenance challenge: finish or safely
+stop the current operation, wait for active tools, then submit the exact
+challenge ID and a concise checkpoint (up to 4096 UTF-8 bytes). Never include
+credentials. Its receipt is a checkpoint acknowledgement, not task completion,
+proof that external effects stopped, or authorization to retry an action.
+Historical workers retain their originally advertised tool catalog.
+
 The worker uses the tool for material findings, risks, questions or blockers:
 
 ```json
@@ -56,7 +65,8 @@ authorization. Delivery may be delayed; a queue acknowledgement is not an answer
 `start_pool.members` accepts either `{ "start": { ... }, "role": "review" }`
 or `{ "existing_agent_id": "ag-...", "role": "review" }` for each of two to
 five seats. Existing members must be independent stable roots with an owned
-RUNNING attempt, no prior pool membership, authenticated proof of the ordinary five-tool or restricted research six-tool catalog. Unknown historical
+RUNNING attempt, no prior pool membership, and authenticated proof of a compatible
+role-bound worker catalog. Unknown historical
 catalog or independence history is refused; resume behavior is otherwise unchanged.
 
 Admission preserves the existing task, native session, model, account, grants,
@@ -110,4 +120,4 @@ stays unknown. See [MCP presentation](mcp-presentation.md).
 Restricted research derives a six-tool surface by adding `save_report`. A
 supervisor-selected nonsecret marker selects discovery; the broker independently
 authenticates the attempt and checks its frozen report-directory contract.
-Ordinary and historical workers keep their existing catalog.
+Historical workers keep their original catalog.

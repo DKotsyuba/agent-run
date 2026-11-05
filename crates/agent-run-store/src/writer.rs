@@ -1314,7 +1314,7 @@ impl StoreReader {
         allow_native_wake: bool,
     ) -> Result<bool> {
         Ok(self.store.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM commands WHERE agent_id=? AND state='pending' AND (? OR kind='cancel' OR COALESCE(json_extract(payload_json,'$.native_completion'),0)<>1))",
+            &format!("SELECT EXISTS(SELECT 1 FROM commands c WHERE c.agent_id=? AND c.state='pending' AND (? OR c.kind='cancel' OR COALESCE(json_extract(c.payload_json,'$.native_completion'),0)<>1) AND {})", crate::journal::MAINTENANCE_COMMAND_ELIGIBLE),
             rusqlite::params![run.as_str(), allow_native_wake],
             |row| row.get(0),
         )?)

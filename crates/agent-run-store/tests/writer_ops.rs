@@ -48,16 +48,16 @@ fn cancel_envelope(kind: &str) -> WriteEnvelope {
     .unwrap()
 }
 
-/// The inventory has 92 active rows with retired ids 54, 55 and 58 with stable, unique wire ids and
+/// The inventory has 107 active rows with retired ids 54, 55 and 58 with stable, unique wire ids and
 /// unique snake-case names, and rows 6, 49 and 79 are internal-only.
 #[test]
 fn inventory_is_closed_with_stable_unique_ids() {
     let all = OpKindRef::all();
-    assert_eq!(all.len(), 92);
+    assert_eq!(all.len(), 107);
     for (index, kind) in all.iter().enumerate() {
         assert_eq!(
             kind.wire_id() as usize,
-            (1..=95)
+            (1..=110)
                 .filter(|id| ![54, 55, 58].contains(id))
                 .nth(index)
                 .unwrap()
@@ -65,12 +65,12 @@ fn inventory_is_closed_with_stable_unique_ids() {
         assert_eq!(OpKindRef::from_wire_id(kind.wire_id()), Some(*kind));
     }
     assert_eq!(OpKindRef::from_wire_id(0), None);
-    assert_eq!(OpKindRef::from_wire_id(96), None);
+    assert_eq!(OpKindRef::from_wire_id(111), None);
     for retired in [54, 55, 58] {
         assert_eq!(OpKindRef::from_wire_id(retired), None);
     }
     let names: BTreeSet<_> = all.iter().map(|kind| kind.name()).collect();
-    assert_eq!(names.len(), 92);
+    assert_eq!(names.len(), 107);
     assert!(
         names
             .iter()
@@ -82,7 +82,7 @@ fn inventory_is_closed_with_stable_unique_ids() {
         .map(|kind| kind.wire_id())
         .collect();
     assert_eq!(internal, vec![6, 49, 79]);
-    assert_eq!(all.iter().filter(|kind| kind.is_remote()).count(), 49);
+    assert_eq!(all.iter().filter(|kind| kind.is_remote()).count(), 52);
 }
 
 /// The static matrix confines worker rows to Worker, broker rows to Broker
@@ -101,6 +101,9 @@ fn authority_matrix_confines_roles() {
     };
     assert!(OpKindRef::AcceptWorkerFinish.permits(&worker));
     assert!(!OpKindRef::AcceptWorkerFinish.permits(&WriteAuthority::Broker));
+    assert!(OpKindRef::AcceptMaintenanceCheckpoint.permits(&worker));
+    assert!(!OpKindRef::AcceptMaintenanceCheckpoint.permits(&WriteAuthority::Broker));
+    assert!(!OpKindRef::AcceptMaintenanceCheckpoint.permits(&cli));
     assert!(!OpKindRef::FinishTerminal.permits(&cli));
     assert!(!OpKindRef::FinishTerminal.permits(&worker));
     assert!(OpKindRef::FinishTerminal.permits(&WriteAuthority::Broker));
@@ -129,6 +132,27 @@ fn authority_matrix_confines_roles() {
         assert!(!OpKindRef::ClaimDelivery.permits(role));
         assert!(!OpKindRef::CompleteDelivery.permits(role));
         assert!(!OpKindRef::PrepareBridgeDelivery.permits(role));
+    }
+    assert!(!OpKindRef::AcceptMaintenanceCheckpoint.permits(&supervisor));
+    assert!(!OpKindRef::AcceptMaintenanceCheckpoint.permits(&collector));
+    assert_eq!(OpKindRef::AcceptMaintenanceCheckpoint.wire_id(), 98);
+    assert_eq!(OpKindRef::RequestMaintenanceSteer.wire_id(), 99);
+    assert!(OpKindRef::RequestMaintenanceSteer.permits(&WriteAuthority::Broker));
+    assert!(OpKindRef::ClaimMaintenanceResume.permits(&WriteAuthority::Broker));
+    for role in [&cli, &worker, &collector, &supervisor] {
+        assert!(!OpKindRef::RequestMaintenanceSteer.permits(role));
+        assert!(!OpKindRef::ClaimMaintenanceResume.permits(role));
+    }
+    for kind in [
+        OpKindRef::ObserveMaintenanceCheckpoint,
+        OpKindRef::ParkMaintenanceAttempt,
+        OpKindRef::BeginMaintenanceClosing,
+    ] {
+        assert!(kind.permits(&supervisor));
+        assert!(kind.is_remote());
+        for role in [&cli, &worker, &collector, &WriteAuthority::Broker] {
+            assert!(!kind.permits(role));
+        }
     }
     assert!(OpKindRef::PruneCapacitySamples.permits(&collector));
     assert!(!OpKindRef::ClaimCommand.permits(&WriteAuthority::Broker));
