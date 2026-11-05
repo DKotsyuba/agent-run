@@ -427,7 +427,8 @@ mod tests {
                 maintenance_epoch: 1,
             }))
             .unwrap();
-        assert!(deferred.contains("No action is required"));
+        assert!(deferred.contains("The restart was not completed"));
+        assert!(deferred.contains("Individual agent notices report failures"));
         let (_, held) = notice_content(&NoticePayload::Maintenance(MaintenanceNotice::After {
             maintenance_epoch: 1,
             resumed: 0,

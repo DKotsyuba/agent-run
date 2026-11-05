@@ -576,6 +576,39 @@ impl Service {
         epoch: i64,
         id: &AgentId,
     ) -> Result<Option<agent_run_store::maintenance_prepared::PreparedMaintenanceClaim>> {
+        self.claim_maintenance_prepared_mode(epoch, id, false, false)
+            .await
+    }
+
+    /// Retire the current writer's unreleased capability after its launch
+    /// future returned; the writer rechecks the exact owner and capability.
+    pub(crate) async fn retake_maintenance_prepared(
+        &self,
+        epoch: i64,
+        id: &AgentId,
+    ) -> Result<Option<agent_run_store::maintenance_prepared::PreparedMaintenanceClaim>> {
+        self.claim_maintenance_prepared_mode(epoch, id, true, true)
+            .await
+    }
+
+    /// Observe a previously committed current-writer retake after an unknown
+    /// acknowledgement; a fresh allocation alone cannot authorize a retry.
+    pub(crate) async fn recover_maintenance_retake(
+        &self,
+        epoch: i64,
+        id: &AgentId,
+    ) -> Result<Option<agent_run_store::maintenance_prepared::PreparedMaintenanceClaim>> {
+        self.claim_maintenance_prepared_mode(epoch, id, true, false)
+            .await
+    }
+
+    async fn claim_maintenance_prepared_mode(
+        &self,
+        epoch: i64,
+        id: &AgentId,
+        retake_current: bool,
+        after_error: bool,
+    ) -> Result<Option<agent_run_store::maintenance_prepared::PreparedMaintenanceClaim>> {
         let lookup = id.clone();
         let candidate=self.read(move|store| {
             let snapshot=store.conn().unchecked_transaction()?;
@@ -596,23 +629,29 @@ impl Service {
             let (owner,birth,capability):(Option<String>,Option<f64>,Option<String>)=store.conn().query_row("SELECT startup_owner_pid_identity,startup_owner_birth_time,supervisor_capability_sha256 FROM agents WHERE id=?",[lookup.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
             let (Some(owner),Some(birth))=(owner,birth) else {return Ok(None);};
             let identity:Value=serde_json::from_str(&owner).map_err(|_|invalid("prepared startup owner is malformed"))?;
-            if let Some(hash) = &capability {
+            if retake_current || capability.is_some() {
                 let broker = identity.as_object().is_some_and(|object| object.len()==3 && ["pid","token","birth"].iter().all(|key|object.contains_key(*key)));
-                if !broker || hash.len()!=64 || !hash.bytes().all(|byte|byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                if !broker || capability.as_ref().is_some_and(|hash|hash.len()!=64 || !hash.bytes().all(|byte|byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
                     || !agent_run_store::maintenance_target_cancel::preparation_not_started(store.conn(),&lookup,&allocation.target_attempt_id)? {
                     return Ok(None);
                 }
             }
+            let retake_count = if retake_current {
+                let writer_epoch:i64=store.conn().query_row("SELECT epoch FROM writer_authority WHERE id=1",[],|row|row.get(0))?;
+                let count:i64=store.conn().query_row("SELECT COUNT(*) FROM events WHERE agent_id=? AND attempt_id=? AND kind='maintenance_prepared_claimed_v1' AND json_extract(data_json,'$.writer_epoch')=? AND json_extract(data_json,'$.current_writer')=1",rusqlite::params![lookup.as_str(),allocation.target_attempt_id,writer_epoch],|row|row.get(0))?;
+                if !after_error && count==0 {return Ok(None);}
+                Some(count)
+            } else {None};
             let pid=identity["pid"].as_i64().and_then(|pid|i32::try_from(pid).ok()).filter(|pid|*pid>1);
             let token=identity["token"].as_str().filter(|token|!token.is_empty());
             if pid.is_none() || token.is_none() || identity["birth"].as_f64()!=Some(birth) || !birth.is_finite() || birth<0.0 {return Ok(None);}
             snapshot.commit()?;
-            let state=process::observe(pid,token,Some(birth));
-            if !matches!(state,agent_run_platform::process::ProcessState::Dead|agent_run_platform::process::ProcessState::Reused) {return Ok(None);}
+            let state=if retake_current {agent_run_platform::process::ProcessState::Alive} else {process::observe(pid,token,Some(birth))};
+            if !retake_current && !matches!(state,agent_run_platform::process::ProcessState::Dead|agent_run_platform::process::ProcessState::Reused) {return Ok(None);}
             let at=now();
             Ok(Some((row,allocation.account_id,agent_run_store::ops::ClaimMaintenancePrepared {
                 epoch,execution:lookup,target_attempt_id:allocation.target_attempt_id,
-                expected_startup_owner:owner,expected_startup_birth_time:birth,expected_capability_sha256:capability,owner_state:state,at,
+                expected_startup_owner:owner,expected_startup_birth_time:birth,expected_capability_sha256:capability,retake_current_writer:retake_current.then_some(true),expected_current_retake_count:retake_count,owner_state:state,at,
                 startup_deadline_at:at+agent_run_platform::launch::Timeouts::default().ready.as_secs_f64(),
             })))
         }).await?;
@@ -2748,25 +2787,34 @@ impl Service {
             let ids = store.conn().prepare(&format!("SELECT a.id,r.epoch,t.id {joins} WHERE {predicate} ORDER BY a.created_at,a.id LIMIT 100 OFFSET ?"))?
                 .query_map([(now() as i64).rem_euclid(count)], |r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            let writer:Option<(i32,Option<String>,Option<f64>)> = store.conn().query_row(
+                "SELECT holder_pid,holder_token,holder_birth FROM writer_authority WHERE id=1",[],
+                |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+            ).optional()?;
             let mut prepared = Vec::new();
             for (id, epoch, target_attempt_id) in ids {
                 let id: AgentId = id.parse()?;
                 let row = store.get(&id)?;
-                let (startup_owner,startup_birth_time): (Option<String>,Option<f64>) = store.conn().query_row(
-                    "SELECT startup_owner_pid_identity,startup_owner_birth_time FROM agents WHERE id=?", [id.as_str()], |r| Ok((r.get(0)?,r.get(1)?)))?;
+                let (startup_owner,startup_birth_time,capability): (Option<String>,Option<f64>,Option<String>) = store.conn().query_row(
+                    "SELECT startup_owner_pid_identity,startup_owner_birth_time,supervisor_capability_sha256 FROM agents WHERE id=?", [id.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
                 let cancel_command_id: i64 = store.conn().query_row("SELECT id FROM commands WHERE agent_id=? AND kind='cancel' AND state IN ('pending','claimed') ORDER BY id LIMIT 1", [id.as_str()], |r| r.get(0))?;
+                let expected_owner = agent_run_store::ops::ExpectedOwnership {
+                    execution:id.clone(),supervisor_pid:row.supervisor_pid,supervisor_identity:row.supervisor_identity,
+                    supervisor_birth_time:row.supervisor_birth_time,process_group_id:row.process_group_id,startup_owner,startup_birth_time,
+                };
+                let current = agent_run_store::maintenance_target_cancel::startup_broker(&expected_owner).is_some_and(|(pid,token,birth)| {
+                    writer.as_ref().is_some_and(|(wpid,wtoken,wbirth)| *wpid==pid && wtoken.as_deref()==Some(token.as_str()) && *wbirth==Some(birth))
+                });
                 prepared.push(agent_run_store::ops::CancelPreparedMaintenance {
                     epoch, execution: id.clone(), target_attempt_id, cancel_command_id,
-                    expected_owner: agent_run_store::ops::ExpectedOwnership {
-                        execution: id, supervisor_pid: row.supervisor_pid, supervisor_identity: row.supervisor_identity,
-                        supervisor_birth_time: row.supervisor_birth_time, process_group_id: row.process_group_id,
-                        startup_owner, startup_birth_time,
-                    },
-                    supervisor_state: agent_run_platform::process::ProcessState::Unknown, at: now(),
+                    expected_owner,
+                    supervisor_state: if current {agent_run_platform::process::ProcessState::Alive} else {agent_run_platform::process::ProcessState::Unknown},
+                    expected_capability_sha256:if current {capability} else {None},cancel_current_broker:current.then_some(true),at: now(),
                 });
             }
             snapshot.commit()?;
             for op in &mut prepared {
+                if op.cancel_current_broker == Some(true) {continue;}
                 let owner = &op.expected_owner;
                 op.supervisor_state = if owner.supervisor_pid.is_some() {
                     process::observe(owner.supervisor_pid, owner.supervisor_identity.as_deref(), owner.supervisor_birth_time)
@@ -2778,7 +2826,7 @@ impl Service {
                     agent_run_platform::process::ProcessState::Unknown
                 };
             }
-            prepared.retain(|op| matches!(op.supervisor_state, agent_run_platform::process::ProcessState::Dead | agent_run_platform::process::ProcessState::Reused));
+            prepared.retain(|op| op.cancel_current_broker==Some(true) || matches!(op.supervisor_state, agent_run_platform::process::ProcessState::Dead | agent_run_platform::process::ProcessState::Reused));
             Ok(prepared)
         }).await?;
         let mut changed = 0;

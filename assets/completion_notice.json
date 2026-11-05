@@ -48,7 +48,7 @@
     },
     "supervisor_spawn_failed": {
       "reason": "The supervisor could not be started; no native work was launched.",
-      "advice": "Check the worker service and executable. Resume an existing session after cleanup and history verification, or start a fresh task if no session exists."
+      "advice": "Check the worker service, executable and any unverified supervisor cleanup. Resume an existing session after cleanup and history verification, or start a fresh task if no session exists."
     },
     "unowned_starting": {
       "reason": "The accepted start exceeded its startup ownership deadline before supervisor handoff.",

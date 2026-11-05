@@ -630,6 +630,7 @@ async fn a_forged_critical_opcode_cannot_take_the_protected_reserve() {
                         execution: fixture.id.clone(),
                         identity: json!({"pid":me.pid,"birth":me.birth,"token":"revoked"}),
                         system_fence: None,
+                        local_capability_sha256: None,
                     },
                     Duration::from_secs(5),
                 )
@@ -672,6 +673,7 @@ async fn a_forged_critical_opcode_cannot_take_the_protected_reserve() {
                         execution: fixture.id.clone(),
                         identity: serde_json::to_value(&me).unwrap(),
                         system_fence: None,
+                        local_capability_sha256: None,
                     },
                     Duration::from_secs(5),
                 )

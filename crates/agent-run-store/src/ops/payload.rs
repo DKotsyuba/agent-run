@@ -40,12 +40,16 @@ pub struct CancelPreparedMaintenance {
     pub target_attempt_id: String,
     /// Explicit pending/claimed cancel belonging to this execution.
     pub cancel_command_id: i64,
-    /// Complete supervisor or spawned startup-child ownership captured before
-    /// OS inspection; the initial broker's short owner document is ineligible.
+    /// Exact supervisor, startup-child or initial broker ownership.
     pub expected_owner: ExpectedOwnership,
-    /// External PID/token/birth observation of the supervisor or full startup
-    /// child; only Dead/Reused admits. A child's JSON birth is authoritative.
+    /// External owner observation, or Alive for the exact current broker.
     pub supervisor_state: agent_run_platform::process::ProcessState,
+    /// Capability observed when cancelling the current broker's pending launch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_capability_sha256: Option<String>,
+    /// Explicitly cancel a launch owned by the current broker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancel_current_broker: Option<bool>,
     /// Observation time in Unix seconds.
     pub at: f64,
 }
@@ -64,6 +68,12 @@ pub struct ClaimMaintenancePrepared {
     /// Exact old capability hash, or none when launch had not begun.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_capability_sha256: Option<String>,
+    /// Retake an unreleased capability owned by the current writer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retake_current_writer: Option<bool>,
+    /// Number of current-writer retakes observed before this claim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_current_retake_count: Option<i64>,
     /// PID-reuse-aware kernel observation prepared outside SQL.
     pub owner_state: agent_run_platform::process::ProcessState,
     /// Observation time and next startup-only deadline in Unix seconds.
@@ -347,6 +357,9 @@ pub struct RecordStartupOwner {
     /// Additional compare-and-swap fence for an externally launched supervisor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_fence: Option<SystemStartupFence>,
+    /// Exact unreleased capability required by the local launcher.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_capability_sha256: Option<String>,
 }
 
 /// Immutable route, capability and admitting broker identity for one external launch.

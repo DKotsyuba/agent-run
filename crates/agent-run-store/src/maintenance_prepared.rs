@@ -44,23 +44,31 @@ impl PreparedMaintenanceClaim {
 
 impl Store<'_> {
     /// Transfer startup ownership of the SAME prepared target only after the
-    /// broker observes the exact prior owner Dead/Reused outside SQL. A prior
-    /// capability can be cleared only for the original broker identity with
-    /// no discovery or native start. No new attempt or quota key is created.
+    /// broker observes the exact prior owner Dead/Reused outside SQL, or the
+    /// current writer retires its own unreleased capability. No new attempt or
+    /// quota key is created.
     pub fn claim_maintenance_prepared(
         &mut self,
         op: &ClaimMaintenancePrepared,
     ) -> Result<PreparedMaintenanceClaim> {
-        if op.epoch <= 0
+        let retake = op.retake_current_writer == Some(true);
+        if op.retake_current_writer == Some(false)
+            || (retake
+                && (op.owner_state != ProcessState::Alive
+                    || op
+                        .expected_current_retake_count
+                        .is_none_or(|count| count < 0)))
+            || (!retake && op.expected_current_retake_count.is_some())
+            || (!retake && !matches!(op.owner_state, ProcessState::Dead | ProcessState::Reused))
+            || op.epoch <= 0
             || !op.at.is_finite()
             || op.at < 0.0
             || !op.startup_deadline_at.is_finite()
             || op.startup_deadline_at <= op.at
             || !op.expected_startup_birth_time.is_finite()
             || op.expected_startup_birth_time < 0.0
-            || !matches!(op.owner_state, ProcessState::Dead | ProcessState::Reused)
         {
-            return Err(invalid("prepared maintenance owner is not proven gone"));
+            return Err(invalid("prepared maintenance owner evidence is invalid"));
         }
         let expected: Value = serde_json::from_str(&op.expected_startup_owner)
             .map_err(|_| invalid("invalid prepared startup owner"))?;
@@ -76,7 +84,7 @@ impl Store<'_> {
         {
             return Err(invalid("incomplete prepared startup owner"));
         }
-        if let Some(capability) = &op.expected_capability_sha256 {
+        if retake || op.expected_capability_sha256.is_some() {
             let exact_broker = expected.as_object().is_some_and(|object| {
                 object.len() == 3
                     && ["pid", "token", "birth"]
@@ -84,10 +92,15 @@ impl Store<'_> {
                         .all(|key| object.contains_key(*key))
             });
             if !exact_broker
-                || capability.len() != 64
-                || !capability
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                || op
+                    .expected_capability_sha256
+                    .as_ref()
+                    .is_some_and(|capability| {
+                        capability.len() != 64
+                            || !capability
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    })
             {
                 return Err(invalid(
                     "prepared capability owner is not the original broker",
@@ -113,7 +126,7 @@ impl Store<'_> {
             || self
                 .maintenance_continuation(&op.execution, &op.target_attempt_id)?
                 .is_none()
-            || (op.expected_capability_sha256.is_some()
+            || ((retake || op.expected_capability_sha256.is_some())
                 && !crate::maintenance_target_cancel::preparation_not_started(
                     &tx,
                     &op.execution,
@@ -148,13 +161,47 @@ impl Store<'_> {
         {
             return Err(invalid("resident writer ownership is incomplete"));
         }
-        if expected["pid"].as_i64() == Some(i64::from(pid))
+        let same_writer = expected["pid"].as_i64() == Some(i64::from(pid))
             && expected["token"].as_str() == token.as_deref()
-            && expected["birth"].as_f64() == birth
-        {
+            && expected["birth"].as_f64() == birth;
+        if retake != same_writer {
             return Err(invalid(
-                "prepared startup is already owned by the current writer",
+                "prepared startup owner does not match the requested recovery",
             ));
+        }
+        if retake {
+            let prior: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM events WHERE agent_id=? AND attempt_id=? AND kind='maintenance_prepared_claimed_v1' \
+                 AND json_extract(data_json,'$.writer_epoch')=? AND json_extract(data_json,'$.current_writer')=1",
+                params![op.execution.as_str(),op.target_attempt_id,epoch], |row|row.get(0),
+            )?;
+            if Some(prior) != op.expected_current_retake_count {
+                return Err(Error::Conflict);
+            }
+            if prior >= 2 {
+                let retired=tx.execute(
+                    "UPDATE agents SET supervisor_capability_sha256=NULL WHERE id=? AND startup_owner_pid_identity=? \
+                     AND startup_owner_birth_time=? AND supervisor_capability_sha256 IS ? AND supervisor_pid IS NULL",
+                    params![op.execution.as_str(),op.expected_startup_owner,op.expected_startup_birth_time,op.expected_capability_sha256],
+                )?;
+                if retired != 1 {
+                    return Err(Error::Conflict);
+                }
+                let mut outcome =
+                    agent_run_domain::domain::Outcome::failure("supervisor_spawn_failed");
+                outcome.failure_text =
+                    Some("the run supervisor could not be started after maintenance".into());
+                let at =
+                    crate::terminal::commit_terminal(self, &op.execution, &outcome, None, None)?
+                        .unwrap_or(op.at);
+                self.complete_terminal_commands(&op.execution, at)?;
+                tx.commit()?;
+                return Ok(PreparedMaintenanceClaim {
+                    allocation,
+                    dispatch_writer_epoch: epoch,
+                    launch_authorized: false,
+                });
+            }
         }
         let enabled:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_accounts WHERE account_id=? AND status='enabled')",[&allocation.account_id],|r|r.get(0))?;
         if !enabled {
@@ -166,7 +213,11 @@ impl Store<'_> {
         if changed != 1 {
             return Err(Error::Conflict);
         }
-        tx.execute("INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES(?,?,?,'maintenance_prepared_claimed_v1',?)",params![op.execution.as_str(),op.target_attempt_id,op.at,json!({"epoch":op.epoch,"target_attempt_id":op.target_attempt_id,"writer_epoch":epoch,"previous_owner_sha256":agent_run_platform::fs::sha256(op.expected_startup_owner.as_bytes())}).to_string()])?;
+        let mut data = json!({"epoch":op.epoch,"target_attempt_id":op.target_attempt_id,"writer_epoch":epoch,"previous_owner_sha256":agent_run_platform::fs::sha256(op.expected_startup_owner.as_bytes())});
+        if retake {
+            data["current_writer"] = json!(true);
+        }
+        tx.execute("INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES(?,?,?,'maintenance_prepared_claimed_v1',?)",params![op.execution.as_str(),op.target_attempt_id,op.at,data.to_string()])?;
         tx.commit()?;
         Ok(PreparedMaintenanceClaim {
             allocation,

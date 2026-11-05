@@ -48,7 +48,7 @@ fn prepared_maintenance_is_quiescent(tx: &rusqlite::Connection, parent: &Record)
         parent.supervisor_identity.as_deref(),
         parent.supervisor_birth_time,
     ) {
-        (Some(pid), Some(token), Some(birth)) => Some((pid, token.to_owned(), birth)),
+        (Some(pid), Some(token), Some(birth)) => Some((pid, token.to_owned(), birth, None)),
         (None, None, None) => {
             let (startup_owner, startup_birth_time): (Option<String>, Option<f64>) = tx.query_row(
                 "SELECT startup_owner_pid_identity,startup_owner_birth_time FROM agents WHERE id=?",
@@ -65,21 +65,19 @@ fn prepared_maintenance_is_quiescent(tx: &rusqlite::Connection, parent: &Record)
                 startup_birth_time,
             };
             crate::maintenance_target_cancel::startup_child(&expected)
-                .map(|child| (child.pid, child.token, child.birth))
-                .or_else(|| crate::maintenance_target_cancel::startup_broker(&expected))
+                .map(|child| (child.pid, child.token, child.birth, None))
+                .or_else(|| {
+                    crate::maintenance_target_cancel::startup_broker(&expected).map(
+                        |(pid, token, birth)| (pid, token, birth, expected.startup_owner.clone()),
+                    )
+                })
         }
         _ => None,
     };
-    let Some((pid, token, birth)) = owner else {
+    let Some((pid, token, birth, broker_owner)) = owner else {
         return Ok(false);
     };
-    if !matches!(
-        agent_run_platform::process::observe(Some(pid), Some(&token), Some(birth)),
-        agent_run_platform::process::ProcessState::Dead
-            | agent_run_platform::process::ProcessState::Reused
-    ) {
-        return Ok(false);
-    }
+    let state = agent_run_platform::process::observe(Some(pid), Some(&token), Some(birth));
     let target: Option<String> = tx.query_row(
         "SELECT t.id FROM maintenance_resumes r JOIN attempts t ON t.id=r.target_attempt_id AND t.agent_id=r.agent_id \
          WHERE r.agent_id=?1 AND t.state=?2 AND t.phase='cleanup_complete' AND json_extract(t.cleanup_proof_json,'$.never_spawned')=1 \
@@ -90,6 +88,31 @@ fn prepared_maintenance_is_quiescent(tx: &rusqlite::Connection, parent: &Record)
         return Ok(false);
     };
     if !crate::maintenance_target_cancel::preparation_is_settled(tx, &parent.id, &target)? {
+        return Ok(false);
+    }
+    if state == agent_run_platform::process::ProcessState::Alive {
+        let Some(raw_owner) = broker_owner else {
+            return Ok(false);
+        };
+        if parent.status != Status::Cancelled
+            || !crate::maintenance_target_cancel::preparation_not_started(tx, &parent.id, &target)?
+            || !tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM writer_authority w JOIN events e ON e.agent_id=?1 AND e.attempt_id=?2 \
+                 JOIN maintenance_resumes r ON r.agent_id=e.agent_id AND r.target_attempt_id=e.attempt_id \
+                 WHERE w.id=1 AND w.holder_pid=?3 AND w.holder_token=?4 AND w.holder_birth=?5 \
+                 AND e.kind='maintenance_current_broker_cancelled_v1' AND json_extract(e.data_json,'$.epoch')=r.epoch \
+                 AND json_extract(e.data_json,'$.target_attempt_id')=r.target_attempt_id AND json_extract(e.data_json,'$.owner_sha256')=?6)",
+                rusqlite::params![parent.id.as_str(),target,pid,token,birth,agent_run_platform::fs::sha256(raw_owner.as_bytes())],
+                |row|row.get::<_,bool>(0),
+            )?
+        {
+            return Ok(false);
+        }
+    } else if !matches!(
+        state,
+        agent_run_platform::process::ProcessState::Dead
+            | agent_run_platform::process::ProcessState::Reused
+    ) {
         return Ok(false);
     }
     Ok(!tx.query_row(

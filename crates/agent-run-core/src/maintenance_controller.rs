@@ -238,10 +238,16 @@ pub async fn recovery_tick(service: &Service) -> Result<()> {
         let epoch = fence.epoch;
         let owned = tokio::spawn(async move {
             let authorized = if prepared {
-                service
+                let claim = service
                     .claim_maintenance_prepared(epoch, &member.id)
-                    .await?
-                    .is_some_and(|claim| claim.launch_authorized)
+                    .await?;
+                match claim {
+                    Some(claim) => claim.launch_authorized,
+                    None => service
+                        .recover_maintenance_retake(epoch, &member.id)
+                        .await?
+                        .is_some_and(|claim| claim.launch_authorized),
+                }
             } else {
                 let request_id = format!("maintenance-resume:{epoch}:{}", member.id);
                 service
@@ -251,7 +257,12 @@ pub async fn recovery_tick(service: &Service) -> Result<()> {
             };
             if authorized {
                 let lane = service.lane("maintenance-launch")?;
-                if let Err(error) = service.launch_provider_supervisor(&member.id, &lane).await {
+                let mut retried = false;
+                loop {
+                    let error = match service.launch_provider_supervisor(&member.id, &lane).await {
+                        Ok(()) => break,
+                        Err(error) => error,
+                    };
                     let lookup = member.id.clone();
                     let never_spawned = matches!(&error, Error::Io(_))
                         && service
@@ -259,7 +270,22 @@ pub async fn recovery_tick(service: &Service) -> Result<()> {
                                 crate::persist::attempt_never_spawned(&store.conn, &lookup)
                             })
                             .await?;
-                    if !never_spawned {
+                    if !never_spawned && matches!(&error, Error::Runtime(_)) {
+                        match service.retake_maintenance_prepared(epoch, &member.id).await {
+                            Ok(Some(claim)) if claim.launch_authorized => {
+                                if !retried {
+                                    retried = true;
+                                    continue;
+                                }
+                            }
+                            Err(
+                                error @ (Error::BrokerUnavailable
+                                | Error::Persistence { .. }
+                                | Error::WriterFailure(_)),
+                            ) => return Err(error),
+                            _ => return Err(error),
+                        }
+                    } else if !never_spawned {
                         return Err(error);
                     }
                     let mut outcome =
@@ -267,6 +293,7 @@ pub async fn recovery_tick(service: &Service) -> Result<()> {
                     outcome.failure_text =
                         Some("the run supervisor could not be started after maintenance".into());
                     lane.finish_terminal(&member.id, &outcome).await?;
+                    break;
                 }
             }
             Ok::<(), Error>(())

@@ -89,6 +89,46 @@ fn system_startup_owner_requires_the_frozen_route_capability_and_broker() {
     ));
 }
 
+/// A late local launch cannot overwrite the owner after its capability rotates.
+#[test]
+fn local_startup_owner_requires_the_current_capability() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = store
+        .admit(&home.request(), &home.config, &json!({}), None)
+        .unwrap()
+        .0;
+    let old = "a".repeat(64);
+    let current = "b".repeat(64);
+    store.record_supervisor_launch(&id, &old).unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET supervisor_capability_sha256=? WHERE id=?",
+            rusqlite::params![current, id.as_str()],
+        )
+        .unwrap();
+    let child = json!({"pid":123,"token":"linux:fixture","birth":1});
+    assert!(matches!(
+        store.record_local_startup_owner(&id, &child, &old),
+        Err(Error::Conflict)
+    ));
+    store
+        .record_local_startup_owner(&id, &child, &current)
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='failed' WHERE id=?",
+            [id.as_str()],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.record_local_startup_owner(&id, &child, &current),
+        Err(Error::Conflict)
+    ));
+}
+
 /// Mirrors `tests/test_reconciliation.py::UnownedStartingReconciliationTests::test_lost_convergence_releases_active_capacity`
 #[test]
 fn dead_startup_owner_is_reconciled_and_capacity_is_released() {

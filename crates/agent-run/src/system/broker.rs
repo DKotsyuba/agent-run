@@ -154,6 +154,7 @@ impl SystemLauncher for BrokerLauncher {
                     route_fingerprint: route.fingerprint.as_str().to_owned(),
                     broker_identity: serde_json::to_value(broker)?,
                 }),
+                local_capability_sha256: None,
             };
             // A pending commit remains owned even if the launch deadline expires.
             let record = tokio::spawn(async move { lane.local(operation, BROKER_BUDGET).await });

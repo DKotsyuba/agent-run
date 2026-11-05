@@ -119,6 +119,8 @@ impl Fixture {
                 startup_birth_time,
             },
             supervisor_state: state,
+            expected_capability_sha256: None,
+            cancel_current_broker: None,
             at: 3.0,
         };
         let f = Self { home, store, op };
@@ -322,6 +324,70 @@ fn dead_broker_prepared_target_cancels_without_launch() {
                 .is_err()
         );
         f.store.conn.execute("UPDATE attempts SET cleanup_proof_json='{\"never_spawned\":true}' WHERE id='target'",[]).unwrap();
+        assert!(
+            f.store
+                .admit(&f.home.request(), &f.home.config, &json!({}), Some(&parent))
+                .is_ok()
+        );
+    }
+}
+
+/// An explicit cancel can fence an unreleased launch owned by the current
+/// broker; a late local child cannot record ownership or start afterwards.
+#[test]
+fn current_broker_prepared_target_cancels_and_fences_late_launch() {
+    for capability in [None, Some("a".repeat(64))] {
+        let mut f = Fixture::new();
+        let me = process::inspect(std::process::id() as i32).unwrap();
+        let owner = json!({"pid":me.pid,"token":me.token,"birth":me.birth});
+        f.startup_owner(&owner);
+        f.store.conn.execute(
+            "UPDATE agents SET startup_owner_birth_time=?,supervisor_capability_sha256=? WHERE id=?",
+            rusqlite::params![me.birth,capability,f.op.execution.as_str()],
+        ).unwrap();
+        f.op.expected_owner.startup_birth_time = Some(me.birth);
+        f.op.supervisor_state = ProcessState::Alive;
+        f.op.cancel_current_broker = Some(true);
+        f.op.expected_capability_sha256 = capability.clone();
+        f.store.conn.execute(
+            "INSERT INTO writer_authority(id,epoch,holder_pid,holder_birth,holder_token,acquired_at,probe_at) VALUES(1,2,?,?,?,1,1)",
+            rusqlite::params![me.pid,me.birth,me.token],
+        ).unwrap();
+        assert!(f.store.cancel_prepared_maintenance(&f.op).unwrap());
+        assert_eq!(
+            f.store.get(&f.op.execution).unwrap().status,
+            Status::Cancelled
+        );
+        if let Some(old) = capability {
+            let child = json!({"pid":123,"token":"linux:fixture","birth":1});
+            assert!(matches!(
+                f.store
+                    .record_local_startup_owner(&f.op.execution, &child, &old),
+                Err(agent_run_domain::Error::Conflict)
+            ));
+        }
+        assert!(
+            f.store
+                .record_supervisor_launch(&f.op.execution, &"b".repeat(64))
+                .is_err()
+        );
+        f.store.end_maintenance_fence(f.op.epoch, 4.0).unwrap();
+        f.store
+            .conn
+            .execute(
+                "UPDATE attempts SET cleanup_proof_json='{\"confirmed\":true}' WHERE id='source'",
+                [],
+            )
+            .unwrap();
+        let parent = f.store.get(&f.op.execution).unwrap();
+        let marker:String=f.store.conn.query_row("SELECT data_json FROM events WHERE agent_id=? AND kind='maintenance_current_broker_cancelled_v1'",[f.op.execution.as_str()],|row|row.get(0)).unwrap();
+        f.store.conn.execute("DELETE FROM events WHERE agent_id=? AND kind='maintenance_current_broker_cancelled_v1'",[f.op.execution.as_str()]).unwrap();
+        assert!(
+            f.store
+                .admit(&f.home.request(), &f.home.config, &json!({}), Some(&parent))
+                .is_err()
+        );
+        f.store.conn.execute("INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES(?,'target',4,'maintenance_current_broker_cancelled_v1',?)",rusqlite::params![f.op.execution.as_str(),marker]).unwrap();
         assert!(
             f.store
                 .admit(&f.home.request(), &f.home.config, &json!({}), Some(&parent))

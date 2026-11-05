@@ -138,7 +138,14 @@ prepared attempt may be reclaimed after the old ownership is verified. A
 supervisor or identified startup child proven dead before native start is
 reported lost; manual resume after loss or cancellation requires settled
 preparation, process cleanup and history verification.
+If the current broker can prove a failed launch never released its capability,
+it retries the same prepared attempt once; a repeated failure is reported.
 An unresolved launch outcome stays fenced until its ownership is established.
+If the provider configuration cannot be loaded, or the original account or
+route is no longer permitted, recovery stays fenced and new admissions remain
+blocked. Restore the configuration or explicitly cancel the affected task.
+If recovery remains held after restoration, cancel the task and resume it
+after cleanup and native-history verification.
 `agent-run maintenance status` reports the current phase.
 
 For manual service-manager integration, `agent-run maintenance prepare`

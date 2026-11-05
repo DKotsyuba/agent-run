@@ -80,6 +80,8 @@ impl Fixture {
             expected_startup_owner: old,
             expected_startup_birth_time: old_birth,
             expected_capability_sha256: None,
+            retake_current_writer: None,
+            expected_current_retake_count: None,
             owner_state: state,
             at: 6.0,
             startup_deadline_at: 36.0,
@@ -209,6 +211,104 @@ fn unreleased_broker_capability_has_one_concurrent_claim() {
     assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
 }
 
+/// The current writer can retire an unreleased capability once per attempt;
+/// a late local owner write with the old capability is rejected.
+#[test]
+fn current_writer_retake_fences_late_local_owner_and_is_bounded() {
+    let mut f = Fixture::new();
+    f.with_unreleased_capability();
+    let me = process::inspect(std::process::id() as i32).unwrap();
+    let owner = json!({"pid":me.pid,"token":me.token,"birth":me.birth}).to_string();
+    f.store
+        .conn
+        .execute(
+            "UPDATE agents SET startup_owner_pid_identity=?,startup_owner_birth_time=? WHERE id=?",
+            rusqlite::params![owner, me.birth, f.run.as_str()],
+        )
+        .unwrap();
+    f.op.expected_startup_owner = owner;
+    f.op.expected_startup_birth_time = me.birth;
+    f.op.owner_state = ProcessState::Alive;
+    f.op.retake_current_writer = Some(true);
+    f.op.expected_current_retake_count = Some(0);
+    let old = f.op.expected_capability_sha256.clone().unwrap();
+    assert!(
+        f.store
+            .claim_maintenance_prepared(&f.op)
+            .unwrap()
+            .launch_authorized
+    );
+    let child = json!({"pid":123,"token":"linux:fixture","birth":1});
+    assert!(matches!(
+        f.store.record_local_startup_owner(&f.run, &child, &old),
+        Err(agent_run_domain::Error::Conflict)
+    ));
+    f.op.expected_capability_sha256 = None;
+    assert!(f.store.claim_maintenance_prepared(&f.op).is_err());
+    let second = "b".repeat(64);
+    f.store.record_supervisor_launch(&f.run, &second).unwrap();
+    f.op.expected_capability_sha256 = Some(second);
+    f.op.expected_current_retake_count = Some(1);
+    assert!(
+        f.store
+            .claim_maintenance_prepared(&f.op)
+            .unwrap()
+            .launch_authorized
+    );
+    let third = "c".repeat(64);
+    f.store.record_supervisor_launch(&f.run, &third).unwrap();
+    f.op.expected_capability_sha256 = Some(third.clone());
+    f.op.expected_current_retake_count = Some(2);
+    assert!(
+        !f.store
+            .claim_maintenance_prepared(&f.op)
+            .unwrap()
+            .launch_authorized
+    );
+    assert_eq!(
+        f.store.get(&f.run).unwrap().status,
+        agent_run_domain::domain::Status::Failed
+    );
+    assert!(matches!(
+        f.store.record_local_startup_owner(&f.run, &child, &third),
+        Err(agent_run_domain::Error::Conflict)
+    ));
+}
+
+/// An empty-capability recovery uses the durable retake count as its CAS.
+#[test]
+fn current_writer_empty_capability_has_one_concurrent_retake() {
+    let mut f = Fixture::new();
+    f.with_unreleased_capability();
+    let me = process::inspect(std::process::id() as i32).unwrap();
+    let owner = json!({"pid":me.pid,"token":me.token,"birth":me.birth}).to_string();
+    f.store.conn.execute("UPDATE agents SET startup_owner_pid_identity=?,startup_owner_birth_time=?,supervisor_capability_sha256=NULL WHERE id=?",rusqlite::params![owner,me.birth,f.run.as_str()]).unwrap();
+    f.op.expected_startup_owner = owner;
+    f.op.expected_startup_birth_time = me.birth;
+    f.op.expected_capability_sha256 = None;
+    f.op.retake_current_writer = Some(true);
+    f.op.expected_current_retake_count = Some(0);
+    f.op.owner_state = ProcessState::Alive;
+    let barrier = Arc::new(Barrier::new(2));
+    let jobs = (0..2)
+        .map(|_| {
+            let path = f.home.path.clone();
+            let op = f.op.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                let mut store = agent_run_store::fixture::open(&path).unwrap();
+                barrier.wait();
+                store.claim_maintenance_prepared(&op)
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = jobs
+        .into_iter()
+        .map(|job| job.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+}
+
 /// Changed capabilities, child owners, discovery and cancellation stay held.
 #[test]
 fn unreleased_broker_capability_requires_exact_unstarted_evidence() {
@@ -315,6 +415,9 @@ fn prepared_maintenance_writer_replay_disarms_and_rollback_preserves_owner() {
             .get("expected_capability_sha256")
             .is_none()
     );
+    let legacy = serde_json::to_value(&f.op).unwrap();
+    assert!(legacy.get("retake_current_writer").is_none());
+    assert!(legacy.get("expected_current_retake_count").is_none());
     f.store.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
     f.store.claim_maintenance_prepared(&f.op).unwrap();
     f.store.conn.execute_batch("ROLLBACK").unwrap();

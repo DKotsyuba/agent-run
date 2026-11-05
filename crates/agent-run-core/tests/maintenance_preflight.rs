@@ -404,6 +404,8 @@ struct RecordingWorker {
     inner: AccountWorker,
     launches: std::sync::atomic::AtomicUsize,
     failure: Option<bool>,
+    child_owner: bool,
+    succeed_after_first: bool,
 }
 
 impl agent_run_core::system_launch::SystemLauncher for RecordingWorker {
@@ -443,19 +445,49 @@ impl agent_run_core::system_launch::SystemLauncher for RecordingWorker {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = agent_run_domain::Result<()>> + Send + 'static>,
     > {
-        self.launches
+        let previous = self
+            .launches
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let failure = self.failure;
+        let recovered = self.succeed_after_first && previous > 0;
+        let failure = if recovered { None } else { self.failure };
+        let child_owner = self.child_owner;
         Box::pin(async move {
+            if recovered {
+                lane.local(
+                    agent_run_store::ops::RecordSupervisorLaunch {
+                        execution: id.clone(),
+                        capability_sha256: "b".repeat(64),
+                    },
+                    std::time::Duration::from_secs(5),
+                )
+                .await?;
+                lane.local(agent_run_store::ops::RecordStartupOwner {
+                    execution:id,
+                    identity:json!({"pid":124,"ppid":1,"group":124,"birth":1,"token":"linux:fixture","zombie":false}),
+                    system_fence:None,local_capability_sha256:Some("b".repeat(64)),
+                },std::time::Duration::from_secs(5)).await?;
+                return Ok(());
+            }
             if let Some(ambiguous) = failure {
                 lane.local(
                     agent_run_store::ops::RecordSupervisorLaunch {
-                        execution: id,
+                        execution: id.clone(),
                         capability_sha256: "a".repeat(64),
                     },
                     std::time::Duration::from_secs(5),
                 )
                 .await?;
+                if child_owner {
+                    lane.local(
+                        agent_run_store::ops::RecordStartupOwner {
+                            execution:id,
+                            identity:json!({"pid":123,"ppid":1,"group":123,"birth":1,"token":"linux:fixture","zombie":false}),
+                            system_fence:None,
+                            local_capability_sha256:Some("a".repeat(64)),
+                        },
+                        std::time::Duration::from_secs(5),
+                    ).await?;
+                }
                 return if ambiguous {
                     Err(agent_run_domain::Error::Runtime("unknown launch".into()))
                 } else {
@@ -484,6 +516,8 @@ async fn maintenance_controller_dispatches_once_and_waits_for_confirmation() {
         },
         launches: std::sync::atomic::AtomicUsize::new(0),
         failure: None,
+        child_owner: false,
+        succeed_after_first: false,
     });
     let service = Service::new(f.home.path().into())
         .with_writer(harness.broker())
@@ -541,13 +575,13 @@ async fn maintenance_controller_dispatches_once_and_waits_for_confirmation() {
     );
 }
 
-/// A definite pre-spawn refusal reports failure and reopens admission; an
-/// ambiguous launch remains fenced and is never sent a second time.
+/// A committed retake whose acknowledgement is lost is observed on the next
+/// tick; after the retry limit, the same proof ends the run without a launch.
 #[tokio::test]
-async fn maintenance_launch_failure_distinguishes_refusal_from_unknown() {
+async fn maintenance_recovers_lost_retake_receipts_without_duplicate_launch() {
     use agent_run_core::{maintenance_controller, service::Service};
     use std::sync::{Arc, atomic::Ordering};
-    for ambiguous in [false, true] {
+    for count in [1_i64, 2] {
         let f = Fixture::with_mode(false, true);
         let harness = common::writer::Harness::start(f.home.path());
         let worker = Arc::new(RecordingWorker {
@@ -556,7 +590,175 @@ async fn maintenance_launch_failure_distinguishes_refusal_from_unknown() {
                 calls: std::sync::atomic::AtomicUsize::new(0),
             },
             launches: std::sync::atomic::AtomicUsize::new(0),
-            failure: Some(ambiguous),
+            failure: None,
+            child_owner: false,
+            succeed_after_first: false,
+        });
+        let service = Service::new(f.home.path().into())
+            .with_writer(harness.broker())
+            .with_system_launcher(worker.clone());
+        let allocation = service
+            .claim_maintenance_resume(
+                f.request.epoch,
+                &f.request.execution,
+                "lost-retake-fixture".into(),
+            )
+            .await
+            .unwrap();
+        let lane = harness.broker().lane("lost-retake-fixture");
+        for prior in 0..count {
+            let cap = format!("{:064x}", prior + 1);
+            lane.local(
+                agent_run_store::ops::RecordSupervisorLaunch {
+                    execution: f.request.execution.clone(),
+                    capability_sha256: cap.clone(),
+                },
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            let (owner,birth):(String,f64)=f.store.conn.query_row("SELECT startup_owner_pid_identity,startup_owner_birth_time FROM agents WHERE id=?",[f.request.execution.as_str()],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+            let at = agent_run_core::domain::now();
+            let _lost_receipt = lane
+                .local(
+                    agent_run_store::ops::ClaimMaintenancePrepared {
+                        epoch: f.request.epoch,
+                        execution: f.request.execution.clone(),
+                        target_attempt_id: allocation.target_attempt_id.clone(),
+                        expected_startup_owner: owner,
+                        expected_startup_birth_time: birth,
+                        expected_capability_sha256: Some(cap),
+                        retake_current_writer: Some(true),
+                        expected_current_retake_count: Some(prior),
+                        owner_state: agent_run_platform::process::ProcessState::Alive,
+                        at,
+                        startup_deadline_at: at + 30.0,
+                    },
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+        }
+        maintenance_controller::recovery_tick(&service)
+            .await
+            .unwrap();
+        let row = f.store.get(&f.request.execution).unwrap();
+        if count == 1 {
+            assert_eq!(worker.launches.load(Ordering::SeqCst), 1);
+            assert_eq!(row.status, agent_run_domain::domain::Status::Starting);
+            assert!(f.store.active_maintenance_fence().unwrap().is_some());
+        } else {
+            assert_eq!(worker.launches.load(Ordering::SeqCst), 0);
+            assert_eq!(row.status, agent_run_domain::domain::Status::Failed);
+            assert!(f.store.active_maintenance_fence().unwrap().is_none());
+        }
+    }
+}
+
+/// Invalid configuration must not terminate a prepared continuation; after
+/// the configuration is restored, the same target can be launched once.
+#[tokio::test]
+async fn maintenance_holds_unstarted_target_until_config_is_valid() {
+    use agent_run_core::{maintenance_controller, service::Service};
+    use std::sync::{Arc, atomic::Ordering};
+    let f = Fixture::with_mode(false, true);
+    let harness = common::writer::Harness::start(f.home.path());
+    let worker = Arc::new(RecordingWorker {
+        inner: AccountWorker {
+            route: f.route.clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        },
+        launches: std::sync::atomic::AtomicUsize::new(0),
+        failure: None,
+        child_owner: false,
+        succeed_after_first: false,
+    });
+    let service = Service::new(f.home.path().into())
+        .with_writer(harness.broker())
+        .with_system_launcher(worker.clone());
+    let allocation = service
+        .claim_maintenance_resume(
+            f.request.epoch,
+            &f.request.execution,
+            "config-fixture".into(),
+        )
+        .await
+        .unwrap();
+    let lane = harness.broker().lane("config-fixture");
+    lane.local(
+        agent_run_store::ops::RecordSupervisorLaunch {
+            execution: f.request.execution.clone(),
+            capability_sha256: "a".repeat(64),
+        },
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let (owner, birth): (String, f64) = f
+        .store
+        .conn
+        .query_row(
+            "SELECT startup_owner_pid_identity,startup_owner_birth_time FROM agents WHERE id=?",
+            [f.request.execution.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let at = agent_run_core::domain::now();
+    lane.local(
+        agent_run_store::ops::ClaimMaintenancePrepared {
+            epoch: f.request.epoch,
+            execution: f.request.execution.clone(),
+            target_attempt_id: allocation.target_attempt_id,
+            expected_startup_owner: owner,
+            expected_startup_birth_time: birth,
+            expected_capability_sha256: Some("a".repeat(64)),
+            retake_current_writer: Some(true),
+            expected_current_retake_count: Some(0),
+            owner_state: agent_run_platform::process::ProcessState::Alive,
+            at,
+            startup_deadline_at: at + 30.0,
+        },
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let path = f.home.path().join("config.toml");
+    let original = std::fs::read(&path).unwrap();
+    std::fs::write(&path, "invalid = [").unwrap();
+    maintenance_controller::recovery_tick(&service)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store.get(&f.request.execution).unwrap().status,
+        agent_run_domain::domain::Status::Starting
+    );
+    assert!(f.store.active_maintenance_fence().unwrap().is_some());
+    assert_eq!(worker.launches.load(Ordering::SeqCst), 0);
+    std::fs::write(path, original).unwrap();
+    maintenance_controller::recovery_tick(&service)
+        .await
+        .unwrap();
+    assert_eq!(worker.launches.load(Ordering::SeqCst), 1);
+}
+
+/// A definite refusal or twice-unreleased launch reports failure; a launch
+/// whose child already owns the handoff remains fenced and is not repeated.
+#[tokio::test]
+async fn maintenance_launch_failure_distinguishes_refusal_from_unknown() {
+    use agent_run_core::{maintenance_controller, service::Service};
+    use std::sync::{Arc, atomic::Ordering};
+    for case in ["refused", "unreleased", "recovered", "child"] {
+        let f = Fixture::with_mode(false, true);
+        let harness = common::writer::Harness::start(f.home.path());
+        let worker = Arc::new(RecordingWorker {
+            inner: AccountWorker {
+                route: f.route.clone(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            },
+            launches: std::sync::atomic::AtomicUsize::new(0),
+            failure: Some(case != "refused"),
+            child_owner: case == "child",
+            succeed_after_first: case == "recovered",
         });
         let service = Service::new(f.home.path().into())
             .with_writer(harness.broker())
@@ -567,9 +769,16 @@ async fn maintenance_launch_failure_distinguishes_refusal_from_unknown() {
         maintenance_controller::recovery_tick(&service)
             .await
             .unwrap();
-        assert_eq!(worker.launches.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            worker.launches.load(Ordering::SeqCst),
+            if matches!(case, "unreleased" | "recovered") {
+                2
+            } else {
+                1
+            }
+        );
         let row = f.store.get(&f.request.execution).unwrap();
-        if ambiguous {
+        if matches!(case, "child" | "recovered") {
             assert_eq!(row.status, agent_run_domain::domain::Status::Starting);
             assert!(f.store.active_maintenance_fence().unwrap().is_some());
         } else {
@@ -726,10 +935,10 @@ async fn maintenance_reclaims_unreleased_dead_broker_capability() {
     );
 }
 
-/// A failed child inspection preserves the broker owner for recovery rather
-/// than recording an unusable partial process identity.
+/// An unverified child inspection is retried once, then reported without
+/// leaving admission fenced or recording a partial process identity.
 #[tokio::test]
-async fn maintenance_failed_child_inspection_preserves_reclaimable_owner() {
+async fn maintenance_failed_child_inspection_has_bounded_recovery() {
     use agent_run_core::{maintenance_controller, service::Service};
     let f = Fixture::with_mode(false, false);
     let harness = common::writer::Harness::start(f.home.path());
@@ -743,11 +952,6 @@ async fn maintenance_failed_child_inspection_preserves_reclaimable_owner() {
     maintenance_controller::recovery_tick(&service)
         .await
         .unwrap();
-    let allocation = f
-        .store
-        .maintenance_resume(f.request.epoch, &f.request.execution)
-        .unwrap()
-        .unwrap();
     let (owner, capability): (String, Option<String>) = f
         .store
         .conn
@@ -759,34 +963,20 @@ async fn maintenance_failed_child_inspection_preserves_reclaimable_owner() {
         .unwrap();
     let owner: serde_json::Value = serde_json::from_str(&owner).unwrap();
     assert_eq!(owner.as_object().unwrap().len(), 3);
-    assert!(capability.is_some());
-    assert!(f.store.active_maintenance_fence().unwrap().is_some());
-    std::fs::remove_file(f.home.path().join("fixture-supervisor-inspect-error")).unwrap();
-    std::fs::remove_file(f.home.path().join("fixture-supervisor-inspect-unverified")).unwrap();
-    let me = agent_run_platform::process::inspect(std::process::id() as i32).unwrap();
-    let old_birth = me.birth - 1.0;
-    let old_owner = json!({"pid":me.pid,"token":format!("{}-old",me.token),"birth":old_birth});
-    f.store
-        .conn
-        .execute(
-            "UPDATE agents SET startup_owner_pid_identity=?,startup_owner_birth_time=? WHERE id=?",
-            rusqlite::params![
-                old_owner.to_string(),
-                old_birth,
-                f.request.execution.as_str()
-            ],
-        )
-        .unwrap();
-    let recovered = service
-        .claim_maintenance_prepared(f.request.epoch, &f.request.execution)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(recovered.launch_authorized);
-    assert_eq!(
-        recovered.allocation.target_attempt_id,
-        allocation.target_attempt_id
-    );
+    assert!(capability.is_none());
+    let row = f.store.get(&f.request.execution).unwrap();
+    assert_eq!(row.status, agent_run_domain::domain::Status::Failed);
+    assert!(f.store.active_maintenance_fence().unwrap().is_none());
+    let claims:i64=f.store.conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='maintenance_prepared_claimed_v1' AND json_extract(data_json,'$.current_writer')=1",
+        [f.request.execution.as_str()], |row|row.get(0),
+    ).unwrap();
+    assert_eq!(claims, 2);
+    let quarantined:i64=f.store.conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='supervisor_unreleased_cleanup_unverified' AND json_extract(data_json,'$.pid')>1",
+        [f.request.execution.as_str()], |row|row.get(0),
+    ).unwrap();
+    assert_eq!(quarantined, 2);
 }
 
 /// If the unauthenticated child and its group are gone, an inspection failure
@@ -839,6 +1029,59 @@ async fn maintenance_broker_cancels_dead_broker_prepared_target() {
     harness
         .broker()
         .lane("cancel-broker-fixture")
+        .remote(
+            agent_run_store::ops::EnqueueCommand {
+                execution: f.request.execution.clone(),
+                kind: "cancel".into(),
+                payload: json!({}),
+            },
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    service.reconcile().await.unwrap();
+    assert_eq!(
+        f.store.get(&f.request.execution).unwrap().status,
+        agent_run_domain::domain::Status::Cancelled
+    );
+    maintenance_controller::recovery_tick(&service)
+        .await
+        .unwrap();
+    assert!(f.store.active_maintenance_fence().unwrap().is_none());
+}
+
+/// A user cancel can fence the current broker's unreleased launch before a
+/// late child records ownership or receives its capability.
+#[tokio::test]
+async fn maintenance_broker_cancels_current_unreleased_target() {
+    use agent_run_core::{maintenance_controller, service::Service};
+    let f = Fixture::with_mode(false, true);
+    let harness = common::writer::Harness::start(f.home.path());
+    let worker = std::sync::Arc::new(AccountWorker {
+        route: f.route.clone(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let service = Service::new(f.home.path().into())
+        .with_writer(harness.broker())
+        .with_system_launcher(worker);
+    service
+        .claim_maintenance_resume(
+            f.request.epoch,
+            &f.request.execution,
+            "cancel-current-fixture".into(),
+        )
+        .await
+        .unwrap();
+    f.store
+        .conn
+        .execute(
+            "UPDATE agents SET supervisor_capability_sha256=? WHERE id=?",
+            rusqlite::params!["a".repeat(64), f.request.execution.as_str()],
+        )
+        .unwrap();
+    harness
+        .broker()
+        .lane("cancel-current-fixture")
         .remote(
             agent_run_store::ops::EnqueueCommand {
                 execution: f.request.execution.clone(),

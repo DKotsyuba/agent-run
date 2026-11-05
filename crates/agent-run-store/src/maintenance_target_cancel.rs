@@ -152,6 +152,7 @@ impl Store<'_> {
     pub fn cancel_prepared_maintenance(&mut self, op: &CancelPreparedMaintenance) -> Result<bool> {
         let owner = &op.expected_owner;
         let broker_owner = startup_broker(owner);
+        let current_broker = op.cancel_current_broker == Some(true);
         let bound_supervisor = owner.supervisor_pid.is_some_and(|pid| pid > 1)
             && owner.supervisor_identity.as_deref().is_some_and(|token| {
                 !token.is_empty()
@@ -162,15 +163,19 @@ impl Store<'_> {
             && owner
                 .supervisor_birth_time
                 .is_some_and(|birth| birth.is_finite() && birth >= 0.0);
-        if op.epoch <= 0
+        if op.cancel_current_broker == Some(false)
+            || (current_broker
+                && (broker_owner.is_none() || op.supervisor_state != ProcessState::Alive))
+            || (!current_broker
+                && !matches!(
+                    op.supervisor_state,
+                    ProcessState::Dead | ProcessState::Reused
+                ))
+            || op.epoch <= 0
             || op.cancel_command_id <= 0
             || !op.at.is_finite()
             || op.at < 0.0
             || owner.execution != op.execution
-            || !matches!(
-                op.supervisor_state,
-                ProcessState::Dead | ProcessState::Reused
-            )
             || !(bound_supervisor || startup_child(owner).is_some() || broker_owner.is_some())
             || owner.process_group_id.is_some()
         {
@@ -197,11 +202,23 @@ impl Store<'_> {
             {
                 return Err(invalid("resident writer ownership is incomplete"));
             }
-            if current.0 == *pid
+            let same_writer = current.0 == *pid
                 && current.1.as_deref() == Some(token.as_str())
-                && current.2 == Some(*birth)
-            {
-                return Err(invalid("prepared startup is owned by the current writer"));
+                && current.2 == Some(*birth);
+            if current_broker != same_writer {
+                return Err(invalid(
+                    "prepared startup owner does not match cancellation evidence",
+                ));
+            }
+            if current_broker {
+                let capability: Option<String> = tx.query_row(
+                    "SELECT supervisor_capability_sha256 FROM agents WHERE id=?",
+                    [op.execution.as_str()],
+                    |row| row.get(0),
+                )?;
+                if capability != op.expected_capability_sha256 {
+                    return Err(Error::Conflict);
+                }
             }
         }
         let row = self.get(&op.execution)?;
@@ -275,6 +292,17 @@ impl Store<'_> {
         let committed =
             crate::terminal::commit_terminal(self, &op.execution, &outcome, None, None)?;
         let at = committed.unwrap_or(op.at);
+        if current_broker && committed.is_some() {
+            let raw_owner = owner
+                .startup_owner
+                .as_deref()
+                .ok_or_else(|| invalid("current broker owner is missing"))?;
+            let owner_hash = agent_run_platform::fs::sha256(raw_owner.as_bytes());
+            tx.execute(
+                "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES(?,?,?,'maintenance_current_broker_cancelled_v1',?)",
+                params![op.execution.as_str(),op.target_attempt_id,at,json!({"epoch":op.epoch,"target_attempt_id":op.target_attempt_id,"owner_sha256":owner_hash}).to_string()],
+            )?;
+        }
         tx.execute("UPDATE commands SET state='completed',completed_at=?,result_json='{\"accepted\":true,\"reason\":\"maintenance_cancelled\"}' WHERE id=? AND agent_id=? AND kind='cancel' AND state='claimed'", params![at, op.cancel_command_id, op.execution.as_str()])?;
         self.complete_terminal_commands(&op.execution, at)?;
         tx.commit()?;

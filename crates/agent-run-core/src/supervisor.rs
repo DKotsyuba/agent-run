@@ -131,10 +131,11 @@ impl Drop for LaunchGuard {
 async fn launch_owned(program: &Path, home: &Path, id: &AgentId, lane: &BrokerLane) -> Result<()> {
     let program = program.to_path_buf();
     let secret = new_capability();
+    let capability_sha256 = fs::sha256(secret.as_bytes());
     lane.local(
         ops::RecordSupervisorLaunch {
             execution: id.clone(),
-            capability_sha256: fs::sha256(secret.as_bytes()),
+            capability_sha256: capability_sha256.clone(),
         },
         BROKER_BUDGET,
     )
@@ -182,7 +183,17 @@ async fn launch_owned(program: &Path, home: &Path, id: &AgentId, lane: &BrokerLa
         let unverified = home.join("fixture-supervisor-inspect-unverified").exists();
         #[cfg(not(feature = "test-fixtures"))]
         let unverified = false;
-        return Err(abandon_unreleased(guard.take(), timeouts, unverified).await);
+        let error = abandon_unreleased(guard.take(), timeouts, unverified).await;
+        if matches!(&error, Error::Runtime(_)) {
+            let _ = lane
+                .event(
+                    id,
+                    "supervisor_unreleased_cleanup_unverified",
+                    json!({"pid":pid}),
+                )
+                .await;
+        }
+        return Err(error);
     };
     // Durable before any proof or capability, so reconciliation can observe this child.
     evidence["spawn_backend"] = json!(backend);
@@ -192,6 +203,7 @@ async fn launch_owned(program: &Path, home: &Path, id: &AgentId, lane: &BrokerLa
                 execution: id.clone(),
                 identity: evidence,
                 system_fence: None,
+                local_capability_sha256: Some(capability_sha256),
             },
             BROKER_BUDGET,
         )

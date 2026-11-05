@@ -84,6 +84,30 @@ impl Store<'_> {
         tx.commit()
     }
 
+    /// Bind a local startup child only while its exact capability still owns
+    /// the starting execution; a retired launch cannot replace a new owner.
+    pub fn record_local_startup_owner(
+        &mut self,
+        id: &AgentId,
+        identity: &serde_json::Value,
+        capability_sha256: &str,
+    ) -> Result<()> {
+        if !identity.is_object() || identity["pid"].as_i64().is_none() {
+            return Err(invalid("startup owner evidence must name a pid"));
+        }
+        hex64("capability hash", capability_sha256)?;
+        let tx = WriteTx::begin(&self.conn)?;
+        let changed = tx.execute(
+            "UPDATE agents SET startup_owner_pid_identity=? WHERE id=? AND status IN ('starting','cancelling') \
+             AND supervisor_pid IS NULL AND supervisor_capability_sha256=?",
+            params![identity.to_string(), id.as_str(), capability_sha256],
+        )?;
+        if changed != 1 {
+            return Err(Error::Conflict);
+        }
+        tx.commit()
+    }
+
     /// Replaces the admitting broker with one system supervisor only while the
     /// original broker, capability and frozen route still match atomically.
     pub fn record_system_startup_owner(

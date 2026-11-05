@@ -552,8 +552,13 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
             out(store.record_supervisor_launch(&op.execution, &op.capability_sha256)?)
         }
         L::RecordStartupOwner(op) => {
+            if op.system_fence.is_some() && op.local_capability_sha256.is_some() {
+                return Err(invalid("startup owner has conflicting fences"));
+            }
             if let Some(fence) = &op.system_fence {
                 out(store.record_system_startup_owner(&op.execution, &op.identity, fence)?)
+            } else if let Some(capability) = &op.local_capability_sha256 {
+                out(store.record_local_startup_owner(&op.execution, &op.identity, capability)?)
             } else {
                 out(store.record_startup_owner(&op.execution, &op.identity)?)
             }
