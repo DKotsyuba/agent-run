@@ -30,7 +30,10 @@ fn owner_environment() -> (
     let base = std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    let home = tempfile::tempdir_in(base.canonicalize().unwrap()).unwrap();
+    let home = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in(base.canonicalize().unwrap())
+        .unwrap();
     let channel = home.path().join("channel.sock");
     let listener = UnixListener::bind(&channel).unwrap();
     std::fs::set_permissions(&channel, std::fs::Permissions::from_mode(0o600)).unwrap();
