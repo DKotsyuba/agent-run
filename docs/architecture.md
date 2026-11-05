@@ -137,11 +137,12 @@ require existing canonical directories.
 
 SQLite is the source of truth for agents, events, messages, answers, native
 session lineage, deliveries, cleanup evidence, capacity, and statistics. The
-current schema is version 30. Numbered migrations live in `sql/migrations/`
-and apply transactionally after a pre-version backup. The step to 17 is paired
-with the schema-2 config: ordinary commands and the broker refuse an older
-database with `migration_required` until `agent-run config migrate` runs. A
-binary refuses a database newer than its supported schema.
+current schema is version 34. Numbered migrations live in `sql/migrations/`
+and apply transactionally after a pre-version backup. Ordinary commands and
+the broker refuse an older database with `migration_required` until the paired
+`agent-run config migrate` runs. The step to 17 also introduces the schema-2
+config and account registry. A binary refuses a database newer than its
+supported schema.
 
 The resident broker owns the sole cooperative writer lease. `sqlite-access`
 runs finite SQL callbacks on tokio-rusqlite's thread; accepted job/byte credits
