@@ -871,6 +871,12 @@ pub fn provider_order_filtered_at(
                 hard_ineligible,
             );
             usable.retain(|account, _| snapshot.cooldown(&definition.id, account, at).is_none());
+            // Ordered binding multipliers choose fallback order, not quota weight.
+            if definition.ordered_accounts {
+                for multiplier in usable.values_mut() {
+                    *multiplier = 1.0;
+                }
+            }
             let ordering = score_lane(&snapshot.facts, &usable, model_lane(offering), at)?;
             let mut best_priority: Option<f64> = None;
             let mut status_rank: u8 = 4;

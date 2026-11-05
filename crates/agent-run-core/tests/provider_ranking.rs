@@ -402,6 +402,52 @@ fn ordered_accounts_use_configured_order_across_quota_states() {
     ));
 }
 
+/// Ordered binding weights select fallback order, not the provider's quota score.
+#[test]
+fn ordered_provider_score_does_not_scale_subscription_quota() {
+    let home = home(&[
+        ("acct-a", "FAKE_A"),
+        ("acct-b", "FAKE_B"),
+        ("acct-c", "FAKE_C"),
+    ]);
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
+    let mut provider = catalog(&store)
+        .provider(&"glm-user".parse().unwrap())
+        .unwrap()
+        .clone();
+    provider.ordered_accounts = true;
+    provider.bindings = serde_json::from_value(json!([
+        {"label":"api", "account":"acct-a", "priority_multiplier":1.0},
+        {"label":"subscription", "account":"acct-b", "priority_multiplier":0.5}
+    ]))
+    .unwrap();
+    sample(&store, "acct-b", "fixture", 55.0);
+    let ordered =
+        ProviderCatalog::new(store.list_accounts().unwrap(), vec![provider.clone()]).unwrap();
+    let score = provider_order_at(&store, &ordered, &none_ineligible(), AT)
+        .unwrap()
+        .providers[0]
+        .models[0]
+        .best_priority
+        .unwrap();
+    provider.bindings[1].multiplier = 1.0.try_into().unwrap();
+    let equal_weights =
+        ProviderCatalog::new(store.list_accounts().unwrap(), vec![provider]).unwrap();
+    let unweighted = provider_order_at(&store, &equal_weights, &none_ineligible(), AT)
+        .unwrap()
+        .providers[0]
+        .models[0]
+        .best_priority
+        .unwrap();
+    assert_eq!(score, unweighted);
+    assert_eq!(
+        candidates(&store, &ordered, "fixture").candidates[0]
+            .account
+            .as_str(),
+        "acct-a"
+    );
+}
+
 /// Governing-window scores multiply by binding weights, the provider
 /// multiplier scales the order view, and unknown capacity never outranks
 /// known capacity regardless of weight.
