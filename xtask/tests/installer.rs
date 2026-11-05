@@ -548,6 +548,18 @@ esac
             String::from_utf8_lossy(&success.stderr)
         );
         assert!(fixture.bin.join("agent-run-tui").is_file());
+        let manifest_path = remote.join("release-manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["artifacts"][0]["name"] = "wrong-bundle.tar.gz".into();
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let malformed = run().output().unwrap();
+        assert!(!malformed.status.success());
+        assert!(
+            String::from_utf8_lossy(&malformed.stderr)
+                .contains("release manifest identity/layout mismatch")
+        );
+        checksums(&remote, "agent-run-1.0.0-aarch64-apple-darwin.tar.gz");
         let missing_linux = run()
             .env("TEST_OS", "Linux")
             .env("TEST_ARCH", "x86_64")

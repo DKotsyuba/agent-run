@@ -181,15 +181,15 @@ jq -e --arg version "$version" '
     .schema_version == 1 and .product == "agent-run" and .version == $version and .tag == ("v"+$version) and .repository == "DKotsyuba/agent-run" and .repository_id == 1348534205 and .trust_profile == "github-attestation" and (.commit | test("^[0-9a-f]{40}$")) and
     (.workflow | (keys | sort) == (["id","path","run_id","run_attempt"] | sort) and .id == 346709607 and .path == ".github/workflows/release.yml" and .run_id > 0 and .run_attempt > 0 and (.run_id | floor) == .run_id and (.run_attempt | floor) == .run_attempt) and
     all(.standard_version,.devkit_version,.baseline; type == "string" and length > 0 and length <= 128) and
-    (.artifacts | length) as $count |
-    ($count == 4 or $count == 5) and
-    ([.artifacts[].name] | length == (unique | length)) and
-    ([.artifacts[] | select(.kind != "bundle") | .kind] | sort) == (["source","installer","evidence"] | sort) and
-    ([.artifacts[] | select(.kind == "bundle") | .target] | sort) ==
-      (if $count == 4 then ["aarch64-apple-darwin"] else ["aarch64-apple-darwin","x86_64-unknown-linux-gnu"] end) and
-    all(.artifacts[]; (.sha256 | test("^[0-9a-f]{64}$")) and .size > 0 and .size <= 536870912 and (.size | floor) == .size and
-      if .kind == "bundle" then .target as $target_name | (keys | sort) == (["name","kind","target","size","sha256"] | sort) and .name == ("agent-run-"+$version+"-"+$target_name+".tar.gz")
-      else (keys | sort) == (["name","kind","size","sha256"] | sort) and (.name == (if .kind == "source" then "agent-run-"+$version+"-source.tar" elif .kind == "installer" then "install.sh" else "acceptance.json" end)) end)
+    ((.artifacts | length) as $count |
+      ($count == 4 or $count == 5) and
+      ([.artifacts[].name] | length == (unique | length)) and
+      ([.artifacts[] | select(.kind != "bundle") | .kind] | sort) == (["source","installer","evidence"] | sort) and
+      ([.artifacts[] | select(.kind == "bundle") | .target] | sort) ==
+        (if $count == 4 then ["aarch64-apple-darwin"] else ["aarch64-apple-darwin","x86_64-unknown-linux-gnu"] end) and
+      all(.artifacts[]; (.sha256 | test("^[0-9a-f]{64}$")) and .size > 0 and .size <= 536870912 and (.size | floor) == .size and
+        if .kind == "bundle" then .target as $target_name | (keys | sort) == (["name","kind","target","size","sha256"] | sort) and .name == ("agent-run-"+$version+"-"+$target_name+".tar.gz")
+        else (keys | sort) == (["name","kind","size","sha256"] | sort) and (.name == (if .kind == "source" then "agent-run-"+$version+"-source.tar" elif .kind == "installer" then "install.sh" else "acceptance.json" end)) end))
 ' "$temporary/release-manifest.json" >/dev/null || fail 'release manifest identity/layout mismatch'
 jq -e --arg target "$target" 'any(.artifacts[]; .kind == "bundle" and .target == $target)' "$temporary/release-manifest.json" >/dev/null || fail 'this release has no binary for the selected platform'
 commit=$(jq -r '.commit' "$temporary/release-manifest.json")
