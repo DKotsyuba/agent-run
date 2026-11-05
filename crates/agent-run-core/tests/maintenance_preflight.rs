@@ -403,6 +403,7 @@ impl agent_run_core::system_launch::SystemLauncher for AccountWorker {
 struct RecordingWorker {
     inner: AccountWorker,
     launches: std::sync::atomic::AtomicUsize,
+    failure: Option<bool>,
 }
 
 impl agent_run_core::system_launch::SystemLauncher for RecordingWorker {
@@ -436,15 +437,35 @@ impl agent_run_core::system_launch::SystemLauncher for RecordingWorker {
     fn launch(
         &self,
         _: std::path::PathBuf,
-        _: agent_run_domain::domain::AgentId,
+        id: agent_run_domain::domain::AgentId,
         _: SystemRoute,
-        _: agent_run_core::broker_writer::BrokerLane,
+        lane: agent_run_core::broker_writer::BrokerLane,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = agent_run_domain::Result<()>> + Send + 'static>,
     > {
         self.launches
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Box::pin(async { Ok(()) })
+        let failure = self.failure;
+        Box::pin(async move {
+            if let Some(ambiguous) = failure {
+                lane.local(
+                    agent_run_store::ops::RecordSupervisorLaunch {
+                        execution: id,
+                        capability_sha256: "a".repeat(64),
+                    },
+                    std::time::Duration::from_secs(5),
+                )
+                .await?;
+                return if ambiguous {
+                    Err(agent_run_domain::Error::Runtime("unknown launch".into()))
+                } else {
+                    Err(agent_run_domain::Error::Io(std::io::Error::other(
+                        "fixture spawn refusal",
+                    )))
+                };
+            }
+            Ok(())
+        })
     }
 }
 
@@ -462,6 +483,7 @@ async fn maintenance_controller_dispatches_once_and_waits_for_confirmation() {
             calls: std::sync::atomic::AtomicUsize::new(0),
         },
         launches: std::sync::atomic::AtomicUsize::new(0),
+        failure: None,
     });
     let service = Service::new(f.home.path().into())
         .with_writer(harness.broker())
@@ -516,6 +538,388 @@ async fn maintenance_controller_dispatches_once_and_waits_for_confirmation() {
             .outcome
             .as_deref(),
         Some("deferred")
+    );
+}
+
+/// A definite pre-spawn refusal reports failure and reopens admission; an
+/// ambiguous launch remains fenced and is never sent a second time.
+#[tokio::test]
+async fn maintenance_launch_failure_distinguishes_refusal_from_unknown() {
+    use agent_run_core::{maintenance_controller, service::Service};
+    use std::sync::{Arc, atomic::Ordering};
+    for ambiguous in [false, true] {
+        let f = Fixture::with_mode(false, true);
+        let harness = common::writer::Harness::start(f.home.path());
+        let worker = Arc::new(RecordingWorker {
+            inner: AccountWorker {
+                route: f.route.clone(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            },
+            launches: std::sync::atomic::AtomicUsize::new(0),
+            failure: Some(ambiguous),
+        });
+        let service = Service::new(f.home.path().into())
+            .with_writer(harness.broker())
+            .with_system_launcher(worker.clone());
+        maintenance_controller::recovery_tick(&service)
+            .await
+            .unwrap();
+        maintenance_controller::recovery_tick(&service)
+            .await
+            .unwrap();
+        assert_eq!(worker.launches.load(Ordering::SeqCst), 1);
+        let row = f.store.get(&f.request.execution).unwrap();
+        if ambiguous {
+            assert_eq!(row.status, agent_run_domain::domain::Status::Starting);
+            assert!(f.store.active_maintenance_fence().unwrap().is_some());
+        } else {
+            assert_eq!(row.status, agent_run_domain::domain::Status::Failed);
+            assert_eq!(row.failure_kind.as_deref(), Some("supervisor_spawn_failed"));
+            assert!(f.store.active_maintenance_fence().unwrap().is_none());
+        }
+    }
+}
+
+/// Reaping the exact dead supervisor reports an unconfirmed continuation and
+/// releases the maintenance fence without submitting another native input.
+#[tokio::test]
+async fn maintenance_reaped_unconfirmed_continuation_does_not_block_admission() {
+    use agent_run_core::{
+        lifecycle::reconcile::reconcile_reaped_agent, maintenance_controller, service::Service,
+    };
+    let mut f = Fixture::with_mode(false, true);
+    let harness = common::writer::Harness::start(f.home.path());
+    let worker = std::sync::Arc::new(AccountWorker {
+        route: f.route.clone(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let service = Service::new(f.home.path().into())
+        .with_writer(harness.broker())
+        .with_system_launcher(worker);
+    let allocation = service
+        .claim_maintenance_resume(
+            f.request.epoch,
+            &f.request.execution,
+            "reaped-unconfirmed-fixture".into(),
+        )
+        .await
+        .unwrap();
+    let now = agent_run_core::domain::now();
+    f.store.conn.execute(
+        "UPDATE agents SET status='running',supervisor_pid=123,supervisor_identity='linux:fixture',supervisor_birth_time=5,process_group_id=456,heartbeat_at=? WHERE id=?",
+        rusqlite::params![now - 1.0, f.request.execution.as_str()],
+    ).unwrap();
+    f.store.conn.execute(
+        "UPDATE attempts SET state='running',phase='spawning',process_identity='fixture',process_birth_time=5 WHERE id=?",
+        [&allocation.target_attempt_id],
+    ).unwrap();
+    assert!(reconcile_reaped_agent(&mut f.store, &f.request.execution, 123, now).unwrap());
+    let row = f.store.get(&f.request.execution).unwrap();
+    assert_eq!(row.status, agent_run_domain::domain::Status::Lost);
+    assert_eq!(
+        row.failure_kind.as_deref(),
+        Some("maintenance_continuation_unconfirmed")
+    );
+    maintenance_controller::recovery_tick(&service)
+        .await
+        .unwrap();
+    assert!(f.store.active_maintenance_fence().unwrap().is_none());
+}
+
+/// A registered supervisor lost before native launch is cleaned up and its
+/// preserved session can be manually continued after the fence opens.
+#[tokio::test]
+async fn maintenance_reconciles_dead_prepared_supervisor_then_allows_resume() {
+    use agent_run_core::{
+        lifecycle::reconcile::reconcile_with, maintenance_controller, service::Service,
+    };
+    let mut f = Fixture::with_mode(false, true);
+    let harness = common::writer::Harness::start(f.home.path());
+    let worker = std::sync::Arc::new(AccountWorker {
+        route: f.route.clone(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let service = Service::new(f.home.path().into())
+        .with_writer(harness.broker())
+        .with_system_launcher(worker);
+    service
+        .claim_maintenance_resume(
+            f.request.epoch,
+            &f.request.execution,
+            "dead-prepared-fixture".into(),
+        )
+        .await
+        .unwrap();
+    let me = agent_run_platform::process::inspect(std::process::id() as i32).unwrap();
+    let now = agent_run_core::domain::now();
+    f.store.conn.execute(
+        "UPDATE agents SET supervisor_pid=?,supervisor_identity=?,supervisor_birth_time=?,process_group_id=NULL,heartbeat_at=? WHERE id=?",
+        rusqlite::params![me.pid,format!("{}-old",me.token),me.birth-1.0,now-1.0,f.request.execution.as_str()],
+    ).unwrap();
+    let changed = reconcile_with(&mut f.store, 10, |_, _, _| {
+        agent_run_platform::process::ProcessState::Reused
+    })
+    .unwrap();
+    assert!(changed.contains(&f.request.execution));
+    let parent = f.store.get(&f.request.execution).unwrap();
+    assert_eq!(
+        parent.failure_kind.as_deref(),
+        Some("maintenance_resume_start_failed")
+    );
+    maintenance_controller::recovery_tick(&service)
+        .await
+        .unwrap();
+    assert!(f.store.active_maintenance_fence().unwrap().is_none());
+    let client = common::Home::new();
+    assert!(
+        f.store
+            .admit(&client.request(), &client.config, &json!({}), Some(&parent))
+            .is_ok()
+    );
+}
+
+/// A dead broker that never released its capability can transfer the same
+/// prepared attempt to the current writer without creating a second attempt.
+#[tokio::test]
+async fn maintenance_reclaims_unreleased_dead_broker_capability() {
+    use agent_run_core::service::Service;
+    let f = Fixture::with_mode(false, true);
+    let harness = common::writer::Harness::start(f.home.path());
+    let worker = std::sync::Arc::new(AccountWorker {
+        route: f.route.clone(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let service = Service::new(f.home.path().into())
+        .with_writer(harness.broker())
+        .with_system_launcher(worker);
+    let allocation = service
+        .claim_maintenance_resume(
+            f.request.epoch,
+            &f.request.execution,
+            "reclaim-fixture".into(),
+        )
+        .await
+        .unwrap();
+    let me = agent_run_platform::process::inspect(std::process::id() as i32).unwrap();
+    let old_birth = me.birth - 1.0;
+    let old_owner = json!({"pid":me.pid,"token":format!("{}-old",me.token),"birth":old_birth});
+    f.store.conn.execute(
+        "UPDATE agents SET startup_owner_pid_identity=?,startup_owner_birth_time=?,supervisor_capability_sha256=? WHERE id=?",
+        rusqlite::params![old_owner.to_string(),old_birth,"a".repeat(64),f.request.execution.as_str()],
+    ).unwrap();
+    let claim = service
+        .claim_maintenance_prepared(f.request.epoch, &f.request.execution)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(claim.launch_authorized);
+    assert_eq!(
+        claim.allocation.target_attempt_id,
+        allocation.target_attempt_id
+    );
+    assert!(
+        service
+            .claim_maintenance_prepared(f.request.epoch, &f.request.execution)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A failed child inspection preserves the broker owner for recovery rather
+/// than recording an unusable partial process identity.
+#[tokio::test]
+async fn maintenance_failed_child_inspection_preserves_reclaimable_owner() {
+    use agent_run_core::{maintenance_controller, service::Service};
+    let f = Fixture::with_mode(false, false);
+    let harness = common::writer::Harness::start(f.home.path());
+    let service = Service::new(f.home.path().into()).with_writer(harness.broker());
+    std::fs::write(f.home.path().join("fixture-supervisor-inspect-error"), "").unwrap();
+    std::fs::write(
+        f.home.path().join("fixture-supervisor-inspect-unverified"),
+        "",
+    )
+    .unwrap();
+    maintenance_controller::recovery_tick(&service)
+        .await
+        .unwrap();
+    let allocation = f
+        .store
+        .maintenance_resume(f.request.epoch, &f.request.execution)
+        .unwrap()
+        .unwrap();
+    let (owner, capability): (String, Option<String>) = f
+        .store
+        .conn
+        .query_row(
+            "SELECT startup_owner_pid_identity,supervisor_capability_sha256 FROM agents WHERE id=?",
+            [f.request.execution.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let owner: serde_json::Value = serde_json::from_str(&owner).unwrap();
+    assert_eq!(owner.as_object().unwrap().len(), 3);
+    assert!(capability.is_some());
+    assert!(f.store.active_maintenance_fence().unwrap().is_some());
+    std::fs::remove_file(f.home.path().join("fixture-supervisor-inspect-error")).unwrap();
+    std::fs::remove_file(f.home.path().join("fixture-supervisor-inspect-unverified")).unwrap();
+    let me = agent_run_platform::process::inspect(std::process::id() as i32).unwrap();
+    let old_birth = me.birth - 1.0;
+    let old_owner = json!({"pid":me.pid,"token":format!("{}-old",me.token),"birth":old_birth});
+    f.store
+        .conn
+        .execute(
+            "UPDATE agents SET startup_owner_pid_identity=?,startup_owner_birth_time=? WHERE id=?",
+            rusqlite::params![
+                old_owner.to_string(),
+                old_birth,
+                f.request.execution.as_str()
+            ],
+        )
+        .unwrap();
+    let recovered = service
+        .claim_maintenance_prepared(f.request.epoch, &f.request.execution)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(recovered.launch_authorized);
+    assert_eq!(
+        recovered.allocation.target_attempt_id,
+        allocation.target_attempt_id
+    );
+}
+
+/// If the unauthenticated child and its group are gone, an inspection failure
+/// is a definite pre-start failure and cannot keep admission fenced.
+#[tokio::test]
+async fn maintenance_failed_child_inspection_finishes_when_cleanup_is_proven() {
+    use agent_run_core::{maintenance_controller, service::Service};
+    let f = Fixture::with_mode(false, false);
+    let harness = common::writer::Harness::start(f.home.path());
+    let service = Service::new(f.home.path().into()).with_writer(harness.broker());
+    std::fs::write(f.home.path().join("fixture-supervisor-inspect-error"), "").unwrap();
+    maintenance_controller::recovery_tick(&service)
+        .await
+        .unwrap();
+    let row = f.store.get(&f.request.execution).unwrap();
+    assert_eq!(row.status, agent_run_domain::domain::Status::Failed);
+    assert_eq!(row.failure_kind.as_deref(), Some("supervisor_spawn_failed"));
+    assert!(f.store.active_maintenance_fence().unwrap().is_none());
+}
+
+/// An explicit cancellation also resolves an unregistered target owned by a
+/// proven-dead broker without starting its native continuation.
+#[tokio::test]
+async fn maintenance_broker_cancels_dead_broker_prepared_target() {
+    use agent_run_core::{maintenance_controller, service::Service};
+    let f = Fixture::with_mode(false, true);
+    let harness = common::writer::Harness::start(f.home.path());
+    let worker = std::sync::Arc::new(AccountWorker {
+        route: f.route.clone(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let service = Service::new(f.home.path().into())
+        .with_writer(harness.broker())
+        .with_system_launcher(worker);
+    service
+        .claim_maintenance_resume(
+            f.request.epoch,
+            &f.request.execution,
+            "cancel-broker-fixture".into(),
+        )
+        .await
+        .unwrap();
+    let me = agent_run_platform::process::inspect(std::process::id() as i32).unwrap();
+    let old_birth = me.birth - 1.0;
+    let old_owner = json!({"pid":me.pid,"token":format!("{}-old",me.token),"birth":old_birth});
+    f.store.conn.execute(
+        "UPDATE agents SET startup_owner_pid_identity=?,startup_owner_birth_time=?,supervisor_capability_sha256=? WHERE id=?",
+        rusqlite::params![old_owner.to_string(),old_birth,"a".repeat(64),f.request.execution.as_str()],
+    ).unwrap();
+    harness
+        .broker()
+        .lane("cancel-broker-fixture")
+        .remote(
+            agent_run_store::ops::EnqueueCommand {
+                execution: f.request.execution.clone(),
+                kind: "cancel".into(),
+                payload: json!({}),
+            },
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    service.reconcile().await.unwrap();
+    assert_eq!(
+        f.store.get(&f.request.execution).unwrap().status,
+        agent_run_domain::domain::Status::Cancelled
+    );
+    maintenance_controller::recovery_tick(&service)
+        .await
+        .unwrap();
+    assert!(f.store.active_maintenance_fence().unwrap().is_none());
+}
+
+/// A proven-dead pre-registration child closes the prepared target instead of
+/// leaving admission fenced indefinitely.
+#[tokio::test]
+async fn maintenance_reconciles_dead_unregistered_startup_child() {
+    use agent_run_core::{
+        lifecycle::reconcile::reconcile_with, maintenance_controller, service::Service,
+    };
+    let mut f = Fixture::with_mode(false, true);
+    let harness = common::writer::Harness::start(f.home.path());
+    let worker = std::sync::Arc::new(AccountWorker {
+        route: f.route.clone(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let service = Service::new(f.home.path().into())
+        .with_writer(harness.broker())
+        .with_system_launcher(worker);
+    service
+        .claim_maintenance_resume(
+            f.request.epoch,
+            &f.request.execution,
+            "dead-child-fixture".into(),
+        )
+        .await
+        .unwrap();
+    let me = agent_run_platform::process::inspect(std::process::id() as i32).unwrap();
+    let old_birth = me.birth - 1.0;
+    let owner = json!({"pid":me.pid,"ppid":me.ppid,"group":me.pid,"birth":old_birth,"token":format!("{}-old",me.token),"zombie":false});
+    f.store.conn.execute(
+        "UPDATE agents SET startup_owner_pid_identity=?,startup_owner_birth_time=?,supervisor_capability_sha256=? WHERE id=?",
+        rusqlite::params![owner.to_string(),old_birth,"a".repeat(64),f.request.execution.as_str()],
+    ).unwrap();
+    let changed = reconcile_with(&mut f.store, 10, |_, _, _| {
+        agent_run_platform::process::ProcessState::Reused
+    })
+    .unwrap();
+    assert!(changed.contains(&f.request.execution));
+    let row = f.store.get(&f.request.execution).unwrap();
+    assert_eq!(
+        row.failure_kind.as_deref(),
+        Some("maintenance_resume_start_failed")
+    );
+    maintenance_controller::recovery_tick(&service)
+        .await
+        .unwrap();
+    assert!(f.store.active_maintenance_fence().unwrap().is_none());
+    let (phase,proof):(String,String) = f.store.conn.query_row(
+        "SELECT phase,cleanup_proof_json FROM attempts WHERE id=(SELECT target_attempt_id FROM maintenance_resumes WHERE agent_id=?)",
+        [f.request.execution.as_str()], |row|Ok((row.get(0)?,row.get(1)?)),
+    ).unwrap();
+    assert_eq!(phase, "cleanup_complete");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&proof).unwrap()["never_spawned"],
+        true
+    );
+    let parent = f.store.get(&f.request.execution).unwrap();
+    let client = common::Home::new();
+    assert!(
+        f.store
+            .admit(&client.request(), &client.config, &json!({}), Some(&parent))
+            .is_ok()
     );
 }
 

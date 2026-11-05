@@ -251,9 +251,23 @@ pub async fn recovery_tick(service: &Service) -> Result<()> {
             };
             if authorized {
                 let lane = service.lane("maintenance-launch")?;
-                service
-                    .launch_provider_supervisor(&member.id, &lane)
-                    .await?;
+                if let Err(error) = service.launch_provider_supervisor(&member.id, &lane).await {
+                    let lookup = member.id.clone();
+                    let never_spawned = matches!(&error, Error::Io(_))
+                        && service
+                            .read(move |store| {
+                                crate::persist::attempt_never_spawned(&store.conn, &lookup)
+                            })
+                            .await?;
+                    if !never_spawned {
+                        return Err(error);
+                    }
+                    let mut outcome =
+                        agent_run_domain::domain::Outcome::failure("supervisor_spawn_failed");
+                    outcome.failure_text =
+                        Some("the run supervisor could not be started after maintenance".into());
+                    lane.finish_terminal(&member.id, &outcome).await?;
+                }
             }
             Ok::<(), Error>(())
         });

@@ -61,6 +61,9 @@ pub struct ClaimMaintenancePrepared {
     /// Exact stored old startup-owner document and matching birth column.
     pub expected_startup_owner: String,
     pub expected_startup_birth_time: f64,
+    /// Exact old capability hash, or none when launch had not begun.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_capability_sha256: Option<String>,
     /// PID-reuse-aware kernel observation prepared outside SQL.
     pub owner_state: agent_run_platform::process::ProcessState,
     /// Observation time and next startup-only deadline in Unix seconds.

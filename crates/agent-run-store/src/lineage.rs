@@ -4,7 +4,12 @@
 //! transaction; the partial unique index remains the final authority on forks.
 
 use crate::Record;
-use agent_run_domain::{Result, domain::AgentId, error::invalid};
+use agent_run_domain::{
+    Result,
+    domain::{AgentId, Status},
+    error::invalid,
+};
+use rusqlite::OptionalExtension;
 
 /// Verified parent facts a child must inherit when continuing one native runtime session.
 pub(crate) struct ResumeLineage {
@@ -26,6 +31,73 @@ fn group_is_gone(pgid: i32) -> bool {
         && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
+/// A maintenance supervisor that died before native launch is quiescent only
+/// after its exact identity is gone and every attempt has cleanup proof.
+fn prepared_maintenance_is_quiescent(tx: &rusqlite::Connection, parent: &Record) -> Result<bool> {
+    let target_state = if parent.status == Status::Lost
+        && parent.failure_kind.as_deref() == Some(crate::reconcile::MAINTENANCE_RESUME_START_FAILED)
+    {
+        "lost"
+    } else if parent.status == Status::Cancelled {
+        "cancelled"
+    } else {
+        return Ok(false);
+    };
+    let owner = match (
+        parent.supervisor_pid,
+        parent.supervisor_identity.as_deref(),
+        parent.supervisor_birth_time,
+    ) {
+        (Some(pid), Some(token), Some(birth)) => Some((pid, token.to_owned(), birth)),
+        (None, None, None) => {
+            let (startup_owner, startup_birth_time): (Option<String>, Option<f64>) = tx.query_row(
+                "SELECT startup_owner_pid_identity,startup_owner_birth_time FROM agents WHERE id=?",
+                [parent.id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let expected = crate::ops::ExpectedOwnership {
+                execution: parent.id.clone(),
+                supervisor_pid: None,
+                supervisor_identity: None,
+                supervisor_birth_time: None,
+                process_group_id: None,
+                startup_owner,
+                startup_birth_time,
+            };
+            crate::maintenance_target_cancel::startup_child(&expected)
+                .map(|child| (child.pid, child.token, child.birth))
+                .or_else(|| crate::maintenance_target_cancel::startup_broker(&expected))
+        }
+        _ => None,
+    };
+    let Some((pid, token, birth)) = owner else {
+        return Ok(false);
+    };
+    if !matches!(
+        agent_run_platform::process::observe(Some(pid), Some(&token), Some(birth)),
+        agent_run_platform::process::ProcessState::Dead
+            | agent_run_platform::process::ProcessState::Reused
+    ) {
+        return Ok(false);
+    }
+    let target: Option<String> = tx.query_row(
+        "SELECT t.id FROM maintenance_resumes r JOIN attempts t ON t.id=r.target_attempt_id AND t.agent_id=r.agent_id \
+         WHERE r.agent_id=?1 AND t.state=?2 AND t.phase='cleanup_complete' AND json_extract(t.cleanup_proof_json,'$.never_spawned')=1 \
+         ORDER BY r.epoch DESC LIMIT 1",
+        rusqlite::params![parent.id.as_str(),target_state], |row| row.get(0),
+    ).optional()?;
+    let Some(target) = target else {
+        return Ok(false);
+    };
+    if !crate::maintenance_target_cancel::preparation_is_settled(tx, &parent.id, &target)? {
+        return Ok(false);
+    }
+    Ok(!tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM attempts WHERE agent_id=? AND (cleanup_proof_json IS NULL OR COALESCE(phase,'')!='cleanup_complete'))",
+        [parent.id.as_str()], |row| row.get::<_,bool>(0),
+    )?)
+}
+
 /// Loads and proves a terminal parent can safely supply exactly one resume child.
 pub(crate) fn resume_parent(
     tx: &rusqlite::Connection,
@@ -42,8 +114,15 @@ pub(crate) fn resume_parent(
             parent.status.as_str()
         )));
     }
+    let prepared_terminal = parent.failure_kind.as_deref() == Some(crate::reconcile::MAINTENANCE_RESUME_START_FAILED)
+        || (parent.status == Status::Cancelled && tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM maintenance_resumes r JOIN attempts t ON t.id=r.target_attempt_id AND t.agent_id=r.agent_id \
+             WHERE r.agent_id=? AND t.state='cancelled' AND t.process_identity IS NULL)",
+            [parent.id.as_str()], |row| row.get::<_,bool>(0),
+        )?);
     let quiescent = match parent.process_group_id {
         Some(pgid) => group_is_gone(pgid),
+        None if prepared_terminal => prepared_maintenance_is_quiescent(tx, &parent)?,
         None => parent.supervisor_pid.is_none(),
     };
     if !quiescent {

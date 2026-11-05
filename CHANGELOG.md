@@ -9,6 +9,9 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 - feat(runtime): prepare a planned restart by fencing new work, notifying
   orchestrators, and resuming verified Codex and Claude sessions after restart.
   Unverified background work defers the restart instead of interrupting it.
+  A proven dead supervisor with an unconfirmed continuation is reported
+  as uncertain without replaying it; an unreleased broker capability can be
+  reclaimed for the same prepared attempt after owner death is verified.
 - feat(quotas): support optional account-owned subscription probes for the
   shared Linux broker without sharing login credentials.
 - fix(claude): temporarily skip an ordered account for one hour after a

@@ -273,6 +273,130 @@ fn startup_cancel_refuses_incomplete_owner_and_stale_snapshot() {
     }
 }
 
+/// An explicit cancel may close an unregistered target owned by a proven-dead
+/// broker, with or without an unreleased capability.
+#[test]
+fn dead_broker_prepared_target_cancels_without_launch() {
+    for capability in [None, Some("a".repeat(64))] {
+        let mut f = Fixture::new();
+        let me = process::inspect(std::process::id() as i32).unwrap();
+        let old_token = format!("{}-old", me.token);
+        let old_birth = me.birth - 1.0;
+        let owner = json!({"pid":me.pid,"token":old_token,"birth":old_birth});
+        f.startup_owner(&owner);
+        f.store.conn.execute(
+            "UPDATE agents SET startup_owner_birth_time=?,supervisor_capability_sha256=? WHERE id=?",
+            rusqlite::params![old_birth,capability,f.op.execution.as_str()],
+        ).unwrap();
+        f.op.expected_owner.startup_birth_time = Some(old_birth);
+        f.op.supervisor_state = process::observe(Some(me.pid), Some(&old_token), Some(old_birth));
+        f.store.conn.execute(
+            "INSERT INTO writer_authority(id,epoch,holder_pid,holder_birth,holder_token,acquired_at,probe_at) VALUES(1,2,?,?,?,1,1)",
+            rusqlite::params![me.pid,me.birth,me.token],
+        ).unwrap();
+        assert!(f.store.cancel_prepared_maintenance(&f.op).unwrap());
+        assert_eq!(
+            f.store.get(&f.op.execution).unwrap().status,
+            Status::Cancelled
+        );
+        assert!(!f.store.cancel_prepared_maintenance(&f.op).unwrap());
+        f.store.end_maintenance_fence(f.op.epoch, 4.0).unwrap();
+        f.store
+            .conn
+            .execute(
+                "UPDATE attempts SET cleanup_proof_json='{\"confirmed\":true}' WHERE id='source'",
+                [],
+            )
+            .unwrap();
+        f.store
+            .conn
+            .execute(
+                "UPDATE attempts SET cleanup_proof_json=NULL WHERE id='target'",
+                [],
+            )
+            .unwrap();
+        let parent = f.store.get(&f.op.execution).unwrap();
+        assert!(
+            f.store
+                .admit(&f.home.request(), &f.home.config, &json!({}), Some(&parent))
+                .is_err()
+        );
+        f.store.conn.execute("UPDATE attempts SET cleanup_proof_json='{\"never_spawned\":true}' WHERE id='target'",[]).unwrap();
+        assert!(
+            f.store
+                .admit(&f.home.request(), &f.home.config, &json!({}), Some(&parent))
+                .is_ok()
+        );
+    }
+}
+
+/// Broker-owned cancellation refuses incomplete discovery or owner evidence.
+#[test]
+fn broker_prepared_cancel_refuses_discovery_and_live_owner() {
+    for case in ["discovery", "live", "current_writer", "incomplete_writer"] {
+        let mut f = Fixture::new();
+        let me = process::inspect(std::process::id() as i32).unwrap();
+        let old_token = if case == "current_writer" {
+            me.token.clone()
+        } else {
+            format!("{}-old", me.token)
+        };
+        let old_birth = if case == "current_writer" {
+            me.birth
+        } else {
+            me.birth - 1.0
+        };
+        let owner = json!({"pid":me.pid,"token":old_token,"birth":old_birth});
+        f.startup_owner(&owner);
+        f.store
+            .conn
+            .execute(
+                "UPDATE agents SET startup_owner_birth_time=? WHERE id=?",
+                rusqlite::params![old_birth, f.op.execution.as_str()],
+            )
+            .unwrap();
+        f.op.expected_owner.startup_birth_time = Some(old_birth);
+        f.op.supervisor_state = if case == "live" {
+            ProcessState::Alive
+        } else {
+            ProcessState::Reused
+        };
+        f.store.conn.execute("INSERT INTO writer_authority(id,epoch,holder_pid,holder_birth,holder_token,acquired_at,probe_at) VALUES(1,2,?,?,?,1,1)",rusqlite::params![me.pid,me.birth,me.token]).unwrap();
+        if case == "incomplete_writer" {
+            f.store
+                .conn
+                .execute("UPDATE writer_authority SET holder_token=NULL", [])
+                .unwrap();
+        }
+        if case == "discovery" {
+            f.marker("maintenance_discovery_started_v1", f.binding());
+        }
+        assert!(
+            f.store.cancel_prepared_maintenance(&f.op).is_err(),
+            "{case}"
+        );
+    }
+}
+
+/// A pre-registration child cannot borrow discovery evidence from another
+/// execution, even when those markers look settled.
+#[test]
+fn unregistered_child_cancel_refuses_discovery_markers() {
+    let mut child = StartupChild::new();
+    child.stop();
+    let mut f = Fixture::new();
+    f.startup_owner(&serde_json::to_value(&child.identity).unwrap());
+    f.op.supervisor_state = process::observe(
+        Some(child.identity.pid),
+        Some(&child.identity.token),
+        Some(child.identity.birth),
+    );
+    f.store.conn.execute("UPDATE agents SET identity_json=json_set(identity_json,'$.authority.harness','claude-code')",[]).unwrap();
+    f.marker("maintenance_discovery_started_v1", f.binding());
+    f.marker("maintenance_discovery_settled_v1", f.binding());
+    assert!(f.store.cancel_prepared_maintenance(&f.op).is_err());
+}
+
 /// A crash before native spawning remains cancellable without allocating a new
 /// attempt/account, and committed cancellation permits releasing the fence.
 #[test]
@@ -319,6 +443,33 @@ fn dead_prepared_target_cancels_once_and_releases_fence() {
     f.store
         .end_maintenance_fence(f.op.epoch, agent_run_domain::domain::now())
         .unwrap();
+}
+
+/// A cancelled prepared target remains resumable after the exact dead owner
+/// and all source/target cleanup proofs are verified.
+#[test]
+fn cancelled_prepared_target_can_resume_after_cleanup() {
+    let mut f = Fixture::new();
+    assert!(f.store.cancel_prepared_maintenance(&f.op).unwrap());
+    f.store.end_maintenance_fence(f.op.epoch, 4.0).unwrap();
+    let parent = f.store.get(&f.op.execution).unwrap();
+    assert!(
+        f.store
+            .admit(&f.home.request(), &f.home.config, &json!({}), Some(&parent))
+            .is_err()
+    );
+    f.store
+        .conn
+        .execute(
+            "UPDATE attempts SET cleanup_proof_json='{\"confirmed\":true}' WHERE id='source'",
+            [],
+        )
+        .unwrap();
+    assert!(
+        f.store
+            .admit(&f.home.request(), &f.home.config, &json!({}), Some(&parent))
+            .is_ok()
+    );
 }
 
 /// Any current owner change, native evidence or command/allocation change wins

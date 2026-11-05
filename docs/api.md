@@ -128,7 +128,18 @@ the original account and permissions. Agent Run verifies foreground native
 activity, process cleanup and history before continuing. It cannot prove that
 arbitrary detached processes or external side effects have finished. An
 unverifiable or uncertain handoff is retained for inspection and is not sent
-again automatically. `agent-run maintenance status` reports the current phase.
+again automatically. If the exact resumed supervisor is proven dead before
+the continuation is confirmed, the execution is reported lost with an
+uncertain-outcome warning and other admissions can reopen. Process ownership
+remains held until cleanup is proven; inspect external effects before any
+manual continuation. A definite pre-spawn refusal is reported as a failure.
+If the prior broker died before releasing its launch capability, the same
+prepared attempt may be reclaimed after the old ownership is verified. A
+supervisor or identified startup child proven dead before native start is
+reported lost; manual resume after loss or cancellation requires settled
+preparation, process cleanup and history verification.
+An unresolved launch outcome stays fenced until its ownership is established.
+`agent-run maintenance status` reports the current phase.
 
 For manual service-manager integration, `agent-run maintenance prepare`
 returns success only when the broker is ready to stop; `--epoch-only` prints

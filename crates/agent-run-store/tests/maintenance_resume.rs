@@ -606,6 +606,7 @@ fn maintenance_resume_is_held_until_exact_continuation_is_confirmed() {
     let mut f = Fixture::new();
     let resume = f.claim().unwrap();
     assert!(agent_run_store::reconcile::has_maintenance_handoff(&f.store.conn, &f.run).unwrap());
+    assert!(agent_run_store::reconcile::maintenance_loss_blocked(&f.store.conn, &f.run).unwrap());
     assert!(f.store.end_maintenance_fence(f.epoch, 12.0).is_err());
     f.store.conn.execute(
         "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES(?,?,10,'maintenance_resume_confirmed_v1',?)",
@@ -636,6 +637,269 @@ fn maintenance_resume_is_held_until_exact_continuation_is_confirmed() {
     ).unwrap();
     assert!(!agent_run_store::reconcile::has_maintenance_handoff(&f.store.conn, &f.run).unwrap());
     assert!(f.store.end_maintenance_fence(f.epoch, 12.0).is_ok());
+}
+
+/// A proven dead owner of a started but unconfirmed continuation is reported
+/// lost without resending input, and no longer blocks other admissions.
+#[test]
+fn dead_unconfirmed_continuation_is_reported_and_releases_the_fence() {
+    let mut f = Fixture::new();
+    let resume = f.claim().unwrap();
+    f.store.conn.execute(
+        "UPDATE attempts SET state='running',phase='spawning',process_identity='fixture',process_birth_time=5 WHERE id=?",
+        [&resume.target_attempt_id],
+    ).unwrap();
+    assert!(agent_run_store::reconcile::maintenance_loss_blocked(&f.store.conn, &f.run).unwrap());
+    f.store.conn.execute(
+        "UPDATE agents SET status='running',supervisor_pid=123,supervisor_identity='linux:fixture',supervisor_birth_time=5,process_group_id=456,heartbeat_at=9 WHERE id=?",
+        [f.run.as_str()],
+    ).unwrap();
+    let (startup, birth): (Option<String>, Option<f64>) = f
+        .store
+        .conn
+        .query_row(
+            "SELECT startup_owner_pid_identity,startup_owner_birth_time FROM agents WHERE id=?",
+            [f.run.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let mut op = agent_run_store::ops::MarkLost {
+        expected: ExpectedOwnership {
+            execution: f.run.clone(),
+            supervisor_pid: Some(123),
+            supervisor_identity: Some("linux:fixture".into()),
+            supervisor_birth_time: Some(5.0),
+            process_group_id: Some(456),
+            startup_owner: startup,
+            startup_birth_time: birth,
+        },
+        failure_kind: "supervisor_dead".into(),
+        failure_text: "fixture".into(),
+        evidence: json!({"verdict":"dead"}),
+        checked_at: 12.0,
+    };
+    assert!(agent_run_store::reconcile::has_maintenance_handoff(&f.store.conn, &f.run).unwrap());
+    assert!(!agent_run_store::reconcile::maintenance_loss_blocked(&f.store.conn, &f.run).unwrap());
+    op.expected.supervisor_pid = Some(124);
+    assert!(!f.store.mark_lost(&op).unwrap());
+    op.expected.supervisor_pid = Some(123);
+    op.checked_at = 8.0;
+    assert!(!f.store.mark_lost(&op).unwrap());
+    op.checked_at = 12.0;
+    assert!(f.store.mark_lost(&op).unwrap());
+    assert!(!f.store.mark_lost(&op).unwrap());
+    let row = f.store.get(&f.run).unwrap();
+    assert_eq!(row.status, agent_run_domain::domain::Status::Lost);
+    assert_eq!(
+        row.failure_kind.as_deref(),
+        Some("maintenance_continuation_unconfirmed")
+    );
+    assert!(
+        row.failure_text
+            .as_deref()
+            .unwrap()
+            .contains("may have started")
+    );
+    assert!(f.store.end_maintenance_fence(f.epoch, 13.0).is_ok());
+    assert_eq!(
+        f.store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM maintenance_resumes WHERE agent_id=?",
+                [f.run.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert!(
+        f.store
+            .conn
+            .query_row(
+                "SELECT ownership_active=1 AND cleanup_proof_json IS NULL FROM attempts WHERE id=?",
+                [&resume.target_attempt_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+    );
+}
+
+/// A dead, registered supervisor that never launched the continuation can be
+/// reported lost; manual resume still waits for every cleanup proof.
+#[test]
+fn dead_prepared_supervisor_requires_settled_preparation_and_cleanup() {
+    let mut f = Fixture::new();
+    let resume = f.claim().unwrap();
+    let me = process::inspect(std::process::id() as i32).unwrap();
+    let old_token = format!("{}-old", me.token);
+    let old_birth = me.birth - 1.0;
+    f.store.conn.execute(
+        "UPDATE agents SET supervisor_pid=?,supervisor_identity=?,supervisor_birth_time=?,process_group_id=NULL,heartbeat_at=9 WHERE id=?",
+        rusqlite::params![me.pid,old_token,old_birth,f.run.as_str()],
+    ).unwrap();
+    let (startup, birth): (Option<String>, Option<f64>) = f
+        .store
+        .conn
+        .query_row(
+            "SELECT startup_owner_pid_identity,startup_owner_birth_time FROM agents WHERE id=?",
+            [f.run.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let op = agent_run_store::ops::MarkLost {
+        expected: ExpectedOwnership {
+            execution: f.run.clone(),
+            supervisor_pid: Some(me.pid),
+            supervisor_identity: Some(old_token),
+            supervisor_birth_time: Some(old_birth),
+            process_group_id: None,
+            startup_owner: startup,
+            startup_birth_time: birth,
+        },
+        failure_kind: "supervisor_dead".into(),
+        failure_text: "fixture".into(),
+        evidence: json!({"verdict":"reused"}),
+        checked_at: 12.0,
+    };
+    f.store.conn.execute(
+        "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES(?,?,11,'maintenance_discovery_started_v1','{}')",
+        rusqlite::params![f.run.as_str(),resume.target_attempt_id],
+    ).unwrap();
+    assert!(!f.store.mark_lost(&op).unwrap());
+    f.store
+        .conn
+        .execute(
+            "DELETE FROM events WHERE agent_id=? AND kind='maintenance_discovery_started_v1'",
+            [f.run.as_str()],
+        )
+        .unwrap();
+    assert!(f.store.mark_lost(&op).unwrap());
+    let row = f.store.get(&f.run).unwrap();
+    assert_eq!(
+        row.failure_kind.as_deref(),
+        Some("maintenance_resume_start_failed")
+    );
+    f.store.end_maintenance_fence(f.epoch, 13.0).unwrap();
+    assert!(
+        f.store
+            .admit(&f.home.request(), &f.home.config, &json!({}), Some(&row))
+            .is_err()
+    );
+    f.store.conn.execute(
+        "UPDATE attempts SET phase='cleanup_complete',cleanup_proof_json='{\"never_spawned\":true}',ownership_active=0 WHERE id=?",
+        [&resume.target_attempt_id],
+    ).unwrap();
+    f.store
+        .conn
+        .execute(
+            "UPDATE agents SET supervisor_identity=?,supervisor_birth_time=? WHERE id=?",
+            rusqlite::params![me.token, me.birth, f.run.as_str()],
+        )
+        .unwrap();
+    let live = f.store.get(&f.run).unwrap();
+    assert!(
+        f.store
+            .admit(&f.home.request(), &f.home.config, &json!({}), Some(&live))
+            .is_err()
+    );
+    f.store
+        .conn
+        .execute(
+            "UPDATE agents SET supervisor_identity=?,supervisor_birth_time=? WHERE id=?",
+            rusqlite::params![op.expected.supervisor_identity, old_birth, f.run.as_str()],
+        )
+        .unwrap();
+    let row = f.store.get(&f.run).unwrap();
+    assert!(
+        f.store
+            .admit(&f.home.request(), &f.home.config, &json!({}), Some(&row))
+            .is_ok()
+    );
+}
+
+/// A proven-dead pre-registration child is reported without launching a new
+/// attempt; incomplete child identity never authorizes that transition.
+#[test]
+fn dead_unregistered_child_is_reported_after_exact_ownership_proof() {
+    let mut f = Fixture::new();
+    let resume = f.claim().unwrap();
+    let me = process::inspect(std::process::id() as i32).unwrap();
+    let old_token = format!("{}-old", me.token);
+    let old_birth = me.birth - 1.0;
+    let full = json!({"pid":me.pid,"ppid":me.ppid,"group":me.pid,"birth":old_birth,"token":old_token,"zombie":false});
+    f.store.conn.execute(
+        "UPDATE agents SET startup_owner_pid_identity=?,startup_owner_birth_time=?,supervisor_capability_sha256=? WHERE id=?",
+        rusqlite::params![full.to_string(),old_birth,"a".repeat(64),f.run.as_str()],
+    ).unwrap();
+    let mut op = agent_run_store::ops::MarkLost {
+        expected: ExpectedOwnership {
+            execution: f.run.clone(),
+            supervisor_pid: None,
+            supervisor_identity: None,
+            supervisor_birth_time: None,
+            process_group_id: None,
+            startup_owner: Some(full.to_string()),
+            startup_birth_time: Some(old_birth),
+        },
+        failure_kind: "unowned_starting".into(),
+        failure_text: "fixture".into(),
+        evidence: json!({"verdict":"reused"}),
+        checked_at: 12.0,
+    };
+    let mut incomplete = full.clone();
+    incomplete.as_object_mut().unwrap().remove("group");
+    f.store
+        .conn
+        .execute(
+            "UPDATE agents SET startup_owner_pid_identity=? WHERE id=?",
+            rusqlite::params![incomplete.to_string(), f.run.as_str()],
+        )
+        .unwrap();
+    op.expected.startup_owner = Some(incomplete.to_string());
+    assert!(!f.store.mark_lost(&op).unwrap());
+    f.store
+        .conn
+        .execute(
+            "UPDATE agents SET startup_owner_pid_identity=? WHERE id=?",
+            rusqlite::params![full.to_string(), f.run.as_str()],
+        )
+        .unwrap();
+    op.expected.startup_owner = Some(full.to_string());
+    let marker = json!({"epoch":f.epoch,"source_attempt_id":resume.source_attempt_id,"target_attempt_id":resume.target_attempt_id}).to_string();
+    f.store.conn.execute("UPDATE agents SET identity_json=json_set(identity_json,'$.authority.harness','claude-code') WHERE id=?",[f.run.as_str()]).unwrap();
+    for kind in [
+        "maintenance_discovery_started_v1",
+        "maintenance_discovery_settled_v1",
+    ] {
+        f.store
+            .conn
+            .execute(
+                "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES(?,?,11,?,?)",
+                rusqlite::params![f.run.as_str(), resume.target_attempt_id, kind, marker],
+            )
+            .unwrap();
+    }
+    assert!(!f.store.mark_lost(&op).unwrap());
+    f.store.conn.execute("DELETE FROM events WHERE agent_id=? AND kind IN ('maintenance_discovery_started_v1','maintenance_discovery_settled_v1')",[f.run.as_str()]).unwrap();
+    f.store.conn.execute("UPDATE agents SET identity_json=json_set(identity_json,'$.authority.harness','codex') WHERE id=?",[f.run.as_str()]).unwrap();
+    assert!(f.store.mark_lost(&op).unwrap());
+    let parent = f.store.get(&f.run).unwrap();
+    assert_eq!(
+        parent.failure_kind.as_deref(),
+        Some("maintenance_resume_start_failed")
+    );
+    f.store.end_maintenance_fence(f.epoch, 13.0).unwrap();
+    assert!(
+        f.store
+            .admit(&f.home.request(), &f.home.config, &json!({}), Some(&parent))
+            .is_err()
+    );
+    f.store.conn.execute("UPDATE attempts SET phase='cleanup_complete',cleanup_proof_json='{\"never_spawned\":true}',ownership_active=0 WHERE id=?",[&resume.target_attempt_id]).unwrap();
+    assert!(
+        f.store
+            .admit(&f.home.request(), &f.home.config, &json!({}), Some(&parent))
+            .is_ok()
+    );
 }
 
 /// Actual non-death/unknown verdicts, changed owner/history/route or disabled

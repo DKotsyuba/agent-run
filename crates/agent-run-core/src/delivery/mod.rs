@@ -389,7 +389,7 @@ fn maintenance_message(notice: &agent_run_store::delivery::MaintenanceNotice) ->
         }
         MaintenanceNotice::Deferred { maintenance_epoch } => (
             maintenance_epoch,
-            "Agent Run deferred this maintenance and reopened task admissions. Existing work was allowed to continue. No action is required."
+            "Agent Run deferred this maintenance and reopened task admissions. The restart was not completed. Individual agent notices report failures or uncertain continuations."
                 .to_owned(),
         ),
     };

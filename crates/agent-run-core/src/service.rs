@@ -568,8 +568,9 @@ impl Service {
     }
 
     /// Recover startup ownership of an existing definitely-unlaunched target.
-    /// The old startup owner must be proven dead outside SQL. No second attempt
-    /// is allocated and replayed writer receipts grant no launch permission.
+    /// The old owner must be proven dead; an outstanding capability is only
+    /// reclaimable when the writer proves it still belonged to that broker.
+    /// No second attempt is allocated and replay grants no launch permission.
     pub async fn claim_maintenance_prepared(
         &self,
         epoch: i64,
@@ -582,7 +583,7 @@ impl Service {
             let eligible:bool=store.conn().query_row(
                 "SELECT EXISTS(SELECT 1 FROM agents a JOIN attempts t ON t.agent_id=a.id JOIN maintenance_fences f ON f.epoch=? \
                  WHERE a.id=? AND t.id=? AND f.ended_at IS NULL AND f.phase IN ('recovering','deferring') \
-                 AND a.status='starting' AND a.finished_at IS NULL AND a.supervisor_capability_sha256 IS NULL \
+                 AND a.status='starting' AND a.finished_at IS NULL \
                  AND a.supervisor_pid IS NULL AND a.supervisor_identity IS NULL AND a.supervisor_birth_time IS NULL AND a.process_group_id IS NULL \
                  AND t.state='prepared' AND t.phase='prepared' AND t.ownership_active=1 AND t.finished_at IS NULL \
                  AND t.process_identity IS NULL AND t.process_birth_time IS NULL AND t.cleanup_proof_json IS NULL \
@@ -592,9 +593,16 @@ impl Service {
                 rusqlite::params![epoch,lookup.as_str(),allocation.target_attempt_id],|r|r.get(0))?;
             if !eligible {return Ok(None);}
             let row=store.get(&lookup)?;
-            let (owner,birth):(Option<String>,Option<f64>)=store.conn().query_row("SELECT startup_owner_pid_identity,startup_owner_birth_time FROM agents WHERE id=?",[lookup.as_str()],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            let (owner,birth,capability):(Option<String>,Option<f64>,Option<String>)=store.conn().query_row("SELECT startup_owner_pid_identity,startup_owner_birth_time,supervisor_capability_sha256 FROM agents WHERE id=?",[lookup.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
             let (Some(owner),Some(birth))=(owner,birth) else {return Ok(None);};
             let identity:Value=serde_json::from_str(&owner).map_err(|_|invalid("prepared startup owner is malformed"))?;
+            if let Some(hash) = &capability {
+                let broker = identity.as_object().is_some_and(|object| object.len()==3 && ["pid","token","birth"].iter().all(|key|object.contains_key(*key)));
+                if !broker || hash.len()!=64 || !hash.bytes().all(|byte|byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    || !agent_run_store::maintenance_target_cancel::preparation_not_started(store.conn(),&lookup,&allocation.target_attempt_id)? {
+                    return Ok(None);
+                }
+            }
             let pid=identity["pid"].as_i64().and_then(|pid|i32::try_from(pid).ok()).filter(|pid|*pid>1);
             let token=identity["token"].as_str().filter(|token|!token.is_empty());
             if pid.is_none() || token.is_none() || identity["birth"].as_f64()!=Some(birth) || !birth.is_finite() || birth<0.0 {return Ok(None);}
@@ -604,7 +612,7 @@ impl Service {
             let at=now();
             Ok(Some((row,allocation.account_id,agent_run_store::ops::ClaimMaintenancePrepared {
                 epoch,execution:lookup,target_attempt_id:allocation.target_attempt_id,
-                expected_startup_owner:owner,expected_startup_birth_time:birth,owner_state:state,at,
+                expected_startup_owner:owner,expected_startup_birth_time:birth,expected_capability_sha256:capability,owner_state:state,at,
                 startup_deadline_at:at+agent_run_platform::launch::Timeouts::default().ready.as_secs_f64(),
             })))
         }).await?;
@@ -2720,8 +2728,8 @@ impl Service {
     }
 
     /// Fulfil explicit cancellation after a maintenance successor's supervisor
-    /// dies before native launch, including a full startup child that died before
-    /// supervisor registration. Ownership is observed outside the SQL snapshot;
+    /// dies before native launch, including a startup child or its broker that
+    /// died before supervisor registration. Ownership is observed outside the SQL snapshot;
     /// the writer rechecks the exact target, discovery guard and never-spawned
     /// boundary. Unknown receipts are resolved by later durable observation.
     async fn reconcile_prepared_cancellations(&self, lane: &BrokerLane) -> Result<usize> {
@@ -2764,6 +2772,8 @@ impl Service {
                     process::observe(owner.supervisor_pid, owner.supervisor_identity.as_deref(), owner.supervisor_birth_time)
                 } else if let Some(child) = agent_run_store::maintenance_target_cancel::startup_child(owner) {
                     process::observe(Some(child.pid), Some(&child.token), Some(child.birth))
+                } else if let Some((pid, token, birth)) = agent_run_store::maintenance_target_cancel::startup_broker(owner) {
+                    process::observe(Some(pid), Some(&token), Some(birth))
                 } else {
                     agent_run_platform::process::ProcessState::Unknown
                 };

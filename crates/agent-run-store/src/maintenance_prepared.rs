@@ -44,9 +44,9 @@ impl PreparedMaintenanceClaim {
 
 impl Store<'_> {
     /// Transfer startup ownership of the SAME prepared target only after the
-    /// broker observes the exact prior owner Dead/Reused outside SQL. Null
-    /// capability and the existing never-spawned predicate exclude uncertain
-    /// starts. No attempt, quota key, native process or input is created here.
+    /// broker observes the exact prior owner Dead/Reused outside SQL. A prior
+    /// capability can be cleared only for the original broker identity with
+    /// no discovery or native start. No new attempt or quota key is created.
     pub fn claim_maintenance_prepared(
         &mut self,
         op: &ClaimMaintenancePrepared,
@@ -68,11 +68,31 @@ impl Store<'_> {
             .as_i64()
             .is_some_and(|pid| pid > 1 && i32::try_from(pid).is_ok())
             || !expected["token"].as_str().is_some_and(|token| {
-                token.len() <= 256 && (token.starts_with("linux:") || token.starts_with("darwin:"))
+                token.len() <= 256
+                    && (token.starts_with("linux:") || token.starts_with("darwin:"))
+                    && !token.chars().any(char::is_control)
             })
             || expected["birth"].as_f64() != Some(op.expected_startup_birth_time)
         {
             return Err(invalid("incomplete prepared startup owner"));
+        }
+        if let Some(capability) = &op.expected_capability_sha256 {
+            let exact_broker = expected.as_object().is_some_and(|object| {
+                object.len() == 3
+                    && ["pid", "token", "birth"]
+                        .iter()
+                        .all(|key| object.contains_key(*key))
+            });
+            if !exact_broker
+                || capability.len() != 64
+                || !capability
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(invalid(
+                    "prepared capability owner is not the original broker",
+                ));
+            }
         }
         let tx = WriteTx::begin(&self.conn)?;
         let allocation = self
@@ -85,14 +105,20 @@ impl Store<'_> {
             "SELECT EXISTS(SELECT 1 FROM agents a JOIN attempts t ON t.agent_id=a.id JOIN maintenance_fences f ON f.epoch=? \
              WHERE a.id=? AND t.id=? AND f.ended_at IS NULL AND f.phase IN ('recovering','deferring') \
              AND a.status='starting' AND a.finished_at IS NULL AND a.supervisor_pid IS NULL AND a.supervisor_identity IS NULL \
-             AND a.supervisor_birth_time IS NULL AND a.process_group_id IS NULL AND a.supervisor_capability_sha256 IS NULL \
+             AND a.supervisor_birth_time IS NULL AND a.process_group_id IS NULL AND a.supervisor_capability_sha256 IS ? \
              AND t.state='prepared' AND t.finished_at IS NULL AND {} \
              AND NOT EXISTS(SELECT 1 FROM commands c WHERE c.agent_id=a.id AND c.kind='cancel' AND c.state IN ('pending','claimed')))",crate::provider_admission::NEVER_SPAWNED),
-            params![op.epoch,op.execution.as_str(),op.target_attempt_id],|r|r.get(0))?;
+            params![op.epoch,op.execution.as_str(),op.target_attempt_id,op.expected_capability_sha256],|r|r.get(0))?;
         if !eligible
             || self
                 .maintenance_continuation(&op.execution, &op.target_attempt_id)?
                 .is_none()
+            || (op.expected_capability_sha256.is_some()
+                && !crate::maintenance_target_cancel::preparation_not_started(
+                    &tx,
+                    &op.execution,
+                    &op.target_attempt_id,
+                )?)
         {
             return Err(Error::Conflict);
         }
@@ -135,8 +161,8 @@ impl Store<'_> {
             return Err(invalid("maintenance source account is no longer enabled"));
         }
         let owner = json!({"pid":pid,"token":token,"birth":birth}).to_string();
-        let changed=tx.execute("UPDATE agents SET startup_owner_pid_identity=?,startup_owner_birth_time=?,startup_deadline_at=? WHERE id=? AND startup_owner_pid_identity=? AND startup_owner_birth_time=? AND supervisor_capability_sha256 IS NULL AND supervisor_pid IS NULL",
-            params![owner,birth,op.startup_deadline_at,op.execution.as_str(),op.expected_startup_owner,op.expected_startup_birth_time])?;
+        let changed=tx.execute("UPDATE agents SET startup_owner_pid_identity=?,startup_owner_birth_time=?,startup_deadline_at=?,supervisor_capability_sha256=NULL WHERE id=? AND startup_owner_pid_identity=? AND startup_owner_birth_time=? AND supervisor_capability_sha256 IS ? AND supervisor_pid IS NULL",
+            params![owner,birth,op.startup_deadline_at,op.execution.as_str(),op.expected_startup_owner,op.expected_startup_birth_time,op.expected_capability_sha256])?;
         if changed != 1 {
             return Err(Error::Conflict);
         }

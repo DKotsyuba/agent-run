@@ -79,6 +79,7 @@ impl Fixture {
             target_attempt_id: TARGET.into(),
             expected_startup_owner: old,
             expected_startup_birth_time: old_birth,
+            expected_capability_sha256: None,
             owner_state: state,
             at: 6.0,
             startup_deadline_at: 36.0,
@@ -104,6 +105,28 @@ impl Fixture {
                 .unwrap(),
             self.store.quota_capacity_revision().unwrap(),
         )
+    }
+
+    /// Model the old broker recording a capability but never releasing it.
+    fn with_unreleased_capability(&mut self) {
+        let capability = "a".repeat(64);
+        self.op.expected_capability_sha256 = Some(capability.clone());
+        self.store
+            .conn
+            .execute(
+                "UPDATE agents SET identity_json=?,supervisor_capability_sha256=? WHERE id=?",
+                rusqlite::params![
+                    json!({"provider_identity_version":2,"authority":{"harness":"codex"}})
+                        .to_string(),
+                    capability,
+                    self.run.as_str()
+                ],
+            )
+            .unwrap();
+        self.store.conn.execute(
+            "INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES(?,'target',4,'maintenance_preparation_guard_v1',?)",
+            rusqlite::params![self.run.as_str(),json!({"epoch":self.op.epoch,"source_attempt_id":SOURCE,"target_attempt_id":TARGET}).to_string()],
+        ).unwrap();
     }
 }
 
@@ -133,6 +156,94 @@ fn prepared_maintenance_recovery_preserves_target_and_reservation() {
     assert_ne!(owner, f.op.expected_startup_owner);
     assert!(cap.is_none());
     assert_eq!(f.store.get(&f.run).unwrap().sequence, 1);
+}
+
+/// A dead original broker's unreleased capability is fenced and replaced once.
+#[test]
+fn prepared_maintenance_reclaims_unreleased_broker_capability_once() {
+    let mut f = Fixture::new();
+    f.with_unreleased_capability();
+    let before = f.counts();
+    assert!(
+        f.store
+            .claim_maintenance_prepared(&f.op)
+            .unwrap()
+            .launch_authorized
+    );
+    assert!(f.store.claim_maintenance_prepared(&f.op).is_err());
+    let cap: Option<String> = f
+        .store
+        .conn
+        .query_row(
+            "SELECT supervisor_capability_sha256 FROM agents WHERE id=?",
+            [f.run.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(cap.is_none());
+    assert_eq!(f.counts(), before);
+}
+
+/// Concurrent reclaimers cannot both replace an unreleased capability.
+#[test]
+fn unreleased_broker_capability_has_one_concurrent_claim() {
+    let mut f = Fixture::new();
+    f.with_unreleased_capability();
+    let barrier = Arc::new(Barrier::new(2));
+    let jobs = (0..2)
+        .map(|_| {
+            let path = f.home.path.clone();
+            let op = f.op.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                let mut store = agent_run_store::fixture::open(&path).unwrap();
+                barrier.wait();
+                store.claim_maintenance_prepared(&op)
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = jobs
+        .into_iter()
+        .map(|job| job.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+}
+
+/// Changed capabilities, child owners, discovery and cancellation stay held.
+#[test]
+fn unreleased_broker_capability_requires_exact_unstarted_evidence() {
+    for case in ["capability", "child", "discovery", "confirmed", "cancel"] {
+        let mut f = Fixture::new();
+        f.with_unreleased_capability();
+        match case {
+            "capability" => f.op.expected_capability_sha256 = Some("b".repeat(64)),
+            "child" => {
+                let mut owner: serde_json::Value =
+                    serde_json::from_str(&f.op.expected_startup_owner).unwrap();
+                owner["group"] = json!(123);
+                f.op.expected_startup_owner = owner.to_string();
+                f.store
+                    .conn
+                    .execute(
+                        "UPDATE agents SET startup_owner_pid_identity=? WHERE id=?",
+                        rusqlite::params![f.op.expected_startup_owner, f.run.as_str()],
+                    )
+                    .unwrap();
+            }
+            "discovery" | "confirmed" => {
+                let kind = if case == "discovery" {
+                    "maintenance_discovery_started_v1"
+                } else {
+                    "maintenance_resume_confirmed_v1"
+                };
+                f.store.conn.execute("INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES(?,'target',5,?,'{}')",rusqlite::params![f.run.as_str(),kind]).unwrap();
+            }
+            _ => {
+                f.store.enqueue(&f.run, "cancel", &json!({})).unwrap();
+            }
+        }
+        assert!(f.store.claim_maintenance_prepared(&f.op).is_err(), "{case}");
+    }
 }
 
 /// Any prior capability/owner/process/spawn evidence or explicit cancellation
@@ -198,6 +309,12 @@ fn prepared_maintenance_concurrent_recovery_has_one_winner() {
 #[test]
 fn prepared_maintenance_writer_replay_disarms_and_rollback_preserves_owner() {
     let mut f = Fixture::new();
+    assert!(
+        serde_json::to_value(&f.op)
+            .unwrap()
+            .get("expected_capability_sha256")
+            .is_none()
+    );
     f.store.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
     f.store.claim_maintenance_prepared(&f.op).unwrap();
     f.store.conn.execute_batch("ROLLBACK").unwrap();

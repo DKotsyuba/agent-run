@@ -165,11 +165,26 @@ async fn launch_owned(program: &Path, home: &Path, id: &AgentId, lane: &BrokerLa
         timeouts,
     };
     let (pid, backend) = (guard.held().pid, guard.held().backend);
+    // Never replace the recoverable broker owner with an incomplete child identity.
+    #[cfg(feature = "test-fixtures")]
+    let inspect_failed = home.join("fixture-supervisor-inspect-error").exists();
+    #[cfg(not(feature = "test-fixtures"))]
+    let inspect_failed = false;
+    let evidence = if inspect_failed {
+        None
+    } else {
+        process::inspect(pid)
+            .ok()
+            .and_then(|identity| serde_json::to_value(identity).ok())
+    };
+    let Some(mut evidence) = evidence else {
+        #[cfg(feature = "test-fixtures")]
+        let unverified = home.join("fixture-supervisor-inspect-unverified").exists();
+        #[cfg(not(feature = "test-fixtures"))]
+        let unverified = false;
+        return Err(abandon_unreleased(guard.take(), timeouts, unverified).await);
+    };
     // Durable before any proof or capability, so reconciliation can observe this child.
-    let mut evidence = process::inspect(pid)
-        .ok()
-        .and_then(|p| serde_json::to_value(p).ok())
-        .unwrap_or_else(|| json!({"pid": pid}));
     evidence["spawn_backend"] = json!(backend);
     let recorded = lane
         .local(
@@ -216,6 +231,32 @@ async fn abandon(
     match tokio::task::spawn_blocking(move || started.abandon(timeouts, message)).await {
         Ok(error) => launch_error(error),
         Err(error) => Error::Runtime(format!("supervisor cleanup task failed: {error}")),
+    }
+}
+
+/// A child that never received its capability is a definite pre-start failure
+/// only when both its PID and its process group are proven absent.
+async fn abandon_unreleased(
+    started: launch::StartedLaunch,
+    timeouts: launch::Timeouts,
+    force_unverified: bool,
+) -> Error {
+    let pid = started.pid;
+    let uncertain = abandon(started, timeouts, "supervisor identity unavailable".into()).await;
+    // SAFETY: signal 0 only checks whether the spawned PID or group exists.
+    let pid_gone = pid > 1
+        && unsafe { libc::kill(pid, 0) } != 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    // SAFETY: signal 0 only checks whether this spawned process group exists.
+    let group_gone = pid > 1
+        && unsafe { libc::killpg(pid, 0) } != 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    if !force_unverified && pid_gone && group_gone {
+        Error::Io(std::io::Error::other(
+            "supervisor identity unavailable before launch",
+        ))
+    } else {
+        uncertain
     }
 }
 

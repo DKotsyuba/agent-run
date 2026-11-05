@@ -34,6 +34,41 @@ pub fn startup_child(owner: &crate::ops::ExpectedOwnership) -> Option<Identity> 
     .then_some(child)
 }
 
+/// Decode only the minimal broker identity written before any startup child.
+pub fn startup_broker(owner: &crate::ops::ExpectedOwnership) -> Option<(i32, String, f64)> {
+    if owner.supervisor_pid.is_some()
+        || owner.supervisor_identity.is_some()
+        || owner.supervisor_birth_time.is_some()
+        || owner.process_group_id.is_some()
+    {
+        return None;
+    }
+    let value: Value = serde_json::from_str(owner.startup_owner.as_deref()?).ok()?;
+    let object = value.as_object()?;
+    if object.len() != 3
+        || !["pid", "token", "birth"]
+            .iter()
+            .all(|key| object.contains_key(*key))
+    {
+        return None;
+    }
+    let pid = i32::try_from(value["pid"].as_i64()?)
+        .ok()
+        .filter(|pid| *pid > 1)?;
+    let token = value["token"].as_str()?.to_owned();
+    let birth = value["birth"].as_f64()?;
+    if token.len() > 256
+        || !(token.starts_with("linux:") || token.starts_with("darwin:"))
+        || token.chars().any(char::is_control)
+        || !birth.is_finite()
+        || birth < 0.0
+        || owner.startup_birth_time != Some(birth)
+    {
+        return None;
+    }
+    Some((pid, token, birth))
+}
+
 /// Prove the exact target's preparation/discovery boundary from durable ordered
 /// markers. The caller must hold a read snapshot or writer transaction while
 /// combining this result with ownership and never-spawned evidence. Missing,
@@ -88,17 +123,35 @@ pub fn preparation_is_settled(
     Ok(true)
 }
 
+/// A broker-owned, unregistered target has not begun discovery or native input.
+pub fn preparation_not_started(
+    conn: &rusqlite::Connection,
+    run: &agent_run_domain::domain::AgentId,
+    target: &str,
+) -> Result<bool> {
+    if !preparation_is_settled(conn, run, target)? {
+        return Ok(false);
+    }
+    Ok(!conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE agent_id=? AND attempt_id=? \
+         AND kind IN ('maintenance_discovery_started_v1','maintenance_discovery_settled_v1','mcp_discovery_ownership','maintenance_resume_confirmed_v1'))",
+        params![run.as_str(), target], |row| row.get::<_,bool>(0),
+    )?)
+}
+
 impl Store<'_> {
     /// Cancel only an allocated successor whose exact supervisor was observed
     /// dead outside SQL and whose native launch is still provably absent.
-    /// Before supervisor registration, only a complete spawned startup-child
-    /// identity can substitute for that supervisor, never an initial broker.
+    /// Before registration, a complete startup-child identity or the exact
+    /// dead broker identity can substitute for the supervisor. The broker case
+    /// also requires proof that discovery never began.
     /// Durable preparation/discovery markers must prove no unfinished discovery.
     /// A missing guard or an unpaired discovery start remains held. The terminal
     /// outcome, reservation release, commands and outbox commit atomically;
     /// an uncertain acknowledgement or terminal replay adds no second notice.
     pub fn cancel_prepared_maintenance(&mut self, op: &CancelPreparedMaintenance) -> Result<bool> {
         let owner = &op.expected_owner;
+        let broker_owner = startup_broker(owner);
         let bound_supervisor = owner.supervisor_pid.is_some_and(|pid| pid > 1)
             && owner.supervisor_identity.as_deref().is_some_and(|token| {
                 !token.is_empty()
@@ -118,7 +171,7 @@ impl Store<'_> {
                 op.supervisor_state,
                 ProcessState::Dead | ProcessState::Reused
             )
-            || !(bound_supervisor || startup_child(owner).is_some())
+            || !(bound_supervisor || startup_child(owner).is_some() || broker_owner.is_some())
             || owner.process_group_id.is_some()
         {
             return Err(invalid(
@@ -126,6 +179,31 @@ impl Store<'_> {
             ));
         }
         let tx = WriteTx::begin(&self.conn)?;
+        if let Some((pid, token, birth)) = &broker_owner {
+            let current: (i32, Option<String>, Option<f64>) = tx.query_row(
+                "SELECT holder_pid,holder_token,holder_birth FROM writer_authority WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            if current.0 <= 1
+                || current.1.as_deref().is_none_or(|value| {
+                    value.len() > 256
+                        || !(value.starts_with("linux:") || value.starts_with("darwin:"))
+                        || value.chars().any(char::is_control)
+                })
+                || current
+                    .2
+                    .is_none_or(|value| !value.is_finite() || value < 0.0)
+            {
+                return Err(invalid("resident writer ownership is incomplete"));
+            }
+            if current.0 == *pid
+                && current.1.as_deref() == Some(token.as_str())
+                && current.2 == Some(*birth)
+            {
+                return Err(invalid("prepared startup is owned by the current writer"));
+            }
+        }
         let row = self.get(&op.execution)?;
         if row.status.terminal() {
             tx.commit()?;
@@ -163,7 +241,12 @@ impl Store<'_> {
             crate::provider_admission::NEVER_SPAWNED),
             params![op.epoch, op.execution.as_str(), op.target_attempt_id], |r| r.get(0),
         )?;
-        if !eligible || !preparation_is_settled(&tx, &op.execution, &op.target_attempt_id)? {
+        let settled = if !bound_supervisor {
+            preparation_not_started(&tx, &op.execution, &op.target_attempt_id)?
+        } else {
+            preparation_is_settled(&tx, &op.execution, &op.target_attempt_id)?
+        };
+        if !eligible || !settled {
             return Err(Error::Conflict);
         }
         let command: Option<(String, String, String)> = tx

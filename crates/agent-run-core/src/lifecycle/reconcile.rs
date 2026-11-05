@@ -661,9 +661,36 @@ fn guarded_lost(
         tx.commit()?;
         return Ok(false);
     };
+    let handoff = agent_run_store::reconcile::has_maintenance_handoff(&tx, &expected.id)?;
+    let blocked =
+        handoff && agent_run_store::reconcile::maintenance_loss_blocked(&tx, &expected.id)?;
+    let unregistered_child = failure_kind == "unowned_starting"
+        && agent_run_store::maintenance_target_cancel::startup_child(
+            &agent_run_store::ops::ExpectedOwnership {
+                execution: expected.id.clone(),
+                supervisor_pid: expected.supervisor_pid,
+                supervisor_identity: expected.supervisor_identity.clone(),
+                supervisor_birth_time: expected.supervisor_birth_time,
+                process_group_id: expected.process_group_id,
+                startup_owner: expected.startup_owner.clone(),
+                startup_birth_time: expected.startup_birth_time,
+            },
+        )
+        .is_some();
+    let prepared_loss = blocked
+        && (unregistered_child
+            || (matches!(
+                failure_kind,
+                "supervisor_dead" | "supervisor_identity_mismatch"
+            ) && expected.supervisor_pid.is_some()))
+        && agent_run_store::reconcile::maintenance_prepared_loss_allowed(
+            &tx,
+            &expected.id,
+            unregistered_child,
+        )?;
     if !same_ownership(expected, &current)
         || current.status.terminal()
-        || agent_run_store::reconcile::has_maintenance_handoff(&tx, &expected.id)?
+        || (blocked && !prepared_loss)
         || (expected.supervisor_pid.is_some()
             && current
                 .heartbeat_at
@@ -673,6 +700,27 @@ fn guarded_lost(
         return Ok(false);
     }
     current.status.transition(Status::Lost)?;
+    let failure_kind = if prepared_loss {
+        agent_run_store::reconcile::MAINTENANCE_RESUME_START_FAILED
+    } else if handoff {
+        agent_run_store::reconcile::MAINTENANCE_CONTINUATION_UNCONFIRMED
+    } else {
+        failure_kind
+    };
+    let failure_text = if prepared_loss {
+        agent_run_store::reconcile::MAINTENANCE_RESUME_START_FAILED_TEXT
+    } else if handoff {
+        agent_run_store::reconcile::MAINTENANCE_CONTINUATION_UNCONFIRMED_TEXT
+    } else {
+        failure_text
+    };
+    let evidence = if prepared_loss {
+        json!({"observation":evidence,"maintenance_continuation":"not_started"})
+    } else if handoff {
+        json!({"observation":evidence,"maintenance_continuation":"unconfirmed"})
+    } else {
+        evidence
+    };
     let finished_at = checked_at;
     tx.execute(
         "UPDATE agents SET status='lost',finished_at=?,failure_kind=?,failure_text=? WHERE id=?",

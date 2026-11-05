@@ -585,6 +585,36 @@ fn notice_rendering_matches_python_golden_cases() {
     }
 }
 
+/// An uncertain maintenance continuation must not suggest blindly retrying.
+#[test]
+fn unconfirmed_maintenance_notice_warns_against_repeating_work() {
+    let notice = notice_from_case(&json!({
+        "notification_id":"ntf-fixture",
+        "agent_id":"ag-20260825-120000-0123456789",
+        "status":"lost",
+        "failure_kind":"maintenance_continuation_unconfirmed"
+    }));
+    let text = notice.render().unwrap();
+    assert!(text.contains("work may have started"));
+    assert!(text.contains("do not repeat the task until its outcome is known"));
+}
+
+/// A definite pre-start failure suggests continuing an existing session.
+#[test]
+fn maintenance_start_failure_notice_explains_safe_continuation() {
+    for kind in ["maintenance_resume_start_failed", "supervisor_spawn_failed"] {
+        let notice = notice_from_case(&json!({
+            "notification_id":"ntf-fixture",
+            "agent_id":"ag-20260825-120000-0123456789",
+            "status":"failed",
+            "failure_kind":kind
+        }));
+        let text = notice.render().unwrap();
+        assert!(!text.contains("without a recognized failure category"));
+        assert!(text.contains("cleanup and") && text.contains("history verification"));
+    }
+}
+
 /// Mirrors `tests/test_codex_queue.py::test_attempt_evidence_is_bounded_redacted_and_exactly_classified`.
 #[test]
 fn evidence_redacts_secret_shaped_tails_and_caps_utf8() {
