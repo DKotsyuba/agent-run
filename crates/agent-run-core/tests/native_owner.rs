@@ -20,10 +20,18 @@ use tokio::{
 const TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 /// Initial successful inference is deliberately not a logical finish.
 const TURN: &str = r#"{"type":"result","subtype":"success","is_error":false,"session_id":"s","result":"NOT_A_FINISH","usage":{}}"#;
-/// Keep the current kernel peer's protected channel alive until the verifier closes it.
-fn owner_environment(home: &Path) -> (BTreeMap<String, String>, tokio::task::JoinHandle<()>) {
+/// Keep the current kernel peer's protected channel in the short socket root.
+fn owner_environment() -> (
+    BTreeMap<String, String>,
+    tokio::task::JoinHandle<()>,
+    tempfile::TempDir,
+) {
     use std::os::unix::fs::PermissionsExt;
-    let channel = home.join("channel.sock");
+    let base = std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let home = tempfile::tempdir_in(base.canonicalize().unwrap()).unwrap();
+    let channel = home.path().join("channel.sock");
     let listener = UnixListener::bind(&channel).unwrap();
     std::fs::set_permissions(&channel, std::fs::Permissions::from_mode(0o600)).unwrap();
     let server = tokio::spawn(async move {
@@ -39,10 +47,11 @@ fn owner_environment(home: &Path) -> (BTreeMap<String, String>, tokio::task::Joi
             ),
             (
                 native_owner::SETTINGS[1].into(),
-                home.to_str().unwrap().into(),
+                home.path().to_str().unwrap().into(),
             ),
         ]),
         server,
+        home,
     )
 }
 /// Write one exact owner frame; no native input or public runner command is used by this driver.
@@ -119,7 +128,7 @@ async fn claude_owner_requires_replay_and_finishes_same_actor() {
     let prep = common::writer::prepare_supervisor(&mut store, &id);
     let harness = common::writer::Harness::start(&home.path);
     let mut persist = harness.supervisor(&home.path, prep, &id).await;
-    let (environment, channel) = owner_environment(&home.path);
+    let (environment, channel, socket_home) = owner_environment();
     let script = format!(
         r#"read initial
 printf '%s\n' '{TURN}'
@@ -149,8 +158,8 @@ sleep 1
             rusqlite::params![leader.token, leader.birth],
         )
         .unwrap();
-    let socket = home
-        .path
+    let socket = socket_home
+        .path()
         .read_dir()
         .unwrap()
         .filter_map(|x| x.ok())
@@ -282,7 +291,7 @@ async fn codex_owner_uses_logical_authority_with_native_model_and_task() {
     let prep = common::writer::prepare_supervisor(&mut store, &id);
     let harness = common::writer::Harness::start(&home.path);
     let mut persist = harness.supervisor(&home.path, prep, &id).await;
-    let (environment, channel) = owner_environment(&home.path);
+    let (environment, channel, socket_home) = owner_environment();
     let tools: serde_json::Map<String, Value> = agent_run_domain::worker::finish_tools_json(false)
         .into_iter()
         .map(|tool| (tool["name"].as_str().unwrap().into(), json!({})))
@@ -317,8 +326,8 @@ esac; done"#
             rusqlite::params![leader.token, leader.birth],
         )
         .unwrap();
-    let socket = home
-        .path
+    let socket = socket_home
+        .path()
         .read_dir()
         .unwrap()
         .filter_map(|x| x.ok())
@@ -451,7 +460,7 @@ async fn owner_lifetime_and_durable_phase_refuse_before_effect() {
     let prep = common::writer::prepare_supervisor(&mut store, &id);
     let harness = common::writer::Harness::start(&home.path);
     let persist = harness.supervisor(&home.path, prep, &id).await;
-    let (environment, channel) = owner_environment(&home.path);
+    let (environment, channel, socket_home) = owner_environment();
     let mut process = Process::spawn(&LaunchPlan {
         binary: "/bin/sh".into(),
         args: vec!["-c".into(), "read unused".into()],
@@ -468,8 +477,8 @@ async fn owner_lifetime_and_durable_phase_refuse_before_effect() {
             rusqlite::params![leader.token, leader.birth],
         )
         .unwrap();
-    let socket = home
-        .path
+    let socket = socket_home
+        .path()
         .read_dir()
         .unwrap()
         .filter_map(|x| x.ok())
@@ -712,7 +721,7 @@ async fn claude_owner_missing_replay_retires_one_effect() {
     let prep = common::writer::prepare_supervisor(&mut store, &id);
     let harness = common::writer::Harness::start(&home.path);
     let mut persist = harness.supervisor(&home.path, prep, &id).await;
-    let (environment, channel) = owner_environment(&home.path);
+    let (environment, channel, socket_home) = owner_environment();
     let script = format!(
         "read initial; printf '%s\\n' '{TURN}'; read wake; printf 'one\\n' >> effect; if read unexpected; then printf 'duplicate\\n' >> effect; fi"
     );
@@ -732,8 +741,8 @@ async fn claude_owner_missing_replay_retires_one_effect() {
             rusqlite::params![leader.token, leader.birth],
         )
         .unwrap();
-    let socket = home
-        .path
+    let socket = socket_home
+        .path()
         .read_dir()
         .unwrap()
         .filter_map(|x| x.ok())
