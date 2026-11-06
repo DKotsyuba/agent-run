@@ -14,7 +14,7 @@ use tokio::net::UnixStream;
 /// connected Unix stream.
 #[derive(Debug, Clone)]
 pub struct PeerIdentity {
-    /// Effective user id of the peer, equal to this process's user.
+    /// Effective user id reported by the kernel.
     pub uid: u32,
     /// Live identity (pid, birth, token, group) of the peer process.
     pub process: Identity,
@@ -37,6 +37,23 @@ pub fn peer_identity(stream: &UnixStream) -> Result<PeerIdentity> {
     if credentials.uid() != uid {
         return Err(invalid("socket peer has another user ID"));
     }
+    let pid = credentials
+        .pid()
+        .filter(|pid| *pid > 1)
+        .ok_or_else(|| invalid("socket peer process id is unavailable"))?;
+    let process =
+        process::inspect(pid).map_err(|_| invalid("socket peer process cannot be inspected"))?;
+    if process.zombie {
+        return Err(invalid("socket peer process has exited"));
+    }
+    Ok(PeerIdentity { uid, process })
+}
+
+/// Identifies a peer already admitted by the shared socket's Unix permissions.
+/// Its process identity is still needed to bind writes to the existing owner.
+pub(crate) fn system_supervisor_peer_identity(stream: &UnixStream) -> Result<PeerIdentity> {
+    let credentials = stream.peer_cred().map_err(Error::Io)?;
+    let uid = credentials.uid();
     let pid = credentials
         .pid()
         .filter(|pid| *pid > 1)

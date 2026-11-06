@@ -818,7 +818,7 @@ async fn cancellation_stops_a_hanging_engine_and_records_terminal_state() {
     let (_tmp, home) = home();
     let id = admit(&home, "fixture:hang");
     let mut child = spawn_supervisor(&home, &id).await;
-    wait_status(&home, &id, Status::Running, Duration::from_secs(10)).await;
+    wait_engine_ready(&home, &id, Duration::from_secs(10)).await;
     fixture_service(home.clone())
         .await
         .cancel(&id)
@@ -844,6 +844,7 @@ async fn cancellation_stops_a_hanging_engine_and_records_terminal_state() {
     // Plain SIGTERM is enough for a well-behaved engine; SIGKILL should not
     // have been necessary.
     assert_eq!(cleanup["signals"], json!(["SIGTERM"]));
+    assert_eq!(cleanup["confirmed"], json!(true));
 }
 
 /// Mirrors `tests/test_supervisor.py::SupervisorTests::test_command_flood_yields_to_engine_poll_after_one_bounded_page`.

@@ -1,12 +1,11 @@
 # Native session continuity across an account change
 
-Status: schema-2 explicit resume and automatic in-flight Codex A→B account
-switching are implemented. A disposable run with two real native Codex logins
-kept one thread and recalled the parent turn. Claude-family continuation stays
-on the parent's account; cross-account Claude continuation is refused. The
-historical schema-1 conditions below explain retained rows, while the current
-provider path and its proof are described in the final section. Schema-1 rows
-do not silently resume through a schema-2 provider.
+Status: schema-2 supports guarded Codex account switching and an opt-in ordered
+Claude API-to-native-login queue. A disposable direct Claude Code probe resumed
+an API-created transcript with a subscription login, retained its session ID and
+recalled a marker; the Agent Run handoff has synthetic integration coverage.
+This does not qualify every provider error or interrupted external action.
+Historical schema-1 rows do not silently resume through a schema-2 provider.
 
 ## Historical schema-1 continuation conditions
 
@@ -56,17 +55,18 @@ These are the durable, checkable conditions of the legacy resume path
   from an earlier release exists at
   `<configured-runtime-home>@<label>/claude-config`, which is then used in
   place. If both directories exist the label is ambiguous and login, runs,
-  and quota collection fail instead of choosing one. Its account-scoped
-  config state and native session discovery need a separate continuity proof.
+  and quota collection fail instead of choosing one. For an ordered switch,
+  authentication uses this account directory while `--resume` names the
+  previously sealed transcript by absolute path.
 
 The historical guard requires the parent's labelled account to remain
 declared. In schema 2, Codex A→B rebinds the credential only after verified
 cleanup and continues the same native thread in the sealed lineage home; this
 was observed with two real logins. A real three-account chain has fixture
-coverage but no live qualification. Claude's account-scoped config location
-still lacks a verified cross-account session-access path, so that switch is
-refused. A new conversation, summary, foreign session ID, changed grants,
-unproved live process, or ambiguous submitted turn cannot count as continuity.
+coverage but no live qualification. Ordered Claude retries the same transcript
+only after its original input, cleanup and tool lifecycle are proven. A new
+conversation, summary, foreign session ID, changed grants, unproved live process,
+or ambiguous submitted turn cannot count as continuity.
 
 ## Repeatable fixture boundary and existing evidence
 
@@ -115,14 +115,12 @@ is cleaned up, then continues with `thread/resume` on the same thread. A
 disposable-state probe with two real native Codex logins (the default login
 and a named one, same provider and model, read-only role) switched accounts
 after the first was disabled in the disposable registry and continued the
-same thread, recalling a nonce from the parent turn. Claude Code keeps its
-history per login directory, so its resume stays on the parent's account;
-cross-account Claude continuation is unverified and refused
-(`cross_account_continuation_unverified`). Automatic, in-flight
-quota-triggered Codex failover is implemented: after an authoritative
-`quota_exhausted` failure of an automatic run, the supervisor allocates the
-next eligible account and continues the same native thread (see
-`provider-contract.md`).
+same thread, recalling a nonce from the parent turn. A separate direct Claude
+Code probe resumed a disposable API transcript under a subscription login by
+absolute path and recalled its marker; the persisted continuation appended to
+the same test transcript. Ordered Claude handoff in Agent Run is separately
+covered by synthetic broker/supervisor tests. Other cross-account Claude paths
+remain refused. See `provider-contract.md` for triggers and proof requirements.
 
 ## Stable public agent identity
 

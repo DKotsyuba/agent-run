@@ -607,7 +607,7 @@ fn bridge_component_bytes(path: &Path, owner: u32, limit: usize) -> Result<Vec<u
     Ok(bytes)
 }
 
-/// Seal exactly the first-party lifecycle package and credential-free hook
+/// Seal exactly the first-party native-context v2 package and credential-free hook
 /// executable into the existing runtime snapshot. Arbitrary runtime plugins,
 /// package install scripts/dependencies and mutable external launch paths are
 /// never enabled by this projection.
@@ -623,8 +623,8 @@ fn seal_opencode_bridge(
     if parsed["name"] != "@agent-bridge/opencode"
         || parsed["main"] != "index.js"
         || parsed["type"] != "module"
-        || parsed.pointer("/agentBridge/protocol") != Some(&json!(1))
-        || parsed.pointer("/agentBridge/mode") != Some(&json!("lifecycle"))
+        || parsed.pointer("/agentBridge/protocol") != Some(&json!(2))
+        || parsed.pointer("/agentBridge/mode") != Some(&json!("native-context"))
         || ["dependencies", "scripts"].iter().any(|name| {
             parsed
                 .get(*name)
@@ -632,7 +632,7 @@ fn seal_opencode_bridge(
         })
     {
         return Err(invalid(
-            "OpenCode Bridge lifecycle package contract is invalid",
+            "OpenCode Bridge native-context v2 package contract is invalid",
         ));
     }
     let source = bridge_component_bytes(&component.package.join("index.js"), owner, 1024 * 1024)?;
@@ -978,7 +978,9 @@ fn materialize_with_provider(
             }
         }
         Adapter::OpenCode => {
-            if let Some((component, _)) = super::opencode::bridge_projection(
+            // Establish native state before the supervisor captures its canonical store.
+            fs::private_dir(&home.join("opencode-data"))?;
+            if let Some((component, _, _)) = super::opencode::bridge_projection(
                 config,
                 runtime,
                 profile,

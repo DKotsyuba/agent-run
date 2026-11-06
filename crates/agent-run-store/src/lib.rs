@@ -45,6 +45,7 @@ pub mod retention;
 pub mod run_stats;
 /// Durable physical storage-layout registry for shared runtime assets.
 pub mod runtime_storage;
+pub mod service_restart;
 /// Supervisor bootstrap, ownership and service-executor identity units.
 mod supervisor_units;
 /// Atomic terminal lifecycle transitions and their durable completion notices.
@@ -640,6 +641,7 @@ impl Store<'_> {
                 return Err(invalid("agent orchestration binding is immutable"));
             }
             touch_session_reference(&tx, &current, reference, at)?;
+            crate::service_restart::bind_captured_agent(&tx, id, &current, reference)?;
             delivery::ensure_bound_terminal_notice(&tx, id, &current, at)?;
             tx.commit()?;
             return Ok(current);
@@ -649,6 +651,7 @@ impl Store<'_> {
             "UPDATE agents SET orchestrator_session_id=? WHERE id=?",
             params![session_id, id.as_str()],
         )?;
+        crate::service_restart::bind_captured_agent(&tx, id, &session_id, reference)?;
         tx.execute(
             "UPDATE deliveries SET orchestrator_session_id=?,state='pending',next_attempt_at=? WHERE agent_id=? AND state='waiting_binding' AND id NOT IN (SELECT completion_delivery_id FROM pools WHERE completion_delivery_id IS NOT NULL)",
             params![session_id, at, id.as_str()],
@@ -1232,14 +1235,65 @@ impl Store<'_> {
             )
             .optional()?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
+        // A user cancellation wins over a pending service-restart continuation.
+        // The internal forced stop writes its own command and does not use this path.
+        let restart: Option<(i64, Option<String>, bool)> = if kind == "cancel" {
+            tx.query_row(
+                "SELECT r.restart_id,r.resumed_execution_id,s.finished_at IS NULL OR r.resume_status='unconfirmed' \
+                 FROM service_restart_agents r JOIN service_restarts s ON s.id=r.restart_id \
+                 WHERE r.cancelled_before_restart=0 AND (r.agent_id=?1 OR r.resumed_execution_id=?1) AND \
+                 ((s.finished_at IS NULL AND r.resume_status IN ('pending','started')) OR r.resume_status='unconfirmed' \
+                  OR (s.finished_at IS NOT NULL AND r.resume_status='started' AND r.agent_id=?1)) \
+                 ORDER BY (s.finished_at IS NULL) DESC,r.restart_id DESC LIMIT 1",
+                [id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+        } else {
+            None
+        };
+        let mut target = id.clone();
+        let mut stopped = false;
         if row.status.terminal() {
-            return Err(invalid("agent is already terminal"));
+            let Some((_, child, _)) = restart.as_ref() else {
+                return Err(invalid("agent is already terminal"));
+            };
+            if !crate::service_restart::is_restart_stop(&tx, id)? {
+                return Err(invalid("agent is already terminal"));
+            }
+            if let Some(child) = child {
+                let state: String =
+                    tx.query_row("SELECT status FROM agents WHERE id=?", [child], |row| {
+                        row.get(0)
+                    })?;
+                if !["created", "starting", "running", "cancelling"].contains(&state.as_str()) {
+                    return Err(invalid("agent is already terminal"));
+                }
+                target = child.parse()?;
+            } else {
+                stopped = true;
+            }
+        }
+        if let Some((restart_id, _, true)) = restart {
+            tx.execute(
+                "UPDATE service_restart_agents SET resume_status='cancelled',resume_error=NULL WHERE restart_id=? \
+                 AND (agent_id=? OR resumed_execution_id=?) AND resume_status IN ('pending','started','unconfirmed')",
+                params![restart_id,id.as_str(),id.as_str()],
+            )?;
+        }
+        if stopped {
+            let at = now();
+            tx.execute("INSERT INTO commands(agent_id,kind,payload_json,state,created_at,completed_at,result_json) VALUES(?,'cancel',?,'completed',?,?,?)",
+                params![id.as_str(),serde_json::to_string(payload)?,at,at,json!({"accepted":true,"reason":"restart_cancelled"}).to_string()])?;
+            let cid = tx.last_insert_rowid();
+            tx.commit()?;
+            return Ok(json!({"command_id":cid,"agent_id":id,"kind":kind,"state":"completed"}));
         }
         if kind != "cancel" && tx.query_row("SELECT EXISTS(SELECT 1 FROM worker_lifecycle l JOIN attempts t ON t.id=l.attempt_id \
             WHERE t.agent_id=? AND t.ownership_active=1 AND l.finish_json IS NOT NULL)",[id.as_str()],|r|r.get::<_,bool>(0))? {
             return Err(invalid("finish already accepted; no new turn may be admitted"));
         }
-        tx.execute("INSERT INTO commands(agent_id,kind,payload_json,state,created_at) VALUES(?,?,?,'pending',?)",params![id.as_str(),kind,serde_json::to_string(payload)?,now()])?;
+        tx.execute("INSERT INTO commands(agent_id,kind,payload_json,state,created_at) VALUES(?,?,?,'pending',?)",params![target.as_str(),kind,serde_json::to_string(payload)?,now()])?;
         let cid = tx.last_insert_rowid();
         tx.commit()?;
         Ok(json!({"command_id":cid,"agent_id":id,"kind":kind,"state":"pending"}))
@@ -1313,7 +1367,11 @@ impl Store<'_> {
         // Admission permits one child per predecessor. The indexed child lookup
         // selects the lineage tip without scanning every root/sequence pair.
         let where_sql = format!(
-            "WHERE (?=0 OR status IN {ACTIVE_SQL}) AND (?=0 OR EXISTS ( \
+            "WHERE (?=0 OR status IN {ACTIVE_SQL} OR EXISTS ( \
+             SELECT 1 FROM service_restart_agents ra JOIN service_restarts rs ON rs.id=ra.restart_id \
+             WHERE ra.agent_id=agents.id AND ((rs.finished_at IS NULL AND ra.resume_status='pending') OR ra.resume_status='unconfirmed') \
+             AND EXISTS(SELECT 1 FROM events e WHERE e.agent_id=agents.id AND e.kind='status' \
+             AND json_extract(e.data_json,'$.service_restart')=1))) AND (?=0 OR EXISTS ( \
              SELECT 1 FROM orchestrator_sessions o WHERE o.id=agents.orchestrator_session_id \
              AND o.external_session_id=? AND o.transport IN (?,?))) \
              AND (?=0 OR NOT EXISTS (SELECT 1 FROM agents newer \

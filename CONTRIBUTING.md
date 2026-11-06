@@ -38,9 +38,8 @@ Transport changes need a live API/MCP smoke. Adapter or supervisor changes need
 recorded fixture or real-engine evidence. Use temporary homes and endpoints;
 never point tests at a production database, socket, inbox, or credential store.
 
-Release workflows publish only the qualified macOS Apple-silicon artifact.
-Linux x86-64 remains a non-blocking validation lane; its release and
-qualification are deferred and failures there must remain visible.
+Release workflows build macOS Apple-silicon and Linux x86-64 artifacts on
+their native runners. Both platform checks must pass before publication.
 
 A pull request must state the problem, exact verification commands and results,
 and any platform or live-resource check that was not run. Follow the invariants

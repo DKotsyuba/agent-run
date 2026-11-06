@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install an attested macOS release; sealed-directory deploy remains unchanged.
+# Install an attested native release; sealed-directory deploy remains unchanged.
 set -eu
 umask 077
 # Fail before switching any installed version.
@@ -10,7 +10,7 @@ usage() {
 Usage: sh install.sh [--version X.Y.Z] [--prefix DIR] [--home DIR] [--bin-dir DIR]
                      [--downloader gh|curl|wget]
 Requires gh (authenticated for private releases), jq, tar and a SHA-256 tool.
-Only macOS Apple silicon is qualified. Stop the broker before updating.
+Supports macOS Apple silicon and Linux x86-64 releases. Stop the broker before updating.
 Attestation verifies the exact repository/workflow/source before executable use.
 Older releases lacking this manifest/provenance are refused by this bootstrap;
 the existing sealed-directory deploy/rollback tooling remains compatible.
@@ -42,7 +42,11 @@ for destination in "$prefix" "$install_home" "$bin_dir"; do
     case "$destination" in /*) ;; *) fail 'use absolute installation paths' ;; esac
     [ "$destination" != / ] || fail 'refusing filesystem root as installation directory'
 done
-[ "$(uname -s)/$(uname -m)" = Darwin/arm64 ] || fail 'only macOS Apple silicon (Darwin/arm64) is qualified'
+case "$(uname -s)/$(uname -m)" in
+    Darwin/arm64) target=aarch64-apple-darwin ;;
+    Linux/x86_64) target=x86_64-unknown-linux-gnu ;;
+    *) fail 'supported platforms are macOS arm64 and Linux x86-64' ;;
+esac
 case "$downloader" in gh|curl|wget) ;; *) fail '--downloader must be gh, curl or wget' ;; esac
 for tool in gh jq tar ps "$downloader"; do command -v "$tool" >/dev/null 2>&1 || fail "required trusted tool: $tool"; done
 if command -v shasum >/dev/null 2>&1; then hash_tool=shasum;
@@ -162,7 +166,7 @@ if [ "$version" = latest ]; then
     version=$(jq -er 'select(.isDraft == false and .isPrerelease == false) | .tagName | ltrimstr("v")' "$temporary/latest.json") || fail 'stable release required'
 fi
 printf '%s\n' "$version" | LC_ALL=C awk 'BEGIN { ok=0 } /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/ { ok++ } END { exit !(NR == 1 && ok == 1) }' || fail 'version must be canonical X.Y.Z'
-asset=agent-run-$version-aarch64-apple-darwin.tar.gz
+asset=agent-run-$version-$target.tar.gz
 base=https://github.com/DKotsyuba/agent-run/releases/download/v$version
 bounded gh release view "v$version" --repo DKotsyuba/agent-run --json tagName,isDraft,isPrerelease > "$temporary/published.json" || fail 'exact release lookup failed'
 [ "$(wc -c < "$temporary/published.json")" -le 65536 ] || fail 'release metadata byte limit'
@@ -172,16 +176,22 @@ bounded gh api --hostname github.com repos/DKotsyuba/agent-run > "$temporary/rep
 jq -e '.id == 1348534205 and .full_name == "DKotsyuba/agent-run"' "$temporary/repo.json" >/dev/null || fail 'repository identity mismatch'
 download release-manifest.json 65536
 download SHA256SUMS 4096
-jq -e --arg version "$version" --arg asset "$asset" '
+jq -e --arg version "$version" '
     (keys | sort) == (["schema_version","product","version","tag","repository","repository_id","commit","workflow","standard_version","devkit_version","baseline","trust_profile","artifacts"] | sort) and
     .schema_version == 1 and .product == "agent-run" and .version == $version and .tag == ("v"+$version) and .repository == "DKotsyuba/agent-run" and .repository_id == 1348534205 and .trust_profile == "github-attestation" and (.commit | test("^[0-9a-f]{40}$")) and
     (.workflow | (keys | sort) == (["id","path","run_id","run_attempt"] | sort) and .id == 346709607 and .path == ".github/workflows/release.yml" and .run_id > 0 and .run_attempt > 0 and (.run_id | floor) == .run_id and (.run_attempt | floor) == .run_attempt) and
     all(.standard_version,.devkit_version,.baseline; type == "string" and length > 0 and length <= 128) and
-    (.artifacts | length) == 4 and ([.artifacts[].kind] | sort) == (["bundle","source","installer","evidence"] | sort) and
-    all(.artifacts[]; (.sha256 | test("^[0-9a-f]{64}$")) and .size > 0 and .size <= 536870912 and (.size | floor) == .size and
-      if .kind == "bundle" then (keys | sort) == (["name","kind","target","size","sha256"] | sort) and .name == $asset and .target == "aarch64-apple-darwin"
-      else (keys | sort) == (["name","kind","size","sha256"] | sort) and (.name == (if .kind == "source" then "agent-run-"+$version+"-source.tar" elif .kind == "installer" then "install.sh" else "acceptance.json" end)) end)
+    ((.artifacts | length) as $count |
+      ($count == 4 or $count == 5) and
+      ([.artifacts[].name] | length == (unique | length)) and
+      ([.artifacts[] | select(.kind != "bundle") | .kind] | sort) == (["source","installer","evidence"] | sort) and
+      ([.artifacts[] | select(.kind == "bundle") | .target] | sort) ==
+        (if $count == 4 then ["aarch64-apple-darwin"] else ["aarch64-apple-darwin","x86_64-unknown-linux-gnu"] end) and
+      all(.artifacts[]; (.sha256 | test("^[0-9a-f]{64}$")) and .size > 0 and .size <= 536870912 and (.size | floor) == .size and
+        if .kind == "bundle" then .target as $target_name | (keys | sort) == (["name","kind","target","size","sha256"] | sort) and .name == ("agent-run-"+$version+"-"+$target_name+".tar.gz")
+        else (keys | sort) == (["name","kind","size","sha256"] | sort) and (.name == (if .kind == "source" then "agent-run-"+$version+"-source.tar" elif .kind == "installer" then "install.sh" else "acceptance.json" end)) end))
 ' "$temporary/release-manifest.json" >/dev/null || fail 'release manifest identity/layout mismatch'
+jq -e --arg target "$target" 'any(.artifacts[]; .kind == "bundle" and .target == $target)' "$temporary/release-manifest.json" >/dev/null || fail 'this release has no binary for the selected platform'
 commit=$(jq -r '.commit' "$temporary/release-manifest.json")
 bounded gh api --hostname github.com "repos/DKotsyuba/agent-run/git/ref/tags/v$version" > "$temporary/tag.json" || fail 'tag lookup failed'
 [ "$(wc -c < "$temporary/tag.json")" -le 65536 ] || fail 'tag metadata limit'
@@ -221,7 +231,7 @@ bounded tar -tvzf "$temporary/$asset" > "$temporary/types" || fail 'invalid arch
 LC_ALL=C awk '
     substr($0,1,1)!="-" && substr($0,1,1)!="d" { exit 1 }
     { mode=$1; if(mode !~ /^[-d][r-][w-][x-][r-]-[x-][r-]-[x-]$/)exit 1; size=($3~/^[0-9]+$/)?$3:$5; if(size!~/^[0-9]+$/)exit 1; total+=size; if(total>2147483648||NR>10000)exit 1;
-      name=$NF; sub(/^\.\//,"",name); if(substr(mode,1,1)=="-"&&mode~/x/&&name!~/^(bin\/(agent-run|agent-run-tui|agent-run-deploy)|collectors\/[A-Za-z0-9_.-]+)$/)exit 1 }
+      name=$NF; sub(/^\.\//,"",name); if(substr(mode,1,1)=="-"&&mode~/x/&&name!~/^(bin\/(agent-run|agent-run-tui|agent-run-deploy)|collectors\/[A-Za-z0-9_.-]+|systemd\/agent-run-service\.sh)$/)exit 1 }
 ' "$temporary/types" || fail 'archive links and special files, modes or unpacked bounds refused'
 mkdir "$temporary/release"
 bounded tar -xzf "$temporary/$asset" --no-same-owner --no-same-permissions -C "$temporary/release" || fail 'archive extraction failed'

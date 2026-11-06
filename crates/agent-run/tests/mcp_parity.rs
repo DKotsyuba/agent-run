@@ -221,6 +221,8 @@ fn additive_wires() -> Vec<Value> {
         "pool",
         "list_pools",
         "agent_integration",
+        "capabilities",
+        "answer_chunk",
     ]
     .into_iter()
     .map(|name| {
@@ -231,6 +233,147 @@ fn additive_wires() -> Vec<Value> {
         value
     })
     .collect()
+}
+
+/// A real MCP proxy and temporary resident broker preserve exact observation
+/// schemas/content in structuredContent, including worst-case JSON escaping.
+/// CLI/socket read results agree and the synthetic execution is never launched.
+#[test]
+fn observation_live_mcp_and_cli_preserve_structured_read_results() {
+    let mut harness = Harness::new();
+    std::fs::write(harness.home.join("config.toml"),format!(
+        "schema_version=1\n[runtimes.mock]\nenabled=true\nadapter='claude'\nbinary='/usr/bin/true'\nhome={}\nmodels=['fixture']\nlimits_source='none'\n",
+        toml::Value::String(harness.home.join("runtimes/mock").to_string_lossy().into_owned()))).unwrap();
+    let config = agent_run::config::Config::load(&harness.home).unwrap();
+    let mut store = agent_run_store::fixture::open(&harness.home).unwrap();
+    let request = serde_json::from_value(json!({"runtime":"mock","model":"fixture","profile":"review","task":"synthetic","workdir":harness.home})).unwrap();
+    let (id, _) = store.admit(&request, &config, &json!({}), None).unwrap();
+    let root = harness.home.join("agents").join(id.as_str());
+    agent_run_platform::fs::private_dir(&root).unwrap();
+    let text = format!("{}é🦀", "\u{0000}".repeat(200_000));
+    let proof = agent_run_platform::verify::seal(&root, Path::new("answer.md"), &text).unwrap();
+    store.running(&id, 42).unwrap();
+    store
+        .finish(
+            &id,
+            &agent_run_domain::domain::Outcome::success(None),
+            Some(&proof),
+            None,
+        )
+        .unwrap();
+    let (medium_id, _) = store.admit(&request, &config, &json!({}), None).unwrap();
+    let medium_root = harness.home.join("agents").join(medium_id.as_str());
+    agent_run_platform::fs::private_dir(&medium_root).unwrap();
+    let medium_text = "a".repeat(16_000);
+    let medium_proof =
+        agent_run_platform::verify::seal(&medium_root, Path::new("answer.md"), &medium_text)
+            .unwrap();
+    store.running(&medium_id, 43).unwrap();
+    store
+        .finish(
+            &medium_id,
+            &agent_run_domain::domain::Outcome::success(None),
+            Some(&medium_proof),
+            None,
+        )
+        .unwrap();
+    let revision = store.revision().unwrap();
+    drop(store);
+    harness.start_broker();
+    let mut mcp = harness.mcp();
+    let _ = mcp.send(initialize("2025-11-25"));
+    let response = mcp.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"capabilities","arguments":{}}})).unwrap();
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let caps = &response["result"]["structuredContent"];
+    assert_eq!(caps, &agent_run_core::observation::capabilities());
+    let cli_caps = Command::new(env!("CARGO_BIN_EXE_agent-run"))
+        .arg("--home")
+        .arg(&harness.home)
+        .arg("capabilities")
+        .output()
+        .unwrap();
+    assert!(cli_caps.status.success(), "{cli_caps:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&cli_caps.stdout).unwrap(),
+        *caps
+    );
+    // The normal answer RPC returns recovery facts instead of dropping a
+    // verified inline answer that exceeds the MCP presentation budget.
+    let answer = mcp.send(json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"answer","arguments":{"agent_id":medium_id}}})).unwrap();
+    assert_ne!(answer["result"]["isError"], true, "{answer}");
+    let metadata = &answer["result"]["structuredContent"];
+    assert_eq!(metadata["sequence"], 1);
+    assert_eq!(metadata["sha256"], medium_proof.sha256);
+    assert_eq!(metadata["size_bytes"], medium_text.len());
+    assert!(
+        answer["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "resource_link")
+    );
+    let mut medium = String::new();
+    let mut medium_offset = 0;
+    loop {
+        let args = json!({"agent_id":medium_id,"sequence":metadata["sequence"],"expected_sha256":metadata["sha256"],"offset_bytes":medium_offset,"max_bytes":4096});
+        let response = mcp.send(json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"answer_chunk","arguments":args}})).unwrap();
+        assert_ne!(response["result"]["isError"], true, "{response}");
+        let chunk = &response["result"]["structuredContent"];
+        medium.push_str(chunk["content"].as_str().unwrap());
+        medium_offset = chunk["next_offset"].as_u64().unwrap();
+        if chunk["complete"] == true {
+            break;
+        }
+    }
+    assert_eq!(medium, medium_text);
+    // The socket may itself omit inline text when JSON escaping exceeds its
+    // frame budget; MCP must still return the same verified recovery facts.
+    let large_answer = mcp.send(json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"answer","arguments":{"agent_id":id}}})).unwrap();
+    assert_ne!(large_answer["result"]["isError"], true, "{large_answer}");
+    assert_eq!(large_answer["result"]["structuredContent"]["sequence"], 1);
+    assert_eq!(
+        large_answer["result"]["structuredContent"]["sha256"],
+        proof.sha256
+    );
+    let mut offset = 0;
+    let mut full = String::new();
+    loop {
+        let args = json!({"agent_id":id,"sequence":1,"expected_sha256":proof.sha256,"offset_bytes":offset,"max_bytes":131072});
+        let response = mcp.send(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"answer_chunk","arguments":args}})).unwrap();
+        assert_ne!(response["result"]["isError"], true, "{response}");
+        assert!(
+            serde_json::to_vec(&response).unwrap().len() < agent_run::transport::socket::MAX_FRAME
+        );
+        let chunk = &response["result"]["structuredContent"];
+        assert_eq!(chunk["sequence"], 1);
+        assert_eq!(chunk["sha256"], proof.sha256);
+        full.push_str(chunk["content"].as_str().unwrap());
+        offset = chunk["next_offset"].as_u64().unwrap();
+        if chunk["complete"] == true {
+            break;
+        }
+    }
+    assert_eq!(full, text);
+    assert_eq!(
+        agent_run_platform::fs::sha256(full.as_bytes()),
+        proof.sha256
+    );
+    let error = mcp.send(json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"answer_chunk","arguments":{"agent_id":id,"sequence":2,"expected_sha256":proof.sha256,"offset_bytes":0}}})).unwrap();
+    assert_eq!(error["result"]["isError"], true);
+    assert!(
+        error["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("ExecutionChanged")
+    );
+    assert_eq!(
+        agent_run_store::writer::StoreReader::open(&harness.home)
+            .unwrap()
+            .revision()
+            .unwrap(),
+        revision
+    );
+    mcp.finish();
 }
 
 /// Applies the explicit discovery delta to frozen Python tool arrays: call-only
@@ -478,6 +621,7 @@ fn mcp_rejects_oversized_stdio_frame() {
 /// only its generated worker snapshot, rejects operator tools/injected identity,
 /// and reports business failure plus a successful fixture enqueue receipt without
 /// leaking capability material. The fixture broker is bounded and owns only its socket.
+/// The legacy fixture removes inherited completion/research catalog selectors.
 #[test]
 fn worker_binary_discovery_protocol_errors_and_eof() {
     let harness = Harness::new();
@@ -487,6 +631,8 @@ fn worker_binary_discovery_protocol_errors_and_eof() {
         .env("AGENT_RUN_WORKER_RUN_ID", "ag-20260928-000000-0000000001")
         .env("AGENT_RUN_WORKER_ATTEMPT_ID", "fixture-attempt")
         .env("AGENT_RUN_WORKER_TOKEN", "a".repeat(64))
+        .env_remove(agent_run_domain::worker::FINISH_ENV)
+        .env_remove(agent_run_domain::worker::RESEARCH_ENV)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -757,35 +903,45 @@ fn long_rpc_ids_are_rejected_before_tool_dispatch() {
     let stop = stopped.clone();
     let broker = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+        'connections: while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(2)))
-                        .unwrap();
+                    stream.set_nonblocking(true).unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = Vec::new();
+                    let read_deadline = (Instant::now() + Duration::from_secs(2)).min(deadline);
+                    loop {
+                        match reader.read_until(b'\n', &mut line) {
+                            Ok(0) if line.is_empty() => continue 'connections,
+                            Ok(_) if line.last() == Some(&b'\n') => break,
+                            Ok(_) => panic!("fixture broker received a partial request"),
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                if Instant::now() >= read_deadline {
+                                    assert!(
+                                        line.is_empty(),
+                                        "fixture broker received a partial request"
+                                    );
+                                    continue 'connections;
+                                }
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(error)
+                                if line.is_empty()
+                                    && error.kind() == std::io::ErrorKind::ConnectionReset =>
+                            {
+                                continue 'connections;
+                            }
+                            Err(error) => panic!("fixture broker read: {error}"),
+                        }
+                    }
+                    let call: Value = serde_json::from_slice(&line).unwrap();
+                    assert_eq!(call["method"], "doc");
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_write_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
-                    let mut line = String::new();
-                    match BufReader::new(stream.try_clone().unwrap()).read_line(&mut line) {
-                        Ok(0) => continue,
-                        Err(error)
-                            if line.is_empty()
-                                && matches!(
-                                    error.kind(),
-                                    std::io::ErrorKind::WouldBlock
-                                        | std::io::ErrorKind::TimedOut
-                                        | std::io::ErrorKind::ConnectionReset
-                                ) =>
-                        {
-                            continue;
-                        }
-                        Ok(_) => {}
-                        Err(error) => panic!("fixture broker read: {error}"),
-                    }
-                    let call: Value = serde_json::from_str(&line).unwrap();
-                    assert_eq!(call["method"], "doc");
-                    seen.fetch_add(1, Ordering::SeqCst);
                     let response = json!({"jsonrpc":"2.0","id":call["id"],"result":{"text":"guide\n".repeat(1024)}});
                     writeln!(stream, "{response}").unwrap();
                 }

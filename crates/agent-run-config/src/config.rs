@@ -175,7 +175,7 @@ impl Default for Delivery {
 }
 
 /// Trusted deployment configuration for Bridge publication and an optional
-/// first-party OpenCode lifecycle asset projection.
+/// first-party OpenCode lifecycle and protected MCP asset projection.
 /// This creates no credential, native caller identity or job admission authority.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -199,17 +199,17 @@ pub struct BridgeDelivery {
     /// Explicit OpenCode namespace; absence never guesses a return destination.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_store: Option<String>,
-    /// Operator-selected first-party lifecycle component, sealed into each eligible home.
+    /// Operator-selected first-party native-context ABI 2 component, sealed into each eligible home.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_plugin: Option<OpenCodeBridgePlugin>,
 }
 
-/// First-party OpenCode lifecycle assets, independent of arbitrary runtime plugins.
+/// First-party OpenCode lifecycle and protected MCP assets, independent of arbitrary runtime plugins.
 /// These paths identify deployed Bridge code, never recipient admission authority.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenCodeBridgePlugin {
-    /// Absolute source package containing the Bridge lifecycle manifest and index.js.
+    /// Absolute source package containing the Bridge native-context ABI 2 manifest and index.js.
     pub package: PathBuf,
     /// Absolute credential-free bridge-hook executable, copied into the frozen home.
     pub hook_command: PathBuf,

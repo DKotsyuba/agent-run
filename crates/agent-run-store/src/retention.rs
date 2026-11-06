@@ -36,8 +36,9 @@ const SCANNED_CANDIDATES: usize = 256;
 /// SQL for one agent `x` that retention may treat as expired for a pool:
 /// terminal with a known finish time older than the cutoff (`?1`) or in a
 /// count-expired lineage (`retention_roots`), with no owned attempt, no attempt
-/// lacking verified cleanup, queued notice, workflow reference, active managed-service
-/// lease, or prepared runtime layout. Protected members retain their pool history.
+/// lacking verified cleanup, active restart, queued notice, workflow reference,
+/// active managed-service lease, or prepared runtime layout. Protected members
+/// retain their pool history.
 /// Notices that are `waiting_binding` do not protect: they have no recipient
 /// to wait for once the whole pool is otherwise expired (see
 /// [`pool_releasable`]).
@@ -46,6 +47,8 @@ const POOL_AGENT_EXPIRED: &str = "(x.status IN ('succeeded','failed','timed_out'
      AND (x.finished_at < ?1 OR COALESCE(NULLIF(x.root_agent_id,''),x.id) IN (SELECT root FROM retention_roots)) \
      AND NOT EXISTS (SELECT 1 FROM attempts t WHERE t.agent_id=x.id \
           AND (t.ownership_active=1 OR t.cleanup_proof_json IS NULL OR t.phase!='cleanup_complete')) \
+     AND NOT EXISTS (SELECT 1 FROM service_restart_agents ra JOIN service_restarts rs ON rs.id=ra.restart_id \
+          WHERE rs.finished_at IS NULL AND (ra.agent_id=x.id OR ra.resumed_execution_id=x.id)) \
      AND NOT EXISTS (SELECT 1 FROM workflow_steps s WHERE s.agent_id=x.id) \
      AND NOT EXISTS (SELECT 1 FROM managed_service_leases l WHERE l.agent_id=x.id AND l.released_at IS NULL) \
      AND NOT EXISTS (SELECT 1 FROM runtime_storage_layouts r WHERE r.state='prepared' \
@@ -65,7 +68,7 @@ fn pool_releasable() -> String {
 
 /// SQL predicate on an `agents` row `a` eligible for history removal: a
 /// terminal agent finished before the cutoff (`?1`) or in a count-expired
-/// lineage (`retention_roots`), with no owned attempt, child, pool
+/// lineage (`retention_roots`), with no owned attempt, active restart, child, pool
 /// membership, workflow step, unreleased service lease, live sending
 /// delivery (lease still valid at the time bound as `at`) or prepared
 /// runtime layout. Shared by the writer batch and the reader preparer.
@@ -76,6 +79,8 @@ fn agent_eligible(at: &str) -> String {
               OR (a.finished_at IS NOT NULL \
                   AND COALESCE(NULLIF(a.root_agent_id,''),a.id) IN (SELECT root FROM retention_roots))) \
          AND NOT EXISTS (SELECT 1 FROM attempts t WHERE t.agent_id=a.id AND t.ownership_active=1) \
+         AND NOT EXISTS (SELECT 1 FROM service_restart_agents ra JOIN service_restarts rs ON rs.id=ra.restart_id \
+           WHERE rs.finished_at IS NULL AND (ra.agent_id=a.id OR ra.resumed_execution_id=a.id)) \
          AND NOT EXISTS (SELECT 1 FROM agents child WHERE child.parent_agent_id=a.id) \
          AND NOT EXISTS (SELECT 1 FROM pool_members pm WHERE pm.agent_id=COALESCE(NULLIF(a.root_agent_id,''),a.id)) \
          AND NOT EXISTS (SELECT 1 FROM workflow_steps s WHERE s.agent_id=a.id) \
@@ -582,6 +587,11 @@ impl Store<'_> {
              OR EXISTS(SELECT 1 FROM pools p WHERE {releasable})
              OR EXISTS(SELECT 1 FROM capacity_samples WHERE observed_at < ?1)
              OR EXISTS(SELECT 1 FROM capacity_route_snapshots WHERE valid_until < ?1)
+             OR EXISTS(SELECT 1 FROM binding_cooldowns WHERE blocked_until < ?1)
+             OR EXISTS(SELECT 1 FROM service_restarts r WHERE r.finished_at < ?1
+                AND NOT EXISTS (SELECT 1 FROM service_restart_agents a WHERE a.restart_id=r.id)
+                AND NOT EXISTS (SELECT 1 FROM service_restart_notices n JOIN deliveries d ON d.id=n.delivery_id
+                  WHERE n.restart_id=r.id AND d.state NOT IN ('delivered','failed','cancelled','expired')))
              OR EXISTS(SELECT 1 FROM managed_service_generations
                 WHERE state='stopped' AND COALESCE(checked_at,created_at) < ?1)
              OR EXISTS(SELECT 1 FROM orchestrator_sessions s WHERE s.last_seen_at < ?1
@@ -854,6 +864,21 @@ impl Store<'_> {
             )?;
         }
         deleted += tx.execute("DELETE FROM agents WHERE id IN retention_agents", [])?;
+        // Service notices use the ordinary delivery outbox. Keep nonterminal
+        // deliveries and restart links for retained agents.
+        deleted += tx.execute(
+            "DELETE FROM deliveries WHERE id IN (SELECT n.delivery_id FROM service_restart_notices n \
+             JOIN service_restarts r ON r.id=n.restart_id WHERE r.finished_at < ? \
+             AND NOT EXISTS (SELECT 1 FROM service_restart_agents a WHERE a.restart_id=r.id) \
+             AND NOT EXISTS (SELECT 1 FROM service_restart_notices x JOIN deliveries d ON d.id=x.delivery_id \
+               WHERE x.restart_id=r.id AND d.state NOT IN ('delivered','failed','cancelled','expired')) LIMIT 64)", [cutoff],
+        )?;
+        deleted += tx.execute(
+            "DELETE FROM service_restarts WHERE id IN (SELECT r.id FROM service_restarts r
+             WHERE r.finished_at < ? AND NOT EXISTS (SELECT 1 FROM service_restart_agents a WHERE a.restart_id=r.id)
+             AND NOT EXISTS (SELECT 1 FROM service_restart_notices n WHERE n.restart_id=r.id)
+             ORDER BY r.finished_at,r.id LIMIT 32)", [cutoff],
+        )?;
         deleted += tx.execute(
             "DELETE FROM capacity_samples WHERE id IN
             (SELECT id FROM capacity_samples WHERE observed_at < ? LIMIT ?)",
@@ -861,6 +886,10 @@ impl Store<'_> {
         )?;
         deleted += tx.execute(
             "DELETE FROM capacity_route_snapshots WHERE valid_until < ?",
+            [cutoff],
+        )?;
+        deleted += tx.execute(
+            "DELETE FROM binding_cooldowns WHERE blocked_until < ?",
             [cutoff],
         )?;
         tx.execute(

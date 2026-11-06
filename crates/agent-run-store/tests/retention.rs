@@ -139,6 +139,62 @@ fn retention_protects_active_ownership_lineage_and_exact_age_boundary() {
     integrity(&store);
 }
 
+/// In-progress restarts retain their source; completed cycles retain unsent
+/// notices without pinning the expired agent or its private history.
+#[test]
+fn retention_preserves_restart_work_and_pending_notices() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let id = agent(&home, &mut store, "running", None);
+    store
+        .bind_orchestrator(
+            &id,
+            &OrchestratorRef {
+                transport: "codex".into(),
+                external_session_id: "restart-owner".into(),
+                external_turn_id: None,
+            },
+            NOW - HISTORY_SECONDS - 100.0,
+        )
+        .unwrap();
+    let restart = store
+        .begin_service_restart("retention-restart", NOW - HISTORY_SECONDS - 2.0)
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='succeeded',finished_at=? WHERE id=?",
+            params![NOW - HISTORY_SECONDS - 1.0, id.as_str()],
+        )
+        .unwrap();
+    drain(&mut store, 10);
+    assert!(store.get(&id).is_ok(), "a restart still needs its source");
+    store
+        .conn
+        .execute(
+            "UPDATE service_restarts SET phase='complete',finished_at=? WHERE id=?",
+            params![NOW - HISTORY_SECONDS - 1.0, restart],
+        )
+        .unwrap();
+    drain(&mut store, 10);
+    assert!(
+        store.get(&id).is_err(),
+        "completed restart must not pin history"
+    );
+    assert_eq!(count(&store, "service_restart_agents"), 0);
+    assert_eq!(count(&store, "service_restarts"), 1);
+    assert_eq!(count(&store, "service_restart_notices"), 1);
+    integrity(&store);
+    store
+        .conn
+        .execute("UPDATE deliveries SET state='delivered' WHERE id IN (SELECT delivery_id FROM service_restart_notices)", [])
+        .unwrap();
+    drain(&mut store, 10);
+    assert_eq!(count(&store, "service_restarts"), 0);
+    assert_eq!(count(&store, "service_restart_notices"), 0);
+    integrity(&store);
+}
+
 /// Large journals drain in batches, retaining referenced terminal events until their notices drain.
 #[test]
 fn retention_drains_large_runs_and_all_attempt_dependents() {
@@ -444,6 +500,41 @@ fn retention_keeps_service_recovery_and_account_quota_latches() {
     assert!(store.get(&agent).is_ok());
     assert!(!store.vacuum_history().unwrap());
     integrity(&store);
+}
+
+/// An active binding cooldown survives agent-history pruning and a reopened
+/// store; a cooldown long past expiry is removed by normal maintenance.
+#[test]
+fn retention_preserves_active_binding_cooldown_without_its_attempt() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let old = NOW - HISTORY_SECONDS - 1.0;
+    let id = agent(&home, &mut store, "succeeded", Some(old));
+    store
+        .conn
+        .execute(
+            "INSERT INTO provider_accounts VALUES ('account','fixture','env:TEST','enabled',0,0)",
+            [],
+        )
+        .unwrap();
+    for (provider, observed, until) in [
+        ("active", NOW - 3000.0, NOW + 600.0),
+        ("expired", old - 3601.0, old - 1.0),
+    ] {
+        store.conn.execute(
+            "INSERT INTO binding_cooldowns(provider_id,account_id,reason,observed_at,blocked_until,attempt_id) VALUES(?1,'account','billing_unavailable',?2,?3,?4)",
+            params![provider, observed, until, id.as_str()],
+        ).unwrap();
+    }
+    drain(&mut store, 16);
+    assert!(store.get(&id).is_err());
+    assert_eq!(count(&store, "binding_cooldowns"), 1);
+    drop(store);
+    let reopened = Store::open(&home.path).unwrap();
+    let until: f64 = reopened.conn.query_row(
+        "SELECT blocked_until FROM binding_cooldowns WHERE provider_id='active' AND account_id='account'", [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(until, NOW + 600.0);
 }
 
 /// Retention's foreign-key checks use indexes instead of scanning other agents' full journals.

@@ -173,6 +173,7 @@ fn admission(home: &common::Home, ordinal: u64) -> agent_run_store::ops::LocalEn
             config_revision: "fixture".into(),
             identity: serde_json::json!({}),
             parent: None,
+            restart_id: None,
         }),
     )
     .unwrap()

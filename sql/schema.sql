@@ -119,7 +119,7 @@ CREATE TABLE commands (
 
 CREATE TABLE deliveries (
   id TEXT PRIMARY KEY,
-  agent_id TEXT NOT NULL REFERENCES agents(id),
+  agent_id TEXT REFERENCES agents(id),
   orchestrator_session_id TEXT REFERENCES orchestrator_sessions(id),
   terminal_event_seq INTEGER REFERENCES events(seq),
   state TEXT NOT NULL CHECK (
@@ -705,4 +705,69 @@ ALTER TABLE agents ADD COLUMN supervisor_capability_sha256 TEXT
 ALTER TABLE managed_service_generations ADD COLUMN exec_capability_sha256 TEXT
   CHECK (exec_capability_sha256 IS NULL OR length(exec_capability_sha256) = 64);
 
-PRAGMA user_version = 32;
+-- Binding cooldowns are separate from quota and survive history retention.
+CREATE TABLE binding_cooldowns (
+  provider_id TEXT NOT NULL CHECK (length(trim(provider_id)) > 0),
+  account_id TEXT NOT NULL REFERENCES provider_accounts(account_id),
+  reason TEXT NOT NULL CHECK (reason IN ('billing_unavailable', 'quota_exhausted')),
+  observed_at REAL NOT NULL CHECK (observed_at >= 0),
+  blocked_until REAL NOT NULL CHECK (blocked_until > observed_at),
+  attempt_id TEXT NOT NULL CHECK (length(trim(attempt_id)) > 0),
+  PRIMARY KEY (account_id, provider_id)
+);
+CREATE INDEX idx_binding_cooldowns_expiry ON binding_cooldowns(blocked_until);
+
+-- Restart history is retained with its agents and any unsent notifications.
+CREATE TABLE service_restarts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id TEXT NOT NULL UNIQUE,
+  phase TEXT NOT NULL CHECK (phase IN ('preparing','ready','requesting','recovering','complete')),
+  started_at REAL NOT NULL,
+  boot_id TEXT NOT NULL,
+  notice_wait_started_ns INTEGER,
+  writer_epoch INTEGER,
+  finished_at REAL,
+  CHECK ((phase='complete') = (finished_at IS NOT NULL))
+);
+CREATE UNIQUE INDEX service_restart_one_active ON service_restarts((1)) WHERE finished_at IS NULL;
+
+CREATE TABLE service_restart_agents (
+  restart_id INTEGER NOT NULL REFERENCES service_restarts(id) ON DELETE CASCADE,
+  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  orchestrator_session_id TEXT REFERENCES orchestrator_sessions(id) ON DELETE SET NULL,
+  cancelled_before_restart INTEGER NOT NULL DEFAULT 0 CHECK (cancelled_before_restart IN (0,1)),
+  first_notice_ns INTEGER,
+  second_notice_ns INTEGER,
+  force_requested_ns INTEGER,
+  resume_requested_ns INTEGER,
+  resumed_execution_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+  resume_status TEXT NOT NULL DEFAULT 'pending' CHECK (resume_status IN ('pending','started','failed','unconfirmed','cancelled','finished')),
+  resume_error TEXT,
+  PRIMARY KEY (restart_id,agent_id)
+);
+CREATE INDEX service_restart_agents_agent ON service_restart_agents(agent_id);
+CREATE INDEX service_restart_agents_child ON service_restart_agents(resumed_execution_id) WHERE resumed_execution_id IS NOT NULL;
+
+CREATE TABLE service_restart_recipients (
+  restart_id INTEGER NOT NULL REFERENCES service_restarts(id) ON DELETE CASCADE,
+  transport TEXT NOT NULL,
+  external_session_id TEXT NOT NULL,
+  had_agents INTEGER NOT NULL DEFAULT 0 CHECK (had_agents IN (0,1)),
+  tried_start INTEGER NOT NULL DEFAULT 0 CHECK (tried_start IN (0,1)),
+  PRIMARY KEY (restart_id,transport,external_session_id)
+);
+
+CREATE TABLE service_restart_notices (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  restart_id INTEGER NOT NULL,
+  transport TEXT NOT NULL,
+  external_session_id TEXT NOT NULL,
+  stage TEXT NOT NULL CHECK (stage IN ('before','after')),
+  message TEXT NOT NULL,
+  delivery_id TEXT NOT NULL UNIQUE REFERENCES deliveries(id) ON DELETE CASCADE,
+  UNIQUE (restart_id,transport,external_session_id,stage),
+  FOREIGN KEY (restart_id,transport,external_session_id)
+    REFERENCES service_restart_recipients(restart_id,transport,external_session_id) ON DELETE CASCADE
+);
+
+PRAGMA user_version = 35;

@@ -310,7 +310,8 @@ pub struct WorkerCatalogProof {
 
 /// Private broker method accepted only from an authenticated worker capability.
 pub const METHOD: &str = "worker/notify";
-/// Launch-time inherited names carrying home, exact run, attempt, and secret.
+/// Launch-time inherited names carrying a private home or authenticated system
+/// endpoint, followed by the exact run, attempt, and secret.
 pub const ENV_NAMES: [&str; 4] = [
     "AGENT_RUN_WORKER_HOME",
     "AGENT_RUN_WORKER_RUN_ID",
@@ -613,9 +614,7 @@ mod tests {
 #[cfg(test)]
 mod completion_catalog_history_tests {
     use super::*;
-    /// The previously admitted ordinary-worker v2 fingerprint stays
-    /// accepted. v3 preserves its old effect hints; v4 truthfully advertises
-    /// the new guard without changing any historical fingerprint.
+    /// Previously admitted catalog fingerprints retain their original effect hints.
     #[test]
     fn guarded_reads_preserve_v2_v3_catalog_fingerprints() {
         assert!(known_pool_catalog(

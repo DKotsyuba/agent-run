@@ -16,7 +16,7 @@ use serde_json::Value;
 use std::{
     fs::{self, OpenOptions},
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path},
 };
 
@@ -34,28 +34,68 @@ fn valid_raw_ref(raw_ref: &str) -> bool {
             .all(|part| matches!(part, Component::Normal(_)))
 }
 
+/// Selects the explicitly checked private or system artifact layout.
+#[derive(Clone, Copy)]
+enum SpoolAccess {
+    Private,
+    System,
+}
+
 /// Writes an oversized transcript body beneath its agent directory and returns its stub/reference.
-fn spool(home: &Path, id: &AgentId, content: &str) -> Result<(String, String)> {
+fn spool(
+    home: &Path,
+    id: &AgentId,
+    content: &str,
+    access: SpoolAccess,
+) -> Result<(String, String)> {
     let directory = home.join("agents").join(id.as_str());
-    fs::create_dir_all(&directory)?;
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    let system_directory = match access {
+        SpoolAccess::System => Some(agent_run_platform::fs::Dir::open(&directory)?),
+        SpoolAccess::Private => None,
+    };
+    if matches!(access, SpoolAccess::Private) {
+        fs::create_dir_all(&directory)?;
+        if fs::symlink_metadata(&directory)?.mode() & 0o2000 != 0 {
+            return Err(Error::Integrity(
+                "system artifact directory needs its frozen route".into(),
+            ));
+        }
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    }
     let bytes = content.as_bytes();
     for _ in 0..16 {
         let name = format!("message.{}.raw", uuid::Uuid::new_v4().simple());
-        let path = directory.join(&name);
-        let opened = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path);
-        let Ok(mut file) = opened else { continue };
-        let write = (|| -> std::io::Result<()> {
-            file.write_all(bytes)?;
-            file.sync_all()
-        })();
-        if let Err(error) = write {
-            let _ = fs::remove_file(path);
-            return Err(error.into());
+        match access {
+            SpoolAccess::Private => {
+                let path = directory.join(&name);
+                let opened = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path);
+                let Ok(mut file) = opened else { continue };
+                let write = (|| -> std::io::Result<()> {
+                    file.write_all(bytes)?;
+                    file.sync_all()
+                })();
+                if let Err(error) = write {
+                    let _ = fs::remove_file(path);
+                    return Err(error.into());
+                }
+            }
+            SpoolAccess::System => {
+                let directory = system_directory.as_ref().expect("system directory checked");
+                let mut file = match directory.create_exclusive(Path::new(&name), 0o660) {
+                    Ok(file) => file,
+                    Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                file.write_all(bytes)?;
+                file.sync_all()?;
+                directory.sync()?;
+            }
         }
         let stub = format!(
             "{}\n[...spooled: {} bytes exceed the 32 KiB inline limit; full content in raw_ref={name}]",
@@ -79,13 +119,24 @@ pub(crate) fn message_storage(
     content: &str,
     raw_ref: Option<&str>,
 ) -> Result<(String, Option<String>)> {
+    message_storage_with_access(home, id, content, raw_ref, SpoolAccess::Private)
+}
+
+/// Stores a message using the selected execution artifact policy.
+fn message_storage_with_access(
+    home: &Path,
+    id: &AgentId,
+    content: &str,
+    raw_ref: Option<&str>,
+    access: SpoolAccess,
+) -> Result<(String, Option<String>)> {
     if raw_ref.is_some_and(|value| !valid_raw_ref(value)) {
         return Err(invalid("raw_ref must be a normalized relative path"));
     }
     if content.len() <= MAX_INLINE_MESSAGE_BYTES {
         return Ok((content.to_owned(), raw_ref.map(str::to_owned)));
     }
-    let (stub, reference) = spool(home, id, content)?;
+    let (stub, reference) = spool(home, id, content, access)?;
     Ok((stub, Some(reference)))
 }
 
@@ -318,8 +369,59 @@ pub fn prepare_message_fragment(
     attempt: Option<&str>,
     error: Option<(bool, &str)>,
 ) -> Result<crate::ops::JournalFragment> {
+    prepare_message_fragment_with_access(
+        home,
+        id,
+        role,
+        text,
+        name,
+        raw_ref,
+        attempt,
+        error,
+        SpoolAccess::Private,
+    )
+}
+
+/// Prepares a fragment in the pre-validated shared service artifact directory.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_system_message_fragment(
+    home: &Path,
+    id: &AgentId,
+    role: &str,
+    text: &str,
+    name: Option<&str>,
+    raw_ref: Option<&str>,
+    attempt: Option<&str>,
+    error: Option<(bool, &str)>,
+) -> Result<crate::ops::JournalFragment> {
+    prepare_message_fragment_with_access(
+        home,
+        id,
+        role,
+        text,
+        name,
+        raw_ref,
+        attempt,
+        error,
+        SpoolAccess::System,
+    )
+}
+
+/// Prepares one fragment with the selected private or system spool policy.
+#[allow(clippy::too_many_arguments)]
+fn prepare_message_fragment_with_access(
+    home: &Path,
+    id: &AgentId,
+    role: &str,
+    text: &str,
+    name: Option<&str>,
+    raw_ref: Option<&str>,
+    attempt: Option<&str>,
+    error: Option<(bool, &str)>,
+    access: SpoolAccess,
+) -> Result<crate::ops::JournalFragment> {
     let content_complete = text.len() <= MAX_INLINE_MESSAGE_BYTES;
-    let (content, raw_ref) = message_storage(home, id, text, raw_ref)?;
+    let (content, raw_ref) = message_storage_with_access(home, id, text, raw_ref, access)?;
     Ok(crate::ops::JournalFragment::Message {
         role: role.to_owned(),
         content,

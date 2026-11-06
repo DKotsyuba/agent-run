@@ -470,6 +470,12 @@ pub enum RejectCode {
     Transition,
     /// Stored evidence failed an integrity check.
     Integrity,
+    /// An observation receipt no longer names the current execution.
+    ExecutionChanged,
+    /// The sealed answer differs from an observation's required digest.
+    AnswerHashMismatch,
+    /// The current execution has no recorded sealed answer.
+    AnswerUnavailable,
     /// Typed provider admission refusal (payload in [`RejectionPayload`]).
     QuotaAdmission,
     /// Active-agent capacity is exhausted (`Error::Capacity`).
@@ -587,6 +593,9 @@ impl StorageRejection {
             Error::AnswerIntegrity(text) | Error::Integrity(text) => {
                 (RejectCode::Integrity, text.clone())
             }
+            Error::ExecutionChanged => (RejectCode::ExecutionChanged, error.to_string()),
+            Error::AnswerHashMismatch => (RejectCode::AnswerHashMismatch, error.to_string()),
+            Error::AnswerUnavailable => (RejectCode::AnswerUnavailable, error.to_string()),
             Error::Json(_) => (RejectCode::Validation, "invalid JSON payload".to_owned()),
             Error::Sql(_)
             | Error::Io(_)
@@ -619,6 +628,9 @@ impl StorageRejection {
             }
             (RejectCode::Transition, _) => Error::Transition(self.message.clone()),
             (RejectCode::Integrity, _) => Error::Integrity(self.message.clone()),
+            (RejectCode::ExecutionChanged, _) => Error::ExecutionChanged,
+            (RejectCode::AnswerHashMismatch, _) => Error::AnswerHashMismatch,
+            (RejectCode::AnswerUnavailable, _) => Error::AnswerUnavailable,
             (RejectCode::Unsupported | RejectCode::SchemaUnsupported, _) => {
                 Error::Unsupported(self.message.clone())
             }
@@ -1012,7 +1024,7 @@ mod tests {
     }
 
     /// Every closed domain class survives the refusal round trip with its
-    /// public machine code, including Capacity and PathEscape.
+    /// public machine code, including execution/answer observation fences.
     #[test]
     fn rejection_round_trip_keeps_public_classes() {
         let cases = [
@@ -1024,10 +1036,17 @@ mod tests {
             Error::Integrity("integrity".into()),
             Error::Unsupported("unsupported".into()),
             Error::Validation("invalid".into()),
+            Error::ExecutionChanged,
+            Error::AnswerHashMismatch,
+            Error::AnswerUnavailable,
         ];
         for error in cases {
             let kind = error.public().kind;
-            let back = StorageRejection::from_error(&error, RejectStage::Statement).into_error();
+            let rejection = StorageRejection::from_error(&error, RejectStage::Statement);
+            let wire = serde_json::to_vec(&rejection).unwrap();
+            let back = serde_json::from_slice::<StorageRejection>(&wire)
+                .unwrap()
+                .into_error();
             assert_eq!(back.public().kind, kind);
         }
     }

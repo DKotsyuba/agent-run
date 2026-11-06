@@ -50,8 +50,12 @@ jobs:
       - name: Normalize temporary root for Unix socket fixtures
         shell: bash
         run: |
-          temporary="$(cd "$RUNNER_TEMP" && pwd -P)"
-          printf 'TMPDIR=%s\nTMP=%s\nTEMP=%s\n' "$temporary" "$temporary" "$temporary" >> "$GITHUB_ENV"
+          root="$(cd "$RUNNER_TEMP" && pwd -P)"
+          # Codex must not place shared assets inside its writable TMPDIR.
+          mkdir -p "$root/agent-run-tmp" "$root/agent-run-fixtures"
+          temporary="$root/agent-run-tmp"
+          fixtures="$root/agent-run-fixtures"
+          printf 'TMPDIR=%s\nTMP=%s\nTEMP=%s\nAGENT_RUN_TEST_TMP=%s\nAGENT_RUN_TEST_SOCKET_TMP=%s\n' "$temporary" "$temporary" "$temporary" "$fixtures" "$fixtures" >> "$GITHUB_ENV"
       - name: Observe full source and dependency gates
         shell: bash
         run: |
@@ -121,9 +125,80 @@ jobs:
           path: dist/*
           if-no-files-found: error
           retention-days: 7
+  native-linux:
+    name: Check and build x86_64-unknown-linux-gnu archive
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Restore Linux dependency cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: agent-run-check-v2-ubuntu-22.04-x86_64
+          cache-bin: false
+          save-if: false
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Verify native runner architecture
+        run: test "$(uname -s)/$(uname -m)" = Linux/x86_64
+      - name: Normalize temporary root for Unix socket fixtures
+        shell: bash
+        run: |
+          root="$(cd "$RUNNER_TEMP" && pwd -P)"
+          # Codex must not place shared assets inside its writable TMPDIR.
+          mkdir -p "$root/agent-run-tmp" "$root/agent-run-fixtures"
+          temporary="$root/agent-run-tmp"
+          fixtures="$root/agent-run-fixtures"
+          printf 'TMPDIR=%s\nTMP=%s\nTEMP=%s\nAGENT_RUN_TEST_TMP=%s\nAGENT_RUN_TEST_SOCKET_TMP=%s\n' "$temporary" "$temporary" "$temporary" "$fixtures" "$fixtures" >> "$GITHUB_ENV"
+      - name: Prepare protected Linux socket fixture root
+        shell: bash
+        run: |
+          socket_root="/run/agent-run-ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          sudo mkdir -m 0750 "$socket_root"
+          sudo chown "$(id -u):$(id -g)" "$socket_root"
+          sudo chmod 0750 "$socket_root"
+          printf 'AGENT_RUN_TEST_SOCKET_TMP=%s\n' "$socket_root" >> "$GITHUB_ENV"
+      - name: Run Linux gates and build the exact payload
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          target=x86_64-unknown-linux-gnu
+          mkdir dist
+          cargo xtask package accept --accepted-commit "$GITHUB_SHA" --target "$target" --output dist/acceptance.json -- cargo xtask check
+          cargo xtask package accept --accepted-commit "$GITHUB_SHA" --target "$target" --output dist/acceptance.json -- node --test scripts/check-desktop-transport.cjs scripts/check-codegraph-probe.cjs
+          cargo xtask package accept --accepted-commit "$GITHUB_SHA" --target "$target" --output dist/acceptance.json -- cargo xtask release build-native --target "$target" --output "$RUNNER_TEMP/native" --version "$version"
+          cargo xtask release verify --release "$RUNNER_TEMP/native/releases/$version"
+          tar --format=ustar -C "$RUNNER_TEMP/native/releases/$version" -czf "dist/agent-run-$version-$target.tar.gz" .
+          cargo xtask package smoke --accepted-commit "$GITHUB_SHA" --target "$target" --directory dist
+          mv dist/acceptance.json dist/native-linux.json
+      - name: Upload exact Linux payload and evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-x86_64-unknown-linux-gnu
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+      - name: Retain Linux failure evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-diagnostics-attempt-${{ github.run_attempt }}
+          path: dist/acceptance.json
+          if-no-files-found: warn
+          retention-days: 7
   publish:
     name: Publish verified release
-    needs: [gate, native]
+    needs: [gate, native, native-linux]
     runs-on: macos-15
     timeout-minutes: 30
     permissions:
@@ -158,9 +233,9 @@ jobs:
         run: |
           mkdir dist
           version="${GITHUB_REF_NAME#v}"
-          cp "$RUNNER_TEMP/candidate/agent-run-$version-aarch64-apple-darwin.tar.gz" "$RUNNER_TEMP/candidate/agent-run-$version-source.tar" "$RUNNER_TEMP/candidate/install.sh" dist/
+          cp "$RUNNER_TEMP/candidate/agent-run-$version-aarch64-apple-darwin.tar.gz" "$RUNNER_TEMP/candidate/agent-run-$version-x86_64-unknown-linux-gnu.tar.gz" "$RUNNER_TEMP/candidate/agent-run-$version-source.tar" "$RUNNER_TEMP/candidate/install.sh" dist/
           verifier=target/aarch64-apple-darwin/release/xtask
-          "$verifier" package merge-evidence --accepted-commit "$GITHUB_SHA" --gate "$RUNNER_TEMP/candidate/gate.json" --native "$RUNNER_TEMP/candidate/native.json" --directory dist
+          "$verifier" package merge-evidence --accepted-commit "$GITHUB_SHA" --gate "$RUNNER_TEMP/candidate/gate.json" --native "$RUNNER_TEMP/candidate/native.json" --linux "$RUNNER_TEMP/candidate/native-linux.json" --directory dist
           "$verifier" package create --accepted-commit "$GITHUB_SHA" --directory dist
           "$verifier" package verify --accepted-commit "$GITHUB_SHA" --directory dist --workflow-id "$AGENT_RUN_WORKFLOW_ID" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
           awk -v version="$version" '$0 == "## "version || $0 == "## ["version"]" { printing=1; next } printing && /^## / { exit } printing { print }' CHANGELOG.md > "$RUNNER_TEMP/notes.md"

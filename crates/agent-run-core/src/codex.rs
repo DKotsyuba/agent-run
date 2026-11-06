@@ -83,31 +83,66 @@ async fn flush_pending_assistant(
     Ok(())
 }
 
-/// Removes arbitrary text fields from unhandled native events; those fields
-/// have no transcript contract and may split a secret across notifications.
-fn omit_native_text(value: &mut Value) {
+/// Identifies credential and environment fields whose values are not journaled.
+fn sensitive_tool_field(name: &str) -> bool {
+    agent_run_adapters::redact::is_secret_name(name)
+        || matches!(
+            name.to_ascii_lowercase().as_str(),
+            "env"
+                | "environment"
+                | "env_vars"
+                | "envvars"
+                | "environment_variables"
+                | "environmentvariables"
+                | "authorization"
+                | "proxy-authorization"
+                | "auth"
+                | "cookie"
+                | "set-cookie"
+        )
+}
+
+/// Removes uncontracted tool inputs, credential fields and arbitrary text from
+/// unhandled native events. Only a usage event's root `tokenUsage` object and
+/// its known numeric counters bypass the credential-shaped name filter.
+fn omit_native_text(value: &mut Value, allow_usage: bool, inside_usage: bool) {
     match value {
         Value::Object(object) => {
             for (name, nested) in object {
-                if matches!(
-                    name.as_str(),
-                    "text"
-                        | "delta"
-                        | "content"
-                        | "aggregatedOutput"
-                        | "output"
-                        | "stdout"
-                        | "stderr"
-                        | "raw"
-                ) && nested.is_string()
+                let usage_container = allow_usage && name == "tokenUsage" && nested.is_object();
+                let usage_counter = inside_usage
+                    && nested.is_number()
+                    && matches!(
+                        name.as_str(),
+                        "inputTokens"
+                            | "outputTokens"
+                            | "cachedInputTokens"
+                            | "cacheWriteInputTokens"
+                            | "reasoningOutputTokens"
+                            | "totalTokens"
+                    );
+                if (sensitive_tool_field(name) && !usage_container && !usage_counter)
+                    || matches!(name.as_str(), "command" | "arguments" | "changes" | "raw")
+                    || (matches!(
+                        name.as_str(),
+                        "text"
+                            | "delta"
+                            | "content"
+                            | "aggregatedOutput"
+                            | "output"
+                            | "stdout"
+                            | "stderr"
+                    ) && nested.is_string())
                 {
                     *nested = Value::String("<omitted>".into());
                 } else {
-                    omit_native_text(nested);
+                    omit_native_text(nested, false, inside_usage || usage_container);
                 }
             }
         }
-        Value::Array(values) => values.iter_mut().for_each(omit_native_text),
+        Value::Array(values) => values
+            .iter_mut()
+            .for_each(|value| omit_native_text(value, false, inside_usage)),
         _ => {}
     }
 }
@@ -121,7 +156,7 @@ async fn record_native_event(
     value: &Value,
 ) -> Result<()> {
     let mut safe = process.redact_value(value);
-    omit_native_text(&mut safe);
+    omit_native_text(&mut safe, method == "thread/tokenUsage/updated", false);
     process
         .observing(store.event(id, &process.redact(method), &safe))
         .await
@@ -505,14 +540,35 @@ impl Grant {
     /// The Codex app-server runs its own nested executor sandbox and cannot be
     /// wrapped whole, so a shared layout relies on the native read rules of the
     /// unchanged managed profile. That is safe only while no writable root —
-    /// nor `/tmp`, `/private/tmp` or the process temporary directory, which
-    /// native temporary-path grants make effectively writable — covers the
+    /// nor `/tmp`, macOS `/private/tmp`, or the process temporary directory,
+    /// which native temporary-path grants make effectively writable — covers the
     /// store root or lies inside it. The root must resolve to a real readable
     /// directory, and every writable root must resolve: an unresolved,
     /// unreadable or overlapping root is a refusal, never a guess. Read-only
     /// roots and the profile itself are untouched, so no permission is widened
     /// by this check.
+    ///
+    /// Uses this process's temporary directory; launch plans must use
+    /// [`Self::admits_shared_root_with_environment`] for their own environment.
     pub fn admits_shared_root(&self, root: &Path) -> Result<()> {
+        self.admits_shared_root_with_temp(root, &std::env::temp_dir())
+    }
+
+    /// Checks the effective child `TMPDIR`, defaulting to `/tmp` when unset.
+    /// The planned environment is inspected only for `TMPDIR` and is never logged.
+    pub fn admits_shared_root_with_environment(
+        &self,
+        root: &Path,
+        environment: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let temporary = environment
+            .get("TMPDIR")
+            .map_or(Path::new("/tmp"), |value| Path::new(value));
+        self.admits_shared_root_with_temp(root, temporary)
+    }
+
+    /// Rejects overlapping or unprovable writable and effective temporary roots.
+    fn admits_shared_root_with_temp(&self, root: &Path, tempdir: &Path) -> Result<()> {
         let refused = |why: &str| {
             invalid(format!(
                 "shared asset store is not launchable under the admitted Codex grant: {why}"
@@ -524,10 +580,21 @@ impl Grant {
         if !canonical.is_dir() || std::fs::read_dir(&canonical).is_err() {
             return Err(refused("store root is not a readable directory"));
         }
-        let mut temporary = vec![PathBuf::from("/tmp"), PathBuf::from("/private/tmp")];
-        if let Ok(tempdir) = std::env::temp_dir().canonicalize() {
-            temporary.push(tempdir);
+        if !tempdir.is_absolute() {
+            return Err(refused(
+                "temporary directory is not an absolute real directory",
+            ));
         }
+        let tempdir = tempdir
+            .canonicalize()
+            .map_err(|_| refused("temporary directory does not resolve"))?;
+        if !tempdir.is_dir() {
+            return Err(refused("temporary directory is not a directory"));
+        }
+        let mut temporary = vec![PathBuf::from("/tmp")];
+        #[cfg(target_os = "macos")]
+        temporary.push(PathBuf::from("/private/tmp"));
+        temporary.push(tempdir);
         let overlaps = |candidate: &Path| -> Result<bool> {
             let resolved = candidate.canonicalize().map_err(|_| {
                 refused(&format!(
@@ -539,17 +606,23 @@ impl Grant {
                 || resolved.starts_with(&canonical)
                 || canonical.starts_with(&resolved))
         };
-        for writable in self
-            .writable_roots
-            .iter()
-            .map(Path::new)
-            .chain(temporary.iter().map(Path::new))
-        {
+        for writable in self.writable_roots.iter().map(Path::new) {
             if overlaps(writable)? {
                 return Err(refused(&format!(
                     "store root overlaps writable root {}",
                     writable.display()
                 )));
+            }
+        }
+        for temporary in &temporary {
+            let resolved = temporary
+                .canonicalize()
+                .map_err(|_| refused("temporary directory does not resolve"))?;
+            if resolved == canonical
+                || resolved.starts_with(&canonical)
+                || canonical.starts_with(&resolved)
+            {
+                return Err(refused("store root overlaps a temporary writable root"));
             }
         }
         Ok(())
@@ -887,6 +960,15 @@ pub async fn run(
             &json!({"turn":turn_id,"input_sha256":input_sha256}),
         ))
         .await?;
+    if record.resume_of_runtime_session_id.is_some() {
+        process
+            .observing(store.event_durable(
+                &record.id,
+                "native_resume_accepted",
+                &json!({"session":tid,"turn":turn_id}),
+            ))
+            .await?;
+    }
     let mut streamed: BTreeMap<String, String> = BTreeMap::new();
     let mut emitted: BTreeMap<String, String> = BTreeMap::new();
     let mut redactors: BTreeMap<String, StreamingRedactor> = BTreeMap::new();
@@ -899,6 +981,8 @@ pub async fn run(
         .await?;
     let mut tools_started = BTreeSet::new();
     let mut tools_completed = BTreeSet::new();
+    let mut missing_tool_inputs: BTreeMap<String, MissingToolInput> = BTreeMap::new();
+    let mut command_outputs = CommandOutputs::default();
     let mut pending_jobs: BTreeMap<String, PendingNativeJob> = BTreeMap::new();
     let mut return_gap_reported = false;
     let mut completed: BTreeMap<String, String> = BTreeMap::new();
@@ -1378,6 +1462,10 @@ pub async fn run(
             continue;
         };
         let p = v.get("params").unwrap_or(&Value::Null);
+        if method == "item/commandExecution/outputDelta" {
+            command_outputs.delta(process, &tid, p);
+            continue;
+        }
         if p.get("threadId")
             .and_then(Value::as_str)
             .is_some_and(|id| id != tid)
@@ -1395,11 +1483,22 @@ pub async fn run(
         {
             let key = item["id"].as_str().expect("matched native item");
             if item["type"] == "commandExecution" {
-                let job = pending_jobs.get_mut(key).expect("owned started item");
-                if job.completion.is_some() {
+                if pending_jobs[key].completion.is_some() {
                     continue;
                 }
-                let text = native_job_text(process, item);
+                journal_missing_tool_input(
+                    process,
+                    store,
+                    &record.id,
+                    &mut missing_tool_inputs,
+                    event_turn.expect("owned turn"),
+                    item,
+                )
+                .await?;
+                let text = command_outputs
+                    .complete(process, item, event_turn.expect("owned turn"))
+                    .map(|text| process.redact(&text))
+                    .unwrap_or_else(|| native_job_text(process, item));
                 process
                     .observing(store.journal_with_error(
                         &record.id,
@@ -1410,6 +1509,7 @@ pub async fn run(
                         tool_error(item),
                     ))
                     .await?;
+                let job = pending_jobs.get_mut(key).expect("owned started item");
                 job.process_id = item["processId"]
                     .as_str()
                     .filter(|id| !id.is_empty())
@@ -1425,6 +1525,15 @@ pub async fn run(
             }
             pending_jobs.remove(key);
             if idle || event_turn != Some(turn_id.as_str()) {
+                journal_missing_tool_input(
+                    process,
+                    store,
+                    &record.id,
+                    &mut missing_tool_inputs,
+                    event_turn.expect("owned turn"),
+                    item,
+                )
+                .await?;
                 native_job_completion(
                     process,
                     store,
@@ -1518,6 +1627,9 @@ pub async fn run(
                         .get("id")
                         .and_then(Value::as_str)
                         .filter(|id| !id.is_empty());
+                    if key.is_some_and(|key| tools_completed.contains(key)) {
+                        continue;
+                    }
                     if record.request.explicit_finish
                         && matches!(
                             item.get("type").and_then(Value::as_str),
@@ -1528,9 +1640,9 @@ pub async fn run(
                             && item.get("tool").and_then(Value::as_str) == Some("finish"))
                         && let Some(key) = key
                     {
-                        pending_jobs.insert(
-                            key.to_owned(),
-                            PendingNativeJob {
+                        pending_jobs
+                            .entry(key.to_owned())
+                            .or_insert_with(|| PendingNativeJob {
                                 turn: turn_id.clone(),
                                 kind: item["type"].as_str().expect("supported kind").to_owned(),
                                 name: name.clone(),
@@ -1539,15 +1651,32 @@ pub async fn run(
                                     .filter(|id| !id.is_empty())
                                     .map(str::to_owned),
                                 completion: None,
-                            },
-                        );
+                            });
                     }
                     if key.is_none_or(|key| tools_started.insert(key.to_owned())) {
+                        if item.get("type").and_then(Value::as_str) == Some("commandExecution")
+                            && let Some(key) = key
+                        {
+                            command_outputs.start(key, &turn_id);
+                        }
+                        let text = native_tool_input(process, item);
+                        if text.is_empty()
+                            && let Some(key) = key
+                        {
+                            missing_tool_inputs.insert(
+                                key.to_owned(),
+                                MissingToolInput {
+                                    turn: turn_id.clone(),
+                                    kind: item["type"].as_str().unwrap_or_default().to_owned(),
+                                    name: name.clone(),
+                                },
+                            );
+                        }
                         process
                             .observing(store.journal_with_error(
                                 &record.id,
                                 "tool_call",
-                                "",
+                                &text,
                                 Some(&process.redact(&name)),
                                 key,
                                 None,
@@ -1609,28 +1738,44 @@ pub async fn run(
                     }
                     let name = process.redact(&name);
                     if native_id.is_none_or(|key| tools_started.insert(key.to_owned())) {
+                        let text = native_tool_input(process, item);
                         process
                             .observing(store.journal_with_error(
                                 &record.id,
                                 "tool_call",
-                                "",
+                                &text,
                                 Some(&name),
                                 native_id,
                                 None,
                             ))
                             .await?;
+                    } else {
+                        journal_missing_tool_input(
+                            process,
+                            store,
+                            &record.id,
+                            &mut missing_tool_inputs,
+                            &turn_id,
+                            item,
+                        )
+                        .await?;
                     }
-                    let text = item
-                        .get("aggregatedOutput")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                        .or_else(|| item.pointer("/result/content").map(Value::to_string))
-                        .or_else(|| {
-                            item.pointer("/error/message")
-                                .and_then(Value::as_str)
-                                .map(str::to_owned)
-                        })
-                        .unwrap_or_default();
+                    let text = (item.get("type").and_then(Value::as_str)
+                        == Some("commandExecution"))
+                    .then(|| command_outputs.complete(process, item, &turn_id))
+                    .flatten()
+                    .or_else(|| {
+                        item.get("aggregatedOutput")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .or_else(|| item.pointer("/result/content").map(Value::to_string))
+                    .or_else(|| {
+                        item.pointer("/error/message")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_default();
                     if item.get("type").and_then(Value::as_str) == Some("mcpToolCall")
                         && item.get("server").and_then(Value::as_str)
                             == Some(agent_run_domain::worker::SERVER_NAME)
@@ -1805,7 +1950,7 @@ fn finish_developer_instructions(config: &Value) -> Result<String> {
         _ => return Err(invalid("native developer instructions have invalid type")),
     };
     Ok(format!(
-        "{existing}\n\nAgent Run runtime completion contract: an inference turn is not the logical run. End the turn while an owned background job or message is pending; the supervisor keeps this run and native thread alive and delivers its completion as a new step. Do not poll or sleep solely to keep inference alive. Before waiting, report newly completed work to its requester through the existing pool or orchestrator tool. Name the concrete pending job or message and its responsible actor; if no such event can advance the task, report the blocker. A result observed by the supervisor does not prove it was delivered into your model context. Do not call finish(failed) merely to suspend, from empty initial job output or speculation about a lost handle. A valid execution session_id is pending work, not failure. Call the private finish tool only when the assigned work is truly done, blocked or failed, with its exact final summary. Keep every configured global and role permission, approval and secret-protection rule."
+        "{existing}\n\nAgent Run runtime completion contract: an inference turn is not the logical run. End the turn while an owned background job or message is pending; the supervisor keeps this run and native thread alive and delivers its completion as a new step. Do not poll or sleep solely to keep inference alive. Before waiting, report newly completed work to its requester through the existing pool or orchestrator tool. Name the concrete pending job or message and its responsible actor; if no such event can advance the task, report the blocker. A result observed by the supervisor does not prove it was delivered into your model context. Do not call finish(failed) merely to suspend, from empty initial job output or speculation about a lost handle. A valid execution session_id is pending work, not failure. Call the private finish tool when the assigned work is truly done, blocked or failed, with its exact final summary. If Agent Run requests a planned service restart, call finish with status done, the exact marker from the request as the first summary line, and the context needed to continue. That summary is a temporary checkpoint. Keep every configured global and role permission, approval and secret-protection rule."
     ))
 }
 
@@ -1867,6 +2012,386 @@ struct PendingNativeJob {
     process_id: Option<String>,
     /// Already journaled, redacted result capped at4096bytes, awaiting return proof.
     completion: Option<Value>,
+}
+
+/// Identity of a started call whose input was absent from its first event.
+struct MissingToolInput {
+    /// Origin turn prevents a later invocation from supplying this call's input.
+    turn: String,
+    /// Native item type must agree with the original call.
+    kind: String,
+    /// Native tool name must agree with the original call.
+    name: String,
+}
+
+/// Maximum retained redacted delta output per command and across the run.
+const COMMAND_OUTPUT_LIMIT: usize = 256 * 1024;
+const COMMAND_OUTPUT_TOTAL_LIMIT: usize = 8 * 1024 * 1024;
+/// Bounds simultaneous streaming redactors and their withheld secret tails.
+const COMMAND_OUTPUT_STREAM_LIMIT: usize = 64;
+const COMMAND_OUTPUT_TRUNCATED: &str = "\n[command output truncated]";
+
+/// Redacted fallback output for an exactly identified started native command.
+struct CommandOutput {
+    /// Origin turn must match every delta and terminal item.
+    turn: String,
+    /// Only already-redacted fragments are retained here.
+    text: String,
+    /// Withholds a possible secret suffix across delta boundaries.
+    redactor: Option<StreamingRedactor>,
+    /// Further output was discarded because a bound was reached.
+    truncated: bool,
+}
+
+/// Buffers bounded command deltas until a matching terminal item selects them.
+#[derive(Default)]
+struct CommandOutputs {
+    items: BTreeMap<String, CommandOutput>,
+    bytes: usize,
+    streams: usize,
+}
+
+impl CommandOutputs {
+    /// Records the accepted start without replacing an existing invocation.
+    fn start(&mut self, id: &str, turn: &str) {
+        self.items
+            .entry(id.to_owned())
+            .or_insert_with(|| CommandOutput {
+                turn: turn.to_owned(),
+                text: String::new(),
+                redactor: None,
+                truncated: false,
+            });
+    }
+
+    /// Keeps only deltas with exact thread, origin-turn and started-item ownership.
+    fn delta(&mut self, process: &Process, thread: &str, params: &Value) {
+        if params.get("threadId").and_then(Value::as_str) != Some(thread) {
+            return;
+        }
+        let (Some(id), Some(turn), Some(delta)) = (
+            params.get("itemId").and_then(Value::as_str),
+            params.get("turnId").and_then(Value::as_str),
+            params.get("delta").and_then(Value::as_str),
+        ) else {
+            return;
+        };
+        let Some(output) = self.items.get_mut(id) else {
+            return;
+        };
+        if output.turn != turn || output.truncated || delta.is_empty() {
+            return;
+        }
+        if output.redactor.is_none() {
+            if self.streams == COMMAND_OUTPUT_STREAM_LIMIT {
+                output.truncated = true;
+                return;
+            }
+            output.redactor = Some(process.stream_redactor());
+            self.streams += 1;
+        }
+        let safe = output
+            .redactor
+            .as_mut()
+            .expect("stream initialized")
+            .feed(delta);
+        Self::append(output, &mut self.bytes, &safe);
+        if output.truncated {
+            // A withheld secret prefix is discarded with the redactor, never
+            // flushed into a prefix whose remaining bytes were dropped.
+            drop(output.redactor.take());
+            self.streams -= 1;
+        }
+    }
+
+    /// Appends safe UTF-8 through both bounds and marks any omitted suffix.
+    fn append(output: &mut CommandOutput, bytes: &mut usize, safe: &str) {
+        let available = COMMAND_OUTPUT_LIMIT
+            .saturating_sub(output.text.len())
+            .min(COMMAND_OUTPUT_TOTAL_LIMIT.saturating_sub(*bytes));
+        let end = safe.floor_char_boundary(safe.len().min(available));
+        output.text.push_str(&safe[..end]);
+        *bytes += end;
+        output.truncated |= end < safe.len();
+    }
+
+    /// Retires the matching start and returns deltas only if no aggregate is
+    /// supplied. Incomplete calls are never converted into terminal results.
+    fn complete(&mut self, process: &Process, item: &Value, turn: &str) -> Option<String> {
+        let id = item.get("id")?.as_str()?;
+        if self.items.get(id)?.turn != turn {
+            return None;
+        }
+        let mut output = self.items.remove(id)?;
+        let observed = output.redactor.is_some() || output.truncated;
+        let mut redactor = output.redactor.take();
+        if redactor.is_some() {
+            self.streams -= 1;
+        }
+        let has_aggregate = item
+            .get("aggregatedOutput")
+            .and_then(Value::as_str)
+            .is_some_and(|output| !output.is_empty());
+        if !has_aggregate && let Some(redactor) = redactor.as_mut() {
+            Self::append(&mut output, &mut self.bytes, &redactor.finish());
+        }
+        self.bytes -= output.text.len();
+        if has_aggregate || !observed {
+            return None;
+        }
+        // Full JSON output gets structural credential/environment redaction;
+        // malformed or truncated JSON-like output cannot be inspected safely.
+        let mut value = Value::String(output.text);
+        if !value
+            .as_str()
+            .is_some_and(|text| plain_command_output(process, text))
+        {
+            sanitize_tool_arguments(&mut value, false);
+        }
+        let mut text = value.as_str().unwrap_or_default().to_owned();
+        if output.truncated {
+            text.push_str(COMMAND_OUTPUT_TRUNCATED);
+        }
+        if let Some(error) = item.pointer("/error/message").and_then(Value::as_str)
+            && !error.is_empty()
+        {
+            let mut error = Value::String(error.to_owned());
+            sanitize_tool_arguments(&mut error, false);
+            if let Some(error) = error.as_str()
+                && !text.contains(error)
+            {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(error);
+            }
+        }
+        Some(text)
+    }
+}
+
+/// Allows ordinary multiline log, progress and quoted text while leaving
+/// JSON-like content and decoded launch secrets for fail-closed sanitization.
+fn plain_command_output(process: &Process, text: &str) -> bool {
+    let mut lines = text.trim_start().lines();
+    let Some(first) = lines.next() else {
+        return false;
+    };
+    plain_command_line(process, first)
+        && lines.all(|line| {
+            let line = line.trim_start();
+            if line.starts_with(['[', '"']) {
+                plain_command_line(process, line)
+            } else {
+                plain_output_tail(line)
+            }
+        })
+}
+
+/// Rejects tails that could append JSON fields, containers or quoted values.
+fn plain_output_tail(tail: &str) -> bool {
+    !tail.trim_start().starts_with(':') && !tail.contains(['{', '[', '"', '\\'])
+}
+
+/// Validates one common prefix and checks decoded quoted text for secrets.
+fn plain_command_line(process: &Process, text: &str) -> bool {
+    let text = text.trim_start();
+    if let Some(rest) = text.strip_prefix('[')
+        && let Some((level, tail)) = rest.split_once(']')
+    {
+        let number = |text: &str| {
+            let text = text.trim();
+            !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+        };
+        let progress = level
+            .split_once('/')
+            .is_some_and(|(current, total)| number(current) && number(total))
+            || level.trim().strip_suffix('%').is_some_and(number);
+        return (matches!(
+            level,
+            "TRACE" | "DEBUG" | "INFO" | "WARN" | "WARNING" | "ERROR" | "FATAL" | "NOTICE"
+        ) || progress)
+            && plain_output_tail(tail);
+    }
+    if !text.starts_with('"') {
+        return false;
+    }
+    let mut escaped = false;
+    for (index, character) in text.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            let end = index + character.len_utf8();
+            return serde_json::from_str::<String>(&text[..end]).is_ok_and(|quoted| {
+                if quoted.contains(['{', '[', '"']) {
+                    return false;
+                }
+                let quoted = Value::String(quoted);
+                process.redact_value(&quoted) == quoted
+            }) && plain_output_tail(&text[end..]);
+        }
+    }
+    false
+}
+
+/// Removes environment and credential-shaped argument fields before journaling.
+/// Embedded JSON is sanitized once; deeper or malformed JSON-like text is omitted.
+fn sanitize_tool_arguments(value: &mut Value, embedded: bool) {
+    match value {
+        Value::Object(object) => {
+            for (name, value) in object {
+                if sensitive_tool_field(name) {
+                    *value = Value::String("<redacted>".into());
+                } else {
+                    sanitize_tool_arguments(value, embedded);
+                }
+            }
+        }
+        Value::Array(values) => values
+            .iter_mut()
+            .for_each(|value| sanitize_tool_arguments(value, embedded)),
+        Value::String(text) => {
+            let json_like = text.trim_start().starts_with(['{', '[', '"']);
+            if json_like {
+                match serde_json::from_str::<Value>(text) {
+                    Ok(mut nested @ (Value::Object(_) | Value::Array(_))) if !embedded => {
+                        sanitize_tool_arguments(&mut nested, true);
+                        *text = nested.to_string();
+                    }
+                    Ok(Value::String(nested))
+                        if !nested.trim_start().starts_with(['{', '[', '"']) => {}
+                    _ => *text = "<omitted>".into(),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Retains a diff only when it has neither escaping nor credential-shaped
+/// markers. Callers still redact known launch literals after projection.
+fn sanitize_file_diff(diff: &str) -> String {
+    if diff.contains('\\')
+        || diff
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .filter(|part| !part.is_empty())
+            .any(|part| {
+                let lower = part.to_ascii_lowercase();
+                sensitive_tool_field(part)
+                    || ["authorization", "auth", "cookie", "environment"]
+                        .iter()
+                        .any(|suffix| lower.ends_with(*suffix))
+            })
+    {
+        "[diff omitted: sensitive or escaped content]".into()
+    } else {
+        diff.to_owned()
+    }
+}
+
+/// Projects only recognized native tool input, redacting it before persistence.
+/// Unknown items and absent inputs are empty; file changes retain only native
+/// paths, kinds and diffs. The native frame limit bounds the redacted input.
+fn native_tool_input(process: &Process, item: &Value) -> String {
+    let text = match item.get("type").and_then(Value::as_str) {
+        Some("commandExecution") => item
+            .get("command")
+            .and_then(Value::as_str)
+            .filter(|command| !command.trim().is_empty())
+            .map(|command| process.redact(command)),
+        Some("mcpToolCall" | "dynamicToolCall") => item
+            .get("arguments")
+            .filter(|value| !value.is_null() && value.as_str() != Some(""))
+            .map(|value| {
+                let mut value = value.clone();
+                sanitize_tool_arguments(&mut value, false);
+                process.redact_value(&value).to_string()
+            }),
+        Some("fileChange") => item
+            .get("changes")
+            .and_then(Value::as_array)
+            .map(|changes| {
+                changes
+                    .iter()
+                    .filter_map(|change| {
+                        let path = change.get("path")?.as_str()?;
+                        let mut projection = json!({"path":path});
+                        if let Some(kind) = change.get("kind").and_then(Value::as_str) {
+                            projection["kind"] = json!(kind);
+                        } else if let Some(kind) =
+                            change.pointer("/kind/type").and_then(Value::as_str)
+                        {
+                            projection["kind"] = json!(kind);
+                            if let Some(path) =
+                                change.pointer("/kind/movePath").and_then(Value::as_str)
+                            {
+                                projection["movePath"] = json!(path);
+                            }
+                        }
+                        if let Some(diff) = change.get("diff").and_then(Value::as_str) {
+                            projection["diff"] = json!(sanitize_file_diff(diff));
+                        }
+                        Some(projection)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|changes| !changes.is_empty())
+            .map(|changes| {
+                process
+                    .redact_value(&json!({"changes":changes}))
+                    .to_string()
+            }),
+        _ => None,
+    };
+    let mut text = text.unwrap_or_default();
+    if text.len() > agent_run_adapters::io::ENGINE_FRAME {
+        let suffix = "\n[tool input truncated]";
+        let limit = agent_run_adapters::io::ENGINE_FRAME - suffix.len();
+        text.truncate(text.floor_char_boundary(limit));
+        text.push_str(suffix);
+    }
+    text
+}
+
+/// Appends late input once only when turn, item kind and tool name match the
+/// previously journaled empty call. A missing or mismatched identity cannot
+/// attach input to another invocation, and completion retires the placeholder.
+async fn journal_missing_tool_input(
+    process: &mut Process,
+    store: &mut Persist,
+    id: &AgentId,
+    missing: &mut BTreeMap<String, MissingToolInput>,
+    turn: &str,
+    item: &Value,
+) -> Result<()> {
+    let Some(key) = item.get("id").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let Some(original) = missing.remove(key) else {
+        return Ok(());
+    };
+    if original.turn != turn
+        || item.get("type").and_then(Value::as_str) != Some(original.kind.as_str())
+        || tool_name(item).as_deref() != Some(original.name.as_str())
+    {
+        return Ok(());
+    }
+    let text = native_tool_input(process, item);
+    if !text.is_empty() {
+        process
+            .observing(store.journal_with_error(
+                id,
+                "tool_call",
+                &text,
+                Some(&process.redact(&original.name)),
+                Some(key),
+                None,
+            ))
+            .await?;
+    }
+    Ok(())
 }
 
 /// Read a terminal native item's output and apply the process's secret redactor.
@@ -2084,7 +2609,7 @@ fn tool_error(item: &Value) -> Option<(bool, &'static str)> {
     }
 }
 
-/// Names known native invocation variants without retaining commands/arguments.
+/// Names known native invocation variants independently of their input content.
 /// Other known invocation kinds count calls but keep errors unknown until their
 /// protocol-specific evidence is supported; unknown item kinds are not guessed.
 fn tool_name(item: &Value) -> Option<String> {
@@ -2190,6 +2715,19 @@ async fn turn_steer(
 
 #[cfg(test)]
 mod tests {
+    /// The shared output budget never splits UTF-8 and reports omitted data.
+    #[test]
+    fn command_delta_shared_budget_marks_truncation() {
+        let mut outputs = super::CommandOutputs::default();
+        outputs.start("job", "turn");
+        outputs.bytes = super::COMMAND_OUTPUT_TOTAL_LIMIT - 1;
+        let output = outputs.items.get_mut("job").unwrap();
+        super::CommandOutputs::append(output, &mut outputs.bytes, "é");
+        assert!(output.text.is_empty());
+        assert!(output.truncated);
+        assert_eq!(outputs.bytes, super::COMMAND_OUTPUT_TOTAL_LIMIT - 1);
+    }
+
     /// Runtime semantics append to configured policy, never to peer/task data;
     /// malformed effective policy cannot silently disappear.
     #[test]

@@ -32,6 +32,14 @@ native-login provider. If the same spelling names the label of one binding
 and the global id of another, login refuses it as ambiguous before touching
 either protected credential store; use an unambiguous label or id.
 
+For a shared system service, the broker's state home and the Claude worker's
+private home are different. `agent-run auth` runs locally and uses its given
+home; it does not route an interactive login to the worker. Sign in through
+the native Claude Code CLI as the worker OS user with `CLAUDE_CONFIG_DIR` set
+to that worker's named account directory, then register the nonsecret
+`named:claude-code:<label>` reference in the shared registry. Do not copy the
+subscription credential to the broker's home.
+
 The custom inference authorization boundary is `Store::list_accounts()` or
 `Store::account(id)`, followed by
 `ProviderConfig::resolve_catalog(account_records)` and

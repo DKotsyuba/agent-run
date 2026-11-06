@@ -284,6 +284,12 @@ pub(crate) fn enrollment_changes(
     drop(q);
     let mut changed = Vec::new();
     for (root, run, attempt) in rows {
+        let run_id = run.parse::<AgentId>()?;
+        if crate::service_restart::restart_view(conn, &run_id)?
+            .is_some_and(|(status, _)| status == "pending")
+        {
+            continue;
+        }
         let delivery_failed:bool=conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM commands WHERE agent_id=? AND kind='steer' AND json_extract(payload_json,'$.pool_enrollment')=? AND state='completed' AND COALESCE(json_extract(result_json,'$.accepted'),0)=0)",
             params![run,root],|r|r.get(0))?;

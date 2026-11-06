@@ -21,10 +21,10 @@ use std::{
 use tempfile::tempdir;
 
 /// Writes a fake Claude CLI whose `auth login` stores `token` privately in
-/// `$CLAUDE_CONFIG_DIR/.credentials.json` and whose `auth status` succeeds.
+/// `$CLAUDE_CONFIG_DIR/.credentials.json`, including under inherited ACLs.
 fn fake_claude(path: &Path, token: &str) {
     let script = format!(
-        "#!/bin/sh\nif [ \"$2\" = login ]; then\n  mkdir -p \"$CLAUDE_CONFIG_DIR\"\n  umask 077\n  printf '%s' '{{\"claudeAiOauth\":{{\"accessToken\":\"{token}\"}}}}' > \"$CLAUDE_CONFIG_DIR/.credentials.json\"\nfi\nexit 0\n"
+        "#!/bin/sh\nif [ \"$2\" = login ]; then\n  mkdir -p \"$CLAUDE_CONFIG_DIR\"\n  umask 077\n  printf '%s' '{{\"claudeAiOauth\":{{\"accessToken\":\"{token}\"}}}}' > \"$CLAUDE_CONFIG_DIR/.credentials.json\"\n  chmod 0600 \"$CLAUDE_CONFIG_DIR/.credentials.json\"\nfi\nexit 0\n"
     );
     fs::write(path, script).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();

@@ -55,9 +55,12 @@ so the same lineage home can retain history while the session consumer
 switches an account after verified cleanup. Native Claude keeps its native
 login/config directory. Fixtures prove the link and launch boundaries; a
 disposable real two-login Codex A→B run also kept its native thread and
-recalled the parent turn. Claude-family cross-account continuation remains
-unverified and is refused. A real three-account rewrite and bound completion
-delivery were not qualified by that two-login run.
+recalled the parent turn. An opt-in ordered Claude provider can select a named
+native login after a custom API binding fails, and reopens the original sealed
+transcript by path; the login remains private to that account. Other Claude
+cross-account paths remain refused. A direct Claude Code API-to-subscription
+probe retained a test session and context; Agent Run's handoff has synthetic
+integration coverage, not a full real-provider failover qualification.
 
 Custom Codex writes only the supported Responses
 `model_provider = "agent_run_gateway"` settings and an `env_key` name into

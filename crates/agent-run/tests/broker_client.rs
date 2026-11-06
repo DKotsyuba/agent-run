@@ -9,11 +9,20 @@ use agent_run::{
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
-use tokio::{io::BufReader, net::UnixListener};
+use tokio::{
+    io::{AsyncReadExt, BufReader},
+    net::UnixListener,
+};
 
 /// Builds one private client endpoint for a test server.
 fn endpoint(home: &tempfile::TempDir) -> PathBuf {
     home.path().join("api.sock")
+}
+
+/// Returns the current process's effective UID for same-user test servers.
+fn process_uid() -> u32 {
+    // SAFETY: geteuid is a read-only process identity query.
+    unsafe { libc::geteuid() }
 }
 
 /// A lost resume response retries the same intent rather than continuing again.
@@ -21,6 +30,7 @@ fn endpoint(home: &tempfile::TempDir) -> PathBuf {
 async fn resume_transport_retry_keeps_one_generated_request_id() {
     let home = tempfile::tempdir().unwrap();
     let listener = UnixListener::bind(endpoint(&home)).unwrap();
+    let server_uid = process_uid();
     let server = tokio::spawn(async move {
         let mut keys = Vec::new();
         for attempt in 0..2 {
@@ -50,7 +60,7 @@ async fn resume_transport_retry_keeps_one_generated_request_id() {
         }
         keys
     });
-    let result = socket::BrokerClient::new(endpoint(&home))
+    let result = socket::BrokerClient::with_expected_server_uid(endpoint(&home), server_uid)
         .call_with_timeout(
             "resume",
             Some(json!({"agent_id":"root","task":"continue"})),
@@ -65,6 +75,98 @@ async fn resume_transport_retry_keeps_one_generated_request_id() {
         .unwrap();
     assert!(!keys[0].is_empty());
     assert_eq!(keys[0], keys[1]);
+}
+
+/// A mismatched trusted UID is rejected before any request bytes on each connection.
+#[tokio::test]
+async fn configured_server_uid_rejects_mismatch_before_request() {
+    let home = tempfile::tempdir().unwrap();
+    let path = endpoint(&home);
+    let listener = UnixListener::bind(&path).unwrap();
+    let server_uid = process_uid();
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut byte = [0; 1];
+            assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+        }
+    });
+    let client = socket::BrokerClient::with_expected_server_uid(path, server_uid.wrapping_add(1));
+    for _ in 0..2 {
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.call("capacity_order", None),
+        )
+        .await
+        .expect("UID refusal deadline")
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::Validation(message) if message == "broker belongs to another user")
+        );
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+/// The one-shot client checks its explicit server UID before writing a request.
+#[tokio::test]
+async fn client_at_checks_server_uid_before_request() {
+    let home = tempfile::tempdir().unwrap();
+    let path = endpoint(&home);
+    let listener = UnixListener::bind(&path).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut rejected, _) = listener.accept().await.unwrap();
+        let mut byte = [0; 1];
+        assert_eq!(rejected.read(&mut byte).await.unwrap(), 0);
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let (input, mut output) = stream.into_split();
+        let request: Value = serde_json::from_slice(
+            &frame::read(&mut BufReader::new(input), socket::MAX_FRAME)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        frame::write(
+            &mut output,
+            &json!({"jsonrpc":"2.0", "id":request["id"], "result":{"ok":true}}),
+            socket::MAX_FRAME,
+        )
+        .await
+        .unwrap();
+    });
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        socket::client_at(
+            &path,
+            process_uid().wrapping_add(1),
+            "capacity_order",
+            json!({}),
+        ),
+    )
+    .await
+    .expect("UID refusal deadline")
+    .unwrap_err();
+    assert!(
+        matches!(error, Error::Validation(message) if message == "broker belongs to another user")
+    );
+    assert_eq!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            socket::client_at(&path, process_uid(), "capacity_order", json!({})),
+        )
+        .await
+        .expect("UID-checked call deadline")
+        .unwrap(),
+        json!({"ok":true})
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 /// Mirrors `test_broker_client.py::test_validation_error_mapping`.

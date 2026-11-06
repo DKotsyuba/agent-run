@@ -60,6 +60,8 @@ pub type SharedBroker = Arc<dyn Broker>;
 pub struct SocketBroker {
     /// Socket endpoint for lazy replacements after cancellation.
     socket: PathBuf,
+    /// Optional trusted server UID for every lane and replacement.
+    expected_server_uid: Option<u32>,
     /// Persistent connection per worker lane (list, transcript, one-shot, pool, discovery, copy).
     clients: [std::sync::Mutex<Arc<BrokerClient>>; 6],
     /// Pool lane generation observed by compatibility discovery.
@@ -71,6 +73,14 @@ pub struct SocketBroker {
 impl SocketBroker {
     /// Creates six lazy clients; no socket opens before its first call.
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
+        Self::with_expected_server_uid(socket_path, None)
+    }
+
+    /// Creates lazy clients using an explicit trusted server UID when supplied.
+    pub fn with_expected_server_uid(
+        socket_path: impl Into<PathBuf>,
+        expected_server_uid: Option<u32>,
+    ) -> Self {
         let socket = socket_path.into();
         let pool_socket_identity = socket
             .symlink_metadata()
@@ -78,12 +88,21 @@ impl SocketBroker {
             .map(|metadata| (metadata.dev(), metadata.ino()));
         Self {
             clients: std::array::from_fn(|_| {
-                std::sync::Mutex::new(Arc::new(BrokerClient::new(socket.clone())))
+                std::sync::Mutex::new(Arc::new(broker_client(&socket, expected_server_uid)))
             }),
             socket,
+            expected_server_uid,
             pool_generation: AtomicU64::new(0),
             pool_socket_identity: std::sync::Mutex::new(pool_socket_identity),
         }
+    }
+}
+
+/// Creates a lazy client with the selected server identity policy.
+fn broker_client(socket: &std::path::Path, expected_server_uid: Option<u32>) -> BrokerClient {
+    match expected_server_uid {
+        Some(uid) => BrokerClient::with_expected_server_uid(socket, uid),
+        None => BrokerClient::new(socket),
     }
 }
 
@@ -93,6 +112,8 @@ struct InFlight<'a> {
     lane: &'a std::sync::Mutex<Arc<BrokerClient>>,
     /// Endpoint of the replacement client.
     socket: &'a PathBuf,
+    /// Trusted UID retained when the lane is replaced.
+    expected_server_uid: Option<u32>,
     /// Whether the response has been consumed.
     complete: bool,
     /// Pool generation, present only for the pool lane.
@@ -104,7 +125,7 @@ impl Drop for InFlight<'_> {
     fn drop(&mut self) {
         if !self.complete {
             *self.lane.lock().expect("broker lane") =
-                Arc::new(BrokerClient::new(self.socket.clone()));
+                Arc::new(broker_client(self.socket, self.expected_server_uid));
             if let Some(generation) = self.pool_generation {
                 generation.fetch_add(1, Ordering::Relaxed);
             }
@@ -160,6 +181,7 @@ impl SocketBroker {
             let mut flight = InFlight {
                 lane,
                 socket: &self.socket,
+                expected_server_uid: self.expected_server_uid,
                 complete: false,
                 pool_generation: matches!(index, 3 | 4).then_some(&self.pool_generation),
             };
@@ -173,7 +195,7 @@ impl SocketBroker {
                 })
             {
                 *lane.lock().expect("broker lane") =
-                    Arc::new(BrokerClient::new(self.socket.clone()));
+                    Arc::new(broker_client(&self.socket, self.expected_server_uid));
                 self.pool_generation.fetch_add(1, Ordering::Relaxed);
             }
             flight.complete = true;
@@ -305,6 +327,17 @@ pub async fn answer(
 mod tests {
     use super::*;
     use agent_run_domain::domain::{AgentId, Status};
+
+    /// Allocate each socket under the configured short test root when available.
+    fn socket_dir() -> tempfile::TempDir {
+        let root = std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        tempfile::Builder::new()
+            .prefix("tui-")
+            .tempdir_in(root)
+            .unwrap()
+    }
 
     /// Parses one valid stable id for request arguments.
     fn aid(value: &str) -> AgentId {
@@ -469,20 +502,70 @@ mod tests {
         assert!(view.available);
         assert_eq!(view.content.as_deref(), Some("the answer\n"));
     }
+    /// All lanes and retired connections reject the wrong UID before writing a request.
+    #[tokio::test]
+    async fn explicit_uid_survives_lane_replacements() {
+        use tokio::io::AsyncReadExt;
+
+        let dir = socket_dir();
+        let socket = dir.path().join("broker.sock");
+        let wrong_uid = std::fs::metadata(dir.path()).unwrap().uid().wrapping_add(1);
+        let broker = SocketBroker::with_expected_server_uid(&socket, Some(wrong_uid));
+
+        // A failed pool call replaces its lane before the socket appears.
+        assert!(broker.call("pool", json!({})).await.is_err());
+        // Dropping an incomplete call also replaces its lane.
+        drop(InFlight {
+            lane: &broker.clients[1],
+            socket: &broker.socket,
+            expected_server_uid: broker.expected_server_uid,
+            complete: false,
+            pool_generation: None,
+        });
+
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..6 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                stream.read_to_end(&mut bytes).await.unwrap();
+                assert!(bytes.is_empty());
+            }
+        });
+        for method in ["list_agents", "transcript", "answer", "pool", "list_pools"] {
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    broker.call(method, json!({}))
+                )
+                .await
+                .unwrap()
+                .is_err()
+            );
+        }
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                broker.copy_call("copy", json!({}))
+            )
+            .await
+            .unwrap()
+            .is_err()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     /// A blocked list poll cannot delay transcript, answer or pool reads on live JSON-RPC sockets.
     /// Blocked pools leave transcript/answer lanes free; cancelled pool and transcript reads
     /// retire their unread connections before the next call.
     #[tokio::test]
     async fn socket_lanes_stay_independent_and_cancelled_frames_are_retired() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let socket = std::env::temp_dir().join(format!(
-            "artui-{}-{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = socket_dir();
+        let socket = dir.path().join("broker.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel::<String>(8);
         let server = tokio::spawn(async move {
@@ -587,14 +670,8 @@ mod tests {
         use crate::tests_support::block_page;
         use agent_run_domain::transcript::{TranscriptQuery, TranscriptView};
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let socket = std::env::temp_dir().join(format!(
-            "artui-block-{}-{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = socket_dir();
+        let socket = dir.path().join("broker.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();

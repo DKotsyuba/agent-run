@@ -556,7 +556,7 @@ mod tests {
     use super::*;
     use std::{sync::mpsc, time::Duration};
 
-    /// Initializes schema32 and adopts its fenced writer with the selected queue bounds.
+    /// Initializes the current schema and adopts its fenced writer with the selected queue bounds.
     fn queue(limits: Limits) -> (tempfile::TempDir, QueuedWriter) {
         let home = tempfile::tempdir().unwrap();
         crate::fixture::initialize(home.path()).unwrap();

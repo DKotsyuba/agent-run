@@ -120,6 +120,135 @@ fn footprint(root: &Path) -> Vec<i64> {
     .collect()
 }
 
+/// Records routed handoffs without starting a model or claiming a successful run.
+struct RoutedFixture {
+    /// Route returned for the provider's current root-approved configuration.
+    route: std::sync::Mutex<agent_run_core::system_launch::SystemRoute>,
+    /// Handoffs observed after admission.
+    launches: std::sync::Arc<std::sync::Mutex<Vec<agent_run_core::system_launch::SystemRoute>>>,
+}
+
+impl agent_run_core::system_launch::SystemLauncher for RoutedFixture {
+    fn route(
+        &self,
+        _provider: &agent_run_domain::catalog::ProviderId,
+        _harness: agent_run_domain::catalog::HarnessId,
+    ) -> agent_run_domain::Result<agent_run_core::system_launch::SystemRoute> {
+        Ok(self.route.lock().unwrap().clone())
+    }
+
+    fn preflight_resume(
+        &self,
+        _parent: agent_run_domain::domain::AgentId,
+        _route: agent_run_core::system_launch::SystemRoute,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = agent_run_domain::Result<String>> + Send + 'static>,
+    > {
+        Box::pin(async { Err(agent_run_domain::Error::ExecutionChanged) })
+    }
+
+    fn launch(
+        &self,
+        _home: std::path::PathBuf,
+        _execution: agent_run_domain::domain::AgentId,
+        route: agent_run_core::system_launch::SystemRoute,
+        _lane: agent_run_core::broker_writer::BrokerLane,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = agent_run_domain::Result<()>> + Send + 'static>,
+    > {
+        let launches = self.launches.clone();
+        Box::pin(async move {
+            launches.lock().unwrap().push(route);
+            Err(agent_run_domain::Error::Runtime(
+                "fixture stops before spawning".into(),
+            ))
+        })
+    }
+}
+
+/// A created execution freezes its route; replay and a changed launcher never start it twice.
+#[tokio::test]
+async fn system_route_is_frozen_and_handoff_never_falls_back() {
+    use agent_run_core::system_launch::SystemRoute;
+    use agent_run_domain::catalog::HarnessId;
+    let temp = home();
+    let root = temp.path().canonicalize().unwrap();
+    // This test never starts the binary; use its own verified executable
+    // instead of assuming a platform-specific path to `true`.
+    let config_path = root.join("config.toml");
+    let original = fs::read_to_string(&config_path).unwrap();
+    let executable = toml::Value::String(
+        std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let portable = original.replace("\"/bin/true\"", &executable.to_string());
+    assert_ne!(portable, original);
+    fs::write(&config_path, portable).unwrap();
+    let writer = common::writer::Harness::start(&root);
+    let launches = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let route = SystemRoute {
+        provider: "glm".parse().unwrap(),
+        harness: HarnessId::ClaudeCode,
+        state_home: root.clone(),
+        private_home: root.clone(),
+        operator_socket: root.join("operator.sock"),
+        writer_socket: root.join("writer.sock"),
+        worker_socket: root.join("worker.sock"),
+        fingerprint: "a".repeat(64).parse().unwrap(),
+    };
+    let launcher = std::sync::Arc::new(RoutedFixture {
+        route: std::sync::Mutex::new(route.clone()),
+        launches: launches.clone(),
+    });
+    let service = Service::new(root.clone())
+        .with_writer(writer.broker())
+        .with_system_launcher(launcher.clone());
+    let request: agent_run_domain::ProviderStartRequest = serde_json::from_value(json!({
+        "provider":"glm", "model":"glm-5.3", "profile":"review", "task":"fixture",
+        "workdir":root, "request_id":"system-route-fixture"
+    }))
+    .unwrap();
+    let before = footprint(&root);
+    launcher.route.lock().unwrap().harness = HarnessId::Codex;
+    assert!(service.admit_provider(request.clone()).await.is_err());
+    assert_eq!(footprint(&root), before);
+    *launcher.route.lock().unwrap() = route.clone();
+    let first = service.start_provider(request.clone()).await.unwrap();
+    assert_eq!(first["created"], true);
+    assert_eq!(
+        launches.lock().unwrap().as_slice(),
+        std::slice::from_ref(&route)
+    );
+    let id = first["agent_id"].as_str().unwrap().parse().unwrap();
+    let store = agent_run_store::writer::StoreReader::open(&root).unwrap();
+    let row = store.get(&id).unwrap();
+    let frozen = agent_run_core::service::ProviderLaunchIdentity::read(&row).unwrap();
+    assert_eq!(frozen.system_route, Some(route));
+    drop(store);
+    let replay = service.start_provider(request).await.unwrap();
+    assert_eq!(replay["created"], false);
+    assert_eq!(launches.lock().unwrap().len(), 1);
+
+    {
+        let mut changed = launcher.route.lock().unwrap();
+        changed.fingerprint = "b".repeat(64).parse().unwrap();
+    }
+    let error = service
+        .admit_provider_resume(&row, "next".into(), None, None, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, agent_run_domain::Error::ExecutionChanged));
+    let local = Service::new(root).with_writer(writer.broker());
+    let error = local
+        .admit_provider_resume(&row, "next".into(), None, None, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, agent_run_domain::Error::Unsupported(_)));
+    assert_eq!(launches.lock().unwrap().len(), 1);
+}
+
 /// Assertions only test the frozen intersection: missing/capped/restricted
 /// grants have no durable effects; exact replay survives deleted directories.
 #[tokio::test]

@@ -88,7 +88,7 @@
     "artifacts": {
       "type": "array",
       "minItems": 4,
-      "maxItems": 4,
+      "maxItems": 5,
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -113,7 +113,7 @@
             ]
           },
           "target": {
-            "const": "aarch64-apple-darwin"
+            "enum": ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
           },
           "size": {
             "type": "integer",

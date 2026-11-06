@@ -245,6 +245,28 @@ impl CliBroker for SocketBroker {
     }
 }
 
+/// One-shot broker calls through an explicitly selected operator socket.
+struct OperatorBroker {
+    socket: PathBuf,
+    expected_uid: Option<u32>,
+}
+
+impl CliBroker for OperatorBroker {
+    /// Retains the ordinary CLI's deadlines and retry rules while verifying the server UID.
+    fn call<'a>(&'a self, method: &'a str, params: Value) -> CliFuture<'a> {
+        let uid = self.expected_uid.unwrap_or_else(|| {
+            // SAFETY: geteuid only reads the current process identity.
+            unsafe { libc::geteuid() }
+        });
+        Box::pin(transport::socket::client_at(
+            &self.socket,
+            uid,
+            method,
+            params,
+        ))
+    }
+}
+
 /// Dependencies for one CLI execution, with production implementations supplied by [`run`].
 pub struct CliDependencies {
     /// Service used by local read/write commands.
@@ -286,6 +308,12 @@ impl CliDependencies {
     about = "Durable local coding-agent supervisor"
 )]
 pub struct Cli {
+    /// Explicit operator endpoint; local state is not opened in this mode.
+    #[arg(long, global = true)]
+    pub broker_socket: Option<PathBuf>,
+    /// Trusted broker UID; defaults to the caller's effective UID.
+    #[arg(long, global = true, requires = "broker_socket")]
+    pub broker_uid: Option<u32>,
     #[arg(long, global = true, env = "AGENT_RUN_HOME")]
     pub home: Option<PathBuf>,
     #[command(subcommand)]
@@ -295,6 +323,8 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     Init,
+    /// Gracefully restart the service and continue its active agents.
+    Restart(Restart),
     /// Read-only local diagnostics; emits one JSON report and exits 0/2/3.
     Doctor {
         /// Explicit JSON selection; JSON remains the default output.
@@ -379,6 +409,26 @@ pub enum Command {
         #[arg(long)]
         text: bool,
     },
+    /// Report the resident broker's versioned read schemas and transport limits.
+    Capabilities,
+    /// Read an exact verified artifact chunk fenced to the current execution.
+    AnswerChunk {
+        /// Stable logical agent identity.
+        agent_id: AgentId,
+        /// Required positive current execution receipt.
+        #[arg(long)]
+        sequence: std::num::NonZeroU32,
+        /// Required lowercase SHA-256 of the complete artifact.
+        #[arg(long)]
+        expected_sha256: agent_run_domain::Sha256Digest,
+        /// Byte offset on a UTF-8 boundary, including EOF.
+        #[arg(long)]
+        offset_bytes: u64,
+        /// Payload bytes in 1..=131072; defaults to 65536.
+        #[arg(long, default_value_t = agent_run_domain::observation::DEFAULT_CHUNK_BYTES)]
+        max_bytes: usize,
+    },
+    /// Read one verified answer with the historical CLI inline cutoff.
     Answer {
         /// Stable agent id; defaults to its latest execution's answer.
         agent_id: AgentId,
@@ -449,6 +499,13 @@ pub enum Command {
     /// Internal run-bound worker channel; context is inherited from the supervisor.
     #[command(name = "_worker-mcp", hide = true)]
     WorkerMcp,
+    /// Account-owned launcher used by a shared broker.
+    #[command(name = "_launch-worker", hide = true)]
+    LaunchWorker {
+        /// Unix socket whose access is controlled by the host.
+        #[arg(long)]
+        socket: PathBuf,
+    },
     Api {
         #[command(subcommand)]
         command: Api,
@@ -530,6 +587,23 @@ pub enum Command {
         #[arg(long = "allow-mcp", required = true)]
         allow_mcp: Vec<String>,
     },
+}
+
+/// Select the native service-manager target for one planned restart.
+#[derive(Args, Debug)]
+pub struct Restart {
+    /// systemd unit or launchd service target; defaults to the standard service.
+    #[arg(long)]
+    pub target: Option<String>,
+    /// Use the caller's systemd user manager rather than the system manager.
+    #[arg(long)]
+    pub systemd_user: bool,
+    /// Stable request identity for retrying the same operation.
+    #[arg(long)]
+    pub request_id: Option<String>,
+    /// Resume a prepared operation after its manager definitively failed.
+    #[arg(long, conflicts_with = "request_id")]
+    pub recover: Option<i64>,
 }
 
 /// Administrative account registry operations; references name existing
@@ -727,6 +801,46 @@ pub struct Agents {
 /// Long-poll window, in seconds, of one follow watch round.
 const FOLLOW_WAIT_SECONDS: f64 = 25.0;
 
+/// Builds the same list filters and revision window for local and operator viewers.
+fn agents_query(
+    agents: &Agents,
+    after_revision: Option<i64>,
+    after_message_revision: Option<i64>,
+) -> Result<Query> {
+    Ok(Query {
+        active: agents.active,
+        offset: agents.offset,
+        limit: agents.limit,
+        after_revision,
+        after_message_revision,
+        wait_seconds: if after_revision.is_none() {
+            0.0
+        } else {
+            FOLLOW_WAIT_SECONDS
+        },
+        orchestrator: agents.session.resolve()?,
+    })
+}
+
+/// Sends a validated list query through the broker without resolving a local home.
+async fn broker_agent_list(broker: &dyn CliBroker, query: Query) -> Result<Value> {
+    query.validate()?;
+    broker
+        .call(
+            "list_agents",
+            json!({
+                "active": query.active,
+                "offset": query.offset,
+                "limit": query.limit,
+                "after_revision": query.after_revision,
+                "after_message_revision": query.after_message_revision,
+                "wait_seconds": query.wait_seconds,
+                "orchestrator": query.orchestrator,
+            }),
+        )
+        .await
+}
+
 /// Reduces one agent view to the stable facts a follow snapshot reports.
 ///
 /// Only fields whose change is meaningful re-emit a page: observation-time
@@ -782,39 +896,31 @@ fn follow_signature(agent: &Value) -> Option<String> {
 /// Runs the persistent `agents --follow` watcher for one command invocation.
 ///
 /// One process emits the first bounded page immediately and then one NDJSON
-/// snapshot per meaningful change: each round long-polls the broker with the
+/// snapshot per meaningful change: each round long-polls the list source with the
 /// last event revision and transcript watermark, so status, usage, tool-count,
 /// name, failure, delivery and answer changes all wake it, while pages whose
 /// only movement is observation time are counted and dropped. The waiter is
 /// abortable at every await: Ctrl-C ends the viewer (never the supervised
 /// agents) and a closed output pipe terminates the process through the
 /// writer's own error.
-async fn follow_agents(dependencies: CliDependencies, a: &Agents) -> Result<()> {
+async fn follow_agents<F, Fut>(a: &Agents, list: F, output: &CliOutput) -> Result<()>
+where
+    F: Fn(Query) -> Fut,
+    Fut: Future<Output = Result<Value>>,
+{
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut after_revision: Option<i64> = None;
     let mut after_message_revision: Option<i64> = None;
     let mut signatures: std::collections::BTreeMap<String, String> = Default::default();
     let mut total: Option<i64> = None;
     loop {
-        let request = Query {
-            active: a.active,
-            offset: a.offset,
-            limit: a.limit,
-            after_revision,
-            after_message_revision,
-            wait_seconds: if after_revision.is_none() {
-                0.0
-            } else {
-                FOLLOW_WAIT_SECONDS
-            },
-            orchestrator: a.session.resolve()?,
-        };
-        // A pending wait owns no SQLite transaction and no engine handle, so
-        // dropping it at the interrupt boundary leaves nothing behind.
+        let request = agents_query(a, after_revision, after_message_revision)?;
+        // A local wait retains no transaction; dropping a remote wait closes
+        // its socket without affecting agents or retrying the observation.
         let page = tokio::select! {
             biased;
             _ = interrupt.recv() => return Ok(()),
-            page = dependencies.service.list(request) => page?,
+            page = list(request) => page?,
         };
         after_revision = Some(page["revision"].as_i64().unwrap_or_default());
         after_message_revision = Some(page["message_revision"].as_i64().unwrap_or_default());
@@ -834,7 +940,7 @@ async fn follow_agents(dependencies: CliDependencies, a: &Agents) -> Result<()> 
         if unchanged {
             continue;
         }
-        (dependencies.output)(&page)?;
+        (output)(&page)?;
     }
 }
 
@@ -844,6 +950,15 @@ pub enum Api {
     Serve {
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Group-accessible operator socket in a protected directory.
+        #[arg(long, requires = "operator_gid", conflicts_with = "socket")]
+        operator_socket: Option<PathBuf>,
+        /// Unix group granted access to the operator socket.
+        #[arg(long, requires = "operator_socket", conflicts_with = "socket")]
+        operator_gid: Option<u32>,
+        /// Shared broker routes; OS users and groups control the sockets.
+        #[arg(long, conflicts_with_all = ["socket", "operator_socket", "operator_gid"])]
+        shared_config: Option<PathBuf>,
     },
     Launchd {
         #[arg(long)]
@@ -1478,19 +1593,21 @@ fn provider_login_target(
 }
 
 /// Recognizes the doctor command in argv before Clap reports invalid flags.
-/// Only the leading command after an optional --home value is considered, so
-/// unrelated commands whose task text contains "doctor" retain their exit policy.
+/// Only the leading command after global option values is considered, so other
+/// commands whose task text contains "doctor" retain their exit policy.
 pub fn doctor_invocation(arguments: &[std::ffi::OsString]) -> bool {
     let mut arguments = arguments.iter().skip(1);
     while let Some(argument) = arguments.next() {
-        if argument == "--home" {
+        if ["--home", "--broker-socket", "--broker-uid"].contains(&argument.to_str().unwrap_or(""))
+        {
             arguments.next();
             continue;
         }
-        if argument
-            .to_str()
-            .is_some_and(|value| value.starts_with("--home="))
-        {
+        if argument.to_str().is_some_and(|value| {
+            ["--home=", "--broker-socket=", "--broker-uid="]
+                .iter()
+                .any(|prefix| value.starts_with(prefix))
+        }) {
             continue;
         }
         return argument == "doctor";
@@ -1499,20 +1616,22 @@ pub fn doctor_invocation(arguments: &[std::ffi::OsString]) -> bool {
 }
 
 /// Identifies only the leading `hook context` command before Clap validation,
-/// ignoring the current global home option. Extend this recognizer alongside
-/// any future global options. Task text, ordinary `context`, and `hook bind`
+/// ignoring global options. Extend this recognizer alongside any future global
+/// options. Task text, ordinary `context`, and `hook bind`
 /// never gain advisory handling. Parse failures of recognized context hooks
 /// remain validation failures in diagnostics, with a nonblocking process exit.
 pub fn context_hook_invocation(arguments: &[std::ffi::OsString]) -> bool {
     let mut arguments = arguments.iter().skip(1);
     let mut commands = Vec::new();
     while let Some(argument) = arguments.next() {
-        if argument == "--home" {
-            arguments.next();
-        } else if argument
-            .to_str()
-            .is_some_and(|value| value.starts_with("--home="))
+        if ["--home", "--broker-socket", "--broker-uid"].contains(&argument.to_str().unwrap_or(""))
         {
+            arguments.next();
+        } else if argument.to_str().is_some_and(|value| {
+            ["--home=", "--broker-socket=", "--broker-uid="]
+                .iter()
+                .any(|prefix| value.starts_with(prefix))
+        }) {
             continue;
         } else {
             commands.push(argument);
@@ -1538,9 +1657,33 @@ pub fn log_context_failure(home: Option<&Path>, error: &Error) {
 /// stdio server. Expected failures
 /// propagate as typed errors for `main` to render as the Python-compatible
 /// JSON error envelope. `start` and `resume` exclusively call the resident
-/// socket broker. Long-lived API and supervisor processes select their own
-/// component log before the process-wide logger is initialized.
+/// socket broker. An explicit operator socket bypasses all local state and
+/// logging, and refuses commands that require local facilities. Long-lived API
+/// and supervisor processes select their own component log before initialization.
 pub async fn run(cli: Cli) -> Result<i32> {
+    if cli.broker_uid.is_some() && cli.broker_socket.is_none() {
+        return Err(invalid("--broker-uid requires --broker-socket"));
+    }
+    if let Some(socket) = cli.broker_socket.clone() {
+        if socket.as_os_str().is_empty() {
+            return Err(invalid("--broker-socket must not be empty"));
+        }
+        if !operator_client_command(&cli.command) {
+            return Err(unsupported_operator_command());
+        }
+        let broker = Arc::new(OperatorBroker {
+            socket,
+            expected_uid: cli.broker_uid,
+        });
+        return run_client_command(
+            cli.command,
+            broker,
+            Arc::new(emit),
+            Arc::new(write_chunk),
+            PathBuf::new(),
+        )
+        .await;
+    }
     // A worker frontend is a thin socket client. It must never migrate/open
     // the store or inherit Desktop host capabilities through the normal MCP.
     if matches!(cli.command, Command::WorkerMcp) {
@@ -1548,6 +1691,10 @@ pub async fn run(cli: Cli) -> Result<i32> {
         return Ok(0);
     }
     let home = fs::home(cli.home.clone())?;
+    if let Command::LaunchWorker { socket } = &cli.command {
+        crate::system::serve_worker(&home, socket).await?;
+        return Ok(0);
+    }
     if matches!(
         &cli.command,
         Command::Doctor { .. } | Command::DoctorCanary { .. }
@@ -1570,25 +1717,652 @@ pub async fn run(cli: Cli) -> Result<i32> {
         Command::ServiceExec { .. } => "services",
         _ => "cli",
     };
-    agent_run_core::logging::configure(&home, component);
+    // A system supervisor selects its account-private logging home only
+    // after authenticating and validating its frozen launch identity.
+    if !matches!(&cli.command, Command::Supervisor { .. })
+        || std::env::var_os("AGENT_RUN_SYSTEM_WRITER_SOCKET").is_none()
+    {
+        agent_run_core::logging::configure(&home, component);
+    }
     run_with(cli, CliDependencies::production(home)).await
 }
 
-/// Executes one parsed command against explicitly supplied service, broker, and output seams.
-///
-/// The parser and command surface are unchanged. Production callers use [`run`], which supplies
-/// the real service, Unix-socket broker, and stdout sink; tests can provide fakes without opening
-/// a broker socket or constructing a local runtime. The supplied dependencies remain borrowed by
-/// asynchronous calls only for the duration of this execution.
-pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
-    let home = fs::home(cli.home)?;
-    match cli.command {
-        Command::Init => (dependencies.output)(&crate::init::initialize(&home)?)?,
-        Command::Doctor { .. } => {
-            let report = (dependencies.doctor)(&home)?;
-            let ok = report.ok();
-            (dependencies.output)(&serde_json::to_value(report)?)?;
-            return Ok(if ok { 0 } else { 2 });
+/// Commands whose complete CLI path already uses only the resident broker (or embedded docs).
+fn client_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Start(_)
+            | Command::Restart(_)
+            | Command::Resume(_)
+            | Command::StartPool { .. }
+            | Command::PoolPost { .. }
+            | Command::PoolReplace { .. }
+            | Command::Pool { .. }
+            | Command::Pools { .. }
+            | Command::Capabilities
+            | Command::AnswerChunk { .. }
+            | Command::Doc { .. }
+            | Command::Mcp
+    )
+}
+
+/// Operator-only adapters for commands whose local implementation reads private state.
+/// The broker resolves a selected run once and returns its public projection.
+fn operator_client_command(command: &Command) -> bool {
+    client_command(command)
+        || matches!(
+            command,
+            Command::Agents(_)
+                | Command::Answer { .. }
+                | Command::Transcript { .. }
+                | Command::Cancel { .. }
+                | Command::Steer { .. }
+                | Command::Models { .. }
+                | Command::Limits
+                | Command::DelegationGuide { .. }
+                | Command::Hook { .. }
+                | Command::Capacity {
+                    command: Capacity::Order { .. }
+                }
+        )
+}
+
+/// Refuses commands that still need a local service, store, or private writer.
+fn unsupported_operator_command() -> Error {
+    Error::Unsupported(
+        "command is unavailable in operator mode; run it locally as the owning user".into(),
+    )
+}
+
+/// Socket-only metadata for one verified and execution-pinned CLI answer.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorAnswer {
+    /// Original public answer metadata, with inline bytes temporarily omitted.
+    answer: Value,
+    /// Exact retained execution receipt selected by the broker.
+    sequence: std::num::NonZeroU32,
+    /// Whether the original CLI answer included inline content.
+    inline: bool,
+    /// Opaque fingerprint of the verified execution and answer proof.
+    proof_token: Option<agent_run_domain::Sha256Digest>,
+}
+
+/// Restores the original CLI answer after verifying every bounded page and the
+/// full artifact digest. No local home or artifact path is opened by the client.
+async fn operator_answer(
+    broker: &dyn CliBroker,
+    agent_id: AgentId,
+    run_id: Option<AgentId>,
+) -> Result<Value> {
+    let invalid_answer =
+        || Error::AnswerIntegrity("broker returned invalid answer evidence".into());
+    let mut selected: OperatorAnswer = serde_json::from_value(
+        broker
+            .call("_cli_answer", json!({"agent_id":agent_id,"run_id":run_id}))
+            .await?,
+    )
+    .map_err(|_| invalid_answer())?;
+    let metadata: agent_run_domain::AnswerView =
+        serde_json::from_value(selected.answer.clone()).map_err(|_| invalid_answer())?;
+    if metadata.content.is_some() || metadata.inline_complete {
+        return Err(invalid_answer());
+    }
+    if !metadata.available {
+        if selected.inline
+            || selected.proof_token.is_some()
+            || metadata.size_bytes.is_some()
+            || metadata.sha256.is_some()
+        {
+            return Err(invalid_answer());
+        }
+        return Ok(selected.answer);
+    }
+    let total = metadata.size_bytes.ok_or_else(invalid_answer)?;
+    let digest: agent_run_domain::Sha256Digest = metadata
+        .sha256
+        .as_deref()
+        .ok_or_else(invalid_answer)?
+        .parse()
+        .map_err(|_| invalid_answer())?;
+    let version = metadata
+        .proof_version
+        .filter(|version| [1, 2].contains(version))
+        .ok_or_else(invalid_answer)?;
+    let token = selected.proof_token.as_ref().ok_or_else(invalid_answer)?;
+    if metadata.path.is_none()
+        || total > crate::verify::MAX_ANSWER as u64
+        || selected.inline != (total <= crate::verify::INLINE_ANSWER as u64)
+    {
+        return Err(invalid_answer());
+    }
+    if !selected.inline {
+        return Ok(selected.answer);
+    }
+
+    let mut content = String::with_capacity(usize::try_from(total).map_err(|_| invalid_answer())?);
+    let mut offset = 0_u64;
+    loop {
+        let page: agent_run_domain::observation::AnswerChunkView = serde_json::from_value(
+            broker
+                .call(
+                    "_cli_answer_chunk",
+                    json!({
+                        "query": {"agent_id":&metadata.agent_id,"sequence":selected.sequence,
+                            "expected_sha256":&digest,"offset_bytes":offset,
+                            "max_bytes":agent_run_domain::observation::MAX_CHUNK_BYTES},
+                        "proof_token":token,
+                    }),
+                )
+                .await?,
+        )
+        .map_err(|_| invalid_answer())?;
+        let next = offset
+            .checked_add(page.content.len() as u64)
+            .ok_or_else(invalid_answer)?;
+        if page.agent_id != metadata.agent_id
+            || page.sequence != selected.sequence.get()
+            || page.sha256 != digest.as_str()
+            || page.total_bytes != total
+            || page.offset_bytes != offset
+            || page.next_offset != next
+            || page.content.len() > agent_run_domain::observation::MAX_CHUNK_BYTES
+            || next > total
+            || page.complete != (next == total)
+            || (!page.complete && next == offset)
+        {
+            return Err(invalid_answer());
+        }
+        content.push_str(&page.content);
+        offset = next;
+        if page.complete {
+            break;
+        }
+    }
+    if crate::fs::sha256(content.as_bytes()) != digest.as_str() {
+        return Err(Error::AnswerHashMismatch);
+    }
+    if version == 1 {
+        if !content.as_bytes().ends_with(crate::verify::LEGACY_FRAME) {
+            return Err(invalid_answer());
+        }
+        content.truncate(content.len() - crate::verify::LEGACY_FRAME.len());
+    }
+    selected.answer["content"] = Value::String(content);
+    selected.answer["inline_complete"] = Value::Bool(true);
+    Ok(selected.answer)
+}
+
+/// The exact execution selected once for an operator transcript viewer.
+#[derive(Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorTranscriptSelection {
+    /// Stable lineage identity used in public results.
+    agent_id: AgentId,
+    /// Exact execution retained for the entire viewer.
+    run_id: AgentId,
+    /// Immutable receipt checked by the broker on every read.
+    sequence: std::num::NonZeroU32,
+}
+
+/// One fragment of a digest-fenced serialized transcript page.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorTranscriptPiece {
+    selection: OperatorTranscriptSelection,
+    sha256: agent_run_domain::Sha256Digest,
+    total_bytes: u64,
+    offset_bytes: u64,
+    next_offset: u64,
+    complete: bool,
+    content: String,
+}
+
+/// Selects one exact run once and checks an explicitly requested historical run.
+async fn operator_transcript_selection(
+    broker: &dyn CliBroker,
+    agent_id: &AgentId,
+    run_id: Option<&AgentId>,
+) -> Result<OperatorTranscriptSelection> {
+    let selection: OperatorTranscriptSelection = serde_json::from_value(
+        broker
+            .call(
+                "_cli_transcript_select",
+                json!({"agent_id":agent_id,"run_id":run_id}),
+            )
+            .await?,
+    )
+    .map_err(|_| invalid("broker returned invalid transcript selection"))?;
+    if run_id.is_some_and(|run| *run != selection.run_id) {
+        return Err(Error::ExecutionChanged);
+    }
+    Ok(selection)
+}
+
+/// Reassembles one exact broker page only while its digest and execution remain stable.
+async fn operator_transcript_page(
+    broker: &dyn CliBroker,
+    selection: &OperatorTranscriptSelection,
+    query: &agent_run_domain::transcript::TranscriptQuery,
+    lineage: bool,
+    recovery: bool,
+) -> Result<Value> {
+    // A busy journal may change the page mid-transfer; retry only this read,
+    // never a mutation, and stop after a bounded number of fresh snapshots.
+    const PAGE_RETRIES: usize = 3;
+    let invalid_page = || invalid("broker returned invalid transcript page");
+    let mut offset = 0_u64;
+    let mut digest: Option<String> = None;
+    let mut total = None;
+    let mut encoded = String::new();
+    let mut retries = 0;
+    loop {
+        let result = broker
+            .call(
+                "_cli_transcript_page",
+                json!({"selection":selection,"query":query,"lineage":lineage,"recovery":recovery,
+                "offset_bytes":offset,"expected_sha256":digest}),
+            )
+            .await;
+        let value = match result {
+            Ok(value) => value,
+            Err(error) => {
+                let changed = matches!(&error, Error::Broker { broker_error_code: Some(code), .. }
+                    if code == agent_run_core::dispatch::CLI_TRANSCRIPT_PAGE_CHANGED_CODE);
+                if !changed || retries == PAGE_RETRIES {
+                    return Err(error);
+                }
+                retries += 1;
+                offset = 0;
+                digest = None;
+                total = None;
+                encoded.clear();
+                continue;
+            }
+        };
+        let piece: OperatorTranscriptPiece =
+            serde_json::from_value(value).map_err(|_| invalid_page())?;
+        if piece.total_bytes > agent_run_core::dispatch::CLI_TRANSCRIPT_MAX_PAGE_BYTES as u64 {
+            return Err(Error::Runtime(
+                "transcript page exceeds 64 MiB limit".into(),
+            ));
+        }
+        let next = offset
+            .checked_add(piece.content.len() as u64)
+            .ok_or_else(invalid_page)?;
+        if piece.selection != *selection
+            || digest
+                .as_ref()
+                .is_some_and(|hash| hash != piece.sha256.as_str())
+            || total.is_some_and(|size| size != piece.total_bytes)
+            || piece.offset_bytes != offset
+            || piece.next_offset != next
+            || piece.content.len() > agent_run_domain::observation::MAX_CHUNK_BYTES
+            || next > piece.total_bytes
+            || piece.complete != (next == piece.total_bytes)
+            || (!piece.complete && next == offset)
+        {
+            return Err(invalid_page());
+        }
+        total = Some(piece.total_bytes);
+        digest = Some(piece.sha256.as_str().to_owned());
+        encoded.push_str(&piece.content);
+        offset = next;
+        if piece.complete {
+            break;
+        }
+    }
+    if digest.as_deref() != Some(crate::fs::sha256(encoded.as_bytes()).as_str()) {
+        return Err(invalid_page());
+    }
+    let page: Value = serde_json::from_str(&encoded).map_err(|_| invalid_page())?;
+    if !page.is_object() || page["agent_id"] != json!(selection.agent_id) {
+        return Err(invalid_page());
+    }
+    Ok(page)
+}
+
+/// Local or socket-backed access to the existing transcript viewer contract.
+enum TranscriptSource<'a> {
+    Local {
+        service: &'a dyn CliService,
+        id: AgentId,
+        lineage: bool,
+        recovery: bool,
+    },
+    Operator {
+        broker: &'a dyn CliBroker,
+        selection: OperatorTranscriptSelection,
+        lineage: bool,
+        recovery: bool,
+    },
+}
+
+impl TranscriptSource<'_> {
+    /// Returns the exact run fixed at viewer startup.
+    fn id(&self) -> &AgentId {
+        match self {
+            Self::Local { id, .. } => id,
+            Self::Operator { selection, .. } => &selection.run_id,
+        }
+    }
+
+    /// Reads one page using the original local or broker-backed selection.
+    async fn page(&self, query: agent_run_domain::transcript::TranscriptQuery) -> Result<Value> {
+        match self {
+            Self::Local {
+                service,
+                id,
+                lineage,
+                recovery,
+            } => {
+                if *recovery {
+                    service.transcript_recovery(id, query.cursor, query.limit)
+                } else {
+                    service.transcript_options(id, &query, *lineage)
+                }
+            }
+            Self::Operator {
+                broker,
+                selection,
+                lineage,
+                recovery,
+            } => operator_transcript_page(*broker, selection, &query, *lineage, *recovery).await,
+        }
+    }
+
+    /// Returns the selected execution's status without following a later resume.
+    async fn status(&self) -> Result<Value> {
+        match self {
+            Self::Local { service, id, .. } => Ok(service.agent(id)?["status"].clone()),
+            Self::Operator {
+                broker, selection, ..
+            } => {
+                let result = broker
+                    .call("_cli_transcript_status", serde_json::to_value(selection)?)
+                    .await?;
+                let actual: OperatorTranscriptSelection =
+                    serde_json::from_value(result["selection"].clone())
+                        .map_err(|_| invalid("broker returned invalid transcript selection"))?;
+                if actual != *selection {
+                    return Err(Error::ExecutionChanged);
+                }
+                Ok(result["status"].clone())
+            }
+        }
+    }
+
+    /// Projects one page or completed full view to the original stable public id.
+    fn project(&self, mut value: Value) -> Result<Value> {
+        match self {
+            Self::Local { service, id, .. } => service.public_run_result(id, value),
+            Self::Operator { selection, .. } => {
+                let object = value
+                    .as_object_mut()
+                    .ok_or_else(|| invalid("agent result must be an object"))?;
+                object.insert("agent_id".into(), json!(selection.agent_id));
+                for key in [
+                    "run_id",
+                    "parent_run_id",
+                    "parent_agent_id",
+                    "root_agent_id",
+                    "attempt_id",
+                ] {
+                    object.remove(key);
+                }
+                Ok(value)
+            }
+        }
+    }
+}
+
+/// Display options retained for one local or remote transcript invocation.
+struct TranscriptViewer {
+    cursor: i64,
+    limit: usize,
+    view: agent_run_domain::transcript::TranscriptView,
+    tail_blocks: Option<usize>,
+    before_cursor: Option<i64>,
+    follow: bool,
+    full: bool,
+    native_history: Option<PathBuf>,
+    format: Option<TranscriptFormat>,
+}
+
+/// Renders the shared transcript view, retaining local pagination and Ctrl-C behavior.
+async fn view_transcript(
+    source: TranscriptSource<'_>,
+    options: TranscriptViewer,
+    output: &CliOutput,
+    text_output: &CliTextOutput,
+) -> Result<()> {
+    let TranscriptViewer {
+        mut cursor,
+        limit,
+        view,
+        tail_blocks,
+        before_cursor,
+        follow,
+        full,
+        native_history,
+        format,
+    } = options;
+    let query = agent_run_domain::transcript::TranscriptQuery {
+        cursor,
+        limit,
+        view,
+        tail_blocks,
+        before_cursor,
+    };
+    query.validate()?;
+    if native_history.is_some()
+        && (!full
+            || follow
+            || cursor != 0
+            || view != agent_run_domain::transcript::TranscriptView::Raw)
+    {
+        return Err(invalid(
+            "native history reconstruction requires --full, raw view and cursor zero",
+        ));
+    }
+    if view == agent_run_domain::transcript::TranscriptView::Blocks && (follow || full) {
+        return Err(invalid(
+            "blocks are bounded pages; --follow and --full require raw view",
+        ));
+    }
+    let page_at = |cursor| {
+        let mut page = query.clone();
+        page.cursor = cursor;
+        source.page(page)
+    };
+    let text = TranscriptFormat::effective(format) == TranscriptFormat::Text;
+    let mut renderer = crate::transcript::Renderer::default();
+    if full {
+        let page = page_at(cursor).await?;
+        let mut messages = page["messages"].as_array().cloned().unwrap_or_default();
+        let mut page_cursor = cursor;
+        let mut pages = 1usize;
+        let mut current = page;
+        while current["complete"] != true {
+            let next = current["next_cursor"]
+                .as_i64()
+                .ok_or_else(|| invalid("transcript pagination did not advance"))?;
+            if next <= page_cursor {
+                return Err(invalid("transcript pagination did not advance"));
+            }
+            page_cursor = next;
+            current = page_at(page_cursor).await?;
+            messages.extend(current["messages"].as_array().cloned().unwrap_or_default());
+            pages += 1;
+        }
+        let reconstruction = if let Some(path) = native_history.as_ref() {
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let name = path
+                .file_name()
+                .ok_or_else(|| invalid("native history needs a file name"))?;
+            let bytes = agent_run_platform::fs::Dir::open(parent)?
+                .read(Path::new(name), 64 * 1024 * 1024)?;
+            let repaired = crate::transcript::restore_claude_history(&mut messages, &bytes)?;
+            Some(
+                json!({"source_sha256":agent_run_platform::fs::sha256(&bytes),"reconstructed_messages":repaired,"raw_journal_unchanged":true}),
+            )
+        } else {
+            None
+        };
+        if text {
+            renderer.page(&messages, &mut |line| (text_output)(line))?;
+            renderer.finish(&mut |line| (text_output)(line))?;
+        } else {
+            let mut value = json!({"agent_id":source.id(),"messages":messages,"cursor":cursor,"next_cursor":null,"complete":true,"pages":pages});
+            if let Some(proof) = reconstruction {
+                value["reconstruction"] = proof;
+            }
+            (output)(&source.project(value)?)?;
+        }
+        return Ok(());
+    }
+    // Install the listener before the first page; dropping a remote read closes
+    // that observation only and cannot cancel a supervised agent.
+    let mut interrupt = follow
+        .then(|| tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()))
+        .transpose()?;
+    // A terminal status may be committed after the page was read; drain one
+    // fresh snapshot so a final journal fragment cannot be skipped.
+    let mut draining_terminal = false;
+    loop {
+        let page = if let Some(interrupt) = interrupt.as_mut() {
+            tokio::select! { _ = interrupt.recv() => break, result = page_at(cursor) => result? }
+        } else {
+            page_at(cursor).await?
+        };
+        if draining_terminal
+            && page["complete"] == true
+            && page["messages"].as_array().is_some_and(Vec::is_empty)
+        {
+            break;
+        }
+        if text {
+            renderer.page(
+                page["messages"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                &mut |line| (text_output)(line),
+            )?;
+        } else {
+            (output)(&source.project(page.clone())?)?;
+        }
+        if let Some(seq) = page["messages"]
+            .as_array()
+            .and_then(|a| a.last())
+            .and_then(|v| v["seq"].as_i64())
+        {
+            cursor = seq;
+        }
+        if !follow {
+            break;
+        }
+        if draining_terminal {
+            if page["complete"] == true {
+                break;
+            }
+            continue;
+        }
+        if page["complete"] == true {
+            let status = if let Some(interrupt) = interrupt.as_mut() {
+                tokio::select! { _ = interrupt.recv() => break, result = source.status() => result? }
+            } else {
+                source.status().await?
+            };
+            if status.as_str().is_some_and(|status| {
+                matches!(
+                    status,
+                    "succeeded" | "failed" | "lost" | "timed_out" | "cancelled"
+                )
+            }) {
+                draining_terminal = true;
+                continue;
+            }
+        }
+        if let Some(interrupt) = interrupt.as_mut() {
+            tokio::select! { _=interrupt.recv()=>break, _=tokio::time::sleep(Duration::from_millis(250))=>{} }
+        }
+    }
+    renderer.finish(&mut |line| (text_output)(line))?;
+    Ok(())
+}
+
+/// Keep only the host session and blocked-restart receipt when forwarding a hook.
+fn restart_hook_payload(payload: &Value, transport: &str) -> Result<Option<Value>> {
+    Ok(
+        hooks::bind::restart_waiter(payload, transport)?.map(|(restart_id, reference)| {
+            json!({"hook_event_name":"PostToolUse","session_id":reference.external_session_id,
+            "tool_response":{"accepted":false,"agent_run_restart_id":restart_id}})
+        }),
+    )
+}
+
+/// Executes existing broker-only CLI operations with their original payloads and output sinks.
+/// The MCP home is metadata only: operator mode passes an empty path and never resolves a home.
+async fn run_client_command(
+    command: Command,
+    broker: Arc<dyn CliBroker>,
+    output: CliOutput,
+    text_output: CliTextOutput,
+    home: PathBuf,
+) -> Result<i32> {
+    match command {
+        Command::Restart(args) => return crate::restart::run(broker.as_ref(), &output, args).await,
+        Command::Hook { command } => {
+            let (bind, transport) = match command {
+                Hook::Context(transport) => (false, transport.transport),
+                Hook::Bind(transport) => (true, transport.transport),
+            };
+            let result: Result<Value> = async {
+                let input = read_stdin(1024 * 1024)?;
+                let payload: Value = serde_json::from_str(&input)
+                    .map_err(|_| invalid("hook payload must be a JSON object"))?;
+                if bind && let Some(safe) = restart_hook_payload(&payload, &transport)? {
+                    return broker
+                        .call("_hook_bind", json!({"payload":safe,"transport":transport}))
+                        .await;
+                }
+                let normalized = hooks::bind::normalize(&payload, bind, &transport)?;
+                let mut safe = json!({
+                    "transport": normalized.reference.transport,
+                    "external_session_id": normalized.reference.external_session_id,
+                });
+                if let Some(turn) = normalized.reference.external_turn_id {
+                    safe["external_turn_id"] = json!(turn);
+                }
+                if let Some(pool) = normalized.pool_id {
+                    safe["pool_id"] = json!(pool);
+                }
+                if let Some(agent) = normalized.agent_id {
+                    safe["agent_id"] = json!(agent);
+                }
+                if let Some(sequence) = normalized.sequence {
+                    safe["sequence"] = json!(sequence);
+                }
+                broker
+                    .call(
+                        if bind { "_hook_bind" } else { "_hook_context" },
+                        json!({"payload":safe,"transport":transport}),
+                    )
+                    .await
+            }
+            .await;
+            match result {
+                Ok(value) => (output)(&value)?,
+                Err(error) if !bind => {
+                    hooks::context::log_failure(&error, None);
+                    (output)(&json!({}))?;
+                }
+                Err(error) => return Err(error),
+            }
         }
         Command::Start(a) => {
             let task = task_text(&a.task, 1024 * 1024)?;
@@ -1628,10 +2402,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 }))
                 .map_err(|_| invalid("invalid provider start arguments"))?;
             request.validate()?;
-            let result = dependencies
-                .broker
-                .call("start", serde_json::to_value(request)?)
-                .await?;
+            let result = broker.call("start", serde_json::to_value(request)?).await?;
             if a.wait {
                 let id: AgentId = serde_json::from_value(result["agent_id"].clone())?;
                 let mut wait = json!({"agent_id": id});
@@ -1643,11 +2414,11 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 } else if let Some(run_id) = result.get("run_id") {
                     wait["run_id"] = run_id.clone();
                 }
-                let result = dependencies.broker.call("wait", wait).await?;
-                (dependencies.output)(&result)?;
+                let result = broker.call("wait", wait).await?;
+                (output)(&result)?;
                 return Ok(result_code(&result));
             }
-            (dependencies.output)(&admission_output(&result)?)?;
+            (output)(&admission_output(&result)?)?;
         }
         Command::Resume(a) => {
             let task = match (a.task, a.task_file) {
@@ -1663,8 +2434,268 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             if let Some(display_name) = a.display_name {
                 arguments["display_name"] = json!(display_name);
             }
-            let result = dependencies.broker.call("resume", arguments).await?;
-            (dependencies.output)(&admission_output(&result)?)?;
+            let result = broker.call("resume", arguments).await?;
+            (output)(&admission_output(&result)?)?;
+        }
+        Command::StartPool { spec, session } => {
+            let mut request = spec_json(&spec)?;
+            if let Some(reference) = session.resolve()? {
+                request["orchestrator"] = serde_json::to_value(reference)?;
+            }
+            let result = broker.call("start_pool", request).await?;
+            (output)(&result)?;
+        }
+        Command::PoolPost {
+            pool_id,
+            request_id,
+            text,
+        } => {
+            let message = task_text(&text, agent_run_domain::pool::MAX_BODY_BYTES)?;
+            let result = broker
+                .call(
+                    "pool_post",
+                    json!({"pool_id": pool_id, "request_id": request_id, "message": message}),
+                )
+                .await?;
+            (output)(&result)?;
+        }
+        Command::PoolReplace {
+            pool_id,
+            agent_id,
+            request_id,
+            spec,
+        } => {
+            let start = spec.as_deref().map(spec_json).transpose()?;
+            let result = broker
+                .call(
+                    "pool_replace",
+                    json!({"pool_id": pool_id, "agent_id": agent_id, "request_id": request_id, "start": start}),
+                )
+                .await?;
+            (output)(&result)?;
+        }
+        Command::Pool {
+            pool_id,
+            after_seq,
+            before_seq,
+            limit,
+        } => {
+            let result = broker
+                .call(
+                    "pool",
+                    json!({"pool_id": pool_id, "after_seq": after_seq, "before_seq": before_seq, "limit": limit}),
+                )
+                .await?;
+            (output)(&result)?;
+        }
+        Command::Pools {
+            state,
+            offset,
+            limit,
+            text,
+        } => {
+            let query: agent_run_domain::pool::ListPoolsQuery =
+                serde_json::from_value(json!({"state": state, "offset": offset, "limit": limit}))
+                    .map_err(|_| invalid("invalid pool list arguments"))?;
+            query.validate()?;
+            let result = broker
+                .call("list_pools", serde_json::to_value(query)?)
+                .await?;
+            if text {
+                (text_output)(&format!(
+                    "{}\n",
+                    crate::transport::mcp_text::list_pools_text(&result)?
+                ))?;
+            } else {
+                (output)(&result)?;
+            }
+        }
+        Command::Capabilities => {
+            (output)(&broker.call("capabilities", json!({})).await?)?;
+        }
+        Command::AnswerChunk {
+            agent_id,
+            sequence,
+            expected_sha256,
+            offset_bytes,
+            max_bytes,
+        } => {
+            let query = agent_run_domain::observation::AnswerChunkQuery {
+                agent_id,
+                sequence,
+                expected_sha256,
+                offset_bytes,
+                max_bytes,
+            };
+            query.validate()?;
+            (output)(
+                &broker
+                    .call("answer_chunk", serde_json::to_value(query)?)
+                    .await?,
+            )?;
+        }
+        Command::Agents(agents) => {
+            let broker = broker.as_ref();
+            if agents.follow {
+                follow_agents(&agents, |query| broker_agent_list(broker, query), &output).await?;
+            } else {
+                (output)(&broker_agent_list(broker, agents_query(&agents, None, None)?).await?)?;
+            }
+        }
+        Command::Answer { agent_id, run_id } => {
+            (output)(&operator_answer(broker.as_ref(), agent_id, run_id).await?)?;
+        }
+        Command::Transcript {
+            agent_id,
+            run_id,
+            cursor,
+            limit,
+            view,
+            tail_blocks,
+            before_cursor,
+            follow,
+            full,
+            native_history,
+            format,
+        } => {
+            let selection =
+                operator_transcript_selection(broker.as_ref(), &agent_id, run_id.as_ref()).await?;
+            let source = TranscriptSource::Operator {
+                broker: broker.as_ref(),
+                selection,
+                lineage: run_id.is_none() && native_history.is_none(),
+                recovery: native_history.is_some(),
+            };
+            view_transcript(
+                source,
+                TranscriptViewer {
+                    cursor,
+                    limit,
+                    view,
+                    tail_blocks,
+                    before_cursor,
+                    follow,
+                    full,
+                    native_history,
+                    format,
+                },
+                &output,
+                &text_output,
+            )
+            .await?;
+        }
+        Command::Cancel { agent_id, run_id } => {
+            (output)(
+                &broker
+                    .call("cancel", json!({"agent_id":agent_id,"run_id":run_id}))
+                    .await?,
+            )?;
+        }
+        Command::Steer {
+            agent_id,
+            run_id,
+            text,
+        } => {
+            (output)(
+                &broker
+                    .call(
+                        "steer",
+                        json!({"agent_id":agent_id,"run_id":run_id,"text":text}),
+                    )
+                    .await?,
+            )?;
+        }
+        Command::Models {
+            provider,
+            profile,
+            model,
+        } => {
+            (output)(
+                &broker
+                    .call(
+                        "models",
+                        json!({"provider":provider,"profile":profile,"model":model}),
+                    )
+                    .await?,
+            )?;
+        }
+        Command::Limits => (output)(&broker.call("limits", json!({})).await?)?,
+        Command::DelegationGuide {
+            provider,
+            profile,
+            model,
+        } => {
+            let value = broker
+                .call(
+                    "delegation_guide",
+                    json!({"provider":provider,"profile":profile,"model":model}),
+                )
+                .await?;
+            let text = value
+                .as_str()
+                .ok_or_else(|| invalid("delegation guide must be text"))?;
+            (text_output)(&format!("{text}\n"))?;
+        }
+        Command::Capacity {
+            command: Capacity::Order { model },
+        } => {
+            (output)(
+                &broker
+                    .call("capacity_order", json!({"model":model}))
+                    .await?,
+            )?;
+        }
+        Command::Doc { topic } => {
+            let topic = topic.as_deref().unwrap_or("index");
+            (output)(&json!({"topic":topic,"text":crate::dispatch::doc(topic)?}))?;
+        }
+        Command::Mcp => transport::mcp::serve_with(home, None, broker.clone()).await?,
+        _ => return Err(unsupported_operator_command()),
+    }
+    Ok(0)
+}
+
+/// Executes one parsed command against supplied service, broker, and output seams.
+/// Explicit operator mode never resolves a local home and refuses local commands.
+/// Production callers use [`run`]; injected dependencies remain borrowed only
+/// for the duration of the execution.
+pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
+    if cli.broker_uid.is_some() && cli.broker_socket.is_none() {
+        return Err(invalid("--broker-uid requires --broker-socket"));
+    }
+    let operator_mode = cli.broker_socket.is_some();
+    if cli
+        .broker_socket
+        .as_ref()
+        .is_some_and(|socket| socket.as_os_str().is_empty())
+    {
+        return Err(invalid("--broker-socket must not be empty"));
+    }
+    if operator_mode && !operator_client_command(&cli.command) {
+        return Err(unsupported_operator_command());
+    }
+    let home = if operator_mode {
+        PathBuf::new()
+    } else {
+        fs::home(cli.home)?
+    };
+    if operator_mode || client_command(&cli.command) {
+        return run_client_command(
+            cli.command,
+            dependencies.broker,
+            dependencies.output,
+            dependencies.text_output,
+            home,
+        )
+        .await;
+    }
+    match cli.command {
+        Command::Init => (dependencies.output)(&crate::init::initialize(&home)?)?,
+        Command::Doctor { .. } => {
+            let report = (dependencies.doctor)(&home)?;
+            let ok = report.ok();
+            (dependencies.output)(&serde_json::to_value(report)?)?;
+            return Ok(if ok { 0 } else { 2 });
         }
         Command::Cancel { agent_id, run_id } => {
             let id = dependencies
@@ -1726,83 +2757,6 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 store.delivery_status(&run.id)?,
             )?)?;
         }
-        Command::StartPool { spec, session } => {
-            let mut request = spec_json(&spec)?;
-            if let Some(reference) = session.resolve()? {
-                request["orchestrator"] = serde_json::to_value(reference)?;
-            }
-            let result = dependencies.broker.call("start_pool", request).await?;
-            (dependencies.output)(&result)?;
-        }
-        Command::PoolPost {
-            pool_id,
-            request_id,
-            text,
-        } => {
-            let message = task_text(&text, agent_run_domain::pool::MAX_BODY_BYTES)?;
-            let result = dependencies
-                .broker
-                .call(
-                    "pool_post",
-                    json!({"pool_id": pool_id, "request_id": request_id, "message": message}),
-                )
-                .await?;
-            (dependencies.output)(&result)?;
-        }
-        Command::PoolReplace {
-            pool_id,
-            agent_id,
-            request_id,
-            spec,
-        } => {
-            let start = spec.as_deref().map(spec_json).transpose()?;
-            let result = dependencies
-                .broker
-                .call(
-                    "pool_replace",
-                    json!({"pool_id": pool_id, "agent_id": agent_id, "request_id": request_id, "start": start}),
-                )
-                .await?;
-            (dependencies.output)(&result)?;
-        }
-        Command::Pool {
-            pool_id,
-            after_seq,
-            before_seq,
-            limit,
-        } => {
-            let result = dependencies
-                .broker
-                .call(
-                    "pool",
-                    json!({"pool_id": pool_id, "after_seq": after_seq, "before_seq": before_seq, "limit": limit}),
-                )
-                .await?;
-            (dependencies.output)(&result)?;
-        }
-        Command::Pools {
-            state,
-            offset,
-            limit,
-            text,
-        } => {
-            let query: agent_run_domain::pool::ListPoolsQuery =
-                serde_json::from_value(json!({"state": state, "offset": offset, "limit": limit}))
-                    .map_err(|_| invalid("invalid pool list arguments"))?;
-            query.validate()?;
-            let result = dependencies
-                .broker
-                .call("list_pools", serde_json::to_value(query)?)
-                .await?;
-            if text {
-                (dependencies.text_output)(&format!(
-                    "{}\n",
-                    crate::transport::mcp_text::list_pools_text(&result)?
-                ))?;
-            } else {
-                (dependencies.output)(&result)?;
-            }
-        }
         Command::Context(a) => {
             let reference = OrchestratorRef {
                 transport: a.session_transport,
@@ -1830,6 +2784,17 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                     (dependencies.output)(&output)?;
                 }
                 Hook::Bind(transport) => {
+                    if let Some(safe) = restart_hook_payload(&payload, &transport.transport)? {
+                        let output = dependencies
+                            .broker
+                            .call(
+                                "_hook_bind",
+                                json!({"payload":safe,"transport":transport.transport}),
+                            )
+                            .await?;
+                        (dependencies.output)(&output)?;
+                        return Ok(0);
+                    }
                     let result =
                         hooks::bind::run_hook_bound(&home, &payload, &transport.transport, None)
                             .await?;
@@ -1844,19 +2809,12 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 (dependencies.output)(
                     &dependencies
                         .service
-                        .list(Query {
-                            active: a.active,
-                            offset: a.offset,
-                            limit: a.limit,
-                            after_revision: None,
-                            after_message_revision: None,
-                            wait_seconds: 0.0,
-                            orchestrator: a.session.resolve()?,
-                        })
+                        .list(agents_query(&a, None, None)?)
                         .await?,
                 )?;
             } else {
-                follow_agents(dependencies, &a).await?;
+                let service = dependencies.service.as_ref();
+                follow_agents(&a, |query| service.list(query), &dependencies.output).await?;
             }
         }
         Command::Answer { agent_id, run_id } => {
@@ -1869,7 +2827,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
         Command::Transcript {
             agent_id,
             run_id,
-            mut cursor,
+            cursor,
             limit,
             view,
             tail_blocks,
@@ -1879,159 +2837,32 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
             native_history,
             format,
         } => {
-            let agent_id = dependencies
+            let id = dependencies
                 .service
                 .resolve_run_id(&agent_id, run_id.as_ref())?;
-            let query = agent_run_domain::transcript::TranscriptQuery {
-                cursor,
-                limit,
-                view,
-                tail_blocks,
-                before_cursor,
+            let source = TranscriptSource::Local {
+                service: dependencies.service.as_ref(),
+                id,
+                lineage: run_id.is_none() && native_history.is_none(),
+                recovery: native_history.is_some(),
             };
-            query.validate()?;
-            if native_history.is_some()
-                && (!full
-                    || follow
-                    || cursor != 0
-                    || view != agent_run_domain::transcript::TranscriptView::Raw)
-            {
-                return Err(invalid(
-                    "native history reconstruction requires --full, raw view and cursor zero",
-                ));
-            }
-            if view == agent_run_domain::transcript::TranscriptView::Blocks && (follow || full) {
-                return Err(invalid(
-                    "blocks are bounded pages; --follow and --full require raw view",
-                ));
-            }
-            let page_at = |cursor| {
-                if native_history.is_some() {
-                    return dependencies.service.transcript_recovery(
-                        &agent_id,
-                        cursor,
-                        query.limit,
-                    );
-                }
-                let mut page = query.clone();
-                page.cursor = cursor;
-                dependencies.service.transcript_options(
-                    &agent_id,
-                    &page,
-                    run_id.is_none() && native_history.is_none(),
-                )
-            };
-            // An explicit --format always wins; otherwise text is interactive
-            // and JSON keeps piped consumers on the historical machine shape.
-            let text = TranscriptFormat::effective(format) == TranscriptFormat::Text;
-            // Streaming state persists across pages and polls so journal
-            // fragments of one model message render continuously; the sink
-            // writes each rendered chunk immediately.
-            let mut renderer = crate::transcript::Renderer::default();
-            if full {
-                let page = page_at(cursor)?;
-                let mut messages = page["messages"].as_array().cloned().unwrap_or_default();
-                let mut page_cursor = cursor;
-                let mut pages = 1usize;
-                let mut current = page;
-                while current["complete"] != true {
-                    let next = current["next_cursor"]
-                        .as_i64()
-                        .ok_or_else(|| invalid("transcript pagination did not advance"))?;
-                    if next <= page_cursor {
-                        return Err(invalid("transcript pagination did not advance"));
-                    }
-                    page_cursor = next;
-                    current = page_at(page_cursor)?;
-                    messages.extend(current["messages"].as_array().cloned().unwrap_or_default());
-                    pages += 1;
-                }
-                let reconstruction = if let Some(path) = native_history.as_ref() {
-                    let parent = path
-                        .parent()
-                        .filter(|p| !p.as_os_str().is_empty())
-                        .unwrap_or_else(|| std::path::Path::new("."));
-                    let name = path
-                        .file_name()
-                        .ok_or_else(|| invalid("native history needs a file name"))?;
-                    let bytes = agent_run_platform::fs::Dir::open(parent)?
-                        .read(std::path::Path::new(name), 64 * 1024 * 1024)?;
-                    let repaired =
-                        crate::transcript::restore_claude_history(&mut messages, &bytes)?;
-                    Some(
-                        json!({"source_sha256":agent_run_platform::fs::sha256(&bytes),"reconstructed_messages":repaired,"raw_journal_unchanged":true}),
-                    )
-                } else {
-                    None
-                };
-                if text {
-                    renderer.page(&messages, &mut |line| (dependencies.text_output)(line))?;
-                    renderer.finish(&mut |line| (dependencies.text_output)(line))?;
-                } else {
-                    let mut value = json!({"agent_id":agent_id,"messages":messages,"cursor":cursor,"next_cursor":null,"complete":true,"pages":pages});
-                    if let Some(proof) = reconstruction {
-                        value["reconstruction"] = proof;
-                    }
-                    (dependencies.output)(
-                        &dependencies.service.public_run_result(&agent_id, value)?,
-                    )?;
-                }
-            } else {
-                // The interrupt listener is installed before the first page,
-                // so a Ctrl-C at any point ends only the viewer, gracefully.
-                let mut interrupt = follow
-                    .then(|| {
-                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                    })
-                    .transpose()?;
-                loop {
-                    let page = page_at(cursor)?;
-                    if text {
-                        renderer.page(
-                            page["messages"]
-                                .as_array()
-                                .map(Vec::as_slice)
-                                .unwrap_or(&[]),
-                            &mut |line| (dependencies.text_output)(line),
-                        )?;
-                    } else {
-                        (dependencies.output)(
-                            &dependencies
-                                .service
-                                .public_run_result(&agent_id, page.clone())?,
-                        )?;
-                    }
-                    if let Some(seq) = page["messages"]
-                        .as_array()
-                        .and_then(|a| a.last())
-                        .and_then(|v| v["seq"].as_i64())
-                    {
-                        cursor = seq;
-                    }
-                    if !follow {
-                        break;
-                    }
-                    if page["complete"] == true
-                        && dependencies.service.agent(&agent_id)?["status"]
-                            .as_str()
-                            .is_some_and(|status| {
-                                matches!(
-                                    status,
-                                    "succeeded" | "failed" | "lost" | "timed_out" | "cancelled"
-                                )
-                            })
-                    {
-                        break;
-                    }
-                    // Interrupting the viewer never cancels the supervised
-                    // agent; the resident supervisor keeps running it.
-                    if let Some(interrupt) = interrupt.as_mut() {
-                        tokio::select! {_=interrupt.recv()=>break,_=tokio::time::sleep(Duration::from_millis(250))=>{}}
-                    }
-                }
-                // Flush the tail of the streamed item on any viewer exit.
-                renderer.finish(&mut |line| (dependencies.text_output)(line))?;
-            }
+            view_transcript(
+                source,
+                TranscriptViewer {
+                    cursor,
+                    limit,
+                    view,
+                    tail_blocks,
+                    before_cursor,
+                    follow,
+                    full,
+                    native_history,
+                    format,
+                },
+                &dependencies.output,
+                &dependencies.text_output,
+            )
+            .await?;
         }
         Command::Models {
             provider,
@@ -2066,20 +2897,53 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 .ok_or_else(|| invalid("delegation guide must be text"))?;
             (dependencies.text_output)(&format!("{text}\n"))?;
         }
-        Command::Doc { topic } => {
-            let topic = topic.as_deref().unwrap_or("index");
-            (dependencies.output)(&json!({"topic":topic,"text":crate::dispatch::doc(topic)?}))?;
-        }
-        Command::Mcp => transport::mcp::serve_with(home, None, dependencies.broker.clone()).await?,
         Command::WorkerMcp => transport::worker_mcp::serve_from_env().await?,
+        Command::LaunchWorker { socket } => crate::system::serve_worker(&home, &socket).await?,
         Command::Api { command } => match command {
-            Api::Serve { socket } => {
-                if let Some(socket) = socket {
-                    transport::socket::serve_at(&home, &socket).await?
-                } else {
-                    transport::socket::serve(&home).await?
+            Api::Serve {
+                socket,
+                operator_socket,
+                operator_gid,
+                shared_config,
+            } => match (socket, operator_socket, operator_gid, shared_config) {
+                (None, None, None, Some(path)) => {
+                    let config = crate::system::Config::load(&path)?;
+                    let operator = config.operator_socket.clone();
+                    let settings = transport::socket::SystemServeOptions {
+                        writer_socket: config.writer_socket.clone(),
+                        operator_sockets: config.operator_sockets.clone(),
+                        launcher: Arc::new(crate::system::BrokerLauncher::new(
+                            home.clone(),
+                            config,
+                        )?),
+                    };
+                    transport::socket::serve_system(
+                        &home,
+                        &operator,
+                        settings,
+                        transport::socket::ServeOptions::default(),
+                    )
+                    .await?
                 }
-            }
+                (None, Some(path), Some(gid), None) => {
+                    transport::socket::serve_with_operator(
+                        &home,
+                        &path,
+                        gid,
+                        transport::socket::ServeOptions::default(),
+                    )
+                    .await?
+                }
+                (Some(socket), None, None, None) => {
+                    transport::socket::serve_at(&home, &socket).await?
+                }
+                (None, None, None, None) => transport::socket::serve(&home).await?,
+                _ => {
+                    return Err(invalid(
+                        "operator socket and group must be paired and cannot be combined with --socket",
+                    ));
+                }
+            },
             Api::Launchd {
                 binary,
                 label,
@@ -2327,6 +3191,7 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                 emit(&decision)?;
             }
         }
+        _ => return Err(unsupported_operator_command()),
     }
     Ok(0)
 }
@@ -2338,6 +3203,20 @@ mod login_selection_tests {
     use super::provider_login_target;
     use agent_run_config::provider_config::ProviderConfig;
     use agent_run_domain::catalog::{AccountRecord, AccountStatus};
+
+    /// Forward only the host identity and restart receipt from a blocked start.
+    #[test]
+    fn restart_hook_drops_unrelated_tool_data() {
+        let payload = serde_json::json!({"hook_event_name":"PostToolUse","session_id":"chat",
+            "tool_input":{"task":"private task"},
+            "tool_response":{"accepted":false,"agent_run_restart_id":7}});
+        let safe = super::restart_hook_payload(&payload, "codex_queue")
+            .unwrap()
+            .unwrap();
+        assert_eq!(safe["session_id"], "chat");
+        assert_eq!(safe["tool_response"]["agent_run_restart_id"], 7);
+        assert!(!safe.to_string().contains("private task"));
+    }
 
     /// A provider label that is another binding's global ID is ambiguous;
     /// unambiguous labels and IDs still select their registered account.

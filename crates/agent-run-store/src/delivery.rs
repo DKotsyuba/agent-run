@@ -73,7 +73,8 @@ pub(crate) fn ensure_bound_terminal_notice(
     let event: Option<i64> = tx.query_row(
         "SELECT MAX(e.seq) FROM events e JOIN agents a ON a.id=e.agent_id \
          WHERE a.id=? AND a.status IN ('succeeded','failed','timed_out','cancelled','lost') \
-         AND e.kind='status' AND e.to_status=a.status",
+         AND e.kind='status' AND e.to_status=a.status \
+         AND COALESCE(json_extract(e.data_json,'$.service_restart'),0)<>1",
         [id.as_str()],
         |row| row.get(0),
     )?;
@@ -353,7 +354,29 @@ fn bounded(value: Option<String>) -> Option<String> {
 }
 
 /// Payload facts of one claimed delivery, validated from durable rows.
-fn claim_payload(tx: &Connection, delivery_id: &str, agent_id: &str) -> Result<Value> {
+fn claim_payload(tx: &Connection, delivery_id: &str, agent_id: Option<&str>) -> Result<Value> {
+    let restart: Option<(String, Option<String>)> = tx
+        .query_row(
+            "SELECT n.message,(SELECT b.intent_json FROM service_restart_notices prior \
+             JOIN bridge_delivery_intents b ON b.delivery_id=prior.delivery_id \
+             WHERE n.stage='after' AND prior.restart_id=n.restart_id AND prior.transport=n.transport \
+             AND prior.external_session_id=n.external_session_id AND prior.stage='before') \
+             FROM service_restart_notices n WHERE n.delivery_id=?",
+            [delivery_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((message, before)) = restart {
+        if message.is_empty() {
+            return Err(invalid("invalid restart notice"));
+        }
+        let before: Option<agent_run_domain::bridge::BridgeIntent> = before
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(|_| invalid("invalid preceding restart intent"))?;
+        return Ok(json!({"kind":"restart","notice":message,"before_intent":before}));
+    }
+    let agent_id = agent_id.ok_or_else(|| invalid("delivery has no agent or restart notice"))?;
     let attention: Option<(String, String)> = tx
         .query_row(
             "SELECT json_extract(e.data_json,'$.pool_id'),json_extract(e.data_json,'$.notice') FROM deliveries d \
@@ -481,7 +504,9 @@ impl Store<'_> {
     /// Lease the oldest due Bridge publication for `op.owner`, expiring unbound terminal notices.
     /// Every unattempted row selects Bridge before I/O, even without deployment configuration.
     /// Attempted historical native rows end held with `legacy_delivery_held` and retained evidence;
-    /// malformed payloads quarantine only their own row. Returns owned facts or no lease.
+    /// malformed payloads quarantine only their own row. A paired restart result
+    /// waits for the warning's frozen route; retry policy remains unchanged.
+    /// Returns owned facts or no lease.
     pub fn claim_delivery_lease(
         &mut self,
         op: &crate::ops::ClaimDelivery,
@@ -504,11 +529,15 @@ impl Store<'_> {
              AND terminal_event_seq IN (SELECT seq FROM events WHERE at<=?)",
             [time - BINDING_WINDOW_SECONDS],
         )?;
-        let found: Option<(String, String, String, u32)> = tx
+        let found: Option<(String, Option<String>, String, u32)> = tx
             .query_row(
-                "SELECT id,agent_id,orchestrator_session_id,attempts FROM deliveries \
-                 WHERE (state IN ('pending','retry_wait') AND COALESCE(next_attempt_at,0)<=?1) OR (state='sending' AND lease_until<=?1) \
-                 ORDER BY COALESCE(next_attempt_at,lease_until,0),id LIMIT 1",
+                "SELECT d.id,d.agent_id,d.orchestrator_session_id,d.attempts FROM deliveries d \
+                 WHERE ((d.state IN ('pending','retry_wait') AND COALESCE(d.next_attempt_at,0)<=?1) OR (d.state='sending' AND d.lease_until<=?1)) \
+                 AND NOT EXISTS(SELECT 1 FROM service_restart_notices n JOIN service_restart_notices prior \
+                   ON prior.restart_id=n.restart_id AND prior.transport=n.transport AND prior.external_session_id=n.external_session_id \
+                   AND prior.stage='before' WHERE n.delivery_id=d.id AND n.stage='after' \
+                   AND NOT EXISTS(SELECT 1 FROM bridge_delivery_intents b WHERE b.delivery_id=prior.delivery_id AND b.intent_json IS NOT NULL)) \
+                 ORDER BY COALESCE(d.next_attempt_at,d.lease_until,0),d.id LIMIT 1",
                 [time],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
@@ -540,7 +569,7 @@ impl Store<'_> {
             tx.commit()?;
             return Ok(None);
         }
-        let payload = match claim_payload(&tx, &delivery_id, &agent_id) {
+        let payload = match claim_payload(&tx, &delivery_id, agent_id.as_deref()) {
             Ok(payload) => payload,
             Err(agent_run_domain::Error::Validation(_) | agent_run_domain::Error::Integrity(_)) => {
                 tx.execute(

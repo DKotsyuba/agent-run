@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     env, fs,
+    os::unix::fs::DirBuilderExt,
     path::{Component, Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
@@ -70,7 +71,9 @@ pub fn build(root: &Path, output: &Path, revision: &str) -> Result<PathBuf, Stri
         });
         let manifest =
             serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())? + "\n";
-        git_archive(root, &commit, output, &prefix, Some(&manifest))?;
+        let manifest_path = temporary.join(MANIFEST);
+        fs::write(&manifest_path, manifest).map_err(|error| error.to_string())?;
+        git_archive(root, &commit, output, &prefix, Some(&manifest_path))?;
         Ok(output.to_path_buf())
     })();
     let _ = fs::remove_dir_all(&temporary);
@@ -217,19 +220,22 @@ fn temporary_directory(label: &str) -> Result<PathBuf, String> {
         "agent-run-xtask-{label}-{}-{stamp}",
         std::process::id()
     ));
-    fs::create_dir(&directory).map_err(|error| error.to_string())?;
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
+        .map_err(|error| error.to_string())?;
     Ok(directory)
 }
 
 /// Archives every tracked source file at commit except the declared cache paths.
 /// No links are omitted or dereferenced; strict inspection rejects unsafe trees
-/// before extraction. An optional generated manifest is added at the prefix.
+/// before extraction. An optional generated manifest file is added at the prefix.
 fn git_archive(
     root: &Path,
     commit: &str,
     output: &Path,
     prefix: &str,
-    manifest: Option<&str>,
+    manifest: Option<&Path>,
 ) -> Result<(), String> {
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -241,12 +247,12 @@ fn git_archive(
         "--prefix",
         &format!("{prefix}/"),
         "--output",
-        output.to_str().ok_or("archive path not UTF-8")?,
-        commit,
     ]);
+    command.arg(output);
     if let Some(manifest) = manifest {
-        command.arg(format!("--add-virtual-file={prefix}/{MANIFEST}:{manifest}"));
+        command.arg("--add-file").arg(manifest);
     }
+    command.arg(commit);
     command.args([
         "--",
         ".",
@@ -405,8 +411,8 @@ fn valid_hash(hash: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::relative_path;
-    use std::path::Path;
+    use super::{MANIFEST, git_archive, relative_path, temporary_directory};
+    use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
     /// Confirms archive manifests cannot address files outside their root.
     #[test]
@@ -417,5 +423,34 @@ mod tests {
             relative_path("Cargo.lock").expect("safe path"),
             Path::new("Cargo.lock")
         );
+    }
+
+    /// Archive scratch data is inaccessible to other accounts from creation.
+    #[test]
+    fn archive_temporary_directory_is_private() {
+        let temporary = temporary_directory("test").unwrap();
+        let mode = fs::metadata(&temporary).unwrap().permissions().mode();
+        fs::remove_dir(temporary).unwrap();
+        assert_eq!(mode & 0o077, 0);
+    }
+
+    /// A large manifest must not be passed as one OS-limited command argument.
+    #[test]
+    fn archives_large_manifest_from_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let manifest = temporary.path().join(MANIFEST);
+        let content = format!("{{\"fixture\":\"{}\"}}", "x".repeat(160 * 1024));
+        fs::write(&manifest, &content).unwrap();
+        let archive = temporary.path().join("source.tar");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        git_archive(root, "HEAD", &archive, "fixture", Some(&manifest)).unwrap();
+        let extracted = Command::new("tar")
+            .arg("-xOf")
+            .arg(&archive)
+            .arg(format!("fixture/{MANIFEST}"))
+            .output()
+            .unwrap();
+        assert!(extracted.status.success());
+        assert_eq!(extracted.stdout, content.as_bytes());
     }
 }

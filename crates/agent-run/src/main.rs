@@ -2,13 +2,22 @@ use clap::{Parser, error::ErrorKind};
 
 /// Parses the CLI, preserving global errors while doctor uses 0/2/3 for
 /// passed checks, failed checks and invocation/report failures respectively.
-/// Optional context hook failures log safe diagnostics and emit an empty JSON
-/// response with exit 0. Binding and all ordinary commands remain strict.
+/// Optional local context hook failures log safe diagnostics and emit an empty
+/// JSON response with exit 0. Operator mode and ordinary commands remain strict.
 #[tokio::main]
 async fn main() {
     let arguments: Vec<_> = std::env::args_os().collect();
     let doctor = agent_run::cli::doctor_invocation(&arguments);
-    let advisory_context = agent_run::cli::context_hook_invocation(&arguments);
+    // Operator options must be strict even when parsing fails before a Cli
+    // exists; the local advisory hook must not mask an unsupported remote hook.
+    let operator_option = arguments.iter().skip(1).any(|argument| {
+        argument.to_str().is_some_and(|value| {
+            matches!(value, "--broker-socket" | "--broker-uid")
+                || value.starts_with("--broker-socket=")
+                || value.starts_with("--broker-uid=")
+        })
+    });
+    let advisory_context = !operator_option && agent_run::cli::context_hook_invocation(&arguments);
     let cli = match agent_run::cli::Cli::try_parse_from(arguments) {
         Ok(cli) => cli,
         Err(error)

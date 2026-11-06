@@ -18,9 +18,17 @@ use agent_run_store::{
     },
     writer::{CatalogPreflight, StoreReader},
 };
-use serde::Deserialize;
+use rusqlite::OptionalExtension;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::Duration;
+
+/// Maximum encoded CLI transcript page, matching the existing 64 MiB native-history input bound.
+pub const CLI_TRANSCRIPT_MAX_PAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Socket-only retry code for a transcript page changed between fragments.
+pub const CLI_TRANSCRIPT_PAGE_CHANGED_CODE: &str = "TranscriptPageChanged";
+
 /// Returns the one domain-owned, Python-compatible public discovery table.
 pub fn tools() -> Vec<Value> {
     tools_json()
@@ -41,6 +49,241 @@ struct Id {
     /// Exact execution within that lineage; omission selects the latest.
     #[serde(default)]
     run_id: Option<AgentId>,
+}
+
+/// Socket-only CLI answer page and the opaque fence from the initial selection.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CliAnswerChunk {
+    /// Exact lineage, execution sequence, artifact digest and byte cursor.
+    query: agent_run_domain::observation::AnswerChunkQuery,
+    /// Fingerprint of the originally verified execution and proof.
+    proof_token: agent_run_domain::Sha256Digest,
+}
+
+/// Socket-only identity of one selected transcript execution.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CliTranscriptSelection {
+    /// Canonical public lineage identity.
+    agent_id: AgentId,
+    /// Exact retained execution fixed at viewer startup.
+    run_id: AgentId,
+    /// Immutable execution receipt checked on every read.
+    sequence: std::num::NonZeroU32,
+}
+
+/// One bounded fragment of a single serialized transcript page.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CliTranscriptPage {
+    /// Selected execution whose identity must still match.
+    selection: CliTranscriptSelection,
+    /// Existing transcript page options and validation.
+    query: agent_run_domain::transcript::TranscriptQuery,
+    /// Read the same retained lineage as the ordinary unpinned CLI viewer.
+    lineage: bool,
+    /// Return exact-run recovery boundaries, never a filesystem path.
+    recovery: bool,
+    /// UTF-8 byte offset within the serialized page.
+    offset_bytes: u64,
+    /// Hash returned by the first fragment; required for every later fragment.
+    expected_sha256: Option<agent_run_domain::Sha256Digest>,
+}
+
+/// Resolves an exact selection and refuses missing, mismatched or changed receipts.
+fn cli_transcript_row(
+    store: &StoreReader,
+    selection: &CliTranscriptSelection,
+) -> Result<crate::state::Record> {
+    let row = agent_identity::resolve(store, &selection.agent_id, Some(&selection.run_id))?;
+    if row.id != selection.run_id
+        || row.root_agent_id != selection.agent_id
+        || row.sequence != selection.sequence.get()
+    {
+        return Err(crate::Error::ExecutionChanged);
+    }
+    Ok(row)
+}
+
+/// Checks candidate row sizes in the caller's page snapshot, using SQLite's
+/// length metadata rather than copying unbounded legacy content into Rust.
+fn check_cli_transcript_budget(
+    store: &StoreReader,
+    row: &crate::state::Record,
+    request: &CliTranscriptPage,
+) -> Result<()> {
+    let blocks = request.query.view == agent_run_domain::transcript::TranscriptView::Blocks;
+    let reverse =
+        blocks && (request.query.tail_blocks.is_some() || request.query.before_cursor.is_some());
+    let (column, id) = if request.lineage {
+        ("root_agent_id", &row.root_agent_id)
+    } else {
+        ("agent_id", &row.id)
+    };
+    let (comparison, order, cursor) = if reverse {
+        ("<", "DESC", request.query.before_cursor.unwrap_or(i64::MAX))
+    } else {
+        (">", "ASC", request.query.cursor)
+    };
+    let scan = if blocks {
+        agent_run_store::transcript::MAX_BLOCK_SCAN_ROWS + 1
+    } else {
+        request.query.limit + 1
+    };
+    let sql = format!(
+        "SELECT COALESCE(MAX(content_bytes),0),COALESCE(SUM(metadata_bytes),0) FROM (
+        SELECT octet_length(content) AS content_bytes,
+          COALESCE(octet_length(name),0)+COALESCE(octet_length(raw_ref),0)+
+          COALESCE(octet_length(error_source),0)+COALESCE(octet_length(role),0)+
+          COALESCE(octet_length(agent_id),0)+COALESCE(octet_length(attempt_id),0) AS metadata_bytes
+        FROM messages WHERE {column}=?1 AND seq{comparison}?2 ORDER BY seq {order} LIMIT ?3)"
+    );
+    let (content, metadata): (i64, i64) = store.conn().query_row(
+        &sql,
+        rusqlite::params![id.as_str(), cursor, scan as i64],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    // Both raw and block readers inspect one excluded neighbor for boundaries.
+    let (neighbor_comparison, neighbor_order) = if reverse {
+        (">=", "ASC")
+    } else {
+        ("<=", "DESC")
+    };
+    let neighbor_sql = format!("SELECT COALESCE(octet_length(name),0)+COALESCE(octet_length(raw_ref),0)+
+        COALESCE(octet_length(error_source),0)+COALESCE(octet_length(role),0)+
+        COALESCE(octet_length(agent_id),0)+COALESCE(octet_length(attempt_id),0)
+        FROM messages WHERE {column}=?1 AND seq{neighbor_comparison}?2 ORDER BY seq {neighbor_order} LIMIT 1");
+    let neighbor: Option<i64> = store
+        .conn()
+        .query_row(
+            &neighbor_sql,
+            rusqlite::params![id.as_str(), cursor],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if metadata.saturating_add(neighbor.unwrap_or(0)) > CLI_TRANSCRIPT_MAX_PAGE_BYTES as i64
+        || (!blocks && content > CLI_TRANSCRIPT_MAX_PAGE_BYTES as i64)
+    {
+        return Err(crate::Error::Runtime(
+            "transcript page exceeds 64 MiB limit".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Accumulates at most the transcript budget while serde serializes a page.
+#[derive(Default)]
+struct BoundedTranscriptJson {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+impl std::io::Write for BoundedTranscriptJson {
+    /// Rejects bytes before growing the buffer beyond the configured bound.
+    fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+        let Some(required) = self.bytes.len().checked_add(input.len()) else {
+            self.exceeded = true;
+            return Err(std::io::Error::other("transcript page exceeds limit"));
+        };
+        if required > CLI_TRANSCRIPT_MAX_PAGE_BYTES {
+            self.exceeded = true;
+            return Err(std::io::Error::other("transcript page exceeds limit"));
+        }
+        if required > self.bytes.capacity() {
+            let target = required
+                .max(self.bytes.capacity().saturating_mul(2))
+                .clamp(4096, CLI_TRANSCRIPT_MAX_PAGE_BYTES);
+            self.bytes.reserve_exact(target - self.bytes.len());
+        }
+        self.bytes.extend_from_slice(input);
+        Ok(input.len())
+    }
+
+    /// In-memory output has nothing to flush.
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Rebuilds one existing transcript page and returns a bounded fragment. Later
+/// fragments fail if the complete serialized page changed since the first read.
+fn cli_transcript_page(service: &Service, request: CliTranscriptPage) -> Result<Value> {
+    cli_transcript_page_observed(service, request, || {})
+}
+
+/// Keeps budget, identity and page reads in one snapshot. The observer allows
+/// tests to commit another connection after preflight, before materialization.
+fn cli_transcript_page_observed(
+    service: &Service,
+    request: CliTranscriptPage,
+    after_budget: impl FnOnce(),
+) -> Result<Value> {
+    request.query.validate()?;
+    if (request.offset_bytes == 0) != request.expected_sha256.is_none() {
+        return Err(invalid("transcript page digest and offset must be paired"));
+    }
+    let store = StoreReader::open(&service.home)?;
+    let snapshot = store.conn().unchecked_transaction()?;
+    let row = cli_transcript_row(&store, &request.selection)?;
+    check_cli_transcript_budget(&store, &row, &request)?;
+    after_budget();
+    let page = if request.recovery {
+        if request.lineage
+            || request.query.view != agent_run_domain::transcript::TranscriptView::Raw
+        {
+            return Err(invalid(
+                "transcript recovery requires an exact raw execution",
+            ));
+        }
+        store.transcript_recovery(&row.id, request.query.cursor, request.query.limit)?
+    } else {
+        store.transcript_query(&row.id, &request.query, request.lineage)?
+    };
+    let page = agent_identity::result(&row, page)?;
+    cli_transcript_row(&store, &request.selection)?;
+    snapshot.commit()?;
+    let mut buffer = BoundedTranscriptJson::default();
+    if let Err(error) = serde_json::to_writer(&mut buffer, &page) {
+        if buffer.exceeded {
+            return Err(crate::Error::Runtime(
+                "transcript page exceeds 64 MiB limit".into(),
+            ));
+        }
+        return Err(error.into());
+    }
+    let encoded = String::from_utf8(buffer.bytes)
+        .map_err(|_| crate::Error::Runtime("transcript page encoding failed".into()))?;
+    let sha256 = crate::fs::sha256(encoded.as_bytes());
+    if request
+        .expected_sha256
+        .as_ref()
+        .is_some_and(|expected| expected.as_str() != sha256)
+    {
+        return Err(crate::Error::Broker {
+            message: "transcript page changed during read".into(),
+            broker_error_code: Some(CLI_TRANSCRIPT_PAGE_CHANGED_CODE.into()),
+            broker_error_data: None,
+        });
+    }
+    let offset = usize::try_from(request.offset_bytes)
+        .map_err(|_| invalid("transcript page offset exceeds its size"))?;
+    if offset > encoded.len() || !encoded.is_char_boundary(offset) {
+        return Err(invalid(
+            "transcript page offset must be a UTF-8 boundary within the page",
+        ));
+    }
+    let mut end = offset
+        .saturating_add(agent_run_domain::observation::MAX_CHUNK_BYTES)
+        .min(encoded.len());
+    while !encoded.is_char_boundary(end) {
+        end -= 1;
+    }
+    Ok(
+        json!({"selection":request.selection,"sha256":sha256,"total_bytes":encoded.len(),
+        "offset_bytes":offset,"next_offset":end,"complete":end == encoded.len(),
+        "content":&encoded[offset..end]}),
+    )
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -97,6 +340,28 @@ struct Doc {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Empty {}
+
+/// A normalized host hook carried over an authenticated operator connection.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HookRequest {
+    payload: Value,
+    transport: String,
+}
+
+/// Private CLI request to begin one planned service restart.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceRestartBegin {
+    request_id: String,
+}
+
+/// Private CLI selection of one planned service restart.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceRestartId {
+    restart_id: i64,
+}
 /// Operator/service-only exact integration selection; null/zero is invalid.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -145,6 +410,83 @@ struct Wait {
 /// socket, MCP, and CLI transports can independently render their protocols.
 pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
     match name {
+        "_service_restart_begin" => {
+            let request: ServiceRestartBegin = args(raw)?;
+            Ok(json!({"restart_id":service.begin_service_restart(&request.request_id).await?}))
+        }
+        "_service_restart_status" => {
+            let request: ServiceRestartId = args(raw)?;
+            service.service_restart_status(request.restart_id).await
+        }
+        "_service_restart_failed" => {
+            let request: ServiceRestartId = args(raw)?;
+            Ok(
+                json!({"restart_id":service.recover_failed_service_restart(request.restart_id).await?}),
+            )
+        }
+        "_service_restart_claim" => {
+            let request: ServiceRestartId = args(raw)?;
+            Ok(json!({"claimed":service.claim_service_restart(request.restart_id).await?}))
+        }
+        "_hook_context" => {
+            let hook: HookRequest = args(raw)?;
+            let normalized = crate::hooks::bind::normalize(&hook.payload, false, &hook.transport)?;
+            let context =
+                crate::hooks::context::build_for_hook(&service.home, &normalized.reference, None)
+                    .await?;
+            Ok(if context.injected && !context.text.trim().is_empty() {
+                json!({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":context.text}})
+            } else {
+                json!({})
+            })
+        }
+        "_hook_bind" => {
+            let hook: HookRequest = args(raw)?;
+            if let Some((restart_id, reference)) =
+                crate::hooks::bind::restart_waiter(&hook.payload, &hook.transport)?
+            {
+                service
+                    .remember_service_restart_caller(restart_id, reference)
+                    .await?;
+                return Ok(
+                    json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"agent-run: restart wait recorded; retry after the restart notice."}}),
+                );
+            }
+            let bound = crate::hooks::bind::run_hook_bound(
+                &service.home,
+                &hook.payload,
+                &hook.transport,
+                None,
+            )
+            .await?;
+            let configured = agent_run_config::provider_config::ProviderConfig::load(&service.home)
+                .map(|(config, _)| config.delivery.bridge.is_some())
+                .or_else(|_| {
+                    crate::config::Config::load(&service.home)
+                        .map(|config| config.delivery.bridge.is_some())
+                });
+            let message = match configured {
+                Ok(true) => bound.message(),
+                other => {
+                    let detail = if other.is_ok() {
+                        "Bridge notifications are not configured"
+                    } else {
+                        "Bridge notification configuration could not be verified"
+                    };
+                    match &bound {
+                        crate::hooks::bind::HookBound::Agent(value) => {
+                            format!("agent-run: agent {} is bound; {detail}.", value.agent_id)
+                        }
+                        crate::hooks::bind::HookBound::Pool(value) => {
+                            format!("agent-run: pool {} is bound; {detail}.", value.pool_id)
+                        }
+                    }
+                }
+            };
+            Ok(
+                json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":message}}),
+            )
+        }
         agent_run_domain::worker::CATALOG_METHOD => register_catalog(service, args(raw)?).await,
         agent_run_domain::worker::METHOD => {
             let call: agent_run_domain::worker::WorkerCall = args(raw)?;
@@ -206,9 +548,81 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
             let row = service.resolve_run(&a.agent_id, a.run_id.as_ref())?;
             agent_identity::result(&row, service.answer(&row.id)?)
         }
+        "_cli_answer" => {
+            let selection: Id = args(raw)?;
+            let service = service.clone();
+            tokio::task::spawn_blocking(move || {
+                service.cli_answer(&selection.agent_id, selection.run_id.as_ref())
+            })
+            .await
+            .map_err(|_| crate::Error::Runtime("CLI answer read failed".into()))?
+        }
+        "_cli_answer_chunk" => {
+            let page: CliAnswerChunk = args(raw)?;
+            let service = service.clone();
+            tokio::task::spawn_blocking(move || {
+                serde_json::to_value(service.cli_answer_chunk(&page.query, &page.proof_token)?)
+                    .map_err(Into::into)
+            })
+            .await
+            .map_err(|_| crate::Error::Runtime("CLI answer chunk read failed".into()))?
+        }
+        "answer_chunk" => {
+            let query = args::<agent_run_domain::observation::AnswerChunkQuery>(raw)?;
+            let service = service.clone();
+            tokio::task::spawn_blocking(move || {
+                serde_json::to_value(service.answer_chunk(&query)?).map_err(Into::into)
+            })
+            .await
+            .map_err(|_| crate::Error::Runtime("answer chunk read failed".into()))?
+        }
+        "capabilities" => {
+            let _: Empty = args(raw)?;
+            Ok(crate::observation::capabilities())
+        }
         "transcript" => {
             let a: Transcript = args(raw)?;
             service.transcript_with_options(&a.agent_id, a.run_id.as_ref(), &a.page)
+        }
+        "_cli_transcript_select" => {
+            let selection: Id = args(raw)?;
+            let service = service.clone();
+            tokio::task::spawn_blocking(move || {
+                let store = StoreReader::open(&service.home)?;
+                let row = agent_identity::resolve(
+                    &store,
+                    &selection.agent_id,
+                    selection.run_id.as_ref(),
+                )?;
+                let sequence = std::num::NonZeroU32::new(row.sequence)
+                    .ok_or_else(|| invalid("transcript execution receipt must be positive"))?;
+                Ok(serde_json::to_value(CliTranscriptSelection {
+                    agent_id: row.root_agent_id,
+                    run_id: row.id,
+                    sequence,
+                })?)
+            })
+            .await
+            .map_err(|_| crate::Error::Runtime("CLI transcript selection failed".into()))?
+        }
+        "_cli_transcript_page" => {
+            let request: CliTranscriptPage = args(raw)?;
+            let service = service.clone();
+            tokio::task::spawn_blocking(move || cli_transcript_page(&service, request))
+                .await
+                .map_err(|_| crate::Error::Runtime("CLI transcript page read failed".into()))?
+        }
+        "_cli_transcript_status" => {
+            let selection: CliTranscriptSelection = args(raw)?;
+            let service = service.clone();
+            tokio::task::spawn_blocking(move || {
+                let store = StoreReader::open(&service.home)?;
+                let row = cli_transcript_row(&store, &selection)?;
+                let view = service.view(&store, &row)?;
+                Ok(json!({"selection":selection,"status":view["status"]}))
+            })
+            .await
+            .map_err(|_| crate::Error::Runtime("CLI transcript status read failed".into()))?
         }
         "start_pool" => {
             service
@@ -658,6 +1072,74 @@ async fn register_catalog(service: &Service, proof: WorkerCatalogProof) -> Resul
                 )
                 .await?;
             Ok(json!({"registered":true}))
+        }
+    }
+}
+
+#[cfg(test)]
+mod cli_transcript_snapshot_tests {
+    use super::*;
+
+    /// A commit after the budget check cannot add unchecked rows to raw,
+    /// block or recovery pages, but becomes visible to the next page snapshot.
+    #[test]
+    fn cli_transcript_budget_and_page_share_snapshot() {
+        for (view, lineage, recovery) in [
+            ("raw", false, false),
+            ("raw", true, false),
+            ("blocks", false, false),
+            ("blocks", true, false),
+            ("raw", false, true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().canonicalize().unwrap();
+            crate::fs::private_dir(&home).unwrap();
+            std::fs::write(
+                home.join("config.toml"),
+                format!(
+                    "schema_version=1\n[runtimes.mock]\nenabled=true\nadapter='claude'\nbinary='/bin/true'\nhome={}\nmodels=['fixture']\nlimits_source='none'\n",
+                    toml::Value::String(home.join("mock").to_string_lossy().into_owned())
+                ),
+            )
+            .unwrap();
+            let config = crate::config::Config::load(&home).unwrap();
+            agent_run_store::fixture::initialize(&home).unwrap();
+            let mut writer = agent_run_store::fixture::open(&home).unwrap();
+            let start = serde_json::from_value(json!({
+                "runtime":"mock", "model":"fixture", "profile":"review",
+                "task":"snapshot fixture", "workdir":home
+            }))
+            .unwrap();
+            let (id, _) = writer.admit(&start, &config, &json!({}), None).unwrap();
+            writer
+                .message(&id, "assistant", "before", None, Some("before"))
+                .unwrap();
+            let request = json!({
+                "selection":{"agent_id":id,"run_id":id,"sequence":1},
+                "query":{"view":view},"lineage":lineage,"recovery":recovery,
+                "offset_bytes":0,"expected_sha256":null
+            });
+            let service = Service::new(home);
+            let first = cli_transcript_page_observed(
+                &service,
+                serde_json::from_value(request.clone()).unwrap(),
+                || {
+                    writer
+                        .message(&id, "assistant", "after", None, Some("after"))
+                        .unwrap();
+                },
+            )
+            .unwrap();
+            assert_eq!(first["complete"], true);
+            let page: Value = serde_json::from_str(first["content"].as_str().unwrap()).unwrap();
+            assert_eq!(page["messages"].as_array().unwrap().len(), 1);
+            assert_eq!(page["messages"][0]["content"], "before");
+
+            let next =
+                cli_transcript_page(&service, serde_json::from_value(request).unwrap()).unwrap();
+            let page: Value = serde_json::from_str(next["content"].as_str().unwrap()).unwrap();
+            assert_eq!(page["messages"].as_array().unwrap().len(), 2);
+            assert_eq!(page["messages"][1]["content"], "after");
         }
     }
 }

@@ -146,6 +146,7 @@ impl Fixture {
                 checks,
                 qualified_hosts: vec![],
                 payload: Some(bundle_artifact),
+                linux_payload: None,
             },
         );
         let artifacts = [
@@ -294,11 +295,89 @@ esac
         }
     }
 
+    /// Adds an independently recorded Linux payload to the synthetic release.
+    fn add_linux(&mut self) {
+        let mac = self
+            .manifest
+            .artifacts
+            .iter()
+            .find(|item| item.kind == "bundle")
+            .unwrap()
+            .clone();
+        let name = format!(
+            "agent-run-{}-x86_64-unknown-linux-gnu.tar.gz",
+            self.manifest.version
+        );
+        fs::copy(self.assets.join(&mac.name), self.assets.join(&name)).unwrap();
+        let bytes = fs::read(self.assets.join(&name)).unwrap();
+        let linux = Artifact {
+            name,
+            kind: "bundle".into(),
+            target: Some("x86_64-unknown-linux-gnu".into()),
+            size: bytes.len() as u64,
+            sha256: agent_run_platform::fs::sha256(&bytes),
+        };
+        let path = self.assets.join("acceptance.json");
+        let mut evidence: Acceptance = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        evidence.linux_payload = Some(linux.clone());
+        evidence.checks.extend(
+            [
+                "linux-workspace",
+                "linux-integration",
+                "linux-native-build",
+                "linux-exact-payload",
+            ]
+            .into_iter()
+            .map(|name| Check {
+                check_id: name.into(),
+                argv_sha256: "b".repeat(64),
+                stdout_sha256: "b".repeat(64),
+                stderr_sha256: "b".repeat(64),
+                exit_code: 0,
+            }),
+        );
+        record(&path, &evidence);
+        self.manifest.artifacts.insert(1, linux);
+        let evidence_asset = self
+            .manifest
+            .artifacts
+            .iter_mut()
+            .find(|item| item.kind == "evidence")
+            .unwrap();
+        let bytes = fs::read(&path).unwrap();
+        evidence_asset.size = bytes.len() as u64;
+        evidence_asset.sha256 = agent_run_platform::fs::sha256(&bytes);
+        record(&self.assets.join("release-manifest.json"), &self.manifest);
+        let mut sums = self
+            .manifest
+            .artifacts
+            .iter()
+            .map(|item| format!("{}  {}\n", item.sha256, item.name))
+            .collect::<String>();
+        sums.push_str(&format!(
+            "{}  release-manifest.json\n",
+            agent_run_platform::fs::sha256(
+                &fs::read(self.assets.join("release-manifest.json")).unwrap()
+            )
+        ));
+        fs::write(self.assets.join("SHA256SUMS"), sums).unwrap();
+        let assets = fs::read_dir(&self.assets).unwrap().map(|entry| {
+            let entry = entry.unwrap();
+            json!({"name":entry.file_name().to_str().unwrap(),"size":entry.metadata().unwrap().len(),"state":"uploaded"})
+        }).collect::<Vec<_>>();
+        record(
+            &self.temp.path().join("published.json"),
+            &json!({"id":29,"tag_name":self.manifest.tag,"draft":false,"prerelease":false,"published_at":"fixture","assets":assets}),
+        );
+    }
+
     /// Spawns the actual xtask binary with only local fixture routes.
+    /// CI identity is opt-in because this source tree is synthetic.
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_xtask"));
         command
             .current_dir(&self.root)
+            .env_remove("GITHUB_ACTIONS")
             .env(
                 "PATH",
                 format!(
@@ -320,7 +399,7 @@ esac
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(25);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
@@ -353,9 +432,9 @@ esac
         }
     }
 
-    /// Gives normal identity/integrity fixtures a finite ten-second observation budget.
+    /// Bounds normal identity/integrity fixtures while allowing concurrent tool startup.
     fn wait(&self, result: &Path, notify: Option<&Path>) -> Output {
-        self.wait_for(result, notify, "10")
+        self.wait_for(result, notify, "30")
     }
 
     /// Uses an explicit deadline; the timeout boundary fixture alone requests one second.
@@ -445,6 +524,91 @@ fn exact_release_and_wrong_notifier_ack_preserve_publication_fact() {
     assert_eq!(event["status"], "released");
     assert_eq!(event["notification"]["status"], "failed");
     assert_eq!(fixture.wait(&result, None).status.code(), Some(5));
+}
+
+/// Linux producer evidence records its actual native target and refuses a
+/// different host target before running the requested check.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn linux_producer_evidence_is_bound_to_the_running_host() {
+    use std::io::Write;
+    let fixture = Fixture::new();
+    writeln!(
+        fs::OpenOptions::new()
+            .append(true)
+            .open(fixture.root.join("family.toml"))
+            .unwrap(),
+        "candidate_targets = [\"x86_64-unknown-linux-gnu\"]"
+    )
+    .unwrap();
+    let evidence = fixture.temp.path().join("linux-evidence.json");
+    let mut command = fixture.command();
+    command.args([
+        "package",
+        "accept",
+        "--accepted-commit",
+        &fixture.manifest.commit,
+        "--target",
+        "x86_64-unknown-linux-gnu",
+        "--output",
+        evidence.to_str().unwrap(),
+        "--",
+        "/bin/true",
+    ]);
+    let output = fixture.output(command);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&fs::read(&evidence).unwrap()).unwrap();
+    assert_eq!(value["identity"]["target"], "x86_64-unknown-linux-gnu");
+    let mut wrong = fixture.command();
+    wrong.args([
+        "package",
+        "accept",
+        "--accepted-commit",
+        &fixture.manifest.commit,
+        "--target",
+        "aarch64-apple-darwin",
+        "--output",
+        fixture.temp.path().join("wrong.json").to_str().unwrap(),
+        "--",
+        "/bin/true",
+    ]);
+    assert!(!fixture.output(wrong).status.success());
+}
+
+/// The release observer downloads and verifies both native archives; a changed
+/// Linux payload cannot be reported as a verified release.
+#[test]
+fn dual_platform_observer_checks_linux_archive() {
+    let mut fixture = Fixture::new();
+    fixture.add_linux();
+    fs::copy(
+        fixture.temp.path().join("published.json"),
+        fixture.temp.path().join("release.json"),
+    )
+    .unwrap();
+    let first = fixture.wait(&fixture.temp.path().join("dual-ok.json"), None);
+    assert!(
+        first.status.success(),
+        "stderr={} stdout={}",
+        String::from_utf8_lossy(&first.stderr),
+        String::from_utf8_lossy(&first.stdout)
+    );
+    let linux = fixture
+        .manifest
+        .artifacts
+        .iter()
+        .find(|item| item.target.as_deref() == Some("x86_64-unknown-linux-gnu"))
+        .unwrap();
+    let path = fixture.assets.join(&linux.name);
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[0] ^= 1;
+    fs::write(path, bytes).unwrap();
+    let tampered = fixture.wait(&fixture.temp.path().join("dual-tampered.json"), None);
+    assert_eq!(tampered.status.code(), Some(5));
 }
 
 /// Workflow failure/changed attempt and absent release are different finite exits.
@@ -547,6 +711,8 @@ fn transient_read_retry_auth_and_deadline_boundaries() {
     )
     .unwrap();
     let mut command = fixture.command();
+    // Full archive verification can share I/O with the other release fixtures.
+    // The one-second deadline is tested separately below.
     command
         .env("TEST_API_RETRY", "1")
         .args([
@@ -563,7 +729,7 @@ fn transient_read_retry_auth_and_deadline_boundaries() {
             "--attempt",
             "1",
             "--timeout",
-            "10",
+            "45",
             "--result-file",
         ])
         .arg(fixture.temp.path().join("retried.json"));
@@ -882,6 +1048,44 @@ fn package_create_verify_accept_relative_and_absolute_directories() {
             )
             .unwrap();
         }
+        let mac = fixture
+            .manifest
+            .artifacts
+            .iter()
+            .find(|item| item.kind == "bundle")
+            .unwrap();
+        let linux_name = format!(
+            "agent-run-{}-x86_64-unknown-linux-gnu.tar.gz",
+            fixture.manifest.version
+        );
+        fs::copy(directory.join(&mac.name), directory.join(&linux_name)).unwrap();
+        let linux_bytes = fs::read(directory.join(&linux_name)).unwrap();
+        let mut evidence: Acceptance =
+            serde_json::from_slice(&fs::read(directory.join("acceptance.json")).unwrap()).unwrap();
+        evidence.linux_payload = Some(Artifact {
+            name: linux_name,
+            kind: "bundle".into(),
+            target: Some("x86_64-unknown-linux-gnu".into()),
+            size: linux_bytes.len() as u64,
+            sha256: agent_run_platform::fs::sha256(&linux_bytes),
+        });
+        evidence.checks.extend(
+            [
+                "linux-workspace",
+                "linux-integration",
+                "linux-native-build",
+                "linux-exact-payload",
+            ]
+            .into_iter()
+            .map(|name| Check {
+                check_id: name.into(),
+                argv_sha256: "b".repeat(64),
+                stdout_sha256: "b".repeat(64),
+                stderr_sha256: "b".repeat(64),
+                exit_code: 0,
+            }),
+        );
+        record(&directory.join("acceptance.json"), &evidence);
         let argument = if absolute {
             directory.to_string_lossy().into_owned()
         } else {

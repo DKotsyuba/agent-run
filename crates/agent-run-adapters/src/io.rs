@@ -957,7 +957,7 @@ mod tests {
             binary: "/bin/sh".into(),
             args: vec![
                 "-c".into(),
-                "printf '%s\\n' '{\"url\":\"http://127.0.0.1:12345\"}' 'native diagnostic'; exit 0"
+                "IFS= read -r _ || exit 1; printf '%s\\n' '{\"url\":\"http://127.0.0.1:12345\"}' 'native diagnostic'; exit 0"
                     .into(),
             ],
             cwd: std::env::current_dir().unwrap(),
@@ -971,6 +971,18 @@ mod tests {
                 Process::spawn(&plan)
             }
             .unwrap();
+            let snapshot = process.owner.snapshot().expect("captured fixture leader");
+            assert!(snapshot.descendants_observed);
+            assert_eq!(
+                agent_run_platform::process::observe(
+                    Some(snapshot.leader.pid),
+                    Some(&snapshot.leader.token),
+                    Some(snapshot.leader.birth),
+                ),
+                agent_run_platform::process::ProcessState::Alive,
+                "the fixture must still be alive before release"
+            );
+            process.send(&serde_json::json!({})).await.unwrap();
             assert!(matches!(process.next().await, Event::Json(_)));
             let next = tokio::time::timeout(Duration::from_secs(5), process.next())
                 .await

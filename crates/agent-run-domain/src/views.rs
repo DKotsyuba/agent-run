@@ -470,6 +470,15 @@ pub struct AnswerView {
     pub proof_version: Option<u32>,
 }
 
+impl AnswerView {
+    /// Drops inline text to meet a transport budget, preserving all proof,
+    /// availability and lifecycle metadata. Never truncates or changes the text.
+    pub fn omit_content(&mut self) {
+        self.content = None;
+        self.inline_complete = false;
+    }
+}
+
 /// Offset page of agent snapshots with an exact total and committed revision.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

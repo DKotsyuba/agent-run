@@ -4,7 +4,8 @@ use crate::{ACTIVE_SQL, Record, Store, admission, lineage, tx_event};
 use agent_run_domain::{
     Error, ProviderStartRequest, Result, canonical,
     catalog::{
-        AccountId, AttemptCredentials, ProviderCatalog, QuotaAdmissionError, QuotaCandidateSet,
+        AccountId, AttemptCredentials, BindingCooldownReason, ProviderBinding, ProviderCatalog,
+        ProviderConnection, ProviderDefinition, QuotaAdmissionError, QuotaCandidateSet,
         ResolvedLaunchAuthority, SelectionIntent,
     },
     domain::{AgentId, StartRequest, Status, now},
@@ -27,6 +28,9 @@ pub(crate) const NEVER_SPAWNED: &str = "t.ownership_active=1 AND t.phase='prepar
      AND NOT EXISTS(SELECT 1 FROM process_ownership o WHERE o.owner_kind='attempt' AND o.owner_id=t.id) \
      AND NOT EXISTS(SELECT 1 FROM process_members m WHERE m.owner_kind='attempt' AND m.owner_id=t.id)";
 
+/// Duration of a confirmed ordered-binding failure, in seconds.
+pub const BINDING_COOLDOWN_SECONDS: f64 = 3600.0;
+
 /// One durable first-attempt selection, including an idempotent replay.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProviderAdmission {
@@ -48,6 +52,47 @@ pub struct ProviderResume<'a> {
     /// Account the parent's last attempt used; an automatic resume keeps it
     /// while it is still a valid candidate and switches only when it is not.
     pub prefer: &'a AccountId,
+    /// Read-only system-worker proof of the unchanged parent and last attempt.
+    pub preflight_digest: Option<&'a str>,
+    /// Broker-owned restart permitting this exact captured continuation.
+    pub restart_id: Option<i64>,
+}
+
+/// Fingerprints the exact parent and last-attempt evidence used by a system
+/// resume preflight, without exposing the stored request, paths or history.
+pub fn resume_preflight_digest(conn: &rusqlite::Connection, parent: &AgentId) -> Result<String> {
+    type ParentAttempt = (
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        String,
+        String,
+        Option<String>,
+        String,
+        i64,
+    );
+    let row: ParentAttempt = conn.query_row(
+        "SELECT a.request_json,a.identity_json,a.status,a.runtime_session_id,\
+         t.id,t.adapter_state_json,t.selected_account_id,t.phase,t.ownership_active \
+         FROM agents a JOIN attempts t ON t.agent_id=a.id \
+         WHERE a.id=?1 ORDER BY t.number DESC LIMIT 1",
+        [parent.as_str()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+            ))
+        },
+    )?;
+    Ok(canonical::sha256_hex(&serde_json::to_value(row)?, true))
 }
 
 /// Returns an existing v2 admission before consulting mutable configuration,
@@ -180,8 +225,8 @@ impl Store<'_> {
         }
     }
 
-    /// Returns a pre-child OS spawn failure to the prepared phase so the
-    /// supervisor can certify never-spawned cleanup and close ownership.
+    /// Returns a pre-child validation or OS spawn refusal to the prepared phase
+    /// so the supervisor can certify never-spawned cleanup and close ownership.
     pub fn provider_spawn_failed(&self, id: &AgentId, attempt: &str) -> Result<()> {
         let changed = self.conn.execute(
             "UPDATE attempts SET phase='prepared' \
@@ -256,7 +301,123 @@ impl Store<'_> {
     /// `native_history_unavailable` reason) in its adapter state, only after
     /// its cleanup proof; the value is metadata, never credential material.
     pub fn provider_history(&self, id: &AgentId, attempt: &str, state: &Value) -> Result<()> {
-        let changed = self.conn.execute(
+        self.provider_history_with_cooldown(id, attempt, state, None, now())
+    }
+
+    /// Records cleanup-bound history and, for a verified ordered-binding failure,
+    /// atomically records its one-hour cooldown and advances the capacity revision.
+    /// `at` is the writer's observation time, in Unix seconds. Identical attempt
+    /// evidence is idempotent and cannot extend a previously recorded cooldown.
+    pub fn provider_history_with_cooldown(
+        &self,
+        id: &AgentId,
+        attempt: &str,
+        state: &Value,
+        cooldown: Option<BindingCooldownReason>,
+        at: f64,
+    ) -> Result<()> {
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
+        let (identity, account, previous): (Option<String>, Option<String>, String) = tx
+            .query_row(
+                "SELECT a.identity_json,t.selected_account_id,t.adapter_state_json \
+             FROM agents a JOIN attempts t ON t.agent_id=a.id \
+             WHERE a.id=?1 AND t.id=?2 AND t.phase='cleanup_complete'",
+                params![id.as_str(), attempt],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        let previous: Value = serde_json::from_str(&previous)
+            .map_err(|_| Error::Integrity("attempt history is malformed".into()))?;
+        let old_reason = previous.get("binding_cooldown_recorded");
+        if state.get("binding_cooldown_recorded").is_some() != cooldown.is_some() {
+            return Err(invalid("binding cooldown evidence is malformed"));
+        }
+        if old_reason.is_some() && old_reason != state.get("binding_cooldown_recorded") {
+            return Err(Error::Conflict);
+        }
+        if let Some(reason) = cooldown {
+            if !at.is_finite() || at < 0.0 || !(at + BINDING_COOLDOWN_SECONDS).is_finite() {
+                return Err(invalid("invalid binding cooldown time"));
+            }
+            if state["binding_cooldown_recorded"] != json!(reason) {
+                return Err(invalid("binding cooldown evidence is malformed"));
+            }
+            let identity =
+                identity.ok_or_else(|| Error::Integrity("provider identity is missing".into()))?;
+            let identity: Value = serde_json::from_str(&identity)
+                .map_err(|_| Error::Integrity("provider identity is malformed".into()))?;
+            let authority: ResolvedLaunchAuthority =
+                serde_json::from_value(identity["authority"].clone())
+                    .map_err(|_| Error::Integrity("provider authority is malformed".into()))?;
+            let account: AccountId = account
+                .ok_or_else(|| invalid("attempt account is missing"))?
+                .parse()?;
+            let provider = &identity["provider_config"]["providers"][authority.provider.as_str()];
+            let connection: ProviderConnection =
+                serde_json::from_value(provider["connection"].clone())
+                    .map_err(|_| Error::Integrity("provider connection is malformed".into()))?;
+            let bindings: Vec<ProviderBinding> =
+                serde_json::from_value(provider["bindings"].clone())
+                    .map_err(|_| Error::Integrity("provider bindings are malformed".into()))?;
+            let mut selected = bindings.iter().filter(|binding| {
+                binding.account == account
+                    && binding
+                        .models
+                        .as_ref()
+                        .is_none_or(|models| models.contains(&authority.model))
+            });
+            let binding = selected
+                .next()
+                .ok_or_else(|| invalid("attempt binding is unavailable"))?;
+            let native = &state["native_failure"];
+            if selected.next().is_some()
+                || identity["provider_identity_version"] != 2
+                || provider["ordered_accounts"] != true
+                || authority.harness != agent_run_domain::catalog::HarnessId::ClaudeCode
+                || provider["harness"] != authority.harness.as_str()
+                || connection != authority.connection
+                || !authority.eligible_accounts.contains(&account)
+                || native["class"] != reason.as_str()
+                || native["attempt"] != attempt
+                || native["account"] != account.as_str()
+                || native["provider"] != authority.provider.as_str()
+                || native["model"] != authority.model
+                || (reason == BindingCooldownReason::BillingUnavailable
+                    && !matches!(
+                        binding.connection.as_ref().unwrap_or(&connection),
+                        ProviderConnection::Custom { .. }
+                    ))
+                || (reason == BindingCooldownReason::QuotaExhausted
+                    && (native["signal"] != "claude.rate_limit_event.rejected"
+                        || !matches!(
+                            native["window"].as_str(),
+                            Some(
+                                "five_hour"
+                                    | "seven_day"
+                                    | "seven_day_opus"
+                                    | "seven_day_sonnet"
+                                    | "seven_day_overage_included"
+                                    | "overage"
+                            )
+                        )))
+            {
+                return Err(invalid(
+                    "binding cooldown does not match the frozen attempt",
+                ));
+            }
+            if old_reason.is_none() {
+                let changed = tx.execute(
+                    "INSERT INTO binding_cooldowns(provider_id,account_id,reason,observed_at,blocked_until,attempt_id) \
+                     VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(account_id,provider_id) DO UPDATE SET \
+                     reason=excluded.reason,observed_at=excluded.observed_at,blocked_until=excluded.blocked_until,attempt_id=excluded.attempt_id \
+                     WHERE excluded.blocked_until > binding_cooldowns.blocked_until",
+                    params![authority.provider.as_str(), account.as_str(), reason.as_str(), at, at + BINDING_COOLDOWN_SECONDS, attempt],
+                )?;
+                if changed != 0 {
+                    Store::advance_quota_capacity_revision(&tx)?;
+                }
+            }
+        }
+        let changed = tx.execute(
             "UPDATE attempts SET adapter_state_json=? \
              WHERE id=? AND agent_id=? AND phase='cleanup_complete'",
             params![serde_json::to_string(state)?, attempt, id.as_str()],
@@ -264,6 +425,7 @@ impl Store<'_> {
         if changed != 1 {
             return Err(Error::Conflict);
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -420,9 +582,23 @@ impl Store<'_> {
             tx.commit()?;
             return Ok(replay);
         }
+        if let Some(restart) = resume.and_then(|resume| resume.restart_id) {
+            crate::service_restart::require_restart_resume(
+                &tx,
+                restart,
+                resume.expect("checked").parent,
+            )?;
+        } else {
+            crate::service_restart::require_admissions_open(&tx)?;
+        }
         let lineage = match resume {
             Some(resume) => {
                 let lineage = lineage::resume_parent(&tx, resume.parent)?;
+                if let Some(expected) = resume.preflight_digest
+                    && resume_preflight_digest(&tx, resume.parent)? != expected
+                {
+                    return Err(Error::ExecutionChanged);
+                }
                 let uncleaned: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM attempts WHERE agent_id=? \
                      AND (cleanup_proof_json IS NULL OR phase!='cleanup_complete')",
@@ -471,6 +647,15 @@ impl Store<'_> {
             &inputs,
             resume.zip(lineage.as_ref()),
         )?;
+        if let Some(restart) = resume.and_then(|resume| resume.restart_id) {
+            let changed = tx.execute(
+                "UPDATE service_restart_agents SET resumed_execution_id=? WHERE restart_id=? AND agent_id=? AND resumed_execution_id IS NULL",
+                params![admission.agent_id.as_str(), restart, resume.expect("checked").parent.as_str()],
+            )?;
+            if changed != 1 {
+                return Err(Error::Conflict);
+            }
+        }
         Store::advance_quota_capacity_revision(&tx)?;
         tx.commit()?;
         Ok(admission)
@@ -495,6 +680,49 @@ pub struct AdmissionInputs<'a> {
     pub harness_cap: Option<usize>,
     /// Account pinned by the request label, if any.
     pub pinned: Option<&'a AccountId>,
+}
+
+/// Ensures an ordered provider's priority and bindings came from the durable
+/// configuration snapshot, not a different caller-supplied catalog. Historical
+/// unordered admissions keep their existing acceptance path.
+fn check_ordered_snapshot(identity: &Value, definition: &ProviderDefinition) -> Result<()> {
+    let document = identity.get("provider_config");
+    let frozen = document
+        .and_then(|document| document.get("providers"))
+        .and_then(|providers| providers.get(definition.id.as_str()));
+    let ordered = match frozen.and_then(|provider| provider.get("ordered_accounts")) {
+        Some(Value::Bool(ordered)) => *ordered,
+        None => false,
+        Some(_) => {
+            return Err(Error::Integrity(
+                "frozen account ordering is malformed".into(),
+            ));
+        }
+    };
+    if !ordered && !definition.ordered_accounts {
+        return Ok(());
+    }
+    let document =
+        document.ok_or_else(|| Error::Integrity("frozen provider config is missing".into()))?;
+    if !ordered
+        || !definition.ordered_accounts
+        || agent_run_config::provider_config::ProviderConfig::snapshot_document(document)
+            .map_err(|_| Error::Integrity("frozen provider config is malformed".into()))?
+            != identity["provider_config_snapshot"]
+    {
+        return Err(Error::Integrity("frozen provider ordering changed".into()));
+    }
+    let mut offered = serde_json::to_value(definition)?;
+    offered
+        .as_object_mut()
+        .ok_or_else(|| Error::Integrity("provider definition is malformed".into()))?
+        .remove("id");
+    if frozen != Some(&offered) {
+        return Err(Error::Integrity(
+            "provider differs from frozen ordering".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Writes one agent admission inside the caller's immediate transaction.
@@ -557,6 +785,7 @@ pub(crate) fn admit_in_tx(
     {
         return Err(invalid("provider admission inputs disagree"));
     }
+    check_ordered_snapshot(identity, definition)?;
     let revision = Store::quota_capacity_revision_in(tx)?;
     if revision != candidates.capacity_revision {
         return Err(QuotaAdmissionError::SelectionStale {
@@ -688,10 +917,9 @@ pub(crate) fn admit_in_tx(
 /// frozen `authority` scope, is not in `exclude` (accounts already tried by
 /// this logical agent), can lease `provider`/`model` from `catalog`, and its
 /// committed registry row is enabled with the catalog's family and storage
-/// reference. Among qualifying candidates the order is: `prefer` first
-/// (a resume keeps its parent's still-valid account), then rank, then the
-/// larger of the account's active attempts and its physical-key
-/// reservations (aliases share physical keys), then account id.
+/// reference. `prefer` keeps a resume's still-valid parent account. Next,
+/// ordered providers use frozen binding order; other providers use candidate
+/// rank, active load and account id.
 #[allow(clippy::too_many_arguments)]
 fn choose<'a>(
     tx: &rusqlite::Connection,
@@ -704,7 +932,24 @@ fn choose<'a>(
     prefer: Option<&AccountId>,
     exclude: &std::collections::BTreeSet<AccountId>,
 ) -> Result<&'a agent_run_domain::catalog::QuotaCandidate> {
+    let definition =
+        catalog
+            .provider(provider)
+            .ok_or_else(|| QuotaAdmissionError::NoEligibleAccount {
+                provider: provider.clone(),
+                model: model.to_owned(),
+            })?;
+    let ordered = definition.ordered_accounts.then(|| {
+        definition
+            .ordered_bindings(model)
+            .iter()
+            .enumerate()
+            .map(|(position, binding)| (binding.account.clone(), position))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    });
     let mut chosen = None;
+    let mut blocked = None;
+    let at = now();
     for candidate in &candidates.candidates {
         if pinned.is_some_and(|account| &candidate.account != account)
             || exclude.contains(&candidate.account)
@@ -733,23 +978,77 @@ fn choose<'a>(
         {
             continue;
         }
+        if let Some((reason, retry_after_seconds)) =
+            binding_cooldown(tx, provider, &candidate.account, at)?
+        {
+            if blocked
+                .as_ref()
+                .is_none_or(|(_, _, seconds)| retry_after_seconds < *seconds)
+            {
+                blocked = Some((candidate.account.clone(), reason, retry_after_seconds));
+            }
+            continue;
+        }
         let active = Store::active_attempt_counts_in(tx, std::slice::from_ref(&candidate.account))?
             [candidate.account.as_str()];
         let reserved = Store::active_reservation_counts_in(tx, &candidate.physical_keys)?;
         let load = active.max(reserved.values().copied().max().unwrap_or(0));
         let kept = prefer.is_none_or(|prefer| &candidate.account != prefer);
-        let key = (kept, candidate.rank, load, candidate.account.as_str());
+        let rank = match &ordered {
+            Some(order) => match order.get(&candidate.account) {
+                Some(rank) => *rank,
+                None => continue,
+            },
+            None => usize::try_from(candidate.rank)
+                .map_err(|_| invalid("candidate rank exceeds platform size"))?,
+        };
+        let key = (kept, rank, load, candidate.account.as_str());
         if chosen.as_ref().is_none_or(|(best, _)| key < *best) {
             chosen = Some((key, candidate));
         }
     }
-    chosen.map(|(_, candidate)| candidate).ok_or_else(|| {
-        QuotaAdmissionError::NoEligibleAccount {
-            provider: provider.clone(),
-            model: model.to_owned(),
+    chosen
+        .map(|(_, candidate)| candidate)
+        .ok_or_else(|| match blocked {
+            Some((account, reason, retry_after_seconds)) => QuotaAdmissionError::BindingCooldown {
+                provider: provider.clone(),
+                model: model.to_owned(),
+                account,
+                reason,
+                retry_after_seconds,
+            }
+            .into(),
+            None => QuotaAdmissionError::NoEligibleAccount {
+                provider: provider.clone(),
+                model: model.to_owned(),
+            }
+            .into(),
+        })
+}
+
+/// Reads an active provider/account cooldown from the caller's transaction.
+pub fn binding_cooldown(
+    conn: &rusqlite::Connection,
+    provider: &agent_run_domain::catalog::ProviderId,
+    account: &AccountId,
+    at: f64,
+) -> Result<Option<(BindingCooldownReason, u64)>> {
+    if !at.is_finite() || at < 0.0 {
+        return Err(invalid("invalid binding cooldown time"));
+    }
+    let row: Option<(String, f64)> = conn.query_row(
+        "SELECT reason,blocked_until FROM binding_cooldowns WHERE provider_id=?1 AND account_id=?2 AND blocked_until>?3",
+        params![provider.as_str(), account.as_str(), at], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    row.map(|(value, until)| {
+        if !until.is_finite() {
+            return Err(Error::Integrity("binding cooldown is malformed".into()));
         }
-        .into()
+        let reason = serde_json::from_value(json!(value))
+            .map_err(|_| Error::Integrity("binding cooldown is malformed".into()))?;
+        Ok((reason, ((until - at).ceil() as u64).max(1)))
     })
+    .transpose()
 }
 
 /// The next attempt allocated on an existing logical agent.
@@ -772,8 +1071,8 @@ impl Store<'_> {
     ///
     /// Requires: the agent is a nonterminal provider run with no pending or
     /// claimed cancel; its latest attempt is the only owned one, has verified
-    /// cleanup proof, a recorded authoritative `quota_exhausted` native
-    /// failure and a recorded native history seal whose `task_proven` shows
+    /// cleanup proof, an authoritative quota failure (or billing failure on an
+    /// ordered Claude custom binding), and a native history seal whose `task_proven` shows
     /// this logical request's admitted turn reached native history (the
     /// continuation evidence); the selection intent is automatic (a pinned run never
     /// switches); `candidates` are for the agent's frozen provider and model
@@ -834,15 +1133,16 @@ impl Store<'_> {
             [id.as_str()],
             |row| row.get(0),
         )?;
-        let (previous, number, phase, proof, state, active): (
+        let (previous, number, phase, proof, state, active, previous_account): (
             String,
             u32,
             Option<String>,
             Option<String>,
             String,
             i64,
+            Option<String>,
         ) = tx.query_row(
-            "SELECT id,number,phase,cleanup_proof_json,adapter_state_json,ownership_active \
+            "SELECT id,number,phase,cleanup_proof_json,adapter_state_json,ownership_active,selected_account_id \
                  FROM attempts WHERE agent_id=? ORDER BY number DESC LIMIT 1",
             [id.as_str()],
             |row| {
@@ -853,6 +1153,7 @@ impl Store<'_> {
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             },
         )?;
@@ -863,11 +1164,46 @@ impl Store<'_> {
             return Err(invalid("the previous attempt has no verified cleanup"));
         }
         let evidence: Value = serde_json::from_str(&state).unwrap_or(Value::Null);
-        if evidence["native_failure"]["class"] != "quota_exhausted" {
-            return Err(invalid(
-                "only a recorded authoritative quota exhaustion allows another attempt",
-            ));
-        }
+        let previous_state = match evidence["native_failure"]["class"].as_str() {
+            Some("quota_exhausted") => "exhausted",
+            Some("billing_unavailable") => {
+                let definition = catalog
+                    .provider(&authority.provider)
+                    .ok_or_else(|| invalid("ordered billing fallback has no frozen provider"))?;
+                check_ordered_snapshot(identity, definition)?;
+                let previous_account: AccountId = previous_account
+                    .as_deref()
+                    .ok_or_else(|| Error::Integrity("attempt account is missing".into()))?
+                    .parse()?;
+                if !definition.ordered_accounts
+                    || authority.harness != agent_run_domain::catalog::HarnessId::ClaudeCode
+                    || definition.harness != authority.harness
+                    || definition.connection != authority.connection
+                    || !authority.eligible_accounts.contains(&previous_account)
+                    || !matches!(
+                        definition.connection_for(&previous_account, &authority.model),
+                        Some(agent_run_domain::catalog::ProviderConnection::Custom { .. })
+                    )
+                    || evidence["native_failure"]["attempt"].as_str() != Some(previous.as_str())
+                    || evidence["native_failure"]["account"].as_str()
+                        != Some(previous_account.as_str())
+                    || evidence["native_failure"]["provider"].as_str()
+                        != Some(authority.provider.as_str())
+                    || evidence["native_failure"]["model"].as_str()
+                        != Some(authority.model.as_str())
+                {
+                    return Err(invalid(
+                        "billing fallback does not match the frozen attempt",
+                    ));
+                }
+                "failed"
+            }
+            _ => {
+                return Err(invalid(
+                    "only a recorded quota or eligible billing failure allows another attempt",
+                ));
+            }
+        };
         if evidence["native_history"]["seal"].is_null() {
             return Err(Error::Unsupported(
                 "continuation_unavailable: the previous attempt recorded no native history seal"
@@ -899,6 +1235,25 @@ impl Store<'_> {
             }
             .into());
         }
+        let definition = catalog.provider(&authority.provider).ok_or_else(|| {
+            QuotaAdmissionError::NoEligibleAccount {
+                provider: authority.provider.clone(),
+                model: authority.model.clone(),
+            }
+        })?;
+        check_ordered_snapshot(identity, definition)?;
+        if definition.ordered_accounts
+            && (authority.harness != definition.harness
+                || authority.connection != definition.connection
+                || !definition
+                    .models
+                    .iter()
+                    .any(|model| model.id == authority.model))
+        {
+            return Err(Error::Integrity(
+                "ordered provider authority changed".into(),
+            ));
+        }
         let tried: std::collections::BTreeSet<AccountId> = tx
             .prepare("SELECT selected_account_id FROM attempts WHERE agent_id=? AND selected_account_id IS NOT NULL")?
             .query_map([id.as_str()], |row| row.get::<_, String>(0))?
@@ -917,12 +1272,12 @@ impl Store<'_> {
             None,
             &tried,
         )?;
-        // Close the exhausted attempt durably and release its ownership (and
+        // Close the failed attempt durably and release its ownership (and
         // with it its physical-key reservations) in the same transaction.
         let released = tx.execute(
-            "UPDATE attempts SET ownership_active=0,state='exhausted',finished_at=? \
+            "UPDATE attempts SET ownership_active=0,state=?,finished_at=? \
              WHERE id=? AND agent_id=? AND ownership_active=1",
-            params![now(), previous, id.as_str()],
+            params![previous_state, now(), previous, id.as_str()],
         )?;
         if released != 1 {
             return Err(Error::Conflict);

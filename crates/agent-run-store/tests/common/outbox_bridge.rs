@@ -59,6 +59,7 @@ fn custody(store: &mut agent_run_store::Store, mut done: DeliveryCompletion) -> 
         address: "local/codex/fixture/session".into(),
         kind: "agent-run.completion".into(),
         message: "synthetic store test".into(),
+        predecessor: None,
         intent_hash: "b".repeat(64),
     };
     store

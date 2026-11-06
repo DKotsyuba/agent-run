@@ -37,6 +37,9 @@ struct Cli {
     /// Broker socket path override; defaults to `<home>/api.sock`.
     #[arg(long)]
     socket: Option<PathBuf>,
+    /// Expected broker server UID; requires an explicit socket.
+    #[arg(long, requires = "socket")]
+    broker_uid: Option<u32>,
     /// Open a cooperative pool directly in the read-only Pools tab.
     #[arg(long)]
     pool: Option<agent_run_domain::pool::PoolId>,
@@ -70,6 +73,9 @@ fn project_root(cli: &Cli) -> agent_run::Result<Option<String>> {
     };
     // Shell-level `~` survives inside quotes; expand it against the home.
     let path = match project.to_str() {
+        Some(text) if text.starts_with("~/") && cli.socket.is_some() => {
+            fs::expand(project).unwrap_or_else(|_| project.clone())
+        }
         Some(text) if text.starts_with("~/") => match fs::home(None) {
             Ok(home) => home.join(&text[2..]),
             Err(_) => project.clone(),
@@ -83,17 +89,29 @@ fn project_root(cli: &Cli) -> agent_run::Result<Option<String>> {
     Ok(Some(root))
 }
 
+/// Resolves the explicit socket without consulting the broker home.
+fn broker_socket(cli: &Cli) -> agent_run::Result<PathBuf> {
+    match &cli.socket {
+        Some(socket) => Ok(socket.clone()),
+        None => Ok(fs::home(cli.home.clone())?.join("api.sock")),
+    }
+}
+
 /// Resolves the broker socket, runs the terminal loop, and restores the tty.
 async fn observe(cli: Cli) -> agent_run::Result<()> {
     // The palette is chosen once from the terminal's color depth.
     ui::theme::set_palette(ui::theme::palette_for(
         std::env::var("COLORTERM").ok().as_deref(),
     ));
-    let home = fs::home(cli.home.clone())?;
-    let socket = cli.socket.clone().unwrap_or_else(|| home.join("api.sock"));
-    let broker: net::SharedBroker = std::sync::Arc::new(net::SocketBroker::new(socket));
+    let socket = broker_socket(&cli)?;
+    let broker: net::SharedBroker = std::sync::Arc::new(match cli.broker_uid {
+        Some(uid) => net::SocketBroker::with_expected_server_uid(socket, Some(uid)),
+        None => net::SocketBroker::new(socket),
+    });
     let mut app = app::App::new();
-    app.home_prefix = fs::home(None).ok().map(|path| path.display().to_string());
+    if cli.socket.is_none() {
+        app.home_prefix = fs::home(None).ok().map(|path| path.display().to_string());
+    }
     app.project_filter = project_root(&cli)?;
     if let Some(id) = cli.pool {
         app.pools.visible = true;
@@ -106,4 +124,38 @@ async fn observe(cli: Cli) -> agent_run::Result<()> {
     let result = events::run(app, broker, guard.terminal()).await;
     drop(guard);
     result
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    /// An explicit UID requires a socket and must be a valid unsigned UID.
+    #[test]
+    fn broker_uid_requires_socket_and_valid_uid() {
+        assert!(Cli::try_parse_from(["tui", "--broker-uid", "123"]).is_err());
+        assert!(
+            Cli::try_parse_from(["tui", "--socket", "/run/broker.sock", "--broker-uid", "-1"])
+                .is_err()
+        );
+        let cli =
+            Cli::try_parse_from(["tui", "--socket", "/run/broker.sock", "--broker-uid", "123"])
+                .unwrap();
+        assert_eq!(cli.broker_uid, Some(123));
+    }
+
+    /// An explicit socket is resolved even when the configured home is invalid.
+    #[test]
+    fn explicit_socket_does_not_resolve_home() {
+        let mut cli = Cli::try_parse_from(["tui", "--socket", "/run/broker.sock"]).unwrap();
+        // Clap rejects a blank argument, but a programmatic caller can still
+        // supply one; the explicit socket must not resolve it.
+        cli.home = Some(PathBuf::new());
+        assert_eq!(
+            broker_socket(&cli).unwrap(),
+            PathBuf::from("/run/broker.sock")
+        );
+        cli.socket = None;
+        assert!(broker_socket(&cli).is_err());
+    }
 }

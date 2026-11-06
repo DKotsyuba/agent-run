@@ -18,7 +18,7 @@ use std::{
 /// Initialization/reopen retain the current inventory, including schema26
 /// enrollment, schema27 independent incident evidence and the schema30 writer
 /// receipt, producer and authority tables, schema31 Bridge intention ownership,
-/// plus the durable WAL and
+/// schema33 binding cooldowns, schema35 restart state, plus durable WAL and
 /// private-mode safety settings.
 #[test]
 fn schema_initialization_and_reopen() {
@@ -26,7 +26,7 @@ fn schema_initialization_and_reopen() {
     let a = h.store().health().unwrap();
     assert_eq!(a["ok"], true);
     assert_eq!(a["schema_version"], agent_run_store::VERSION);
-    assert_eq!(a["tables"], 40);
+    assert_eq!(a["tables"], 45);
     assert_eq!(h.store().health().unwrap()["integrity"], "ok");
     let store = h.store();
     for name in [
@@ -36,6 +36,11 @@ fn schema_initialization_and_reopen() {
         "writer_producers",
         "writer_authority",
         "bridge_delivery_intents",
+        "binding_cooldowns",
+        "service_restarts",
+        "service_restart_agents",
+        "service_restart_recipients",
+        "service_restart_notices",
     ] {
         assert!(
             store

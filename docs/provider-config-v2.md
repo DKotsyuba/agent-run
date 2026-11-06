@@ -119,6 +119,64 @@ the sealed adapter APIs that consume this configuration.
 The [one-time migration plan](provider-migration.md) requires explicit
 runtime, model, account, and harness mappings before any later apply step.
 
+## Ordered Claude API and subscription accounts
+
+An explicitly ordered Claude provider can use an API credential first and a
+separate native Claude Code login next. Register the accounts before adding the
+bindings; the configuration contains references, never credential values.
+
+```toml
+[providers.claude]
+harness = "claude-code"
+connection = { kind = "custom", endpoint = "https://api.anthropic.com", protocol = "messages", auth_header = "x_api_key" }
+auth_family = "anthropic"
+limits_source = "none"
+ordered_accounts = true
+
+[[providers.claude.models]]
+id = "example-model"
+
+[[providers.claude.bindings]]
+label = "api"
+account = "acct-api"
+priority_multiplier = 2.0
+
+[[providers.claude.bindings]]
+label = "subscription"
+account = "acct-subscription"
+priority_multiplier = 1.0
+connection = { kind = "native" }
+```
+
+Register the API account with an explicit file/environment/Keychain reference
+and the subscription with `named:claude-code:<label>`. The named login is owned
+by the Claude worker's OS account. In a shared system service, authenticate in
+that worker's private home; the shared broker's home is not the login store.
+
+Ordered bindings use descending `priority_multiplier`, with declaration order
+breaking ties. Known exhausted and disabled accounts are still excluded; an
+unknown balance does not move a lower-priority account ahead. This initial
+mode is limited to Claude custom Messages providers with
+`limits_source = "none"`; native is the only binding connection override. An explicitly pinned
+account never switches. Existing executions retain their frozen configuration.
+
+A structured Claude billing error on a custom binding, or an authoritative
+quota rejection on an ordered binding, temporarily excludes that provider/account
+binding for one hour. New automatic executions select the next eligible binding
+immediately. The cooldown survives a broker restart and is separate from quota
+measurements: a billing error does not establish a zero balance. After one hour,
+the normal priority order applies again, subject to any independently known quota.
+An explicitly pinned account is never redirected; while it is cooling down the
+request is refused with `binding_cooldown` and the remaining wait in seconds.
+Executions already admitted before the failure are not cancelled or retroactively
+moved to another account.
+
+The current execution can advance after verified cleanup and history/input proof.
+Generic throttling, authentication and network errors do not authorize a switch
+or a cooldown. An unresolved tool call or uncertain history stops continuation;
+the original task is not resent. See
+[session continuity](session-continuity.md) for evidence and limits.
+
 ## MCP selection and tool caps
 
 Declare a stdio server once in the shared catalog. `global` is optional and

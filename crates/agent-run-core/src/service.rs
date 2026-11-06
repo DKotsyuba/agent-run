@@ -11,8 +11,7 @@ use crate::{
     process,
     profiles::{self, Profile},
     state::{Record, Store},
-    supervisor,
-    verify::{self, Proof},
+    supervisor, verify,
 };
 use agent_run_config::provider_config::ProviderConfig;
 use agent_run_config::role_plan;
@@ -102,6 +101,9 @@ pub struct ProviderLaunchIdentity {
     pub provider_config_snapshot: Value,
     /// Frozen provider/model/role/scope; asset digest seals before spawning.
     pub authority: ResolvedLaunchAuthority,
+    /// Root-approved system route, absent for ordinary per-user executions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_route: Option<crate::system_launch::SystemRoute>,
     /// Per-lineage generated home once sealed.
     pub runtime_home: Option<PathBuf>,
     /// Runtime asset index digest once sealed.
@@ -193,6 +195,13 @@ impl ProviderLaunchIdentity {
                 "stored provider authority contradicts request".into(),
             ));
         }
+        if let Some(route) = &identity.system_route {
+            route
+                .validate_for(&identity.authority.provider, identity.authority.harness)
+                .map_err(|_| {
+                    Error::Integrity("stored system route contradicts provider authority".into())
+                })?;
+        }
         Ok(identity)
     }
 }
@@ -231,6 +240,8 @@ pub struct Service {
     /// Producer lanes of the resident writer; `None` until the broker attaches
     /// its writer (a service without one cannot mutate durable state).
     writer: Option<BrokerWriter>,
+    /// Optional root-coordinated launcher; ordinary per-user services keep `None`.
+    system_launcher: Option<Arc<dyn crate::system_launch::SystemLauncher>>,
     /// Bounded empty-read episodes shared by service clones; no credential data.
     pub(crate) pool_reads: Arc<std::sync::Mutex<crate::dispatch::PoolReadGuards>>,
 }
@@ -302,6 +313,112 @@ impl Query {
     }
 }
 impl Service {
+    /// Block new admissions and durably capture the agents in a service restart.
+    pub async fn begin_service_restart(&self, request_id: &str) -> Result<i64> {
+        // Resolve the boot identity before entering the sole writer.
+        agent_run_platform::monotonic::boot_id()?;
+        self.lane("service-restart")?
+            .local(
+                agent_run_store::ops::BeginServiceRestart {
+                    request_id: request_id.into(),
+                    at: now(),
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await
+    }
+
+    /// Queue restart warnings or cancellation when their intervals have elapsed.
+    pub(crate) async fn advance_service_restart(&self, restart_id: i64) -> Result<usize> {
+        let (boot_id, now_ns) = agent_run_platform::monotonic::now()?;
+        self.lane("service-restart")?
+            .local(
+                agent_run_store::ops::AdvanceServiceRestart {
+                    restart_id,
+                    boot_id,
+                    now_ns,
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await
+    }
+
+    /// Observe a new broker writer and enter recovery for a prepared restart.
+    pub async fn recover_service_restart(&self) -> Result<Option<i64>> {
+        agent_run_platform::monotonic::boot_id()?;
+        self.lane("service-restart")?
+            .local(
+                agent_run_store::ops::RecoverServiceRestart {
+                    failed_restart: None,
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await
+    }
+
+    /// Continue a prepared restart on the same writer after the manager fails.
+    pub async fn recover_failed_service_restart(&self, restart_id: i64) -> Result<Option<i64>> {
+        self.lane("service-restart")?
+            .local(
+                agent_run_store::ops::RecoverServiceRestart {
+                    failed_restart: Some(restart_id),
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await
+    }
+
+    /// Claim the one service-manager invocation after the workers stop.
+    pub async fn claim_service_restart(&self, restart_id: i64) -> Result<bool> {
+        self.lane("service-restart")?
+            .local(
+                agent_run_store::ops::ClaimServiceRestart { restart_id },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await
+    }
+
+    /// Read the phase of one restart without changing its state.
+    pub async fn service_restart_status(&self, restart_id: i64) -> Result<Value> {
+        self.read(move |store| {
+            let phase: Option<String> = store.conn().query_row(
+                "SELECT phase FROM service_restarts WHERE id=?", [restart_id], |row|row.get(0),
+            ).optional()?;
+            Ok(json!({"restart_id":restart_id,"phase":phase.ok_or_else(|| invalid("unknown service restart"))?}))
+        }).await
+    }
+
+    /// Retain a blocked caller's session for the restart completion notice.
+    pub async fn remember_service_restart_caller(
+        &self,
+        restart_id: i64,
+        reference: OrchestratorRef,
+    ) -> Result<()> {
+        self.lane("service-restart")?
+            .local(
+                agent_run_store::ops::RememberServiceRestartCaller {
+                    restart_id,
+                    reference,
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await
+    }
+
+    /// Preserve a known caller when a start was refused by the restart barrier.
+    async fn remember_blocked_start(
+        &self,
+        error: &Error,
+        caller: Option<OrchestratorRef>,
+    ) -> Result<()> {
+        if let (Error::Transition(message), Some(reference)) = (error, caller)
+            && let Some(restart_id) = agent_run_store::service_restart::blocked_restart_id(message)
+        {
+            self.remember_service_restart_caller(restart_id, reference)
+                .await?;
+        }
+        Ok(())
+    }
     /// Borrow bounded advisory read counters. Poison discards and restores the
     /// entire hint cache; durable notices still deduplicate corrective input.
     /// This cache never authenticates a call or authorizes native work.
@@ -330,6 +447,7 @@ impl Service {
             home,
             config: Arc::new(RwLock::new(None)),
             writer: None,
+            system_launcher: None,
             pool_reads: Arc::default(),
         }
     }
@@ -339,6 +457,55 @@ impl Service {
     pub fn with_writer(mut self, writer: BrokerWriter) -> Self {
         self.writer = Some(writer);
         self
+    }
+
+    /// Selects a configured external launcher for new provider executions.
+    /// Every admitted provider must have a matching route.
+    #[must_use]
+    pub fn with_system_launcher(
+        mut self,
+        launcher: Arc<dyn crate::system_launch::SystemLauncher>,
+    ) -> Self {
+        self.system_launcher = Some(launcher);
+        self
+    }
+
+    /// Freezes the configured system route into a provider admission, if enabled.
+    fn bind_system_route(&self, prepared: &mut Prepared) -> Result<()> {
+        if let Some(launcher) = &self.system_launcher {
+            let route = launcher.route(&prepared.authority.provider, prepared.authority.harness)?;
+            route.validate_for(&prepared.authority.provider, prepared.authority.harness)?;
+            let identity = prepared.identity.as_object_mut().ok_or_else(|| {
+                Error::Integrity("provider launch identity is not an object".into())
+            })?;
+            identity.insert("system_route".into(), serde_json::to_value(route)?);
+        }
+        Ok(())
+    }
+
+    /// Uses only the launcher matching the execution's durable system route.
+    async fn launch_provider_supervisor(&self, id: &AgentId, lane: &BrokerLane) -> Result<()> {
+        let lookup = id.clone();
+        let row = self.read(move |store| store.get(&lookup)).await?;
+        let identity = ProviderLaunchIdentity::read(&row)?;
+        match (&self.system_launcher, identity.system_route) {
+            (None, None) => supervisor::launch(&self.home, id, lane).await,
+            (Some(launcher), Some(route)) => {
+                route.validate_for(&identity.authority.provider, identity.authority.harness)?;
+                let current =
+                    launcher.route(&identity.authority.provider, identity.authority.harness)?;
+                if current != route {
+                    return Err(Error::ExecutionChanged);
+                }
+                let future = launcher.launch(self.home.clone(), id.clone(), route, lane.clone());
+                tokio::spawn(future).await.map_err(|error| {
+                    Error::Runtime(format!("system supervisor launch task failed: {error}"))
+                })?
+            }
+            _ => Err(Error::Unsupported(
+                "execution belongs to a different launcher mode".into(),
+            )),
+        }
     }
 
     /// The broker lane of one subsystem.
@@ -429,6 +596,53 @@ impl Service {
                 _ => None,
             })
             .ok_or_else(|| invalid("provider start requires schema_version 2"))
+    }
+
+    /// Evaluates current policy for a stored system execution without returning
+    /// configuration, private paths, account identifiers or credential data.
+    pub fn system_current_policy(&self, id: &AgentId) -> crate::system_launch::CurrentPolicy {
+        use crate::system_launch::CurrentPolicy;
+        let frozen = Store::open(&self.home)
+            .and_then(|store| store.get(id))
+            .and_then(|row| ProviderLaunchIdentity::read(&row));
+        let Ok(frozen) = frozen else {
+            return CurrentPolicy::Refused;
+        };
+        let (Some(launcher), Some(route)) = (&self.system_launcher, &frozen.system_route) else {
+            return CurrentPolicy::Refused;
+        };
+        if route.state_home != self.home
+            || launcher
+                .route(&frozen.authority.provider, frozen.authority.harness)
+                .ok()
+                .as_ref()
+                != Some(route)
+        {
+            return CurrentPolicy::Refused;
+        }
+        let Ok((current, _)) = self.current_provider_config() else {
+            return CurrentPolicy::Unavailable;
+        };
+        if current_policy_permits(&current, &frozen, &frozen.provider_request).is_err() {
+            return CurrentPolicy::Refused;
+        }
+        let bound = supervisor::current_bindings(&current, &frozen.authority);
+        let accounts = &frozen.authority.eligible_accounts;
+        let authority = match serde_json::to_value(&frozen.authority) {
+            Ok(value) => value,
+            Err(_) => return CurrentPolicy::Refused,
+        };
+        CurrentPolicy::Allowed {
+            authority_sha256: agent_run_domain::canonical::sha256_hex(&authority, true),
+            bound: accounts
+                .iter()
+                .map(|account| bound.contains(account))
+                .collect(),
+            unchanged: accounts
+                .iter()
+                .map(|account| supervisor::ordered_binding_unchanged(&current, account, &frozen))
+                .collect(),
+        }
     }
 
     /// Admits a strict provider request, choosing its account mechanically
@@ -553,10 +767,19 @@ impl Service {
                 "created":false,"agent":self.view(&store,&row)?}),
             );
         }
+        if let Some(restart_id) = agent_run_store::service_restart::active_service_restart(
+            &Store::open(&self.home)?.conn,
+        )? {
+            return Err(Error::Transition(
+                agent_run_store::service_restart::blocked_message(restart_id),
+            ));
+        }
         paths?;
         let (config, revision) = self.current_provider_config()?;
         let accounts = Store::open(&self.home)?.list_accounts()?;
         let catalog = config.resolve_catalog(accounts)?;
+        let mut prepared = prepare_provider(&config, &revision, &catalog, request)?;
+        self.bind_system_route(&mut prepared)?;
         let Prepared {
             request,
             effective,
@@ -564,7 +787,7 @@ impl Service {
             identity,
             cap,
             pinned,
-        } = prepare_provider(&config, &revision, &catalog, request)?;
+        } = prepared;
         let global_cap = config.core.max_active_agents;
         let mut submission = 0;
         let admission = loop {
@@ -621,7 +844,14 @@ impl Service {
     /// to the normal detached provider-aware supervisor; a replayed admission
     /// (`created=false`) never launches another child or reserves again.
     pub async fn start_provider(&self, request: ProviderStartRequest) -> Result<Value> {
-        let mut result = self.admit_provider(request).await?;
+        let caller = request.orchestrator.clone();
+        let mut result = match self.admit_provider(request).await {
+            Ok(value) => value,
+            Err(error) => {
+                self.remember_blocked_start(&error, caller).await?;
+                return Err(error);
+            }
+        };
         self.hand_off_provider(&mut result).await?;
         Ok(result)
     }
@@ -641,7 +871,7 @@ impl Service {
         if result["created"] == true {
             let id: AgentId = serde_json::from_value(result["agent_id"].clone())?;
             let lane = self.lane("admission")?;
-            if let Err(error) = supervisor::launch(&self.home, &id, &lane).await {
+            if let Err(error) = self.launch_provider_supervisor(&id, &lane).await {
                 lane.event(
                     &id,
                     "supervisor_handoff_error",
@@ -776,6 +1006,13 @@ impl Service {
                 return self.pool_view(&Store::open(&self.home)?, &found);
             }
         }
+        if let Some(restart_id) =
+            agent_run_store::service_restart::active_service_restart(&store.conn)?
+        {
+            return Err(Error::Transition(
+                agent_run_store::service_restart::blocked_message(restart_id),
+            ));
+        }
         let (config, revision) = self.current_provider_config()?;
         let accounts = Store::open(&self.home)?.list_accounts()?;
         let catalog = config.resolve_catalog(accounts)?;
@@ -853,7 +1090,9 @@ impl Service {
                 }
                 start.orchestrator = binding.clone();
                 start.validate()?;
-                prepared.push(Some(prepare_provider(&config, &revision, &catalog, start)?));
+                let mut member = prepare_provider(&config, &revision, &catalog, start)?;
+                self.bind_system_route(&mut member)?;
+                prepared.push(Some(member));
             } else {
                 prepared.push(None);
             }
@@ -971,7 +1210,14 @@ impl Service {
     /// whose launch fails ends terminally with its exact identity visible and
     /// the remaining members are still launched; a replay launches nothing.
     pub async fn start_pool(&self, request: PoolStartRequest) -> Result<Value> {
-        let result = self.admit_pool(request).await?;
+        let caller = request.orchestrator.clone();
+        let result = match self.admit_pool(request).await {
+            Ok(value) => value,
+            Err(error) => {
+                self.remember_blocked_start(&error, caller).await?;
+                return Err(error);
+            }
+        };
         self.hand_off_pool(result).await
     }
 
@@ -1174,7 +1420,8 @@ impl Service {
                 start.explicit_finish,
             )?;
             start.validate()?;
-            let prepared = prepare_provider(&config, &revision, &catalog, start)?;
+            let mut prepared = prepare_provider(&config, &revision, &catalog, start)?;
+            self.bind_system_route(&mut prepared)?;
             let candidates = produce(&store, &catalog, &prepared.request, submission)?;
             let replacement = agent_run_store::ops::ReplacePoolMember {
                 pool_id: request.pool_id.clone(),
@@ -1370,6 +1617,11 @@ impl Service {
                 );
             }
         }
+        if self.system_launcher.is_some() {
+            return Err(Error::Unsupported(
+                "system execution requires a provider configuration".into(),
+            ));
+        }
         let config = self.current_config()?;
         let runtime = config.runtime(&request.runtime)?;
         request.account = runtime.selected_account(request.account.as_deref())?;
@@ -1415,7 +1667,7 @@ impl Service {
         let runtime = request.runtime.clone();
         let model = request.model.clone();
         let result = self
-            .admit(request, &config, identity, None, config_revision)
+            .admit(request, &config, identity, None, config_revision, None)
             .await?;
         if let (Some(agent_id), Some(created)) = (
             result.get("agent_id").and_then(Value::as_str),
@@ -1435,6 +1687,7 @@ impl Service {
         identity: LaunchIdentity,
         parent: Option<&Record>,
         config_revision: &str,
+        restart_id: Option<i64>,
     ) -> Result<Value> {
         let admitted = self
             .lane("admission")?
@@ -1445,6 +1698,7 @@ impl Service {
                     config_revision: config_revision.to_owned(),
                     identity: serde_json::to_value(identity)?,
                     parent: parent.map(|row| row.id.clone()),
+                    restart_id,
                 },
                 crate::broker_writer::BROKER_BUDGET,
             )
@@ -1513,6 +1767,20 @@ impl Service {
         display_name: Option<String>,
         orchestrator: Option<OrchestratorRef>,
     ) -> Result<Value> {
+        self.resume_for(id, task, request_id, display_name, orchestrator, None)
+            .await
+    }
+
+    /// Resume an exact terminal execution, optionally as a captured restart member.
+    async fn resume_for(
+        &self,
+        id: &AgentId,
+        task: String,
+        request_id: Option<String>,
+        display_name: Option<String>,
+        orchestrator: Option<OrchestratorRef>,
+        restart_id: Option<i64>,
+    ) -> Result<Value> {
         let parent = Store::open(&self.home)?.get(id)?;
         if !parent.status.terminal() || parent.runtime_session_id.is_none() {
             return Err(invalid(
@@ -1528,7 +1796,14 @@ impl Service {
             .is_some_and(|identity| identity["provider_identity_version"] == 2);
         if provider_row {
             let mut result = self
-                .admit_provider_resume(&parent, task, request_id, display_name, orchestrator)
+                .admit_provider_resume_for(
+                    &parent,
+                    task,
+                    request_id,
+                    display_name,
+                    orchestrator,
+                    restart_id,
+                )
                 .await?;
             self.hand_off_provider(&mut result).await?;
             return Ok(result);
@@ -1584,6 +1859,11 @@ impl Service {
                 );
             }
         }
+        if self.system_launcher.is_some() {
+            return Err(Error::Unsupported(
+                "system execution cannot resume a legacy run".into(),
+            ));
+        }
         if matches!(self.active_config()?.value, CachedConfigValue::Providers(_)) {
             return Err(Error::Unsupported(
                 "legacy_continuation_unavailable: a schema-1 run cannot be continued under schema 2; its history remains readable".into(),
@@ -1636,7 +1916,14 @@ impl Service {
             "pending:materialization"
         };
         match self
-            .admit(request, &current, identity, Some(&parent), child_revision)
+            .admit(
+                request,
+                &current,
+                identity,
+                Some(&parent),
+                child_revision,
+                restart_id,
+            )
             .await
         {
             Ok(value) => Ok(value),
@@ -1689,6 +1976,20 @@ impl Service {
         display_name: Option<String>,
         orchestrator: Option<OrchestratorRef>,
     ) -> Result<Value> {
+        self.admit_provider_resume_for(parent, task, request_id, display_name, orchestrator, None)
+            .await
+    }
+
+    /// Reuse ordinary provider resume admission for one captured restart member.
+    async fn admit_provider_resume_for(
+        &self,
+        parent: &Record,
+        task: String,
+        request_id: Option<String>,
+        display_name: Option<String>,
+        orchestrator: Option<OrchestratorRef>,
+        restart_id: Option<i64>,
+    ) -> Result<Value> {
         let frozen = ProviderLaunchIdentity::read(parent)?;
         let mut request = frozen.provider_request.clone();
         request.task = task;
@@ -1720,6 +2021,20 @@ impl Service {
                 "created":false,"agent":self.view(&store,&row)?}),
             );
         }
+        match (&self.system_launcher, &frozen.system_route) {
+            (None, None) => {}
+            (Some(launcher), Some(route)) => {
+                route.validate_for(&frozen.authority.provider, frozen.authority.harness)?;
+                if launcher.route(&frozen.authority.provider, frozen.authority.harness)? != *route {
+                    return Err(Error::ExecutionChanged);
+                }
+            }
+            _ => {
+                return Err(Error::Unsupported(
+                    "execution belongs to a different launcher mode".into(),
+                ));
+            }
+        }
         request.validate()?;
         // A parent that already has a child is refused for that reason (the
         // child's own turns legitimately changed the parent's sealed history);
@@ -1750,17 +2065,48 @@ impl Service {
         // shared layout verifies the same original index through its bound
         // trees, and a still-prepared row refuses — the parent's history is
         // never rebuilt from changed live sources.
-        crate::runtime_storage::verify(
-            &Store::open(&self.home)?,
-            &self.home,
-            &runtime_home,
-            frozen.authority.assets_sha256.as_str(),
-        )
-        .map_err(|_| {
-            Error::Unsupported(
-                "continuation_unavailable: parent runtime assets no longer verify".into(),
-            )
-        })?;
+        let preflight_digest =
+            if let (Some(launcher), Some(route)) = (&self.system_launcher, &frozen.system_route) {
+                // Bind the worker's read-only proof to the same parent snapshot
+                // that admission will use; the writer compares it again in its
+                // transaction after replay and lineage checks.
+                let expected = {
+                    let store = Store::open(&self.home)?;
+                    store.conn.execute_batch("BEGIN")?;
+                    let current = store.get(&parent.id)?;
+                    if current.identity != parent.identity
+                        || current.request != parent.request
+                        || current.runtime_session_id != parent.runtime_session_id
+                        || current.status != parent.status
+                    {
+                        return Err(Error::ExecutionChanged);
+                    }
+                    agent_run_store::provider_admission::resume_preflight_digest(
+                        &store.conn,
+                        &parent.id,
+                    )?
+                };
+                let actual = launcher
+                    .preflight_resume(parent.id.clone(), route.clone())
+                    .await?;
+                if actual != expected {
+                    return Err(Error::ExecutionChanged);
+                }
+                Some(expected)
+            } else {
+                crate::runtime_storage::verify(
+                    &Store::open(&self.home)?,
+                    &self.home,
+                    &runtime_home,
+                    frozen.authority.assets_sha256.as_str(),
+                )
+                .map_err(|_| {
+                    Error::Unsupported(
+                        "continuation_unavailable: parent runtime assets no longer verify".into(),
+                    )
+                })?;
+                None
+            };
         let (prefer, intent, pinned_id, adapter_state): (String, String, Option<String>, String) =
             Store::open(&self.home)?.conn.query_row(
                 "SELECT t.selected_account_id,a.selection_intent,a.requested_account_id,t.adapter_state_json \
@@ -1799,7 +2145,9 @@ impl Service {
         // handoff binds every harness to the launch plan's actual root.
         let expected_root = (authority.harness == agent_run_domain::catalog::HarnessId::Codex)
             .then_some(runtime_home.as_path());
-        verify_recorded_history(&adapter_state, &frozen, expected_root, session)?;
+        if preflight_digest.is_none() {
+            verify_recorded_history(&adapter_state, &frozen, expected_root, session)?;
+        }
         let bound: std::collections::BTreeSet<_> = offered
             .bindings
             .iter()
@@ -1812,9 +2160,16 @@ impl Service {
             .map(|binding| binding.account.clone())
             .collect();
         let mut child_authority = authority.clone();
+        let ordered_claude = authority.harness == agent_run_domain::catalog::HarnessId::ClaudeCode
+            && frozen
+                .provider_config
+                .providers
+                .get(&authority.provider)
+                .is_some_and(|provider| provider.ordered_accounts);
         child_authority.eligible_accounts.retain(|account| {
             bound.contains(account)
                 && (authority.harness == agent_run_domain::catalog::HarnessId::Codex
+                    || ordered_claude
                     || *account == prefer)
         });
         let frozen_catalog = frozen.provider_config.resolve_catalog(accounts)?;
@@ -1861,6 +2216,7 @@ impl Service {
             provider_config: frozen.provider_config.clone(),
             provider_config_snapshot: frozen.provider_config_snapshot.clone(),
             authority: child_authority.clone(),
+            system_route: frozen.system_route.clone(),
             runtime_home: Some(runtime_home),
             snapshot_sha256: frozen.snapshot_sha256.clone(),
         })?;
@@ -1889,6 +2245,8 @@ impl Service {
                         catalog: frozen_catalog.clone(),
                         parent: parent.id.clone(),
                         prefer: prefer.clone(),
+                        preflight_digest: preflight_digest.clone(),
+                        restart_id,
                         inputs: agent_run_store::ops::AdmissionSpec {
                             request: request.clone(),
                             effective: effective.clone(),
@@ -1924,6 +2282,98 @@ impl Service {
             json!({"agent_id":admission.agent_id,"attempt_id":admission.attempt_id,
             "created":admission.created,"agent":self.view(&store,&row)?}),
         )
+    }
+
+    /// Continue one captured agent after its restart deadline is recorded.
+    pub(crate) async fn resume_service_restart(
+        &self,
+        restart_id: i64,
+        id: &AgentId,
+    ) -> Result<Value> {
+        let result = self
+            .resume_for(
+                id,
+                "Agent Run has finished its restart procedure. Continue your existing work from where you stopped."
+                    .into(),
+                Some(format!("service-restart:{restart_id}:{id}")),
+                None,
+                None,
+                Some(restart_id),
+            )
+            .await;
+        if let Err(error) = &result
+            && !matches!(
+                error,
+                Error::Persistence { .. } | Error::WriterFailure(_) | Error::BrokerUnavailable
+            )
+        {
+            let reason = match error {
+                Error::Unsupported(message)
+                    if message.starts_with("continuation_unavailable:")
+                        && message.len() <= 180
+                        && message.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || b" _:-.".contains(&byte)
+                        }) =>
+                {
+                    message.clone()
+                }
+                Error::ExecutionChanged => "The original execution or account changed.".into(),
+                Error::Validation(message)
+                    if message == "resume requires a terminal run with a native session ID" =>
+                {
+                    "The native session is unavailable.".into()
+                }
+                _ => format!("Resume was refused: {}", error.public().kind),
+            };
+            let _ = self
+                .lane("service-restart")?
+                .local(
+                    agent_run_store::ops::FailServiceRestartResume {
+                        restart_id,
+                        agent_id: id.clone(),
+                        reason,
+                    },
+                    crate::broker_writer::BROKER_BUDGET,
+                )
+                .await;
+        }
+        result
+    }
+
+    /// Start the deadline before a captured agent's resume is dispatched.
+    pub(crate) async fn request_service_restart_resume(
+        &self,
+        restart_id: i64,
+        id: &AgentId,
+    ) -> Result<()> {
+        let (boot_id, now_ns) = agent_run_platform::monotonic::now()?;
+        self.lane("service-restart")?
+            .local(
+                agent_run_store::ops::RequestServiceRestartResume {
+                    restart_id,
+                    agent_id: id.clone(),
+                    boot_id,
+                    now_ns,
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await
+    }
+
+    /// Reconcile confirmed resumes and the configured 60-second deadline.
+    pub(crate) async fn refresh_service_restart(&self, restart_id: i64) -> Result<bool> {
+        let (boot_id, now_ns) = agent_run_platform::monotonic::now()?;
+        self.lane("service-restart")?
+            .local(
+                agent_run_store::ops::RefreshServiceRestart {
+                    restart_id,
+                    boot_id,
+                    now_ns,
+                    at: now(),
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await
     }
 
     /// Enqueues one durable cancellation and returns the agent's public view.
@@ -1967,23 +2417,26 @@ impl Service {
             )
             .await
     }
+    /// Reads a pinned execution's answer using the shared sealed-proof verifier.
+    /// Unavailable answers retain their metadata envelope; verified inline text
+    /// keeps the historical 1 MiB CLI cutoff independently of transport budgets.
     pub fn answer(&self, id: &AgentId) -> Result<Value> {
-        let row = Store::open(&self.home)?.get(id)?;
+        let store = Store::open(&self.home)?;
+        let row = store.get(id)?;
+        let restart = agent_run_store::service_restart::restart_view(&store.conn, id)?;
+        let status = match restart.as_ref().map(|(status, _)| status.as_str()) {
+            Some("failed") => "failed",
+            Some("cancelled") => "cancelled",
+            Some("cancelling") => "cancelling",
+            Some(_) => "running",
+            None => row.status.as_str(),
+        };
         let Some(path) = &row.answer_path else {
             return Ok(
-                json!({"agent_id":id,"status":row.status,"available":false,"path":null,"size_bytes":null,"sha256":null,"content":null,"inline_complete":false,"relative_path":null,"kind":null,"media_type":null,"proof_version":null}),
+                json!({"agent_id":id,"status":status,"available":false,"path":null,"size_bytes":null,"sha256":null,"content":null,"inline_complete":false,"relative_path":null,"kind":null,"media_type":null,"proof_version":null}),
             );
         };
-        let proof = Proof {
-            path: path.clone(),
-            bytes: row
-                .answer_bytes
-                .ok_or_else(|| Error::Integrity("answer size evidence is missing".into()))?,
-            sha256: row
-                .answer_sha256
-                .ok_or_else(|| Error::Integrity("answer digest is missing".into()))?,
-            proof_version: 2,
-        };
+        let proof = crate::observation::answer_proof(&row)?;
         let root = self.home.join("agents").join(id.as_str());
         let (version, content) = verify::read(&root, &proof, verify::INLINE_ANSWER)?;
         Ok(
@@ -2071,6 +2524,8 @@ impl Service {
         }
     }
     /// Wait for a terminal durable revision or this observer's optional deadline.
+    /// A service-restart continuation follows its confirmed successor; ordinary
+    /// user-requested continuations remain pinned to the selected execution.
     ///
     /// The run itself is never given an execution deadline here: `seconds`
     /// bounds only this observer.  Each read opens and drops its own
@@ -2089,17 +2544,35 @@ impl Service {
                     .ok_or_else(|| invalid("wait deadline is out of range"))
             })
             .transpose()?;
+        let mut current = id.clone();
         loop {
             // This scope drops the thread-affine connection before the await.
             // A waiter therefore owns neither a SQLite transaction nor a socket
             // lane while another process commits the terminal revision.
-            let row = { Store::open(&self.home)?.get(id)? };
-            if row.status.terminal() {
-                return self.answer(id);
+            let (row, restart, continuation) = {
+                let store = Store::open(&self.home)?;
+                let row = store.get(&current)?;
+                let restart =
+                    agent_run_store::service_restart::restart_view(&store.conn, &current)?;
+                let continuation: Option<Option<String>> = store.conn.query_row(
+                    "SELECT resumed_execution_id FROM service_restart_agents WHERE agent_id=? AND resume_status IN ('started','cancelled') AND resumed_execution_id IS NOT NULL ORDER BY restart_id DESC LIMIT 1",
+                    [current.as_str()], |row| row.get(0),
+                ).optional()?;
+                (row, restart, continuation.flatten())
+            };
+            if let Some(child) = continuation {
+                current = child.parse()?;
+                continue;
+            }
+            let restarting = restart.as_ref().is_some_and(|(state, _)| {
+                matches!(state.as_str(), "pending" | "unconfirmed" | "cancelling")
+            });
+            if row.status.terminal() && !restarting {
+                return self.answer(&current);
             }
             if until.is_some_and(|d| tokio::time::Instant::now() >= d) {
                 return Ok(
-                    json!({"agent_id":id,"status":row.status,"terminal":false,"available":false}),
+                    json!({"agent_id":id,"status":if restarting {"running"} else {row.status.as_str()},"terminal":false,"available":false}),
                 );
             }
             let poll = Duration::from_millis(200);
@@ -2150,6 +2623,47 @@ impl Service {
             "created_at":row.created_at,"started_at":row.started_at,"finished_at":row.finished_at,"elapsed_seconds":(row.finished_at.unwrap_or(observed)-row.started_at.unwrap_or(row.created_at)).max(0.0),"last_progress_at":progress,"silence_seconds":if row.status.terminal(){None}else{Some((observed-progress.or(row.started_at).unwrap_or(row.created_at)).max(0.0))},"failure_kind":row.failure_kind,"failure_text":row.failure_text,"answer_available":row.answer_path.is_some(),"answer_bytes":row.answer_bytes,"answer_sha256":row.answer_sha256,"effort":row.request.effort,
             "delivery":store.delivery_status(&row.id)?,"parent_agent_id":row.parent_agent_id,"root_agent_id":row.root_agent_id,"sequence":row.sequence,"cleanup":store.last_event(&row.id,"process_cleanup")?,"policy":policy,"phase":phase,"phase_started_at":row.finished_at.or(row.started_at).unwrap_or(row.created_at),"process_state":process::observe(row.supervisor_pid,row.supervisor_identity.as_deref(),row.supervisor_birth_time),"observed_at":observed,"runtime_outcome":if row.status.terminal(){Some(row.status.as_str())}else{None},"acceptance":"pending","workdir":row.request.workdir.display().to_string(),
             "usage":store.usage_view(&row.id)?,"usage_cumulative":store.usage_cumulative(&row.root_agent_id)?,"tool_counts":store.tool_counts(&row.id)?});
+        if let Some((status, reason)) =
+            agent_run_store::service_restart::restart_view(&store.conn, &row.id)?
+        {
+            let failed = status == "failed";
+            let cancelled = status == "cancelled";
+            let cancelling = status == "cancelling";
+            view["status"] = json!(if failed {
+                "failed"
+            } else if cancelled {
+                "cancelled"
+            } else if cancelling {
+                "cancelling"
+            } else {
+                "running"
+            });
+            view["phase"] = json!(match status.as_str() {
+                "failed" | "cancelled" => "terminal",
+                "cancelling" => "stopping",
+                "unconfirmed" => "restart_unconfirmed",
+                _ => "restarting",
+            });
+            if !failed && !cancelled {
+                view["finished_at"] = Value::Null;
+            }
+            view["runtime_outcome"] = if failed {
+                json!("failed")
+            } else if cancelled {
+                json!("cancelled")
+            } else {
+                Value::Null
+            };
+            view["answer_available"] = json!(false);
+            view["answer_bytes"] = Value::Null;
+            view["answer_sha256"] = Value::Null;
+            view["failure_kind"] = if failed {
+                json!("restart_resume_failed")
+            } else {
+                Value::Null
+            };
+            view["failure_text"] = serde_json::to_value(reason)?;
+        }
         if let Some(lifecycle) = store.worker_lifecycle_view_at(&row.id, observed)? {
             if !row.status.terminal() && row.status == Status::Running {
                 view["phase"] = lifecycle["phase"].clone();
@@ -2349,6 +2863,18 @@ pub(crate) fn current_policy_permits(
     {
         return refuse("harness or connection");
     }
+    if frozen
+        .provider_config
+        .providers
+        .get(&authority.provider)
+        .is_some_and(|provider| provider.ordered_accounts)
+        && current
+            .providers
+            .get(&authority.provider)
+            .is_none_or(|provider| !provider.ordered_accounts)
+    {
+        return refuse("account queue");
+    }
     if now.native_model.as_deref().unwrap_or(&now.id)
         != then.native_model.as_deref().unwrap_or(&then.id)
     {
@@ -2469,18 +2995,74 @@ pub(crate) fn current_policy_permits(
     Ok(())
 }
 
+/// Verifies a system parent's assets and native history as its account-owned
+/// worker, returning only a digest of the unchanged parent and attempt rows.
+/// The worker socket and route fingerprint must match the stored route; no
+/// caller-supplied path is used to select the files being verified.
+pub fn system_resume_preflight(
+    home: &std::path::Path,
+    parent: &AgentId,
+    worker_socket: &std::path::Path,
+    route_fingerprint: &str,
+) -> std::result::Result<String, crate::system_launch::ResumePreflightFailure> {
+    use crate::system_launch::ResumePreflightFailure as Failure;
+    let store = Store::open(home).map_err(|_| Failure::ParentUnverifiable)?;
+    let before = agent_run_store::provider_admission::resume_preflight_digest(&store.conn, parent)
+        .map_err(|_| Failure::ParentUnverifiable)?;
+    let row = store.get(parent).map_err(|_| Failure::ParentUnverifiable)?;
+    let frozen = ProviderLaunchIdentity::read(&row).map_err(|_| Failure::ParentUnverifiable)?;
+    let route = frozen.system_route.as_ref().ok_or(Failure::RouteChanged)?;
+    if route.state_home != home
+        || route.worker_socket != worker_socket
+        || route.fingerprint.as_str() != route_fingerprint
+    {
+        return Err(Failure::RouteChanged);
+    }
+    if !row.status.terminal() {
+        return Err(Failure::ParentChanged);
+    }
+    let runtime_home = frozen
+        .runtime_home
+        .as_deref()
+        .ok_or(Failure::AssetsUnverifiable)?;
+    let session = row
+        .runtime_session_id
+        .as_deref()
+        .ok_or(Failure::HistoryUnverifiable)?;
+    crate::runtime_storage::verify(
+        &store,
+        &route.private_home,
+        runtime_home,
+        frozen.authority.assets_sha256.as_str(),
+    )
+    .map_err(|_| Failure::AssetsUnverifiable)?;
+    let state = store
+        .latest_attempt_state(parent)
+        .map_err(|_| Failure::HistoryUnverifiable)?;
+    let expected_root = (frozen.authority.harness == agent_run_domain::catalog::HarnessId::Codex)
+        .then_some(runtime_home);
+    verify_recorded_history(&state, &frozen, expected_root, session)
+        .map_err(|_| Failure::HistoryUnverifiable)?;
+    if agent_run_store::provider_admission::resume_preflight_digest(&store.conn, parent)
+        .map_err(|_| Failure::ParentUnverifiable)?
+        != before
+    {
+        return Err(Failure::ParentChanged);
+    }
+    Ok(before)
+}
+
 /// Verifies the native-history seal the supervisor recorded in the parent's
 /// last attempt (`adapter_state_json.native_history`) against the file it
-/// names. The seal must exist, be bound to the parent's session, harness and
-/// assets digest, name `expected_root` (when given) as its storage root, and
-/// the file must still have the exact sealed bytes. A missing seal fails closed: history is never
-/// adopted for the first time here.
+/// names. The returned seal must be bound to the parent's session, harness and
+/// assets digest, name `expected_root` (when given), and still match the file's
+/// exact bytes. A missing seal fails closed; history is never adopted here.
 pub(crate) fn verify_recorded_history(
     adapter_state: &str,
     frozen: &ProviderLaunchIdentity,
     expected_root: Option<&std::path::Path>,
     session: &str,
-) -> Result<()> {
+) -> Result<crate::continuity::HistorySeal> {
     let unavailable =
         |reason: &str| Error::Unsupported(format!("continuation_unavailable: {reason}"));
     let state: Value = serde_json::from_str(adapter_state)
@@ -2507,7 +3089,8 @@ pub(crate) fn verify_recorded_history(
             "native history seal names another storage root",
         ));
     }
-    crate::continuity::verify(&seal, frozen.authority.harness, session)
+    crate::continuity::verify(&seal, frozen.authority.harness, session)?;
+    Ok(seal)
 }
 
 /// Everything the store needs to admit one provider request, derived without
@@ -2701,6 +3284,7 @@ pub(crate) fn prepare_provider(
         provider_config: config.clone(),
         provider_config_snapshot: config.snapshot()?,
         authority: authority.clone(),
+        system_route: None,
         runtime_home: None,
         snapshot_sha256: None,
     };

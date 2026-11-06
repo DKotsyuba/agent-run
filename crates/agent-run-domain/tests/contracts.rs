@@ -288,8 +288,10 @@ fn aliased_catalog() -> ProviderCatalog {
             label: "plus".parse().unwrap(),
             account: account.clone(),
             models: None,
+            connection: None,
             multiplier: PositiveFinite::try_from(1.0).unwrap(),
         }],
+        ordered_accounts: false,
     };
     ProviderCatalog::new(
         vec![AccountRecord {
@@ -301,6 +303,75 @@ fn aliased_catalog() -> ProviderCatalog {
         vec![make("codex-plus"), make("codex-pro")],
     )
     .unwrap()
+}
+
+/// Optional ordered settings preserve legacy bytes and constrain connection overrides.
+#[test]
+fn ordered_provider_serialization_and_binding_contract() {
+    let mut provider: ProviderDefinition = serde_json::from_value(json!({
+        "id":"claude", "harness":"claude-code", "auth_family":"anthropic",
+        "connection":{"kind":"custom","endpoint":"https://api.example.com","protocol":"messages"},
+        "limits_source":"none", "models":[{"id":"m"}],
+        "bindings":[
+            {"label":"api","account":"acct-a","priority_multiplier":2.0},
+            {"label":"native","account":"acct-b","priority_multiplier":1.0},
+            {"label":"last","account":"acct-c","priority_multiplier":1.0,"models":["m"]}
+        ]
+    }))
+    .unwrap();
+    let legacy = serde_json::to_value(&provider).unwrap();
+    assert!(legacy.get("ordered_accounts").is_none());
+    assert!(
+        legacy["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|binding| binding.get("connection").is_none())
+    );
+    let mut explicit_defaults = legacy.clone();
+    explicit_defaults["ordered_accounts"] = json!(false);
+    explicit_defaults["bindings"][0]["connection"] = serde_json::Value::Null;
+    let decoded: ProviderDefinition = serde_json::from_value(explicit_defaults).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&decoded).unwrap(),
+        serde_json::to_vec(&provider).unwrap()
+    );
+
+    provider.ordered_accounts = true;
+    provider.bindings[1].connection = Some(ProviderConnection::Native);
+    provider.validate().unwrap();
+    assert_eq!(
+        provider.connection_for(&"acct-a".parse().unwrap(), "m"),
+        Some(&provider.connection)
+    );
+    assert_eq!(
+        provider.connection_for(&"acct-b".parse().unwrap(), "m"),
+        Some(&ProviderConnection::Native)
+    );
+    assert_eq!(
+        provider.connection_for(&"acct-b".parse().unwrap(), "other"),
+        None
+    );
+    assert_eq!(
+        provider
+            .ordered_bindings("m")
+            .iter()
+            .map(|binding| binding.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["api", "native", "last"]
+    );
+    let mut duplicate = provider.clone();
+    duplicate.bindings[2].account = duplicate.bindings[0].account.clone();
+    assert!(duplicate.validate().is_err());
+    let mut wrong_connection = provider.clone();
+    wrong_connection.bindings[1].connection = Some(provider.connection.clone());
+    assert!(wrong_connection.validate().is_err());
+    let mut unordered = provider.clone();
+    unordered.ordered_accounts = false;
+    assert!(unordered.validate().is_err());
+    let mut native_default = provider;
+    native_default.connection = ProviderConnection::Native;
+    assert!(native_default.validate().is_err());
 }
 
 /// The same global account under two provider aliases is one physical pool:
@@ -496,6 +567,7 @@ fn aliases_and_lease_scope_remain_bound_to_one_account() {
         label: "backup".parse().unwrap(),
         account: "acct-codex-native".parse().unwrap(),
         models: None,
+        connection: None,
         multiplier: PositiveFinite::try_from(1.0).unwrap(),
     });
     let record = aliased_catalog()
@@ -771,6 +843,25 @@ fn quota_admission_verdicts_are_typed_and_stable() {
     // from active-slot capacity exhaustion.
     let public = agent_run_domain::Error::QuotaAdmission(exhausted.clone()).public();
     assert_eq!(public.kind, "quota_exhausted");
+    let cooldown = QuotaAdmissionError::BindingCooldown {
+        provider: ProviderId::from_str("claude").unwrap(),
+        model: "fixture".into(),
+        account: AccountId::from_str("acct-api").unwrap(),
+        reason: agent_run_domain::catalog::BindingCooldownReason::BillingUnavailable,
+        retry_after_seconds: 21,
+    };
+    assert_eq!(cooldown.kind(), "binding_cooldown");
+    let public = agent_run_domain::Error::QuotaAdmission(cooldown.clone()).public();
+    assert_eq!(public.kind, "binding_cooldown");
+    assert!(public.message.contains("billing_unavailable"));
+    assert!(public.message.contains("21 seconds"));
+    assert_eq!(
+        serde_json::from_value::<QuotaAdmissionError>(
+            serde_json::to_value(cooldown.clone()).unwrap()
+        )
+        .unwrap(),
+        cooldown
+    );
     assert_eq!(
         agent_run_domain::Error::Capacity.public().kind,
         "CapacityExhausted"
@@ -786,6 +877,7 @@ fn quota_admission_verdicts_are_typed_and_stable() {
         "selection_busy",
         "no_eligible_account",
         "quota_exhausted",
+        "binding_cooldown",
         "RequestConflict",
     ] {
         assert_eq!(broker(Some(code)).public().kind, code);

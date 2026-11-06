@@ -353,10 +353,10 @@ completion/receipt facts. Known doctor false positives and historical ownership
 warnings require an accurate before/after comparison; never delete or rename their
 evidence to claim a clean doctor. Add no unmeasured family/host qualification.
 
-Choose a fresh release version only after acceptance. macOS Apple silicon remains
-the only published host; Linux qualification stays deferred. Publication,
-installation, profile activation, schema migration and installed live qualification
-remain separate proofs under [releasing.md](releasing.md). Deployment waits for
+At the time of this plan, macOS Apple silicon was the only published target and
+Linux qualification was deferred. Current release requirements are described
+in [releasing.md](releasing.md); publication, installation, profile activation,
+schema migration and installed live qualification remain separate proofs. Deployment waits for
 fresh zero active work and real writer/lock quiescence, with no production job
 cancellation. A schema-changing release additionally requires the tested explicit
 migration and recovery procedure from S4.

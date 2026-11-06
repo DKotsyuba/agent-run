@@ -46,7 +46,9 @@ supported_protocol_revisions = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-
 # Historically qualified through the published native releases; every
 # release re-runs the native gate before this stays true.
 qualified_targets = ["aarch64-apple-darwin"]
-candidate_targets = []
+# The Linux release producer must pass its native gate before publication.
+# Candidate records intent; it does not claim that a release has passed yet.
+candidate_targets = ["x86_64-unknown-linux-gnu"]
 # No host has passed a formal family host-matrix qualification. Observed
 # integrations and unknowns are separated in docs/family-standard.md.
 qualified_hosts = []

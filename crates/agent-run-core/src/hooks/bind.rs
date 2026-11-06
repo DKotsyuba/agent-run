@@ -196,6 +196,67 @@ pub struct HookPayload {
     pub pool_id: Option<String>,
 }
 
+/// Read a blocked-start receipt from the existing post-tool hook. The host
+/// supplies the session even when no agent was created by the refused call.
+pub fn restart_waiter(payload: &Value, transport: &str) -> Result<Option<(i64, OrchestratorRef)>> {
+    let Some(object) = payload.as_object() else {
+        return Err(invalid("hook payload must be a JSON object"));
+    };
+    let mut ids = BTreeSet::new();
+    if let Some(response) = object.get("tool_response") {
+        collect_restart_ids(response, &mut ids)?;
+    }
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    if ids.len() != 1
+        || object
+            .get("hook_event_name")
+            .is_some_and(|event| event.as_str() != Some("PostToolUse"))
+    {
+        return Err(invalid("invalid restart hook receipt"));
+    }
+    let reference = OrchestratorRef {
+        transport: transport.into(),
+        external_session_id: required_string(object.get("session_id"), "session_id")?,
+        external_turn_id: object.get("turn_id").map(value_string).transpose()?,
+    };
+    reference.validate()?;
+    Ok(Some((ids.pop_first().expect("one restart id"), reference)))
+}
+
+/// Inspect only structured or JSON-encoded response envelopes for the marker.
+fn collect_restart_ids(value: &Value, ids: &mut BTreeSet<i64>) -> Result<()> {
+    match value {
+        Value::Object(object) => {
+            if object.get("accepted") == Some(&Value::Bool(false))
+                && let Some(id) = object.get("agent_run_restart_id")
+            {
+                ids.insert(
+                    id.as_i64()
+                        .filter(|id| *id > 0)
+                        .ok_or_else(|| invalid("invalid restart receipt"))?,
+                );
+            }
+            for item in object.values() {
+                collect_restart_ids(item, ids)?;
+            }
+        }
+        Value::Array(values) => {
+            for item in values {
+                collect_restart_ids(item, ids)?;
+            }
+        }
+        Value::String(text) => {
+            if let Ok(decoded) = serde_json::from_str::<Value>(text) {
+                collect_restart_ids(&decoded, ids)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Converts raw or normalized context/bind payloads into one strict host-neutral form.
 pub fn normalize(payload: &Value, bind: bool, transport: &str) -> Result<HookPayload> {
     if !HOOK_TRANSPORTS.contains(&transport) {

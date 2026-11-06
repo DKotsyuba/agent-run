@@ -6,6 +6,29 @@
 - [x] Reject unknown or duplicate replays, runner-ID collisions, malformed origins and foreign sessions; retain content-free refusal categories.
 Release gate: background-command completion and native continuation through Sonnet and GLM must be verified on the exact candidate before publication.
 
+## P1 — Explicit worker finish and event-driven idle
+
+- [ ] Implement the owner's explicit completion contract: only an authenticated internal worker `finish(summary)` completes a run; a native turn end becomes idle.
+- [ ] Preserve the same run/native session across pool, steer and approved native/tool completion wakes; eliminate model polling used only to hold a turn open.
+- [ ] Keep the finish summary immutable and schema-validated, with idempotent receipts, verified cleanup and restart-safe persistence. Never treat unknown native input, a late result or an unconfirmed cleanup as success.
+- [ ] Probe Codex exec-cell survival, qualify Sonnet/GLM background wake and finish, then stage opt-in evaluation and default rollout for new runs. Preserve frozen legacy runs and unlimited execution.
+
+Plan: [explicit-finish-plan.md](explicit-finish-plan.md). This is planned follow-up work, separate from the current Claude CLI interoperability fix. No execution or idle-age timeout is reintroduced.
+
+## Claude background-task notifications — fixed and installed in 0.24.2
+
+- [x] Fix the Claude-family stream interoperability issue observed with Agent Run 0.24.1 and Claude Code 2.1.294. Both Sonnet IDE-experiment arms ended with `runtime_contract_rejected` / `ValidationError` at `engine_execution`, about 1.4 seconds after an internal background-command completion notification.
+- [x] Separate validated native internal `task-notification` messages from replay acknowledgements of runner-written user inputs. Native context is tracked separately, including the bounded optional emitter `runId`; unknown runner replay IDs remain refused.
+- [x] Preserve task/result/session correlation. Do not accept arbitrary unknown replay IDs, trust notification-like text, or treat an internal notification as completion of the owner's task. Keep unknown/duplicate external replays and spoofed or unowned notifications fail-closed.
+- [x] Add fixture regressions for foreground and background commands, completion arriving mid-turn, multiple notifications, genuine steering acknowledgements, malformed/spoofed origins, duplicate IDs and resumed sessions. Verify that a valid background completion lets the original task continue through a correlated final answer and verified cleanup.
+- [x] Retain bounded content-free replay-origin refusal and terminal-correlation evidence, without messages, native IDs, arguments, environment values or credentials.
+- [x] Qualify real native Sonnet and GLM foreground/background commands through sequence 3 with unchanged native sessions, exact answer hashes and confirmed cleanup. Publish and install 0.24.2 from accepted source `bee1a4e961ce6b372a4ed87e1412103712572ccd`.
+- [ ] Rerun the affected benchmark pair as a separately labelled experiment. Preserve the original failed runs and candidates; do not patch or restart active benchmark participants.
+
+Installed qualification on 2026-10-10 verified the exact attested published payload, CLI/TUI and resident 0.24.2, schema 28 integrity, unchanged configuration, fresh API/MCP lifecycle and a provider-free admission-refusal fixture. Real Sonnet/GLM qualification used an isolated local binary from the exact accepted source before publication. Existing doctor findings remain unchanged: two compaction-key false positives and three historical ownership warnings. The new explicit-finish lifecycle above is not part of this repair.
+
+Evidence: an isolated model-free Rust reproduction of the unchanged replay predicate accepts a known runner input and rejects the native background-notification shape. Native histories show the same notification/failure timing in both arms. The original rejected stdout frame was not retained: the interoperability mechanism is reproduced, while attribution of these exact failures remains a high-confidence inference. Detailed private receipts are in the experiment's `run/sonnet-contract-diagnosis.json` and `run/sonnet-replay-reproduction.json`, outside release source; do not publish raw histories or process/session details with this backlog item.
+
 ## Synchronous start admission preflight
 
 - [x] Validate that the requested launch is supported before `start` accepts asynchronous work and returns an agent ID. Unsupported harness/profile/model/account/options or permission combinations must return a typed error in that same tool call.

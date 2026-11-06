@@ -652,14 +652,14 @@ pub(crate) fn inventory(
     Ok(())
 }
 
-/// Downloads only the six exact approved names; create-new scratch plus child
-/// file-size limit prevents overwrite/unbounded payloads. Partial downloads remain.
+/// Downloads the manifest or its exact validated inventory; create-new scratch
+/// and child file-size limits prevent overwrite/unbounded payloads.
 pub(crate) fn download(
     root: &Path,
     tag: &str,
     directory: &Path,
     deadline: Instant,
-    manifest_only: bool,
+    manifest: Option<&Manifest>,
 ) -> Result<(), Failure> {
     let mut args = vec![
         "release".into(),
@@ -670,21 +670,17 @@ pub(crate) fn download(
         "--dir".into(),
         directory.to_string_lossy().into_owned(),
     ];
-    if manifest_only {
-        args.extend(["--pattern".into(), MANIFEST.into()]);
-    } else {
-        for name in [
-            format!(
-                "agent-run-{}-aarch64-apple-darwin.tar.gz",
-                tag.trim_start_matches('v')
-            ),
-            format!("agent-run-{}-source.tar", tag.trim_start_matches('v')),
-            "install.sh".into(),
-            "acceptance.json".into(),
-            "SHA256SUMS".into(),
-        ] {
-            args.extend(["--pattern".into(), name]);
+    if let Some(manifest) = manifest {
+        for name in manifest
+            .artifacts
+            .iter()
+            .map(|item| item.name.as_str())
+            .chain(["SHA256SUMS"])
+        {
+            args.extend(["--pattern".into(), name.into()]);
         }
+    } else {
+        args.extend(["--pattern".into(), MANIFEST.into()]);
     }
     let outcome = delivery::run("gh", &args, root, budget(deadline, 180)?);
     budget(deadline, 180)?;
@@ -806,7 +802,7 @@ fn observe(root: &Path, o: &Options, w: &mut Option<Workflow>) -> Result<String,
                         .tempdir_in(root.join("target/release-observer"))
                         .map_err(|_| failure(5, "scratch unavailable"))?
                         .keep();
-                    download(root, &o.tag, &scratch, deadline, true)?;
+                    download(root, &o.tag, &scratch, deadline, None)?;
                     let bytes = delivery::read_regular(&scratch.join(MANIFEST), 65536)
                         .map_err(|_| failure(5, "manifest download size/type refused"))?;
                     if bytes.len() > 65536 {
@@ -824,7 +820,7 @@ fn observe(root: &Path, o: &Options, w: &mut Option<Workflow>) -> Result<String,
                     }
                     inventory(&release, &manifest, bytes.len() as u64)?;
                     let pinned_toolchain = source_contract(root, &manifest, deadline)?;
-                    download(root, &o.tag, &scratch, deadline, false)?;
+                    download(root, &o.tag, &scratch, deadline, Some(&manifest))?;
                     let verified =
                         delivery::verify_until(&scratch, &o.commit, Some(workflow), deadline);
                     budget(deadline, 30)?;

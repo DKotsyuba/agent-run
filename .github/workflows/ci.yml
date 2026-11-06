@@ -16,7 +16,6 @@ concurrency:
 jobs:
   rust:
     name: Rust checks (${{ matrix.label }})
-    continue-on-error: ${{ matrix.continue_on_error }}
     strategy:
       fail-fast: false
       matrix:
@@ -25,12 +24,10 @@ jobs:
             label: supported-macos-arm64
             target: aarch64-apple-darwin
             architecture: arm64
-            continue_on_error: false
-          - os: ubuntu-latest
-            label: validation-only-linux-x86_64-unqualified
+          - os: ubuntu-22.04
+            label: supported-linux-x86_64
             target: x86_64-unknown-linux-gnu
             architecture: x86_64
-            continue_on_error: true
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out source
@@ -39,6 +36,9 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup show active-toolchain
+      - name: Bound Linux build cache size
+        if: runner.os == 'Linux'
+        run: printf 'CARGO_PROFILE_DEV_DEBUG=0\nCARGO_PROFILE_TEST_DEBUG=0\nCARGO_INCREMENTAL=0\n' >> "$GITHUB_ENV"
       - name: Restore Rust dependency cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -52,8 +52,21 @@ jobs:
       - name: Normalize temporary root for Unix socket fixtures
         shell: bash
         run: |
-          temporary="$(cd "$RUNNER_TEMP" && pwd -P)"
-          printf 'TMPDIR=%s\nTMP=%s\nTEMP=%s\n' "$temporary" "$temporary" "$temporary" >> "$GITHUB_ENV"
+          root="$(cd "$RUNNER_TEMP" && pwd -P)"
+          # Codex must not place shared assets inside its writable TMPDIR.
+          mkdir -p "$root/agent-run-tmp" "$root/agent-run-fixtures"
+          temporary="$root/agent-run-tmp"
+          fixtures="$root/agent-run-fixtures"
+          printf 'TMPDIR=%s\nTMP=%s\nTEMP=%s\nAGENT_RUN_TEST_TMP=%s\nAGENT_RUN_TEST_SOCKET_TMP=%s\n' "$temporary" "$temporary" "$temporary" "$fixtures" "$fixtures" >> "$GITHUB_ENV"
+      - name: Prepare protected Linux socket fixture root
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          socket_root="/run/agent-run-ci-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          sudo mkdir -m 0750 "$socket_root"
+          sudo chown "$(id -u):$(id -g)" "$socket_root"
+          sudo chmod 0750 "$socket_root"
+          printf 'AGENT_RUN_TEST_SOCKET_TMP=%s\n' "$socket_root" >> "$GITHUB_ENV"
       - name: Verify shared filesystem support
         if: runner.os == 'macOS'
         run: |
@@ -64,7 +77,7 @@ jobs:
         run: node --test scripts/check-desktop-transport.cjs scripts/check-codegraph-probe.cjs
       - name: Build and verify sealed native release
         # The required release-contract job covers this exact macOS payload.
-        # Keep the independent unqualified Linux build visible.
+        # Linux is independently built and verified on its native runner.
         if: runner.os != 'macOS'
         shell: bash
         run: |

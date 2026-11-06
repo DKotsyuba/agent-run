@@ -518,7 +518,7 @@ impl Faults {
 }
 
 impl StoreWriter<'_> {
-    /// Opens the existing schema-30 database under the consumed lease. An
+    /// Opens the existing current-schema database under the consumed lease. An
     /// absent, empty, older or newer database is refused with a typed
     /// unsupported error; this never initializes or migrates. Registers the
     /// fence function, verifies WAL/FULL/foreign keys and bumps the writer
@@ -1103,7 +1103,7 @@ pub struct ReservationScopes {
     pub probes: Vec<(String, String)>,
 }
 
-/// Opens one fenced read-write connection to an existing schema-30 WAL
+/// Opens one fenced read-write connection to an existing current-schema WAL
 /// database without following symlinks: busy wait [`WRITER_BUSY`], foreign
 /// keys, `synchronous=FULL` and the fence function.
 fn open_writer_connection(path: &Path) -> Result<Connection> {
@@ -1152,7 +1152,7 @@ impl Drop for OfflineWriterGuard {
 }
 
 impl OfflineWriterGuard {
-    /// Initializes an absent or empty database at schema 30.
+    /// Initializes an absent or empty database at the current schema.
     pub fn initialize(&mut self) -> Result<()> {
         let mut store = Store::connect(&self.home, true)?;
         register_fence(&store.conn)?;
@@ -1210,7 +1210,7 @@ impl StoreReader {
         Self::open_with(home, WRITER_BUSY)
     }
 
-    /// Opens the existing schema-30 database read-only. Never creates,
+    /// Opens the existing current-schema database read-only. Never creates,
     /// migrates or changes the file; a missing database or another schema
     /// version is a typed unsupported error. Writes through it fail with
     /// SQLITE_READONLY.

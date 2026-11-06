@@ -102,7 +102,9 @@ impl AuthorizedRequest {
             endpoint,
             auth_header,
             ..
-        } = &definition.connection
+        } = definition
+            .connection_for(account, model)
+            .ok_or_else(|| invalid("account is not bound to the provider model"))?
         else {
             return Err(invalid("native provider uses harness-owned authentication"));
         };

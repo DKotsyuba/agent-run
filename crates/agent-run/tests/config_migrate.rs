@@ -273,6 +273,59 @@ fn v2_target_config_migration_preserves_accounts_and_history() {
     assert_eq!(history(&home.root), before_history);
 }
 
+/// A shared-mode schema-32 home upgrades and rolls back as a paired config/DB
+/// without changing its group-searchable directory mode or historical rows.
+#[test]
+fn v32_shared_home_upgrade_and_paired_rollback_preserve_mode() {
+    use std::os::unix::fs::MetadataExt;
+    let home = Home::v2();
+    let old_db = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/baseline/db/current-v32.sqlite");
+    fs::copy(old_db, home.root.join("state.db")).unwrap();
+    let conn = rusqlite::Connection::open(home.root.join("state.db")).unwrap();
+    agent_run_store::fixture::fenced(&conn).unwrap();
+    conn.execute("UPDATE agents SET status='succeeded'", [])
+        .unwrap();
+    conn.execute("INSERT INTO provider_accounts(account_id,auth_family,secret_ref,status,created_at,updated_at) VALUES ('acct-existing','anthropic','env:EXISTING_KEY','enabled',0,0)", []).unwrap();
+    drop(conn);
+    seal(&home.root.join("old-release"), 32);
+    fs::set_permissions(&home.root, fs::Permissions::from_mode(0o2750)).unwrap();
+    let before_config = fs::read(home.root.join("config.toml")).unwrap();
+    let before = application_rows(&home.root);
+    let target = home.path("target.toml");
+    let old = home.path("old-release");
+    let (ok, result) = run(
+        &home.root,
+        &[
+            "config",
+            "migrate",
+            "--target-config",
+            &target,
+            "--apply",
+            "--from-release",
+            &old,
+        ],
+        false,
+    );
+    assert!(ok, "{result}");
+    assert_eq!(version(&home.root), agent_run::state::VERSION as u32);
+    assert_eq!(fs::metadata(&home.root).unwrap().mode() & 0o7777, 0o2750);
+    let snapshot = result["snapshot"].as_str().unwrap();
+    let (ok, result) = run(
+        &home.root,
+        &["config", "rollback", "--snapshot", snapshot],
+        false,
+    );
+    assert!(ok, "{result}");
+    assert_eq!(version(&home.root), 32);
+    assert_eq!(fs::metadata(&home.root).unwrap().mode() & 0o7777, 0o2750);
+    assert_eq!(
+        fs::read(home.root.join("config.toml")).unwrap(),
+        before_config
+    );
+    assert_eq!(application_rows(&home.root), before);
+}
+
 /// Captures every application table's stored values for paired rollback checks.
 /// SQLite backup may change page layout/journal header counters, so logical data
 /// (including account references, events and usage) is compared independently of

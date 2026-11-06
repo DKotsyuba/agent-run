@@ -24,7 +24,7 @@ impl Drop for Decoder {
 }
 
 /// Inspects a regular tar or gzip tar before extraction. Native payloads accept
-/// executable bits only on shipped binaries/collectors; source archives allow
+/// executable bits only on shipped binaries and reviewed helper scripts; source archives allow
 /// ordinary executable files. Refuses links, specials, unsafe paths/modes,
 /// duplicate normalized entries, malformed headers, extensions changing
 /// extraction semantics, excess count/bytes and missing end markers.
@@ -342,6 +342,7 @@ fn inspect_stream(mut input: impl Read, native: bool) -> Result<(), String> {
                     | "collectors/codex.sh"
                     | "collectors/claude.sh"
                     | "collectors/glm.sh"
+                    | "systemd/agent-run-service.sh"
             )
         {
             return Err("unexpected executable archive member".into());

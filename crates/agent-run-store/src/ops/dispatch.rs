@@ -111,6 +111,14 @@ pub fn implemented(kind: OpKindRef) -> bool {
             | K::StopServiceGeneration
             | K::RecoverServiceProbes
             | K::PruneHistoryBatch
+            | K::BeginServiceRestart
+            | K::AdvanceServiceRestart
+            | K::RememberServiceRestartCaller
+            | K::RecoverServiceRestart
+            | K::RequestServiceRestartResume
+            | K::FailServiceRestartResume
+            | K::RefreshServiceRestart
+            | K::ClaimServiceRestart
     )
 }
 
@@ -428,7 +436,13 @@ pub(crate) fn run_remote(store: &mut Store, op: RemoteOp) -> Result<Value> {
         )?)),
         R::ProviderHistory(op) => {
             let metadata = history_value(&op.metadata)?;
-            out(store.provider_history(&op.target.execution, &op.target.attempt, &metadata)?)
+            out(store.provider_history_with_cooldown(
+                &op.target.execution,
+                &op.target.attempt,
+                &metadata,
+                op.metadata.cooldown_reason,
+                agent_run_domain::domain::now(),
+            )?)
         }
         R::CompleteTerminalCommands(op) => {
             out(store.complete_terminal_commands(&op.execution, op.at)?)
@@ -466,10 +480,45 @@ pub(crate) fn run_remote(store: &mut Store, op: RemoteOp) -> Result<Value> {
 pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
     use LocalOp as L;
     match op {
+        L::BeginServiceRestart(op) => out(store.begin_service_restart(&op.request_id, op.at)?),
+        L::AdvanceServiceRestart(op) => {
+            out(store.advance_service_restart(op.restart_id, &op.boot_id, op.now_ns)?)
+        }
+        L::RememberServiceRestartCaller(op) => {
+            out(store.remember_service_restart_caller(op.restart_id, &op.reference)?)
+        }
+        L::RecoverServiceRestart(op) => out(match op.failed_restart {
+            Some(id) => store.recover_service_restart_after_failure(id)?,
+            None => store.recover_service_restart()?,
+        }),
+        L::RequestServiceRestartResume(op) => out(store.request_service_restart_resume(
+            op.restart_id,
+            &op.agent_id,
+            &op.boot_id,
+            op.now_ns,
+        )?),
+        L::FailServiceRestartResume(op) => {
+            out(store.fail_service_restart_resume(op.restart_id, &op.agent_id, &op.reason)?)
+        }
+        L::RefreshServiceRestart(op) => {
+            out(store.refresh_service_restart(op.restart_id, &op.boot_id, op.now_ns, op.at)?)
+        }
+        L::ClaimServiceRestart(op) => out(store.claim_service_restart(op.restart_id)?),
         L::RecordSupervisorLaunch(op) => {
             out(store.record_supervisor_launch(&op.execution, &op.capability_sha256)?)
         }
-        L::RecordStartupOwner(op) => out(store.record_startup_owner(&op.execution, &op.identity)?),
+        L::RecordStartupOwner(op) => {
+            if op.system_fence.is_some() && op.local_capability_sha256.is_some() {
+                return Err(invalid("startup owner has conflicting fences"));
+            }
+            if let Some(fence) = &op.system_fence {
+                out(store.record_system_startup_owner(&op.execution, &op.identity, fence)?)
+            } else if let Some(capability) = &op.local_capability_sha256 {
+                out(store.record_local_startup_owner(&op.execution, &op.identity, capability)?)
+            } else {
+                out(store.record_startup_owner(&op.execution, &op.identity)?)
+            }
+        }
         L::BeginSupervisorHandoff(op) => out(store.begin_supervisor_handoff_with(&op)?),
         L::SetOwner(op) => out(store.set_owner(&op.execution, op.pid, &op.identity, op.birth)?),
         L::RegisterWorkerCatalog(op) => out(store.register_worker_catalog(&op.proof, op.at)?),
@@ -507,12 +556,14 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
         L::CaptureIncident(op) => out(store.capture_incident(&op.projection)?),
         L::AdmitStart(op) => {
             let parent = op.parent.as_ref().map(|id| store.get(id)).transpose()?;
-            let (agent_id, created) = store.admit_with_config_revision(
+            let (agent_id, created) = crate::admission::admit_with_restart(
+                store,
                 &op.request,
                 &op.config,
                 &op.config_revision,
                 &op.identity,
                 parent.as_ref(),
+                op.restart_id,
             )?;
             out(AdmitStartOutput {
                 agent_id,
@@ -548,6 +599,8 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
                 crate::provider_admission::ProviderResume {
                     parent: &op.parent,
                     prefer: &op.prefer,
+                    preflight_digest: op.preflight_digest.as_deref(),
+                    restart_id: op.restart_id,
                 },
             )?)
         }
@@ -734,6 +787,9 @@ fn history_value(metadata: &ProviderHistoryMetadata) -> Result<Value> {
     }
     if let Some(failure) = &metadata.native_failure {
         value.insert("native_failure".into(), failure.clone());
+    }
+    if let Some(reason) = metadata.cooldown_reason {
+        value.insert("binding_cooldown_recorded".into(), json!(reason));
     }
     Ok(Value::Object(value))
 }

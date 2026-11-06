@@ -1,0 +1,12 @@
+# Only paths are configured here. The host assigns account and group access.
+operator_socket = "/run/agent-run/broker/api.sock"
+writer_socket = "/run/agent-run/broker/writer.sock"
+operator_sockets = ["/run/agent-run/codex-client/api.sock", "/run/agent-run/claude-client/api.sock"]
+
+[workers.codex]
+socket = "/run/agent-run/codex/worker.sock"
+private_home = "/home/codex-agent/.agent-run"
+
+[workers.claude-code]
+socket = "/run/agent-run/claude/worker.sock"
+private_home = "/home/claude-agent/.agent-run"

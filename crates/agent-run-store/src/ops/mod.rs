@@ -218,6 +218,14 @@ inventory! {
     93 HealthTick "health_tick" L B y;
     94 AcceptHealthReply "accept_health_reply" L N y;
     95 ReportPoolReadLoop "report_pool_read_loop" L N y;
+    96 BeginServiceRestart "begin_service_restart" L C n;
+    97 AdvanceServiceRestart "advance_service_restart" L C n;
+    98 RememberServiceRestartCaller "remember_service_restart_caller" L N n;
+    99 RecoverServiceRestart "recover_service_restart" L C n;
+    100 RequestServiceRestartResume "request_service_restart_resume" L C n;
+    101 FailServiceRestartResume "fail_service_restart_resume" L C n;
+    102 RefreshServiceRestart "refresh_service_restart" L C n;
+    105 ClaimServiceRestart "claim_service_restart" L C n;
 }
 
 /// Seals one payload and binds it to its inventory row and typed output.
@@ -234,6 +242,14 @@ macro_rules! op {
 }
 
 op! {
+    BeginServiceRestart => i64;
+    AdvanceServiceRestart => usize;
+    RememberServiceRestartCaller => ();
+    RecoverServiceRestart => Option<i64>;
+    RequestServiceRestartResume => ();
+    FailServiceRestartResume => ();
+    RefreshServiceRestart => bool;
+    ClaimServiceRestart => bool;
     AdmitStart => AdmitStartOutput;
     AdmitProvider => crate::provider_admission::ProviderAdmission;
     AdmitProviderResume => crate::provider_admission::ProviderAdmission;
@@ -423,6 +439,14 @@ op_enum! {
     /// authority; all others require `Broker`.
     #[derive(Clone, Serialize)]
     pub enum LocalOp {
+        BeginServiceRestart,
+        AdvanceServiceRestart,
+        RememberServiceRestartCaller,
+        RecoverServiceRestart,
+        RequestServiceRestartResume,
+        FailServiceRestartResume,
+        RefreshServiceRestart,
+        ClaimServiceRestart,
         AdmitStart,
         AdmitProvider,
         AdmitProviderResume,

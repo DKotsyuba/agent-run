@@ -414,6 +414,112 @@ async fn python_sigterm_completes_admitted_requests_and_releases_the_store() {
     assert!(agent_run_store::fixture::open(temp.path()).is_ok());
 }
 
+/// A real disposable broker preserves its admission fence across process
+/// replacement and queues a notice for a caller without an existing agent.
+#[tokio::test]
+async fn restart_recovers_after_real_broker_replacement() {
+    let temp = tempfile::tempdir().unwrap();
+    cli::init(temp.path()).unwrap();
+    let path = temp.path().join("api.sock");
+    let spawn = || {
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_agent-run"))
+            .arg("--home")
+            .arg(temp.path())
+            .args(["api", "serve"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    };
+    let mut broker = spawn();
+    wait_for_socket(&path).await;
+    let started = request(
+        &path,
+        json!({"jsonrpc":"2.0","id":1,
+        "method":"_service_restart_begin","params":{"request_id":"fixture-restart"}}),
+    )
+    .await;
+    let id = started["result"]["restart_id"].as_i64().unwrap();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let status = request(
+                &path,
+                json!({"jsonrpc":"2.0","id":2,
+                "method":"_service_restart_status","params":{"restart_id":id}}),
+            )
+            .await;
+            if status["result"]["phase"] == "ready" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let refused = request(&path, json!({"jsonrpc":"2.0","id":3,"method":"start","params":{
+        "provider":"codex","model":"fixture","profile":"review","task":"fixture",
+        "workdir":temp.path(),"orchestrator":{"transport":"codex","external_session_id":"waiting-chat"}
+    }})).await;
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("restarting")
+    );
+    let pid = broker.id().unwrap();
+    // SAFETY: this PID is the live fixture broker spawned above.
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) }, 0);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), broker.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+
+    let mut broker = spawn();
+    wait_for_socket(&path).await;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let status = request(
+                &path,
+                json!({"jsonrpc":"2.0","id":4,
+                "method":"_service_restart_status","params":{"restart_id":id}}),
+            )
+            .await;
+            if status["result"]["phase"] == "complete" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pid = broker.id().unwrap();
+    // SAFETY: this PID is the replacement fixture broker spawned above.
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) }, 0);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), broker.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+
+    let store = agent_run_store::fixture::open(temp.path()).unwrap();
+    let agents: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM agents", [], |row| row.get(0))
+        .unwrap();
+    let notices: i64 = store.conn.query_row(
+        "SELECT COUNT(*) FROM service_restart_notices WHERE restart_id=? AND external_session_id='waiting-chat' AND stage='after'",
+        [id], |row| row.get(0),
+    ).unwrap();
+    assert_eq!((agents, notices), (0, 1));
+}
+
 /// Waits for the real test listener to publish without using a global socket.
 async fn wait_for_socket(path: &std::path::Path) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);

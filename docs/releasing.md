@@ -4,14 +4,16 @@ The canonical version is `workspace.package.version` in `Cargo.toml`. Releases
 use annotated `vX.Y.Z` tags. The tag workflow refuses a tag that does not match
 the workspace version.
 
-Release automation publishes one native target: qualified macOS Apple silicon
-(`aarch64-apple-darwin`). Linux x86-64 remains a visible non-blocking CI
-validation lane; its release and qualification are deferred.
+The release workflow builds macOS Apple silicon (`aarch64-apple-darwin`) and
+Linux x86-64 (`x86_64-unknown-linux-gnu`) on native runners. Both producers and
+the source gate must succeed before publication. Linux is built on Ubuntu 22.04
+against glibc. Historical releases may contain only the macOS archive.
 
 Publication and installation are separate boundaries. A green publication
 workflow does not prove a production cutover, and a local `release install` or
-`update` never publishes to GitHub. Linux stays labelled unqualified until a
-hosted full-suite run and sealed-release smoke exist for it.
+`update` never publishes to GitHub. Linux remains a candidate in the family
+declaration until hosted release evidence exists; workflow configuration alone
+does not certify a platform or a host deployment.
 
 ## Prepare
 
@@ -26,13 +28,18 @@ cargo build --locked --release --package agent-run --bin agent-run
 node --test scripts/check-desktop-transport.cjs scripts/check-codegraph-probe.cjs
 ```
 
-Use a short canonical temporary root for native-owner Unix-socket fixtures.
-Hosted source gates normalize `RUNNER_TEMP` into `TMPDIR`, `TMP` and `TEMP`;
-the native no-symlink checks remain mandatory.
+Use short, canonical and non-overlapping roots for process temporary files and
+test fixtures. The Codex shared-asset store must not sit inside its writable
+`TMPDIR`. Hosted gates use sibling `agent-run-tmp` and `agent-run-fixtures`
+directories beneath `RUNNER_TEMP`, and set `TMPDIR`, `TMP`, `TEMP` and
+`AGENT_RUN_TEST_TMP` accordingly. On Linux a newly created protected `/run`
+directory is used for `AGENT_RUN_TEST_SOCKET_TMP`, because operator-socket tests
+also require protected ancestors without ACLs. The native no-symlink checks
+remain mandatory.
 
-Run the release gates on macOS arm64. The non-blocking Linux validation lane
-runs the workspace and sealed-build checks independently, but its result does
-not gate or add an artifact to the qualified native release.
+Run the release gates on both macOS arm64 and Linux x86-64. Each native
+producer builds and smoke-tests its own payload; a failed Linux job blocks
+publication just as a failed macOS job does.
 
 CI separates the source-check cache from the explicit native package workload.
 Rust-cache additionally keys by toolchain, manifests, lockfile and build inputs.
@@ -52,7 +59,8 @@ smoke.
 ```bash
 release_root="$(mktemp -d)"
 version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
-cargo xtask package --target aarch64-apple-darwin --output "$release_root" --version "$version"
+target="$(rustc -vV | sed -n 's/^host: //p')"
+cargo xtask package --target "$target" --output "$release_root" --version "$version"
 cargo xtask release verify --release "$release_root/releases/$version"
 cargo xtask archive --revision HEAD \
   --output "$release_root/agent-run-$version-source.tar" --verify
@@ -60,7 +68,7 @@ cargo xtask archive --revision HEAD \
 
 `build-native` seals the current host binaries. The sealed directory contains the
 runtime, the separate `bin/agent-run-tui` observer, `bin/agent-run-deploy` (the native xtask deployment entry point), external
-quota scripts, metadata, `SHA256SUMS`, and the `COMPLETE` marker. It contains no
+quota scripts, systemd examples, metadata, `SHA256SUMS`, and the `COMPLETE` marker. It contains no
 interpreter, virtual environment, or package installation. `release verify` and the
 installer treat that directory as a closed inventory of regular files: every file
 except `SHA256SUMS` and `COMPLETE` must be listed with a matching hash, and an
@@ -83,8 +91,8 @@ one host's binary.
    The publisher accepts only a source commit reachable from `origin/main`.
    It never substitutes the moving branch tip for the accepted full SHA.
 
-The release source gate and native payload build run independently, and
-publication needs both. Installed binaries are built once per attempt; the
+The release source gate and both native payload builds run independently, and
+publication needs all three. Installed binaries are built once per attempt; the
 publisher compiles verification tooling only and receives those exact bytes.
 Observed checks and an exact-payload smoke bind the archive digest, source,
 target, compiler and actual workflow/run/attempt. Local evidence has no
@@ -140,7 +148,11 @@ normalized duplicates, links, special entries, modes, entry count and unpacked
 bytes are bounded and rejected before execution. There is no silent trust
 downgrade. Earlier releases retain their own version-bound bootstraps.
 `install.sh --version X.Y.Z` pins a published release; omitting the version uses
-the latest stable GitHub Release. macOS Apple silicon is the only accepted host.
+the latest stable GitHub Release. The selected release must contain an archive
+for the current supported macOS arm64 or Linux x86-64 host.
+An older, saved macOS-only bootstrap rejects the expanded inventory; download
+the current release's installer before updating. The new bootstrap can still
+verify an older macOS-only manifest on macOS.
 
 The standalone helper takes `install --release DIR --version X.Y.Z --prefix DIR
 --home DIR --bin-dir DIR`. It serializes installation, holds the broker startup
@@ -205,6 +217,7 @@ older binary at a database already migrated by a newer schema.
 GitHub Releases is the only public distribution channel. Each release carries:
 
 - `agent-run-X.Y.Z-aarch64-apple-darwin.tar.gz`;
+- `agent-run-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz`;
 - `agent-run-X.Y.Z-source.tar`;
 - `install.sh`;
 - `release-manifest.json`;

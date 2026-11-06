@@ -7,48 +7,73 @@ use agent_run_platform::fs::Dir;
 use bridge_sdk::{Client, ClientError, TransportOutcome, bridge_protocol::*};
 use std::{io::Read, os::unix::fs::MetadataExt, path::Path, time::Duration};
 
-/// Freeze the four notice forms and the existing binding's explicitly mapped
+/// Freeze the notice and the existing binding's explicitly mapped
 /// destination. Unknown transports/namespaces or invalid content refuse before socket I/O;
 /// the protected credential file is read to freeze its deployment association.
 pub(super) fn intent(claim: &Claim, config: &BridgeDelivery) -> Result<BridgeIntent> {
-    let (host, namespace) = match claim.transport.as_str() {
-        "codex_queue" => ("codex", config.codex_store.as_deref()),
-        "claude_uds" => ("claude-code", config.claude_store.as_deref()),
-        _ => return Err(invalid("unsupported Bridge destination transport")),
-    };
-    let namespace =
-        namespace.ok_or_else(|| invalid("Bridge destination namespace is not configured"))?;
-    let encode = |value: &str| value.replace('%', "%25").replace('/', "%2F");
-    let address = NativeAddress::parse(&format!(
-        "{}/{host}/{}/{}",
-        encode(&config.host_id),
-        encode(namespace),
-        encode(&claim.session)
-    ))
-    .map_err(|_| invalid("invalid Bridge destination"))?
-    .canonical();
     let (kind, message) = match &claim.payload {
         NoticePayload::Completion(n) => ("agent-run.completion", n.render()?),
         NoticePayload::Worker(n) => ("agent-run.worker-report", n.render()?),
         NoticePayload::Pool(n) => ("agent-run.pool-completion", n.render()?),
         NoticePayload::PoolAttention(n) => ("agent-run.pool-attention", n.render_attention()?),
+        NoticePayload::Restart(text) => ("agent-run.maintenance", text.clone()),
+    };
+    let (owner, address) = if let Some(before) = &claim.restart_before {
+        let address = NativeAddress::parse(&before.address)
+            .map_err(|_| invalid("invalid preceding restart destination"))?
+            .canonical();
+        let fingerprint = publication_intent_fingerprint(
+            &params(before).map_err(|_| invalid("invalid preceding restart intent"))?,
+        )
+        .map_err(|_| invalid("invalid preceding restart fingerprint"))?;
+        if kind != "agent-run.maintenance"
+            || before.kind != kind
+            || before.owner.producer != "agent-run"
+            || address != before.address
+            || fingerprint != before.intent_hash
+        {
+            return Err(invalid("preceding restart intent does not verify"));
+        }
+        (before.owner.clone(), address)
+    } else {
+        let (host, namespace) = match claim.transport.as_str() {
+            "codex_queue" => ("codex", config.codex_store.as_deref()),
+            "claude_uds" => ("claude-code", config.claude_store.as_deref()),
+            _ => return Err(invalid("unsupported Bridge destination transport")),
+        };
+        let namespace =
+            namespace.ok_or_else(|| invalid("Bridge destination namespace is not configured"))?;
+        let encode = |value: &str| value.replace('%', "%25").replace('/', "%2F");
+        let address = NativeAddress::parse(&format!(
+            "{}/{host}/{}/{}",
+            encode(&config.host_id),
+            encode(namespace),
+            encode(&claim.session)
+        ))
+        .map_err(|_| invalid("invalid Bridge destination"))?
+        .canonical();
+        let (_, credential_sha256) = client(config)
+            .map_err(|_| invalid("protected Bridge producer credential unavailable"))?;
+        (
+            BridgeOwner {
+                registration_socket: config.registration_socket.clone(),
+                core_socket: config.core_socket.clone(),
+                token_file: config.token_file.clone(),
+                credential_sha256,
+                producer: "agent-run".into(),
+            },
+            address,
+        )
     };
     let identity = agent_run_platform::fs::sha256(claim.delivery_id.as_bytes());
-    let (_, credential_sha256) =
-        client(config).map_err(|_| invalid("protected Bridge producer credential unavailable"))?;
     let mut intent = BridgeIntent {
-        owner: BridgeOwner {
-            registration_socket: config.registration_socket.clone(),
-            core_socket: config.core_socket.clone(),
-            token_file: config.token_file.clone(),
-            credential_sha256,
-            producer: "agent-run".into(),
-        },
+        owner,
         request_id: format!("ar-publish-{identity}"),
         event_id: format!("ar-notice-{identity}"),
         address,
         kind: kind.into(),
         message,
+        predecessor: None,
         intent_hash: String::new(),
     };
     intent.intent_hash = publication_intent_fingerprint(
@@ -59,8 +84,12 @@ pub(super) fn intent(claim: &Claim, config: &BridgeDelivery) -> Result<BridgeInt
 }
 
 /// Convert a frozen intention to the sole supported publication policy.
-/// Message/KeepAll, no expiry, metadata, route registration or lifetime authority.
+/// Message/KeepAll with any ordering metadata already frozen by an older build.
 fn params(intent: &BridgeIntent) -> std::result::Result<PublishParams, ClientError> {
+    let mut metadata = Metadata::default();
+    if let Some(predecessor) = &intent.predecessor {
+        metadata.insert("predecessor".into(), predecessor.clone());
+    }
     Ok(PublishParams {
         destination: Destination::Address {
             address: intent.address.clone(),
@@ -70,7 +99,7 @@ fn params(intent: &BridgeIntent) -> std::result::Result<PublishParams, ClientErr
         payload: Payload::new(intent.message.clone()).map_err(ClientError::InvalidRequest)?,
         mode: Mode::Message,
         policy: Policy::KeepAll,
-        metadata: Metadata::default(),
+        metadata,
         expires_at_ms: None,
         delivery_scope_key: None,
     })
@@ -93,10 +122,7 @@ pub(crate) fn client_with_token(
         let parent = token_file
             .parent()
             .ok_or_else(|| invalid("Bridge credential parent missing"))?;
-        let relative = parent
-            .strip_prefix("/")
-            .map_err(|_| invalid("Bridge credential path must be absolute"))?;
-        let directory = Dir::open(Path::new("/"))?.subdir(relative)?;
+        let directory = Dir::open_searchable(parent)?;
         let entry = directory.entry(None)?;
         let name = token_file
             .file_name()
@@ -402,6 +428,7 @@ mod tests {
                 policy: Default::default(),
                 bridge_intent: None,
                 bridge_unknown: false,
+                restart_before: None,
             };
             let frozen = intent(&claim, &config).unwrap();
             assert_eq!(frozen.kind, kind);
@@ -443,12 +470,31 @@ mod tests {
             opencode_plugin: None,
         };
         assert!(client(&config).is_ok());
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(client(&config).is_err());
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o644)).unwrap();
         let error = client(&config).unwrap_err();
         assert!(!format!("{error:?}").contains("synthetic-private-producer-credential"));
         std::fs::rename(&token, directory.join("real-token")).unwrap();
         std::os::unix::fs::symlink("real-token", &token).unwrap();
         assert!(client(&config).is_err());
+        std::fs::remove_file(&token).unwrap();
+        std::fs::write(&token, vec![b'x'; 16_385]).unwrap();
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(client(&config).is_err());
+        std::fs::write(&token, "synthetic-private-producer-credential").unwrap();
+        assert!(client(&config).is_ok());
+
+        let link = directory.parent().unwrap().join(format!(
+            "{}-link",
+            directory.file_name().unwrap().to_string_lossy()
+        ));
+        std::os::unix::fs::symlink(&directory, &link).unwrap();
+        let mut linked = config;
+        linked.token_file = link.join("token");
+        assert!(client(&linked).is_err());
+        std::fs::remove_file(link).unwrap();
     }
 
     /// Observer references are explicitly separate and absent from historical

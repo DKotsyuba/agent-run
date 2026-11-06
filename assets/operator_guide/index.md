@@ -27,3 +27,26 @@ an oversized page is refused whole, with no skipped rows or fabricated cursor.
 Formatting failure after accepted work preserves its receipt: keep the original
 agent/notification and request IDs, and do not repeat a write to repair the text.
 The CLI and socket keep their structured results and full document retrieval.
+
+Read-only observers can query `capabilities` (CLI `agent-run capabilities`) for
+schema-version-1 product facts, transport limits and actual read-method schemas.
+Source revision is null without verified build provenance. Retain `ping`/`tools`
+fallback for older brokers; discovery starts no provider collection or work.
+
+When an answer is too large for the MCP text budget, `answer` returns the
+existing verified artifact's path, size, SHA-256 and execution sequence. A file
+link follows the host's normal permissions. No extra answer copy is created;
+the existing history retention also governs this file. If the path is not
+accessible, retrieve the answer through `answer_chunk`.
+
+For complete large answers, `answer_chunk` (CLI `answer-chunk`) requires the
+current `agent_id`, positive `sequence`, verified `expected_sha256` and UTF-8
+`offset_bytes`. Continue with returned `next_offset` and the same fences; the
+default budget is 64 KiB, maximum 128 KiB. Reconstruct on demand and verify the
+final hash. Resume, hash changes, invalid offsets and corrupt proofs reject;
+EOF returns empty content and `complete:true`. Exact legacy artifact chunks
+include their terminal frame for hash fidelity. Paths come only from broker
+records. Socket answers exceeding the complete 1 MiB JSON frame return metadata
+with `content:null`, `inline_complete:false`; the CLI inline cutoff stays 1 MiB.
+MCP exposes these two new reads in full `structuredContent`. See `docs/api.md`
+in the source distribution for the complete argument/result/error contract.

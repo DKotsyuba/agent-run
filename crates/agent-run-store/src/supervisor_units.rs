@@ -84,6 +84,79 @@ impl Store<'_> {
         tx.commit()
     }
 
+    /// Bind a local startup child only while its exact capability still owns
+    /// the starting execution; a retired launch cannot replace a new owner.
+    pub fn record_local_startup_owner(
+        &mut self,
+        id: &AgentId,
+        identity: &serde_json::Value,
+        capability_sha256: &str,
+    ) -> Result<()> {
+        if !identity.is_object() || identity["pid"].as_i64().is_none() {
+            return Err(invalid("startup owner evidence must name a pid"));
+        }
+        hex64("capability hash", capability_sha256)?;
+        let tx = WriteTx::begin(&self.conn)?;
+        let changed = tx.execute(
+            "UPDATE agents SET startup_owner_pid_identity=? WHERE id=? AND status IN ('starting','cancelling') \
+             AND supervisor_pid IS NULL AND supervisor_capability_sha256=?",
+            params![identity.to_string(), id.as_str(), capability_sha256],
+        )?;
+        if changed != 1 {
+            return Err(Error::Conflict);
+        }
+        tx.commit()
+    }
+
+    /// Replaces the admitting broker with one system supervisor only while the
+    /// original broker, capability and frozen route still match atomically.
+    pub fn record_system_startup_owner(
+        &mut self,
+        id: &AgentId,
+        identity: &serde_json::Value,
+        fence: &crate::ops::SystemStartupFence,
+    ) -> Result<()> {
+        hex64("capability hash", &fence.capability_sha256)?;
+        hex64("route fingerprint", &fence.route_fingerprint)?;
+        let facts = |value: &serde_json::Value| -> Result<(i64, String, f64)> {
+            let pid = value["pid"]
+                .as_i64()
+                .filter(|pid| *pid > 1 && i32::try_from(*pid).is_ok())
+                .ok_or_else(|| invalid("system owner pid is invalid"))?;
+            let token = value["token"]
+                .as_str()
+                .filter(|token| {
+                    (token.starts_with("linux:") || token.starts_with("darwin:"))
+                        && token.len() <= 256
+                })
+                .ok_or_else(|| invalid("system owner token is invalid"))?
+                .to_owned();
+            let birth = value["birth"]
+                .as_f64()
+                .filter(|birth| birth.is_finite() && *birth >= 0.0)
+                .ok_or_else(|| invalid("system owner birth is invalid"))?;
+            Ok((pid, token, birth))
+        };
+        let (_, _, target_birth) = facts(identity)?;
+        let (broker_pid, broker_token, broker_birth) = facts(&fence.broker_identity)?;
+        let tx = WriteTx::begin(&self.conn)?;
+        let changed = tx.execute(
+            "UPDATE agents SET startup_owner_pid_identity=?1,startup_owner_birth_time=?2 \
+             WHERE id=?3 AND status IN ('starting','cancelling') AND supervisor_pid IS NULL \
+             AND supervisor_capability_sha256=?4 \
+             AND CASE WHEN json_valid(identity_json) THEN json_extract(identity_json,'$.system_route.fingerprint') END=?5 \
+             AND CASE WHEN json_valid(startup_owner_pid_identity) THEN json_extract(startup_owner_pid_identity,'$.pid') END=?6 \
+             AND CASE WHEN json_valid(startup_owner_pid_identity) THEN json_extract(startup_owner_pid_identity,'$.token') END=?7 \
+             AND CASE WHEN json_valid(startup_owner_pid_identity) THEN json_extract(startup_owner_pid_identity,'$.birth') END=?8",
+            params![identity.to_string(), target_birth, id.as_str(), fence.capability_sha256,
+                fence.route_fingerprint, broker_pid, broker_token, broker_birth],
+        )?;
+        if changed != 1 {
+            return Err(Error::Conflict);
+        }
+        tx.commit()
+    }
+
     /// Renews a startup handoff and, when renewed, installs the new launch
     /// capability hash so the previous launch's authority becomes stale.
     pub fn begin_supervisor_handoff_with(

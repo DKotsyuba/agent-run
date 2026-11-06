@@ -143,6 +143,118 @@ fn none_ineligible() -> BTreeSet<AccountId> {
     BTreeSet::new()
 }
 
+/// Binding cooldowns affect only their provider/account, expire exactly at the
+/// recorded instant, and report the nearest retry without calling it quota.
+#[test]
+fn binding_cooldowns_scope_selection_and_report_nearest_expiry() {
+    let home = home(&[("acct-a", "A"), ("acct-b", "B"), ("acct-c", "C")]);
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
+    let catalog = catalog(&store);
+    for (account, reason, until) in [
+        ("acct-a", "billing_unavailable", AT + 3599.25),
+        ("acct-b", "quota_exhausted", AT + 20.1),
+        ("acct-c", "billing_unavailable", AT + 3000.0),
+    ] {
+        store.conn.execute(
+            "INSERT INTO binding_cooldowns(provider_id,account_id,reason,observed_at,blocked_until,attempt_id) VALUES('glm-user',?1,?2,?3,?4,'fixture-attempt')",
+            rusqlite::params![account, reason, AT, until],
+        ).unwrap();
+    }
+    let provider = "glm-user".parse().unwrap();
+    let error = provider_candidates_at(
+        &store,
+        &catalog,
+        &provider,
+        "fixture",
+        None,
+        &none_ineligible(),
+        AT,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, Error::QuotaAdmission(QuotaAdmissionError::BindingCooldown {
+        account, reason: agent_run_domain::catalog::BindingCooldownReason::QuotaExhausted,
+        retry_after_seconds: 21, ..
+    }) if account.as_str() == "acct-b")
+    );
+    let pinned = provider_candidates_at(
+        &store,
+        &catalog,
+        &provider,
+        "fixture",
+        Some("alpha"),
+        &none_ineligible(),
+        AT,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(pinned, Error::QuotaAdmission(QuotaAdmissionError::BindingCooldown {
+        account, reason: agent_run_domain::catalog::BindingCooldownReason::BillingUnavailable,
+        retry_after_seconds: 3600, ..
+    }) if account.as_str() == "acct-a")
+    );
+    let other = provider_candidates_at(
+        &store,
+        &catalog,
+        &"glm-alias".parse().unwrap(),
+        "fixture",
+        None,
+        &none_ineligible(),
+        AT,
+    )
+    .unwrap();
+    assert_eq!(other.candidates[0].account.as_str(), "acct-a");
+    store
+        .conn
+        .execute(
+            "DELETE FROM binding_cooldowns WHERE provider_id='glm-user' AND account_id='acct-b'",
+            [],
+        )
+        .unwrap();
+    latch(&store, "acct-b", "fixture", Some(AT + 5.0));
+    let mixed = provider_candidates_at(
+        &store,
+        &catalog,
+        &provider,
+        "fixture",
+        None,
+        &none_ineligible(),
+        AT,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(mixed, Error::QuotaAdmission(QuotaAdmissionError::QuotaExhausted { account, .. }) if account.as_str() == "acct-b")
+    );
+    store
+        .conn
+        .execute("DELETE FROM quota_exhaustion WHERE account_id='acct-b'", [])
+        .unwrap();
+    store.conn.execute(
+        "INSERT INTO binding_cooldowns(provider_id,account_id,reason,observed_at,blocked_until,attempt_id) VALUES('glm-user','acct-b','quota_exhausted',?1,?2,'fixture-attempt')",
+        rusqlite::params![AT, AT + 20.1],
+    ).unwrap();
+    let after = provider_candidates_at(
+        &store,
+        &catalog,
+        &provider,
+        "fixture",
+        None,
+        &none_ineligible(),
+        AT + 20.1,
+    )
+    .unwrap();
+    assert_eq!(after.candidates.len(), 1);
+    assert_eq!(after.candidates[0].account.as_str(), "acct-b");
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM quota_exhaustion", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
 /// Produces candidates for the main provider at the fixed clock.
 fn candidates(
     store: &Store,
@@ -192,6 +304,148 @@ fn summary(set: &agent_run_domain::catalog::QuotaCandidateSet) -> Vec<(String, u
             )
         })
         .collect()
+}
+
+/// Ordered bindings outrank quota knowledge, preserve declaration ties, and
+/// still exclude exhausted or disabled accounts and honor a pinned label.
+#[test]
+fn ordered_accounts_use_configured_order_across_quota_states() {
+    let home = home(&[
+        ("acct-a", "FAKE_A"),
+        ("acct-b", "FAKE_B"),
+        ("acct-c", "FAKE_C"),
+    ]);
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
+    let mut provider = catalog(&store)
+        .provider(&"glm-user".parse().unwrap())
+        .unwrap()
+        .clone();
+    provider.ordered_accounts = true;
+    provider.bindings = serde_json::from_value(json!([
+        {"label":"beta", "account":"acct-b", "priority_multiplier":1.0},
+        {"label":"gamma", "account":"acct-c", "priority_multiplier":1.0},
+        {"label":"alpha", "account":"acct-a", "priority_multiplier":3.0}
+    ]))
+    .unwrap();
+    let catalog =
+        ProviderCatalog::new(store.list_accounts().unwrap(), vec![provider.clone()]).unwrap();
+    sample(&store, "acct-b", "fixture", 80.0);
+    assert_eq!(
+        summary(&candidates(&store, &catalog, "fixture")),
+        vec![
+            ("acct-a".into(), 0, 3.0, false),
+            ("acct-b".into(), 1, 1.0, true),
+            ("acct-c".into(), 2, 1.0, false),
+        ]
+    );
+    let pinned = provider_candidates_at(
+        &store,
+        &catalog,
+        &"glm-user".parse().unwrap(),
+        "fixture",
+        Some("beta"),
+        &none_ineligible(),
+        AT,
+    )
+    .unwrap();
+    assert_eq!(
+        pinned.intent,
+        SelectionIntent::Pinned("acct-b".parse().unwrap())
+    );
+    assert_eq!(pinned.candidates.len(), 1);
+    assert_eq!(pinned.candidates[0].account.as_str(), "acct-b");
+
+    // A finite ordering weight is not multiplied into quota score: even a
+    // large weight cannot overflow and wrongly remove a known account.
+    provider.bindings[2].multiplier = f64::MAX.try_into().unwrap();
+    let large_weight =
+        ProviderCatalog::new(store.list_accounts().unwrap(), vec![provider]).unwrap();
+    sample(&store, "acct-a", "fixture", 80.0);
+    assert_eq!(
+        candidates(&store, &large_weight, "fixture").candidates[0]
+            .account
+            .as_str(),
+        "acct-a"
+    );
+
+    latch(&store, "acct-a", "fixture", Some(AT + 100.0));
+    assert_eq!(
+        candidates(&store, &catalog, "fixture")
+            .candidates
+            .iter()
+            .map(|candidate| candidate.account.as_str())
+            .collect::<Vec<_>>(),
+        vec!["acct-b", "acct-c"]
+    );
+    store.disable_account(&"acct-b".parse().unwrap()).unwrap();
+    assert_eq!(
+        candidates(&store, &catalog, "fixture")
+            .candidates
+            .iter()
+            .map(|candidate| candidate.account.as_str())
+            .collect::<Vec<_>>(),
+        vec!["acct-c"]
+    );
+    let error = provider_candidates_at(
+        &store,
+        &catalog,
+        &"glm-user".parse().unwrap(),
+        "fixture",
+        Some("beta"),
+        &none_ineligible(),
+        AT,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::QuotaAdmission(QuotaAdmissionError::NoEligibleAccount { .. })
+    ));
+}
+
+/// Ordered binding weights select fallback order, not the provider's quota score.
+#[test]
+fn ordered_provider_score_does_not_scale_subscription_quota() {
+    let home = home(&[
+        ("acct-a", "FAKE_A"),
+        ("acct-b", "FAKE_B"),
+        ("acct-c", "FAKE_C"),
+    ]);
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
+    let mut provider = catalog(&store)
+        .provider(&"glm-user".parse().unwrap())
+        .unwrap()
+        .clone();
+    provider.ordered_accounts = true;
+    provider.bindings = serde_json::from_value(json!([
+        {"label":"api", "account":"acct-a", "priority_multiplier":1.0},
+        {"label":"subscription", "account":"acct-b", "priority_multiplier":0.5}
+    ]))
+    .unwrap();
+    sample(&store, "acct-b", "fixture", 55.0);
+    let ordered =
+        ProviderCatalog::new(store.list_accounts().unwrap(), vec![provider.clone()]).unwrap();
+    let score = provider_order_at(&store, &ordered, &none_ineligible(), AT)
+        .unwrap()
+        .providers[0]
+        .models[0]
+        .best_priority
+        .unwrap();
+    provider.bindings[1].multiplier = 1.0.try_into().unwrap();
+    let equal_weights =
+        ProviderCatalog::new(store.list_accounts().unwrap(), vec![provider]).unwrap();
+    let unweighted = provider_order_at(&store, &equal_weights, &none_ineligible(), AT)
+        .unwrap()
+        .providers[0]
+        .models[0]
+        .best_priority
+        .unwrap();
+    assert_eq!(score, unweighted);
+    assert_eq!(
+        candidates(&store, &ordered, "fixture").candidates[0]
+            .account
+            .as_str(),
+        "acct-a"
+    );
 }
 
 /// Governing-window scores multiply by binding weights, the provider

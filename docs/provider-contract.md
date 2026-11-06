@@ -184,12 +184,11 @@ the latest terminal execution. Storage still records a physical child:
   provider, harness, connection and model must still be offered, and the
   eligible accounts are the frozen scope intersected with the current
   bindings. A changed connection or model refuses.
-- A pinned run never switches. An automatic run keeps its previous account
-  while that account is still a candidate and switches only when it is not
-  (disabled, exhausted, unbound); rank alone never moves it. Codex keeps its
-  conversation in the run's own `CODEX_HOME`, so only the auth link is
-  rebound after cleanup; Claude Code keeps history per login, so it resumes
-  on the parent's account only (cross-account continuation is unverified).
+- A pinned run never switches. An automatic resume initially keeps its previous
+  account while that account remains eligible; rank alone never moves it.
+  Ordinary Claude providers keep the parent's account. An explicitly ordered
+  Claude provider retains the frozen alternative accounts for a later guarded
+  switch, while resuming the parent's verified transcript.
 - The current configuration must still permit the frozen execution: the
   offering's native model alias is unchanged, its current hard restrictions
   are already in the frozen role, the current canonical role still grants
@@ -473,20 +472,21 @@ the current capacity revision. The chosen account must be in the frozen
 scope, enabled, and not tried by an earlier attempt of the same agent
 (aliases resolve to the same account). The agent keeps its own cap slot; the
 previous attempt's ownership and physical-key reservations are released and
-the new attempt is written exactly once. It also requires that attempt's recorded
-authoritative `quota_exhausted` native failure, and closes it as
-`exhausted` in the same transaction.
+the new attempt is written exactly once. It requires a recorded authoritative
+quota failure, or a billing failure on an ordered custom Claude binding. Quota
+closes as `exhausted`; billing closes as `failed` without asserting a balance.
 
 ### Automatic account switch within one logical run
 
-When a provider attempt ends with an authoritative quota exhaustion, the
-supervisor records the native failure and history seal on that attempt and
-tries to continue the same logical run on another account:
+When a provider attempt ends with an authoritative quota exhaustion, or an
+ordered custom Claude attempt reports a native `billing_error`, the supervisor
+records the failure and history seal and may continue on another account:
 
-- Codex only. Its conversation lives in the run's own `CODEX_HOME`, so only
-  the account's auth link is rebound. Claude Code keeps history per login;
-  cross-account continuation is unverified there and refused
-  (`cross_account_continuation_unverified`).
+- Codex uses its run-owned `CODEX_HOME`. Opt-in ordered Claude providers may
+  switch from a custom API binding to a named native login: Claude receives the
+  original verified transcript's absolute path, while authentication stays in
+  the selected account's private configuration directory. Other Claude
+  cross-account switches remain refused.
 - Automatic runs only (`pinned_account` otherwise), never after a cancel,
   and only while the current configuration still permits the frozen
   execution, including the same harness and connection (endpoint, protocol,
@@ -496,12 +496,10 @@ tries to continue the same logical run on another account:
   recomputes (`no_eligible_account`, `selection_busy`); an unsealable history
   (for example a pending tool call) refuses with `continuation_unavailable`.
 - The switch also requires proof that this logical request's admitted task
-  reached native history (`task_proven` in the seal evidence). The Codex
-  runner records each attempt's own `turn/start` id and the SHA-256 of its
-  exact wire input (role preamble plus task) as a `native_turn_started`
-  event; at the cleanup boundary the sealed rollout must contain a user
-  `message` whose `internal_chat_message_metadata_passthrough.turn_id` is
-  that id with an `input_text` of that digest. A later automatic attempt
+  reached native history (`task_proven` in the seal evidence). Codex records
+  its `turn/start` id and exact wire-input hash; Claude records the UUID and
+  hash of its one admitted text block before sending it. The sealed history
+  must contain that exact native user input. A later automatic attempt
   carries the earlier attempt's proof (`task_proof`: the original turn id
   and digest) only after re-finding that same original turn in its own
   newly sealed rollout; its own continuation-control turn never counts, so
@@ -511,20 +509,28 @@ tries to continue the same logical run on another account:
   An early rejection before the input was recorded (meta-only history)
   refuses with `continuation_unavailable: the admitted task never reached
   native history`; nothing is replayed.
-- The next attempt re-verifies the previous attempt's seal against the root
-  its launch plan selects, resumes the same thread (`thread/resume`) and, as
-  Codex app-server requires `input` on `turn/start`, sends one fixed internal
-  control turn asking it to continue the same task. The original task is
-  neither resent nor journaled again; the run keeps its start time and its
-  one logical slot, and yields one final answer and delivery.
-- A blocked switch ends the run failed with `quota_exhausted` and
-  `failover_blocked: <reason>`.
+- The next attempt re-verifies the previous seal at handoff; ordered Claude
+  repeats that verification immediately before spawn. It resumes the same
+  native session and sends one fixed control turn. The
+  original task is neither resent nor journaled again; the run keeps its start
+  time and one logical slot, and yields one final answer and delivery. Claude
+  re-seals the original transcript after the new account appends to it.
+- A blocked switch ends with `quota_exhausted` or `billing_unavailable` and
+  `failover_blocked: <reason>`. A billing error is not a measured zero balance.
+  A history with an unresolved tool call is refused; completed external effects
+  cannot be made idempotent by the transcript alone.
+- A confirmed billing failure on an ordered custom Claude binding, or an
+  authoritative quota rejection on an ordered binding, also cools down that
+  provider/account binding for one hour. Other providers and accounts are not
+  affected. The persisted cooldown is rechecked at admission and expires after
+  a restart as well. A pinned binding is refused with `binding_cooldown` rather
+  than silently redirected; automatic selection uses another eligible binding.
 - Exhaustion feeds the durable latch only when `collector.exhaustion_windows`
   explicitly identifies the physical pool for that native window. The mapping
   governs the account's eligible model lanes and is journaled under
-  `native-quota-exhaustion`. Windowless or unmapped failures exclude the account
-  for that run without inventing a shared pool. Ranking consumes the stored
-  per-window model membership.
+  `native-quota-exhaustion`. Windowless or unmapped failures do not invent a
+  shared quota pool. Ranking consumes the stored per-window model membership;
+  ordered Claude bindings additionally use the separate one-hour cooldown above.
 
 ### Unlimited executions, handoff serialization and recovery
 

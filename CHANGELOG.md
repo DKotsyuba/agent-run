@@ -4,6 +4,36 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.30.0
+
+- feat(runtime): support planned service restarts with temporary agent finishes,
+  automatic continuation, and one result summary per affected orchestrator.
+- feat(quotas): support optional account-owned subscription probes for the
+  shared Linux broker without sharing login credentials.
+- fix(claude): temporarily skip an ordered account for one hour after a
+  confirmed billing or quota failure, including for subsequent executions.
+- feat(linux): add a shared systemd service with account-owned workers and
+  native x86-64 release artifacts alongside macOS Apple Silicon artifacts.
+- feat(claude): continue verified sessions across an ordered API-to-native
+  account queue, with owner-UID preflight and current-policy checks.
+- fix(mcp): return verified references and retrieval metadata for large
+  answers, with bounded previews for oversized transcript blocks.
+- fix(macos): preserve buffered Unix-socket frames when a peer closes while
+  retaining bounded deadlines and safe nonblocking I/O.
+- fix(runtime): make version probes race-safe, support jq 1.6 in the Codex
+  collector, and retain OpenCode compatibility and dependency security fixes.
+- fix(notices): explain provider billing failures without assuming a balance.
+- fix(linux): respect search-only ancestor permissions for protected Bridge
+  credentials and report directories while retaining no-follow checks.
+- feat(observation): retrieve large verified answers in execution-fenced chunks.
+- fix(installer): validate release manifests with both jq 1.6 and jq 1.8.
+- fix(dependencies): update Tokio, certificate verification and root bundles
+  to address RUSTSEC-2026-0381, RUSTSEC-2026-0382 and RUSTSEC-2026-0386.
+- fix(opencode): restore compatibility with deployed Bridge native-context ABI 2
+  components after the 0.28.8 regression rejected their launches. Preserve actual
+  MCP ToolContext through the original permission-checked executor and create
+  the private native store before spawn so immediate observation is available.
+
 ## 0.28.8
 
 - fix(hooks): keep optional prompt context nonblocking for Codex and Claude,

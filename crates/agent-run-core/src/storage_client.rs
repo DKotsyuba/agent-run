@@ -74,6 +74,30 @@ impl Dial for UnixDial {
     }
 }
 
+/// Dials the system writer only when the connected peer has the configured
+/// broker UID. No capability or launch-secret context is sent before this check.
+pub struct SystemUnixDial {
+    /// Protected system writer endpoint.
+    pub path: std::path::PathBuf,
+    /// Root-configured unprivileged broker UID.
+    pub broker_uid: u32,
+}
+
+impl Dial for SystemUnixDial {
+    fn dial(&self) -> Pin<Box<dyn Future<Output = io::Result<Connection>> + Send + '_>> {
+        Box::pin(async move {
+            let stream = tokio::net::UnixStream::connect(&self.path).await?;
+            if stream.peer_cred()?.uid() != self.broker_uid {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "system writer peer UID does not match",
+                ));
+            }
+            Ok(Box::new(stream) as Connection)
+        })
+    }
+}
+
 /// Client introduction, the body of a [`Message::Hello`] frame.
 ///
 /// Every field is a CLAIM: the server derives the authority from the kernel

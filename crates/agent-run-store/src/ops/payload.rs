@@ -28,6 +28,75 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Begin a service restart and capture its existing agents.
+#[derive(Clone, Serialize)]
+pub struct BeginServiceRestart {
+    /// Stable request id for an identical retry.
+    pub request_id: String,
+    /// Wall-clock observation time in Unix seconds.
+    pub at: f64,
+}
+
+/// Queue any restart warning or forced stop due at this monotonic reading.
+#[derive(Clone, Serialize)]
+pub struct AdvanceServiceRestart {
+    /// Restart returned by `BeginServiceRestart`.
+    pub restart_id: i64,
+    /// Boot identity paired with `now_ns`.
+    pub boot_id: String,
+    /// Monotonic nanoseconds since the host's current boot.
+    pub now_ns: u64,
+}
+
+/// Remember the caller of a start refused during a service restart.
+#[derive(Clone, Serialize)]
+pub struct RememberServiceRestartCaller {
+    /// Exact restart that blocked the request.
+    pub restart_id: i64,
+    /// Existing host session identity used for later delivery.
+    pub reference: OrchestratorRef,
+}
+
+/// Enter recovery after writer replacement, or after a confirmed manager failure.
+#[derive(Clone, Serialize)]
+pub struct RecoverServiceRestart {
+    /// A failed manager attempt, admitted only by the unchanged writer epoch.
+    pub failed_restart: Option<i64>,
+}
+
+/// Claim the single service-manager invocation for one ready restart.
+#[derive(Clone, Serialize)]
+pub struct ClaimServiceRestart {
+    /// Restart whose service-manager invocation is being claimed.
+    pub restart_id: i64,
+}
+
+/// Start the confirmation clock for one captured agent's continuation.
+#[derive(Clone, Serialize)]
+pub struct RequestServiceRestartResume {
+    pub restart_id: i64,
+    pub agent_id: AgentId,
+    pub boot_id: String,
+    pub now_ns: u64,
+}
+
+/// Record a definite refusal to continue one captured agent.
+#[derive(Clone, Serialize)]
+pub struct FailServiceRestartResume {
+    pub restart_id: i64,
+    pub agent_id: AgentId,
+    pub reason: String,
+}
+
+/// Reconcile continuation confirmations and the user-selected deadline.
+#[derive(Clone, Serialize)]
+pub struct RefreshServiceRestart {
+    pub restart_id: i64,
+    pub boot_id: String,
+    pub now_ns: u64,
+    pub at: f64,
+}
+
 /// Owned provider admission inputs (the owned form of `AdmissionInputs`).
 #[derive(Debug, Clone, Serialize)]
 pub struct AdmissionSpec {
@@ -80,6 +149,9 @@ pub struct AdmitStart {
     pub identity: Value,
     /// Resume parent execution, if any.
     pub parent: Option<AgentId>,
+    /// Internal restart identity; absent for ordinary admission.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_id: Option<i64>,
 }
 
 /// Result of [`AdmitStart`].
@@ -111,6 +183,12 @@ pub struct AdmitProviderResume {
     pub parent: AgentId,
     /// Account the parent's last attempt used.
     pub prefer: AccountId,
+    /// Optional digest of the parent and attempt verified by a system worker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preflight_digest: Option<String>,
+    /// Internal restart identity; absent for ordinary operator resumes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_id: Option<i64>,
 }
 
 /// Owned pool member admission source.
@@ -229,6 +307,23 @@ pub struct RecordStartupOwner {
     pub execution: AgentId,
     /// Inspected process identity evidence (pid, birth, token, spawn backend).
     pub identity: Value,
+    /// Additional compare-and-swap fence for an externally launched supervisor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_fence: Option<SystemStartupFence>,
+    /// Exact unreleased capability required by the local launcher.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_capability_sha256: Option<String>,
+}
+
+/// Immutable route, capability and admitting broker identity for one external launch.
+#[derive(Debug, Clone, Serialize)]
+pub struct SystemStartupFence {
+    /// SHA-256 of the not-yet-released supervisor capability.
+    pub capability_sha256: String,
+    /// Frozen route fingerprint.
+    pub route_fingerprint: String,
+    /// Admitting broker's process identity.
+    pub broker_identity: Value,
 }
 
 /// 10 — renew a startup handoff to a new launch (broker).
@@ -407,6 +502,9 @@ pub struct ProviderHistoryMetadata {
     pub native_history_unavailable: Option<String>,
     /// Closed native failure facts.
     pub native_failure: Option<Value>,
+    /// Confirmed failed native outcome eligible for an ordered binding cooldown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_reason: Option<agent_run_domain::catalog::BindingCooldownReason>,
 }
 
 /// 23 — record continuation metadata after cleanup.

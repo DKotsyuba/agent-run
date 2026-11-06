@@ -301,6 +301,55 @@ impl Dir {
             .open(path)?;
         Ok(Self(f))
     }
+    /// Opens an absolute directory without following any component.
+    ///
+    /// On Linux, intermediate descriptors require directory search permission
+    /// but not directory listing permission. The final directory is opened
+    /// normally, so descriptor-relative reads, writes and synchronization remain
+    /// available there. Other Unix platforms retain existing traversal semantics.
+    pub fn open_searchable(path: &Path) -> Result<Self> {
+        let relative_path = path
+            .strip_prefix("/")
+            .map_err(|_| invalid("directory must be absolute"))?;
+        if relative_path.as_os_str().is_empty() {
+            return Self::open(Path::new("/"));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let parts = relative(relative_path)?;
+            let mut parent = Self::open(Path::new("/"))?.0;
+            for (index, name) in parts.iter().enumerate() {
+                let access = if index + 1 == parts.len() {
+                    libc::O_RDONLY
+                } else {
+                    libc::O_PATH
+                };
+                // SAFETY: parent and name remain live; the returned descriptor
+                // is uniquely owned and O_DIRECTORY rejects symlink targets.
+                let fd = unsafe {
+                    libc::openat(
+                        parent.as_raw_fd(),
+                        name.as_ptr(),
+                        access | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                // SAFETY: openat returned a new nonnegative descriptor.
+                let child = unsafe { File::from_raw_fd(fd) };
+                if !child.metadata()?.is_dir() {
+                    return Err(invalid("path contains a non-directory"));
+                }
+                parent = child;
+            }
+            Ok(Self(parent))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::open(Path::new("/"))?.subdir(relative_path)
+        }
+    }
     /// Opens a new directory description so independent scans start at offset zero.
     pub fn scan(&self) -> Result<DirScan> {
         // SAFETY: openat of "." resolves beneath this already-open real directory.

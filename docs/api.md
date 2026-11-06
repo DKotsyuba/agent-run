@@ -41,9 +41,9 @@ broker, supervisors, and runtime children inherit that limit instead of
 launchd's default 256. A foreground process can still be run under another
 supervisor when launchd is unavailable.
 
-Future, unqualified Linux builds can run the foreground command under an
-external service manager. Linux is not a qualified or published release target,
-and agent-run does not generate systemd units. A user unit can use:
+On Linux, the foreground command can run under an external service manager.
+For a shared service with separate worker accounts, see the bundled
+[systemd deployment guide](linux-access-control.md). A per-user unit can use:
 
 ```ini
 [Unit]
@@ -75,6 +75,50 @@ paths, then run `systemctl --user enable --now agent-run.service`.
 - `SIGTERM`/`SIGINT` shut the server down and remove the socket file.
 - Startup takes a couple of seconds (service construction); wait for the
   socket file to appear before connecting.
+
+## Planned service restart
+
+Use `agent-run --home ~/.agent-run restart` for the standard systemd unit on
+Linux or launchd job on macOS. For a Linux user unit, add `--systemd-user`;
+`--target` selects a different systemd unit or launchd service target. A shared
+broker can instead be reached using the existing `--broker-socket` and
+`--broker-uid` options. The caller must already have the OS permission to
+restart the selected service.
+
+The command blocks new starts, queues a warning to affected chats, asks workers
+to call `finish` with the supplied restart marker, and sends a stricter warning after 30 seconds. Workers that
+have not stopped after another 30 seconds are interrupted. After restart it
+resumes the same sessions and reports each outcome. An unconfirmed continuation
+is reported as unknown after 60 seconds. Cancelled or previously finished
+agents are not resumed.
+
+The existing Bridge delivery policy handles restart notices. Before stopping
+workers, the broker allows up to 10 seconds for queued warnings to be attempted;
+an unavailable dispatcher cannot block restart indefinitely. Bridge custody
+does not confirm that the native client accepted or the model read the notice.
+The existing Bridge producer grant must also allow the `agent-run.maintenance`
+kind with `message` mode and `keep_all` policy for these notices.
+
+The schema-35 migration refuses to remove records from the earlier experimental
+schema-34 maintenance implementation. It retains the original database and its
+pre-migration backup when such records exist.
+
+The current chat binding stores a transport and session ID, while Bridge has one
+configured store per transport. It cannot safely distinguish multiple stores
+for the same transport. A first-time caller without an explicit binding also
+depends on its post-tool hook reaching the broker; a disconnect in that gap can
+leave that caller unrecorded. These cases need per-call routing before restart
+notifications can be relied on for all chats in a shared deployment. An agent
+bound only after a recipient's result has been attempted cannot be added to
+that already frozen result.
+
+If the manager definitively fails, the original broker resumes the workers and
+the initiating command reports the error. The first JSON output includes the
+restart ID and request ID. If the manager outcome is unknown, do not invoke it
+again blindly; after confirming it is no longer running and did not restart the
+service, `agent-run restart --recover ID` resumes the prepared work on the old
+broker. A repeated `--request-id` selects the same recorded operation and never
+invokes an already-claimed manager request a second time.
 
 ## Wire protocol
 
@@ -126,6 +170,9 @@ Discover the authoritative surface at runtime:
   for every tool's parameters**. This is the contract; prefer it over any
   hardcoded list.
 - `ping` (no params) — `{"ok": true}`; liveness probe.
+- `capabilities` (no params) — versioned compiled read schemas and transport
+  bounds. New observers should try this first, retaining `ping`/`tools` fallback
+  for older brokers. The historical `ping` response is unchanged.
 
 Cooperative pools use five strict methods from the same table: `start_pool`
 (two to five members sharing one goal and acceptance criteria, admitted
@@ -149,13 +196,21 @@ exact `pool_post` summary using that challenge changes `pending` to `joined`;
 unjoined members cannot vote or settle. `needs_action` reports failed awareness
 without restarting or cancelling old work. See [worker enrollment](worker-mcp.md).
 
-Over MCP, every tool result renders as one compact plain-text page (see
+Over MCP, existing tool results render as one compact plain-text page (see
 `assets/mcp/*.txt.j2`) instead of the structured JSON below; `start`/`resume`
 additionally keep `structuredContent` `{"agent_id": ..., "sequence": ...}` so
 automatic PostToolUse binding can pin its exact admission. The numeric counter
 is transport metadata, not another agent identifier; orchestrators use only
 `agent_id`. This socket API and the CLI
 keep the structured contracts documented here.
+The additive `capabilities` and `answer_chunk` methods return their exact
+structured result in MCP `structuredContent`, with a fixed text summary.
+When an answer exceeds the MCP text budget, `answer` returns a bounded summary
+with the verified artifact size, SHA-256 and execution sequence, plus a link to
+the existing local answer file where its managed path permits one. Access to
+that file follows operating-system permissions; `answer_chunk` provides the
+content over MCP without direct filesystem access. The artifact remains subject
+to the existing history retention policy.
 
 The current MCP contract, byte/row budgets, protocol-versus-business error
 channels, and status-preserving presentation fallback are documented in
@@ -164,13 +219,73 @@ channels, and status-preserving presentation fallback are documented in
 `schemas/mcp-registration.json` describes commands and environment names
 without registering anything with a host.
 
-Shared MCP/socket discovery advertises 16 tools: `start`, `resume`, `cancel`,
+Shared MCP/socket discovery advertises 18 tools: `start`, `resume`, `cancel`,
 `steer`, `list_agents`, `answer`, `transcript`, `doc`, `delegation_guide`,
 `limits`, `start_pool`, `pool_post`, `pool_replace`, `pool`, `list_pools`, and
-`agent_integration`.
+`agent_integration`, `capabilities`, and `answer_chunk`.
 `models` and `capacity_order` remain call-only compatibility methods in the
 same registry/dispatcher; their original structured CLI/socket responses and
 schema-1 behavior remain available, including direct MCP calls by known name.
+
+### Read-only observer discovery and complete answers
+
+`capabilities` accepts only `{}` and returns:
+
+```json
+{"schema_version":1,"product":"agent-run","version":"0.30.0","source_revision":null,"transports":["cli","mcp","unix_socket"],"limits":{"socket_max_frame_bytes":1048576,"answer_max_bytes":16777216,"answer_chunk_default_bytes":65536,"answer_chunk_max_bytes":131072},"read_methods":[{"name":"answer_chunk","input_schema":{"type":"object"},"result_shape":{"type":"object"}}]}
+```
+
+The example abbreviates schemas and the method list. The actual list derives
+from every read-only method in the authoritative registry, including call-only
+compatibility reads. Each entry contains its exact `name`, full `input_schema`
+and registered `result_shape` (null for historical undeclared result shapes).
+`version` is the compiled package version. `source_revision` is null because
+this build has no verified source identity input; it never guesses a deployed
+commit from a checkout or asserts release qualification. This method performs
+no database access, provider collection, inference or Bridge lookup. The CLI
+equivalent is `agent-run capabilities`, querying the resident broker.
+
+`answer_chunk` accepts the strict object
+`{"agent_id":"...","sequence":1,"expected_sha256":"64 lowercase hex characters","offset_bytes":0,"max_bytes":65536}`.
+The positive u32 `sequence` and exact lowercase SHA-256 are required fences,
+obtained from the current agent view and verified `answer` metadata. This read
+selects the current execution, rejecting a retained older sequence after resume.
+`offset_bytes` is required, nonnegative and must identify a UTF-8 boundary at or
+before EOF. `max_bytes` may be omitted (65536), accepts 1..131072, and cannot
+be null. Missing fences, nulls, extra fields and caller paths are rejected.
+
+```json
+{"agent_id":"ag-20261020-120000-0123456789","sequence":1,"sha256":"...","total_bytes":9,"offset_bytes":0,"next_offset":5,"content":"hello","complete":false}
+```
+
+Continue with the returned `next_offset`, measured in bytes, preserving both
+fences. The end rounds down to a UTF-8 boundary; a budget too small for the next
+character rejects. At EOF the content is empty, `next_offset` remains EOF and
+`complete` is true; beyond EOF rejects. Each read verifies the entire artifact
+and seal using broker-derived paths, owned no-follow descriptors, size, UTF-8
+and SHA-256, then revalidates the current execution and recorded proof before
+returning. Reads change no lifecycle or durable state. Reconstructed exact
+artifact bytes hash to `sha256`; legacy artifacts include their exact terminal
+frame in chunks, while historical full `answer` display still strips it once.
+Consumers aggregate only on demand, checking sequence, cursors and final hash.
+
+Stable failures are `ExecutionChanged` (sequence changed, including after resume),
+`AnswerHashMismatch` (required digest differs), `AnswerUnavailable` (no recorded
+answer), `AnswerIntegrityError` (corrupt/missing artifact, invalid UTF-8 or seal),
+and `PathEscapeError` (unsafe/no-follow path). These are JSON-RPC `-32000`, except
+path rejection is `-32602`. Invalid ranges/boundaries/budgets/arguments use
+`ValidationError` / `-32602`. Unknown agents retain `AgentNotFound`. CLI and MCP
+preserve the same machine categories. Filesystem/store errors remain typed.
+
+The CLI equivalent is `agent-run answer-chunk AGENT_ID --sequence N
+--expected-sha256 HASH --offset-bytes N [--max-bytes N]`.
+The existing full answer verification limit remains 16 MiB and the CLI inline
+content cutoff stays 1 MiB. Socket serialization counts the entire escaped JSON
+envelope and terminating newline. Only a successful `answer` response exceeding
+that frame cap falls back to metadata with `content:null` and
+`inline_complete:false`, retaining proof and availability. The metadata form is
+checked again; other oversized replies keep the existing error. No text is
+silently truncated and no wire limit is increased.
 
 `list_pools` accepts a strict object with optional `state` (`"open"` or
 `"completed"`; omitted/null means all), `limit` (integer 1..200, default 50)
@@ -479,6 +594,6 @@ rendered as `RuntimeError`.
   an agent-run upgrade instead of caching schemas across versions.
 - Restart `api serve` after switching the verified sealed release at
   `~/.agent-run/standalone/current`.
-- The current database schema is version 25, reached through the paired
+- The current database schema is version 35, reached through the paired
   `agent-run config migrate`. Older resident processes refuse a newer database
   and must be restarted after an upgrade migrates it.

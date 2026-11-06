@@ -50,12 +50,14 @@ async fn continuous_descendant_output_does_not_postpone_escalation() {
     use agent_run_platform::process::{self, ProcessState};
     let plan=LaunchPlan {
         binary:PathBuf::from("/bin/sh"),
-        args:vec!["-c".into(),r#"node -e 'process.on("SIGTERM", () => {}); setInterval(() => console.log("{\"tick\":true}"), 5); setTimeout(() => process.exit(0), 12000)' & printf '{"pid":%s}\n' "$!"; read begin; exit 0"#.into()],
+        args:vec!["-c".into(),r#"node -e 'process.on("SIGTERM", () => {}); setInterval(() => console.log("{\"tick\":true}"), 5); setTimeout(() => process.exit(0), 30000)' & printf '{"pid":%s}\n' "$!"; read begin; exit 0"#.into()],
         cwd:std::env::current_dir().unwrap(),
         environment:BTreeMap::from([("PATH".into(),std::env::var("PATH").unwrap())]),initial_input:None,
     };
     let mut fixture = Fixture(Process::spawn(&plan).unwrap());
-    let startup = tokio::time::Instant::now() + Duration::from_secs(2);
+    // Allow shared runners time to start Node; the cleanup deadline below is
+    // still measured separately after the first observed output.
+    let startup = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut pid = None;
     loop {
         let Event::Json(value) = tokio::time::timeout_at(startup, fixture.0.next())

@@ -1,4 +1,4 @@
-//! Bounded LF-delimited JSON-RPC 2.0 over a private same-user Unix socket.
+//! Bounded LF-delimited JSON-RPC 2.0 over authenticated Unix sockets.
 use super::frame;
 use crate::{Error, Result, dispatch, service::Service};
 use agent_run_domain::ProviderStartRequest;
@@ -26,8 +26,10 @@ const CLIENT_DEFAULT_TIMEOUT: f64 = 600.0;
 
 /// A reusable, serialized client session for the resident Unix-socket broker.
 pub struct BrokerClient {
-    /// Private broker endpoint owned by the selected agent-run home.
+    /// Broker endpoint selected by the caller.
     socket_path: PathBuf,
+    /// Explicit trusted server UID, or the effective UID at each connection.
+    expected_server_uid: Option<u32>,
     /// Monotonic request identity and cancellation state for this client.
     next_id: AtomicU64,
     aborted: AtomicBool,
@@ -68,15 +70,28 @@ enum ClientAttemptError {
 }
 
 impl BrokerClient {
-    /// Creates a lazy broker client; no socket is opened until its first call.
+    /// Creates a lazy broker client that trusts only its effective UID at connection time.
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
+            expected_server_uid: None,
             next_id: AtomicU64::new(1),
             aborted: AtomicBool::new(false),
             wake: Arc::new(tokio::sync::Notify::new()),
             connection: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Creates a lazy client for an explicit socket and trusted server UID.
+    ///
+    /// Every connection checks the kernel-reported peer UID before sending a request.
+    pub fn with_expected_server_uid(
+        socket_path: impl Into<PathBuf>,
+        expected_server_uid: u32,
+    ) -> Self {
+        let mut client = Self::new(socket_path);
+        client.expected_server_uid = Some(expected_server_uid);
+        client
     }
 
     /// Sends one object-valued request using Python's default 600-second deadline.
@@ -212,8 +227,11 @@ impl BrokerClient {
                 result.map_err(|_| Error::BrokerUnavailable)?.map_err(|_| Error::BrokerUnavailable)?
             }
         };
-        // SAFETY: geteuid is a read-only process identity query.
-        if stream.peer_cred()?.uid() != unsafe { libc::geteuid() } {
+        let expected_uid = self.expected_server_uid.unwrap_or_else(|| {
+            // SAFETY: geteuid is a read-only process identity query.
+            unsafe { libc::geteuid() }
+        });
+        if stream.peer_cred()?.uid() != expected_uid {
             return Err(crate::error::invalid("broker belongs to another user"));
         }
         let (input, output) = stream.into_split();
@@ -278,7 +296,7 @@ impl BrokerClient {
 }
 
 /// Python-compatible upper bound for one newline-delimited JSON RPC message.
-pub const MAX_FRAME: usize = 1024 * 1024;
+pub const MAX_FRAME: usize = agent_run_domain::observation::SOCKET_MAX_FRAME_BYTES;
 const MAX_CONNECTIONS: usize = 32;
 const MAX_PENDING_REQUESTS: usize = 64;
 const CONTROL_FRAME_DEADLINE: Duration = Duration::from_millis(500);
@@ -292,6 +310,7 @@ const CONTROL_METHODS: &[&str] = &[
     "start_pool",
     "pool_post",
     "pool_replace",
+    "_hook_bind",
 ];
 /// Steady database maintenance interval: expiry found no work and compaction
 /// reclaimed no pages, so nothing eligible remains.
@@ -484,6 +503,17 @@ pub struct ServeOptions {
     pub idle_timeout: Duration,
 }
 
+/// Explicit system-only writer and launcher configuration supplied by the
+/// authenticated service bootstrap, never by an operator request.
+pub struct SystemServeOptions {
+    /// Protected group-authorized writer endpoint for target supervisors.
+    pub writer_socket: PathBuf,
+    /// Extra operator endpoints, each controlled by its directory permissions.
+    pub operator_sockets: Vec<PathBuf>,
+    /// Launcher bound to the authenticated root coordinator.
+    pub launcher: Arc<dyn agent_run_core::system_launch::SystemLauncher>,
+}
+
 impl Default for ServeOptions {
     /// Returns the production limits matching the Python socket server.
     fn default() -> Self {
@@ -557,6 +587,21 @@ fn err(id: Value, code: i32, message: &str, data: Option<Value>) -> Value {
 /// Turns one domain failure into the Python socket's stable domain envelope.
 fn domain_err(id: Value, error: &Error) -> Value {
     let public = error.public();
+    // This socket-only code is stable for a bounded page retry; it is not a
+    // new public machine code or part of MCP discovery.
+    if let Error::Broker {
+        broker_error_code: Some(code),
+        ..
+    } = error
+        && code == dispatch::CLI_TRANSCRIPT_PAGE_CHANGED_CODE
+    {
+        return err(
+            id,
+            -32000,
+            &public.message,
+            Some(json!({"code":code,"message":public.message})),
+        );
+    }
     err(
         id,
         -32000,
@@ -570,6 +615,101 @@ fn domain_err(id: Value, error: &Error) -> Value {
 /// required by the Python broker. The caller owns `service` and therefore the
 /// SQLite connection lifetime remains outside this pure transport boundary.
 pub async fn respond(service: &Service, v: Value) -> Option<Value> {
+    respond_with_access(service, v, SocketAccess::Private).await
+}
+
+/// Group-socket access is granted by the operating system; worker methods
+/// retain their existing attempt-bound capability checks.
+#[derive(Clone, Copy)]
+enum SocketAccess {
+    /// The existing same-effective-UID API, including capability-bound worker calls.
+    Private,
+    /// Filesystem-group-authorized operator calls, never private worker calls.
+    Operator,
+    /// The shared service endpoint also exposes capability-bound worker calls.
+    SystemGroup,
+}
+
+/// Narrow CLI compatibility reads excluded from public tool discovery.
+const CLI_READ_METHODS: &[&str] = &[
+    "_cli_answer",
+    "_cli_answer_chunk",
+    "_cli_transcript_select",
+    "_cli_transcript_page",
+    "_cli_transcript_status",
+    "_hook_context",
+    "_hook_bind",
+    "_runtime_retention",
+    "_system_policy",
+];
+
+/// Operator-only restart controls; deliberately absent from MCP discovery.
+const SERVICE_RESTART_METHODS: &[&str] = &[
+    "_service_restart_begin",
+    "_service_restart_status",
+    "_service_restart_failed",
+    "_service_restart_claim",
+];
+
+/// Returns only the broker's fixed policy verdict for a stored execution.
+/// No caller-supplied file path, credential or configuration is accepted.
+fn system_policy(service: &Service, params: Value) -> Result<Value> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Request {
+        execution: crate::domain::AgentId,
+    }
+    let request: Request = serde_json::from_value(params)
+        .map_err(|_| crate::error::invalid("invalid system policy request"))?;
+    Ok(serde_json::to_value(
+        service.system_current_policy(&request.execution),
+    )?)
+}
+
+/// Exposes configured runtime roots and path references, but no file contents.
+/// An invalid or unreadable configuration never authorizes account-local cleanup.
+fn runtime_retention_config(service: &Service, params: &Value) -> Result<Value> {
+    let object = params
+        .as_object()
+        .ok_or_else(|| crate::error::invalid("runtime retention parameters must be an object"))?;
+    if !object.is_empty() {
+        return Err(crate::error::invalid("unknown runtime retention parameter"));
+    }
+    let (config, _) = agent_run_config::provider_config::ProviderConfig::load(&service.home)?;
+    let roots: Vec<PathBuf> = config
+        .harnesses
+        .values()
+        .map(|harness| harness.home.clone())
+        .collect();
+    let paths = agent_run_core::housekeeping::config_paths(&service.home)?;
+    Ok(json!({
+        "roots": serde_json::to_value(roots)?,
+        "protected_paths": serde_json::to_value(paths)?,
+    }))
+}
+
+/// Validates the kernel peer before reading requests or replying to overload.
+/// Operator membership is enforced by pathname DAC, including supplementary groups.
+fn authenticate_socket(stream: &UnixStream, access: SocketAccess) -> Result<()> {
+    let credentials = stream.peer_cred()?;
+    match access {
+        SocketAccess::Private => {
+            // SAFETY: geteuid only reads the effective process identity.
+            if credentials.uid() != unsafe { libc::geteuid() } {
+                return Err(crate::error::invalid("socket peer has another user ID"));
+            }
+        }
+        SocketAccess::Operator | SocketAccess::SystemGroup => {
+            if credentials.pid().is_none_or(|pid| pid <= 0) {
+                return Err(crate::error::invalid("operator peer identity unavailable"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Uses the normal protocol envelope while fencing private methods before dispatch.
+async fn respond_with_access(service: &Service, v: Value, access: SocketAccess) -> Option<Value> {
     if v.is_array() {
         return Some(err(
             Value::Null,
@@ -607,6 +747,8 @@ pub async fn respond(service: &Service, v: Value) -> Option<Value> {
         };
     }
     let known = dispatch::is_tool(method)
+        || CLI_READ_METHODS.contains(&method)
+        || SERVICE_RESTART_METHODS.contains(&method)
         || [
             "tools",
             "ping",
@@ -616,10 +758,30 @@ pub async fn respond(service: &Service, v: Value) -> Option<Value> {
             agent_run_domain::worker::CATALOG_METHOD,
         ]
         .contains(&method);
+    let worker_method = [
+        agent_run_domain::worker::METHOD,
+        agent_run_domain::worker::TOOL_METHOD,
+        agent_run_domain::worker::CATALOG_METHOD,
+    ]
+    .contains(&method);
+    let known = known
+        && (method != "_system_policy" || matches!(access, SocketAccess::SystemGroup))
+        && match access {
+            SocketAccess::Private => true,
+            SocketAccess::Operator => !worker_method,
+            SocketAccess::SystemGroup => true,
+        };
     let response = if !known {
         err(id, -32601, "method not found", None)
     } else {
-        match dispatch::call(service, method, params).await {
+        let result = if method == "_runtime_retention" {
+            runtime_retention_config(service, &params)
+        } else if method == "_system_policy" {
+            system_policy(service, params)
+        } else {
+            dispatch::call(service, method, params).await
+        };
+        match result {
             Ok(value) => json!({"jsonrpc":"2.0","id":id,"result":value}),
             Err(e) => {
                 if e.rpc_code() == -32602 {
@@ -639,18 +801,17 @@ pub async fn respond(service: &Service, v: Value) -> Option<Value> {
     if notification { None } else { Some(response) }
 }
 /// Runs one connection with framed parsing, lane admission, and ordered writes.
+/// Oversized successful answers shed inline content before the frame cap is
+/// enforced; all other reply and lifecycle/deadline behavior is preserved.
 async fn connection(
     stream: UnixStream,
     service: Service,
     lanes: Lanes,
     control_only: bool,
     options: ServeOptions,
+    access: SocketAccess,
 ) -> Result<()> {
-    // SAFETY: geteuid has no arguments or memory safety preconditions.
-    let uid = unsafe { libc::geteuid() };
-    if stream.peer_cred()?.uid() != uid {
-        return Err(crate::error::invalid("socket peer has another user ID"));
-    }
+    authenticate_socket(&stream, access)?;
     let (input, mut output) = stream.into_split();
     let mut input = BufReader::new(input);
     loop {
@@ -673,6 +834,7 @@ async fn connection(
             }
             Err(_) => return Ok(()),
         };
+        let mut answer_response = false;
         let response = match serde_json::from_slice::<Value>(&raw) {
             Ok(mut value) => {
                 if !valid_start_frame(
@@ -684,6 +846,7 @@ async fn connection(
                     value["params"] = json!({"invalid_start_frame":true});
                 }
                 let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+                answer_response = method == "answer";
                 if control_only && !CONTROL_METHODS.contains(&method) {
                     let id = value.get("id").cloned().unwrap_or(Value::Null);
                     if value.get("id").is_some() {
@@ -705,13 +868,13 @@ async fn connection(
                                 .and_then(Value::as_f64)
                                 .is_some_and(|seconds| seconds > 0.0));
                     if long_poll {
-                        respond(&service, value).await
+                        respond_with_access(&service, value, access).await
                     } else if let Some(_permit) = lanes.try_acquire(method) {
                         let request_id = value.get("id").cloned().unwrap_or(Value::Null);
                         let has_id = value.get("id").is_some();
                         match tokio::time::timeout(
                             options.request_timeout,
-                            respond(&service, value),
+                            respond_with_access(&service, value, access),
                         )
                         .await
                         {
@@ -732,15 +895,8 @@ async fn connection(
             }
             Err(_) => Some(err(Value::Null, -32700, "parse error", None)),
         };
-        if let Some(mut response) = response {
-            if serde_json::to_vec(&response)?.len() + 1 > MAX_FRAME {
-                response = err(
-                    response["id"].clone(),
-                    -32603,
-                    "response exceeds maximum size",
-                    None,
-                );
-            }
+        if let Some(response) = response {
+            let response = fit_response(response, answer_response)?;
             tokio::time::timeout(
                 Duration::from_secs(15),
                 frame::write(&mut output, &response, MAX_FRAME),
@@ -752,6 +908,34 @@ async fn connection(
             return Ok(());
         }
     }
+}
+
+/// Fits a complete newline-terminated reply to the wire budget. Only oversized
+/// successful answer envelopes may shed inline content through AnswerView;
+/// ordinary answers are byte-for-byte unchanged and all other oversized replies
+/// retain the historical internal error. The metadata-only form is rechecked.
+fn fit_response(mut response: Value, answer_response: bool) -> Result<Value> {
+    if serde_json::to_vec(&response)?.len() < MAX_FRAME {
+        return Ok(response);
+    }
+    if answer_response
+        && response.get("error").is_none()
+        && let Some(result) = response.get("result")
+        && let Ok(mut answer) =
+            serde_json::from_value::<agent_run_domain::AnswerView>(result.clone())
+    {
+        answer.omit_content();
+        response["result"] = serde_json::to_value(answer)?;
+        if serde_json::to_vec(&response)?.len() < MAX_FRAME {
+            return Ok(response);
+        }
+    }
+    Ok(err(
+        response["id"].clone(),
+        -32603,
+        "response exceeds maximum size",
+        None,
+    ))
 }
 
 /// Decodes start parameters from their original frame before a generic JSON map
@@ -850,6 +1034,299 @@ pub(crate) async fn bind_private(socket_path: &Path) -> Result<(UnixListener, So
     Ok((listener, guard))
 }
 
+/// Binds a shared socket without changing the host-configured owner, group or
+/// mode. The OS umask and parent directory determine who can connect.
+pub(crate) async fn bind_shared(path: &Path) -> Result<(UnixListener, SocketGuard)> {
+    if !path.is_absolute() || path.file_name().is_none() {
+        return Err(crate::error::invalid("shared socket path must be absolute"));
+    }
+    let lock_path = path.with_file_name(format!(
+        ".{}.lock",
+        path.file_name().unwrap().to_string_lossy()
+    ));
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(lock_path)?;
+    if !lock.metadata()?.is_file() {
+        return Err(crate::error::invalid("shared socket lock is not a file"));
+    }
+    lock.try_lock_exclusive()
+        .map_err(|_| crate::error::invalid("shared socket is already in use"))?;
+    if let Ok(previous) = std::fs::symlink_metadata(path) {
+        if !previous.file_type().is_socket() {
+            return Err(crate::error::invalid(
+                "refusing to replace a non-socket path",
+            ));
+        }
+        match tokio::time::timeout(Duration::from_secs(3), UnixStream::connect(path)).await {
+            Ok(Ok(_)) => return Err(crate::error::invalid("another worker is listening")),
+            Ok(Err(error))
+                if [Some(libc::ECONNREFUSED), Some(libc::ENOENT)]
+                    .contains(&error.raw_os_error()) =>
+            {
+                let current = std::fs::symlink_metadata(path)?;
+                if (current.dev(), current.ino()) != (previous.dev(), previous.ino())
+                    || !current.file_type().is_socket()
+                {
+                    return Err(crate::error::invalid(
+                        "shared socket changed during stale reclaim",
+                    ));
+                }
+                std::fs::remove_file(path)?;
+            }
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => return Err(crate::error::invalid("shared socket probe timed out")),
+        }
+    }
+    let listener = UnixListener::bind(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    Ok((
+        listener,
+        SocketGuard {
+            path: path.to_owned(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            _lock: lock,
+        },
+    ))
+}
+
+/// Proves traversal for operator-group members without assuming their other
+/// groups. With a different owning group, either group class might apply, so
+/// both group and other execute are required. Callers must exclude access ACLs.
+#[cfg(target_os = "linux")]
+fn operator_group_can_traverse(mode: u32, owning_gid: u32, operator_gid: u32) -> bool {
+    mode & 0o010 != 0 && (owning_gid == operator_gid || mode & 0o001 != 0)
+}
+
+/// Refuses a POSIX ACL without reading its entries or changing its permissions.
+/// Path-based lookup supports searchable ancestors without directory read access.
+#[cfg(target_os = "linux")]
+fn reject_operator_acl(path: &Path, name: &std::ffi::CStr) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| crate::error::invalid("invalid operator directory path"))?;
+    // SAFETY: both C strings outlive the call. A null buffer and zero length
+    // ask only for the xattr size; lgetxattr does not follow a final symlink.
+    let size = unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+    if size >= 0 {
+        return Err(crate::error::invalid(
+            "operator directory ACLs are not supported",
+        ));
+    }
+    let error = std::io::Error::last_os_error();
+    if ![Some(libc::ENODATA), Some(libc::EOPNOTSUPP)].contains(&error.raw_os_error()) {
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+/// Requires a service-owned 0750 operator directory with its exact group and
+/// root/service-owned, non-writable ancestors searchable by every operator-group
+/// member. Symlinks/access ACLs anywhere and default ACLs on the directory refuse.
+#[cfg(target_os = "linux")]
+fn validate_operator_directory(path: &Path, gid: u32) -> Result<()> {
+    if !path.is_absolute()
+        || gid == u32::MAX
+        || path.components().any(|part| {
+            !matches!(
+                part,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+    {
+        return Err(crate::error::invalid(
+            "invalid operator socket path or group",
+        ));
+    }
+    let directory = path
+        .parent()
+        .filter(|_| path.file_name().is_some())
+        .ok_or_else(|| crate::error::invalid("operator socket needs a directory and name"))?;
+    // SAFETY: geteuid only reads the process identity.
+    let uid = unsafe { libc::geteuid() };
+    for ancestor in directory.ancestors() {
+        let metadata = std::fs::symlink_metadata(ancestor)?;
+        if !metadata.is_dir() || ![0, uid].contains(&metadata.uid()) || metadata.mode() & 0o022 != 0
+        {
+            return Err(crate::error::invalid(
+                "operator socket ancestors are not protected",
+            ));
+        }
+        if !operator_group_can_traverse(metadata.mode(), metadata.gid(), gid) {
+            return Err(crate::error::invalid(
+                "operator group cannot traverse a socket ancestor",
+            ));
+        }
+        reject_operator_acl(ancestor, c"system.posix_acl_access")?;
+        if ancestor == directory
+            && (metadata.uid() != uid || metadata.gid() != gid || metadata.mode() & 0o7777 != 0o750)
+        {
+            return Err(crate::error::invalid(
+                "operator directory must be service-owned with its group and mode 0750",
+            ));
+        }
+    }
+    reject_operator_acl(directory, c"system.posix_acl_default")?;
+    Ok(())
+}
+
+/// Removes only the empty private staging directory created for this publication.
+#[cfg(target_os = "linux")]
+struct OperatorStage {
+    /// Unpredictable owner-only staging directory inside the protected parent.
+    path: PathBuf,
+    /// Filesystem identity, retained so cleanup never removes a replacement.
+    identity: (u64, u64),
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for OperatorStage {
+    fn drop(&mut self) {
+        if let Ok(metadata) = std::fs::symlink_metadata(&self.path)
+            && metadata.is_dir()
+            && (metadata.dev(), metadata.ino()) == self.identity
+        {
+            let _ = std::fs::remove_dir(&self.path);
+        }
+    }
+}
+
+/// Publishes a group-authorized Linux socket only after its ownership and mode
+/// are final. The private staging directory prevents early connections; an
+/// atomic no-replace rename and the lifetime lock prevent endpoint takeover.
+#[cfg(target_os = "linux")]
+pub(super) async fn bind_operator(path: &Path, gid: u32) -> Result<(UnixListener, SocketGuard)> {
+    use std::{
+        ffi::CString,
+        os::unix::{ffi::OsStrExt, fs::DirBuilderExt},
+    };
+    validate_operator_directory(path, gid)?;
+    // SAFETY: geteuid only reads the process identity.
+    let uid = unsafe { libc::geteuid() };
+    let directory = path.parent().expect("validated parent");
+    let mut lock_name = std::ffi::OsString::from(".");
+    lock_name.push(path.file_name().expect("validated name"));
+    lock_name.push(".lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory.join(lock_name))?;
+    let metadata = lock.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != uid
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o7777 != 0o600
+    {
+        return Err(crate::error::invalid(
+            "operator startup lock is not private and owned",
+        ));
+    }
+    lock.try_lock_exclusive()
+        .map_err(|_| crate::error::invalid("operator socket is already in use"))?;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_socket()
+                || metadata.uid() != uid
+                || metadata.gid() != gid
+                || metadata.mode() & 0o7777 != 0o660
+            {
+                return Err(crate::error::invalid(
+                    "refusing to replace an untrusted operator socket",
+                ));
+            }
+            match tokio::time::timeout(Duration::from_secs(3), UnixStream::connect(path)).await {
+                Ok(Err(error))
+                    if [Some(libc::ECONNREFUSED), Some(libc::ENOENT)]
+                        .contains(&error.raw_os_error()) =>
+                {
+                    let current = std::fs::symlink_metadata(path)?;
+                    if (current.dev(), current.ino()) != (metadata.dev(), metadata.ino())
+                        || !current.file_type().is_socket()
+                    {
+                        return Err(crate::error::invalid(
+                            "operator socket changed during stale reclaim",
+                        ));
+                    }
+                    std::fs::remove_file(path)?;
+                }
+                Ok(Ok(_)) => {
+                    return Err(crate::error::invalid(
+                        "another operator broker is listening",
+                    ));
+                }
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_) => return Err(crate::error::invalid("operator socket probe timed out")),
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    validate_operator_directory(path, gid)?;
+    let stage_path = directory.join(format!(
+        ".op-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..10]
+    ));
+    std::fs::DirBuilder::new().mode(0o700).create(&stage_path)?;
+    let metadata = std::fs::symlink_metadata(&stage_path)?;
+    let stage = OperatorStage {
+        path: stage_path,
+        identity: (metadata.dev(), metadata.ino()),
+    };
+    let staged_path = stage.path.join("s");
+    let listener = UnixListener::bind(&staged_path)?;
+    let metadata = std::fs::symlink_metadata(&staged_path)?;
+    let mut guard = SocketGuard {
+        path: staged_path.clone(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        _lock: lock,
+    };
+    std::os::unix::fs::chown(&staged_path, Some(uid), Some(gid))?;
+    std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o660))?;
+    let metadata = std::fs::symlink_metadata(&staged_path)?;
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != uid
+        || metadata.gid() != gid
+        || metadata.mode() & 0o7777 != 0o660
+        || (metadata.dev(), metadata.ino()) != (guard.device, guard.inode)
+    {
+        return Err(crate::error::invalid(
+            "operator socket ownership verification failed",
+        ));
+    }
+    let source = CString::new(staged_path.as_os_str().as_bytes())
+        .map_err(|_| crate::error::invalid("invalid operator staging path"))?;
+    let destination = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| crate::error::invalid("invalid operator socket path"))?;
+    // SAFETY: both C paths outlive this call. RENAME_NOREPLACE atomically
+    // publishes only into an absent name; unsupported kernels fail closed.
+    if unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    guard.path = path.to_path_buf();
+    std::fs::remove_dir(&stage.path)?;
+    Ok((listener, guard))
+}
+
 /// Serves the default `<home>/api.sock` broker endpoint until a termination signal.
 pub async fn serve(home: &Path) -> Result<()> {
     serve_at(home, &home.join("api.sock")).await
@@ -872,11 +1349,109 @@ pub async fn serve_at_with_options(
     socket_path: &Path,
     options: ServeOptions,
 ) -> Result<()> {
+    serve_endpoints(home, socket_path, None, None, options).await
+}
+
+/// Adds an opt-in Linux operator endpoint to the unchanged private API/writer.
+/// Both listeners share one service, writer, connection pool, and request lanes.
+/// The pre-existing operator directory must satisfy the protected 0750/group
+/// contract; the socket is published 0660 and authorizes the group's full
+/// public operator API, never worker-only methods. Other platforms refuse.
+pub async fn serve_with_operator(
+    home: &Path,
+    operator_path: &Path,
+    operator_gid: u32,
+    options: ServeOptions,
+) -> Result<()> {
+    serve_endpoints(
+        home,
+        &home.join("api.sock"),
+        Some((operator_path, operator_gid)),
+        None,
+        options,
+    )
+    .await
+}
+
+/// Serves the shared system broker with separate operator and supervisor
+/// sockets. Group-authorized clients may use existing capability-bound worker
+/// methods on the shared endpoint.
+pub async fn serve_system(
+    home: &Path,
+    operator_path: &Path,
+    system: SystemServeOptions,
+    options: ServeOptions,
+) -> Result<()> {
+    serve_endpoints(
+        home,
+        &home.join("api.sock"),
+        Some((operator_path, 0)),
+        Some(system),
+        options,
+    )
+    .await
+}
+
+/// Accepts the private or any operator endpoint, rotating their priority.
+async fn accept_endpoint(
+    private: &UnixListener,
+    operators: &[(UnixListener, SocketGuard)],
+    system_group: bool,
+    cursor: &mut usize,
+) -> std::io::Result<(UnixStream, SocketAccess)> {
+    std::future::poll_fn(|context| {
+        use std::task::Poll;
+        let count = operators.len() + 1;
+        for offset in 0..count {
+            let index = (*cursor + offset) % count;
+            let listener = if index == 0 {
+                private
+            } else {
+                &operators[index - 1].0
+            };
+            if let Poll::Ready(result) = listener.poll_accept(context) {
+                *cursor = (index + 1) % count;
+                let access = if index == 0 {
+                    SocketAccess::Private
+                } else if system_group {
+                    SocketAccess::SystemGroup
+                } else {
+                    SocketAccess::Operator
+                };
+                return Poll::Ready(result.map(|(stream, _)| (stream, access)));
+            }
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+/// Owns the shared broker lifecycle and optional protected operator listener.
+async fn serve_endpoints(
+    home: &Path,
+    socket_path: &Path,
+    operator: Option<(&Path, u32)>,
+    system: Option<SystemServeOptions>,
+    options: ServeOptions,
+) -> Result<()> {
     if options.max_connections == 0 || options.max_pending_requests == 0 {
         return Err(crate::error::invalid("socket limits must be positive"));
     }
     if options.request_timeout.is_zero() || options.idle_timeout.is_zero() {
         return Err(crate::error::invalid("socket deadlines must be positive"));
+    }
+    // SAFETY: geteuid is a read-only process identity query.
+    let uid = unsafe { libc::geteuid() };
+    // Validate the opt-in boundary before creating any endpoint or writer.
+    #[cfg(target_os = "linux")]
+    if system.is_none()
+        && let Some((path, gid)) = operator
+    {
+        validate_operator_directory(path, gid)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    if operator.is_some() && system.is_none() {
+        return Err(Error::Unsupported("operator socket requires Linux".into()));
     }
     agent_run_core::logging::configure(home, "api");
     // An older database is only ever upgraded by the paired config migration.
@@ -886,12 +1461,10 @@ pub async fn serve_at_with_options(
         let _ = crate::config::Config::load(home)?;
     }
     let directory = std::fs::symlink_metadata(home)?;
-    // SAFETY: geteuid is a read-only process identity query.
-    let uid = unsafe { libc::geteuid() };
     if !directory.is_dir()
         || directory.file_type().is_symlink()
         || directory.uid() != uid
-        || directory.mode() & 0o077 != 0
+        || (system.is_none() && directory.mode() & 0o077 != 0)
     {
         return Err(crate::error::invalid(
             "agent-run home must be an owned mode-0700 directory",
@@ -901,6 +1474,29 @@ pub async fn serve_at_with_options(
     // The writer socket is bound before anything is served: its startup lock is
     // what offline tools take to prove that no broker serves this home.
     let (writer_listener, writer_guard) = bind_private(&home.join("writer.sock")).await?;
+    let operator_endpoint = match operator {
+        Some((path, gid)) if system.is_some() => {
+            let _ = gid;
+            Some(bind_shared(path).await?)
+        }
+        #[cfg(target_os = "linux")]
+        Some((path, gid)) => Some(bind_operator(path, gid).await?),
+        #[cfg(not(target_os = "linux"))]
+        Some(_) => return Err(Error::Unsupported("operator socket requires Linux".into())),
+        None => None,
+    };
+    let mut operator_endpoints: Vec<_> = operator_endpoint.into_iter().collect();
+    if let Some(settings) = &system {
+        for path in &settings.operator_sockets {
+            operator_endpoints.push(bind_shared(path).await?);
+        }
+    }
+    let system_endpoint = match &system {
+        Some(settings) => Some(bind_shared(&settings.writer_socket).await?),
+        None => None,
+    };
+    let launcher = system.as_ref().map(|settings| settings.launcher.clone());
+    let system_group = system.is_some();
     // The one resident writer: acquires the home-wide writer lease and opens the
     // EXISTING schema-30 store on its dedicated thread (never initializes or
     // migrates; an absent or old schema is a typed refusal).
@@ -919,13 +1515,29 @@ pub async fn serve_at_with_options(
     // (a broker whose writer socket is dead must not look alive).
     let mut writer_task = Some(tokio::spawn(async move {
         let _guard = writer_guard;
+        if let Some((system_listener, system_guard)) = system_endpoint {
+            let _system_guard = system_guard;
+            return super::writer_socket::serve_system_listeners(
+                writer_listener,
+                system_listener,
+                endpoint,
+                async {
+                    let _ = writer_stopped.await;
+                },
+            )
+            .await;
+        }
         super::writer_socket::serve_listener(writer_listener, endpoint, async {
             let _ = writer_stopped.await;
         })
         .await
     }));
     let mut writer_failure: Option<Error> = None;
-    let service = Service::new(home.to_owned()).with_writer(broker_writer.clone());
+    let mut service = Service::new(home.to_owned()).with_writer(broker_writer.clone());
+    if let Some(launcher) = launcher {
+        service = service.with_system_launcher(launcher);
+    }
+    service.recover_service_restart().await?;
     let _ = service.reconcile().await?;
     let mut services =
         agent_run_core::managed_services::Manager::new(home, std::env::current_exe()?)?
@@ -933,8 +1545,10 @@ pub async fn serve_at_with_options(
     // JoinSet aborts maintenance on every exit path, including cancellation of
     // serve_at itself; dropping a bare JoinHandle would detach these loops.
     let mut workers = JoinSet::new();
+    workers.spawn(agent_run_core::service_restart::run(service.clone()));
     let history_home = home.to_owned();
     let retention_lane = broker_writer.lane("retention");
+    let shared_retention = system_group;
     workers.spawn(async move {
         // Database expiry/compaction and filesystem retention keep independent
         // schedules: a filesystem backlog drains in one-second passes without
@@ -1015,8 +1629,21 @@ pub async fn serve_at_with_options(
                         lane: retention_lane.clone(),
                         reader,
                     };
-                    agent_run_core::housekeeping::sweep_on(&home, crate::domain::now(), &mut layout)
+                    if shared_retention {
+                        agent_run_core::housekeeping::sweep_shared_on(
+                            &home,
+                            crate::domain::now(),
+                            &mut layout,
+                        )
                         .await
+                    } else {
+                        agent_run_core::housekeeping::sweep_on(
+                            &home,
+                            crate::domain::now(),
+                            &mut layout,
+                        )
+                        .await
+                    }
                 }
                 .await;
                 let at = tokio::time::Instant::now();
@@ -1080,10 +1707,29 @@ pub async fn serve_at_with_options(
     let lanes = Lanes::new(options.max_pending_requests);
     let mut handlers = JoinSet::new();
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut draining = false;
+    let mut accept_cursor = 0;
+    let mut drain_tick = tokio::time::interval(Duration::from_secs(1));
+    let drain_home = service.home.clone();
     loop {
         tokio::select! {
-            _=tokio::signal::ctrl_c()=>break,
-            _=term.recv()=>break,
+            _=tokio::signal::ctrl_c()=>{
+                if !system_group { break; }
+                writer_service.handle().close_admissions("shared service stopping");
+                draining = true;
+            },
+            _=term.recv()=>{
+                if !system_group { break; }
+                writer_service.handle().close_admissions("shared service stopping");
+                draining = true;
+            },
+            _=drain_tick.tick(), if draining => {
+                match shared_service_idle(drain_home.clone()).await {
+                    Ok(true) => break,
+                    Ok(false) => {},
+                    Err(error) => maintenance_diagnostic("shutdown", "drain", &error),
+                }
+            },
             ended = writer_task.as_mut().expect("held while selectable"), if writer_task.is_some() => {
                 writer_task = None;
                 writer_failure = Some(match ended {
@@ -1093,8 +1739,17 @@ pub async fn serve_at_with_options(
                 });
                 break;
             }
-            accepted=listener.accept()=>{
-                let(mut stream,_)=accepted?;
+            accepted=accept_endpoint(&listener, &operator_endpoints, system_group, &mut accept_cursor)=>{
+                let (mut stream, access) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        writer_failure = Some(error.into());
+                        break;
+                    }
+                };
+                if authenticate_socket(&stream, access).is_err() {
+                    continue;
+                }
                 let (permit, control_only) = match gate.clone().try_acquire_owned() {
                     Ok(permit) => (permit, false),
                     Err(_) => match control_gate.clone().try_acquire_owned() {
@@ -1108,7 +1763,7 @@ pub async fn serve_at_with_options(
                 let service=service.clone();
                 let lanes=lanes.clone();
                 let options = options.clone();
-                handlers.spawn(async move { let _permit=permit; let _=connection(stream,service,lanes,control_only,options).await; });
+                handlers.spawn(async move { let _permit=permit; let _=connection(stream,service,lanes,control_only,options,access).await; });
             }
         }
     }
@@ -1143,6 +1798,20 @@ pub async fn serve_at_with_options(
         Some(error) => Err(error),
         None => drained,
     }
+}
+
+/// A planned shared-service stop waits for every active execution and process
+/// ownership claim; an unreadable database is not proof that it is safe to stop.
+async fn shared_service_idle(home: PathBuf) -> Result<bool> {
+    tokio::task::spawn_blocking(move || {
+        let store = crate::state::writer::StoreReader::open_with(&home, Duration::from_millis(250))?;
+        let idle = store.conn().query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM agents WHERE status IN ('created','starting','running','cancelling')) \
+             AND NOT EXISTS(SELECT 1 FROM attempts WHERE ownership_active=1)",
+            [], |row| row.get(0),
+        )?;
+        Ok(idle)
+    }).await.map_err(|_| Error::Runtime("shared service drain check failed".into()))?
 }
 /// Spawns the serial lease/process reconciliation loop on `workers`.
 ///
@@ -1217,13 +1886,39 @@ fn spawn_delivery_loop<D, Fut, C>(
 /// explicit keys are preserved and domain errors are never retried. Wait keeps
 /// its bounded observation loop; other methods retain their one-shot behavior.
 pub async fn client(home: &Path, method: &str, params: Value) -> Result<Value> {
+    client_with_uid(&home.join("api.sock"), None, method, params).await
+}
+
+/// Calls an explicit socket, trusting only the specified kernel-reported server UID.
+///
+/// Uses the same deadlines and retry rules as [`client`], checking the UID before
+/// each request, including reconnects.
+pub async fn client_at(
+    socket_path: &Path,
+    expected_server_uid: u32,
+    method: &str,
+    params: Value,
+) -> Result<Value> {
+    client_with_uid(socket_path, Some(expected_server_uid), method, params).await
+}
+
+/// Runs a one-shot call with the selected server identity policy.
+async fn client_with_uid(
+    socket_path: &Path,
+    expected_server_uid: Option<u32>,
+    method: &str,
+    params: Value,
+) -> Result<Value> {
     if method == "resume" {
-        return BrokerClient::new(home.join("api.sock"))
-            .call_with_timeout(method, Some(params), 120.0)
-            .await;
+        let client = match expected_server_uid {
+            Some(uid) => BrokerClient::with_expected_server_uid(socket_path, uid),
+            None => BrokerClient::new(socket_path),
+        };
+        return client.call_with_timeout(method, Some(params), 120.0).await;
     }
     client_with_wait_deadlines(
-        home,
+        socket_path,
+        expected_server_uid,
         method,
         params,
         Duration::from_secs(60),
@@ -1276,7 +1971,8 @@ fn broker_error(object: &serde_json::Map<String, Value>) -> Error {
 
 /// Calls the broker, bounding wait observations and retrying only timed-out observations.
 async fn client_with_wait_deadlines(
-    home: &Path,
+    socket_path: &Path,
+    expected_server_uid: Option<u32>,
     method: &str,
     mut params: Value,
     wait_seconds: Duration,
@@ -1287,15 +1983,16 @@ async fn client_with_wait_deadlines(
         object.insert("timeout_seconds".into(), json!(wait_seconds.as_secs_f64()));
     }
     loop {
-        let mut stream = tokio::time::timeout(
-            Duration::from_secs(3),
-            UnixStream::connect(home.join("api.sock")),
-        )
-        .await
-        .map_err(|_| Error::BrokerUnavailable)?
-        .map_err(|_| Error::BrokerUnavailable)?;
-        // SAFETY: geteuid is a read-only query.
-        if stream.peer_cred()?.uid() != unsafe { libc::geteuid() } {
+        let mut stream =
+            tokio::time::timeout(Duration::from_secs(3), UnixStream::connect(socket_path))
+                .await
+                .map_err(|_| Error::BrokerUnavailable)?
+                .map_err(|_| Error::BrokerUnavailable)?;
+        let expected_uid = expected_server_uid.unwrap_or_else(|| {
+            // SAFETY: geteuid is a read-only query.
+            unsafe { libc::geteuid() }
+        });
+        if stream.peer_cred()?.uid() != expected_uid {
             return Err(crate::error::invalid("broker belongs to another user"));
         }
         let id = uuid::Uuid::new_v4().to_string();
@@ -1355,8 +2052,254 @@ async fn client_with_wait_deadlines(
 
 #[cfg(test)]
 mod tests {
+    /// Restart control stays on the existing operator socket, not the MCP catalog.
+    #[tokio::test]
+    async fn service_restart_control_is_not_an_mcp_tool() {
+        let service = Service::new("/unused-restart-fixture".into());
+        for method in SERVICE_RESTART_METHODS {
+            assert!(!dispatch::is_tool(method));
+            let response = respond_with_access(
+                &service,
+                json!({"jsonrpc":"2.0","id":1,"method":method,"params":{}}),
+                SocketAccess::Operator,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response["error"]["code"], -32602);
+        }
+    }
     use super::*;
     use tokio::net::UnixListener;
+
+    /// The narrow CLI answer reads are operator-socket methods, not advertised MCP tools.
+    #[tokio::test]
+    async fn cli_answer_methods_are_socket_only() {
+        let service = Service::new("/unused-answer-fixture".into());
+        for method in [
+            "_cli_answer",
+            "_cli_answer_chunk",
+            "_cli_transcript_select",
+            "_cli_transcript_page",
+            "_cli_transcript_status",
+        ] {
+            assert!(!dispatch::is_tool(method));
+            let response = respond_with_access(
+                &service,
+                json!({"jsonrpc":"2.0","id":1,"method":method,"params":{}}),
+                SocketAccess::Operator,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response["error"]["code"], -32602);
+        }
+    }
+
+    /// Unrelated supplementary groups must not select a non-searchable class
+    /// even when the ancestor's other execute bit is set.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn operator_traversal_requires_every_possible_group_class() {
+        for (mode, owning_gid, expected) in [
+            (0o700, 1001, false),
+            (0o750, 1001, true),
+            (0o750, 2002, false),
+            (0o701, 1001, false),
+            (0o701, 2002, false),
+            (0o711, 2002, true),
+            (0o755, 2002, true),
+        ] {
+            assert_eq!(
+                operator_group_can_traverse(mode, owning_gid, 1001),
+                expected,
+                "mode={mode:o}, owning_gid={owning_gid}"
+            );
+        }
+    }
+
+    /// Creates only a synthetic store/sealed answer; never starts an engine.
+    fn answer_fixture(
+        text: &str,
+    ) -> (
+        tempfile::TempDir,
+        Service,
+        crate::domain::AgentId,
+        agent_run_platform::verify::Proof,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        crate::fs::private_dir(&home).unwrap();
+        std::fs::write(home.join("config.toml"), format!("schema_version=1\n[runtimes.mock]\nenabled=true\nadapter='claude'\nbinary='/usr/bin/true'\nhome={}\nmodels=['fixture']\nlimits_source='none'\n",toml::Value::String(home.join("runtimes/mock").to_string_lossy().into_owned()))).unwrap();
+        let config = crate::config::Config::load(&home).unwrap();
+        agent_run_store::fixture::initialize(&home).unwrap();
+        let mut store = agent_run_store::fixture::open(&home).unwrap();
+        let request = serde_json::from_value(json!({"runtime":"mock","model":"fixture","profile":"review","task":"fixture","workdir":home})).unwrap();
+        let (id, _) = store.admit(&request, &config, &json!({}), None).unwrap();
+        let root = home.join("agents").join(id.as_str());
+        crate::fs::private_dir(&root).unwrap();
+        let proof = agent_run_platform::verify::seal(&root, Path::new("answer.md"), text).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE agents SET answer_path=?1,answer_bytes=?2,answer_sha256=?3 WHERE id=?4",
+                rusqlite::params![
+                    proof.path.to_str().unwrap(),
+                    proof.bytes,
+                    proof.sha256,
+                    id.as_str()
+                ],
+            )
+            .unwrap();
+        (temp, Service::new(home), id, proof)
+    }
+
+    /// Full CLI answers retain their cutoff; only overflowing successful socket
+    /// answers lose content. ASCII envelopes, escaping and Unicode all count.
+    #[test]
+    fn answer_frame_budget_downgrades_only_oversized_successes() {
+        for text in [
+            "x".repeat(MAX_FRAME),
+            "\"".repeat(MAX_FRAME / 2),
+            "\u{0000}".repeat(MAX_FRAME / 6),
+            "🦀".repeat(MAX_FRAME / 4),
+        ] {
+            let (_temp, service, id, _) = answer_fixture(&text);
+            let answer = service.answer(&id).unwrap();
+            assert_eq!(
+                answer["content"], text,
+                "CLI inline behavior remains unchanged"
+            );
+            let original = json!({"jsonrpc":"2.0","id":1,"result":answer});
+            assert!(serde_json::to_vec(&original).unwrap().len() + 1 > MAX_FRAME);
+            let fitted = fit_response(original.clone(), true).unwrap();
+            assert!(fitted["result"]["content"].is_null());
+            assert_eq!(fitted["result"]["inline_complete"], false);
+            for key in [
+                "agent_id",
+                "available",
+                "status",
+                "path",
+                "size_bytes",
+                "sha256",
+                "proof_version",
+            ] {
+                assert_eq!(fitted["result"][key], original["result"][key]);
+            }
+            assert!(serde_json::to_vec(&fitted).unwrap().len() < MAX_FRAME);
+            assert_eq!(
+                fit_response(original, false).unwrap()["error"]["code"],
+                -32603
+            );
+        }
+        let (_temp, service, id, _) = answer_fixture("ordinary \"é\"\n");
+        let mut ordinary =
+            json!({"jsonrpc":"2.0","id":"ordinary","result":service.answer(&id).unwrap()});
+        assert_eq!(fit_response(ordinary.clone(), true).unwrap(), ordinary);
+        // Account for escaping by measuring an empty content envelope directly.
+        ordinary["result"]["content"] = json!("");
+        let empty_bytes = serde_json::to_vec(&ordinary).unwrap().len() + 1;
+        ordinary["result"]["content"] = json!("x".repeat(MAX_FRAME - empty_bytes));
+        assert_eq!(serde_json::to_vec(&ordinary).unwrap().len() + 1, MAX_FRAME);
+        assert_eq!(fit_response(ordinary.clone(), true).unwrap(), ordinary);
+        ordinary["result"]["content"] = json!("x".repeat(MAX_FRAME - empty_bytes + 1));
+        assert!(fit_response(ordinary.clone(), true).unwrap()["result"]["content"].is_null());
+        ordinary["result"]["path"] = json!("x".repeat(MAX_FRAME));
+        assert_eq!(
+            fit_response(ordinary, true).unwrap()["error"]["code"],
+            -32603
+        );
+    }
+
+    /// A real framed connection exercises metadata fallback and chunk recovery,
+    /// keeps ping exact and closes its handler after EOF without lifecycle work.
+    #[tokio::test]
+    async fn observation_reads_work_over_live_socket_frames() {
+        let text = "\u{0000}\"é🦀".repeat(100_000);
+        let (_temp, service, id, proof) = answer_fixture(&text);
+        let revision = agent_run_store::writer::StoreReader::open(&service.home)
+            .unwrap()
+            .revision()
+            .unwrap();
+        let (client, server) = UnixStream::pair().unwrap();
+        let serving = tokio::spawn(connection(
+            server,
+            service.clone(),
+            Lanes::new(1),
+            false,
+            ServeOptions::default(),
+            SocketAccess::Private,
+        ));
+        let (input, mut output) = client.into_split();
+        let mut input = BufReader::new(input);
+        for (method, params) in [
+            ("ping", json!({})),
+            ("capabilities", json!({})),
+            ("answer", json!({"agent_id":id})),
+        ] {
+            frame::write(
+                &mut output,
+                &json!({"jsonrpc":"2.0","id":method,"method":method,"params":params}),
+                MAX_FRAME,
+            )
+            .await
+            .unwrap();
+            let raw = frame::read(&mut input, MAX_FRAME).await.unwrap().unwrap();
+            let response: Value = serde_json::from_slice(&raw).unwrap();
+            assert!(response.get("error").is_none(), "{response}");
+            match method {
+                "ping" => assert_eq!(response["result"], json!({"ok":true})),
+                "capabilities" => assert_eq!(
+                    response["result"],
+                    agent_run_core::observation::capabilities()
+                ),
+                "answer" => {
+                    assert_eq!(response["result"]["available"], true);
+                    assert!(response["result"]["content"].is_null());
+                    assert_eq!(response["result"]["sha256"], proof.sha256);
+                }
+                _ => unreachable!(),
+            }
+        }
+        let mut offset = 0;
+        let mut full = String::new();
+        loop {
+            let params = json!({"agent_id":id,"sequence":1,"expected_sha256":proof.sha256,"offset_bytes":offset,"max_bytes":131072});
+            let expected = dispatch::call(&service, "answer_chunk", params.clone())
+                .await
+                .unwrap();
+            frame::write(
+                &mut output,
+                &json!({"jsonrpc":"2.0","id":offset,"method":"answer_chunk","params":params}),
+                MAX_FRAME,
+            )
+            .await
+            .unwrap();
+            let raw = frame::read(&mut input, MAX_FRAME).await.unwrap().unwrap();
+            let response: Value = serde_json::from_slice(&raw).unwrap();
+            assert_eq!(response["result"], expected);
+            let chunk = &response["result"];
+            full.push_str(chunk["content"].as_str().unwrap());
+            offset = chunk["next_offset"].as_u64().unwrap();
+            if chunk["complete"] == true {
+                break;
+            }
+        }
+        assert_eq!(full, text);
+        assert_eq!(crate::fs::sha256(full.as_bytes()), proof.sha256);
+        assert_eq!(
+            agent_run_store::writer::StoreReader::open(&service.home)
+                .unwrap()
+                .revision()
+                .unwrap(),
+            revision
+        );
+        drop(output);
+        drop(input);
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 
     /// Duplicate server keys cannot collapse into an admissible socket start.
     #[test]
@@ -1380,6 +2323,7 @@ mod tests {
             Lanes::new(1),
             false,
             ServeOptions::default(),
+            SocketAccess::Private,
         ));
         let (reader, mut writer) = client.into_split();
         let mut reader = BufReader::new(reader);
@@ -1425,6 +2369,20 @@ mod tests {
         assert!(lanes.try_acquire("list_pools").is_some());
     }
 
+    /// Observation reads use the ordinary read permit and leave the control
+    /// lane available, preserving lifecycle admission under observer pressure.
+    #[test]
+    fn observation_methods_use_only_the_read_lane() {
+        for method in ["capabilities", "answer_chunk"] {
+            let lanes = Lanes::new(0);
+            let read = lanes.try_acquire(method).unwrap();
+            assert!(lanes.try_acquire("list_agents").is_none());
+            assert!(lanes.try_acquire("resume").is_some());
+            drop(read);
+            assert!(lanes.try_acquire(method).is_some());
+        }
+    }
+
     // Protects the client from a broker that holds a wait response open forever.
     #[tokio::test]
     async fn wait_client_deadline_closes_when_broker_holds_response() {
@@ -1440,7 +2398,8 @@ mod tests {
         });
 
         let result = client_with_wait_deadlines(
-            home.path(),
+            &path,
+            None,
             "wait",
             json!({"agent_id":"ag-test"}),
             Duration::from_millis(10),
@@ -1482,7 +2441,8 @@ mod tests {
         });
 
         let result = client_with_wait_deadlines(
-            home.path(),
+            &path,
+            None,
             "wait",
             json!({"agent_id":"ag-test"}),
             Duration::from_millis(10),

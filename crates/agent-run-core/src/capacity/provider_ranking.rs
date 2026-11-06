@@ -34,8 +34,9 @@ use crate::{Result, domain::now, error::invalid, state::Store};
 use agent_run_domain::{
     ProviderId,
     catalog::{
-        AccountId, AccountStatus, PhysicalQuotaKey, ProviderCatalog, ProviderDefinition,
-        ProviderModel, QuotaAdmissionError, QuotaCandidate, QuotaCandidateSet, SelectionIntent,
+        AccountId, AccountStatus, BindingCooldownReason, PhysicalQuotaKey, ProviderCatalog,
+        ProviderDefinition, ProviderModel, QuotaAdmissionError, QuotaCandidate, QuotaCandidateSet,
+        SelectionIntent,
     },
 };
 use rusqlite::{Connection, OptionalExtension};
@@ -161,6 +162,23 @@ struct QuotaSnapshot {
     enabled: BTreeMap<AccountId, bool>,
     /// Per-account samples and durable latches.
     facts: BTreeMap<AccountId, AccountFacts>,
+    /// Separate provider/account cooldowns, never quota observations.
+    cooldowns: BTreeMap<(String, AccountId), (BindingCooldownReason, f64)>,
+}
+
+impl QuotaSnapshot {
+    /// A binding is excluded strictly before its recorded expiry.
+    fn cooldown(
+        &self,
+        provider: &ProviderId,
+        account: &AccountId,
+        at: f64,
+    ) -> Option<(BindingCooldownReason, f64)> {
+        self.cooldowns
+            .get(&(provider.as_str().to_owned(), account.clone()))
+            .filter(|(_, until)| *until > at)
+            .map(|(reason, until)| (*reason, *until))
+    }
 }
 
 /// Reads registry status, account-bound sample history, durable latches, and
@@ -184,6 +202,7 @@ fn read_snapshot(conn: &Connection, scope: &BTreeSet<AccountId>) -> Result<Quota
     let tx = conn;
     let mut enabled = BTreeMap::new();
     let mut facts: BTreeMap<AccountId, AccountFacts> = BTreeMap::new();
+    let mut cooldowns = BTreeMap::new();
     for account in scope {
         let status: Option<String> = tx
             .query_row(
@@ -194,6 +213,24 @@ fn read_snapshot(conn: &Connection, scope: &BTreeSet<AccountId>) -> Result<Quota
             .optional()?;
         enabled.insert(account.clone(), status.as_deref() == Some("enabled"));
         facts.insert(account.clone(), AccountFacts::default());
+        let mut statement = tx.prepare(
+            "SELECT provider_id,reason,blocked_until FROM binding_cooldowns WHERE account_id=?",
+        )?;
+        for row in statement.query_map([account.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f64>(2)?,
+            ))
+        })? {
+            let (provider, reason, until) = row?;
+            if !until.is_finite() || until < 0.0 {
+                return Err(invalid("binding cooldown is malformed"));
+            }
+            let reason = serde_json::from_value(serde_json::json!(reason))
+                .map_err(|_| invalid("binding cooldown is malformed"))?;
+            cooldowns.insert((provider, account.clone()), (reason, until));
+        }
     }
     for account in scope {
         let prefix = format!("{}::", account.as_str());
@@ -301,6 +338,7 @@ fn read_snapshot(conn: &Connection, scope: &BTreeSet<AccountId>) -> Result<Quota
         revision,
         enabled,
         facts,
+        cooldowns,
     })
 }
 
@@ -524,12 +562,11 @@ pub fn provider_candidates(
 ///
 /// Reads only the store (registry status, account-bound sample history,
 /// durable latches, capacity revision) inside one deferred transaction and
-/// writes nothing. Known usable candidates precede unknown fallbacks
-/// regardless of weights; exhausted, disabled, and hard-ineligible accounts
-/// are never revived by any multiplier. Rank groups follow the shared
-/// ranker's priority order with only exactly equal priorities sharing a
-/// rank; ties inside a group are left to admission's active-count/id
-/// tie-break. The returned set carries the same committed
+/// writes nothing. Normally known usable candidates precede unknown fallbacks;
+/// ordered providers instead use binding weight and declaration order for all
+/// usable accounts. Exhausted, disabled, and hard-ineligible accounts are never
+/// revived. Normal rank ties use admission's active-count/id tie-break. The
+/// returned set carries the same committed
 /// `capacity_revision` the scores were computed against.
 ///
 /// Errors distinguish invalid input (unknown provider, unoffered model,
@@ -580,13 +617,34 @@ pub fn provider_candidates_at(
         scope.insert(account.clone());
     }
     let snapshot = read_snapshot(&store.conn, &scope)?;
-    let usable = current_eligible(
+    let mut usable = current_eligible(
         &snapshot,
         catalog,
         definition,
         &eligible_accounts(definition, model),
         hard_ineligible,
     );
+    let blocked: BTreeMap<_, _> = usable
+        .keys()
+        .filter_map(|account| {
+            snapshot
+                .cooldown(provider, account, at)
+                .map(|decision| (account.clone(), decision))
+        })
+        .collect();
+    usable.retain(|account, _| !blocked.contains_key(account));
+    if let Some(account) = &pinned
+        && let Some((reason, until)) = blocked.get(account)
+    {
+        return Err(QuotaAdmissionError::BindingCooldown {
+            provider: provider.clone(),
+            model: model.to_owned(),
+            account: account.clone(),
+            reason: *reason,
+            retry_after_seconds: ((*until - at).ceil() as u64).max(1),
+        }
+        .into());
+    }
     let (intent, accounts) = match &pinned {
         Some(account) => {
             let Some(factor) = usable.get(account) else {
@@ -603,7 +661,24 @@ pub fn provider_candidates_at(
         }
         None => (SelectionIntent::Auto, usable),
     };
-    let ordering = score_lane(&snapshot.facts, &accounts, &lane, at)?;
+    // Ordered weights express sequence, not quota-score multipliers. Use
+    // neutral weights to classify capacity without overflowing a score and
+    // exclude only the same exhausted/unavailable evidence as usual.
+    let neutral: BTreeMap<_, _> = if definition.ordered_accounts {
+        accounts
+            .keys()
+            .cloned()
+            .map(|account| (account, 1.0))
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+    let scoring = if definition.ordered_accounts {
+        &neutral
+    } else {
+        &accounts
+    };
+    let ordering = score_lane(&snapshot.facts, scoring, &lane, at)?;
     let mut candidates: Vec<QuotaCandidate> = Vec::new();
     let mut rank: u32 = 0;
     let mut previous_priority: Option<f64> = None;
@@ -651,11 +726,34 @@ pub fn provider_candidates_at(
                 "provider quota priority overflowed a finite number",
             ));
         }
-        if let Some((account, _)) = exhausted.iter().min_by(|a, b| {
+        let soonest_block = blocked.into_iter().min_by(|a, b| a.1.1.total_cmp(&b.1.1));
+        let soonest_quota = exhausted.iter().min_by(|a, b| {
             (a.1.is_none(), a.1.unwrap_or(f64::INFINITY), &a.0)
                 .partial_cmp(&(b.1.is_none(), b.1.unwrap_or(f64::INFINITY), &b.0))
                 .expect("exhaustion resets compare finite against infinity")
-        }) {
+        });
+        if let (Some((account, Some(reset))), Some((_, (_, until)))) =
+            (soonest_quota, &soonest_block)
+            && *reset <= *until
+        {
+            return Err(QuotaAdmissionError::QuotaExhausted {
+                provider: provider.clone(),
+                model: model.to_owned(),
+                account: account.clone(),
+            }
+            .into());
+        }
+        if let Some((account, (reason, until))) = soonest_block {
+            return Err(QuotaAdmissionError::BindingCooldown {
+                provider: provider.clone(),
+                model: model.to_owned(),
+                account,
+                reason,
+                retry_after_seconds: ((until - at).ceil() as u64).max(1),
+            }
+            .into());
+        }
+        if let Some((account, _)) = soonest_quota {
             return Err(QuotaAdmissionError::QuotaExhausted {
                 provider: provider.clone(),
                 model: model.to_owned(),
@@ -668,6 +766,27 @@ pub fn provider_candidates_at(
             model: model.to_owned(),
         }
         .into());
+    }
+    if definition.ordered_accounts {
+        let order: BTreeMap<_, _> = definition
+            .ordered_bindings(model)
+            .iter()
+            .enumerate()
+            .map(|(index, binding)| (binding.account.clone(), index))
+            .collect();
+        if candidates
+            .iter()
+            .any(|candidate| !order.contains_key(&candidate.account))
+        {
+            return Err(invalid(
+                "ordered account is outside the provider model scope",
+            ));
+        }
+        candidates.sort_by_key(|candidate| order[&candidate.account]);
+        for (index, candidate) in candidates.iter_mut().enumerate() {
+            candidate.rank =
+                u32::try_from(index).map_err(|_| invalid("too many ordered provider accounts"))?;
+        }
     }
     let set = QuotaCandidateSet {
         provider: provider.clone(),
@@ -744,13 +863,20 @@ pub fn provider_order_filtered_at(
             .iter()
             .filter(|offering| keep(definition, offering))
         {
-            let usable = current_eligible(
+            let mut usable = current_eligible(
                 &snapshot,
                 catalog,
                 definition,
                 &eligible_accounts(definition, &offering.id),
                 hard_ineligible,
             );
+            usable.retain(|account, _| snapshot.cooldown(&definition.id, account, at).is_none());
+            // Ordered binding multipliers choose fallback order, not quota weight.
+            if definition.ordered_accounts {
+                for multiplier in usable.values_mut() {
+                    *multiplier = 1.0;
+                }
+            }
             let ordering = score_lane(&snapshot.facts, &usable, model_lane(offering), at)?;
             let mut best_priority: Option<f64> = None;
             let mut status_rank: u8 = 4;

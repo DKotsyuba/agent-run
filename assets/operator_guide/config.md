@@ -34,6 +34,17 @@ label = "main"
 account = "acct-codex-native"
 ```
 
+For a Claude custom Messages provider with `limits_source = "none"`,
+`ordered_accounts = true` orders bindings by descending
+`priority_multiplier` (declaration order breaks ties). A binding may select a
+separate native Claude login with `connection = { kind = "native" }` and a
+registered `named:claude-code:<label>` account. Billing failure on a custom
+binding or an authoritative quota rejection can continue the verified session
+on the next binding; pinned runs never switch. Billing is not proof of a zero
+balance, and without a collector each new task tries the first eligible binding
+again. An unproven input, unfinished tool or unconfirmed cleanup stops the
+handoff. See `docs/provider-config-v2.md` for the complete example.
+
 Quota collection executes the configured command and literal arguments.
 Python, Bash and native programs share one JSON stdin/stdout contract. Stdin
 contains account identity, explicit model scope, time and protected authentication

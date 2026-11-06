@@ -340,6 +340,8 @@ struct Claim {
     bridge_intent: Option<agent_run_domain::bridge::BridgeIntent>,
     /// Sticky possible custody effect; a later refusal cannot erase it.
     bridge_unknown: bool,
+    /// Frozen warning route for a paired restart result, if one was prepared.
+    restart_before: Option<agent_run_domain::bridge::BridgeIntent>,
 }
 
 /// The one trusted delivery shape selected from the durable outbox row.
@@ -352,6 +354,8 @@ enum Payload {
     Pool(agent_run_domain::pool::PoolNotice),
     /// Broker-authored enrollment failure, with no completion/lifecycle claim.
     PoolAttention(agent_run_domain::pool::PoolNotice),
+    /// Broker-authored service restart notice, not tied to an agent.
+    Restart(String),
 }
 
 /// Counts one bounded outbox drain and reports whether another process owns it.
@@ -443,6 +447,10 @@ async fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
     let Some(mut claimed) = claimed else {
         return Ok(None);
     };
+    let restart_before = claimed["payload"]["before_intent"]
+        .as_object()
+        .map(|_| serde_json::from_value(claimed["payload"]["before_intent"].clone()))
+        .transpose()?;
     let payload = &mut claimed["payload"];
     let notice = payload["notice"].take();
     let payload = match payload["kind"].as_str() {
@@ -456,6 +464,13 @@ async fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
         }
         Some("pool") => Payload::Pool(pool_notice(&notice)?),
         Some("pool_attention") => Payload::PoolAttention(pool_notice(&notice)?),
+        Some("restart") => Payload::Restart(
+            notice
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .ok_or_else(|| invalid("invalid restart notice"))?
+                .to_owned(),
+        ),
         _ => return Err(invalid("invalid claimed delivery payload")),
     };
     Ok(Some(Claim {
@@ -474,6 +489,7 @@ async fn claim(home: &Path, owner: &str) -> Result<Option<Claim>> {
             .map(|_| serde_json::from_value(claimed["bridge_intent"].clone()))
             .transpose()?,
         bridge_unknown: claimed["bridge_unknown"].as_bool().unwrap_or(false),
+        restart_before,
     }))
 }
 
@@ -692,6 +708,17 @@ mod tests {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+
+    /// Billing failures name the provider issue without claiming a known balance.
+    #[test]
+    fn billing_guidance_does_not_report_an_unknown_failure() {
+        let (_, reason, advice) =
+            super::guidance(crate::domain::Status::Failed, Some("billing_unavailable"))
+                .unwrap()
+                .unwrap();
+        assert!(reason.contains("billing problem") && reason.contains("not established"));
+        assert!(advice.contains("fallback status"));
+    }
 
     /// Known persistence categories must not fall back to an unknown failure
     /// or turn a failed checkpoint write into a claim of lost process ownership.

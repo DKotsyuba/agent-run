@@ -115,6 +115,7 @@ fn admission_commits_and_replays_by_request() {
             config_revision: "cfg".into(),
             identity: json!({}),
             parent: None,
+            restart_id: None,
         })
     };
     let envelope = f.local(admit());

@@ -66,6 +66,75 @@ account = "acct-glm"
     )
 }
 
+/// Ordered Claude bindings are opt-in and leave legacy normalized snapshots unchanged.
+#[test]
+fn ordered_accounts_preserve_snapshots_and_validate_connections() {
+    let home = tempfile::tempdir().unwrap();
+    let text = document(home.path());
+    let legacy = ProviderConfig::parse(&text, home.path()).unwrap();
+    let legacy_json = serde_json::to_value(&legacy).unwrap();
+    for provider in legacy_json["providers"].as_object().unwrap().values() {
+        assert!(provider.get("ordered_accounts").is_none());
+        assert!(
+            provider["bindings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|binding| binding.get("connection").is_none())
+        );
+    }
+    let explicit_false = text.replace(
+        "[providers.glm]",
+        "[providers.glm]\nordered_accounts = false",
+    );
+    let restored = ProviderConfig::parse(&explicit_false, home.path()).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&legacy).unwrap(),
+        serde_json::to_vec(&restored).unwrap()
+    );
+    assert_eq!(legacy.snapshot().unwrap(), restored.snapshot().unwrap());
+    let reread: ProviderConfig = serde_json::from_value(legacy_json.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&reread).unwrap(), legacy_json);
+    assert_eq!(reread.snapshot().unwrap(), legacy.snapshot().unwrap());
+
+    let ordered = text
+        .replace("[providers.glm]", "[providers.glm]\nordered_accounts = true")
+        .replace("limits_source = \"exec\"\ncollector = { command = \"/bin/bash\", args = [\"/collectors/glm.sh\"] }", "limits_source = \"none\"");
+    let ordered = format!(
+        "{ordered}\n[[providers.glm.bindings]]\nlabel='backup'\naccount='acct-backup'\nconnection={{kind='native'}}\npriority_multiplier=0.5\n"
+    );
+    let config = ProviderConfig::parse(&ordered, home.path()).unwrap();
+    let mut registered = accounts();
+    registered.push(AccountRecord {
+        account_id: "acct-backup".parse().unwrap(),
+        auth_family: "anthropic".parse().unwrap(),
+        secret_ref: "named:claude-code:backup".parse().unwrap(),
+        status: AccountStatus::Enabled,
+    });
+    let catalog = config.resolve_catalog(registered).unwrap();
+    let definition = catalog.provider(&"glm".parse().unwrap()).unwrap();
+    assert!(definition.ordered_accounts);
+    assert_eq!(
+        definition.connection_for(&"acct-backup".parse().unwrap(), "glm-5.3"),
+        Some(&ProviderConnection::Native)
+    );
+    let encoded = serde_json::to_value(&config).unwrap();
+    assert_eq!(encoded["providers"]["glm"]["ordered_accounts"], true);
+    let mut catalog_entry = serde_json::to_value(definition).unwrap();
+    catalog_entry.as_object_mut().unwrap().remove("id");
+    assert_eq!(catalog_entry, encoded["providers"]["glm"]);
+
+    for invalid in [
+        ordered.replace("ordered_accounts = true", "ordered_accounts = false"),
+        ordered.replace("account='acct-backup'", "account='acct-glm'"),
+        ordered.replace("connection={kind='native'}", "connection={kind='custom',endpoint='https://other.example',protocol='messages'}"),
+        ordered.replace("connection = { kind = \"custom\", endpoint = \"https://api.example.com/messages\", protocol = \"messages\" }", "connection = { kind = \"native\" }"),
+        ordered.replace("limits_source = \"none\"\n[[providers.glm.models]]", "limits_source = \"exec\"\ncollector = { command = '/bin/bash' }\n[[providers.glm.models]]"),
+    ] {
+        assert!(ProviderConfig::parse(&invalid, home.path()).is_err(), "{invalid}");
+    }
+}
+
 /// The global Fast flag is Codex-only and omission preserves historical normalized snapshots.
 #[test]
 fn harness_fast_mode_defaults_and_validation() {

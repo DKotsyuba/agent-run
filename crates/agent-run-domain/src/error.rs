@@ -16,6 +16,8 @@ pub enum MachineCode {
     /// Every eligible account is authoritatively quota-exhausted until a
     /// known reset; distinct from active-slot `CapacityExhausted`.
     QuotaExhausted,
+    /// A provider binding is temporarily excluded after a native failure.
+    BindingCooldown,
     /// The caller supplied an invalid public value.
     ValidationError,
     /// A derived path escaped its declared owned root.
@@ -34,6 +36,12 @@ pub enum MachineCode {
     BrokerUnavailable,
     /// Answer evidence is malformed, missing, oversized, or inconsistent.
     AnswerIntegrityError,
+    /// The requested receipt no longer identifies the current execution.
+    ExecutionChanged,
+    /// The current answer digest differs from the caller's required fence.
+    AnswerHashMismatch,
+    /// The current execution has no recorded sealed answer.
+    AnswerUnavailable,
     /// A safe runtime failure that has no more specific public category.
     RuntimeError,
     /// Local filesystem or descriptor I/O failed without exposing the source message.
@@ -50,6 +58,7 @@ impl MachineCode {
             Self::SelectionBusy => "selection_busy",
             Self::NoEligibleAccount => "no_eligible_account",
             Self::QuotaExhausted => "quota_exhausted",
+            Self::BindingCooldown => "binding_cooldown",
             Self::ValidationError => "ValidationError",
             Self::PathEscapeError => "PathEscapeError",
             Self::AgentNotFound => "AgentNotFound",
@@ -59,6 +68,9 @@ impl MachineCode {
             Self::Unsupported => "Unsupported",
             Self::BrokerUnavailable => "BrokerUnavailable",
             Self::AnswerIntegrityError => "AnswerIntegrityError",
+            Self::ExecutionChanged => "ExecutionChanged",
+            Self::AnswerHashMismatch => "AnswerHashMismatch",
+            Self::AnswerUnavailable => "AnswerUnavailable",
             Self::RuntimeError => "RuntimeError",
             Self::IOError => "IOError",
             Self::StorageError => "StorageError",
@@ -66,11 +78,12 @@ impl MachineCode {
     }
 
     /// Every public machine code, in declaration order.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 20] = [
         Self::SelectionStale,
         Self::SelectionBusy,
         Self::NoEligibleAccount,
         Self::QuotaExhausted,
+        Self::BindingCooldown,
         Self::ValidationError,
         Self::PathEscapeError,
         Self::AgentNotFound,
@@ -80,6 +93,9 @@ impl MachineCode {
         Self::Unsupported,
         Self::BrokerUnavailable,
         Self::AnswerIntegrityError,
+        Self::ExecutionChanged,
+        Self::AnswerHashMismatch,
+        Self::AnswerUnavailable,
         Self::RuntimeError,
         Self::IOError,
         Self::StorageError,
@@ -186,6 +202,15 @@ pub enum Error {
     /// Verified-answer evidence failed an integrity contract and is never validation.
     #[error("{0}")]
     AnswerIntegrity(String),
+    /// Current execution differs from the required sequence receipt.
+    #[error("current execution differs from the required sequence")]
+    ExecutionChanged,
+    /// Current sealed digest differs from the required answer hash.
+    #[error("current answer differs from the required sha256")]
+    AnswerHashMismatch,
+    /// No sealed answer is recorded for the current execution.
+    #[error("current execution has no sealed answer")]
+    AnswerUnavailable,
     /// Legacy integrity name retained temporarily for existing migration callers.
     #[error("{0}")]
     Integrity(String),
@@ -399,6 +424,9 @@ impl Error {
             Self::QuotaAdmission(QuotaAdmissionError::QuotaExhausted { .. }) => {
                 MachineCode::QuotaExhausted
             }
+            Self::QuotaAdmission(QuotaAdmissionError::BindingCooldown { .. }) => {
+                MachineCode::BindingCooldown
+            }
             Self::Validation(_) | Self::Json(_) => MachineCode::ValidationError,
             Self::PathEscape(_) => MachineCode::PathEscapeError,
             Self::NotFound(_) => MachineCode::AgentNotFound,
@@ -408,6 +436,9 @@ impl Error {
             Self::Unsupported(_) => MachineCode::Unsupported,
             Self::BrokerUnavailable => MachineCode::BrokerUnavailable,
             Self::AnswerIntegrity(_) | Self::Integrity(_) => MachineCode::AnswerIntegrityError,
+            Self::ExecutionChanged => MachineCode::ExecutionChanged,
+            Self::AnswerHashMismatch => MachineCode::AnswerHashMismatch,
+            Self::AnswerUnavailable => MachineCode::AnswerUnavailable,
             Self::Broker {
                 broker_error_code: Some(code),
                 ..

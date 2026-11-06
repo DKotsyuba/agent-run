@@ -10,6 +10,12 @@ never advertises or dispatches operator tools such as `start`, `resume`, `cancel
 `steer` or the operator pool tools.
 Configured work MCPs remain available according to the frozen role. Restricted research excludes configured work MCPs and adds only `save_report`; see [research permissions](research-permissions.md).
 
+An explicit-completion worker also receives `finish` and `health_reply`. For a
+planned service restart, its system message requests `finish` with `status: "done"`
+and an exact first-line marker followed by a summary for continuation. The broker
+accepts that marker only after the active restart has queued the worker's warning;
+an ordinary `finish` retains its usual completion semantics.
+
 The worker uses the tool for material findings, risks, questions or blockers:
 
 ```json

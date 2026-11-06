@@ -717,7 +717,9 @@ impl OwnedProcess {
     ///
     /// Captured identities accumulate in `known` and survive later refreshes, so
     /// a descendant seen while the leader lived is still probed individually by
-    /// `cleanup`. The snapshot counts as *verified* descendant evidence only when
+    /// `cleanup`. On Linux, new group members are captured only while the
+    /// recorded leader is alive; its number may name an unrelated later group.
+    /// The snapshot counts as *verified* descendant evidence only when
     /// the captured leader is itself observably alive: after it exits, a
     /// descendant which left the original process group is reachable through
     /// neither parentage nor the group, so an empty snapshot then proves nothing.
@@ -736,6 +738,9 @@ impl OwnedProcess {
         if leader_state == Some(ProcessState::Alive) {
             self.descendants_observed = true;
         }
+        #[cfg(target_os = "linux")]
+        let leader_owned = leader_state == Some(ProcessState::Alive);
+        #[cfg(not(target_os = "linux"))]
         let leader_owned = matches!(leader_state, Some(ProcessState::Alive | ProcessState::Dead));
         // Expand only from currently verified owned parents, never an unverified reused PID.
         loop {

@@ -22,7 +22,13 @@ pub(super) fn bridge_projection<'a>(
     runtime: &Runtime,
     profile: &Profile,
     explicit_finish: bool,
-) -> Result<Option<(&'a agent_run_config::config::OpenCodeBridgePlugin, &'a str)>> {
+) -> Result<
+    Option<(
+        &'a agent_run_config::config::OpenCodeBridgePlugin,
+        &'a str,
+        &'a str,
+    )>,
+> {
     use agent_run_domain::domain::Constraint;
     let Some(component) = config
         .delivery
@@ -50,16 +56,12 @@ pub(super) fn bridge_projection<'a>(
         .get(crate::native_owner::SETTINGS[0])
         .filter(|path| Path::new(path).is_absolute())
         .ok_or_else(|| invalid("OpenCode Bridge owner channel is missing or relative"))?;
-    if !environment
+    let directory = environment
         .variables
         .get(crate::native_owner::SETTINGS[1])
-        .is_some_and(|path| Path::new(path).is_absolute())
-    {
-        return Err(invalid(
-            "OpenCode Bridge owner directory is missing or relative",
-        ));
-    }
-    Ok(Some((component, channel)))
+        .filter(|path| Path::new(path).is_absolute())
+        .ok_or_else(|| invalid("OpenCode Bridge owner directory is missing or relative"))?;
+    Ok(Some((component, channel, directory)))
 }
 
 /// Rejects unqualified native features instead of silently weakening a role.
@@ -199,7 +201,9 @@ pub fn permissions(profile: &Profile, home: &Path, workdir: &Path) -> Result<Val
 /// `home` stores sealed assets and `workdir` grants editor access; no I/O or
 /// credential lookup occurs. Missing servers/unsupported role features refuse.
 /// `explicit_finish` permits only the configured first-party lifecycle projection;
-/// one-shot and IPC-isolated roles retain an empty plugin list.
+/// one-shot and IPC-isolated roles retain an empty plugin list. Eligible local
+/// MCPs retain their backend behind the first-party per-call metadata transport;
+/// the private worker MCP remains on its original capability-bearing route.
 pub fn render(
     config: &Config,
     runtime: &Runtime,
@@ -210,6 +214,8 @@ pub fn render(
 ) -> Result<Value> {
     validate(runtime, profile)?;
     let permissions = permissions(profile, home, workdir)?;
+    let projection = bridge_projection(config, runtime, profile, explicit_finish)?;
+    let mut native_servers = Vec::new();
     let mut servers = serde_json::Map::new();
     for name in &profile.mcp {
         let server = config
@@ -218,17 +224,32 @@ pub fn render(
             .ok_or_else(|| invalid("OpenCode selected MCP is unavailable"))?;
         let mut command = vec![server.command.to_string_lossy().into_owned()];
         command.extend(server.args.clone());
+        if let Some((_, _, directory)) = projection
+            && name != agent_run_domain::worker::SERVER_NAME
+        {
+            let mut proxy = vec![
+                home.join("bridge-opencode/bridge-hook")
+                    .to_string_lossy()
+                    .into_owned(),
+                "mcp-proxy".to_owned(),
+                directory.to_owned(),
+                name.clone(),
+            ];
+            proxy.extend(command);
+            command = proxy;
+            native_servers.push(name.clone());
+        }
         // Inherit the already filtered child's environment; capability values never enter this file.
         servers.insert(
             name.clone(),
             json!({"type":"local","command":command,"codemode":false}),
         );
     }
-    let plugins: Vec<Value> = bridge_projection(config, runtime, profile, explicit_finish)?
-        .map(|(_, channel)| {
+    let plugins: Vec<Value> = projection
+        .map(|(_, channel, directory)| {
             json!({
                 "package":home.join("bridge-opencode/plugin"),
-                "options":{"channel":channel,"hookCommand":home.join("bridge-opencode/bridge-hook")}
+                "options":{"channel":channel,"hookCommand":home.join("bridge-opencode/bridge-hook"),"contextDirectory":directory,"mcpServers":native_servers}
             })
         })
         .into_iter()
@@ -722,7 +743,7 @@ mod tests {
         let request=serde_json::from_value(json!({"runtime":"opencode","model":"free","profile":"review","task":"canary","workdir":"/workspace"})).unwrap();
         let mut profile=agent_run_config::profiles::parse("+++\nrevision='one'\nwrite=false\nnetwork=false\nallow_external_read_roots=false\nskills=[]\nmcp=[]\nrequired_constraints=[]\n+++\nReview only.",&request).unwrap();
         let mut runtime:Runtime=serde_json::from_value(json!({"enabled":true,"adapter":"opencode","binary":"/usr/bin/true","home":"/native","models":["free"],"environment":"bridge"})).unwrap();
-        let config:Config=serde_json::from_value(json!({"schema_version":1,"delivery":{"bridge":{"registration_socket":"/bridge/ch.sock","core_socket":"/bridge/core.sock","token_file":"/bridge/key","host_id":"local","codex_store":"codex-main","opencode_plugin":{"package":"/bridge/plugin","hook_command":"/bridge/hook"}}},"environments":{"bridge":{"variables":{"BRIDGE_NATIVE_OWNER_CHANNEL":"/bridge/ch.sock","BRIDGE_NATIVE_OWNER_DIRECTORY":"/bridge/owner"}}}})).unwrap();
+        let mut config:Config=serde_json::from_value(json!({"schema_version":1,"delivery":{"bridge":{"registration_socket":"/bridge/ch.sock","core_socket":"/bridge/core.sock","token_file":"/bridge/key","host_id":"local","codex_store":"codex-main","opencode_plugin":{"package":"/bridge/plugin","hook_command":"/bridge/hook"}}},"environments":{"bridge":{"variables":{"BRIDGE_NATIVE_OWNER_CHANNEL":"/bridge/ch.sock","BRIDGE_NATIVE_OWNER_DIRECTORY":"/bridge/owner"}}}})).unwrap();
         let native = render(
             &config,
             &runtime,
@@ -754,6 +775,50 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .is_empty()
+        );
+        config.mcp.insert(
+            "pool".into(),
+            serde_json::from_value(json!({"transport":"stdio","command":"/backend/pool","args":["mcp"],"approval_mode":"approve"})).unwrap(),
+        );
+        config.mcp.insert(
+            agent_run_domain::worker::SERVER_NAME.into(),
+            serde_json::from_value(
+                json!({"transport":"stdio","command":"/backend/worker","approval_mode":"approve"}),
+            )
+            .unwrap(),
+        );
+        profile.mcp = vec!["pool".into(), agent_run_domain::worker::SERVER_NAME.into()];
+        let projected = render(
+            &config,
+            &runtime,
+            &profile,
+            Path::new("/native"),
+            Path::new("/workspace"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            projected["mcp"]["servers"]["pool"]["command"],
+            json!([
+                "/native/bridge-opencode/bridge-hook",
+                "mcp-proxy",
+                "/bridge/owner",
+                "pool",
+                "/backend/pool",
+                "mcp"
+            ])
+        );
+        assert_eq!(
+            projected["mcp"]["servers"][agent_run_domain::worker::SERVER_NAME]["command"],
+            json!(["/backend/worker"])
+        );
+        assert_eq!(
+            projected["plugins"][0]["options"]["mcpServers"],
+            json!(["pool"])
+        );
+        assert_eq!(
+            projected["plugins"][0]["options"]["contextDirectory"],
+            "/bridge/owner"
         );
         for constraint in [Constraint::UnixIpcIsolation, Constraint::McpIpcIsolation] {
             profile.required_constraints = std::collections::BTreeSet::from([constraint]);

@@ -99,6 +99,14 @@ Native process identity and signalling are described in
 
 - **Codex** speaks the app-server protocol, preserves normalized stream deltas,
   and stores the native thread identity for continuation.
+- **OpenCode** seals the configured first-party Bridge native-context ABI 2
+  component and hook into each eligible home. Selected local MCP commands retain
+  their persistent backends behind the protected native-context transport; the
+  private worker MCP stays direct. Original native permission checks and results
+  remain unchanged. The owner directory and private native data store exist before
+  spawn, so immediate identity observation has a canonical store. An older
+  lifecycle-only Bridge component is refused; arbitrary plugins and restricted
+  research/IPC policies remain denied.
 - **Claude Code** uses its native CLI protocol and retains the session identity
   for continuation. The GLM adapter belongs to historical schema-1 runs.
 - Claude CLI background-task notifications are contextual native input. Only the
@@ -129,11 +137,12 @@ require existing canonical directories.
 
 SQLite is the source of truth for agents, events, messages, answers, native
 session lineage, deliveries, cleanup evidence, capacity, and statistics. The
-current schema is version 30. Numbered migrations live in `sql/migrations/`
-and apply transactionally after a pre-version backup. The step to 17 is paired
-with the schema-2 config: ordinary commands and the broker refuse an older
-database with `migration_required` until `agent-run config migrate` runs. A
-binary refuses a database newer than its supported schema.
+current schema is version 34. Numbered migrations live in `sql/migrations/`
+and apply transactionally after a pre-version backup. Ordinary commands and
+the broker refuse an older database with `migration_required` until the paired
+`agent-run config migrate` runs. The step to 17 also introduces the schema-2
+config and account registry. A binary refuses a database newer than its
+supported schema.
 
 The resident broker owns the sole cooperative writer lease. `sqlite-access`
 runs finite SQL callbacks on tokio-rusqlite's thread; accepted job/byte credits
@@ -326,11 +335,11 @@ A sealed native release contains `bin/agent-run`, metadata, checksums, and a
 switches `standalone/current` only after manifest verification, writer
 quiescence, backup, and schema checks.
 
-Release automation publishes a macOS Apple-silicon artifact. macOS is the only
-qualified 0.12.3 release platform. Linux x86-64 remains a visible non-blocking
-validation lane; its release and qualification are deferred. launchd
-integration is built in on macOS. Future Linux deployments use an external
-service manager. A platform-only integration such as launchd fails explicitly
+The release workflow builds separate macOS Apple-silicon and Linux x86-64
+artifacts and requires both native gates. Historical releases contain only
+macOS; Linux qualification remains a candidate until hosted evidence exists.
+launchd integration is built in on macOS. Linux can use the bundled systemd
+service examples. A platform-only integration such as launchd fails explicitly
 where it is unavailable. See [releasing.md](releasing.md).
 
 ## Design invariants

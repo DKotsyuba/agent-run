@@ -334,12 +334,9 @@ pub fn verify_opencode_started(seal: &HistorySeal, root: &Path, session: &str) -
     Ok(())
 }
 
-/// Reports whether the sealed Codex history shows the admitted turn itself:
-/// a `response_item` user `message` whose
-/// `internal_chat_message_metadata_passthrough.turn_id` is exactly `turn`
-/// (the id `turn/start` returned for this attempt) and one of whose
-/// `input_text` items hashes to `input_sha256` (the exact wire input, role
-/// preamble included).
+/// Reports whether sealed native history contains this attempt's admitted input.
+/// Codex binds the `turn/start` id to its exact wire text; Claude binds the
+/// runner-supplied user-message UUID to its single exact text block.
 ///
 /// Provenance is the turn id, never text equality, so an older turn with
 /// identical text (an explicit-resume parent, a repeated control text) can
@@ -348,7 +345,7 @@ pub fn verify_opencode_started(seal: &HistorySeal, root: &Path, session: &str) -
 /// `false` means the turn never reached native history (for example a
 /// usage-limit rejection before the user input was recorded).
 pub fn admitted_turn_recorded(seal: &HistorySeal, turn: &str, input_sha256: &str) -> Result<bool> {
-    if seal.harness != HarnessId::Codex || turn.is_empty() {
+    if !matches!(seal.harness, HarnessId::Codex | HarnessId::ClaudeCode) || turn.is_empty() {
         return Ok(false);
     }
     let bytes = read(&seal.root, &seal.relative)?;
@@ -357,30 +354,54 @@ pub fn admitted_turn_recorded(seal: &HistorySeal, turn: &str, input_sha256: &str
     }
     let text =
         std::str::from_utf8(&bytes).map_err(|_| unavailable("native history is not UTF-8"))?;
+    let mut claude_seen = false;
+    let mut claude_admitted = false;
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         let record: Value = serde_json::from_str(line)
             .map_err(|_| unavailable("native history has a malformed record"))?;
-        let payload = &record["payload"];
-        if record["type"] != "response_item"
-            || payload["type"] != "message"
-            || payload["role"] != "user"
-            || payload["internal_chat_message_metadata_passthrough"]["turn_id"] != turn
-        {
-            continue;
-        }
-        let admitted = payload["content"].as_array().is_some_and(|items| {
-            items.iter().any(|item| {
-                item["type"] == "input_text"
-                    && item["text"]
-                        .as_str()
-                        .is_some_and(|text| fs::sha256(text.as_bytes()) == input_sha256)
-            })
-        });
+        let admitted = match seal.harness {
+            HarnessId::Codex => {
+                let payload = &record["payload"];
+                record["type"] == "response_item"
+                    && payload["type"] == "message"
+                    && payload["role"] == "user"
+                    && payload["internal_chat_message_metadata_passthrough"]["turn_id"] == turn
+                    && payload["content"].as_array().is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item["type"] == "input_text"
+                                && item["text"]
+                                    .as_str()
+                                    .is_some_and(|text| fs::sha256(text.as_bytes()) == input_sha256)
+                        })
+                    })
+            }
+            HarnessId::ClaudeCode => {
+                if record["type"] == "user" && record["uuid"] == turn {
+                    if claude_seen {
+                        return Err(unavailable("native history repeats the admitted user ID"));
+                    }
+                    claude_seen = true;
+                    claude_admitted = record["sessionId"] == seal.session
+                        && record["isSidechain"] != true
+                        && record["message"]["role"] == "user"
+                        && record["message"]["content"]
+                            .as_array()
+                            .is_some_and(|items| {
+                                matches!(items.as_slice(), [item]
+                                if item["type"] == "text"
+                                    && item["text"].as_str().is_some_and(|text|
+                                        fs::sha256(text.as_bytes()) == input_sha256))
+                            });
+                }
+                false
+            }
+            HarnessId::OpenCode => false,
+        };
         if admitted {
             return Ok(true);
         }
     }
-    Ok(false)
+    Ok(claude_admitted)
 }
 
 /// Reads `relative` under `root` through the anchored no-follow directory
@@ -519,9 +540,8 @@ fn codex(records: &[Value], session: &str) -> Result<()> {
     )
 }
 
-/// Claude transcript: every record carrying `sessionId` must name `session`
-/// (at least one must); `tool_use` content opens a lifecycle by `id` that a
-/// later `tool_result` closes by `tool_use_id`.
+/// Claude transcript: every recorded session id must match, real tool calls
+/// must close, and API request snapshots may only repeat known tool events.
 fn claude(records: &[Value], session: &str) -> Result<()> {
     let ids: Vec<&Value> = records
         .iter()
@@ -530,9 +550,11 @@ fn claude(records: &[Value], session: &str) -> Result<()> {
     if ids.is_empty() || ids.iter().any(|id| *id != session) {
         return Err(unavailable("native history belongs to another session"));
     }
+    claude_request_snapshots(records)?;
     lifecycle(
         records
             .iter()
+            .filter(|record| record["type"] != "api-request-blob")
             .filter_map(|record| record["message"]["content"].as_array())
             .flatten()
             .filter_map(|item| match item["type"].as_str()? {
@@ -541,6 +563,87 @@ fn claude(records: &[Value], session: &str) -> Result<()> {
                 _ => None,
             }),
     )
+}
+
+/// Checks repeated API-request tool records against earlier real conversation
+/// events; snapshots cannot introduce or settle a tool call of their own.
+fn claude_request_snapshots(records: &[Value]) -> Result<()> {
+    let mut seen: BTreeMap<(&str, &str), &Value> = BTreeMap::new();
+    let mut conversation = false;
+    for record in records {
+        let snapshot = record["type"] == "api-request-blob";
+        if !snapshot
+            && match &record["message"]["content"] {
+                Value::String(text) => !text.is_empty(),
+                Value::Array(items) => !items.is_empty(),
+                _ => false,
+            }
+        {
+            conversation = true;
+        }
+        let Some(items) = record["message"]["content"].as_array() else {
+            continue;
+        };
+        for item in items {
+            let (kind, id) = match item["type"].as_str() {
+                Some("tool_use") => ("tool_use", item["id"].as_str()),
+                Some("tool_result") => ("tool_result", item["tool_use_id"].as_str()),
+                _ => continue,
+            };
+            if !snapshot {
+                if let Some(id) = id.filter(|id| !id.is_empty()) {
+                    seen.entry((kind, id)).or_insert(item);
+                }
+                continue;
+            }
+            let previous = id
+                .filter(|id| !id.is_empty())
+                .and_then(|id| seen.get(&(kind, id)))
+                .ok_or_else(|| {
+                    unavailable("Claude request snapshot references an unrecorded tool event")
+                })?;
+            if kind == "tool_use" && !same_claude_snapshot_call(previous, item) {
+                return Err(unavailable("Claude request snapshot changes a tool call"));
+            }
+            if kind == "tool_result"
+                && !matches!(
+                    (claude_tool_error(previous), claude_tool_error(item)),
+                    (Some(first), Some(second)) if first == second
+                )
+            {
+                return Err(unavailable(
+                    "Claude request snapshot changes a tool result status",
+                ));
+            }
+        }
+    }
+    if !conversation {
+        return Err(unavailable("Claude history has no conversation messages"));
+    }
+    Ok(())
+}
+
+/// Compares a request-snapshot tool call while ignoring Claude's caller metadata.
+fn same_claude_snapshot_call(first: &Value, second: &Value) -> bool {
+    let (Some(first), Some(second)) = (first.as_object(), second.as_object()) else {
+        return false;
+    };
+    first
+        .iter()
+        .filter(|(key, _)| key.as_str() != "caller")
+        .all(|(key, value)| second.get(key) == Some(value))
+        && second
+            .iter()
+            .filter(|(key, _)| key.as_str() != "caller")
+            .all(|(key, value)| first.get(key) == Some(value))
+}
+
+/// Treats an absent tool-error flag as false; a malformed flag remains unknown.
+fn claude_tool_error(item: &Value) -> Option<bool> {
+    match item.get("is_error") {
+        None => Some(false),
+        Some(value) => value.as_bool(),
+    }
 }
 
 /// Compatibility name for [`seal`] used by the structural unit tests.
@@ -613,6 +716,134 @@ mod tests {
         fs::write(&path, "{\"sessionId\":\"s2\"}\n").unwrap();
         assert!(prove(HarnessId::ClaudeCode, temp.path(), "s1").is_err());
         assert!(prove(HarnessId::ClaudeCode, temp.path(), "../s1").is_err());
+    }
+
+    /// API request snapshots may repeat completed tools, but cannot prove an
+    /// unrecorded call, close a pending call, or weaken the sealed bytes.
+    #[test]
+    fn claude_request_blobs_do_not_replay_or_hide_tool_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("projects/-tmp-work");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s1.jsonl");
+        let record = |kind: &str, item: serde_json::Value| serde_json::json!({"sessionId":"s1","type":kind,"message":{"content":[item]}});
+        let call =
+            serde_json::json!({"type":"tool_use","id":"t1","name":"fixture","input":{"x":1}});
+        let result = serde_json::json!({"type":"tool_result","tool_use_id":"t1","content":"ok"});
+        let blob_call = serde_json::json!({"type":"tool_use","id":"t1","name":"fixture","input":{"x":1},"caller":{"type":"direct"}});
+        let blob_result = serde_json::json!({"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"ok"}]});
+        let write = |records: &[serde_json::Value]| {
+            let body: String = records
+                .iter()
+                .map(|r| format!("{}\n", serde_json::to_string(r).unwrap()))
+                .collect();
+            fs::write(&path, body).unwrap();
+        };
+        let valid = vec![
+            record("assistant", call.clone()),
+            record("user", result.clone()),
+            record("api-request-blob", blob_call.clone()),
+            record("api-request-blob", blob_result.clone()),
+            record("api-request-blob", blob_result.clone()),
+        ];
+        write(&valid);
+        let sealed = seal(HarnessId::ClaudeCode, temp.path(), "s1").unwrap();
+        assert!(verify(&sealed, HarnessId::ClaudeCode, "s1").is_ok());
+        let mut altered = valid.clone();
+        altered[4]["message"]["content"][0]["content"] = serde_json::json!("changed");
+        write(&altered);
+        assert!(verify(&sealed, HarnessId::ClaudeCode, "s1").is_err());
+
+        let mut changed_call = blob_call.clone();
+        changed_call["input"]["x"] = serde_json::json!(2);
+        let mut changed_result = blob_result.clone();
+        changed_result["is_error"] = serde_json::json!(true);
+        let mut invalid_result = blob_result.clone();
+        invalid_result["is_error"] = serde_json::json!("invalid");
+        let mut wrong_session = record("api-request-blob", blob_result.clone());
+        wrong_session["sessionId"] = serde_json::json!("s2");
+        let cases = [
+            vec![record(
+                "api-request-blob",
+                serde_json::json!({"type":"text","text":"snapshot only"}),
+            )],
+            vec![
+                serde_json::json!({"sessionId":"s1","type":"progress","message":{}}),
+                record(
+                    "api-request-blob",
+                    serde_json::json!({"type":"text","text":"snapshot only"}),
+                ),
+            ],
+            vec![
+                record("assistant", call.clone()),
+                record("api-request-blob", blob_call.clone()),
+            ],
+            vec![
+                record("api-request-blob", blob_call.clone()),
+                record("api-request-blob", blob_result.clone()),
+            ],
+            vec![
+                record("assistant", call.clone()),
+                record("api-request-blob", blob_result.clone()),
+            ],
+            vec![
+                record("api-request-blob", blob_call.clone()),
+                record("user", result.clone()),
+            ],
+            vec![
+                record("assistant", call.clone()),
+                record("assistant", call.clone()),
+                record("user", result.clone()),
+            ],
+            vec![
+                record("assistant", call.clone()),
+                record("user", result.clone()),
+                record("user", result.clone()),
+            ],
+            vec![
+                record("user", result.clone()),
+                record("assistant", call.clone()),
+            ],
+            vec![
+                record("assistant", call.clone()),
+                record("user", result.clone()),
+                record("api-request-blob", changed_call),
+            ],
+            vec![
+                record("assistant", call.clone()),
+                record("user", result.clone()),
+                record("api-request-blob", changed_result),
+            ],
+            vec![
+                record("assistant", call.clone()),
+                record("user", result.clone()),
+                record("api-request-blob", invalid_result),
+            ],
+            vec![
+                record("assistant", call.clone()),
+                record("user", result.clone()),
+                record("api-request-blob", serde_json::json!({"type":"tool_use"})),
+            ],
+            vec![
+                record("assistant", call.clone()),
+                record("user", result.clone()),
+                record("api-request-blob", blob_call.clone()),
+                record("assistant", call.clone()),
+            ],
+            vec![
+                record("assistant", call.clone()),
+                record("user", result.clone()),
+                wrong_session,
+            ],
+        ];
+        for records in cases {
+            write(&records);
+            assert!(seal(HarnessId::ClaudeCode, temp.path(), "s1").is_err());
+        }
+        write(&[serde_json::json!({
+            "sessionId":"s1", "type":"user", "message":{"content":"plain task"}
+        })]);
+        assert!(seal(HarnessId::ClaudeCode, temp.path(), "s1").is_ok());
     }
 
     /// A result preceding its tool call cannot prove that later call finished.
@@ -762,6 +993,58 @@ mod tests {
         let pending = "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"call_id\":\"c1\"}}\n";
         fs::write(&path, format!("{meta}{}{pending}", user("new-turn"))).unwrap();
         assert!(super::seal(HarnessId::Codex, temp.path(), "s1").is_err());
+    }
+
+    /// Claude continuation proves the runner's exact UUID and UTF-8 input,
+    /// never an identical older message, sidechain or request snapshot.
+    #[test]
+    fn claude_admitted_input_requires_exact_user_identity_and_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("projects/-tmp-work");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s1.jsonl");
+        let input = "fixture:exact\ninput ☃";
+        let digest = crate::fs::sha256(input.as_bytes());
+        let user = |id: &str| {
+            serde_json::json!({"type":"user","sessionId":"s1","uuid":id,"isSidechain":false,
+                "message":{"role":"user","content":[{"type":"text","text":input}]}})
+        };
+        let write = |records: &[serde_json::Value]| {
+            let body: String = records
+                .iter()
+                .map(|record| format!("{}\n", serde_json::to_string(record).unwrap()))
+                .collect();
+            fs::write(&path, body).unwrap();
+        };
+        write(&[user("older"), user("current")]);
+        let sealed = seal(HarnessId::ClaudeCode, temp.path(), "s1").unwrap();
+        assert!(super::admitted_turn_recorded(&sealed, "current", &digest).unwrap());
+        assert!(!super::admitted_turn_recorded(&sealed, "different", &digest).unwrap());
+        assert!(
+            !super::admitted_turn_recorded(&sealed, "current", &crate::fs::sha256(b"other"))
+                .unwrap()
+        );
+
+        let mut sidechain = user("current");
+        sidechain["isSidechain"] = serde_json::json!(true);
+        let mut blob = user("current");
+        blob["type"] = serde_json::json!("api-request-blob");
+        let mut multiple = user("current");
+        multiple["message"]["content"] = serde_json::json!([
+            {"type":"text","text":input}, {"type":"text","text":"extra"}
+        ]);
+        for record in [sidechain, blob, multiple] {
+            write(&[user("older"), record]);
+            let sealed = seal(HarnessId::ClaudeCode, temp.path(), "s1").unwrap();
+            assert!(!super::admitted_turn_recorded(&sealed, "current", &digest).unwrap());
+        }
+        write(&[user("current"), user("current")]);
+        let repeated = seal(HarnessId::ClaudeCode, temp.path(), "s1").unwrap();
+        assert!(super::admitted_turn_recorded(&repeated, "current", &digest).is_err());
+        write(&[user("current")]);
+        let sealed = seal(HarnessId::ClaudeCode, temp.path(), "s1").unwrap();
+        write(&[user("older")]);
+        assert!(super::admitted_turn_recorded(&sealed, "current", &digest).is_err());
     }
     /// Creates only the native tables the version-pinned read-only proof needs.
     /// The connection stays open so the test can exercise an authoritative WAL.

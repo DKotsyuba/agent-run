@@ -4,8 +4,8 @@ use agent_run_domain::{ArgumentDefault, registry, tool, tools_json};
 use serde_json::Value;
 
 /// Tools added after the frozen Python table: the guide read and the five
-/// cooperative-pool operator tools and native integration read, pinned separately.
-const ADDITIVE: [&str; 7] = [
+/// cooperative-pool operator tools and native integration and observation reads, pinned separately.
+const ADDITIVE: [&str; 9] = [
     "delegation_guide",
     "start_pool",
     "pool_post",
@@ -13,7 +13,49 @@ const ADDITIVE: [&str; 7] = [
     "pool",
     "list_pools",
     "agent_integration",
+    "capabilities",
+    "answer_chunk",
 ];
+
+/// Observation methods share strict schemas, stable errors and read-only hints;
+/// no private worker capability gains these operator reads.
+#[test]
+fn observation_tools_declare_strict_read_contracts() {
+    use agent_run_domain::{Error, MachineCode};
+    for name in ["capabilities", "answer_chunk"] {
+        let tool = tool(name).unwrap();
+        assert!(tool.annotations.read_only_hint);
+        assert!(!tool.annotations.open_world_hint);
+        assert_eq!(tool.input_schema["additionalProperties"], false);
+        assert!(tool.output_schema.is_some());
+        assert!(
+            !agent_run_domain::tools::worker_registry()
+                .iter()
+                .any(|t| t.name == name)
+        );
+    }
+    let chunk = tool("answer_chunk").unwrap();
+    assert_eq!(
+        chunk
+            .arguments()
+            .iter()
+            .find(|a| a.name == "max_bytes")
+            .unwrap()
+            .default,
+        Some(ArgumentDefault::Integer(65536))
+    );
+    for (error, code) in [
+        (Error::ExecutionChanged, MachineCode::ExecutionChanged),
+        (Error::AnswerHashMismatch, MachineCode::AnswerHashMismatch),
+        (Error::AnswerUnavailable, MachineCode::AnswerUnavailable),
+    ] {
+        assert_eq!(error.machine_code(), code);
+        assert_eq!(MachineCode::from_wire(code.as_str()), Some(code));
+        assert_eq!(error.rpc_code(), -32000);
+        assert_eq!(error.public().kind, code.as_str());
+        assert!(chunk.error_classes().contains(&code));
+    }
+}
 
 /// Parses the captured Python discovery payload shared by all registry assertions.
 fn golden() -> Vec<Value> {
@@ -35,7 +77,7 @@ fn registry_matches_python_golden_field_by_field() {
         .map(|definition| serde_json::to_value(definition).unwrap())
         .filter(|tool| !ADDITIVE.contains(&tool["name"].as_str().unwrap_or_default()))
         .collect();
-    assert_eq!(tools_json().len(), 16);
+    assert_eq!(tools_json().len(), 18);
     for (name, canonical) in [("models", "delegation_guide"), ("capacity_order", "limits")] {
         assert_eq!(tool(name).unwrap().legacy_for.as_deref(), Some(canonical));
         assert!(!tools_json().iter().any(|entry| entry["name"] == name));

@@ -326,7 +326,26 @@ async fn background_notification_rejects_session_rebind_with_safe_reason() {
             "origin":{"kind":"task-notification","producer":"session-task"},
             "message":{"role":"user","content":"PRIVATE_NOTIFICATION_TEXT"}}),
     ];
-    let mut process = Process::spawn(&fake_engine(&home.path, &lines)).unwrap();
+    // Keep the fixture alive until ownership is captured; an immediately exiting
+    // cat can legitimately leave descendant cleanup unverified.
+    let mut plan = fake_engine(&home.path, &lines);
+    let stream_file = plan.args.remove(0);
+    plan.binary = "/bin/sh".into();
+    plan.args = vec![
+        "-c".into(),
+        "read -r ready; exec /bin/cat \"$1\"".into(),
+        "fixture".into(),
+        stream_file,
+    ];
+    let mut process = Process::spawn(&plan).unwrap();
+    assert!(
+        process
+            .owner
+            .snapshot()
+            .is_some_and(|snapshot| snapshot.descendants_observed),
+        "fixture must be observed alive before replay"
+    );
+    process.text("ready\n").await.unwrap();
     let result = stream::run(&mut process, &mut persist, &record, &record, None).await;
     persist.flush().await.unwrap();
     let cleanup = process

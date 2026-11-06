@@ -191,9 +191,28 @@ pub fn commit_terminal(
     };
     from.transition(to)?;
     let time = now();
+    let technical_restart: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM service_restart_agents a JOIN service_restarts r ON r.id=a.restart_id \
+         WHERE a.agent_id=? AND r.phase='preparing' AND r.finished_at IS NULL AND a.resume_status<>'cancelled' AND \
+         (EXISTS(SELECT 1 FROM events e WHERE e.agent_id=a.agent_id \
+           AND e.kind='worker_finish_accepted_v1' AND json_extract(e.data_json,'$.service_restart_id')=r.id) \
+          OR (a.force_requested_ns IS NOT NULL AND NOT EXISTS(SELECT 1 FROM worker_lifecycle l \
+            JOIN attempts t ON t.id=l.attempt_id WHERE t.agent_id=a.agent_id AND t.ownership_active=1 \
+            AND l.finish_json IS NOT NULL))))",
+        [id.as_str()], |row| row.get(0),
+    )?;
+    if !technical_restart {
+        // Retain the captured work but never resume an independent completion.
+        tx.execute(
+            "UPDATE service_restart_agents SET resume_status='finished' WHERE agent_id=? AND resume_status='pending' \
+             AND restart_id IN (SELECT id FROM service_restarts WHERE phase='preparing' AND finished_at IS NULL)",
+            [id.as_str()],
+        )?;
+    }
+    let answer = if technical_restart { None } else { proof };
     tx.execute(
         "UPDATE agents SET status=?,finished_at=?,exit_code=?,failure_kind=?,failure_text=?,runtime_session_id=COALESCE(?,runtime_session_id),answer_path=?,answer_bytes=?,answer_sha256=? WHERE id=?",
-        params![to.as_str(), time, outcome.exit_code, outcome.failure_kind, outcome.failure_text, outcome.runtime_session_id, proof.map(|proof| proof.path.to_string_lossy().into_owned()), proof.map(|proof| proof.bytes as i64), proof.map(|proof| proof.sha256.as_str()), id.as_str()],
+        params![to.as_str(), time, outcome.exit_code, outcome.failure_kind, outcome.failure_text, outcome.runtime_session_id, answer.map(|proof| proof.path.to_string_lossy().into_owned()), answer.map(|proof| proof.bytes as i64), answer.map(|proof| proof.sha256.as_str()), id.as_str()],
     )?;
     if let Some(command_id) = pending_cancel {
         tx.execute(
@@ -217,15 +236,20 @@ pub fn commit_terminal(
             params![to.as_str(), time, id.as_str()],
         )?;
     }
-    let event = tx_event(
-        &tx,
-        id,
-        "status",
-        Some(from),
-        Some(to),
-        &json!({"failure_kind":outcome.failure_kind}),
-    )?;
-    delivery::insert_terminal_notice(&tx, id, row.orchestrator_session_id.as_deref(), event, time)?;
+    let mut status_data = json!({"failure_kind":outcome.failure_kind});
+    if technical_restart {
+        status_data["service_restart"] = json!(true);
+    }
+    let event = tx_event(&tx, id, "status", Some(from), Some(to), &status_data)?;
+    if !technical_restart {
+        delivery::insert_terminal_notice(
+            &tx,
+            id,
+            row.orchestrator_session_id.as_deref(),
+            event,
+            time,
+        )?;
+    }
     if let Some(usage) = usage {
         let kind = if usage.get("_source").and_then(Value::as_str) == Some("token_usage_updated") {
             "thread/tokenUsage/updated"

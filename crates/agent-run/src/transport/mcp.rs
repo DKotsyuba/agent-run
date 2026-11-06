@@ -3,8 +3,8 @@ use crate::{Error, Result, cli::CliBroker, dispatch, domain::OrchestratorRef};
 use rmcp::{
     ServerHandler, ServiceExt,
     model::{
-        CallToolRequestParams, CallToolResponse, ErrorData, Implementation, ListToolsResult,
-        PaginatedRequestParams, ServerConfig, Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+        Implementation, ListToolsResult, PaginatedRequestParams, ServerConfig, Tool,
     },
     service::{RequestContext, RoleServer},
 };
@@ -23,6 +23,25 @@ const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// Preserve Python's stable, operator-actionable broker-unavailable wording.
 const BROKER_UNAVAILABLE: &str =
     "agent-run broker is not running; start it with `agent-run api serve` or its launchd job";
+
+/// Return a blocked-start receipt that the existing post-tool hook can bind.
+/// No agent was admitted; the host supplies the caller's session separately.
+fn restart_refusal(tool: &str, error: &Error) -> Option<CallToolResult> {
+    if !matches!(tool, "start" | "start_pool")
+        || error.machine_code() != agent_run_domain::MachineCode::StateTransitionError
+    {
+        return None;
+    }
+    let id = agent_run_store::service_restart::blocked_restart_id(&error.public().message)?;
+    let value = json!({
+        "accepted": false,
+        "agent_run_restart_id": id,
+        "message": "Agent Run is restarting. No agent was started; wait for the restart notice before retrying."
+    });
+    let mut result = CallToolResult::success(vec![ContentBlock::text(value.to_string())]);
+    result.structured_content = Some(value);
+    Some(result)
+}
 
 /// JSON-RPC string IDs must fit this encoded budget (including JSON quotes),
 /// leaving the presenter's 4 KiB envelope reserve ample room for the SDK wrapper.
@@ -357,20 +376,44 @@ impl ServerHandler for Proxy {
             .get("request_id")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        let arguments = Value::Object(arguments);
         let result = match detached_broker_call(
             self.broker.clone(),
             request.name.to_string(),
-            Value::Object(arguments),
+            arguments.clone(),
         )
         .await
         {
-            Ok(value) => crate::transport::mcp_text::public_success_result_with_request(
-                request.name.as_ref(),
-                &value,
-                request_id.as_deref(),
-            ),
+            Ok(mut value) => {
+                if request.name == "answer"
+                    && crate::transport::mcp_text::answer_needs_metadata(&value)
+                    && let Ok(selection) =
+                        detached_broker_call(self.broker.clone(), "_cli_answer".into(), arguments)
+                            .await
+                {
+                    match answer_sequence(&value, &selection) {
+                        Ok(sequence) => value["sequence"] = json!(sequence),
+                        Err(error) => {
+                            return Ok(super::mcp_text::failure_result(
+                                "answer",
+                                &error,
+                                None,
+                                target_id.as_deref(),
+                            )
+                            .into());
+                        }
+                    }
+                }
+                crate::transport::mcp_text::public_success_result_with_request(
+                    request.name.as_ref(),
+                    &value,
+                    request_id.as_deref(),
+                )
+            }
             Err(error) => {
-                if matches!(error, Error::BrokerUnavailable) && request.name != "resume" {
+                if let Some(refusal) = restart_refusal(request.name.as_ref(), &error) {
+                    refusal
+                } else if matches!(error, Error::BrokerUnavailable) && request.name != "resume" {
                     crate::transport::mcp_text::error_result(
                         "BrokerUnavailable",
                         BROKER_UNAVAILABLE,
@@ -387,6 +430,32 @@ impl ServerHandler for Proxy {
         };
         Ok(result.into())
     }
+}
+
+/// Fences supplemental CLI metadata to the answer already read from the broker.
+fn answer_sequence(answer: &Value, selection: &Value) -> Result<u32> {
+    let selected = &selection["answer"];
+    for key in [
+        "agent_id",
+        "status",
+        "available",
+        "path",
+        "size_bytes",
+        "sha256",
+        "relative_path",
+        "kind",
+        "media_type",
+        "proof_version",
+    ] {
+        if answer[key] != selected[key] {
+            return Err(Error::ExecutionChanged);
+        }
+    }
+    selection["sequence"]
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| Error::AnswerIntegrity("answer sequence is unavailable".into()))
 }
 
 /// Classifies SDK-erased malformed supported requests without implementing a
@@ -505,6 +574,43 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// A blocked start remains visibly unaccepted while carrying the receipt
+    /// used by the existing post-tool hook; no agent identity is invented.
+    #[test]
+    fn blocked_start_exposes_a_restart_receipt_without_an_agent() {
+        let error = crate::Error::Transition(agent_run_store::service_restart::blocked_message(7));
+        let result = super::restart_refusal("start", &error).unwrap();
+        let value = result.structured_content.unwrap();
+        assert_eq!(value["accepted"], false);
+        assert_eq!(value["agent_run_restart_id"], 7);
+        assert!(value.get("agent_id").is_none());
+        assert!(super::restart_refusal("answer", &error).is_none());
+        let broker = crate::Error::Broker {
+            message: error.to_string(),
+            broker_error_code: Some("StateTransitionError".into()),
+            broker_error_data: None,
+        };
+        assert!(super::restart_refusal("start", &broker).is_some());
+    }
+
+    /// Supplemental sequence metadata must describe the same sealed execution.
+    #[test]
+    fn answer_sequence_refuses_changed_proof() {
+        let answer = serde_json::json!({
+            "agent_id":"ag-20200101-000000-0000000001", "status":"succeeded",
+            "available":true, "path":"/srv/agents/ag-20200101-000000-0000000001/answer.md",
+            "size_bytes":16078, "sha256":"a".repeat(64), "relative_path":"answer.md",
+            "kind":"agent_answer", "media_type":"text/markdown", "proof_version":2
+        });
+        let mut selection = serde_json::json!({"sequence":1,"answer":answer});
+        assert_eq!(super::answer_sequence(&answer, &selection).unwrap(), 1);
+        selection["answer"]["sha256"] = serde_json::json!("b".repeat(64));
+        assert!(matches!(
+            super::answer_sequence(&answer, &selection),
+            Err(crate::Error::ExecutionChanged)
+        ));
+    }
+
     /// The shared input boundary rejects escaped IDs before an injected
     /// mutating broker call, while a normal opaque ID retains a complete receipt.
     #[tokio::test]

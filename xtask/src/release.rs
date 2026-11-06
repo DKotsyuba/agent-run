@@ -2,6 +2,8 @@
 
 use std::{
     fs, io,
+    io::Write,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -39,6 +41,41 @@ fn files(root: &Path) -> io::Result<Vec<PathBuf>> {
     visit(root, root, &mut result)?;
     result.sort();
     Ok(result)
+}
+
+/// Creates new release directories with no group/other write permissions.
+fn create_directories(path: &Path) -> io::Result<()> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(path)
+}
+
+/// Copies bytes into a new release file without adding access or group/other write bits.
+/// Existing destinations are never replaced or chmodded.
+fn copy_asset(source: &Path, destination: &Path) -> io::Result<()> {
+    let mut input = fs::File::open(source)?;
+    let mode = input.metadata()?.permissions().mode() & 0o755;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(destination)?;
+    io::copy(&mut input, &mut output)?;
+    output.sync_all()
+}
+
+/// Writes one new non-executable release metadata file.
+fn write_asset(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// Creates a sealed legacy release from an already-built native binary.
@@ -94,7 +131,12 @@ fn build_inner(
     installer: Option<&Path>,
     tui: Option<&Path>,
 ) -> Result<PathBuf, String> {
-    if version.trim().is_empty() || version.contains('/') {
+    let mut components = Path::new(version).components();
+    if version.trim().is_empty()
+        || version.contains('/')
+        || !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
         return Err("version must be a nonblank path component".into());
     }
     if !binary.is_file() {
@@ -125,7 +167,7 @@ fn build_inner(
             );
         }
     }
-    for directory in ["collectors", "services"] {
+    for directory in ["collectors", "services", "systemd"] {
         let scripts = scripts_root.join(directory);
         for relative in files(&scripts).map_err(|_| "source asset inventory unavailable")? {
             expected.insert(
@@ -161,29 +203,43 @@ fn build_inner(
         }
         return Ok(release);
     }
-    fs::create_dir_all(release.join("bin")).map_err(|error| error.to_string())?;
-    fs::copy(binary, release.join("bin/agent-run")).map_err(|error| error.to_string())?;
+    create_directories(&output.join("releases")).map_err(|error| error.to_string())?;
+    fs::DirBuilder::new()
+        .mode(0o755)
+        .create(&release)
+        .map_err(|error| error.to_string())?;
+    create_directories(&release.join("bin")).map_err(|error| error.to_string())?;
+    copy_asset(binary, &release.join("bin/agent-run")).map_err(|error| error.to_string())?;
     if let Some(installer) = installer {
-        fs::copy(installer, release.join("bin/agent-run-deploy"))
+        copy_asset(installer, &release.join("bin/agent-run-deploy"))
             .map_err(|error| error.to_string())?;
     }
     if let Some(tui) = tui {
-        fs::copy(tui, release.join("bin/agent-run-tui")).map_err(|error| error.to_string())?;
+        copy_asset(tui, &release.join("bin/agent-run-tui")).map_err(|error| error.to_string())?;
     }
     // External integration scripts remain ordinary files, never embedded executable logic.
-    for directory in ["collectors", "services"] {
+    for directory in ["collectors", "services", "systemd"] {
         let scripts = scripts_root.join(directory);
-        fs::create_dir(release.join(directory)).map_err(|error| error.to_string())?;
+        create_directories(&release.join(directory)).map_err(|error| error.to_string())?;
         for relative in files(&scripts).map_err(|error| error.to_string())? {
             let destination = release.join(directory).join(&relative);
             if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                create_directories(parent).map_err(|error| error.to_string())?;
             }
-            fs::copy(scripts.join(&relative), destination).map_err(|error| error.to_string())?;
+            copy_asset(&scripts.join(&relative), &destination)
+                .map_err(|error| error.to_string())?;
         }
     }
 
-    fs::write(release.join("metadata.json"), metadata).map_err(|error| error.to_string())?;
+    write_asset(&release.join("metadata.json"), metadata.as_bytes())
+        .map_err(|error| error.to_string())?;
+    for (relative, expected_digest) in &expected {
+        if digest(&release.join(relative)).map_err(|_| "copied asset digest unavailable")?
+            != *expected_digest
+        {
+            return Err("release input changed while copying".into());
+        }
+    }
     let manifest = files(&release)
         .map_err(|error| error.to_string())?
         .into_iter()
@@ -196,8 +252,9 @@ fn build_inner(
             ))
         })
         .collect::<Result<String, String>>()?;
-    fs::write(release.join("SHA256SUMS"), manifest).map_err(|error| error.to_string())?;
-    fs::write(release.join("COMPLETE"), "complete\n").map_err(|error| error.to_string())?;
+    write_asset(&release.join("SHA256SUMS"), manifest.as_bytes())
+        .map_err(|error| error.to_string())?;
+    write_asset(&release.join("COMPLETE"), b"complete\n").map_err(|error| error.to_string())?;
     verify(&release)?;
     Ok(release)
 }

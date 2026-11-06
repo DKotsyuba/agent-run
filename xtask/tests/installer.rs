@@ -128,12 +128,22 @@ fn executable(path: &Path, text: &str) {
 fn checksums(remote: &Path, asset: &str) {
     let bytes = fs::read(remote.join(asset)).unwrap();
     let digest = agent_run_platform::fs::sha256(&bytes);
-    let artifacts = serde_json::json!([
-        {"name":asset,"kind":"bundle","target":"aarch64-apple-darwin","size":bytes.len(),"sha256":digest},
-        {"name":"agent-run-1.0.0-source.tar","kind":"source","size":1,"sha256":"b".repeat(64)},
-        {"name":"install.sh","kind":"installer","size":1,"sha256":"b".repeat(64)},
-        {"name":"acceptance.json","kind":"evidence","size":1,"sha256":"b".repeat(64)}
-    ]);
+    let mut artifacts = vec![
+        serde_json::json!({"name":asset,"kind":"bundle","target":"aarch64-apple-darwin","size":bytes.len(),"sha256":digest}),
+        serde_json::json!({"name":"agent-run-1.0.0-source.tar","kind":"source","size":1,"sha256":"b".repeat(64)}),
+        serde_json::json!({"name":"install.sh","kind":"installer","size":1,"sha256":"b".repeat(64)}),
+        serde_json::json!({"name":"acceptance.json","kind":"evidence","size":1,"sha256":"b".repeat(64)}),
+    ];
+    let linux_name = "agent-run-1.0.0-x86_64-unknown-linux-gnu.tar.gz";
+    if let Ok(linux) = fs::read(remote.join(linux_name)) {
+        artifacts.insert(
+            1,
+            serde_json::json!({
+                "name":linux_name, "kind":"bundle", "target":"x86_64-unknown-linux-gnu",
+                "size":linux.len(), "sha256":agent_run_platform::fs::sha256(&linux)
+            }),
+        );
+    }
     let manifest = serde_json::json!({"schema_version":1,"product":"agent-run","version":"1.0.0","tag":"v1.0.0","repository":xtask::delivery::REPOSITORY,"repository_id":xtask::delivery::REPOSITORY_ID,"commit":"a".repeat(40),"workflow":{"id":xtask::delivery::WORKFLOW_ID,"path":xtask::delivery::WORKFLOW_PATH,"run_id":17,"run_attempt":1},"standard_version":"1.0.0-rc.2","devkit_version":"0.2.1","baseline":"rust-macos-2026-09-candidate1","trust_profile":"github-attestation","artifacts":artifacts});
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
     fs::write(remote.join("release-manifest.json"), &manifest_bytes).unwrap();
@@ -399,9 +409,15 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         if !tool_id.exists() || !timer_id.exists() || !sleep_ids.exists() {
+            // Closed startup facts diagnose the fixture without exposing stderr or environment values.
+            let observed = (tool_id.exists(), timer_id.exists(), sleep_ids.exists());
+            let early_exit = child.try_wait().unwrap();
             let _ = child.kill();
             let _ = child.wait();
-            panic!("finite fake gh did not start");
+            panic!(
+                "finite fake gh did not start: tool={}, watchdog={}, sleeps={}, early_exit={early_exit:?}",
+                observed.0, observed.1, observed.2
+            );
         }
         if cancel {
             // SAFETY: this is the owned unreaped bootstrap child, not a persisted PID.
@@ -471,7 +487,7 @@ fn shell_download_and_archive_checks() {
         fs::create_dir(&mocks).unwrap();
         executable(
             &mocks.join("uname"),
-            "#!/bin/sh\ncase $1 in -s) echo \"${TEST_OS:-Darwin}\" ;; -m) echo arm64 ;; esac\n",
+            "#!/bin/sh\ncase $1 in -s) echo \"${TEST_OS:-Darwin}\" ;; -m) echo \"${TEST_ARCH:-arm64}\" ;; esac\n",
         );
         executable(
             &mocks.join(downloader),
@@ -532,6 +548,60 @@ esac
             String::from_utf8_lossy(&success.stderr)
         );
         assert!(fixture.bin.join("agent-run-tui").is_file());
+        let manifest_path = remote.join("release-manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["artifacts"][0]["name"] = "wrong-bundle.tar.gz".into();
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let malformed = run().output().unwrap();
+        assert!(!malformed.status.success());
+        assert!(
+            String::from_utf8_lossy(&malformed.stderr)
+                .contains("release manifest identity/layout mismatch")
+        );
+        checksums(&remote, "agent-run-1.0.0-aarch64-apple-darwin.tar.gz");
+        let missing_linux = run()
+            .env("TEST_OS", "Linux")
+            .env("TEST_ARCH", "x86_64")
+            .output()
+            .unwrap();
+        assert!(!missing_linux.status.success());
+        assert!(
+            String::from_utf8_lossy(&missing_linux.stderr)
+                .contains("no binary for the selected platform")
+        );
+        let linux_name = "agent-run-1.0.0-x86_64-unknown-linux-gnu.tar.gz";
+        fs::write(remote.join(linux_name), b"not an archive").unwrap();
+        checksums(&remote, "agent-run-1.0.0-aarch64-apple-darwin.tar.gz");
+        let invalid_linux = run()
+            .env("TEST_OS", "Linux")
+            .env("TEST_ARCH", "x86_64")
+            .output()
+            .unwrap();
+        assert!(!invalid_linux.status.success());
+        assert!(String::from_utf8_lossy(&invalid_linux.stderr).contains("invalid archive"));
+        fs::copy(
+            remote.join("agent-run-1.0.0-aarch64-apple-darwin.tar.gz"),
+            remote.join(linux_name),
+        )
+        .unwrap();
+        checksums(&remote, "agent-run-1.0.0-aarch64-apple-darwin.tar.gz");
+        let linux = run()
+            .env("TEST_OS", "Linux")
+            .env("TEST_ARCH", "x86_64")
+            .output()
+            .unwrap();
+        assert!(
+            linux.status.success(),
+            "{}",
+            String::from_utf8_lossy(&linux.stderr)
+        );
+        let mac = run().output().unwrap();
+        assert!(
+            mac.status.success(),
+            "{}",
+            String::from_utf8_lossy(&mac.stderr)
+        );
         let refused = run().env("TEST_ATTEST_FAIL", "1").output().unwrap();
         assert!(!refused.status.success());
         assert!(
@@ -551,7 +621,7 @@ esac
         assert!(String::from_utf8_lossy(&bad.stderr).contains("checksum mismatch"));
         let unsupported = run().env("TEST_OS", "Linux").output().unwrap();
         assert!(!unsupported.status.success());
-        assert!(String::from_utf8_lossy(&unsupported.stderr).contains("only macOS"));
+        assert!(String::from_utf8_lossy(&unsupported.stderr).contains("supported platforms"));
         std::os::unix::fs::symlink("/tmp", fixture.candidate.join("unsafe-link")).unwrap();
         let asset = "agent-run-1.0.0-aarch64-apple-darwin.tar.gz";
         assert!(
@@ -769,7 +839,8 @@ fn legacy_and_complete_inventories_still_install() {
 
 /// Child-process entry for the bounded FIFO installer check: with
 /// `AGENT_RUN_FIFO_INSTALL` set to `candidate:prefix:home:bin` it runs the
-/// installer and prints the outcome; otherwise it is a no-op.
+/// installer and prints the outcome on its own line even under serial libtest;
+/// otherwise it is a no-op.
 #[test]
 fn fifo_installer_child_entry() {
     let Some(paths) = std::env::var_os("AGENT_RUN_FIFO_INSTALL") else {
@@ -786,7 +857,7 @@ fn fifo_installer_child_entry() {
         Path::new(bin),
         "1.0.0",
     );
-    println!("OUTCOME:{outcome:?}");
+    println!("\nOUTCOME:{outcome:?}");
 }
 
 /// Asserts a FIFO in place of `seal_file` is refused by the installer promptly, before any

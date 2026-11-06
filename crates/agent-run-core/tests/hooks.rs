@@ -1153,3 +1153,56 @@ async fn advisory_context_bounds_sql_work_and_keeps_the_prepared_active_block() 
         1
     );
 }
+/// A refused first start can use the same post-tool hook without an agent ID.
+#[test]
+fn restart_waiter_uses_the_host_session() {
+    use agent_run_core::hooks::bind::restart_waiter;
+    let receipt = serde_json::json!({"accepted":false,"agent_run_restart_id":7,"message":"wait"});
+    let hook = serde_json::json!({
+        "hook_event_name":"PostToolUse", "session_id":"session-one",
+        "tool_response":{"content":[{"type":"text","text":receipt.to_string()}]}
+    });
+    let (id, reference) = restart_waiter(&hook, "codex_queue").unwrap().unwrap();
+    assert_eq!(id, 7);
+    assert_eq!(reference.external_session_id, "session-one");
+    let mut conflict = hook.clone();
+    conflict["tool_response"]["other"] =
+        serde_json::json!({"accepted":false,"agent_run_restart_id":8});
+    assert!(restart_waiter(&conflict, "codex_queue").is_err());
+}
+
+/// The real broker path stores a first-time blocked caller without an agent.
+#[tokio::test]
+async fn restart_waiter_hook_records_a_first_time_caller() {
+    let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let service =
+        agent_run_core::service::Service::new(home.path.clone()).with_writer(writer.broker());
+    let restart = service.begin_service_restart("hook-restart").await.unwrap();
+    let payload = json!({
+        "hook_event_name":"PostToolUse", "session_id":"first-session",
+        "tool_response":{"accepted":false,"agent_run_restart_id":restart}
+    });
+    for _ in 0..2 {
+        agent_run_core::dispatch::call(
+            &service,
+            "_hook_bind",
+            json!({"payload":payload,"transport":"codex_queue"}),
+        )
+        .await
+        .unwrap();
+    }
+    let store = home.store();
+    assert_eq!(store.conn.query_row(
+        "SELECT COUNT(*) FROM service_restart_recipients WHERE restart_id=? AND external_session_id='first-session' AND tried_start=1",
+        [restart], |row| row.get::<_,i64>(0),
+    ).unwrap(), 1);
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM agents", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}

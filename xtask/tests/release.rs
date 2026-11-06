@@ -16,6 +16,41 @@ use std::fs;
 use tempfile::tempdir;
 use xtask::{deploy, release};
 
+/// Group-writable input does not make newly created release files writable by
+/// other users, and the original input mode is not changed.
+#[test]
+fn release_creates_safe_modes_without_changing_input() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = tempfile::tempdir().unwrap();
+    let binary = fixture.path().join("binary");
+    fs::write(&binary, b"fixture").unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o770)).unwrap();
+    let staged = release::build(fixture.path(), "1.0.0", &binary).unwrap();
+    assert_eq!(
+        fs::metadata(&binary).unwrap().permissions().mode() & 0o777,
+        0o770
+    );
+    let installed_mode = fs::metadata(staged.join("bin/agent-run"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(installed_mode & 0o007, 0, "copy must not add public access");
+    for path in [
+        staged.clone(),
+        staged.join("bin"),
+        staged.join("bin/agent-run"),
+        staged.join("metadata.json"),
+    ] {
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o022, 0);
+    }
+    release::verify(&staged).unwrap();
+    assert!(staged.join("systemd/agent-run.service").is_file());
+    assert!(staged.join("systemd/agent-run-service.sh").is_file());
+    for version in [".", "..", "nested/", "nested/../other"] {
+        assert!(release::build(fixture.path(), version, &binary).is_err());
+    }
+}
+
 /// Mirrors `tests/test_release_script.py::LocalTests::test_complete_and_manifest_gate`.
 #[test]
 fn python_release_incomplete_or_corrupt_never_becomes_current() {

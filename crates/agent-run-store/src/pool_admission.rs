@@ -146,6 +146,7 @@ impl Store<'_> {
             tx.commit()?;
             return Ok(found);
         }
+        crate::service_restart::require_admissions_open(&tx)?;
         if input.members.is_empty() {
             return Err(invalid("pool members must share one orchestrator binding"));
         }
