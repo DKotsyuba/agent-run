@@ -211,6 +211,10 @@ impl Fixture {
         let run = json!({"id":17,"run_attempt":1,"workflow_id":WORKFLOW_ID,"path":WORKFLOW_PATH,"head_sha":manifest.commit,"head_branch":manifest.tag,"event":"push","repository":{"id":REPOSITORY_ID,"full_name":REPOSITORY},"status":"completed","conclusion":"success"});
         record(&temp.path().join("run.json"), &run);
         record(
+            &temp.path().join("jobs.json"),
+            &json!({"total_count":0,"jobs":[]}),
+        );
+        record(
             &temp.path().join("runs.json"),
             &json!({"workflow_runs":[run]}),
         );
@@ -259,6 +263,14 @@ case "$1" in
    repos/DKotsyuba/agent-run) cat "$TEST_FIXTURE/repo.json" ;;
    */actions/workflows/346709607) cat "$TEST_FIXTURE/workflow.json" ;;
    */actions/workflows/*/runs*) cat "$TEST_FIXTURE/runs.json" ;;
+   */actions/runs/17/attempts/1/jobs\?*)
+    if [ "${TEST_JOBS_STALL:-0}" = 1 ]; then
+      count=0; [ ! -f "$TEST_FIXTURE/jobs-count" ] || read count < "$TEST_FIXTURE/jobs-count"
+      count=$((count+1)); printf '%s\n' "$count" > "$TEST_FIXTURE/jobs-count"
+      [ ! -f "$TEST_FIXTURE/completed-run.json" ] || cp "$TEST_FIXTURE/completed-run.json" "$TEST_FIXTURE/run.json"
+      sleep 30; exit 1
+    fi
+    cat "$TEST_FIXTURE/jobs.json" ;;
    */actions/runs/17) cat "$TEST_FIXTURE/run.json" ;;
    */git/ref/tags/*) cat "$TEST_FIXTURE/tag.json" ;;
    */git/tags/*) cat "$TEST_FIXTURE/tag-object.json" ;;
@@ -437,8 +449,13 @@ esac
         self.wait_for(result, notify, "30")
     }
 
-    /// Uses an explicit deadline; the timeout boundary fixture alone requests one second.
+    /// Runs the observer with an explicit deadline.
     fn wait_for(&self, result: &Path, notify: Option<&Path>, timeout: &str) -> Output {
+        self.output(self.wait_command(result, notify, timeout))
+    }
+
+    /// Builds the observer command so fixtures can set additional environment.
+    fn wait_command(&self, result: &Path, notify: Option<&Path>, timeout: &str) -> Command {
         let mut command = self.command();
         command
             .args([
@@ -464,8 +481,100 @@ esac
         if let Some(path) = notify {
             command.arg("--notify-exec").arg(path);
         }
-        self.output(command)
+        command
     }
+}
+
+/// CI progress is reported once per change and never prints unknown job names.
+#[test]
+fn observer_reports_bounded_ci_progress() {
+    let fixture = Fixture::new();
+    let run_path = fixture.temp.path().join("run.json");
+    let mut run: Value = serde_json::from_slice(&fs::read(&run_path).unwrap()).unwrap();
+    run["status"] = json!("in_progress");
+    run["conclusion"] = Value::Null;
+    record(&run_path, &run);
+    record(
+        &fixture.temp.path().join("jobs.json"),
+        &json!({"total_count":5,"jobs":[
+            {"run_id":17,"name":"Verify tag and build source archive","status":"in_progress"},
+            {"run_id":17,"name":"Check and build x86_64-unknown-linux-gnu archive","status":"completed","conclusion":"success"},
+            {"run_id":17,"name":"Build aarch64-apple-darwin archive","status":"completed","conclusion":"cancelled"},
+            {"run_id":17,"name":"Publish verified release","status":"queued"},
+            {"run_id":17,"name":"UNTRUSTED_JOB_NAME","status":"in_progress"}
+        ]}),
+    );
+    let output = fixture.wait_for(&fixture.temp.path().join("progress.json"), None, "8");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(
+            "CI attempt 1: source=running, linux=passed, macos=cancelled, publish=queued"
+        )
+    );
+    assert_eq!(stderr.matches("CI attempt 1:").count(), 1);
+    assert_eq!(stderr.matches("Waiting for exact release").count(), 1);
+    assert!(!stderr.contains("UNTRUSTED_JOB_NAME"));
+}
+
+/// A stalled optional jobs endpoint cannot prevent a later successful release.
+#[test]
+fn observer_bounds_optional_ci_progress_reads() {
+    let fixture = Fixture::new();
+    let run_path = fixture.temp.path().join("run.json");
+    let mut run: Value = serde_json::from_slice(&fs::read(&run_path).unwrap()).unwrap();
+    record(&fixture.temp.path().join("completed-run.json"), &run);
+    run["status"] = json!("in_progress");
+    run["conclusion"] = Value::Null;
+    record(&run_path, &run);
+    fs::copy(
+        fixture.temp.path().join("published.json"),
+        fixture.temp.path().join("release.json"),
+    )
+    .unwrap();
+    let mut command = fixture.wait_command(
+        &fixture.temp.path().join("stalled-progress.json"),
+        None,
+        "30",
+    );
+    command.env("TEST_JOBS_STALL", "1");
+    let output = fixture.output(command);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.temp.path().join("jobs-count"))
+            .unwrap()
+            .trim(),
+        "1"
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("Retrying GitHub read"));
+}
+
+/// Optional progress cannot delay verification after the exact workflow succeeds.
+#[test]
+fn observer_skips_optional_progress_after_ci_succeeds() {
+    let fixture = Fixture::new();
+    fs::copy(
+        fixture.temp.path().join("published.json"),
+        fixture.temp.path().join("release.json"),
+    )
+    .unwrap();
+    let mut command = fixture.wait_command(
+        &fixture.temp.path().join("completed-progress.json"),
+        None,
+        "30",
+    );
+    command.env("TEST_JOBS_STALL", "1");
+    let output = fixture.output(command);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!fixture.temp.path().join("jobs-count").exists());
 }
 
 /// Real observer control flow checks hashes/final identity and finite ACK handling.

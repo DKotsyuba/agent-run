@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+- feat(release): report CI job progress while observing an exact release.
+
 ## 0.30.0
 
 - feat(runtime): support planned service restarts with temporary agent finishes,
