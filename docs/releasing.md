@@ -124,7 +124,10 @@ bounded discovery refuses ambiguous candidates. It checks repository/tag/run
 identity, the published stable release, manifest and every artifact's size/hash,
 then rechecks identity. A monotonic deadline bounds API calls, downloads and
 polling. It writes one final JSON to stdout and a create-new mode-0600 result;
-progress goes to stderr. Existing result paths are never overwritten.
+progress goes to stderr, including changes to the source, Linux, macOS and
+publication jobs for the selected attempt. Existing result paths are never overwritten.
+To use a trusted prebuilt observer without rebuilding, set
+`AGENT_RUN_RELEASE_WATCH_XTASK` to its absolute path before running the script.
 
 The event explicitly reports `installed=false`, `agent_awakened=false` and
 provenance verification `not_performed`: integrity observation is not permission

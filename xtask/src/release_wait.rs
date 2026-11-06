@@ -554,6 +554,62 @@ pub(crate) fn validate_run(
     Ok(true)
 }
 
+/// Summarizes known jobs from this run without printing untrusted GitHub text.
+fn ci_progress(value: &Value, run_id: u64) -> Option<String> {
+    let jobs = value["jobs"].as_array()?;
+    if jobs.len() > 100 || value["total_count"].as_u64()? > 100 {
+        return None;
+    }
+    let known = [
+        ("Verify tag and build source archive", "source"),
+        ("Check and build x86_64-unknown-linux-gnu archive", "linux"),
+        ("Build aarch64-apple-darwin archive", "macos"),
+        ("Publish verified release", "publish"),
+    ];
+    let mut progress = Vec::new();
+    for (name, label) in known {
+        let mut matching = jobs.iter().filter(|job| job["name"] == name);
+        let Some(job) = matching.next() else { continue };
+        if matching.next().is_some() || job["run_id"] != run_id {
+            return None;
+        }
+        let state = match (job["status"].as_str(), job["conclusion"].as_str()) {
+            (Some("queued" | "waiting" | "pending" | "requested"), _) => "queued",
+            (Some("in_progress"), _) => "running",
+            (Some("completed"), Some("success")) => "passed",
+            (Some("completed"), Some("cancelled")) => "cancelled",
+            (Some("completed"), Some("skipped")) => "skipped",
+            (
+                Some("completed"),
+                Some("failure" | "timed_out" | "startup_failure" | "action_required"),
+            ) => "failed",
+            _ => "unknown",
+        };
+        progress.push(format!("{label}={state}"));
+    }
+    (!progress.is_empty()).then(|| progress.join(", "))
+}
+
+/// Reads optional job progress once, within two seconds, without retry diagnostics.
+fn ci_jobs(root: &Path, workflow: &Workflow, deadline: Instant) -> Result<Option<String>, Failure> {
+    let path = format!(
+        "repos/{REPOSITORY}/actions/runs/{}/attempts/{}/jobs?per_page=100",
+        workflow.run_id, workflow.run_attempt
+    );
+    let args = ["api", "--hostname", "github.com", &path, "--method", "GET"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let response = delivery::run("gh", &args, root, budget(deadline, 2)?);
+    budget(deadline, 1)?;
+    Ok(match response {
+        Ok((0, out, _)) => serde_json::from_slice(&out)
+            .ok()
+            .and_then(|jobs| ci_progress(&jobs, workflow.run_id)),
+        _ => None,
+    })
+}
+
 /// Discovers at most five pages; multiple exact candidates fail closed, never latest.
 fn discover(root: &Path, o: &Options, deadline: Instant) -> Result<Option<Workflow>, Failure> {
     let mut candidates = Vec::new();
@@ -767,6 +823,8 @@ fn observe(root: &Path, o: &Options, w: &mut Option<Workflow>) -> Result<String,
     let deadline = Instant::now() + o.timeout;
     preflight(root, deadline)?;
     let mut original_tag = None;
+    let mut last_progress = None;
+    let mut announced_waiting = false;
     loop {
         budget(deadline, 30)?;
         if let Some(current) = tag(root, &o.tag, &o.commit, deadline)? {
@@ -785,7 +843,19 @@ fn observe(root: &Path, o: &Options, w: &mut Option<Workflow>) -> Result<String,
                     false,
                 )?
                 .ok_or_else(|| failure(5, "run disappeared"))?;
-                if validate_run(&run, workflow, &o.tag, &o.commit)?
+                let completed = validate_run(&run, workflow, &o.tag, &o.commit)?;
+                let progress = if completed {
+                    Some("passed".to_owned())
+                } else {
+                    ci_jobs(root, workflow, deadline)?
+                };
+                if let Some(progress) = progress
+                    && last_progress.as_ref() != Some(&progress)
+                {
+                    eprintln!("CI attempt {}: {progress}", workflow.run_attempt);
+                    last_progress = Some(progress);
+                }
+                if completed
                     && let Some(release) = api(
                         root,
                         &format!("repos/{REPOSITORY}/releases/tags/{}", o.tag),
@@ -868,7 +938,10 @@ fn observe(root: &Path, o: &Options, w: &mut Option<Workflow>) -> Result<String,
         } else if original_tag.is_some() {
             return Err(failure(5, "tag disappeared during wait"));
         }
-        eprintln!("Waiting for exact release {}", o.tag);
+        if !announced_waiting {
+            eprintln!("Waiting for exact release {}", o.tag);
+            announced_waiting = true;
+        }
         let until = Instant::now() + o.interval.min(budget(deadline, 300)?);
         while Instant::now() < until {
             budget(deadline, 1)?;
