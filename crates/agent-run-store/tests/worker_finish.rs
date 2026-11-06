@@ -246,7 +246,7 @@ fn callback_authority_and_validation_are_closed() {
 
 /// Migration from an exact historical schema 28 (the current schema with the
 /// schema-29 lifecycle, schema-30 writer, schema-31 Bridge and schema-33
-/// cooldown tables and columns removed) through every later migration leaves
+/// cooldown and schema-35 restart tables and columns removed) through every later migration leaves
 /// legacy request JSON intact and adds no implicit lifecycle/finish state.
 #[test]
 fn migration_28_to_29_preserves_legacy_requests() {
@@ -262,7 +262,7 @@ fn migration_28_to_29_preserves_legacy_requests() {
     store
         .conn
         .execute_batch(
-            "DROP TABLE maintenance_resumes; DROP TABLE maintenance_parks; DROP TABLE maintenance_checkpoints; DROP TABLE maintenance_recipients; DROP TABLE maintenance_cohort; DROP TABLE maintenance_fences; \
+            "DROP TABLE service_restart_notices; DROP TABLE service_restart_recipients; DROP TABLE service_restart_agents; DROP TABLE service_restarts; \
              DROP TABLE binding_cooldowns; \
              DROP TABLE worker_native_wakes; DROP TABLE worker_lifecycle; \
              DROP TABLE operation_receipts; DROP TABLE writer_producers; DROP TABLE writer_authority; \

@@ -586,23 +586,6 @@ impl Process {
         input.flush().await?;
         Ok(())
     }
-    /// Report already buffered native work without discarding or reordering it.
-    /// This is a conservative check only: an empty queue does not prove that
-    /// the OS pipe, reader task or external side effects have settled.
-    pub fn has_buffered_events(&mut self) -> bool {
-        if self.primary_exited || self.ownership_failure.is_some() || !self.backlog.is_empty() {
-            return true;
-        }
-        match self.events.try_recv() {
-            Ok(event) => {
-                self.backlog.push_back(event);
-                true
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => false,
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => true,
-        }
-    }
-
     /// Returns a retained notification or observes stdout and the primary PID together.
     pub async fn next(&mut self) -> Event {
         // A control exchange retained this first cause while returning an

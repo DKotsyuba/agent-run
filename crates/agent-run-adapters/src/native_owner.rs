@@ -410,7 +410,6 @@ mod tests {
             .unwrap_or_else(std::env::temp_dir);
         tempfile::tempdir_in(base.canonicalize().unwrap()).unwrap()
     }
-
     /// One exact typed owner request with fixed synthetic process identity.
     fn request() -> Request {
         Request {

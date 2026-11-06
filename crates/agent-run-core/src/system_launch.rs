@@ -40,70 +40,6 @@ impl ResumePreflightFailure {
     }
 }
 
-/// A fixed parked source to inspect under its original account. No private
-/// path, checkpoint text, credentials or replacement authority is accepted.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MaintenancePreflightRequest {
-    /// Open maintenance epoch which captured the logical execution.
-    pub epoch: i64,
-    /// Exact logical execution, unchanged by the requested continuation.
-    pub execution: AgentId,
-    /// Parked attempt whose private history must be verified.
-    pub source_attempt_id: String,
-    /// Immutable store-side proof binding that source and its authority.
-    pub source_proof_sha256: String,
-}
-
-impl MaintenancePreflightRequest {
-    /// Validate bounded identifiers before any worker socket or filesystem access.
-    pub fn validate(&self) -> Result<()> {
-        if self.epoch <= 0
-            || self.source_attempt_id.is_empty()
-            || self.source_attempt_id.len() > 256
-            || self.source_attempt_id.chars().any(char::is_control)
-            || self.source_proof_sha256.parse::<Sha256Digest>().is_err()
-        {
-            return Err(invalid("invalid maintenance preflight request"));
-        }
-        Ok(())
-    }
-}
-
-/// Bounded account-worker observation returned to the broker. It discloses no
-/// private paths or native history and is not a launch or allocation permission.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MaintenancePreflightResult {
-    /// The exact proof requested, rechecked after the worker's reads.
-    pub source_proof_sha256: String,
-    /// Digest of the native history bytes verified under the worker account.
-    pub verified_history_sha256: String,
-    /// Kernel observation of the recorded old supervisor generation.
-    pub supervisor_state: agent_run_platform::process::ProcessState,
-}
-
-impl MaintenancePreflightResult {
-    /// A worker reply can confirm only exact source identity and proven death.
-    pub fn validate_for(&self, request: &MaintenancePreflightRequest) -> Result<()> {
-        request.validate()?;
-        if self.source_proof_sha256 != request.source_proof_sha256
-            || self
-                .verified_history_sha256
-                .parse::<Sha256Digest>()
-                .is_err()
-            || !matches!(
-                self.supervisor_state,
-                agent_run_platform::process::ProcessState::Dead
-                    | agent_run_platform::process::ProcessState::Reused
-            )
-        {
-            return Err(invalid("invalid maintenance preflight result"));
-        }
-        Ok(())
-    }
-}
-
 /// Broker-evaluated policy for the frozen eligible accounts, in their stored
 /// order. No current configuration, paths, credential references or values
 /// cross the group socket.
@@ -235,20 +171,6 @@ pub trait SystemLauncher: Send + Sync {
         Box::pin(async {
             Err(crate::Error::Unsupported(
                 "continuation_unavailable: system preflight is unavailable".into(),
-            ))
-        })
-    }
-
-    /// Verify an exact nonterminal parked source under its frozen account UID.
-    /// This is separate from ordinary terminal-parent resume and never launches.
-    fn preflight_maintenance_resume(
-        &self,
-        _request: MaintenancePreflightRequest,
-        _route: SystemRoute,
-    ) -> Pin<Box<dyn Future<Output = Result<MaintenancePreflightResult>> + Send + 'static>> {
-        Box::pin(async {
-            Err(crate::Error::Unsupported(
-                "continuation_unavailable: maintenance worker preflight is unavailable".into(),
             ))
         })
     }

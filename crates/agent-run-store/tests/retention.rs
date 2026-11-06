@@ -139,80 +139,26 @@ fn retention_protects_active_ownership_lineage_and_exact_age_boundary() {
     integrity(&store);
 }
 
-/// Captured work may finish while the service prepares to restart. Retention
-/// keeps it through the open fence and resumes ordinary expiry after release.
+/// In-progress restarts retain their source; completed cycles retain unsent
+/// notices without pinning the expired agent or its private history.
 #[test]
-fn maintenance_fence_keeps_completed_cohort_until_released() {
+fn retention_preserves_restart_work_and_pending_notices() {
     let home = common::Home::new();
     let mut store = home.store();
-    let cutoff = NOW - HISTORY_SECONDS;
-    let captured = agent(&home, &mut store, "running", None);
-    let unrelated = agent(&home, &mut store, "succeeded", Some(cutoff - 1.0));
-    let fence = store
-        .begin_maintenance_fence("retention-test", NOW - 100.0)
-        .unwrap();
-    store.conn.execute(
-        "INSERT INTO maintenance_checkpoints(epoch,agent_id,attempt_id,challenge_id,requested_at,checkpoint_json,checkpoint_sha256,accepted_at) \
-         VALUES(?,?,?,?,?,?,?,?)",
-        params![fence.epoch, captured.as_str(), "attempt", "a".repeat(64), NOW - 99.0, "{}", "b".repeat(64), NOW - 98.0],
-    ).unwrap();
-    store.conn.execute(
-        "INSERT INTO maintenance_parks(epoch,agent_id,attempt_id,native_event_seq,proof_sha256,parked_at) VALUES(?,?,?,1,?,?)",
-        params![fence.epoch, captured.as_str(), "attempt", "c".repeat(64), NOW - 97.0],
-    ).unwrap();
-    store.conn.execute(
-        "INSERT INTO maintenance_resumes(epoch,agent_id,request_id,source_attempt_id,target_attempt_id,target_number,account_id,source_proof_sha256,writer_epoch,claimed_at,preflight_json) VALUES(?,?,'retention-resume','attempt','successor',2,'fixture',?,1,?,'{}')",
-        params![fence.epoch, captured.as_str(), "c".repeat(64), NOW - 96.0],
-    ).unwrap();
+    let id = agent(&home, &mut store, "running", None);
     store
-        .conn
-        .execute(
-            "UPDATE agents SET status='succeeded',finished_at=? WHERE id=?",
-            params![cutoff - 1.0, captured.as_str()],
+        .bind_orchestrator(
+            &id,
+            &OrchestratorRef {
+                transport: "codex".into(),
+                external_session_id: "restart-owner".into(),
+                external_turn_id: None,
+            },
+            NOW - HISTORY_SECONDS - 100.0,
         )
         .unwrap();
-
-    drain(&mut store, 8);
-    assert!(store.get(&captured).is_ok());
-    assert!(store.get(&unrelated).is_err());
-    assert_eq!(count(&store, "maintenance_checkpoints"), 1);
-    assert_eq!(count(&store, "maintenance_parks"), 1);
-    assert_eq!(count(&store, "maintenance_resumes"), 1);
-    store.end_maintenance_fence(fence.epoch, NOW).unwrap();
-    drain(&mut store, 8);
-    assert!(store.get(&captured).is_err());
-    assert_eq!(count(&store, "maintenance_checkpoints"), 0);
-    assert_eq!(count(&store, "maintenance_parks"), 0);
-    assert_eq!(count(&store, "maintenance_resumes"), 0);
-    assert_eq!(count(&store, "maintenance_cohort"), 0);
-    integrity(&store);
-}
-
-/// Retention must not erase the recipient or task while Bridge custody is
-/// unknown, even after admission has reopened.
-#[test]
-fn maintenance_unknown_custody_keeps_recipient_history() {
-    let home = common::Home::new();
-    let mut store = home.store();
-    let mut request = home.request();
-    request.orchestrator = Some(OrchestratorRef {
-        transport: "codex_queue".into(),
-        external_session_id: "retention-session".into(),
-        external_turn_id: None,
-    });
-    let (id, _) = store
-        .admit(&request, &home.config, &json!({}), None)
-        .unwrap();
-    let fence = store
-        .begin_maintenance_fence("retention-notice", NOW - 100.0)
-        .unwrap();
-    let delivery: String = store
-        .conn
-        .query_row(
-            "SELECT before_delivery_id FROM maintenance_recipients WHERE epoch=?",
-            [fence.epoch],
-            |r| r.get(0),
-        )
+    let restart = store
+        .begin_service_restart("retention-restart", NOW - HISTORY_SECONDS - 2.0)
         .unwrap();
     store
         .conn
@@ -221,41 +167,31 @@ fn maintenance_unknown_custody_keeps_recipient_history() {
             params![NOW - HISTORY_SECONDS - 1.0, id.as_str()],
         )
         .unwrap();
-    store
-        .end_maintenance_fence(fence.epoch, NOW - 50.0)
-        .unwrap();
-    store
-        .conn
-        .execute(
-            "UPDATE deliveries SET state='failed' WHERE id=?",
-            [&delivery],
-        )
-        .unwrap();
-    store.conn.execute("INSERT INTO bridge_delivery_intents(delivery_id,custody_state) VALUES(?,'outcome_unknown')", [&delivery]).unwrap();
-
-    drain(&mut store, 8);
-    assert!(store.get(&id).is_ok());
-    assert_eq!(count(&store, "maintenance_recipients"), 1);
-    store.conn.execute("UPDATE bridge_delivery_intents SET custody_state='custody_accepted' WHERE delivery_id=?", [&delivery]).unwrap();
+    drain(&mut store, 10);
+    assert!(store.get(&id).is_ok(), "a restart still needs its source");
     store
         .conn
         .execute(
-            "UPDATE deliveries SET state='delivered' WHERE id=?",
-            [&delivery],
+            "UPDATE service_restarts SET phase='complete',finished_at=? WHERE id=?",
+            params![NOW - HISTORY_SECONDS - 1.0, restart],
         )
         .unwrap();
-    // The newly created follow-up is independently retained until its own
-    // delivery settles, even after the pre-notice custody is known.
-    drain(&mut store, 8);
-    assert!(store.get(&id).is_ok());
-    store.conn.execute(
-        "UPDATE deliveries SET state='delivered' WHERE id=(SELECT after_delivery_id FROM maintenance_recipients WHERE epoch=?)",
-        [fence.epoch],
-    ).unwrap();
-    drain(&mut store, 8);
-    assert!(store.get(&id).is_err());
-    assert_eq!(count(&store, "maintenance_recipients"), 0);
-    assert_eq!(count(&store, "maintenance_cohort"), 0);
+    drain(&mut store, 10);
+    assert!(
+        store.get(&id).is_err(),
+        "completed restart must not pin history"
+    );
+    assert_eq!(count(&store, "service_restart_agents"), 0);
+    assert_eq!(count(&store, "service_restarts"), 1);
+    assert_eq!(count(&store, "service_restart_notices"), 1);
+    integrity(&store);
+    store
+        .conn
+        .execute("UPDATE deliveries SET state='delivered' WHERE id IN (SELECT delivery_id FROM service_restart_notices)", [])
+        .unwrap();
+    drain(&mut store, 10);
+    assert_eq!(count(&store, "service_restarts"), 0);
+    assert_eq!(count(&store, "service_restart_notices"), 0);
     integrity(&store);
 }
 

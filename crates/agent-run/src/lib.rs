@@ -15,6 +15,7 @@ pub mod launchd;
 pub mod migrate;
 /// Exclusive offline authority over a home's database.
 pub mod offline;
+mod restart;
 pub mod storage_admin;
 pub mod system;
 pub mod transcript;

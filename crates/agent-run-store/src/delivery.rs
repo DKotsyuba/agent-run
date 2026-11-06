@@ -8,69 +8,6 @@ use agent_run_domain::{Result, domain::AgentId, error::invalid};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value, json};
 
-/// Preserve older maintenance notice bytes when no failure is recorded.
-fn is_zero(value: &u32) -> bool {
-    *value == 0
-}
-
-/// Broker-authored facts for one maintenance notice. These facts are not
-/// evidence that the controller restored work or that a recipient read them.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "stage", rename_all = "snake_case", deny_unknown_fields)]
-pub enum MaintenanceNotice {
-    /// The controller has fenced new admissions and is preparing maintenance.
-    Pre {
-        /// Positive durable maintenance-fence epoch.
-        maintenance_epoch: i64,
-    },
-    /// Recovery finished and the admission fence was removed.
-    After {
-        /// Positive durable maintenance-fence epoch.
-        maintenance_epoch: i64,
-        /// Cohort executions resumed after maintenance.
-        resumed: u32,
-        /// Cohort executions that completed during the maintenance process.
-        completed: u32,
-        /// Cohort executions that failed, timed out or were lost.
-        #[serde(default, skip_serializing_if = "is_zero")]
-        failed: u32,
-        /// Cohort executions that were cancelled.
-        cancelled: u32,
-        /// Cohort executions still held for attention.
-        held: u32,
-    },
-    /// Maintenance was deferred after normal operation was restored.
-    Deferred {
-        /// Positive durable maintenance-fence epoch.
-        maintenance_epoch: i64,
-    },
-}
-
-impl MaintenanceNotice {
-    /// Reject nonpositive epochs; the controller owns the truth of stage and counts.
-    pub fn validate(&self) -> Result<()> {
-        let epoch = match self {
-            Self::Pre { maintenance_epoch }
-            | Self::After {
-                maintenance_epoch, ..
-            }
-            | Self::Deferred { maintenance_epoch } => *maintenance_epoch,
-        };
-        if epoch <= 0 {
-            return Err(invalid("invalid maintenance notice epoch"));
-        }
-        Ok(())
-    }
-}
-
-/// Decode only the fixed maintenance event structure, without retaining input text.
-pub fn maintenance_notice(value: Value) -> Result<MaintenanceNotice> {
-    let notice: MaintenanceNotice =
-        serde_json::from_value(value).map_err(|_| invalid("invalid maintenance notice"))?;
-    notice.validate()?;
-    Ok(notice)
-}
-
 /// Maximum age of an unbound completion notice before it is permanently expired.
 pub const BINDING_WINDOW_SECONDS: f64 = 3600.0;
 /// Maximum UTF-8 bytes retained in one persisted stdout or stderr evidence tail.
@@ -136,7 +73,8 @@ pub(crate) fn ensure_bound_terminal_notice(
     let event: Option<i64> = tx.query_row(
         "SELECT MAX(e.seq) FROM events e JOIN agents a ON a.id=e.agent_id \
          WHERE a.id=? AND a.status IN ('succeeded','failed','timed_out','cancelled','lost') \
-         AND e.kind='status' AND e.to_status=a.status",
+         AND e.kind='status' AND e.to_status=a.status \
+         AND COALESCE(json_extract(e.data_json,'$.service_restart'),0)<>1",
         [id.as_str()],
         |row| row.get(0),
     )?;
@@ -416,27 +354,29 @@ fn bounded(value: Option<String>) -> Option<String> {
 }
 
 /// Payload facts of one claimed delivery, validated from durable rows.
-fn claim_payload(tx: &Connection, delivery_id: &str, agent_id: &str) -> Result<Value> {
-    let maintenance: Option<(String, String)> = tx
+fn claim_payload(tx: &Connection, delivery_id: &str, agent_id: Option<&str>) -> Result<Value> {
+    let restart: Option<(String, Option<String>)> = tx
         .query_row(
-            "SELECT e.agent_id,e.data_json FROM deliveries d JOIN events e ON e.seq=d.terminal_event_seq \
-             WHERE d.id=? AND e.kind='maintenance_notice_v1'",
+            "SELECT n.message,(SELECT b.intent_json FROM service_restart_notices prior \
+             JOIN bridge_delivery_intents b ON b.delivery_id=prior.delivery_id \
+             WHERE n.stage='after' AND prior.restart_id=n.restart_id AND prior.transport=n.transport \
+             AND prior.external_session_id=n.external_session_id AND prior.stage='before') \
+             FROM service_restart_notices n WHERE n.delivery_id=?",
             [delivery_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    if let Some((event_agent, raw)) = maintenance {
-        // A notice cannot borrow another agent's event or smuggle arbitrary
-        // event data through the renderer. Decode the raw object to reject
-        // duplicate keys as well as unknown fields.
-        if event_agent != agent_id || raw.len() > 512 {
-            return Err(invalid("invalid maintenance notice"));
+    if let Some((message, before)) = restart {
+        if message.is_empty() {
+            return Err(invalid("invalid restart notice"));
         }
-        let notice: MaintenanceNotice =
-            serde_json::from_str(&raw).map_err(|_| invalid("invalid maintenance notice"))?;
-        notice.validate()?;
-        return Ok(json!({"kind": "maintenance", "notice": notice}));
+        let before: Option<agent_run_domain::bridge::BridgeIntent> = before
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(|_| invalid("invalid preceding restart intent"))?;
+        return Ok(json!({"kind":"restart","notice":message,"before_intent":before}));
     }
+    let agent_id = agent_id.ok_or_else(|| invalid("delivery has no agent or restart notice"))?;
     let attention: Option<(String, String)> = tx
         .query_row(
             "SELECT json_extract(e.data_json,'$.pool_id'),json_extract(e.data_json,'$.notice') FROM deliveries d \
@@ -564,7 +504,9 @@ impl Store<'_> {
     /// Lease the oldest due Bridge publication for `op.owner`, expiring unbound terminal notices.
     /// Every unattempted row selects Bridge before I/O, even without deployment configuration.
     /// Attempted historical native rows end held with `legacy_delivery_held` and retained evidence;
-    /// malformed payloads quarantine only their own row. Returns owned facts or no lease.
+    /// malformed payloads quarantine only their own row. A paired restart result
+    /// waits for the warning's frozen route; retry policy remains unchanged.
+    /// Returns owned facts or no lease.
     pub fn claim_delivery_lease(
         &mut self,
         op: &crate::ops::ClaimDelivery,
@@ -587,12 +529,14 @@ impl Store<'_> {
              AND terminal_event_seq IN (SELECT seq FROM events WHERE at<=?)",
             [time - BINDING_WINDOW_SECONDS],
         )?;
-        let found: Option<(String, String, String, u32)> = tx
+        let found: Option<(String, Option<String>, String, u32)> = tx
             .query_row(
                 "SELECT d.id,d.agent_id,d.orchestrator_session_id,d.attempts FROM deliveries d \
                  WHERE ((d.state IN ('pending','retry_wait') AND COALESCE(d.next_attempt_at,0)<=?1) OR (d.state='sending' AND d.lease_until<=?1)) \
-                 AND NOT EXISTS (SELECT 1 FROM maintenance_recipients r WHERE r.after_delivery_id=d.id \
-                   AND NOT EXISTS (SELECT 1 FROM bridge_delivery_intents b WHERE b.delivery_id=r.before_delivery_id AND b.custody_state='custody_accepted' AND b.intent_json IS NOT NULL)) \
+                 AND NOT EXISTS(SELECT 1 FROM service_restart_notices n JOIN service_restart_notices prior \
+                   ON prior.restart_id=n.restart_id AND prior.transport=n.transport AND prior.external_session_id=n.external_session_id \
+                   AND prior.stage='before' WHERE n.delivery_id=d.id AND n.stage='after' \
+                   AND NOT EXISTS(SELECT 1 FROM bridge_delivery_intents b WHERE b.delivery_id=prior.delivery_id AND b.intent_json IS NOT NULL)) \
                  ORDER BY COALESCE(d.next_attempt_at,d.lease_until,0),d.id LIMIT 1",
                 [time],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
@@ -602,47 +546,11 @@ impl Store<'_> {
             tx.commit()?;
             return Ok(None);
         };
-        let maintenance: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM deliveries d JOIN events e ON e.seq=d.terminal_event_seq \
-             WHERE d.id=? AND e.kind='maintenance_notice_v1')",
-            [&delivery_id],
-            |row| row.get(0),
+        let (transport, session): (String, String) = tx.query_row(
+            "SELECT transport,external_session_id FROM orchestrator_sessions WHERE id=?",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let mut captured_notice = None;
-        let mut predecessor_id = None;
-        let (transport, session): (String, String) = if maintenance {
-            let recipient: Option<(i64, String, String, String, String, String)> = tx.query_row(
-                "SELECT epoch,orchestrator_session_id,anchor_agent_id,transport,external_session_id,before_delivery_id \
-                 FROM maintenance_recipients WHERE before_delivery_id=?1 OR after_delivery_id=?1",
-                [&delivery_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
-            ).optional()?;
-            match recipient {
-                Some((epoch, captured_session, anchor, transport, external, before))
-                    if captured_session == session_id && anchor == agent_id =>
-                {
-                    captured_notice = Some((epoch, before == delivery_id));
-                    if before != delivery_id {
-                        predecessor_id = Some(before);
-                    }
-                    (transport, external)
-                }
-                _ => {
-                    tx.execute(
-                        "UPDATE deliveries SET state='failed',lease_owner=NULL,lease_until=NULL,next_attempt_at=NULL,last_error='maintenance_route_invalid' WHERE id=?",
-                        [&delivery_id],
-                    )?;
-                    tx.commit()?;
-                    return Ok(None);
-                }
-            }
-        } else {
-            tx.query_row(
-                "SELECT transport,external_session_id FROM orchestrator_sessions WHERE id=?",
-                [session_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?
-        };
         let transport =
             agent_run_domain::domain::OrchestratorRef::canonical_transport_name(&transport)
                 .map(str::to_owned)
@@ -661,7 +569,7 @@ impl Store<'_> {
             tx.commit()?;
             return Ok(None);
         }
-        let payload = match claim_payload(&tx, &delivery_id, &agent_id) {
+        let payload = match claim_payload(&tx, &delivery_id, agent_id.as_deref()) {
             Ok(payload) => payload,
             Err(agent_run_domain::Error::Validation(_) | agent_run_domain::Error::Integrity(_)) => {
                 tx.execute(
@@ -673,31 +581,6 @@ impl Store<'_> {
             }
             Err(error) => return Err(error),
         };
-        let stage = payload["notice"]["stage"].as_str();
-        let valid_maintenance = captured_notice.is_some_and(|(epoch, before)| {
-            payload["notice"]["maintenance_epoch"].as_i64() == Some(epoch)
-                && if before {
-                    stage == Some("pre")
-                } else {
-                    matches!(stage, Some("after" | "deferred"))
-                }
-        });
-        if maintenance && !valid_maintenance {
-            tx.execute(
-                "UPDATE deliveries SET state='failed',lease_owner=NULL,lease_until=NULL,next_attempt_at=NULL,last_error='invalid_payload' WHERE id=?",
-                [&delivery_id],
-            )?;
-            tx.commit()?;
-            return Ok(None);
-        }
-        let predecessor = predecessor_id.map(|id| {
-            let raw: String = tx.query_row(
-                "SELECT intent_json FROM bridge_delivery_intents WHERE delivery_id=? AND custody_state='custody_accepted' AND intent_json IS NOT NULL",
-                [id],
-                |row| row.get(0),
-            )?;
-            serde_json::from_str::<Value>(&raw).map_err(agent_run_domain::Error::from)
-        }).transpose()?;
         let attempt = attempts
             .checked_add(1)
             .ok_or_else(|| invalid("delivery attempt counter overflow"))?;
@@ -733,7 +616,6 @@ impl Store<'_> {
                 "transport": transport,
                 "session": session,
                 "payload": payload,
-                "maintenance_predecessor": predecessor,
                 "bridge_owned": bridge.is_some(),
                 "bridge_intent": bridge_intent,
                 "bridge_unknown": bridge.as_ref().is_some_and(|(_, state)| state == "outcome_unknown"),

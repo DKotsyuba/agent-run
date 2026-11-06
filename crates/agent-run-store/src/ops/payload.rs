@@ -18,9 +18,7 @@ use agent_run_domain::{
     provider_start::ProviderStartRequest,
     quota_snapshot::NormalizedQuotaSnapshot,
     storage::{OperationId, PayloadDigest},
-    worker::{
-        FinishGuard, FinishRequest, MaintenancePauseRequest, NotifyRequest, WorkerCatalogProof,
-    },
+    worker::{FinishGuard, FinishRequest, NotifyRequest, WorkerCatalogProof},
 };
 use agent_run_platform::{
     process::{Cleanup, Identity, OwnershipSnapshot},
@@ -30,123 +28,72 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// 110 — cancel the exact never-spawned successor after supervisor death.
+/// Begin a service restart and capture its existing agents.
 #[derive(Clone, Serialize)]
-pub struct CancelPreparedMaintenance {
-    /// Open maintenance epoch and original logical execution.
-    pub epoch: i64,
-    pub execution: AgentId,
-    /// Exact retained allocation target, never a newly selected attempt.
-    pub target_attempt_id: String,
-    /// Explicit pending/claimed cancel belonging to this execution.
-    pub cancel_command_id: i64,
-    /// Exact supervisor, startup-child or initial broker ownership.
-    pub expected_owner: ExpectedOwnership,
-    /// External owner observation, or Alive for the exact current broker.
-    pub supervisor_state: agent_run_platform::process::ProcessState,
-    /// Capability observed when cancelling the current broker's pending launch.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expected_capability_sha256: Option<String>,
-    /// Explicitly cancel a launch owned by the current broker.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cancel_current_broker: Option<bool>,
-    /// Observation time in Unix seconds.
-    pub at: f64,
-}
-
-/// 109 — recover the exact never-spawned target after startup-owner death.
-#[derive(Clone, Serialize)]
-pub struct ClaimMaintenancePrepared {
-    /// Original maintenance epoch and unchanged logical execution.
-    pub epoch: i64,
-    pub execution: AgentId,
-    /// Existing allocation target; no replacement may be selected.
-    pub target_attempt_id: String,
-    /// Exact stored old startup-owner document and matching birth column.
-    pub expected_startup_owner: String,
-    pub expected_startup_birth_time: f64,
-    /// Exact old capability hash, or none when launch had not begun.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expected_capability_sha256: Option<String>,
-    /// Retake an unreleased capability owned by the current writer.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub retake_current_writer: Option<bool>,
-    /// Number of current-writer retakes observed before this claim.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expected_current_retake_count: Option<i64>,
-    /// PID-reuse-aware kernel observation prepared outside SQL.
-    pub owner_state: agent_run_platform::process::ProcessState,
-    /// Observation time and next startup-only deadline in Unix seconds.
-    pub at: f64,
-    pub startup_deadline_at: f64,
-}
-
-/// 104 — fulfil an explicit parked cancel after broker-observed supervisor death.
-#[derive(Clone, Serialize)]
-pub struct CancelParkedMaintenance {
-    /// Epoch and exact original logical execution.
-    pub epoch: i64,
-    pub execution: AgentId,
-    /// Still-reserved parked attempt; never a guessed latest successor.
-    pub attempt: String,
-    /// Immutable park-source proof observed by the broker.
-    pub source_proof_sha256: String,
-    /// Exact user-requested pending/claimed cancel command.
-    pub cancel_command_id: i64,
-    /// Recorded ownership matched during the broker's kernel observation.
-    pub expected_owner: ExpectedOwnership,
-    /// Actual OS verdict; Alive/Unknown/Denied/NotStarted refuse.
-    pub supervisor_state: agent_run_platform::process::ProcessState,
-    /// Observation time in Unix seconds.
-    pub at: f64,
-}
-
-/// 105 — commit readiness after all active captured work is safely parked.
-#[derive(Clone, Serialize)]
-pub struct ReadyMaintenanceFence {
-    /// Open epoch and broker-verified observations for every active member.
-    pub epoch: i64,
-    pub members: Vec<crate::maintenance::MaintenanceReadyMember>,
-}
-
-/// 106 — cancel preparation while keeping admission closed during recovery.
-#[derive(Clone, Serialize)]
-pub struct DeferMaintenanceFence {
-    /// Exact open maintenance epoch.
-    pub epoch: i64,
-}
-
-/// 107 — establish whether a new writer restarted during maintenance.
-#[derive(Clone, Serialize)]
-pub struct ObserveMaintenanceRestart {
-    /// Exact open maintenance epoch.
-    pub epoch: i64,
-}
-
-/// 108 — seal a verified ready boundary when the service actually stops.
-#[derive(Clone, Serialize)]
-pub struct CommitMaintenanceStop {
-    /// Exact ready maintenance epoch.
-    pub epoch: i64,
-}
-
-/// 96 — atomically fence fresh admissions and capture active execution facts.
-/// Broker-only; no process stop, checkpoint, notification or resume is implied.
-#[derive(Debug, Clone, Serialize)]
-pub struct BeginMaintenanceFence {
-    /// Stable operation intent across lost acknowledgments and broker restarts.
+pub struct BeginServiceRestart {
+    /// Stable request id for an identical retry.
     pub request_id: String,
-    /// Observation time in Unix seconds; not a request identity component.
+    /// Wall-clock observation time in Unix seconds.
     pub at: f64,
 }
 
-/// 97 — lift only the named admission epoch, preserving its captured cohort.
-/// This does not assert readiness to restart or resume paused executions.
-#[derive(Debug, Clone, Serialize)]
-pub struct EndMaintenanceFence {
-    /// Exact durable epoch; releasing an old epoch cannot release a newer one.
-    pub epoch: i64,
-    /// Observation time in Unix seconds.
+/// Queue any restart warning or forced stop due at this monotonic reading.
+#[derive(Clone, Serialize)]
+pub struct AdvanceServiceRestart {
+    /// Restart returned by `BeginServiceRestart`.
+    pub restart_id: i64,
+    /// Boot identity paired with `now_ns`.
+    pub boot_id: String,
+    /// Monotonic nanoseconds since the host's current boot.
+    pub now_ns: u64,
+}
+
+/// Remember the caller of a start refused during a service restart.
+#[derive(Clone, Serialize)]
+pub struct RememberServiceRestartCaller {
+    /// Exact restart that blocked the request.
+    pub restart_id: i64,
+    /// Existing host session identity used for later delivery.
+    pub reference: OrchestratorRef,
+}
+
+/// Enter recovery after writer replacement, or after a confirmed manager failure.
+#[derive(Clone, Serialize)]
+pub struct RecoverServiceRestart {
+    /// A failed manager attempt, admitted only by the unchanged writer epoch.
+    pub failed_restart: Option<i64>,
+}
+
+/// Claim the single service-manager invocation for one ready restart.
+#[derive(Clone, Serialize)]
+pub struct ClaimServiceRestart {
+    /// Restart whose service-manager invocation is being claimed.
+    pub restart_id: i64,
+}
+
+/// Start the confirmation clock for one captured agent's continuation.
+#[derive(Clone, Serialize)]
+pub struct RequestServiceRestartResume {
+    pub restart_id: i64,
+    pub agent_id: AgentId,
+    pub boot_id: String,
+    pub now_ns: u64,
+}
+
+/// Record a definite refusal to continue one captured agent.
+#[derive(Clone, Serialize)]
+pub struct FailServiceRestartResume {
+    pub restart_id: i64,
+    pub agent_id: AgentId,
+    pub reason: String,
+}
+
+/// Reconcile continuation confirmations and the user-selected deadline.
+#[derive(Clone, Serialize)]
+pub struct RefreshServiceRestart {
+    pub restart_id: i64,
+    pub boot_id: String,
+    pub now_ns: u64,
     pub at: f64,
 }
 
@@ -202,6 +149,9 @@ pub struct AdmitStart {
     pub identity: Value,
     /// Resume parent execution, if any.
     pub parent: Option<AgentId>,
+    /// Internal restart identity; absent for ordinary admission.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_id: Option<i64>,
 }
 
 /// Result of [`AdmitStart`].
@@ -236,6 +186,9 @@ pub struct AdmitProviderResume {
     /// Optional digest of the parent and attempt verified by a system worker.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preflight_digest: Option<String>,
+    /// Internal restart identity; absent for ordinary operator resumes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_id: Option<i64>,
 }
 
 /// Owned pool member admission source.
@@ -933,133 +886,6 @@ pub struct AcceptWorkerFinish {
     /// [`super::LocalEnvelope::set_finish_guard`] changes it before SQL.
     #[serde(skip)]
     pub guard: FinishGuard,
-}
-
-/// 103 — fence new inputs after a verified native maintenance boundary.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BeginMaintenanceClosing {
-    /// Open maintenance epoch containing the execution.
-    pub epoch: i64,
-    /// Exact owned execution.
-    pub execution: AgentId,
-    /// Exact pinned attempt.
-    pub attempt: String,
-    /// Sequence of the trusted native-settlement event.
-    pub native_event_seq: i64,
-    /// Unix observation time.
-    pub at: f64,
-}
-
-/// 102 — allocate the original agent's successor after broker preflight.
-#[derive(Debug, Clone, Serialize)]
-pub struct ClaimMaintenanceResume {
-    /// Open maintenance epoch.
-    pub epoch: i64,
-    /// Original logical execution.
-    pub execution: AgentId,
-    /// Stable allocation request identity.
-    pub request_id: String,
-    /// Broker-prepared process, route and history observations.
-    pub preflight: crate::maintenance_resume::ResumePreflight,
-    /// Unix observation time.
-    pub at: f64,
-    /// Deadline for the new startup-owner handoff.
-    pub startup_deadline_at: f64,
-}
-
-/// 100 — record a native-observed checkpoint receipt (supervisor authority).
-#[derive(Clone, Serialize, Deserialize)]
-pub struct ObserveMaintenanceCheckpoint {
-    /// Open maintenance epoch containing the execution.
-    pub epoch: i64,
-    /// Exact owned execution.
-    pub execution: AgentId,
-    /// Exact pinned attempt.
-    pub attempt: String,
-    /// Challenge correlated with the accepted checkpoint.
-    pub challenge_id: String,
-    /// Digest of the exact accepted callback.
-    pub receipt_sha256: String,
-}
-
-impl std::fmt::Debug for ObserveMaintenanceCheckpoint {
-    /// Avoid exposing challenge and receipt identifiers in diagnostics.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ObserveMaintenanceCheckpoint")
-            .field("epoch", &self.epoch)
-            .field("execution", &self.execution)
-            .field("attempt", &self.attempt)
-            .finish_non_exhaustive()
-    }
-}
-
-/// 101 — persist one verified nonterminal maintenance park (supervisor authority).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ParkMaintenanceAttempt {
-    /// Open maintenance epoch containing the execution.
-    pub epoch: i64,
-    /// Exact owned execution.
-    pub execution: AgentId,
-    /// Exact pinned attempt.
-    pub attempt: String,
-    /// Sequence of the trusted native-settlement event.
-    pub native_event_seq: i64,
-    /// Unix observation time.
-    pub at: f64,
-}
-
-/// 99 — request one attempt-bound maintenance checkpoint (broker authority).
-#[derive(Clone, Serialize)]
-pub struct RequestMaintenanceSteer {
-    /// Existing open maintenance epoch.
-    pub epoch: i64,
-    /// Logical execution captured by the epoch.
-    pub execution: AgentId,
-    /// Current worker attempt to receive the instruction.
-    pub attempt: String,
-    /// Opaque, broker-generated challenge for this attempt.
-    pub challenge_id: String,
-    /// Unix time at which the request is observed.
-    pub at: f64,
-}
-
-impl std::fmt::Debug for RequestMaintenanceSteer {
-    /// Keep the challenge out of diagnostics.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RequestMaintenanceSteer")
-            .field("epoch", &self.epoch)
-            .field("execution", &self.execution)
-            .field("attempt", &self.attempt)
-            .finish_non_exhaustive()
-    }
-}
-
-/// 98 — accept one attempt-bound maintenance checkpoint (worker authority).
-#[derive(Clone, Serialize)]
-pub struct AcceptMaintenanceCheckpoint {
-    /// Exact execution from the worker capability, not model input.
-    pub execution: AgentId,
-    /// Exact attempt from the worker capability, not model input.
-    pub attempt: String,
-    /// Private worker capability; never logged or stored as a receipt.
-    pub token: String,
-    /// Model-supplied checkpoint and runtime-issued challenge.
-    pub input: MaintenancePauseRequest,
-    /// Acceptance observation time.
-    pub at: f64,
-    /// Broker-computed launch-secret verdict, excluded from operation identity.
-    #[serde(skip)]
-    pub guard: FinishGuard,
-}
-
-impl std::fmt::Debug for AcceptMaintenanceCheckpoint {
-    /// Do not print capability, challenge or checkpoint content.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AcceptMaintenanceCheckpoint")
-            .field("execution", &self.execution)
-            .field("attempt", &self.attempt)
-            .finish_non_exhaustive()
-    }
 }
 
 /// 46 — queue one worker report (worker authority).

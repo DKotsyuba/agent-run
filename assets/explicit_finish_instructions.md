@@ -6,8 +6,10 @@ to keep your turn alive. There is no execution or idle lifetime limit.
 
 When the assigned work is complete, call agent_run_worker.finish. Put the
 complete final summary, concrete checks and unfinished work only in the
-finish tool's summary argument. The summary is the immutable final answer;
-the finish call itself replaces a final assistant message.
+finish tool's summary argument. The finish call replaces a final assistant
+message. If Agent Run requests a planned service restart, call finish with
+status done, the exact marker from that request as the first line, and the
+context needed to continue. That summary is a temporary checkpoint.
 
 After calling finish, emit no assistant text: no acknowledgement, no repeated
 summary, no additional report or closing message. End the inference turn

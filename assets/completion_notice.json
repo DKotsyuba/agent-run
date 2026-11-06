@@ -18,14 +18,6 @@
     }
   },
   "failure_guidance": {
-    "maintenance_resume_start_failed": {
-      "reason": "The supervisor exited before the maintenance continuation started.",
-      "advice": "Check the supervisor and worker service, then resume after cleanup and native-history verification."
-    },
-    "maintenance_continuation_unconfirmed": {
-      "reason": "The supervisor exited before continuation acceptance was confirmed; the work may have started.",
-      "advice": "Inspect the transcript and external effects; do not repeat the task until its outcome is known. Resume only after cleanup and history verification."
-    },
     "billing_unavailable": {
       "reason": "The selected account's provider reported a billing problem; its current balance is not established by this notice.",
       "advice": "Check billing for that account and the recorded fallback status before retrying or continuing the task."
@@ -45,10 +37,6 @@
     "supervisor_start_failed": {
       "reason": "The detached supervisor did not complete its READY handoff.",
       "advice": "Inspect status and supervisor bootstrap logs; fix the named executable, database, or ownership failure before retrying."
-    },
-    "supervisor_spawn_failed": {
-      "reason": "The supervisor could not be started; no native work was launched.",
-      "advice": "Check the worker service, executable and any unverified supervisor cleanup. Resume an existing session after cleanup and history verification, or start a fresh task if no session exists."
     },
     "unowned_starting": {
       "reason": "The accepted start exceeded its startup ownership deadline before supervisor handoff.",

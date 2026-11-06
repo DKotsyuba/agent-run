@@ -6,7 +6,7 @@ three expose the same operator tool surface through one shared dispatcher
 (`crates/agent-run-core/src/dispatch.rs`), so a tool that exists in MCP exists here
 under the same name with the same parameters.
 
-Workers use a [separate MCP surface](worker-mcp.md) whose base tools are
+Workers use a [separate fixed five-tool MCP surface](worker-mcp.md):
 `notify_orchestrator`, `pool_post`, `pool_read`, `pool_propose` and `pool_vote`.
 Pool actions require live authenticated membership. Private worker broker routes are not in operator
 discovery and requires the current run/attempt capability on every call.
@@ -76,86 +76,49 @@ paths, then run `systemctl --user enable --now agent-run.service`.
 - Startup takes a couple of seconds (service construction); wait for the
   socket file to appear before connecting.
 
-To inspect an existing maintenance admission fence, run:
+## Planned service restart
 
-```bash
-agent-run maintenance status
-```
+Use `agent-run --home ~/.agent-run restart` for the standard systemd unit on
+Linux or launchd job on macOS. For a Linux user unit, add `--systemd-user`;
+`--target` selects a different systemd unit or launchd service target. A shared
+broker can instead be reached using the existing `--broker-socket` and
+`--broker-uid` options. The caller must already have the OS permission to
+restart the selected service.
 
-This read-only command reports `inactive` or `fenced`, the fence epoch, and
-counts of captured, active, parked, terminal and unavailable executions. Parked
-executions are included in the active count. It does not
-start the broker or create a state database. A fenced status does not, by
-itself, establish that agents are paused or that a restart is safe.
+The command blocks new starts, queues a warning to affected chats, asks workers
+to call `finish` with the supplied restart marker, and sends a stricter warning after 30 seconds. Workers that
+have not stopped after another 30 seconds are interrupted. After restart it
+resumes the same sessions and reports each outcome. An unconfirmed continuation
+is reported as unknown after 60 seconds. Cancelled or previously finished
+agents are not resumed.
 
-## Planned restart without discarding tasks
+The existing Bridge delivery policy handles restart notices. Before stopping
+workers, the broker allows up to 10 seconds for queued warnings to be attempted;
+an unavailable dispatcher cannot block restart indefinitely. Bridge custody
+does not confirm that the native client accepted or the model read the notice.
+The existing Bridge producer grant must also allow the `agent-run.maintenance`
+kind with `message` mode and `keep_all` policy for these notices.
 
-Use the bundled `services/agent-run-restart.sh` with the same global arguments
-you use to reach the broker. It prepares the captured agents, invokes the host
-service manager, then waits for that exact maintenance epoch to recover:
+The schema-35 migration refuses to remove records from the earlier experimental
+schema-34 maintenance implementation. It retains the original database and its
+pre-migration backup when such records exist.
 
-```sh
-AGENT_RUN_BINARY=/path/to/agent-run /path/to/services/agent-run-restart.sh \
-  --broker-socket /run/agent-run/operator/api.sock --broker-uid 1000
-```
+The current chat binding stores a transport and session ID, while Bridge has one
+configured store per transport. It cannot safely distinguish multiple stores
+for the same transport. A first-time caller without an explicit binding also
+depends on its post-tool hook reaching the broker; a disconnect in that gap can
+leave that caller unrecorded. These cases need per-call routing before restart
+notifications can be relied on for all chats in a shared deployment. An agent
+bound only after a recipient's result has been attempted cannot be added to
+that already frozen result.
 
-The example targets a shared Linux broker; substitute the actual socket and
-broker UID. The caller must have the normal operating-system permission to
-restart the configured systemd unit. On macOS, omit the shared-socket options
-for a per-user broker and run the script as the account owning its launchd job.
-`AGENT_RUN_SYSTEMD_UNIT` and `AGENT_RUN_LAUNCHD_TARGET` select non-default service
-names. A launchd job must be configured to restart after receiving `SIGTERM`.
-
-Preparation blocks new admissions and requests a checkpoint from compatible
-Codex and Claude workers using explicit completion. Older, incompatible or
-non-cooperating workers are allowed to finish normally. If a safe boundary is
-not established within ten minutes, preparation is deferred after any in-flight
-check settles. Bound orchestrators
-receive durable before/after notices through their configured Bridge route;
-the Bridge publisher must allow the `agent-run.maintenance` kind. An accepted
-notice is not evidence that its recipient read it. A pending or unknown Bridge
-outcome can delay preparation.
-
-Claude's built-in file tools and foreground Bash calls are eligible after their
-matching native results; background or ambiguous commands and unsupported tools
-still prevent automatic checkpointing. Codex commands likewise need native exit
-evidence. A continuation from a verified maintenance pause can be paused again;
-an ordinary resumed session lacks inherited background-work evidence and must
-finish normally or cause preparation to be deferred.
-
-The checkpoint resumes the same logical execution and native session, under
-the original account and permissions. Agent Run verifies foreground native
-activity, process cleanup and history before continuing. It cannot prove that
-arbitrary detached processes or external side effects have finished. An
-unverifiable or uncertain handoff is retained for inspection and is not sent
-again automatically. If the exact resumed supervisor is proven dead before
-the continuation is confirmed, the execution is reported lost with an
-uncertain-outcome warning and other admissions can reopen. Process ownership
-remains held until cleanup is proven; inspect external effects before any
-manual continuation. A definite pre-spawn refusal is reported as a failure.
-If the prior broker died before releasing its launch capability, the same
-prepared attempt may be reclaimed after the old ownership is verified. A
-supervisor or identified startup child proven dead before native start is
-reported lost; manual resume after loss or cancellation requires settled
-preparation, process cleanup and history verification.
-If the current broker can prove a failed launch never released its capability,
-it retries the same prepared attempt once; a repeated failure is reported.
-An unresolved launch outcome stays fenced until its ownership is established.
-If the provider configuration cannot be loaded, or the original account or
-route is no longer permitted, recovery stays fenced and new admissions remain
-blocked. Restore the configuration or explicitly cancel the affected task.
-If recovery remains held after restoration, cancel the task and resume it
-after cleanup and native-history verification.
-`agent-run maintenance status` reports the current phase.
-
-For manual service-manager integration, `agent-run maintenance prepare`
-returns success only when the broker is ready to stop; `--epoch-only` prints
-the epoch for a script. After the manager restarts the service,
-`agent-run maintenance wait EPOCH` reports the outcome of that exact epoch.
-If a restart was definitely never requested, `agent-run maintenance defer EPOCH`
-restores already paused work before reopening admission. If the service
-manager's outcome is unknown, inspect the status before deciding whether to
-defer: the original restart request could still complete.
+If the manager definitively fails, the original broker resumes the workers and
+the initiating command reports the error. The first JSON output includes the
+restart ID and request ID. If the manager outcome is unknown, do not invoke it
+again blindly; after confirming it is no longer running and did not restart the
+service, `agent-run restart --recover ID` resumes the prepared work on the old
+broker. A repeated `--request-id` selects the same recorded operation and never
+invokes an already-claimed manager request a second time.
 
 ## Wire protocol
 
@@ -631,6 +594,6 @@ rendered as `RuntimeError`.
   an agent-run upgrade instead of caching schemas across versions.
 - Restart `api serve` after switching the verified sealed release at
   `~/.agent-run/standalone/current`.
-- The current database schema is version 34, reached through the paired
+- The current database schema is version 35, reached through the paired
   `agent-run config migrate`. Older resident processes refuse a newer database
   and must be restarted after an upgrade migrates it.

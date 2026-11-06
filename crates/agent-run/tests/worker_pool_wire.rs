@@ -62,7 +62,8 @@ fn reply_reader(stdout: std::process::ChildStdout) -> std::sync::mpsc::Receiver<
 /// Spawns the real `agent-run api serve` broker and one real `_worker-mcp`
 /// child wired to it through the inherited environment, then returns the
 /// child's stdin/stdout pair. Removes ambient completion/research selectors so
-/// this legacy fixture always uses its asserted fixed pool catalog.
+/// this legacy fixture always uses its asserted fixed pool catalog. A configured
+/// short socket root keeps the broker's Unix-socket path within platform limits.
 fn spawn_worker() -> (
     BrokerGuard,
     Worker,
@@ -72,7 +73,8 @@ fn spawn_worker() -> (
     let home = tempfile::Builder::new()
         .prefix("ar-pool-wire-")
         .tempdir_in(
-            std::env::var_os("AGENT_RUN_TEST_TMP")
+            std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
+                .or_else(|| std::env::var_os("AGENT_RUN_TEST_TMP"))
                 .or_else(|| std::env::var_os("TMPDIR"))
                 .expect("project test temporary directory must be supplied"),
         )

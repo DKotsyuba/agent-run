@@ -22,22 +22,7 @@ pub fn implemented(kind: OpKindRef) -> bool {
     use OpKindRef as K;
     matches!(
         kind,
-        K::CancelPreparedMaintenance
-            | K::ClaimMaintenancePrepared
-            | K::CancelParkedMaintenance
-            | K::ReadyMaintenanceFence
-            | K::DeferMaintenanceFence
-            | K::ObserveMaintenanceRestart
-            | K::CommitMaintenanceStop
-            | K::BeginMaintenanceFence
-            | K::EndMaintenanceFence
-            | K::AcceptMaintenanceCheckpoint
-            | K::RequestMaintenanceSteer
-            | K::ObserveMaintenanceCheckpoint
-            | K::ParkMaintenanceAttempt
-            | K::ClaimMaintenanceResume
-            | K::BeginMaintenanceClosing
-            | K::ClaimStartup
+        K::ClaimStartup
             | K::RecordSupervisorOwner
             | K::SetOwner
             | K::UpdateIdentity
@@ -126,6 +111,14 @@ pub fn implemented(kind: OpKindRef) -> bool {
             | K::StopServiceGeneration
             | K::RecoverServiceProbes
             | K::PruneHistoryBatch
+            | K::BeginServiceRestart
+            | K::AdvanceServiceRestart
+            | K::RememberServiceRestartCaller
+            | K::RecoverServiceRestart
+            | K::RequestServiceRestartResume
+            | K::FailServiceRestartResume
+            | K::RefreshServiceRestart
+            | K::ClaimServiceRestart
     )
 }
 
@@ -178,9 +171,6 @@ pub(crate) fn remote_facts(op: &RemoteOp) -> Facts {
         R::EnqueueNativeWake(op) => exec(&op.execution),
         R::WorkerTurn(op) => exec(&op.execution),
         R::ObserveWorkerFinishReceipt(op) => exec(&op.execution),
-        R::ObserveMaintenanceCheckpoint(op) => attempt(&op.execution, &op.attempt),
-        R::ParkMaintenanceAttempt(op) => attempt(&op.execution, &op.attempt),
-        R::BeginMaintenanceClosing(op) => attempt(&op.execution, &op.attempt),
         R::PersistRecoveryObservation(op) => attempt(&op.execution, &op.attempt),
         R::FinishTerminal(op) => exec(&op.execution),
         R::PersistRunStats(op) => exec(&op.row.agent_id),
@@ -254,19 +244,6 @@ pub(crate) fn local_facts(op: &LocalOp) -> Facts {
     use LocalOp as L;
     let exec = |id: &AgentId| (Some(id.clone()), None, None);
     match op {
-        L::CancelPreparedMaintenance(op) => (
-            Some(op.execution.clone()),
-            Some(op.target_attempt_id.clone()),
-            None,
-        ),
-        L::ClaimMaintenancePrepared(op) => (
-            Some(op.execution.clone()),
-            Some(op.target_attempt_id.clone()),
-            None,
-        ),
-        L::CancelParkedMaintenance(op) => {
-            (Some(op.execution.clone()), Some(op.attempt.clone()), None)
-        }
         L::RecordSupervisorLaunch(op) => exec(&op.execution),
         L::RecordStartupOwner(op) => exec(&op.execution),
         L::BeginSupervisorHandoff(op) => exec(&op.execution),
@@ -277,17 +254,6 @@ pub(crate) fn local_facts(op: &LocalOp) -> Facts {
             None,
         ),
         L::AcceptWorkerFinish(op) => (Some(op.execution.clone()), Some(op.attempt.clone()), None),
-        L::AcceptMaintenanceCheckpoint(op) => {
-            (Some(op.execution.clone()), Some(op.attempt.clone()), None)
-        }
-        L::RequestMaintenanceSteer(op) => {
-            (Some(op.execution.clone()), Some(op.attempt.clone()), None)
-        }
-        L::ClaimMaintenanceResume(op) => (
-            Some(op.execution.clone()),
-            Some(op.preflight.source_attempt_id.clone()),
-            None,
-        ),
         L::AcceptHealthReply(op) => (Some(op.execution.clone()), Some(op.attempt.clone()), None),
         L::ReportPoolReadLoop(op) => (Some(op.execution.clone()), Some(op.attempt.clone()), None),
         L::HealthTick(op) => (Some(op.execution.clone()), None, None),
@@ -316,27 +282,6 @@ pub(crate) fn run_remote(store: &mut Store, op: RemoteOp) -> Result<Value> {
             op.owner_birth_time,
             op.at,
             op.deadline_seconds,
-        )?),
-        R::ObserveMaintenanceCheckpoint(op) => out(store.observe_maintenance_checkpoint_receipt(
-            op.epoch,
-            &op.execution,
-            &op.attempt,
-            &op.challenge_id,
-            &op.receipt_sha256,
-        )?),
-        R::ParkMaintenanceAttempt(op) => out(store.park_maintenance_attempt(
-            op.epoch,
-            &op.execution,
-            &op.attempt,
-            op.native_event_seq,
-            op.at,
-        )?),
-        R::BeginMaintenanceClosing(op) => out(store.begin_maintenance_closing(
-            op.epoch,
-            &op.execution,
-            &op.attempt,
-            op.native_event_seq,
-            op.at,
         )?),
         R::RecordSupervisorOwner(op) => {
             match op.process_group_id {
@@ -535,19 +480,30 @@ pub(crate) fn run_remote(store: &mut Store, op: RemoteOp) -> Result<Value> {
 pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
     use LocalOp as L;
     match op {
-        L::CancelPreparedMaintenance(op) => out(store.cancel_prepared_maintenance(&op)?),
-        L::ClaimMaintenancePrepared(op) => out(store.claim_maintenance_prepared(&op)?),
-        L::CancelParkedMaintenance(op) => out(store.cancel_parked_maintenance(&op)?),
-        L::ReadyMaintenanceFence(op) => out(store.ready_maintenance_fence(
-            op.epoch,
-            &op.members,
-            agent_run_domain::domain::now(),
+        L::BeginServiceRestart(op) => out(store.begin_service_restart(&op.request_id, op.at)?),
+        L::AdvanceServiceRestart(op) => {
+            out(store.advance_service_restart(op.restart_id, &op.boot_id, op.now_ns)?)
+        }
+        L::RememberServiceRestartCaller(op) => {
+            out(store.remember_service_restart_caller(op.restart_id, &op.reference)?)
+        }
+        L::RecoverServiceRestart(op) => out(match op.failed_restart {
+            Some(id) => store.recover_service_restart_after_failure(id)?,
+            None => store.recover_service_restart()?,
+        }),
+        L::RequestServiceRestartResume(op) => out(store.request_service_restart_resume(
+            op.restart_id,
+            &op.agent_id,
+            &op.boot_id,
+            op.now_ns,
         )?),
-        L::DeferMaintenanceFence(op) => out(store.defer_maintenance_fence(op.epoch)?),
-        L::ObserveMaintenanceRestart(op) => out(store.observe_maintenance_restart(op.epoch)?),
-        L::CommitMaintenanceStop(op) => out(store.commit_maintenance_stop(op.epoch)?),
-        L::BeginMaintenanceFence(op) => out(store.begin_maintenance_fence(&op.request_id, op.at)?),
-        L::EndMaintenanceFence(op) => out(store.end_maintenance_fence(op.epoch, op.at)?),
+        L::FailServiceRestartResume(op) => {
+            out(store.fail_service_restart_resume(op.restart_id, &op.agent_id, &op.reason)?)
+        }
+        L::RefreshServiceRestart(op) => {
+            out(store.refresh_service_restart(op.restart_id, &op.boot_id, op.now_ns, op.at)?)
+        }
+        L::ClaimServiceRestart(op) => out(store.claim_service_restart(op.restart_id)?),
         L::RecordSupervisorLaunch(op) => {
             out(store.record_supervisor_launch(&op.execution, &op.capability_sha256)?)
         }
@@ -573,30 +529,6 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
             &op.input,
             op.at,
             op.guard,
-        )?),
-        L::AcceptMaintenanceCheckpoint(op) => out(store
-            .accept_maintenance_checkpoint_for_challenge(
-                &op.execution,
-                &op.attempt,
-                &op.token,
-                &op.input,
-                op.at,
-                op.guard,
-            )?),
-        L::RequestMaintenanceSteer(op) => out(store.request_maintenance_steer(
-            op.epoch,
-            &op.execution,
-            &op.attempt,
-            &op.challenge_id,
-            op.at,
-        )?),
-        L::ClaimMaintenanceResume(op) => out(store.claim_maintenance_resume(
-            op.epoch,
-            &op.execution,
-            &op.request_id,
-            &op.preflight,
-            op.at,
-            op.startup_deadline_at,
         )?),
         L::HealthTick(op) => out(store.health_tick_prepared(&op.execution, op.at, &op.facts)?),
         L::AcceptHealthReply(op) => out(store.accept_health_reply(
@@ -624,12 +556,14 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
         L::CaptureIncident(op) => out(store.capture_incident(&op.projection)?),
         L::AdmitStart(op) => {
             let parent = op.parent.as_ref().map(|id| store.get(id)).transpose()?;
-            let (agent_id, created) = store.admit_with_config_revision(
+            let (agent_id, created) = crate::admission::admit_with_restart(
+                store,
                 &op.request,
                 &op.config,
                 &op.config_revision,
                 &op.identity,
                 parent.as_ref(),
+                op.restart_id,
             )?;
             out(AdmitStartOutput {
                 agent_id,
@@ -666,6 +600,7 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
                     parent: &op.parent,
                     prefer: &op.prefer,
                     preflight_digest: op.preflight_digest.as_deref(),
+                    restart_id: op.restart_id,
                 },
             )?)
         }

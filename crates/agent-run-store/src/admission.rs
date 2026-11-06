@@ -85,6 +85,27 @@ pub fn admit_with_config_revision(
     identity: &Value,
     parent: Option<&Record>,
 ) -> Result<(AgentId, bool)> {
+    admit_with_restart(
+        store,
+        request,
+        config,
+        config_revision,
+        identity,
+        parent,
+        None,
+    )
+}
+
+/// Admit a legacy continuation for one captured service-restart member.
+pub(crate) fn admit_with_restart(
+    store: &mut Store,
+    request: &StartRequest,
+    config: &Config,
+    config_revision: &str,
+    identity: &Value,
+    parent: Option<&Record>,
+    restart_id: Option<i64>,
+) -> Result<(AgentId, bool)> {
     agent_run_domain::domain::nonblank("config_revision", config_revision)?;
     let mut checked = request.clone();
     checked.validate()?;
@@ -102,7 +123,12 @@ pub fn admit_with_config_revision(
         return Ok((found.id, false));
     }
 
-    crate::maintenance::require_admissions_open(&tx)?;
+    if let Some(restart_id) = restart_id {
+        let parent = parent.ok_or(Error::Conflict)?;
+        crate::service_restart::require_restart_resume(&tx, restart_id, &parent.id)?;
+    } else {
+        crate::service_restart::require_admissions_open(&tx)?;
+    }
     let global: i64 = tx.query_row(
         &format!("SELECT COUNT(*) FROM agents WHERE status IN {ACTIVE_SQL}"),
         [],
@@ -182,6 +208,16 @@ pub fn admit_with_config_revision(
         Some(Status::Starting),
         &json!({"durable_admission": true}),
     )?;
+    if let Some(restart_id) = restart_id {
+        let parent = parent.ok_or(Error::Conflict)?;
+        let changed = tx.execute(
+            "UPDATE service_restart_agents SET resumed_execution_id=? WHERE restart_id=? AND agent_id=? AND resumed_execution_id IS NULL",
+            params![id.as_str(), restart_id, parent.id.as_str()],
+        )?;
+        if changed != 1 {
+            return Err(Error::Conflict);
+        }
+    }
     tx.commit()?;
     Ok((id, true))
 }

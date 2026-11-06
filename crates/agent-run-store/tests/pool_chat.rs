@@ -2057,6 +2057,59 @@ fn completion_needs_agreement_succeeded_tips_and_cleanup() {
     assert!(!notice.contains("att_"), "no attempt identity: {notice}");
 }
 
+/// A member's temporary finish for service restart cannot finish its pool.
+#[test]
+fn pool_waits_for_a_restart_stopped_member() {
+    let home = common::Home::new();
+    let (_, members, pool_id) = voted_pool(&home);
+    let mut store = home.store();
+    finish_members(&store, &members, true);
+    store.conn.execute(
+        "INSERT INTO events(agent_id,at,kind,to_status,data_json) VALUES(?,1,'status','succeeded','{\"service_restart\":true}')",
+        [members[0].0.as_str()],
+    ).unwrap();
+    assert!(store.settle_pool(&pool_id).unwrap().is_none());
+    assert_eq!(rows_of(&store, "deliveries"), 0);
+}
+
+/// A pending enrollment does not become a false worker-ended alert while
+/// its member is temporarily stopped for a service restart.
+#[test]
+fn pool_enrollment_waits_for_restart_recovery() {
+    let home = common::Home::new();
+    let (pool_id, members) = pool(&home, &[("done", "it ships")]);
+    let mut store = home.store();
+    store.conn.execute(
+        "INSERT INTO pool_enrollments(agent_id,run_id,attempt_id,challenge,created_at) VALUES(?,?,?,?,1)",
+        rusqlite::params![members[0].0.as_str(),members[0].0.as_str(),members[0].1,"restart-join"],
+    ).unwrap();
+    store.begin_service_restart("pool-restart", 2.0).unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='succeeded' WHERE id=?",
+            [members[0].0.as_str()],
+        )
+        .unwrap();
+    store.conn.execute(
+        "INSERT INTO events(agent_id,at,kind,to_status,data_json) VALUES(?,3,'status','succeeded','{\"service_restart\":true}')",
+        [members[0].0.as_str()],
+    ).unwrap();
+    store
+        .reconcile_pool_enrollments(&pool_id.parse().unwrap())
+        .unwrap();
+    let state: String = store
+        .conn
+        .query_row(
+            "SELECT state FROM pool_enrollments WHERE agent_id=?",
+            [members[0].0.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "pending");
+    assert_eq!(rows_of(&store, "deliveries"), 0);
+}
+
 /// Every non-success condition leaves the pool open with nothing written.
 #[test]
 fn failed_missing_stale_or_withdrawn_agreement_never_completes() {

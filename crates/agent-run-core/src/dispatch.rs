@@ -13,8 +13,8 @@ use agent_run_domain::{
 };
 use agent_run_store::{
     ops::{
-        AcceptMaintenanceCheckpoint, AcceptWorkerFinish, NotifyOrchestrator, PoolOutcome,
-        PoolWrite, PoolWriteSpec, RegisterWorkerCatalog,
+        AcceptWorkerFinish, NotifyOrchestrator, PoolOutcome, PoolWrite, PoolWriteSpec,
+        RegisterWorkerCatalog,
     },
     writer::{CatalogPreflight, StoreReader},
 };
@@ -49,20 +49,6 @@ struct Id {
     /// Exact execution within that lineage; omission selects the latest.
     #[serde(default)]
     run_id: Option<AgentId>,
-}
-
-/// Operator request to capture an idempotent planned-maintenance cohort.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MaintenanceBegin {
-    request_id: String,
-}
-
-/// Exact open epoch for a deferral request.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MaintenanceEpoch {
-    epoch: i64,
 }
 
 /// Socket-only CLI answer page and the opaque fence from the initial selection.
@@ -362,6 +348,20 @@ struct HookRequest {
     payload: Value,
     transport: String,
 }
+
+/// Private CLI request to begin one planned service restart.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceRestartBegin {
+    request_id: String,
+}
+
+/// Private CLI selection of one planned service restart.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceRestartId {
+    restart_id: i64,
+}
 /// Operator/service-only exact integration selection; null/zero is invalid.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -410,6 +410,24 @@ struct Wait {
 /// socket, MCP, and CLI transports can independently render their protocols.
 pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
     match name {
+        "_service_restart_begin" => {
+            let request: ServiceRestartBegin = args(raw)?;
+            Ok(json!({"restart_id":service.begin_service_restart(&request.request_id).await?}))
+        }
+        "_service_restart_status" => {
+            let request: ServiceRestartId = args(raw)?;
+            service.service_restart_status(request.restart_id).await
+        }
+        "_service_restart_failed" => {
+            let request: ServiceRestartId = args(raw)?;
+            Ok(
+                json!({"restart_id":service.recover_failed_service_restart(request.restart_id).await?}),
+            )
+        }
+        "_service_restart_claim" => {
+            let request: ServiceRestartId = args(raw)?;
+            Ok(json!({"claimed":service.claim_service_restart(request.restart_id).await?}))
+        }
         "_hook_context" => {
             let hook: HookRequest = args(raw)?;
             let normalized = crate::hooks::bind::normalize(&hook.payload, false, &hook.transport)?;
@@ -424,6 +442,16 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
         }
         "_hook_bind" => {
             let hook: HookRequest = args(raw)?;
+            if let Some((restart_id, reference)) =
+                crate::hooks::bind::restart_waiter(&hook.payload, &hook.transport)?
+            {
+                service
+                    .remember_service_restart_caller(restart_id, reference)
+                    .await?;
+                return Ok(
+                    json!({"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"agent-run: restart wait recorded; retry after the restart notice."}}),
+                );
+            }
             let bound = crate::hooks::bind::run_hook_bound(
                 &service.home,
                 &hook.payload,
@@ -595,38 +623,6 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
             })
             .await
             .map_err(|_| crate::Error::Runtime("CLI transcript status read failed".into()))?
-        }
-        "_cli_maintenance_status" => {
-            let _: Empty = args(raw)?;
-            let service = service.clone();
-            // A stalled read may outlive the response timeout, but its
-            // read-only connection cannot mutate state or create work.
-            tokio::time::timeout(
-                Duration::from_secs(2),
-                tokio::task::spawn_blocking(move || service.maintenance_status()),
-            )
-            .await
-            .map_err(|_| crate::Error::Runtime("maintenance status read timed out".into()))?
-            .map_err(|_| crate::Error::Runtime("maintenance status read failed".into()))?
-        }
-        "_cli_maintenance_begin" => {
-            let request: MaintenanceBegin = args(raw)?;
-            Ok(serde_json::to_value(
-                service.begin_maintenance(&request.request_id).await?,
-            )?)
-        }
-        "_cli_maintenance_defer" => {
-            let request: MaintenanceEpoch = args(raw)?;
-            crate::maintenance_controller::defer(service, request.epoch).await?;
-            service.maintenance_status()
-        }
-        "_cli_maintenance_epoch" => {
-            let request: MaintenanceEpoch = args(raw)?;
-            let fence = service
-                .read(move |store| store.maintenance_fence(request.epoch))
-                .await?
-                .ok_or_else(|| invalid("unknown maintenance epoch"))?;
-            Ok(serde_json::to_value(fence)?)
         }
         "start_pool" => {
             service
@@ -831,28 +827,6 @@ async fn worker_tool_call(
                 .local_as(
                     worker_authority(&call.run_id, &call.attempt_id),
                     AcceptWorkerFinish {
-                        execution: call.run_id,
-                        attempt: call.attempt_id,
-                        token: call.token,
-                        input,
-                        at: crate::domain::now(),
-                        // The writer handle replaces this with its pre-SQL verdict.
-                        guard: agent_run_domain::worker::FinishGuard::Unavailable,
-                    },
-                    BROKER_BUDGET,
-                )
-                .await?;
-            Ok(serde_json::to_value(receipt)?)
-        }
-        WorkerTool::MaintenancePause => {
-            let input: agent_run_domain::worker::MaintenancePauseRequest =
-                serde_json::from_value(call.input)
-                    .map_err(|_| invalid("invalid maintenance checkpoint arguments"))?;
-            let receipt = service
-                .lane("workers")?
-                .local_as(
-                    worker_authority(&call.run_id, &call.attempt_id),
-                    AcceptMaintenanceCheckpoint {
                         execution: call.run_id,
                         attempt: call.attempt_id,
                         token: call.token,

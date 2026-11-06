@@ -754,6 +754,15 @@ async fn run_native(
     process
         .observing(prompt(&client, &session, &input_id, &record.request.task))
         .await?;
+    if record.resume_of_runtime_session_id.is_some() {
+        process
+            .observing(store.event_durable(
+                &record.id,
+                "native_resume_accepted",
+                &json!({"session":session,"input_id":input_id}),
+            ))
+            .await?;
+    }
     process
         .observing(store.worker_turn(&record.id, false, crate::domain::now()))
         .await?;

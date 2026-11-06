@@ -44,8 +44,7 @@ pub struct BridgeIntent {
     pub kind: String,
     /// Immutable rendered message; private outbox data, never diagnostic output.
     pub message: String,
-    /// Earlier event from the same producer that must be accepted by the native
-    /// recipient before this event may be handed off, when present.
+    /// Ordering metadata from an already frozen legacy publication, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predecessor: Option<String>,
     /// SDK-normalized publication fingerprint; historical receipts must match it exactly.
@@ -63,16 +62,20 @@ impl std::fmt::Debug for BridgeIntent {
 mod tests {
     use super::*;
 
-    /// Historical frozen intents keep their exact JSON shape and no predecessor.
+    /// Frozen intents with and without legacy ordering metadata remain readable.
     #[test]
-    fn historical_intent_without_predecessor_stays_compatible() {
-        let old = serde_json::json!({
+    fn historical_intent_keeps_its_optional_predecessor() {
+        let mut value = serde_json::json!({
             "owner":{"registration_socket":"/fixture/register","core_socket":"/fixture/core","token_file":"/fixture/token","credential_sha256":"a".repeat(64),"producer":"agent-run"},
             "request_id":"request","event_id":"event","address":"host/codex/store/session",
             "kind":"agent-run.completion","message":"fixture","intent_hash":"b".repeat(64)
         });
-        let decoded: BridgeIntent = serde_json::from_value(old.clone()).unwrap();
+        let decoded: BridgeIntent = serde_json::from_value(value.clone()).unwrap();
         assert!(decoded.predecessor.is_none());
-        assert_eq!(serde_json::to_value(decoded).unwrap(), old);
+        assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+        value["predecessor"] = serde_json::json!("previous-event");
+        let decoded: BridgeIntent = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(decoded.predecessor.as_deref(), Some("previous-event"));
+        assert_eq!(serde_json::to_value(decoded).unwrap(), value);
     }
 }

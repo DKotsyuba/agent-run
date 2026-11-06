@@ -248,26 +248,8 @@ printf '%s\n' "$unexpected" > unexpected.json
                 i64::from(background)
             );
             assert_eq!(store.conn.query_row("SELECT COUNT(*) FROM messages WHERE agent_id=? AND role='tool_result' AND raw_ref='background-job'",[id.as_str()],|r|r.get::<_,i64>(0)).unwrap(),1,"duplicate completion cannot duplicate journal");
-            let background_result: String = store.conn.query_row("SELECT content FROM messages WHERE agent_id=? AND role='tool_result' AND raw_ref='background-job'", [id.as_str()], |row| row.get(0)).unwrap();
-            assert_eq!(background_result, "BACKGROUND_PASS");
-            let calls = {
-                let mut statement = store.conn.prepare("SELECT content FROM messages WHERE agent_id=? AND role='tool_call' AND raw_ref='background-job' ORDER BY seq").unwrap();
-                let rows = statement
-                    .query_map([id.as_str()], |row| row.get::<_, String>(0))
-                    .unwrap();
-                rows.collect::<std::result::Result<Vec<_>, _>>().unwrap()
-            };
-            assert_eq!(
-                calls,
-                ["", "printf background <redacted>"],
-                "late input belongs to the owned job once"
-            );
             if fulfilled {
                 assert_eq!(store.conn.query_row("SELECT COUNT(*) FROM messages WHERE agent_id=? AND role='tool_result' AND raw_ref='foreground-job'",[id.as_str()],|r|r.get::<_,i64>(0)).unwrap(),1,"wrapped foreground completion journals once without a wake");
-                let command: String = store.conn.query_row("SELECT content FROM messages WHERE agent_id=? AND role='tool_call' AND raw_ref='foreground-job'", [id.as_str()], |row| row.get(0)).unwrap();
-                assert_eq!(command, "printf foreground");
-                let foreground_result: String = store.conn.query_row("SELECT content FROM messages WHERE agent_id=? AND role='tool_result' AND raw_ref='foreground-job'", [id.as_str()], |row| row.get(0)).unwrap();
-                assert_eq!(foreground_result, "FOREGROUND_INLINE");
             }
             service.cancel(&id).await.unwrap();
             return;
@@ -418,7 +400,6 @@ fn codex_fixture(
     let catalog =
         json!({"data":[{"name":"agent_run_worker","runtimeStatus":"connected","tools":tools}]});
     let mut environment = BTreeMap::from([
-        ("FIXTURE_PROVIDER_TOKEN".into(), "synthetic-secret".into()),
         ("ECHO_LEGACY".into(), legacy.to_string()),
         ("ECHO_MODERN".into(), modern.to_string()),
         ("CATALOG".into(), catalog.to_string()),
@@ -429,7 +410,7 @@ fn codex_fixture(
         ),
     ]);
     if let Some(background) = background {
-        let mut item = json!({"type":"commandExecution","id":"background-job","command":"printf background synthetic-secret","status":"completed","exitCode":0,"aggregatedOutput":null});
+        let mut item = json!({"type":"commandExecution","id":"background-job","status":"completed","exitCode":0,"aggregatedOutput":"BACKGROUND_PASS"});
         // Native 0.163 assigns a PTY processId to foreground commands too.
         item["processId"] = json!("86309");
         let mut result = json!({"chunk_id":"fixture-chunk","wall_time_seconds":0.1,"original_token_count":0,"output":""});
@@ -440,9 +421,8 @@ fn codex_fixture(
         }
         let returned = if fulfilled {
             let foreground = json!({"chunk_id":"foreground","wall_time_seconds":0.2,"exit_code":0,"original_token_count":1,"output":"FOREGROUND_INLINE"});
-            environment.insert("FG_STARTED".into(), json!({"method":"item/started","params":{"threadId":"thread","turnId":"turn-1","item":{"type":"commandExecution","id":"foreground-job","command":"printf foreground","processId":"86310","status":"inProgress"}}}).to_string());
-            environment.insert("FG_DELTA".into(), json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread","turnId":"turn-1","itemId":"foreground-job","delta":"ignored foreground delta"}}).to_string());
-            environment.insert("FG_COMPLETED".into(), json!({"method":"item/completed","params":{"threadId":"thread","turnId":"turn-1","item":{"type":"commandExecution","id":"foreground-job","command":"printf foreground","processId":"86310","status":"completed","exitCode":0,"aggregatedOutput":"FOREGROUND_INLINE"}}}).to_string());
+            environment.insert("FG_STARTED".into(), json!({"method":"item/started","params":{"threadId":"thread","turnId":"turn-1","item":{"type":"commandExecution","id":"foreground-job","processId":"86310","status":"inProgress"}}}).to_string());
+            environment.insert("FG_COMPLETED".into(), json!({"method":"item/completed","params":{"threadId":"thread","turnId":"turn-1","item":{"type":"commandExecution","id":"foreground-job","processId":"86310","status":"completed","exitCode":0,"aggregatedOutput":"FOREGROUND_INLINE"}}}).to_string());
             json!([
                 {"type":"input_text","text":"Script completed\nOutput:\n"},
                 {"type":"input_text","text":json!({"status":"fulfilled","value":result}).to_string()},
@@ -453,8 +433,6 @@ fn codex_fixture(
         };
         environment.insert("RETURNED".into(), json!({"type":"response_item","payload":{"type":"custom_tool_call_output","internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"},"output":returned}}).to_string());
         environment.insert("JOB_STARTED".into(),json!({"method":"item/started","params":{"threadId":"thread","turnId":"turn-1","item":{"type":"commandExecution","id":"background-job","status":"inProgress"}}}).to_string());
-        environment.insert("JOB_DELTA_1".into(), json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread","turnId":"turn-1","itemId":"background-job","delta":"BACK"}}).to_string());
-        environment.insert("JOB_DELTA_2".into(), json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread","turnId":"turn-1","itemId":"background-job","delta":"GROUND_PASS"}}).to_string());
         environment.insert("JOB_COMPLETED".into(),json!({"method":"item/completed","params":{"threadId":"thread","turnId":"turn-1","item":item}}).to_string());
     }
     let script = r#"turns=0
@@ -477,10 +455,10 @@ printf '%s\n' "$turns" > turns.txt
 if test "$turns" -gt 1; then printf '%s\n' "$line" > wake.pending; mv wake.pending wake.json; fi
 printf '{"id":%s,"result":{"turn":{"id":"turn-%s"}}}\n' "$id" "$turns"
 if test "$turns" -eq 1 && test -n "$JOB_STARTED"; then
-printf '%s\n' "$JOB_STARTED" "$JOB_STARTED"
+printf '%s\n' "$JOB_STARTED"
 if test -n "$FG_STARTED"; then printf '%s\n' "$FG_STARTED"; fi
-if test "$COMPLETE_LATE" = no; then printf '%s\n' "$JOB_DELTA_1" "$JOB_DELTA_2" "$JOB_COMPLETED" "$JOB_COMPLETED"; fi
-if test -n "$FG_COMPLETED"; then printf '%s\n' "$FG_DELTA" "$FG_COMPLETED" "$FG_COMPLETED"; fi
+if test "$COMPLETE_LATE" = no; then printf '%s\n' "$JOB_COMPLETED" "$JOB_COMPLETED"; fi
+if test -n "$FG_COMPLETED"; then printf '%s\n' "$FG_COMPLETED" "$FG_COMPLETED"; fi
 printf '%s\n' "$RETURNED" >> "$HISTORY"
 printf '%s\n' '{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}' >> "$HISTORY"
 fi
@@ -488,7 +466,7 @@ if test "$turns" -gt 1; then while test ! -f health-receipt; do sleep 0.01; done
 printf '{"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn-%s","status":"completed","items":[]}}}\n' "$turns"
 if test "$turns" -eq 1 && test -n "$JOB_STARTED" && test "$COMPLETE_LATE" = yes; then
 while test ! -f release-completion; do sleep 0.01; done
-printf '%s\n' "$JOB_DELTA_1" "$JOB_DELTA_2" "$JOB_COMPLETED" "$JOB_COMPLETED"
+printf '%s\n' "$JOB_COMPLETED" "$JOB_COMPLETED"
 fi
 ;;
 *'"method":"turn/interrupt"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;

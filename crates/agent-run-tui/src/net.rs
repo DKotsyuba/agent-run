@@ -328,6 +328,17 @@ mod tests {
     use super::*;
     use agent_run_domain::domain::{AgentId, Status};
 
+    /// Allocate each socket under the configured short test root when available.
+    fn socket_dir() -> tempfile::TempDir {
+        let root = std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        tempfile::Builder::new()
+            .prefix("tui-")
+            .tempdir_in(root)
+            .unwrap()
+    }
+
     /// Parses one valid stable id for request arguments.
     fn aid(value: &str) -> AgentId {
         value.parse().expect("valid agent id")
@@ -496,7 +507,7 @@ mod tests {
     async fn explicit_uid_survives_lane_replacements() {
         use tokio::io::AsyncReadExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = socket_dir();
         let socket = dir.path().join("broker.sock");
         let wrong_uid = std::fs::metadata(dir.path()).unwrap().uid().wrapping_add(1);
         let broker = SocketBroker::with_expected_server_uid(&socket, Some(wrong_uid));
@@ -553,14 +564,8 @@ mod tests {
     #[tokio::test]
     async fn socket_lanes_stay_independent_and_cancelled_frames_are_retired() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let socket = std::env::temp_dir().join(format!(
-            "artui-{}-{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = socket_dir();
+        let socket = dir.path().join("broker.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel::<String>(8);
         let server = tokio::spawn(async move {
@@ -665,14 +670,8 @@ mod tests {
         use crate::tests_support::block_page;
         use agent_run_domain::transcript::{TranscriptQuery, TranscriptView};
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let socket = std::env::temp_dir().join(format!(
-            "artui-block-{}-{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = socket_dir();
+        let socket = dir.path().join("broker.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();

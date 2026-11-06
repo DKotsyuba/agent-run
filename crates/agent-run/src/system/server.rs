@@ -63,24 +63,6 @@ impl Worker {
                     Err(reason) => wire::write(&mut stream, &Reply::ResumeRefused { reason }),
                 };
             }
-            Request::MaintenancePreflight(request) => {
-                let wire::MaintenanceOperation::MaintenancePreflight = request.operation;
-                let broker_uid = std::fs::metadata(&self.home)?.uid();
-                let verified = if peer_uid == broker_uid {
-                    agent_run_core::service::system_maintenance_resume_preflight(
-                        &self.home,
-                        &request.request,
-                        &self.socket,
-                        &request.route_fingerprint,
-                    )
-                } else {
-                    Err(agent_run_core::system_launch::ResumePreflightFailure::AccessDenied)
-                };
-                return match verified {
-                    Ok(result) => wire::write(&mut stream, &Reply::MaintenanceVerified { result }),
-                    Err(reason) => wire::write(&mut stream, &Reply::ResumeRefused { reason }),
-                };
-            }
         };
         if !wire::lowercase_hex64(&start.capability_sha256) {
             return wire::write(
@@ -270,82 +252,6 @@ mod tests {
     use super::*;
     use crate::system::PendingLaunch;
     use std::{io::Write, path::PathBuf, thread, time::Instant};
-
-    /// The read-only maintenance operation rejects another socket peer before
-    /// opening any stored/private execution and never reaches the launch path.
-    #[test]
-    fn maintenance_preflight_refuses_nonbroker_peer_without_launch() {
-        let temp = tempfile::tempdir().unwrap();
-        let worker = Worker::new(
-            temp.path().join("nonexistent-supervisor"),
-            temp.path().into(),
-            temp.path().join("worker.sock"),
-        )
-        .unwrap();
-        let uid = std::fs::metadata(temp.path()).unwrap().uid();
-        let (mut client, server) = UnixStream::pair().unwrap();
-        let job = thread::spawn(move || worker.serve_one(server, uid.wrapping_add(1)));
-        wire::write(
-            &mut client,
-            &wire::MaintenancePreflight {
-                operation: wire::MaintenanceOperation::MaintenancePreflight,
-                request: agent_run_core::system_launch::MaintenancePreflightRequest {
-                    epoch: 1,
-                    execution: "ag-20261010-000000-0123456789".parse().unwrap(),
-                    source_attempt_id: "attempt".into(),
-                    source_proof_sha256: "a".repeat(64),
-                },
-                route_fingerprint: "b".repeat(64),
-            },
-        )
-        .unwrap();
-        assert!(matches!(
-            wire::read::<Reply>(&mut client).unwrap(),
-            Reply::ResumeRefused {
-                reason: agent_run_core::system_launch::ResumePreflightFailure::AccessDenied
-            }
-        ));
-        job.join().unwrap().unwrap();
-        assert!(!temp.path().join("state.db").exists());
-    }
-
-    /// An authorized read of a nonexistent source produces only a closed
-    /// refusal; neither database initialization nor supervisor execution occurs.
-    #[test]
-    fn maintenance_preflight_missing_source_is_read_only() {
-        let temp = tempfile::tempdir().unwrap();
-        let worker = Worker::new(
-            temp.path().join("nonexistent-supervisor"),
-            temp.path().into(),
-            temp.path().join("worker.sock"),
-        )
-        .unwrap();
-        let uid = std::fs::metadata(temp.path()).unwrap().uid();
-        let (mut client, server) = UnixStream::pair().unwrap();
-        let job = thread::spawn(move || worker.serve_one(server, uid));
-        wire::write(
-            &mut client,
-            &wire::MaintenancePreflight {
-                operation: wire::MaintenanceOperation::MaintenancePreflight,
-                request: agent_run_core::system_launch::MaintenancePreflightRequest {
-                    epoch: 1,
-                    execution: "ag-20261010-000000-0123456789".parse().unwrap(),
-                    source_attempt_id: "attempt".into(),
-                    source_proof_sha256: "a".repeat(64),
-                },
-                route_fingerprint: "b".repeat(64),
-            },
-        )
-        .unwrap();
-        assert!(matches!(
-            wire::read::<Reply>(&mut client).unwrap(),
-            Reply::ResumeRefused {
-                reason: agent_run_core::system_launch::ResumePreflightFailure::ParentUnverifiable
-            }
-        ));
-        job.join().unwrap().unwrap();
-        assert!(!temp.path().join("state.db").exists());
-    }
 
     /// Short real-process launch and cleanup deadlines for the handshake fixtures.
     fn quick() -> Timeouts {

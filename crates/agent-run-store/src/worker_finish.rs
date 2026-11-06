@@ -91,14 +91,6 @@ impl Store<'_> {
         if !admissible {
             return Err(invalid("worker attempt is not running"));
         }
-        let closing: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM maintenance_checkpoints WHERE agent_id=? AND attempt_id=? AND closing_event_seq IS NOT NULL)",
-            params![run.as_str(), attempt],
-            |row| row.get(0),
-        )?;
-        if closing {
-            return Err(invalid("maintenance pause is already closing this attempt"));
-        }
         let request: String = tx.query_row(
             "SELECT request_json FROM agents WHERE id=?",
             [run.as_str()],
@@ -109,7 +101,25 @@ impl Store<'_> {
         if !request.explicit_finish {
             return Err(invalid("explicit finish was not admitted"));
         }
-        input.validate_schema(request.output_schema.as_ref())?;
+        let restart = if input.summary.starts_with("[agent-run-restart-finish:") {
+            let id = crate::service_restart::finish_restart(&tx, run, attempt)?
+                .ok_or_else(|| invalid("restart finish was not requested for this worker"))?;
+            let prefix = format!("{}\n", crate::service_restart::finish_marker(id));
+            if input.status != agent_run_domain::worker::FinishStatus::Done
+                || input
+                    .summary
+                    .strip_prefix(&prefix)
+                    .is_none_or(|text| text.trim().is_empty())
+            {
+                return Err(invalid("invalid restart finish marker"));
+            }
+            Some(id)
+        } else {
+            None
+        };
+        if restart.is_none() {
+            input.validate_schema(request.output_schema.as_ref())?;
+        }
         let payload = String::from_utf8(agent_run_domain::canonical::dumps(
             &serde_json::to_value(input)?,
             true,
@@ -153,8 +163,14 @@ impl Store<'_> {
         tx.execute("UPDATE worker_lifecycle SET idle_seconds=idle_seconds+CASE WHEN phase='idle' THEN MAX(0,?-transition_at) ELSE 0 END, \
             phase='closing',transition_at=?,finish_json=?,finish_sha256=?,accepted_at=? \
             WHERE attempt_id=? AND finish_json IS NULL",params![at,at,payload,digest,at,attempt])?;
+        let mut event =
+            serde_json::json!({"sha256":digest,"bytes":input.summary.len(),"status":input.status});
+        if let Some(restart_id) = restart {
+            event["service_restart"] = serde_json::json!(true);
+            event["service_restart_id"] = serde_json::json!(restart_id);
+        }
         tx.execute("INSERT INTO events(agent_id,attempt_id,at,kind,data_json) VALUES(?,?,?,'worker_finish_accepted_v1',?)",
-            params![run.as_str(),attempt,at,serde_json::json!({"sha256":digest,"bytes":input.summary.len(),"status":input.status}).to_string()])?;
+            params![run.as_str(),attempt,at,event.to_string()])?;
         tx.commit()?;
         Ok(FinishReceipt {
             sha256: digest,

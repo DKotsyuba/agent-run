@@ -129,69 +129,6 @@ fn candidates(revision: i64, items: &[(&str, u32)]) -> QuotaCandidateSet {
     }
 }
 
-/// Maintenance refuses fresh provider allocations before quota mutation while
-/// preserving original request replay, account reservations and active attempts.
-#[test]
-fn maintenance_provider_fence_preserves_replay_and_reservations() {
-    let home = home();
-    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
-    let catalog = catalog(&store);
-    let request = provider_request(home.path(), "before-maintenance");
-    let authority = authority(&catalog, home.path());
-    let frozen = identity(&request, &authority);
-    let offered = candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
-    let first = store
-        .admit_provider(
-            &request,
-            &request.storage_projection(),
-            &catalog,
-            &authority,
-            &offered,
-            &frozen,
-            8,
-            None,
-            None,
-        )
-        .unwrap();
-    let revision = store.quota_capacity_revision().unwrap();
-    let fence = store.begin_maintenance_fence("maintenance", 1.0).unwrap();
-    let replay = store
-        .admit_provider(
-            &request,
-            &request.storage_projection(),
-            &catalog,
-            &authority,
-            &offered,
-            &frozen,
-            8,
-            None,
-            None,
-        )
-        .unwrap();
-    assert!(!replay.created);
-    assert_eq!(replay.attempt_id, first.attempt_id);
-    let next = provider_request(home.path(), "after-maintenance");
-    assert!(matches!(
-        store.admit_provider(
-            &next,
-            &next.storage_projection(),
-            &catalog,
-            &authority,
-            &offered,
-            &identity(&next, &authority),
-            8,
-            None,
-            None
-        ),
-        Err(Error::Transition(_))
-    ));
-    assert_eq!(store.quota_capacity_revision().unwrap(), revision);
-    let cohort = store.maintenance_cohort(fence.epoch).unwrap();
-    assert_eq!(cohort.len(), 1);
-    assert_eq!(cohort[0].attempts[0].id, first.attempt_id);
-    assert!(cohort[0].attempts[0].ownership_active);
-}
-
 /// Supplies the explicit identity hash checked by replay before mutable state.
 fn identity(request: &ProviderStartRequest, authority: &ResolvedLaunchAuthority) -> Value {
     json!({
@@ -1532,6 +1469,7 @@ fn prepared_storage_layout_gates_provider_resume_only() {
                 parent: &admitted.agent_id,
                 prefer: &"acct-a".parse().unwrap(),
                 preflight_digest: None,
+                restart_id: None,
             },
         )
         .unwrap_err();
@@ -1597,6 +1535,7 @@ fn prepared_storage_layout_gates_provider_resume_only() {
             parent: &admitted.agent_id,
             prefer: &"acct-a".parse().unwrap(),
             preflight_digest: Some(&stale),
+            restart_id: None,
         },
     );
     assert!(matches!(refused, Err(Error::ExecutionChanged)));
@@ -1629,6 +1568,7 @@ fn prepared_storage_layout_gates_provider_resume_only() {
                 parent: &admitted.agent_id,
                 prefer: &"acct-a".parse().unwrap(),
                 preflight_digest: Some(&current),
+                restart_id: None,
             },
         )
         .unwrap();
@@ -1648,9 +1588,105 @@ fn prepared_storage_layout_gates_provider_resume_only() {
                 parent: &admitted.agent_id,
                 prefer: &"acct-a".parse().unwrap(),
                 preflight_digest: Some(&stale),
+                restart_id: None,
             },
         )
         .unwrap();
     assert!(!replay.created);
     assert_eq!(replay.agent_id, resumed.agent_id);
+}
+
+/// Only a captured restart member may use the ordinary resume admission while
+/// new external starts remain blocked; replay keeps the same child.
+#[test]
+fn restart_resume_uses_the_existing_provider_admission() {
+    use agent_run_store::provider_admission::ProviderResume;
+    let home = home();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
+    let catalog = catalog(&store);
+    let request = provider_request(home.path(), "restart-parent");
+    let authority = authority(&catalog, home.path());
+    let admitted = store
+        .admit_provider(
+            &request,
+            &request.storage_projection(),
+            &catalog,
+            &authority,
+            &candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]),
+            &identity(&request, &authority),
+            8,
+            None,
+            None,
+        )
+        .unwrap();
+    let restart = store
+        .begin_service_restart("restart-admission", 1.0)
+        .unwrap();
+    store.conn.execute(
+        "UPDATE attempts SET phase='cleanup_complete',cleanup_proof_json='{\"confirmed\":true}',ownership_active=0,finished_at=2 WHERE id=?",
+        [&admitted.attempt_id],
+    ).unwrap();
+    store.conn.execute(
+        "UPDATE agents SET status='cancelled',finished_at=2,runtime_session_id='sess-a' WHERE id=?",
+        [admitted.agent_id.as_str()],
+    ).unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE service_restarts SET phase='recovering' WHERE id=?",
+            [restart],
+        )
+        .unwrap();
+    let resume_request = provider_request(home.path(), "restart-child");
+    let candidate = candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+    let resume_identity = identity(&resume_request, &authority);
+    let admission = |store: &mut agent_run_store::Store<'_>, restart_id| {
+        store.admit_provider_resume(
+            &resume_request,
+            &resume_request.storage_projection(),
+            &catalog,
+            &authority,
+            &candidate,
+            &resume_identity,
+            8,
+            None,
+            None,
+            ProviderResume {
+                parent: &admitted.agent_id,
+                prefer: &"acct-a".parse().unwrap(),
+                preflight_digest: None,
+                restart_id,
+            },
+        )
+    };
+    assert!(matches!(
+        admission(&mut store, None),
+        Err(Error::Transition(_))
+    ));
+    assert!(admission(&mut store, Some(restart + 1)).is_err());
+    store
+        .conn
+        .execute(
+            "UPDATE service_restart_agents SET cancelled_before_restart=1 WHERE restart_id=?",
+            [restart],
+        )
+        .unwrap();
+    assert!(matches!(
+        admission(&mut store, Some(restart)),
+        Err(Error::Conflict)
+    ));
+    store
+        .conn
+        .execute(
+            "UPDATE service_restart_agents SET cancelled_before_restart=0 WHERE restart_id=?",
+            [restart],
+        )
+        .unwrap();
+    let child = admission(&mut store, Some(restart)).unwrap();
+    assert!(child.created);
+    assert_eq!(store.conn.query_row(
+        "SELECT resumed_execution_id FROM service_restart_agents WHERE restart_id=? AND agent_id=?",
+        rusqlite::params![restart,admitted.agent_id.as_str()], |row|row.get::<_,String>(0),
+    ).unwrap(), child.agent_id.as_str());
+    assert!(!admission(&mut store, Some(restart)).unwrap().created);
 }

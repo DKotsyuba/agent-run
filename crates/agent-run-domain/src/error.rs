@@ -482,17 +482,6 @@ impl Error {
             Self::QuotaAdmission(value) => value.to_string(),
             Self::Broker { message, .. } => message.clone(),
             Self::Bootstrap { message, .. } => message.clone(),
-            Self::Persistence {
-                operation: PersistenceOperation::WriterApply,
-                phase: Some(crate::storage::RejectStage::Gate),
-                source,
-                ..
-            } if matches!(
-                source.as_ref(),
-                Self::WriterFailure(crate::storage::WriterFailure::NotEnqueued(
-                    crate::storage::NotEnqueuedReason::AdmissionsClosed
-                ))
-            ) => "Agent Run is temporarily not accepting new agents. Retry with the same request ID when the service is ready.".into(),
             // Parser/OS/database diagnostics can contain configured secret values.
             Self::Io(_) => "local I/O operation failed".into(),
             Self::Sql(_) => "state database operation failed".into(),
@@ -529,39 +518,6 @@ pub fn invalid(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod writer_identity_tests {
     use super::*;
-
-    /// Only the explicit admission gate gets a maintenance-oriented message;
-    /// uncertain outcomes and other storage failures keep their generic wording.
-    #[test]
-    fn closed_admissions_are_distinct_from_uncertain_persistence() {
-        use crate::storage::{NotEnqueuedReason, RejectStage, UnknownCause, WriterFailure};
-
-        let error = |failure| Error::Persistence {
-            operation: PersistenceOperation::WriterApply,
-            elapsed_ms: 0,
-            attempts: 1,
-            writer_identity: None,
-            phase: Some(RejectStage::Gate),
-            source: Box::new(Error::WriterFailure(failure)),
-        };
-        let closed = error(WriterFailure::NotEnqueued(
-            NotEnqueuedReason::AdmissionsClosed,
-        ));
-        assert_eq!(closed.public().kind, "RuntimeError");
-        assert_eq!(
-            closed.public().message,
-            "Agent Run is temporarily not accepting new agents. Retry with the same request ID when the service is ready."
-        );
-        for other in [
-            WriterFailure::NotEnqueued(NotEnqueuedReason::QueueFull),
-            WriterFailure::Unknown(UnknownCause::CommitUncertain),
-        ] {
-            assert_eq!(
-                error(other).public().message,
-                "state persistence operation failed"
-            );
-        }
-    }
     /// Safe identity metadata cannot broaden or remove the existing proven
     /// ownership-BEGIN contention retry; numeric totals stay replaceable.
     #[test]

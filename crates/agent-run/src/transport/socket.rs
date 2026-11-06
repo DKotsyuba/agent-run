@@ -637,14 +637,18 @@ const CLI_READ_METHODS: &[&str] = &[
     "_cli_transcript_select",
     "_cli_transcript_page",
     "_cli_transcript_status",
-    "_cli_maintenance_status",
-    "_cli_maintenance_begin",
-    "_cli_maintenance_defer",
-    "_cli_maintenance_epoch",
     "_hook_context",
     "_hook_bind",
     "_runtime_retention",
     "_system_policy",
+];
+
+/// Operator-only restart controls; deliberately absent from MCP discovery.
+const SERVICE_RESTART_METHODS: &[&str] = &[
+    "_service_restart_begin",
+    "_service_restart_status",
+    "_service_restart_failed",
+    "_service_restart_claim",
 ];
 
 /// Returns only the broker's fixed policy verdict for a stored execution.
@@ -744,6 +748,7 @@ async fn respond_with_access(service: &Service, v: Value, access: SocketAccess) 
     }
     let known = dispatch::is_tool(method)
         || CLI_READ_METHODS.contains(&method)
+        || SERVICE_RESTART_METHODS.contains(&method)
         || [
             "tools",
             "ping",
@@ -1532,6 +1537,7 @@ async fn serve_endpoints(
     if let Some(launcher) = launcher {
         service = service.with_system_launcher(launcher);
     }
+    service.recover_service_restart().await?;
     let _ = service.reconcile().await?;
     let mut services =
         agent_run_core::managed_services::Manager::new(home, std::env::current_exe()?)?
@@ -1539,6 +1545,7 @@ async fn serve_endpoints(
     // JoinSet aborts maintenance on every exit path, including cancellation of
     // serve_at itself; dropping a bare JoinHandle would detach these loops.
     let mut workers = JoinSet::new();
+    workers.spawn(agent_run_core::service_restart::run(service.clone()));
     let history_home = home.to_owned();
     let retention_lane = broker_writer.lane("retention");
     let shared_retention = system_group;
@@ -1668,11 +1675,6 @@ async fn serve_endpoints(
             if let Err(error) = reconciler.reconcile().await {
                 maintenance_diagnostic("reconcile", "queued", &error);
             }
-            if let Err(error) =
-                agent_run_core::maintenance_controller::recovery_tick(&reconciler).await
-            {
-                maintenance_diagnostic("planned_restart", "recovery", &error);
-            }
         }
     });
     let checker = service.clone();
@@ -1712,37 +1714,20 @@ async fn serve_endpoints(
     loop {
         tokio::select! {
             _=tokio::signal::ctrl_c()=>{
-                writer_service.handle().close_admissions("service stopping");
-                match agent_run_core::maintenance_controller::commit_stop(&service).await {
-                    Ok(agent_run_core::maintenance_controller::StopDisposition::Committed) => break,
-                    Ok(agent_run_core::maintenance_controller::StopDisposition::NoFence) if !system_group => break,
-                    Err(error) => maintenance_diagnostic("planned_restart", "stop", &error),
-                    _ => {}
-                }
+                if !system_group { break; }
+                writer_service.handle().close_admissions("shared service stopping");
                 draining = true;
             },
             _=term.recv()=>{
-                writer_service.handle().close_admissions("service stopping");
-                match agent_run_core::maintenance_controller::commit_stop(&service).await {
-                    Ok(agent_run_core::maintenance_controller::StopDisposition::Committed) => break,
-                    Ok(agent_run_core::maintenance_controller::StopDisposition::NoFence) if !system_group => break,
-                    Err(error) => maintenance_diagnostic("planned_restart", "stop", &error),
-                    _ => {}
-                }
+                if !system_group { break; }
+                writer_service.handle().close_admissions("shared service stopping");
                 draining = true;
             },
             _=drain_tick.tick(), if draining => {
-                match agent_run_core::maintenance_controller::commit_stop(&service).await {
-                    Ok(agent_run_core::maintenance_controller::StopDisposition::Committed) => break,
-                    Ok(agent_run_core::maintenance_controller::StopDisposition::NoFence) => {
-                        match shared_service_idle(drain_home.clone()).await {
-                            Ok(true) => break,
-                            Ok(false) => {},
-                            Err(error) => maintenance_diagnostic("shutdown", "drain", &error),
-                        }
-                    },
-                    Ok(agent_run_core::maintenance_controller::StopDisposition::Waiting) => {},
-                    Err(error) => maintenance_diagnostic("planned_restart", "stop", &error),
+                match shared_service_idle(drain_home.clone()).await {
+                    Ok(true) => break,
+                    Ok(false) => {},
+                    Err(error) => maintenance_diagnostic("shutdown", "drain", &error),
                 }
             },
             ended = writer_task.as_mut().expect("held while selectable"), if writer_task.is_some() => {
@@ -2067,6 +2052,22 @@ async fn client_with_wait_deadlines(
 
 #[cfg(test)]
 mod tests {
+    /// Restart control stays on the existing operator socket, not the MCP catalog.
+    #[tokio::test]
+    async fn service_restart_control_is_not_an_mcp_tool() {
+        let service = Service::new("/unused-restart-fixture".into());
+        for method in SERVICE_RESTART_METHODS {
+            assert!(!dispatch::is_tool(method));
+            let response = respond_with_access(
+                &service,
+                json!({"jsonrpc":"2.0","id":1,"method":method,"params":{}}),
+                SocketAccess::Operator,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response["error"]["code"], -32602);
+        }
+    }
     use super::*;
     use tokio::net::UnixListener;
 
@@ -2086,29 +2087,6 @@ mod tests {
                 &service,
                 json!({"jsonrpc":"2.0","id":1,"method":method,"params":{}}),
                 SocketAccess::Operator,
-            )
-            .await
-            .unwrap();
-            assert_eq!(response["error"]["code"], -32602);
-        }
-    }
-
-    /// Maintenance status is a strict read on both authenticated socket types,
-    /// and does not become an advertised worker or MCP tool.
-    #[tokio::test]
-    async fn maintenance_status_is_socket_only_and_rejects_arguments() {
-        let service = Service::new("/unused-maintenance-fixture".into());
-        let method = "_cli_maintenance_status";
-        assert!(!dispatch::is_tool(method));
-        for access in [
-            SocketAccess::Private,
-            SocketAccess::Operator,
-            SocketAccess::SystemGroup,
-        ] {
-            let response = respond_with_access(
-                &service,
-                json!({"jsonrpc":"2.0","id":1,"method":method,"params":{"extra":true}}),
-                access,
             )
             .await
             .unwrap();

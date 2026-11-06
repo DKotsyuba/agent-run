@@ -379,6 +379,181 @@ async fn broker_ready(home: &Path, child: &mut tokio::process::Child) {
     }
 }
 
+/// A disposable broker and fake Claude worker exercise the actual finish,
+/// broker replacement and native-session resume path without a paid model.
+#[tokio::test]
+async fn service_restart_resumes_a_cooperative_fake_worker() {
+    service_restart_fake_worker(true).await;
+}
+
+/// A failed manager request resumes the same worker on the original broker.
+#[tokio::test]
+async fn service_restart_recovers_a_fake_worker_after_manager_failure() {
+    service_restart_fake_worker(false).await;
+}
+
+/// Exercise both manager outcomes using only a local fake provider.
+async fn service_restart_fake_worker(replace_broker: bool) {
+    use agent_run::transport::socket;
+    let socket_root = std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
+        .unwrap_or_else(|| std::env::temp_dir().into_os_string());
+    let (_temp, home) = home_in(socket_root, "", &[]);
+    let mut broker = resident_broker(&home);
+    broker_ready(&home, &mut broker).await;
+    let mut input = request(&home);
+    input.task = "fixture:restart-worker".into();
+    input.explicit_finish = true;
+    input.request_id = Some("restart-worker".into());
+    let admitted = socket::client(&home, "start", serde_json::to_value(input).unwrap())
+        .await
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let row = agent_run_store::fixture::open(&home)
+                .unwrap()
+                .get(&id)
+                .unwrap();
+            if row.status == Status::Running && row.runtime_session_id.is_some() {
+                break;
+            }
+            assert!(
+                !row.status.terminal(),
+                "worker ended before restart: {:?}",
+                row.failure_kind
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let started = socket::client(
+        &home,
+        "_service_restart_begin",
+        serde_json::json!({"request_id":"restart-fixture"}),
+    )
+    .await
+    .unwrap();
+    let restart = started["restart_id"].as_i64().unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let state = socket::client(
+                &home,
+                "_service_restart_status",
+                serde_json::json!({"restart_id":restart}),
+            )
+            .await
+            .unwrap();
+            if state["phase"] == "ready" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    let completion_count: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM deliveries WHERE agent_id=?",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        completion_count, 0,
+        "temporary finish must not produce a completion notice"
+    );
+    drop(store);
+    let claimed = socket::client(
+        &home,
+        "_service_restart_claim",
+        serde_json::json!({"restart_id":restart}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(claimed["claimed"], true);
+    let duplicate = socket::client(
+        &home,
+        "_service_restart_claim",
+        serde_json::json!({"restart_id":restart}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(duplicate["claimed"], false);
+
+    if replace_broker {
+        let pid = broker.id().unwrap();
+        // SAFETY: the PID belongs to this test's live disposable broker.
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) }, 0);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), broker.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        broker = resident_broker(&home);
+        broker_ready(&home, &mut broker).await;
+    } else {
+        let result = socket::client(
+            &home,
+            "_service_restart_failed",
+            serde_json::json!({"restart_id":restart}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["restart_id"], restart);
+    }
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let state = socket::client(
+                &home,
+                "_service_restart_status",
+                serde_json::json!({"restart_id":restart}),
+            )
+            .await
+            .unwrap();
+            if state["phase"] == "complete" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    let (result, child, reason): (String, Option<String>, Option<String>) = store.conn.query_row(
+        "SELECT resume_status,resumed_execution_id,resume_error FROM service_restart_agents WHERE restart_id=? AND agent_id=?",
+        rusqlite::params![restart,id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    ).unwrap();
+    assert_eq!(result, "started", "resume refusal: {reason:?}");
+    let accepted: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='native_resume_accepted'",
+            [child.unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        accepted, 1,
+        "a started result requires native resume confirmation"
+    );
+    drop(store);
+    let pid = broker.id().unwrap();
+    // SAFETY: the PID belongs to this test's current disposable broker.
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) }, 0);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), broker.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+}
+
 /// Real socket admission keeps service warmup in the resident broker after the submitting connection closes.
 #[tokio::test]
 async fn managed_services_run_through_the_resident_socket_broker() {
@@ -2972,6 +3147,7 @@ async fn resume_selector_keeps_the_parent_account_until_it_is_unavailable() {
                     parent: &id,
                     prefer: &work,
                     preflight_digest: None,
+                    restart_id: None,
                 },
             );
         match expected {

@@ -313,16 +313,13 @@ impl Query {
     }
 }
 impl Service {
-    /// Capture the active cohort and bound-recipient pre-notices under one
-    /// durable admission fence. This is an internal broker operation; it does
-    /// not stop workers or initiate an operating-system restart.
-    pub async fn begin_maintenance(
-        &self,
-        request_id: &str,
-    ) -> Result<agent_run_store::maintenance::MaintenanceFence> {
-        self.lane("maintenance")?
+    /// Block new admissions and durably capture the agents in a service restart.
+    pub async fn begin_service_restart(&self, request_id: &str) -> Result<i64> {
+        // Resolve the boot identity before entering the sole writer.
+        agent_run_platform::monotonic::boot_id()?;
+        self.lane("service-restart")?
             .local(
-                agent_run_store::ops::BeginMaintenanceFence {
+                agent_run_store::ops::BeginServiceRestart {
                     request_id: request_id.into(),
                     at: now(),
                 },
@@ -331,86 +328,97 @@ impl Service {
             .await
     }
 
-    /// Request a checkpoint from one exact attempt using a repeatable
-    /// correlation id. The writer checks the live attempt, compatible worker,
-    /// recipient custody and cancellation before queuing one instruction.
-    /// The id is not a credential; worker capability checks remain mandatory.
-    /// This does not stop or resume a process.
-    pub async fn request_maintenance_pause(
-        &self,
-        epoch: i64,
-        id: &AgentId,
-        attempt: &str,
-    ) -> Result<agent_run_store::maintenance_checkpoint::MaintenanceSteer> {
-        if epoch <= 0
-            || attempt.is_empty()
-            || attempt.len() > 256
-            || attempt.chars().any(char::is_control)
-        {
-            return Err(invalid("invalid maintenance attempt"));
-        }
-        let challenge_id = agent_run_domain::canonical::sha256_hex(
-            &json!(["agent-run-maintenance-v1", epoch, id, attempt]),
-            true,
-        );
-        self.lane("maintenance")?
+    /// Queue restart warnings or cancellation when their intervals have elapsed.
+    pub(crate) async fn advance_service_restart(&self, restart_id: i64) -> Result<usize> {
+        let (boot_id, now_ns) = agent_run_platform::monotonic::now()?;
+        self.lane("service-restart")?
             .local(
-                agent_run_store::ops::RequestMaintenanceSteer {
-                    epoch,
-                    execution: id.clone(),
-                    attempt: attempt.into(),
-                    challenge_id,
-                    at: now(),
+                agent_run_store::ops::AdvanceServiceRestart {
+                    restart_id,
+                    boot_id,
+                    now_ns,
                 },
                 crate::broker_writer::BROKER_BUDGET,
             )
             .await
     }
 
-    /// Read one consistent, content-free view of the active maintenance fence.
-    /// Counts describe only its captured executions, not restart readiness.
-    /// A missing or incompatible database is an error, never an inferred absence.
-    pub fn maintenance_status(&self) -> Result<Value> {
-        let reader = StoreReader::open_with(&self.home, READ_ALLOWANCE)?;
-        type MaintenanceStatusRow = (i64, i64, i64, i64, i64, i64, i64, String);
-        let row: Option<MaintenanceStatusRow> = reader.conn().query_row(
-            "SELECT f.epoch,f.member_count,COUNT(c.agent_id), \
-                COALESCE(SUM(CASE WHEN a.status IN ('created','starting','running','cancelling') THEN 1 ELSE 0 END),0), \
-                COALESCE(SUM(CASE WHEN a.status IN ('succeeded','failed','timed_out','cancelled','lost') THEN 1 ELSE 0 END),0), \
-                COALESCE(SUM(CASE WHEN a.status IN ('created','starting','running','cancelling') AND EXISTS(SELECT 1 FROM attempts t WHERE t.agent_id=a.id AND t.state='maintenance_parked' AND t.finished_at IS NULL) THEN 1 ELSE 0 END),0), \
-                (SELECT COUNT(*) FROM maintenance_fences WHERE ended_at IS NULL),f.phase \
-             FROM maintenance_fences f \
-             LEFT JOIN maintenance_cohort c ON c.epoch=f.epoch \
-             LEFT JOIN agents a ON a.id=c.agent_id AND a.sequence=c.sequence \
-             WHERE f.ended_at IS NULL GROUP BY f.epoch,f.member_count",
-            [],
-            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)),
-        ).optional()?;
-        let Some((epoch, captured, actual, active, terminal, parked, open, phase)) = row else {
-            return Ok(
-                json!({"state":"inactive","phase":null,"epoch":null,"captured":0,"active":0,"parked":0,"terminal":0,"unavailable":0}),
-            );
-        };
-        let unavailable = captured
-            .checked_sub(active)
-            .and_then(|remaining| remaining.checked_sub(terminal))
-            .filter(|remaining| *remaining >= 0);
-        if epoch <= 0
-            || captured < 0
-            || actual != captured
-            || open != 1
-            || parked > active
-            || unavailable.is_none()
-        {
-            return Err(Error::Integrity(
-                "maintenance cohort is inconsistent".into(),
-            ));
-        }
-        Ok(
-            json!({"state":"fenced","phase":phase,"epoch":epoch,"captured":captured,"active":active,"parked":parked,"terminal":terminal,"unavailable":unavailable}),
-        )
+    /// Observe a new broker writer and enter recovery for a prepared restart.
+    pub async fn recover_service_restart(&self) -> Result<Option<i64>> {
+        agent_run_platform::monotonic::boot_id()?;
+        self.lane("service-restart")?
+            .local(
+                agent_run_store::ops::RecoverServiceRestart {
+                    failed_restart: None,
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await
     }
 
+    /// Continue a prepared restart on the same writer after the manager fails.
+    pub async fn recover_failed_service_restart(&self, restart_id: i64) -> Result<Option<i64>> {
+        self.lane("service-restart")?
+            .local(
+                agent_run_store::ops::RecoverServiceRestart {
+                    failed_restart: Some(restart_id),
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await
+    }
+
+    /// Claim the one service-manager invocation after the workers stop.
+    pub async fn claim_service_restart(&self, restart_id: i64) -> Result<bool> {
+        self.lane("service-restart")?
+            .local(
+                agent_run_store::ops::ClaimServiceRestart { restart_id },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await
+    }
+
+    /// Read the phase of one restart without changing its state.
+    pub async fn service_restart_status(&self, restart_id: i64) -> Result<Value> {
+        self.read(move |store| {
+            let phase: Option<String> = store.conn().query_row(
+                "SELECT phase FROM service_restarts WHERE id=?", [restart_id], |row|row.get(0),
+            ).optional()?;
+            Ok(json!({"restart_id":restart_id,"phase":phase.ok_or_else(|| invalid("unknown service restart"))?}))
+        }).await
+    }
+
+    /// Retain a blocked caller's session for the restart completion notice.
+    pub async fn remember_service_restart_caller(
+        &self,
+        restart_id: i64,
+        reference: OrchestratorRef,
+    ) -> Result<()> {
+        self.lane("service-restart")?
+            .local(
+                agent_run_store::ops::RememberServiceRestartCaller {
+                    restart_id,
+                    reference,
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await
+    }
+
+    /// Preserve a known caller when a start was refused by the restart barrier.
+    async fn remember_blocked_start(
+        &self,
+        error: &Error,
+        caller: Option<OrchestratorRef>,
+    ) -> Result<()> {
+        if let (Error::Transition(message), Some(reference)) = (error, caller)
+            && let Some(restart_id) = agent_run_store::service_restart::blocked_restart_id(message)
+        {
+            self.remember_service_restart_caller(restart_id, reference)
+                .await?;
+        }
+        Ok(())
+    }
     /// Borrow bounded advisory read counters. Poison discards and restores the
     /// entire hint cache; durable notices still deduplicate corrective input.
     /// This cache never authenticates a call or authorizes native work.
@@ -476,11 +484,7 @@ impl Service {
     }
 
     /// Uses only the launcher matching the execution's durable system route.
-    pub(crate) async fn launch_provider_supervisor(
-        &self,
-        id: &AgentId,
-        lane: &BrokerLane,
-    ) -> Result<()> {
+    async fn launch_provider_supervisor(&self, id: &AgentId, lane: &BrokerLane) -> Result<()> {
         let lookup = id.clone();
         let row = self.read(move |store| store.get(&lookup)).await?;
         let identity = ProviderLaunchIdentity::read(&row)?;
@@ -502,295 +506,6 @@ impl Service {
                 "execution belongs to a different launcher mode".into(),
             )),
         }
-    }
-
-    /// Prepare and commit one same-agent maintenance allocation, never a launch.
-    /// Existing allocation identity is returned before mutable policy/history
-    /// checks; callers must reconcile that target rather than treating a replay
-    /// as permission to spawn or resend native input.
-    pub async fn claim_maintenance_resume(
-        &self,
-        epoch: i64,
-        id: &AgentId,
-        request_id: String,
-    ) -> Result<agent_run_store::maintenance_resume::MaintenanceResume> {
-        if epoch <= 0
-            || request_id.trim().is_empty()
-            || request_id.len() > 256
-            || request_id.chars().any(char::is_control)
-        {
-            return Err(invalid("invalid maintenance resume request"));
-        }
-        if let Some(prior) = self
-            .maintenance_resume_replay(epoch, id, &request_id)
-            .await?
-        {
-            return Ok(prior);
-        }
-        let lane = self.lane("maintenance")?;
-        let prepared = self.prepare_maintenance_resume(epoch, id).await;
-        let result = match prepared {
-            Ok(preflight) => {
-                let at = now();
-                let outcome = lane
-                    .local_raw(
-                        agent_run_domain::storage::WriteAuthority::Broker,
-                        agent_run_store::ops::ClaimMaintenanceResume {
-                            epoch,
-                            execution: id.clone(),
-                            request_id: request_id.clone(),
-                            preflight,
-                            at,
-                            startup_deadline_at: at
-                                + agent_run_platform::launch::Timeouts::default()
-                                    .ready
-                                    .as_secs_f64(),
-                        },
-                        crate::broker_writer::BROKER_BUDGET,
-                    )
-                    .await;
-                match outcome {
-                    agent_run_domain::storage::SubmitResult::Committed(receipt) => {
-                        agent_run_store::maintenance_resume::MaintenanceResume::from_dispatch_receipt(&receipt)
-                    }
-                    other => crate::persist::into_result(other),
-                }
-            }
-            Err(error) => Err(error),
-        };
-        match result {
-            Ok(claim) => Ok(claim),
-            Err(error) => match self.maintenance_resume_replay(epoch, id, &request_id).await {
-                Ok(Some(prior)) => Ok(prior),
-                _ => Err(error),
-            },
-        }
-    }
-
-    /// Recover startup ownership of an existing definitely-unlaunched target.
-    /// The old owner must be proven dead; an outstanding capability is only
-    /// reclaimable when the writer proves it still belonged to that broker.
-    /// No second attempt is allocated and replay grants no launch permission.
-    pub async fn claim_maintenance_prepared(
-        &self,
-        epoch: i64,
-        id: &AgentId,
-    ) -> Result<Option<agent_run_store::maintenance_prepared::PreparedMaintenanceClaim>> {
-        self.claim_maintenance_prepared_mode(epoch, id, false, false)
-            .await
-    }
-
-    /// Retire the current writer's unreleased capability after its launch
-    /// future returned; the writer rechecks the exact owner and capability.
-    pub(crate) async fn retake_maintenance_prepared(
-        &self,
-        epoch: i64,
-        id: &AgentId,
-    ) -> Result<Option<agent_run_store::maintenance_prepared::PreparedMaintenanceClaim>> {
-        self.claim_maintenance_prepared_mode(epoch, id, true, true)
-            .await
-    }
-
-    /// Observe a previously committed current-writer retake after an unknown
-    /// acknowledgement; a fresh allocation alone cannot authorize a retry.
-    pub(crate) async fn recover_maintenance_retake(
-        &self,
-        epoch: i64,
-        id: &AgentId,
-    ) -> Result<Option<agent_run_store::maintenance_prepared::PreparedMaintenanceClaim>> {
-        self.claim_maintenance_prepared_mode(epoch, id, true, false)
-            .await
-    }
-
-    async fn claim_maintenance_prepared_mode(
-        &self,
-        epoch: i64,
-        id: &AgentId,
-        retake_current: bool,
-        after_error: bool,
-    ) -> Result<Option<agent_run_store::maintenance_prepared::PreparedMaintenanceClaim>> {
-        let lookup = id.clone();
-        let candidate=self.read(move|store| {
-            let snapshot=store.conn().unchecked_transaction()?;
-            let Some(allocation)=store.maintenance_resume(epoch,&lookup)? else {return Ok(None);};
-            let eligible:bool=store.conn().query_row(
-                "SELECT EXISTS(SELECT 1 FROM agents a JOIN attempts t ON t.agent_id=a.id JOIN maintenance_fences f ON f.epoch=? \
-                 WHERE a.id=? AND t.id=? AND f.ended_at IS NULL AND f.phase IN ('recovering','deferring') \
-                 AND a.status='starting' AND a.finished_at IS NULL \
-                 AND a.supervisor_pid IS NULL AND a.supervisor_identity IS NULL AND a.supervisor_birth_time IS NULL AND a.process_group_id IS NULL \
-                 AND t.state='prepared' AND t.phase='prepared' AND t.ownership_active=1 AND t.finished_at IS NULL \
-                 AND t.process_identity IS NULL AND t.process_birth_time IS NULL AND t.cleanup_proof_json IS NULL \
-                 AND NOT EXISTS(SELECT 1 FROM process_ownership p WHERE p.owner_kind='attempt' AND p.owner_id=t.id) \
-                 AND NOT EXISTS(SELECT 1 FROM process_members p WHERE p.owner_kind='attempt' AND p.owner_id=t.id) \
-                 AND NOT EXISTS(SELECT 1 FROM commands c WHERE c.agent_id=a.id AND c.kind='cancel' AND c.state IN ('pending','claimed')))",
-                rusqlite::params![epoch,lookup.as_str(),allocation.target_attempt_id],|r|r.get(0))?;
-            if !eligible {return Ok(None);}
-            let row=store.get(&lookup)?;
-            let (owner,birth,capability):(Option<String>,Option<f64>,Option<String>)=store.conn().query_row("SELECT startup_owner_pid_identity,startup_owner_birth_time,supervisor_capability_sha256 FROM agents WHERE id=?",[lookup.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-            let (Some(owner),Some(birth))=(owner,birth) else {return Ok(None);};
-            let identity:Value=serde_json::from_str(&owner).map_err(|_|invalid("prepared startup owner is malformed"))?;
-            if retake_current || capability.is_some() {
-                let broker = identity.as_object().is_some_and(|object| object.len()==3 && ["pid","token","birth"].iter().all(|key|object.contains_key(*key)));
-                if !broker || capability.as_ref().is_some_and(|hash|hash.len()!=64 || !hash.bytes().all(|byte|byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
-                    || !agent_run_store::maintenance_target_cancel::preparation_not_started(store.conn(),&lookup,&allocation.target_attempt_id)? {
-                    return Ok(None);
-                }
-            }
-            let retake_count = if retake_current {
-                let writer_epoch:i64=store.conn().query_row("SELECT epoch FROM writer_authority WHERE id=1",[],|row|row.get(0))?;
-                let count:i64=store.conn().query_row("SELECT COUNT(*) FROM events WHERE agent_id=? AND attempt_id=? AND kind='maintenance_prepared_claimed_v1' AND json_extract(data_json,'$.writer_epoch')=? AND json_extract(data_json,'$.current_writer')=1",rusqlite::params![lookup.as_str(),allocation.target_attempt_id,writer_epoch],|row|row.get(0))?;
-                if !after_error && count==0 {return Ok(None);}
-                Some(count)
-            } else {None};
-            let pid=identity["pid"].as_i64().and_then(|pid|i32::try_from(pid).ok()).filter(|pid|*pid>1);
-            let token=identity["token"].as_str().filter(|token|!token.is_empty());
-            if pid.is_none() || token.is_none() || identity["birth"].as_f64()!=Some(birth) || !birth.is_finite() || birth<0.0 {return Ok(None);}
-            snapshot.commit()?;
-            let state=if retake_current {agent_run_platform::process::ProcessState::Alive} else {process::observe(pid,token,Some(birth))};
-            if !retake_current && !matches!(state,agent_run_platform::process::ProcessState::Dead|agent_run_platform::process::ProcessState::Reused) {return Ok(None);}
-            let at=now();
-            Ok(Some((row,allocation.account_id,agent_run_store::ops::ClaimMaintenancePrepared {
-                epoch,execution:lookup,target_attempt_id:allocation.target_attempt_id,
-                expected_startup_owner:owner,expected_startup_birth_time:birth,expected_capability_sha256:capability,retake_current_writer:retake_current.then_some(true),expected_current_retake_count:retake_count,owner_state:state,at,
-                startup_deadline_at:at+agent_run_platform::launch::Timeouts::default().ready.as_secs_f64(),
-            })))
-        }).await?;
-        let Some((row, account, operation)) = candidate else {
-            return Ok(None);
-        };
-        let frozen = ProviderLaunchIdentity::read(&row)?;
-        self.maintenance_resume_policy(&frozen, &account.parse()?)?;
-        let outcome = self
-            .lane("maintenance")?
-            .local_raw(
-                agent_run_domain::storage::WriteAuthority::Broker,
-                operation,
-                crate::broker_writer::BROKER_BUDGET,
-            )
-            .await;
-        match outcome {
-            agent_run_domain::storage::SubmitResult::Committed(receipt)=>agent_run_store::maintenance_prepared::PreparedMaintenanceClaim::from_dispatch_receipt(&receipt).map(Some),
-            other=>crate::persist::into_result(other).map(Some),
-        }
-    }
-
-    /// Resolve durable identity after a concurrent/unknown claim without
-    /// submitting another mutation or inspecting native private files.
-    async fn maintenance_resume_replay(
-        &self,
-        epoch: i64,
-        id: &AgentId,
-        request_id: &str,
-    ) -> Result<Option<agent_run_store::maintenance_resume::MaintenanceResume>> {
-        let id = id.clone();
-        let request_id = request_id.to_owned();
-        self.read(move |store| {
-            let prior = store.maintenance_resume(epoch, &id)?;
-            if prior
-                .as_ref()
-                .is_some_and(|prior| prior.request_id != request_id)
-            {
-                return Err(Error::Conflict);
-            }
-            Ok(prior)
-        })
-        .await
-    }
-
-    /// Recheck mutable account/role/route policy without replacing the frozen
-    /// authority. This remains necessary again at the eventual native handoff.
-    fn maintenance_resume_policy(
-        &self,
-        frozen: &ProviderLaunchIdentity,
-        account: &agent_run_domain::catalog::AccountId,
-    ) -> Result<()> {
-        let (current, _) = self.current_provider_config()?;
-        current_policy_permits(&current, frozen, &frozen.provider_request)?;
-        if !frozen.authority.eligible_accounts.contains(account)
-            || !supervisor::current_bindings(&current, &frozen.authority).contains(account)
-            || !supervisor::ordered_binding_unchanged(&current, account, frozen)
-            || !StoreReader::open(&self.home)?
-                .account(account)?
-                .is_some_and(|record| record.status == AccountStatus::Enabled)
-        {
-            return Err(invalid("maintenance source account is no longer permitted"));
-        }
-        match (&self.system_launcher, &frozen.system_route) {
-            (Some(launcher), Some(route))
-                if route.state_home == self.home
-                    && launcher.route(&frozen.authority.provider, frozen.authority.harness)?
-                        == *route =>
-            {
-                Ok(())
-            }
-            (None, None) => Ok(()),
-            _ => Err(Error::ExecutionChanged),
-        }
-    }
-
-    /// Prepare OS, private-history and policy observations outside SQL writes.
-    /// Shared mode delegates private reads to the original account's worker;
-    /// local mode explicitly refuses any execution carrying a system route.
-    pub(crate) async fn prepare_maintenance_resume(
-        &self,
-        epoch: i64,
-        id: &AgentId,
-    ) -> Result<agent_run_store::maintenance_resume::ResumePreflight> {
-        let lookup = id.clone();
-        let (row,park,expected_owner,account)=self.read(move|store| {
-            let snapshot=store.conn().unchecked_transaction()?;
-            let park=store.maintenance_park(epoch,&lookup)?.ok_or_else(||invalid("maintenance source is not parked"))?;
-            if store.parked_maintenance_checkpoint(epoch,&lookup,&park.attempt_id)?.is_none() {return Err(Error::ExecutionChanged);}
-            let row=store.get(&lookup)?;
-            let (startup_owner,startup_birth_time):(Option<String>,Option<f64>)=store.conn().query_row(
-                "SELECT startup_owner_pid_identity,startup_owner_birth_time FROM agents WHERE id=?",[lookup.as_str()],|r|Ok((r.get(0)?,r.get(1)?)))?;
-            let account:String=store.conn().query_row("SELECT selected_account_id FROM attempts WHERE id=? AND agent_id=?",rusqlite::params![park.attempt_id,lookup.as_str()],|r|r.get(0))?;
-            let expected=agent_run_store::ops::ExpectedOwnership {execution:lookup,supervisor_pid:row.supervisor_pid,supervisor_identity:row.supervisor_identity.clone(),supervisor_birth_time:row.supervisor_birth_time,process_group_id:row.process_group_id,startup_owner,startup_birth_time};
-            snapshot.commit()?;
-            Ok((row,park,expected,account.parse::<agent_run_domain::catalog::AccountId>()?))
-        }).await?;
-        let frozen = ProviderLaunchIdentity::read(&row)?;
-        self.maintenance_resume_policy(&frozen, &account)?;
-        let request = crate::system_launch::MaintenancePreflightRequest {
-            epoch,
-            execution: id.clone(),
-            source_attempt_id: park.attempt_id.clone(),
-            source_proof_sha256: park.proof_sha256.clone(),
-        };
-        let observed = match (&self.system_launcher, &frozen.system_route) {
-            (Some(launcher), Some(route)) => {
-                launcher
-                    .preflight_maintenance_resume(request.clone(), route.clone())
-                    .await?
-            }
-            (None, None) => {
-                let home = self.home.clone();
-                let request = request.clone();
-                tokio::task::spawn_blocking(move || {
-                    maintenance_resume_preflight(&home, &request, None)
-                })
-                .await
-                .map_err(|_| Error::Runtime("maintenance preflight task failed".into()))?
-                .map_err(|reason| {
-                    Error::Unsupported(format!("continuation_unavailable: {}", reason.code()))
-                })?
-            }
-            _ => return Err(Error::ExecutionChanged),
-        };
-        observed.validate_for(&request)?;
-        // Filesystem/worker I/O may have overlapped a configuration revision.
-        self.maintenance_resume_policy(&frozen, &account)?;
-        Ok(agent_run_store::maintenance_resume::ResumePreflight {
-            source_attempt_id: park.attempt_id,
-            source_proof_sha256: park.proof_sha256,
-            expected_owner,
-            supervisor_state: observed.supervisor_state,
-            verified_history_sha256: observed.verified_history_sha256,
-            current_route_fingerprint: frozen
-                .system_route
-                .as_ref()
-                .map(|route| route.fingerprint.as_str().into()),
-        })
     }
 
     /// The broker lane of one subsystem.
@@ -1052,6 +767,13 @@ impl Service {
                 "created":false,"agent":self.view(&store,&row)?}),
             );
         }
+        if let Some(restart_id) = agent_run_store::service_restart::active_service_restart(
+            &Store::open(&self.home)?.conn,
+        )? {
+            return Err(Error::Transition(
+                agent_run_store::service_restart::blocked_message(restart_id),
+            ));
+        }
         paths?;
         let (config, revision) = self.current_provider_config()?;
         let accounts = Store::open(&self.home)?.list_accounts()?;
@@ -1122,7 +844,14 @@ impl Service {
     /// to the normal detached provider-aware supervisor; a replayed admission
     /// (`created=false`) never launches another child or reserves again.
     pub async fn start_provider(&self, request: ProviderStartRequest) -> Result<Value> {
-        let mut result = self.admit_provider(request).await?;
+        let caller = request.orchestrator.clone();
+        let mut result = match self.admit_provider(request).await {
+            Ok(value) => value,
+            Err(error) => {
+                self.remember_blocked_start(&error, caller).await?;
+                return Err(error);
+            }
+        };
         self.hand_off_provider(&mut result).await?;
         Ok(result)
     }
@@ -1276,6 +1005,13 @@ impl Service {
             if let Some(found) = store.replay_pool(&namespace, &request.request_id, &sha)? {
                 return self.pool_view(&Store::open(&self.home)?, &found);
             }
+        }
+        if let Some(restart_id) =
+            agent_run_store::service_restart::active_service_restart(&store.conn)?
+        {
+            return Err(Error::Transition(
+                agent_run_store::service_restart::blocked_message(restart_id),
+            ));
         }
         let (config, revision) = self.current_provider_config()?;
         let accounts = Store::open(&self.home)?.list_accounts()?;
@@ -1474,7 +1210,14 @@ impl Service {
     /// whose launch fails ends terminally with its exact identity visible and
     /// the remaining members are still launched; a replay launches nothing.
     pub async fn start_pool(&self, request: PoolStartRequest) -> Result<Value> {
-        let result = self.admit_pool(request).await?;
+        let caller = request.orchestrator.clone();
+        let result = match self.admit_pool(request).await {
+            Ok(value) => value,
+            Err(error) => {
+                self.remember_blocked_start(&error, caller).await?;
+                return Err(error);
+            }
+        };
         self.hand_off_pool(result).await
     }
 
@@ -1924,7 +1667,7 @@ impl Service {
         let runtime = request.runtime.clone();
         let model = request.model.clone();
         let result = self
-            .admit(request, &config, identity, None, config_revision)
+            .admit(request, &config, identity, None, config_revision, None)
             .await?;
         if let (Some(agent_id), Some(created)) = (
             result.get("agent_id").and_then(Value::as_str),
@@ -1944,6 +1687,7 @@ impl Service {
         identity: LaunchIdentity,
         parent: Option<&Record>,
         config_revision: &str,
+        restart_id: Option<i64>,
     ) -> Result<Value> {
         let admitted = self
             .lane("admission")?
@@ -1954,6 +1698,7 @@ impl Service {
                     config_revision: config_revision.to_owned(),
                     identity: serde_json::to_value(identity)?,
                     parent: parent.map(|row| row.id.clone()),
+                    restart_id,
                 },
                 crate::broker_writer::BROKER_BUDGET,
             )
@@ -2022,6 +1767,20 @@ impl Service {
         display_name: Option<String>,
         orchestrator: Option<OrchestratorRef>,
     ) -> Result<Value> {
+        self.resume_for(id, task, request_id, display_name, orchestrator, None)
+            .await
+    }
+
+    /// Resume an exact terminal execution, optionally as a captured restart member.
+    async fn resume_for(
+        &self,
+        id: &AgentId,
+        task: String,
+        request_id: Option<String>,
+        display_name: Option<String>,
+        orchestrator: Option<OrchestratorRef>,
+        restart_id: Option<i64>,
+    ) -> Result<Value> {
         let parent = Store::open(&self.home)?.get(id)?;
         if !parent.status.terminal() || parent.runtime_session_id.is_none() {
             return Err(invalid(
@@ -2037,7 +1796,14 @@ impl Service {
             .is_some_and(|identity| identity["provider_identity_version"] == 2);
         if provider_row {
             let mut result = self
-                .admit_provider_resume(&parent, task, request_id, display_name, orchestrator)
+                .admit_provider_resume_for(
+                    &parent,
+                    task,
+                    request_id,
+                    display_name,
+                    orchestrator,
+                    restart_id,
+                )
                 .await?;
             self.hand_off_provider(&mut result).await?;
             return Ok(result);
@@ -2150,7 +1916,14 @@ impl Service {
             "pending:materialization"
         };
         match self
-            .admit(request, &current, identity, Some(&parent), child_revision)
+            .admit(
+                request,
+                &current,
+                identity,
+                Some(&parent),
+                child_revision,
+                restart_id,
+            )
             .await
         {
             Ok(value) => Ok(value),
@@ -2202,6 +1975,20 @@ impl Service {
         request_id: Option<String>,
         display_name: Option<String>,
         orchestrator: Option<OrchestratorRef>,
+    ) -> Result<Value> {
+        self.admit_provider_resume_for(parent, task, request_id, display_name, orchestrator, None)
+            .await
+    }
+
+    /// Reuse ordinary provider resume admission for one captured restart member.
+    async fn admit_provider_resume_for(
+        &self,
+        parent: &Record,
+        task: String,
+        request_id: Option<String>,
+        display_name: Option<String>,
+        orchestrator: Option<OrchestratorRef>,
+        restart_id: Option<i64>,
     ) -> Result<Value> {
         let frozen = ProviderLaunchIdentity::read(parent)?;
         let mut request = frozen.provider_request.clone();
@@ -2459,6 +2246,7 @@ impl Service {
                         parent: parent.id.clone(),
                         prefer: prefer.clone(),
                         preflight_digest: preflight_digest.clone(),
+                        restart_id,
                         inputs: agent_run_store::ops::AdmissionSpec {
                             request: request.clone(),
                             effective: effective.clone(),
@@ -2494,6 +2282,98 @@ impl Service {
             json!({"agent_id":admission.agent_id,"attempt_id":admission.attempt_id,
             "created":admission.created,"agent":self.view(&store,&row)?}),
         )
+    }
+
+    /// Continue one captured agent after its restart deadline is recorded.
+    pub(crate) async fn resume_service_restart(
+        &self,
+        restart_id: i64,
+        id: &AgentId,
+    ) -> Result<Value> {
+        let result = self
+            .resume_for(
+                id,
+                "Agent Run has finished its restart procedure. Continue your existing work from where you stopped."
+                    .into(),
+                Some(format!("service-restart:{restart_id}:{id}")),
+                None,
+                None,
+                Some(restart_id),
+            )
+            .await;
+        if let Err(error) = &result
+            && !matches!(
+                error,
+                Error::Persistence { .. } | Error::WriterFailure(_) | Error::BrokerUnavailable
+            )
+        {
+            let reason = match error {
+                Error::Unsupported(message)
+                    if message.starts_with("continuation_unavailable:")
+                        && message.len() <= 180
+                        && message.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || b" _:-.".contains(&byte)
+                        }) =>
+                {
+                    message.clone()
+                }
+                Error::ExecutionChanged => "The original execution or account changed.".into(),
+                Error::Validation(message)
+                    if message == "resume requires a terminal run with a native session ID" =>
+                {
+                    "The native session is unavailable.".into()
+                }
+                _ => format!("Resume was refused: {}", error.public().kind),
+            };
+            let _ = self
+                .lane("service-restart")?
+                .local(
+                    agent_run_store::ops::FailServiceRestartResume {
+                        restart_id,
+                        agent_id: id.clone(),
+                        reason,
+                    },
+                    crate::broker_writer::BROKER_BUDGET,
+                )
+                .await;
+        }
+        result
+    }
+
+    /// Start the deadline before a captured agent's resume is dispatched.
+    pub(crate) async fn request_service_restart_resume(
+        &self,
+        restart_id: i64,
+        id: &AgentId,
+    ) -> Result<()> {
+        let (boot_id, now_ns) = agent_run_platform::monotonic::now()?;
+        self.lane("service-restart")?
+            .local(
+                agent_run_store::ops::RequestServiceRestartResume {
+                    restart_id,
+                    agent_id: id.clone(),
+                    boot_id,
+                    now_ns,
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await
+    }
+
+    /// Reconcile confirmed resumes and the configured 60-second deadline.
+    pub(crate) async fn refresh_service_restart(&self, restart_id: i64) -> Result<bool> {
+        let (boot_id, now_ns) = agent_run_platform::monotonic::now()?;
+        self.lane("service-restart")?
+            .local(
+                agent_run_store::ops::RefreshServiceRestart {
+                    restart_id,
+                    boot_id,
+                    now_ns,
+                    at: now(),
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await
     }
 
     /// Enqueues one durable cancellation and returns the agent's public view.
@@ -2541,10 +2421,19 @@ impl Service {
     /// Unavailable answers retain their metadata envelope; verified inline text
     /// keeps the historical 1 MiB CLI cutoff independently of transport budgets.
     pub fn answer(&self, id: &AgentId) -> Result<Value> {
-        let row = Store::open(&self.home)?.get(id)?;
+        let store = Store::open(&self.home)?;
+        let row = store.get(id)?;
+        let restart = agent_run_store::service_restart::restart_view(&store.conn, id)?;
+        let status = match restart.as_ref().map(|(status, _)| status.as_str()) {
+            Some("failed") => "failed",
+            Some("cancelled") => "cancelled",
+            Some("cancelling") => "cancelling",
+            Some(_) => "running",
+            None => row.status.as_str(),
+        };
         let Some(path) = &row.answer_path else {
             return Ok(
-                json!({"agent_id":id,"status":row.status,"available":false,"path":null,"size_bytes":null,"sha256":null,"content":null,"inline_complete":false,"relative_path":null,"kind":null,"media_type":null,"proof_version":null}),
+                json!({"agent_id":id,"status":status,"available":false,"path":null,"size_bytes":null,"sha256":null,"content":null,"inline_complete":false,"relative_path":null,"kind":null,"media_type":null,"proof_version":null}),
             );
         };
         let proof = crate::observation::answer_proof(&row)?;
@@ -2635,6 +2524,8 @@ impl Service {
         }
     }
     /// Wait for a terminal durable revision or this observer's optional deadline.
+    /// A service-restart continuation follows its confirmed successor; ordinary
+    /// user-requested continuations remain pinned to the selected execution.
     ///
     /// The run itself is never given an execution deadline here: `seconds`
     /// bounds only this observer.  Each read opens and drops its own
@@ -2653,17 +2544,35 @@ impl Service {
                     .ok_or_else(|| invalid("wait deadline is out of range"))
             })
             .transpose()?;
+        let mut current = id.clone();
         loop {
             // This scope drops the thread-affine connection before the await.
             // A waiter therefore owns neither a SQLite transaction nor a socket
             // lane while another process commits the terminal revision.
-            let row = { Store::open(&self.home)?.get(id)? };
-            if row.status.terminal() {
-                return self.answer(id);
+            let (row, restart, continuation) = {
+                let store = Store::open(&self.home)?;
+                let row = store.get(&current)?;
+                let restart =
+                    agent_run_store::service_restart::restart_view(&store.conn, &current)?;
+                let continuation: Option<Option<String>> = store.conn.query_row(
+                    "SELECT resumed_execution_id FROM service_restart_agents WHERE agent_id=? AND resume_status IN ('started','cancelled') AND resumed_execution_id IS NOT NULL ORDER BY restart_id DESC LIMIT 1",
+                    [current.as_str()], |row| row.get(0),
+                ).optional()?;
+                (row, restart, continuation.flatten())
+            };
+            if let Some(child) = continuation {
+                current = child.parse()?;
+                continue;
+            }
+            let restarting = restart.as_ref().is_some_and(|(state, _)| {
+                matches!(state.as_str(), "pending" | "unconfirmed" | "cancelling")
+            });
+            if row.status.terminal() && !restarting {
+                return self.answer(&current);
             }
             if until.is_some_and(|d| tokio::time::Instant::now() >= d) {
                 return Ok(
-                    json!({"agent_id":id,"status":row.status,"terminal":false,"available":false}),
+                    json!({"agent_id":id,"status":if restarting {"running"} else {row.status.as_str()},"terminal":false,"available":false}),
                 );
             }
             let poll = Duration::from_millis(200);
@@ -2714,6 +2623,47 @@ impl Service {
             "created_at":row.created_at,"started_at":row.started_at,"finished_at":row.finished_at,"elapsed_seconds":(row.finished_at.unwrap_or(observed)-row.started_at.unwrap_or(row.created_at)).max(0.0),"last_progress_at":progress,"silence_seconds":if row.status.terminal(){None}else{Some((observed-progress.or(row.started_at).unwrap_or(row.created_at)).max(0.0))},"failure_kind":row.failure_kind,"failure_text":row.failure_text,"answer_available":row.answer_path.is_some(),"answer_bytes":row.answer_bytes,"answer_sha256":row.answer_sha256,"effort":row.request.effort,
             "delivery":store.delivery_status(&row.id)?,"parent_agent_id":row.parent_agent_id,"root_agent_id":row.root_agent_id,"sequence":row.sequence,"cleanup":store.last_event(&row.id,"process_cleanup")?,"policy":policy,"phase":phase,"phase_started_at":row.finished_at.or(row.started_at).unwrap_or(row.created_at),"process_state":process::observe(row.supervisor_pid,row.supervisor_identity.as_deref(),row.supervisor_birth_time),"observed_at":observed,"runtime_outcome":if row.status.terminal(){Some(row.status.as_str())}else{None},"acceptance":"pending","workdir":row.request.workdir.display().to_string(),
             "usage":store.usage_view(&row.id)?,"usage_cumulative":store.usage_cumulative(&row.root_agent_id)?,"tool_counts":store.tool_counts(&row.id)?});
+        if let Some((status, reason)) =
+            agent_run_store::service_restart::restart_view(&store.conn, &row.id)?
+        {
+            let failed = status == "failed";
+            let cancelled = status == "cancelled";
+            let cancelling = status == "cancelling";
+            view["status"] = json!(if failed {
+                "failed"
+            } else if cancelled {
+                "cancelled"
+            } else if cancelling {
+                "cancelling"
+            } else {
+                "running"
+            });
+            view["phase"] = json!(match status.as_str() {
+                "failed" | "cancelled" => "terminal",
+                "cancelling" => "stopping",
+                "unconfirmed" => "restart_unconfirmed",
+                _ => "restarting",
+            });
+            if !failed && !cancelled {
+                view["finished_at"] = Value::Null;
+            }
+            view["runtime_outcome"] = if failed {
+                json!("failed")
+            } else if cancelled {
+                json!("cancelled")
+            } else {
+                Value::Null
+            };
+            view["answer_available"] = json!(false);
+            view["answer_bytes"] = Value::Null;
+            view["answer_sha256"] = Value::Null;
+            view["failure_kind"] = if failed {
+                json!("restart_resume_failed")
+            } else {
+                Value::Null
+            };
+            view["failure_text"] = serde_json::to_value(reason)?;
+        }
         if let Some(lifecycle) = store.worker_lifecycle_view_at(&row.id, observed)? {
             if !row.status.terminal() && row.status == Status::Running {
                 view["phase"] = lifecycle["phase"].clone();
@@ -2740,8 +2690,6 @@ impl Service {
     /// pools create no settlement receipts. The writer rechecks each decision.
     pub async fn reconcile(&self) -> Result<usize> {
         let lane = self.lane("reconcile")?;
-        let parked_cancelled = self.reconcile_parked_cancellations(&lane).await?;
-        let prepared_cancelled = self.reconcile_prepared_cancellations(&lane).await?;
         let reconciled = reconcile::queued::reconcile(&self.home, &lane, 100)
             .await?
             .len();
@@ -2763,141 +2711,7 @@ impl Service {
             )
             .await?;
         }
-        Ok(reconciled + parked_cancelled + prepared_cancelled)
-    }
-
-    /// Fulfil explicit cancellation after a maintenance successor's supervisor
-    /// dies before native launch, including a startup child or its broker that
-    /// died before supervisor registration. Ownership is observed outside the SQL snapshot;
-    /// the writer rechecks the exact target, discovery guard and never-spawned
-    /// boundary. Unknown receipts are resolved by later durable observation.
-    async fn reconcile_prepared_cancellations(&self, lane: &BrokerLane) -> Result<usize> {
-        let candidates = self.read(|store| {
-            let snapshot = store.conn().unchecked_transaction()?;
-            let predicate = "a.status='starting' AND a.finished_at IS NULL \
-                AND ((a.supervisor_pid IS NOT NULL AND a.supervisor_identity IS NOT NULL AND a.supervisor_birth_time IS NOT NULL) \
-                    OR (a.supervisor_pid IS NULL AND a.supervisor_identity IS NULL AND a.supervisor_birth_time IS NULL AND a.startup_owner_pid_identity IS NOT NULL)) \
-                AND a.process_group_id IS NULL AND f.ended_at IS NULL AND f.phase IN ('recovering','deferring') \
-                AND t.state='prepared' AND t.phase='prepared' AND t.ownership_active=1 AND t.finished_at IS NULL \
-                AND EXISTS(SELECT 1 FROM commands q WHERE q.agent_id=a.id AND q.kind='cancel' AND q.state IN ('pending','claimed'))";
-            let joins = "FROM maintenance_resumes r JOIN maintenance_fences f ON f.epoch=r.epoch \
-                JOIN agents a ON a.id=r.agent_id JOIN attempts t ON t.id=r.target_attempt_id AND t.agent_id=a.id";
-            let count: i64 = store.conn().query_row(&format!("SELECT COUNT(*) {joins} WHERE {predicate}"), [], |r| r.get(0))?;
-            if count == 0 { return Ok(Vec::new()); }
-            let ids = store.conn().prepare(&format!("SELECT a.id,r.epoch,t.id {joins} WHERE {predicate} ORDER BY a.created_at,a.id LIMIT 100 OFFSET ?"))?
-                .query_map([(now() as i64).rem_euclid(count)], |r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let writer:Option<(i32,Option<String>,Option<f64>)> = store.conn().query_row(
-                "SELECT holder_pid,holder_token,holder_birth FROM writer_authority WHERE id=1",[],
-                |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
-            ).optional()?;
-            let mut prepared = Vec::new();
-            for (id, epoch, target_attempt_id) in ids {
-                let id: AgentId = id.parse()?;
-                let row = store.get(&id)?;
-                let (startup_owner,startup_birth_time,capability): (Option<String>,Option<f64>,Option<String>) = store.conn().query_row(
-                    "SELECT startup_owner_pid_identity,startup_owner_birth_time,supervisor_capability_sha256 FROM agents WHERE id=?", [id.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-                let cancel_command_id: i64 = store.conn().query_row("SELECT id FROM commands WHERE agent_id=? AND kind='cancel' AND state IN ('pending','claimed') ORDER BY id LIMIT 1", [id.as_str()], |r| r.get(0))?;
-                let expected_owner = agent_run_store::ops::ExpectedOwnership {
-                    execution:id.clone(),supervisor_pid:row.supervisor_pid,supervisor_identity:row.supervisor_identity,
-                    supervisor_birth_time:row.supervisor_birth_time,process_group_id:row.process_group_id,startup_owner,startup_birth_time,
-                };
-                let current = agent_run_store::maintenance_target_cancel::startup_broker(&expected_owner).is_some_and(|(pid,token,birth)| {
-                    writer.as_ref().is_some_and(|(wpid,wtoken,wbirth)| *wpid==pid && wtoken.as_deref()==Some(token.as_str()) && *wbirth==Some(birth))
-                });
-                prepared.push(agent_run_store::ops::CancelPreparedMaintenance {
-                    epoch, execution: id.clone(), target_attempt_id, cancel_command_id,
-                    expected_owner,
-                    supervisor_state: if current {agent_run_platform::process::ProcessState::Alive} else {agent_run_platform::process::ProcessState::Unknown},
-                    expected_capability_sha256:if current {capability} else {None},cancel_current_broker:current.then_some(true),at: now(),
-                });
-            }
-            snapshot.commit()?;
-            for op in &mut prepared {
-                if op.cancel_current_broker == Some(true) {continue;}
-                let owner = &op.expected_owner;
-                op.supervisor_state = if owner.supervisor_pid.is_some() {
-                    process::observe(owner.supervisor_pid, owner.supervisor_identity.as_deref(), owner.supervisor_birth_time)
-                } else if let Some(child) = agent_run_store::maintenance_target_cancel::startup_child(owner) {
-                    process::observe(Some(child.pid), Some(&child.token), Some(child.birth))
-                } else if let Some((pid, token, birth)) = agent_run_store::maintenance_target_cancel::startup_broker(owner) {
-                    process::observe(Some(pid), Some(&token), Some(birth))
-                } else {
-                    agent_run_platform::process::ProcessState::Unknown
-                };
-            }
-            prepared.retain(|op| op.cancel_current_broker==Some(true) || matches!(op.supervisor_state, agent_run_platform::process::ProcessState::Dead | agent_run_platform::process::ProcessState::Reused));
-            Ok(prepared)
-        }).await?;
-        let mut changed = 0;
-        for candidate in candidates {
-            // An unknown acknowledgement never causes a second terminal effect:
-            // later sweeps observe the atomic commit or use the same cancel id.
-            if matches!(
-                lane.local(candidate, crate::broker_writer::BROKER_BUDGET)
-                    .await,
-                Ok(true)
-            ) {
-                changed += 1;
-            }
-        }
-        Ok(changed)
-    }
-
-    /// Close the cancel-after-park/exit race in the existing periodic sweep.
-    /// Only metadata and kernel identity are read; no native signal or private
-    /// history access occurs. The writer rechecks every source and command.
-    async fn reconcile_parked_cancellations(&self, lane: &BrokerLane) -> Result<usize> {
-        let candidates=self.read(|store| {
-            let snapshot=store.conn().unchecked_transaction()?;
-            let predicate="a.status='running' AND a.finished_at IS NULL AND EXISTS(SELECT 1 FROM maintenance_parks p JOIN attempts t ON t.id=p.attempt_id AND t.agent_id=p.agent_id WHERE p.agent_id=a.id AND t.state='maintenance_parked' AND t.ownership_active=1 AND t.finished_at IS NULL) AND EXISTS(SELECT 1 FROM commands c WHERE c.agent_id=a.id AND c.kind='cancel' AND c.state IN ('pending','claimed'))";
-            let count:i64=store.conn().query_row(&format!("SELECT COUNT(*) FROM agents a WHERE {predicate}"),[],|r|r.get(0))?;
-            if count==0 {return Ok(Vec::new());}
-            let offset=(now() as i64).rem_euclid(count);
-            let ids=store.conn().prepare(&format!("SELECT a.id FROM agents a WHERE {predicate} ORDER BY a.created_at,a.id LIMIT 100 OFFSET ?"))?
-                .query_map([offset],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            let mut prepared=Vec::new();
-            for id in ids {
-                let id:AgentId=id.parse()?;let row=store.get(&id)?;
-                let (epoch,attempt,proof):(i64,String,String)=store.conn().query_row(
-                    "SELECT p.epoch,p.attempt_id,p.proof_sha256 FROM maintenance_parks p JOIN attempts t ON t.id=p.attempt_id AND t.agent_id=p.agent_id WHERE p.agent_id=? AND t.state='maintenance_parked' AND t.ownership_active=1 ORDER BY p.epoch DESC LIMIT 1",
-                    [id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-                let command:i64=store.conn().query_row("SELECT id FROM commands WHERE agent_id=? AND kind='cancel' AND state IN ('pending','claimed') ORDER BY id LIMIT 1",[id.as_str()],|r|r.get(0))?;
-                let (startup_owner,startup_birth_time):(Option<String>,Option<f64>)=store.conn().query_row("SELECT startup_owner_pid_identity,startup_owner_birth_time FROM agents WHERE id=?",[id.as_str()],|r|Ok((r.get(0)?,r.get(1)?)))?;
-                prepared.push(agent_run_store::ops::CancelParkedMaintenance {
-                    epoch,execution:id.clone(),attempt,source_proof_sha256:proof,cancel_command_id:command,
-                    expected_owner:agent_run_store::ops::ExpectedOwnership {execution:id,supervisor_pid:row.supervisor_pid,supervisor_identity:row.supervisor_identity,supervisor_birth_time:row.supervisor_birth_time,process_group_id:row.process_group_id,startup_owner,startup_birth_time},
-                    supervisor_state:agent_run_platform::process::ProcessState::Unknown,at:now(),
-                });
-            }
-            snapshot.commit()?;
-            // Observation starts only after the consistent SQL read ends.
-            for prepared in &mut prepared {
-                let owner=&prepared.expected_owner;
-                prepared.supervisor_state=process::observe(owner.supervisor_pid,owner.supervisor_identity.as_deref(),owner.supervisor_birth_time);
-            }
-            prepared.retain(|prepared|matches!(prepared.supervisor_state,agent_run_platform::process::ProcessState::Dead|agent_run_platform::process::ProcessState::Reused));
-            Ok(prepared)
-        }).await?;
-        let mut changed = 0;
-        for candidate in candidates {
-            match lane
-                .local(candidate, crate::broker_writer::BROKER_BUDGET)
-                .await
-            {
-                Ok(true) => changed += 1,
-                Ok(false) => {}
-                Err(_) => {
-                    // The pending cancel remains its durable idempotency key;
-                    // no process action is retried and terminal commit is a no-op
-                    // if an uncertain earlier acknowledgement already committed.
-                    if let Some(logger) = logging::configured() {
-                        logger.log(logging::Level::Warning,"parked cancellation remains unconfirmed; ownership retained for reconciliation");
-                    }
-                }
-            }
-        }
-        Ok(changed)
+        Ok(reconciled)
     }
     /// Returns the active cached config revision after the request-boundary
     /// digest check; an invalid edit keeps the last valid revision active.
@@ -3236,148 +3050,6 @@ pub fn system_resume_preflight(
         return Err(Failure::ParentChanged);
     }
     Ok(before)
-}
-
-/// Read-only maintenance preflight executed by the original account's worker.
-/// The broker supplies only an exact parked source and frozen route; all asset
-/// and history paths come from immutable storage. Current policy is checked by
-/// the broker separately, and all source facts are rechecked by claim in SQL.
-/// Ordinary terminal-parent preflight above intentionally remains unchanged.
-pub fn system_maintenance_resume_preflight(
-    home: &std::path::Path,
-    request: &crate::system_launch::MaintenancePreflightRequest,
-    worker_socket: &std::path::Path,
-    route_fingerprint: &str,
-) -> std::result::Result<
-    crate::system_launch::MaintenancePreflightResult,
-    crate::system_launch::ResumePreflightFailure,
-> {
-    maintenance_resume_preflight(home, request, Some((worker_socket, route_fingerprint)))
-}
-
-/// Shared private-file verifier with an explicit mutually exclusive route mode.
-/// Local mode never reads a system execution's account home as the broker.
-fn maintenance_resume_preflight(
-    home: &std::path::Path,
-    request: &crate::system_launch::MaintenancePreflightRequest,
-    worker_route: Option<(&std::path::Path, &str)>,
-) -> std::result::Result<
-    crate::system_launch::MaintenancePreflightResult,
-    crate::system_launch::ResumePreflightFailure,
-> {
-    use crate::system_launch::{MaintenancePreflightResult, ResumePreflightFailure as Failure};
-    request
-        .validate()
-        .map_err(|_| Failure::ParentUnverifiable)?;
-    let store = StoreReader::open(home).map_err(|_| Failure::ParentUnverifiable)?;
-    let snapshot = store
-        .conn()
-        .unchecked_transaction()
-        .map_err(|_| Failure::ParentUnverifiable)?;
-    let park = store
-        .maintenance_park(request.epoch, &request.execution)
-        .map_err(|_| Failure::ParentUnverifiable)?
-        .ok_or(Failure::ParentChanged)?;
-    if park.attempt_id != request.source_attempt_id
-        || park.proof_sha256 != request.source_proof_sha256
-        || store
-            .parked_maintenance_checkpoint(
-                request.epoch,
-                &request.execution,
-                &request.source_attempt_id,
-            )
-            .map_err(|_| Failure::ParentUnverifiable)?
-            .is_none()
-    {
-        return Err(Failure::ParentChanged);
-    }
-    let row = store
-        .get(&request.execution)
-        .map_err(|_| Failure::ParentUnverifiable)?;
-    let frozen = ProviderLaunchIdentity::read(&row).map_err(|_| Failure::ParentUnverifiable)?;
-    let private_home = match (worker_route, frozen.system_route.as_ref()) {
-        (Some((worker_socket, fingerprint)), Some(route))
-            if route.state_home == home
-                && route.worker_socket == worker_socket
-                && route.fingerprint.as_str() == fingerprint =>
-        {
-            route.private_home.as_path()
-        }
-        (None, None) => home,
-        _ => return Err(Failure::RouteChanged),
-    };
-    let runtime_home = frozen
-        .runtime_home
-        .as_deref()
-        .ok_or(Failure::AssetsUnverifiable)?;
-    let session = row
-        .runtime_session_id
-        .as_deref()
-        .ok_or(Failure::HistoryUnverifiable)?;
-    let state: String = store
-        .conn()
-        .query_row(
-            "SELECT adapter_state_json FROM attempts WHERE id=? AND agent_id=?",
-            rusqlite::params![request.source_attempt_id, request.execution.as_str()],
-            |r| r.get(0),
-        )
-        .map_err(|_| Failure::HistoryUnverifiable)?;
-    snapshot.commit().map_err(|_| Failure::ParentUnverifiable)?;
-    // No SQLite write lock spans kernel observation or private filesystem reads.
-    if row.supervisor_pid.is_none_or(|pid| pid <= 1)
-        || row
-            .supervisor_identity
-            .as_deref()
-            .is_none_or(|token| token.is_empty())
-        || row
-            .supervisor_birth_time
-            .is_none_or(|birth| !birth.is_finite() || birth < 0.0)
-    {
-        return Err(Failure::ParentUnverifiable);
-    }
-    let supervisor_state = process::observe(
-        row.supervisor_pid,
-        row.supervisor_identity.as_deref(),
-        row.supervisor_birth_time,
-    );
-    match supervisor_state {
-        agent_run_platform::process::ProcessState::Dead
-        | agent_run_platform::process::ProcessState::Reused => {}
-        agent_run_platform::process::ProcessState::Denied => return Err(Failure::AccessDenied),
-        _ => return Err(Failure::ParentChanged),
-    }
-    crate::runtime_storage::verify(
-        &store,
-        private_home,
-        runtime_home,
-        frozen.authority.assets_sha256.as_str(),
-    )
-    .map_err(|_| Failure::AssetsUnverifiable)?;
-    let expected_root = (frozen.authority.harness == agent_run_domain::catalog::HarnessId::Codex)
-        .then_some(runtime_home);
-    let seal = verify_recorded_history(&state, &frozen, expected_root, session)
-        .map_err(|_| Failure::HistoryUnverifiable)?;
-    if store
-        .parked_maintenance_checkpoint(
-            request.epoch,
-            &request.execution,
-            &request.source_attempt_id,
-        )
-        .map_err(|_| Failure::ParentChanged)?
-        .is_none()
-        || store
-            .maintenance_park(request.epoch, &request.execution)
-            .map_err(|_| Failure::ParentChanged)?
-            .as_ref()
-            != Some(&park)
-    {
-        return Err(Failure::ParentChanged);
-    }
-    Ok(MaintenancePreflightResult {
-        source_proof_sha256: park.proof_sha256,
-        verified_history_sha256: seal.sha256,
-        supervisor_state,
-    })
 }
 
 /// Verifies the native-history seal the supervisor recorded in the parent's

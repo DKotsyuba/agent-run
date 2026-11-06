@@ -4,14 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
-## 0.29.3
-
-- feat(runtime): prepare a planned restart by fencing new work, notifying
-  orchestrators, and resuming verified Codex and Claude sessions after restart.
-  Unverified background work defers the restart instead of interrupting it.
-  A proven dead supervisor with an unconfirmed continuation is reported
-  as uncertain without replaying it; an unreleased broker capability can be
-  reclaimed for the same prepared attempt after owner death is verified.
+- feat(runtime): support planned service restarts with temporary agent finishes,
+  automatic continuation, and one result summary per affected orchestrator.
 - feat(quotas): support optional account-owned subscription probes for the
   shared Linux broker without sharing login credentials.
 - fix(claude): temporarily skip an ordered account for one hour after a
@@ -26,40 +20,13 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   retaining bounded deadlines and safe nonblocking I/O.
 - fix(runtime): make version probes race-safe, support jq 1.6 in the Codex
   collector, and retain OpenCode compatibility and dependency security fixes.
-
-## 0.29.2
-
-- fix(system): recheck automatic account fallback through the broker and verify
-  resumed runtime assets under their owning worker's Unix account.
-- fix(mcp): return a verified artifact reference and retrieval metadata for
-  oversized answers, and a bounded preview for a single oversized transcript block.
 - fix(notices): explain provider billing failures without assuming a balance.
-
-## 0.29.1
-
-- fix(macos): preserve buffered coordinator frames when a peer closes the Unix
-  socket, while keeping frame deadlines and bounded nonblocking I/O.
-- feat(claude): support an explicit ordered API-to-native-login queue that
-  continues a verified session after an eligible billing or quota failure.
-- feat(linux): support an optional shared systemd service with account-owned
-  Codex and Claude workers and Unix-controlled access; document deployment and
-  credentials for external operators.
-- feat(release): require native macOS arm64 and Linux x86-64 checks and ship
-  separately verified archives through the existing attested installer.
 - fix(linux): respect search-only ancestor permissions for protected Bridge
   credentials and report directories while retaining no-follow checks.
-- fix(runtime): capture a version probe's process identity before execution,
-  preventing fast commands from being reported unavailable after they exit.
-- fix(collectors): accept valid Codex paths with jq 1.6 while still rejecting
-  embedded NUL characters before launching a collector.
 - feat(observation): retrieve large verified answers in execution-fenced chunks.
-- fix(opencode): restore compatibility with Bridge native-context ABI 2 and
-  preserve the permission-checked tool context for native execution.
+- fix(installer): validate release manifests with both jq 1.6 and jq 1.8.
 - fix(dependencies): update Tokio, certificate verification and root bundles
   to address RUSTSEC-2026-0381, RUSTSEC-2026-0382 and RUSTSEC-2026-0386.
-
-## 0.28.9
-
 - fix(opencode): restore compatibility with deployed Bridge native-context ABI 2
   components after the 0.28.8 regression rejected their launches. Preserve actual
   MCP ToolContext through the original permission-checked executor and create

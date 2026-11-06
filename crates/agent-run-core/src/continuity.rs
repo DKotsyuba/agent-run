@@ -404,84 +404,6 @@ pub fn admitted_turn_recorded(seal: &HistorySeal, turn: &str, input_sha256: &str
     Ok(claude_admitted)
 }
 
-/// Verify every maintenance control against the same sealed native history.
-/// Each exact turn may have only one user message with one text block; duplicate
-/// turns, altered bytes, wrong sessions or different inputs do not prove it.
-pub fn maintenance_turns_recorded(seal: &HistorySeal, proofs: &[(String, String)]) -> Result<bool> {
-    if proofs.is_empty() {
-        return Ok(true);
-    }
-    if !matches!(seal.harness, HarnessId::Codex | HarnessId::ClaudeCode) {
-        return Ok(false);
-    }
-    let mut expected = std::collections::BTreeMap::new();
-    for (turn, digest) in proofs {
-        if turn.trim().is_empty()
-            || turn.len() > 1024
-            || turn.chars().any(char::is_control)
-            || digest.parse::<agent_run_domain::Sha256Digest>().is_err()
-            || expected
-                .insert(turn.as_str(), (digest.as_str(), false))
-                .is_some()
-        {
-            return Err(unavailable("maintenance control proof is malformed"));
-        }
-    }
-    let bytes = read(&seal.root, &seal.relative)?;
-    if bytes.len() as u64 != seal.bytes || fs::sha256(&bytes) != seal.sha256 {
-        return Err(unavailable("native history changed since it was sealed"));
-    }
-    let text =
-        std::str::from_utf8(&bytes).map_err(|_| unavailable("native history is not UTF-8"))?;
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let record: Value = serde_json::from_str(line)
-            .map_err(|_| unavailable("native history has a malformed record"))?;
-        let (turn, session_ok, content) = match seal.harness {
-            HarnessId::Codex
-                if record["type"] == "response_item"
-                    && record["payload"]["type"] == "message"
-                    && record["payload"]["role"] == "user" =>
-            {
-                (
-                    record["payload"]["internal_chat_message_metadata_passthrough"]["turn_id"]
-                        .as_str(),
-                    true,
-                    &record["payload"]["content"],
-                )
-            }
-            HarnessId::ClaudeCode if record["type"] == "user" => (
-                record["uuid"].as_str(),
-                record["sessionId"] == seal.session
-                    && record["isSidechain"] != true
-                    && record["message"]["role"] == "user",
-                &record["message"]["content"],
-            ),
-            _ => continue,
-        };
-        let Some((digest, seen)) = turn.and_then(|turn| expected.get_mut(turn)) else {
-            continue;
-        };
-        if *seen {
-            return Err(unavailable("native history repeats a maintenance control"));
-        }
-        *seen = true;
-        let text_type = if seal.harness == HarnessId::Codex {
-            "input_text"
-        } else {
-            "text"
-        };
-        if !session_ok
-            || !content.as_array().is_some_and(|items| {
-                matches!(items.as_slice(), [item] if item["type"] == text_type
-                && item["text"].as_str().is_some_and(|text| fs::sha256(text.as_bytes()) == *digest))
-            })
-        {
-            return Ok(false);
-        }
-    }
-    Ok(expected.values().all(|(_, seen)| *seen))
-}
-
 /// Reads `relative` under `root` through the anchored no-follow directory
 /// primitive, refusing escapes, links, non-regular files and more than the
 /// byte bound (the bound applies to the bytes actually read).
@@ -1073,41 +995,6 @@ mod tests {
         assert!(super::seal(HarnessId::Codex, temp.path(), "s1").is_err());
     }
 
-    /// A maintenance control must occur once as the exact sealed user input;
-    /// similar text, extra blocks, duplicates and later rewrites are refused.
-    #[test]
-    fn maintenance_codex_control_requires_one_exact_sealed_turn() {
-        let temp = tempfile::tempdir().unwrap();
-        let meta = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\"}}\n";
-        let input = "role\n\nResume the checkpoint.";
-        let record = serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user",
-            "content":[{"type":"input_text","text":input}],
-            "internal_chat_message_metadata_passthrough":{"turn_id":"resume-turn"}}});
-        let path = rollout(temp.path(), "s1", &format!("{meta}{record}\n"));
-        let proofs = vec![(
-            "resume-turn".to_owned(),
-            crate::fs::sha256(input.as_bytes()),
-        )];
-        let sealed = super::seal(HarnessId::Codex, temp.path(), "s1").unwrap();
-        assert!(super::maintenance_turns_recorded(&sealed, &proofs).unwrap());
-        assert!(
-            !super::maintenance_turns_recorded(&sealed, &[("other".into(), proofs[0].1.clone())])
-                .unwrap()
-        );
-        let mut extra = record.clone();
-        extra["payload"]["content"]
-            .as_array_mut()
-            .unwrap()
-            .push(serde_json::json!({"type":"input_text","text":"extra"}));
-        fs::write(&path, format!("{meta}{extra}\n")).unwrap();
-        assert!(super::maintenance_turns_recorded(&sealed, &proofs).is_err());
-        let extra_seal = super::seal(HarnessId::Codex, temp.path(), "s1").unwrap();
-        assert!(!super::maintenance_turns_recorded(&extra_seal, &proofs).unwrap());
-        fs::write(&path, format!("{meta}{record}\n{record}\n")).unwrap();
-        let repeated = super::seal(HarnessId::Codex, temp.path(), "s1").unwrap();
-        assert!(super::maintenance_turns_recorded(&repeated, &proofs).is_err());
-    }
-
     /// Claude continuation proves the runner's exact UUID and UTF-8 input,
     /// never an identical older message, sidechain or request snapshot.
     #[test]
@@ -1132,10 +1019,6 @@ mod tests {
         write(&[user("older"), user("current")]);
         let sealed = seal(HarnessId::ClaudeCode, temp.path(), "s1").unwrap();
         assert!(super::admitted_turn_recorded(&sealed, "current", &digest).unwrap());
-        assert!(
-            super::maintenance_turns_recorded(&sealed, &[("current".into(), digest.clone())])
-                .unwrap()
-        );
         assert!(!super::admitted_turn_recorded(&sealed, "different", &digest).unwrap());
         assert!(
             !super::admitted_turn_recorded(&sealed, "current", &crate::fs::sha256(b"other"))
@@ -1158,10 +1041,6 @@ mod tests {
         write(&[user("current"), user("current")]);
         let repeated = seal(HarnessId::ClaudeCode, temp.path(), "s1").unwrap();
         assert!(super::admitted_turn_recorded(&repeated, "current", &digest).is_err());
-        assert!(
-            super::maintenance_turns_recorded(&repeated, &[("current".into(), digest.clone())])
-                .is_err()
-        );
         write(&[user("current")]);
         let sealed = seal(HarnessId::ClaudeCode, temp.path(), "s1").unwrap();
         write(&[user("older")]);

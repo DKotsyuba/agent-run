@@ -84,6 +84,90 @@ fn bridge_receipt(
     }
 }
 
+/// Restart notices use the ordinary delivery outbox and preserve queue order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_notices_use_existing_bridge_outbox() {
+    let home = common::Home::new();
+    let bridge = bridge_fixture::start(&home.path, false);
+    let mut store = home.store();
+    let mut request = home.request();
+    request.orchestrator = Some(agent_run_domain::domain::OrchestratorRef {
+        transport: "codex_queue".into(),
+        external_session_id: "fixture-session".into(),
+        external_turn_id: None,
+    });
+    let (agent, _) = store
+        .admit(&request, &home.config, &json!({}), None)
+        .unwrap();
+    let restart = store.begin_service_restart("bridge-restart", 1.0).unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE service_restarts SET phase='recovering' WHERE id=?",
+            [restart],
+        )
+        .unwrap();
+    store.conn.execute("UPDATE service_restart_agents SET resume_status='failed',resume_error='history_unverifiable' WHERE restart_id=?", [restart]).unwrap();
+    let boot = agent_run_platform::monotonic::boot_id().unwrap();
+    assert!(
+        store
+            .refresh_service_restart(restart, &boot, 1, 2.0)
+            .unwrap()
+    );
+    // Even if the result is nominally due first, it cannot choose a new route
+    // before the earlier warning's publication intent has been frozen.
+    store.conn.execute("UPDATE deliveries SET next_attempt_at=0 WHERE id IN (SELECT delivery_id FROM service_restart_notices WHERE restart_id=? AND stage='after')", [restart]).unwrap();
+    drop(store);
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
+    assert_eq!(
+        agent_run_core::delivery::dispatch_once(&home.path)
+            .await
+            .unwrap(),
+        1
+    );
+    let config_path = home.path.join("config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    assert!(config.contains("codex_store='codex-main'"));
+    std::fs::write(
+        &config_path,
+        config.replace("codex_store='codex-main'", "codex_store='different-store'"),
+    )
+    .unwrap();
+    assert_eq!(
+        agent_run_core::delivery::dispatch_once(&home.path)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        agent_run_core::delivery::dispatch_once(&home.path)
+            .await
+            .unwrap(),
+        0
+    );
+    let published = bridge.published.lock().unwrap();
+    assert_eq!(published.len(), 2);
+    assert_eq!(
+        serde_json::to_value(&published[0].destination).unwrap(),
+        serde_json::to_value(&published[1].destination).unwrap(),
+        "the result must keep the warning's frozen destination"
+    );
+    assert!(
+        published
+            .iter()
+            .all(|item| item.kind == "agent-run.maintenance")
+    );
+    assert!(published[0].payload.as_str().contains("preparing"));
+    assert!(published[1].payload.as_str().contains(agent.as_str()));
+    assert!(
+        published[1]
+            .payload
+            .as_str()
+            .contains("history_unverifiable")
+    );
+}
+
 /// Owner-authorized opt-in native control through the actual outbox/SDK adapter.
 /// Uses a fresh disposable home, an explicit protected config and recipient;
 /// retains only private intent/receipt artifacts, launches no provider engine,
@@ -582,36 +666,6 @@ fn notice_rendering_matches_python_golden_cases() {
             "Inspect progress and transcript; resume explicitly after the native-history, authority and cleanup checks pass. Executions have no time limit.",
         );
         assert_eq!(notice.render().unwrap(), expected, "{}", case["id"]);
-    }
-}
-
-/// An uncertain maintenance continuation must not suggest blindly retrying.
-#[test]
-fn unconfirmed_maintenance_notice_warns_against_repeating_work() {
-    let notice = notice_from_case(&json!({
-        "notification_id":"ntf-fixture",
-        "agent_id":"ag-20260825-120000-0123456789",
-        "status":"lost",
-        "failure_kind":"maintenance_continuation_unconfirmed"
-    }));
-    let text = notice.render().unwrap();
-    assert!(text.contains("work may have started"));
-    assert!(text.contains("do not repeat the task until its outcome is known"));
-}
-
-/// A definite pre-start failure suggests continuing an existing session.
-#[test]
-fn maintenance_start_failure_notice_explains_safe_continuation() {
-    for kind in ["maintenance_resume_start_failed", "supervisor_spawn_failed"] {
-        let notice = notice_from_case(&json!({
-            "notification_id":"ntf-fixture",
-            "agent_id":"ag-20260825-120000-0123456789",
-            "status":"failed",
-            "failure_kind":kind
-        }));
-        let text = notice.render().unwrap();
-        assert!(!text.contains("without a recognized failure category"));
-        assert!(text.contains("cleanup and") && text.contains("history verification"));
     }
 }
 

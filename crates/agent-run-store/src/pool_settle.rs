@@ -205,6 +205,9 @@ fn evaluate(tx: &Connection, pool_id: &PoolId) -> Result<Evaluation> {
             return Ok(Evaluation::NotReady);
         }
         let tip = tip_of(tx, &root)?;
+        if crate::service_restart::is_restart_stop(tx, &tip)? {
+            return Ok(Evaluation::NotReady);
+        }
         let tip_status: String = tx.query_row(
             "SELECT status FROM agents WHERE id=?",
             [tip.as_str()],

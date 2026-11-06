@@ -105,55 +105,6 @@ fn models(store: &Store<'_>, run: &AgentId) -> i64 {
     store.conn.query_row("SELECT COUNT(*) FROM commands WHERE agent_id=? AND json_extract(payload_json,'$.health_ping') IS NOT NULL",[run.as_str()],|r|r.get(0)).unwrap()
 }
 
-/// Both live v4 and opt-in v5 retain health and pool-read protections; a
-/// historical v3 catalog keeps its earlier, narrower contract.
-#[test]
-fn maintenance_catalog_preserves_health_and_pool_guards() {
-    for version in [3, 4, 5] {
-        let (_home, mut store, run) = running(PingPolicy::Recover);
-        let digest = match version {
-            3 => "57ba0c3ed7f3a689488e78456180031c8ca1df57e8a62e43466f5d0c5549a212".to_owned(),
-            4 => agent_run_domain::worker::finish_catalog_digest(false),
-            _ => agent_run_domain::worker::maintenance_pause_catalog_digest(false),
-        };
-        store.conn.execute("UPDATE worker_capabilities SET pool_catalog_version=?,pool_catalog_digest=? WHERE attempt_id='attempt'",rusqlite::params![version,digest]).unwrap();
-        assert_eq!(
-            store.pool_read_guard_enabled(&run, "attempt").unwrap(),
-            version >= 4
-        );
-        stalled(&mut store, &run);
-        assert_eq!(models(&store, &run), i64::from(version >= 4));
-    }
-}
-
-/// Pausing or parked attempts do not receive health probes that could wake a
-/// model or generate misleading notices during the restart boundary.
-#[test]
-fn maintenance_pause_suppresses_health_probes_until_fence_release() {
-    let (_home, mut store, run) = running(PingPolicy::Recover);
-    assert_eq!(store.health_due(160.0, 10).unwrap(), vec![run.clone()]);
-    let fence = store
-        .begin_maintenance_fence("health-maintenance", 110.0)
-        .unwrap();
-    store.conn.execute("INSERT INTO commands(agent_id,kind,payload_json,state,created_at) VALUES(?,'steer','{}','pending',111)", [run.as_str()]).unwrap();
-    let command = store.conn.last_insert_rowid();
-    store.conn.execute("INSERT INTO maintenance_checkpoints(epoch,agent_id,attempt_id,challenge_id,requested_at,command_id) VALUES(?,?,'attempt',?,111,?)",rusqlite::params![fence.epoch,run.as_str(),"b".repeat(64),command]).unwrap();
-    assert!(store.health_due(160.0, 10).unwrap().is_empty());
-    assert!(!store.health_tick(&run, 160.0).unwrap());
-    assert_eq!(models(&store, &run), 0);
-    store.end_maintenance_fence(fence.epoch, 161.0).unwrap();
-    assert_eq!(store.health_due(162.0, 10).unwrap(), vec![run.clone()]);
-    store
-        .conn
-        .execute(
-            "UPDATE attempts SET state='maintenance_parked' WHERE id='attempt'",
-            [],
-        )
-        .unwrap();
-    assert!(store.health_due(162.0, 10).unwrap().is_empty());
-    assert!(!store.health_tick(&run, 162.0).unwrap());
-}
-
 /// Broker health traffic never authorizes model work by default or terminates
 /// an idle run; the original lost-wake incident becomes one actionable notice.
 #[test]

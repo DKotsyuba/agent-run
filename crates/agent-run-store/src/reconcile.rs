@@ -94,93 +94,6 @@ fn same_ownership(expected: &crate::ops::ExpectedOwnership, current: &Ownership)
         && expected.startup_birth_time == current.startup_birth_time
 }
 
-/// Whether a parked, pausing or unconfirmed resumed execution has a handoff.
-pub fn has_maintenance_handoff(conn: &rusqlite::Connection, id: &AgentId) -> Result<bool> {
-    maintenance_handoff(conn, id, false, None)
-}
-
-/// A started, unconfirmed continuation may be reported lost only after the
-/// ordinary owner-death checks; parked and unstarted attempts remain guarded.
-pub fn maintenance_loss_blocked(conn: &rusqlite::Connection, id: &AgentId) -> Result<bool> {
-    maintenance_handoff(conn, id, true, None)
-}
-
-/// Failure category for a dead owner whose continuation may have been sent.
-pub const MAINTENANCE_CONTINUATION_UNCONFIRMED: &str = "maintenance_continuation_unconfirmed";
-/// Public, content-free explanation for the uncertain continuation outcome.
-pub const MAINTENANCE_CONTINUATION_UNCONFIRMED_TEXT: &str = "Continuation acceptance was not confirmed; work may have started. Inspect its effects before resuming.";
-/// Failure category for a dead supervisor before native continuation began.
-pub const MAINTENANCE_RESUME_START_FAILED: &str = "maintenance_resume_start_failed";
-/// Public explanation for a provably unstarted maintenance continuation.
-pub const MAINTENANCE_RESUME_START_FAILED_TEXT: &str =
-    "The supervisor exited before the maintenance continuation started.";
-
-fn maintenance_handoff(
-    conn: &rusqlite::Connection,
-    id: &AgentId,
-    allow_started_loss: bool,
-    exempt_prepared: Option<&str>,
-) -> Result<bool> {
-    Ok(conn.query_row(
-        &format!("SELECT EXISTS(SELECT 1 FROM attempts WHERE agent_id=?1 AND state='maintenance_parked' AND finished_at IS NULL) \
-         OR EXISTS(SELECT 1 FROM maintenance_checkpoints m JOIN maintenance_fences f ON f.epoch=m.epoch \
-            JOIN attempts t ON t.id=m.attempt_id AND t.agent_id=m.agent_id \
-            JOIN commands c ON c.id=m.command_id AND c.agent_id=m.agent_id \
-            WHERE m.agent_id=?1 AND f.ended_at IS NULL AND t.ownership_active=1 AND t.finished_at IS NULL \
-              AND ({} OR m.checkpoint_json IS NOT NULL)) \
-         OR EXISTS(SELECT 1 FROM maintenance_resumes r JOIN agents a ON a.id=r.agent_id \
-            LEFT JOIN attempts t ON t.id=r.target_attempt_id AND t.agent_id=a.id \
-            WHERE r.agent_id=?1 AND a.status IN ('created','starting','running','cancelling') \
-              AND (t.id IS NULL OR NOT EXISTS( \
-                SELECT 1 FROM events e WHERE e.agent_id=r.agent_id AND e.attempt_id=r.target_attempt_id \
-                  AND e.kind='maintenance_resume_confirmed_v1' AND json_extract(e.data_json,'$.epoch')=r.epoch \
-                  AND json_extract(e.data_json,'$.source_attempt_id')=r.source_attempt_id \
-                  AND json_extract(e.data_json,'$.target_attempt_id')=r.target_attempt_id \
-                  AND json_type(e.data_json,'$.session')='text' AND json_extract(e.data_json,'$.session')=a.runtime_session_id \
-                  AND json_type(e.data_json,'$.turn')='text' AND length(CAST(json_extract(e.data_json,'$.turn') AS BLOB)) BETWEEN 1 AND 1024 \
-                  AND json_type(e.data_json,'$.input_sha256')='text' AND length(json_extract(e.data_json,'$.input_sha256'))=64 \
-                  AND json_extract(e.data_json,'$.input_sha256') NOT GLOB '*[^0-9a-f]*')) \
-              AND (?2=0 OR t.id IS NULL OR t.ownership_active!=1 OR t.finished_at IS NOT NULL \
-                OR t.phase IS NULL OR t.phase NOT IN ('spawning','cleanup_complete') \
-                OR a.supervisor_pid IS NULL OR a.supervisor_identity IS NULL \
-                OR a.supervisor_birth_time IS NULL) \
-              AND (?3 IS NULL OR t.id IS NOT ?3))", crate::maintenance::COMMAND_MAY_HAVE_EFFECT),
-        params![id.as_str(), allow_started_loss, exempt_prepared],
-        |row| row.get(0),
-    )?)
-}
-
-/// Permit loss only for one never-spawned target whose exact registered or
-/// pre-registration child owner is dead and whose preparation is settled.
-/// The caller must still recheck its exact ownership and death observation.
-pub fn maintenance_prepared_loss_allowed(
-    conn: &rusqlite::Connection,
-    id: &AgentId,
-    unregistered_child: bool,
-) -> Result<bool> {
-    let target: Option<String> = conn.query_row(&format!(
-        "SELECT t.id FROM maintenance_resumes r JOIN maintenance_fences f ON f.epoch=r.epoch \
-         JOIN agents a ON a.id=r.agent_id JOIN attempts t ON t.id=r.target_attempt_id AND t.agent_id=a.id \
-         WHERE a.id=? AND f.ended_at IS NULL AND f.phase IN ('recovering','deferring') \
-         AND a.status='starting' AND a.finished_at IS NULL AND a.process_group_id IS NULL \
-         AND ((?2=0 AND a.supervisor_pid>1 AND a.supervisor_identity IS NOT NULL AND a.supervisor_birth_time IS NOT NULL) \
-           OR (?2=1 AND a.supervisor_pid IS NULL AND a.supervisor_identity IS NULL AND a.supervisor_birth_time IS NULL)) \
-         AND t.state='prepared' AND t.finished_at IS NULL AND {} \
-         AND NOT EXISTS(SELECT 1 FROM events e WHERE e.agent_id=a.id AND e.attempt_id=t.id AND e.kind='maintenance_resume_confirmed_v1') \
-         AND NOT EXISTS(SELECT 1 FROM commands c WHERE c.agent_id=a.id AND c.kind='cancel' AND c.state IN ('pending','claimed'))",
-        crate::provider_admission::NEVER_SPAWNED,
-    ), params![id.as_str(),unregistered_child], |row| row.get(0)).optional()?;
-    let Some(target) = target else {
-        return Ok(false);
-    };
-    let settled = if unregistered_child {
-        crate::maintenance_target_cancel::preparation_not_started(conn, id, &target)?
-    } else {
-        crate::maintenance_target_cancel::preparation_is_settled(conn, id, &target)?
-    };
-    Ok(settled && !maintenance_handoff(conn, id, true, Some(&target))?)
-}
-
 impl Store<'_> {
     /// Advances one reconciliation cursor (row 59).
     pub fn advance_reconcile_cursor(&self, op: &crate::ops::ReconcileReapedAgent) -> Result<()> {
@@ -374,20 +287,8 @@ impl Store<'_> {
             tx.commit()?;
             return Ok(false);
         };
-        let handoff = has_maintenance_handoff(&tx, id)?;
-        let blocked = handoff && maintenance_loss_blocked(&tx, id)?;
-        let unregistered_child = op.failure_kind == "unowned_starting"
-            && crate::maintenance_target_cancel::startup_child(&op.expected).is_some();
-        let prepared_loss = blocked
-            && (unregistered_child
-                || (matches!(
-                    op.failure_kind.as_str(),
-                    "supervisor_dead" | "supervisor_identity_mismatch"
-                ) && op.expected.supervisor_pid.is_some()))
-            && maintenance_prepared_loss_allowed(&tx, id, unregistered_child)?;
         if !same_ownership(&op.expected, &current)
             || current.status.terminal()
-            || (blocked && !prepared_loss)
             || (op.expected.supervisor_pid.is_some()
                 && current
                     .heartbeat_at
@@ -398,30 +299,9 @@ impl Store<'_> {
         }
         current.status.transition(Status::Lost)?;
         let at = op.checked_at;
-        let failure_kind = if prepared_loss {
-            MAINTENANCE_RESUME_START_FAILED
-        } else if handoff {
-            MAINTENANCE_CONTINUATION_UNCONFIRMED
-        } else {
-            &op.failure_kind
-        };
-        let failure_text = if prepared_loss {
-            MAINTENANCE_RESUME_START_FAILED_TEXT
-        } else if handoff {
-            MAINTENANCE_CONTINUATION_UNCONFIRMED_TEXT
-        } else {
-            &op.failure_text
-        };
-        let evidence = if prepared_loss {
-            json!({"observation":&op.evidence,"maintenance_continuation":"not_started"})
-        } else if handoff {
-            json!({"observation":&op.evidence,"maintenance_continuation":"unconfirmed"})
-        } else {
-            op.evidence.clone()
-        };
         tx.execute(
             "UPDATE agents SET status='lost',finished_at=?,failure_kind=?,failure_text=? WHERE id=?",
-            params![at, failure_kind, failure_text, id.as_str()],
+            params![at, op.failure_kind, op.failure_text, id.as_str()],
         )?;
         tx.execute(
             "UPDATE attempts SET state='lost',finished_at=? WHERE agent_id=? AND finished_at IS NULL",
@@ -435,7 +315,7 @@ impl Store<'_> {
                 "status",
                 current.status.as_str(),
                 "lost",
-                json!({"failure_kind": failure_kind}).to_string()
+                json!({"failure_kind": op.failure_kind}).to_string()
             ],
         )?;
         let terminal_event_seq = tx.last_insert_rowid();
@@ -447,7 +327,7 @@ impl Store<'_> {
                 "reconciled_lost",
                 current.status.as_str(),
                 "lost",
-                evidence.to_string()
+                op.evidence.to_string()
             ],
         )?;
         if let Some(session) = &current.session {

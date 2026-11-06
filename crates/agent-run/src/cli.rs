@@ -323,6 +323,8 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     Init,
+    /// Gracefully restart the service and continue its active agents.
+    Restart(Restart),
     /// Read-only local diagnostics; emits one JSON report and exits 0/2/3.
     Doctor {
         /// Explicit JSON selection; JSON remains the default output.
@@ -535,11 +537,6 @@ pub enum Command {
         #[command(subcommand)]
         command: StorageCommand,
     },
-    /// Read the broker's maintenance admission-fence status.
-    Maintenance {
-        #[command(subcommand)]
-        command: MaintenanceCommand,
-    },
     /// Manage global account references without invoking native login.
     Accounts {
         #[command(subcommand)]
@@ -590,6 +587,23 @@ pub enum Command {
         #[arg(long = "allow-mcp", required = true)]
         allow_mcp: Vec<String>,
     },
+}
+
+/// Select the native service-manager target for one planned restart.
+#[derive(Args, Debug)]
+pub struct Restart {
+    /// systemd unit or launchd service target; defaults to the standard service.
+    #[arg(long)]
+    pub target: Option<String>,
+    /// Use the caller's systemd user manager rather than the system manager.
+    #[arg(long)]
+    pub systemd_user: bool,
+    /// Stable request identity for retrying the same operation.
+    #[arg(long)]
+    pub request_id: Option<String>,
+    /// Resume a prepared operation after its manager definitively failed.
+    #[arg(long, conflicts_with = "request_id")]
+    pub recover: Option<i64>,
 }
 
 /// Administrative account registry operations; references name existing
@@ -1017,38 +1031,6 @@ pub enum StorageCommand {
     },
     /// Roll interrupted shared-storage relocations forward, offline.
     Recover,
-}
-
-/// Planned restart preparation and safe deferral through the resident broker.
-#[derive(Subcommand, Debug)]
-pub enum MaintenanceCommand {
-    /// Show the current fence and captured execution counts.
-    Status,
-    /// Pause eligible agents and wait until the service can be restarted.
-    Prepare {
-        /// Maximum preparation time in seconds, from 1 to 600.
-        #[arg(long, default_value_t = 600)]
-        timeout_seconds: u64,
-        /// Stable intent ID for retrying an uncertain request.
-        #[arg(long)]
-        request_id: Option<String>,
-        /// Print only the ready epoch for a service-manager wrapper.
-        #[arg(long)]
-        epoch_only: bool,
-    },
-    /// Defer a preparation when a restart is known not to have been requested.
-    Defer {
-        /// Exact current maintenance epoch.
-        epoch: i64,
-    },
-    /// Wait for the exact epoch to complete after the service manager restarts.
-    Wait {
-        /// Exact maintenance epoch returned by preparation.
-        epoch: i64,
-        /// Maximum wait in seconds, from 1 to 600.
-        #[arg(long, default_value_t = 600)]
-        timeout_seconds: u64,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1715,7 +1697,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
     }
     if matches!(
         &cli.command,
-        Command::Doctor { .. } | Command::DoctorCanary { .. } | Command::Maintenance { .. }
+        Command::Doctor { .. } | Command::DoctorCanary { .. }
     ) {
         return run_with(cli, CliDependencies::production(home)).await;
     }
@@ -1750,13 +1732,13 @@ fn client_command(command: &Command) -> bool {
     matches!(
         command,
         Command::Start(_)
+            | Command::Restart(_)
             | Command::Resume(_)
             | Command::StartPool { .. }
             | Command::PoolPost { .. }
             | Command::PoolReplace { .. }
             | Command::Pool { .. }
             | Command::Pools { .. }
-            | Command::Maintenance { .. }
             | Command::Capabilities
             | Command::AnswerChunk { .. }
             | Command::Doc { .. }
@@ -2313,23 +2295,14 @@ async fn view_transcript(
     Ok(())
 }
 
-/// Request one bounded deferral after a known-unrequested service restart.
-/// A timeout stays unknown and is not followed by another mutation.
-async fn defer_preparation(broker: &dyn CliBroker, epoch: i64, output: &CliOutput) -> Result<i32> {
-    match tokio::time::timeout(
-        Duration::from_secs(3),
-        broker.call("_cli_maintenance_defer", json!({"epoch":epoch})),
+/// Keep only the host session and blocked-restart receipt when forwarding a hook.
+fn restart_hook_payload(payload: &Value, transport: &str) -> Result<Option<Value>> {
+    Ok(
+        hooks::bind::restart_waiter(payload, transport)?.map(|(restart_id, reference)| {
+            json!({"hook_event_name":"PostToolUse","session_id":reference.external_session_id,
+            "tool_response":{"accepted":false,"agent_run_restart_id":restart_id}})
+        }),
     )
-    .await
-    {
-        Ok(Ok(status)) => {
-            (output)(&status)?;
-            Ok(2)
-        }
-        _ => Err(Error::Runtime(format!(
-            "maintenance deferral outcome is unknown for epoch {epoch}; inspect maintenance status"
-        ))),
-    }
 }
 
 /// Executes existing broker-only CLI operations with their original payloads and output sinks.
@@ -2342,123 +2315,7 @@ async fn run_client_command(
     home: PathBuf,
 ) -> Result<i32> {
     match command {
-        Command::Maintenance {
-            command: MaintenanceCommand::Status,
-        } => (output)(&broker.call("_cli_maintenance_status", json!({})).await?)?,
-        Command::Maintenance {
-            command: MaintenanceCommand::Defer { epoch },
-        } => (output)(
-            &broker
-                .call("_cli_maintenance_defer", json!({"epoch":epoch}))
-                .await?,
-        )?,
-        Command::Maintenance {
-            command:
-                MaintenanceCommand::Prepare {
-                    timeout_seconds,
-                    request_id,
-                    epoch_only,
-                },
-        } => {
-            if !(1..=600).contains(&timeout_seconds) {
-                return Err(invalid(
-                    "maintenance timeout must be between 1 and 600 seconds",
-                ));
-            }
-            let request_id = request_id
-                .unwrap_or_else(|| format!("maintenance-{}", uuid::Uuid::new_v4().simple()));
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
-            let begun = match tokio::time::timeout_at(
-                deadline,
-                broker.call("_cli_maintenance_begin", json!({"request_id":&request_id})),
-            )
-            .await
-            {
-                Ok(result) => result?,
-                Err(_) => {
-                    return Err(Error::Runtime(format!(
-                        "maintenance start outcome is unknown; inspect status or retry with --request-id {request_id}"
-                    )));
-                }
-            };
-            let epoch = begun["epoch"]
-                .as_i64()
-                .filter(|epoch| *epoch > 0)
-                .ok_or_else(|| invalid("maintenance broker returned an invalid epoch"))?;
-            if !begun["ended_at"].is_null() {
-                return Err(invalid("maintenance request has already completed"));
-            }
-            loop {
-                if tokio::time::Instant::now() >= deadline {
-                    return defer_preparation(broker.as_ref(), epoch, &output).await;
-                }
-                let status = match tokio::time::timeout_at(
-                    deadline,
-                    broker.call("_cli_maintenance_status", json!({})),
-                )
-                .await
-                {
-                    Ok(Ok(status)) => status,
-                    _ => return defer_preparation(broker.as_ref(), epoch, &output).await,
-                };
-                if status["state"] == "inactive" || status["phase"] == "deferring" {
-                    (output)(&status)?;
-                    return Ok(2);
-                }
-                if status["epoch"].as_i64() != Some(epoch) {
-                    return Err(Error::Integrity(
-                        "maintenance epoch changed while preparing".into(),
-                    ));
-                }
-                if status["phase"] == "ready" {
-                    if epoch_only {
-                        (text_output)(&format!("{epoch}\n"))?;
-                    } else {
-                        (output)(&status)?;
-                    }
-                    return Ok(0);
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-        Command::Maintenance {
-            command:
-                MaintenanceCommand::Wait {
-                    epoch,
-                    timeout_seconds,
-                },
-        } => {
-            if epoch <= 0 || !(1..=600).contains(&timeout_seconds) {
-                return Err(invalid("invalid maintenance epoch or timeout"));
-            }
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
-            let mut last = json!({"epoch":epoch,"state":"unknown"});
-            loop {
-                if let Ok(Ok(fence)) = tokio::time::timeout(
-                    Duration::from_secs(3),
-                    broker.call("_cli_maintenance_epoch", json!({"epoch":epoch})),
-                )
-                .await
-                {
-                    if fence["epoch"].as_i64() != Some(epoch) {
-                        return Err(Error::Integrity(
-                            "maintenance epoch changed while waiting".into(),
-                        ));
-                    }
-                    if fence["phase"] == "complete" {
-                        let completed = fence["outcome"] == "completed";
-                        (output)(&fence)?;
-                        return Ok(if completed { 0 } else { 2 });
-                    }
-                    last = fence;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    (output)(&last)?;
-                    return Ok(2);
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
+        Command::Restart(args) => return crate::restart::run(broker.as_ref(), &output, args).await,
         Command::Hook { command } => {
             let (bind, transport) = match command {
                 Hook::Context(transport) => (false, transport.transport),
@@ -2468,6 +2325,11 @@ async fn run_client_command(
                 let input = read_stdin(1024 * 1024)?;
                 let payload: Value = serde_json::from_str(&input)
                     .map_err(|_| invalid("hook payload must be a JSON object"))?;
+                if bind && let Some(safe) = restart_hook_payload(&payload, &transport)? {
+                    return broker
+                        .call("_hook_bind", json!({"payload":safe,"transport":transport}))
+                        .await;
+                }
                 let normalized = hooks::bind::normalize(&payload, bind, &transport)?;
                 let mut safe = json!({
                     "transport": normalized.reference.transport,
@@ -2922,6 +2784,17 @@ pub async fn run_with(cli: Cli, dependencies: CliDependencies) -> Result<i32> {
                     (dependencies.output)(&output)?;
                 }
                 Hook::Bind(transport) => {
+                    if let Some(safe) = restart_hook_payload(&payload, &transport.transport)? {
+                        let output = dependencies
+                            .broker
+                            .call(
+                                "_hook_bind",
+                                json!({"payload":safe,"transport":transport.transport}),
+                            )
+                            .await?;
+                        (dependencies.output)(&output)?;
+                        return Ok(0);
+                    }
                     let result =
                         hooks::bind::run_hook_bound(&home, &payload, &transport.transport, None)
                             .await?;
@@ -3330,6 +3203,20 @@ mod login_selection_tests {
     use super::provider_login_target;
     use agent_run_config::provider_config::ProviderConfig;
     use agent_run_domain::catalog::{AccountRecord, AccountStatus};
+
+    /// Forward only the host identity and restart receipt from a blocked start.
+    #[test]
+    fn restart_hook_drops_unrelated_tool_data() {
+        let payload = serde_json::json!({"hook_event_name":"PostToolUse","session_id":"chat",
+            "tool_input":{"task":"private task"},
+            "tool_response":{"accepted":false,"agent_run_restart_id":7}});
+        let safe = super::restart_hook_payload(&payload, "codex_queue")
+            .unwrap()
+            .unwrap();
+        assert_eq!(safe["session_id"], "chat");
+        assert_eq!(safe["tool_response"]["agent_run_restart_id"], 7);
+        assert!(!safe.to_string().contains("private task"));
+    }
 
     /// A provider label that is another binding's global ID is ambiguous;
     /// unambiguous labels and IDs still select their registered account.

@@ -218,21 +218,14 @@ inventory! {
     93 HealthTick "health_tick" L B y;
     94 AcceptHealthReply "accept_health_reply" L N y;
     95 ReportPoolReadLoop "report_pool_read_loop" L N y;
-    96 BeginMaintenanceFence "begin_maintenance_fence" L C n;
-    97 EndMaintenanceFence "end_maintenance_fence" L C n;
-    98 AcceptMaintenanceCheckpoint "accept_maintenance_checkpoint" L N y;
-    99 RequestMaintenanceSteer "request_maintenance_steer" L C y;
-    100 ObserveMaintenanceCheckpoint "observe_maintenance_checkpoint" R C y;
-    101 ParkMaintenanceAttempt "park_maintenance_attempt" R C y;
-    102 ClaimMaintenanceResume "claim_maintenance_resume" L C y;
-    103 BeginMaintenanceClosing "begin_maintenance_closing" R C y;
-    104 CancelParkedMaintenance "cancel_parked_maintenance" L C y;
-    105 ReadyMaintenanceFence "ready_maintenance_fence" L C n;
-    106 DeferMaintenanceFence "defer_maintenance_fence" L C n;
-    107 ObserveMaintenanceRestart "observe_maintenance_restart" L C n;
-    108 CommitMaintenanceStop "commit_maintenance_stop" L C n;
-    109 ClaimMaintenancePrepared "claim_maintenance_prepared" L C y;
-    110 CancelPreparedMaintenance "cancel_prepared_maintenance" L C y;
+    96 BeginServiceRestart "begin_service_restart" L C n;
+    97 AdvanceServiceRestart "advance_service_restart" L C n;
+    98 RememberServiceRestartCaller "remember_service_restart_caller" L N n;
+    99 RecoverServiceRestart "recover_service_restart" L C n;
+    100 RequestServiceRestartResume "request_service_restart_resume" L C n;
+    101 FailServiceRestartResume "fail_service_restart_resume" L C n;
+    102 RefreshServiceRestart "refresh_service_restart" L C n;
+    105 ClaimServiceRestart "claim_service_restart" L C n;
 }
 
 /// Seals one payload and binds it to its inventory row and typed output.
@@ -249,21 +242,14 @@ macro_rules! op {
 }
 
 op! {
-    CancelPreparedMaintenance => bool;
-    ClaimMaintenancePrepared => crate::maintenance_prepared::PreparedMaintenanceClaim;
-    BeginMaintenanceFence => crate::maintenance::MaintenanceFence;
-    EndMaintenanceFence => crate::maintenance::MaintenanceFence;
-    AcceptMaintenanceCheckpoint => agent_run_domain::worker::MaintenancePauseReceipt;
-    RequestMaintenanceSteer => crate::maintenance_checkpoint::MaintenanceSteer;
-    ObserveMaintenanceCheckpoint => bool;
-    ParkMaintenanceAttempt => crate::maintenance_park::MaintenancePark;
-    ClaimMaintenanceResume => crate::maintenance_resume::MaintenanceResume;
-    BeginMaintenanceClosing => bool;
-    CancelParkedMaintenance => bool;
-    ReadyMaintenanceFence => crate::maintenance::MaintenanceFence;
-    DeferMaintenanceFence => crate::maintenance::MaintenanceFence;
-    ObserveMaintenanceRestart => crate::maintenance::MaintenanceFence;
-    CommitMaintenanceStop => bool;
+    BeginServiceRestart => i64;
+    AdvanceServiceRestart => usize;
+    RememberServiceRestartCaller => ();
+    RecoverServiceRestart => Option<i64>;
+    RequestServiceRestartResume => ();
+    FailServiceRestartResume => ();
+    RefreshServiceRestart => bool;
+    ClaimServiceRestart => bool;
     AdmitStart => AdmitStartOutput;
     AdmitProvider => crate::provider_admission::ProviderAdmission;
     AdmitProviderResume => crate::provider_admission::ProviderAdmission;
@@ -424,9 +410,6 @@ op_enum! {
         EnqueueNativeWake,
         WorkerTurn,
         ObserveWorkerFinishReceipt,
-        ObserveMaintenanceCheckpoint,
-        ParkMaintenanceAttempt,
-        BeginMaintenanceClosing,
         PersistRecoveryObservation,
         FinishTerminal,
         PersistRunStats,
@@ -456,18 +439,14 @@ op_enum! {
     /// authority; all others require `Broker`.
     #[derive(Clone, Serialize)]
     pub enum LocalOp {
-        CancelPreparedMaintenance,
-        ClaimMaintenancePrepared,
-        CancelParkedMaintenance,
-        ReadyMaintenanceFence,
-        DeferMaintenanceFence,
-        ObserveMaintenanceRestart,
-        CommitMaintenanceStop,
-        BeginMaintenanceFence,
-        EndMaintenanceFence,
-        AcceptMaintenanceCheckpoint,
-        RequestMaintenanceSteer,
-        ClaimMaintenanceResume,
+        BeginServiceRestart,
+        AdvanceServiceRestart,
+        RememberServiceRestartCaller,
+        RecoverServiceRestart,
+        RequestServiceRestartResume,
+        FailServiceRestartResume,
+        RefreshServiceRestart,
+        ClaimServiceRestart,
         AdmitStart,
         AdmitProvider,
         AdmitProviderResume,
@@ -573,7 +552,6 @@ impl OpKindRef {
         match self {
             Self::RegisterWorkerCatalog
             | Self::AcceptWorkerFinish
-            | Self::AcceptMaintenanceCheckpoint
             | Self::AcceptHealthReply
             | Self::ReportPoolReadLoop
             | Self::NotifyOrchestrator
@@ -603,10 +581,7 @@ impl OpKindRef {
             | Self::ObservedCommandResult
             | Self::EnqueueNativeWake
             | Self::WorkerTurn
-            | Self::ObserveWorkerFinishReceipt
-            | Self::ObserveMaintenanceCheckpoint
-            | Self::ParkMaintenanceAttempt
-            | Self::BeginMaintenanceClosing => supervisor,
+            | Self::ObserveWorkerFinishReceipt => supervisor,
             Self::AppendJournal
             | Self::CompleteTerminalCommands
             | Self::PersistRecoveryObservation
@@ -985,14 +960,6 @@ impl LocalEnvelope {
     /// ignore it.
     pub fn set_finish_guard(&mut self, guard: agent_run_domain::worker::FinishGuard) {
         if let LocalOp::AcceptWorkerFinish(op) = &mut self.op {
-            op.guard = guard;
-        }
-    }
-
-    /// Install the broker's unsequenced checkpoint-secret verdict without
-    /// changing serialized bytes, operation digest or durable receipt identity.
-    pub fn set_maintenance_guard(&mut self, guard: agent_run_domain::worker::FinishGuard) {
-        if let LocalOp::AcceptMaintenanceCheckpoint(op) = &mut self.op {
             op.guard = guard;
         }
     }

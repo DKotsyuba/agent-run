@@ -140,6 +140,124 @@ fn every_historical_version_migrates_to_a_schema_indistinguishable_from_fresh() 
     }
 }
 
+/// Empty v34 maintenance tables can be removed without altering delivery history.
+#[test]
+fn v34_empty_maintenance_upgrades_and_preserves_deliveries() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("state.db");
+    let conn = build_fixture(&path, 34);
+    let deliveries_sql = "SELECT json_group_array(json_array(\
+        id,agent_id,orchestrator_session_id,terminal_event_seq,state,attempts,lease_owner,\
+        lease_until,next_attempt_at,remote_message_id,last_error,ambiguous_result)) FROM deliveries";
+    let deliveries: String = conn
+        .query_row(deliveries_sql, [], |row| row.get(0))
+        .unwrap();
+    let agents = agent_count(&conn);
+    drop(conn);
+
+    assert_eq!(migrations::migrate(&path).unwrap(), 35);
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(user_version(&conn), 35);
+    assert_eq!(agent_count(&conn), agents);
+    assert_eq!(
+        conn.query_row(deliveries_sql, [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        deliveries
+    );
+    assert_eq!(schema_objects(&conn), fresh_schema_objects());
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        0
+    );
+    conn.execute(
+        "INSERT INTO service_restarts(request_id,phase,started_at,boot_id) \
+         VALUES('finished-fixture','preparing',1,'boot')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO service_restart_agents(restart_id,agent_id,resume_status) \
+         SELECT (SELECT id FROM service_restarts WHERE request_id='finished-fixture'), \
+                id,'finished' FROM agents LIMIT 1",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM service_restart_agents WHERE resume_status='finished'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
+
+/// Any v34 maintenance row prevents migration and remains byte-for-byte recoverable.
+#[test]
+fn v34_maintenance_history_refuses_upgrade_without_modifying_database() {
+    // Isolate every table, including orphaned rows, so each emptiness check matters.
+    let cases = [
+        (
+            "maintenance_fences",
+            "INSERT INTO maintenance_fences(request_id,created_at,member_count) VALUES('keep',1,0)",
+        ),
+        (
+            "maintenance_cohort",
+            "INSERT INTO maintenance_cohort(epoch,agent_id,status,sequence,attempts_json) VALUES(1,'keep','running',1,'[]')",
+        ),
+        (
+            "maintenance_recipients",
+            "INSERT INTO maintenance_recipients(epoch,orchestrator_session_id,transport,external_session_id,anchor_agent_id,before_delivery_id) VALUES(1,'keep','transport','session','agent','delivery')",
+        ),
+        (
+            "maintenance_checkpoints",
+            "INSERT INTO maintenance_checkpoints(epoch,agent_id,attempt_id,challenge_id,requested_at) VALUES(1,'agent','keep',printf('%064d',0),1)",
+        ),
+        (
+            "maintenance_parks",
+            "INSERT INTO maintenance_parks(epoch,agent_id,attempt_id,native_event_seq,proof_sha256,parked_at) VALUES(1,'keep','attempt',1,printf('%064d',0),1)",
+        ),
+        (
+            "maintenance_resumes",
+            "INSERT INTO maintenance_resumes(epoch,agent_id,request_id,source_attempt_id,target_attempt_id,target_number,account_id,source_proof_sha256,writer_epoch,claimed_at,preflight_json) VALUES(1,'agent','keep','source','target',2,'account',printf('%064d',0),1,1,'{}')",
+        ),
+    ];
+    for (table, insert) in cases {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("state.db");
+        let conn = build_fixture(&path, 34);
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute(insert, []).unwrap();
+        drop(conn);
+        let before = std::fs::read(&path).unwrap();
+
+        let error = migrations::migrate(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("maintenance history exists"),
+            "{table}: {error}"
+        );
+        assert!(error.contains("preserve the database"), "{table}: {error}");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "{table}");
+        let backup = migrations::backup_path(&path, 35);
+        assert!(backup.is_file(), "{table}");
+        for database in [&path, &backup] {
+            let conn = open_ro(database);
+            assert_eq!(user_version(&conn), 34, "{table}");
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1,
+                "{table}"
+            );
+        }
+    }
+}
+
 /// Schema 32 upgrades without changing history; a colliding table rolls back
 /// the 32→33 step and retains the pre-migration SQLite backup.
 #[test]

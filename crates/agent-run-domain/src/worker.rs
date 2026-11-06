@@ -15,8 +15,6 @@ pub const CATALOG_METHOD: &str = "worker/catalog";
 pub const POOL_CATALOG_VERSION: u32 = 1;
 /// Reviewed explicit-completion catalog; legacy pool/research catalogs stay v1.
 pub const FINISH_CATALOG_VERSION: u32 = 4;
-/// Staged catalog with maintenance checkpoints; it is not yet served or admitted.
-pub const MAINTENANCE_PAUSE_CATALOG_VERSION: u32 = 5;
 
 /// Fingerprints the actual embedded private catalog served by this binary.
 /// The digest includes schemas/effect hints, not runtime capability material.
@@ -32,9 +30,6 @@ pub const RESEARCH_ENV: &str = "AGENT_RUN_WORKER_RESEARCH";
 /// Nonsecret supervisor-selected explicit completion catalog marker. The
 /// broker checks frozen admission and capability independently of this flag.
 pub const FINISH_ENV: &str = "AGENT_RUN_WORKER_FINISH";
-/// Supervisor-selected value of [`FINISH_ENV`] for the v5 maintenance catalog.
-/// Existing supervisors set only `0` or `1`; this value does not itself grant authority.
-pub const MAINTENANCE_PAUSE_ENV_VALUE: &str = "5";
 
 /// The broker's pre-SQL verdict on one finish summary against the transient
 /// launch-secret context its verified supervisor installed for that exact
@@ -140,69 +135,6 @@ pub struct FinishReceipt {
     pub duplicate: bool,
 }
 
-/// A worker's checkpoint for one runtime-issued maintenance challenge.
-/// The private transport binds the attempt; this declaration is neither task
-/// completion nor proof that native work or process cleanup has settled.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MaintenancePauseRequest {
-    /// Opaque 64-character lowercase hexadecimal identifier issued by the runtime.
-    pub challenge_id: String,
-    /// Nonblank resumption context, at most 4096 UTF-8 bytes; never an answer.
-    pub checkpoint: String,
-}
-
-impl MaintenancePauseRequest {
-    /// Validate the wire shape and bounds without treating the checkpoint as
-    /// an answer. Authentication, challenge ownership and secret checking are
-    /// the broker's responsibility and must precede persistence.
-    pub fn validate(&self) -> Result<()> {
-        if !lowercase_hex64(&self.challenge_id) {
-            return Err(Error::Validation("invalid maintenance challenge id".into()));
-        }
-        bounded_text("maintenance checkpoint", &self.checkpoint, 4096)
-    }
-}
-
-impl fmt::Debug for MaintenancePauseRequest {
-    /// Avoid exposing worker-supplied context in diagnostics.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MaintenancePauseRequest")
-            .field("checkpoint_bytes", &self.checkpoint.len())
-            .finish_non_exhaustive()
-    }
-}
-
-/// Content-free receipt of a maintenance checkpoint, not a safe-stop proof.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MaintenancePauseReceipt {
-    /// Digest of the exact canonical callback payload for identical retries.
-    pub sha256: String,
-    /// True when this attempt already accepted this exact payload.
-    pub duplicate: bool,
-}
-
-impl MaintenancePauseReceipt {
-    /// Reject a malformed receipt digest before treating it as an acknowledgement.
-    pub fn validate(&self) -> Result<()> {
-        if !lowercase_hex64(&self.sha256) {
-            return Err(Error::Validation(
-                "invalid maintenance receipt digest".into(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Check the fixed wire spelling of an opaque challenge or SHA-256 digest.
-fn lowercase_hex64(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
 /// Frozen v3 explicit catalog, including its read-only pool_read hint. Used
 /// only to verify historical v2/v3 proofs; never silently upgraded in storage.
 fn finish_tools_json_v3(research: bool) -> Vec<Value> {
@@ -270,30 +202,6 @@ pub fn finish_catalog_digest(research: bool) -> String {
     crate::canonical::sha256_hex(&serde_json::json!(finish_tools_json(research)), true)
 }
 
-/// The v5 catalog extends v4 for maintenance-aware explicit-completion workers.
-/// A callback receipt alone never authorizes stopping or resuming a process.
-pub fn maintenance_pause_tools_json(research: bool) -> Vec<Value> {
-    let mut tools = finish_tools_json(research);
-    tools.push(serde_json::json!({
-        "name":"maintenance_pause",
-        "description":"Respond only to a runtime-issued maintenance challenge with the context needed to continue your current work. Never include credentials. The receipt records checkpoint intent; it does not prove completion, settled tools, process cleanup or restart. If the receipt is uncertain, retry the exact same payload.",
-        "annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false},
-        "inputSchema":{"type":"object","additionalProperties":false,"required":["challenge_id","checkpoint"],"properties":{
-            "challenge_id":{"type":"string","minLength":64,"maxLength":64,"pattern":"^[0-9a-f]{64}$","description":"Exact identifier from the runtime's pending maintenance challenge."},
-            "checkpoint":{"type":"string","minLength":1,"maxLength":4096,"description":"Nonblank context for resuming the current work, at most 4096 UTF-8 bytes."}
-        }}
-    }));
-    tools
-}
-
-/// Fingerprint the opt-in role-bound maintenance catalog.
-pub fn maintenance_pause_catalog_digest(research: bool) -> String {
-    crate::canonical::sha256_hex(
-        &serde_json::json!(maintenance_pause_tools_json(research)),
-        true,
-    )
-}
-
 /// The research surface retains safe completion/pool messages and adds only a
 /// confined filesystem tool. The ordinary five-tool surface stays unchanged.
 pub fn research_tools_json() -> Vec<Value> {
@@ -337,9 +245,6 @@ pub fn known_pool_catalog(version: u32, digest: &str) -> bool {
             }))
         || (version == FINISH_CATALOG_VERSION
             && (digest == finish_catalog_digest(false) || digest == finish_catalog_digest(true)))
-        || (version == MAINTENANCE_PAUSE_CATALOG_VERSION
-            && (digest == maintenance_pause_catalog_digest(false)
-                || digest == maintenance_pause_catalog_digest(true)))
 }
 
 /// A bounded report request. Its directory comes from frozen authority; a
@@ -523,8 +428,6 @@ pub const TOOL_METHOD: &str = "worker/call";
 pub enum WorkerTool {
     /// Declare this attempt's immutable final summary through its private capability.
     Finish,
-    /// Record a checkpoint for the exact requested maintenance challenge.
-    MaintenancePause,
     /// Answer only a current attempt-owned liveness challenge.
     HealthReply,
     /// Report a material finding to this run's orchestrator.
@@ -546,7 +449,6 @@ impl WorkerTool {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Finish => "finish",
-            Self::MaintenancePause => "maintenance_pause",
             Self::HealthReply => "health_reply",
             Self::Notify => "notify_orchestrator",
             Self::SaveReport => "save_report",
@@ -561,7 +463,6 @@ impl WorkerTool {
     pub fn parse(name: &str) -> Option<Self> {
         [
             (Self::Finish.as_str(), Self::Finish),
-            (Self::MaintenancePause.as_str(), Self::MaintenancePause),
             (Self::HealthReply.as_str(), Self::HealthReply),
             (Self::Notify.as_str(), Self::Notify),
             (Self::SaveReport.as_str(), Self::SaveReport),
@@ -713,9 +614,7 @@ mod tests {
 #[cfg(test)]
 mod completion_catalog_history_tests {
     use super::*;
-    /// The previously admitted ordinary-worker v2 fingerprint stays
-    /// accepted. v3 preserves its old effect hints; v4 truthfully advertises
-    /// the new guard without changing any historical fingerprint.
+    /// Previously admitted catalog fingerprints retain their original effect hints.
     #[test]
     fn guarded_reads_preserve_v2_v3_catalog_fingerprints() {
         assert!(known_pool_catalog(
@@ -748,109 +647,5 @@ mod completion_catalog_history_tests {
                 false
             );
         }
-    }
-
-    /// Every previously served role/version pair retains its exact fingerprint;
-    /// v5 proofs are recognized while the default served catalog remains v4.
-    #[test]
-    fn maintenance_catalog_preserves_history_without_activation() {
-        let historical = [
-            [
-                "2f8503bdc2be9a8370dbea29de8e420a0de9c95970e6a115fd0f4cd33cbe10f5",
-                "a7ca2499ed9d72fa957780418d2bd45674db3ca9394b5d97fe0270012e6a3089",
-                "57ba0c3ed7f3a689488e78456180031c8ca1df57e8a62e43466f5d0c5549a212",
-                "35c88704bd4cf7a3485717234e1d9446c4103adf14cb9b0cbefa17f9b9e7ebf0",
-            ],
-            [
-                "041c40529dee0630ce31a5ba61090136e801750716248a7044373f0149ddd484",
-                "6b2361e439c781a352e4fb578fe273727dc326c5bc5378854588b68620bd7f12",
-                "d8ffbe5925a0cb29b7d0ff1a0dcfeb3e5c610de586d3cb0fee40c1964d382a14",
-                "1ef92ae3e209e1c3ef9476f835104c84ad0fb94ae5324230c07841ef66c10023",
-            ],
-        ];
-        assert_eq!(FINISH_CATALOG_VERSION, 4);
-        assert_eq!(MAINTENANCE_PAUSE_CATALOG_VERSION, 5);
-        for (research, digests) in [false, true].into_iter().zip(historical) {
-            for (version, digest) in (1..=4).zip(digests) {
-                assert!(known_pool_catalog(version, digest));
-            }
-            let live = finish_tools_json(research);
-            assert_eq!(finish_catalog_digest(research), digests[3]);
-            let mut staged = maintenance_pause_tools_json(research);
-            assert_eq!(staged.pop().unwrap()["name"], "maintenance_pause");
-            assert_eq!(staged, live);
-            assert!(known_pool_catalog(
-                MAINTENANCE_PAUSE_CATALOG_VERSION,
-                &maintenance_pause_catalog_digest(research)
-            ));
-            assert!(live.iter().all(|tool| tool["name"] != "maintenance_pause"));
-        }
-        assert_eq!(
-            WorkerTool::parse("maintenance_pause"),
-            Some(WorkerTool::MaintenancePause)
-        );
-    }
-
-    /// Checkpoint shape, byte limits and receipt digests are strict; a checkpoint
-    /// remains private even when a request is formatted for diagnostics.
-    #[test]
-    fn maintenance_pause_validates_boundaries_and_redacts_debug() {
-        let challenge = "a".repeat(64);
-        let valid =
-            serde_json::json!({"challenge_id":challenge,"checkpoint":"resume here\nnext step"});
-        let request: MaintenancePauseRequest = serde_json::from_value(valid.clone()).unwrap();
-        assert!(request.validate().is_ok());
-        assert!(!format!("{request:?}").contains("resume here"));
-        for value in [
-            serde_json::json!({"challenge_id":"a".repeat(64)}),
-            serde_json::json!({"checkpoint":"resume"}),
-            serde_json::json!({"challenge_id":"a".repeat(64),"checkpoint":"resume","status":"done"}),
-            serde_json::json!({"challenge_id":123,"checkpoint":"resume"}),
-        ] {
-            assert!(serde_json::from_value::<MaintenancePauseRequest>(value).is_err());
-        }
-        for bad in [
-            "a".repeat(63),
-            "a".repeat(65),
-            "A".repeat(64),
-            "g".repeat(64),
-            "é".repeat(32),
-        ] {
-            let mut invalid = request.clone();
-            invalid.challenge_id = bad;
-            assert!(invalid.validate().is_err());
-        }
-        for bad in [
-            "".to_owned(),
-            " \n\t".to_owned(),
-            "bad\0text".to_owned(),
-            "é".repeat(2049),
-        ] {
-            let mut invalid = request.clone();
-            invalid.checkpoint = bad;
-            assert!(invalid.validate().is_err());
-        }
-        let mut boundary = request.clone();
-        boundary.checkpoint = "é".repeat(2048);
-        assert!(boundary.validate().is_ok());
-        let valid_receipt = serde_json::json!({"sha256":"f".repeat(64),"duplicate":false});
-        let receipt: MaintenancePauseReceipt = serde_json::from_value(valid_receipt).unwrap();
-        assert!(receipt.validate().is_ok());
-        let mut bad_receipt = receipt;
-        bad_receipt.sha256 = "X".repeat(64);
-        assert!(bad_receipt.validate().is_err());
-        assert!(
-            serde_json::from_value::<MaintenancePauseReceipt>(serde_json::json!({
-                "sha256":"f".repeat(64), "duplicate":false, "finished":true
-            }))
-            .is_err()
-        );
-        let catalog = maintenance_pause_tools_json(false);
-        let schema = &catalog.last().unwrap()["inputSchema"];
-        let validator = jsonschema::validator_for(schema).unwrap();
-        assert!(validator.is_valid(&valid));
-        assert!(!validator.is_valid(&serde_json::json!({
-            "challenge_id":"a".repeat(64), "checkpoint":"resume", "status":"done"
-        })));
     }
 }

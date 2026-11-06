@@ -3,8 +3,8 @@ use crate::{Error, Result, cli::CliBroker, dispatch, domain::OrchestratorRef};
 use rmcp::{
     ServerHandler, ServiceExt,
     model::{
-        CallToolRequestParams, CallToolResponse, ErrorData, Implementation, ListToolsResult,
-        PaginatedRequestParams, ServerConfig, Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+        Implementation, ListToolsResult, PaginatedRequestParams, ServerConfig, Tool,
     },
     service::{RequestContext, RoleServer},
 };
@@ -23,6 +23,25 @@ const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// Preserve Python's stable, operator-actionable broker-unavailable wording.
 const BROKER_UNAVAILABLE: &str =
     "agent-run broker is not running; start it with `agent-run api serve` or its launchd job";
+
+/// Return a blocked-start receipt that the existing post-tool hook can bind.
+/// No agent was admitted; the host supplies the caller's session separately.
+fn restart_refusal(tool: &str, error: &Error) -> Option<CallToolResult> {
+    if !matches!(tool, "start" | "start_pool")
+        || error.machine_code() != agent_run_domain::MachineCode::StateTransitionError
+    {
+        return None;
+    }
+    let id = agent_run_store::service_restart::blocked_restart_id(&error.public().message)?;
+    let value = json!({
+        "accepted": false,
+        "agent_run_restart_id": id,
+        "message": "Agent Run is restarting. No agent was started; wait for the restart notice before retrying."
+    });
+    let mut result = CallToolResult::success(vec![ContentBlock::text(value.to_string())]);
+    result.structured_content = Some(value);
+    Some(result)
+}
 
 /// JSON-RPC string IDs must fit this encoded budget (including JSON quotes),
 /// leaving the presenter's 4 KiB envelope reserve ample room for the SDK wrapper.
@@ -392,7 +411,9 @@ impl ServerHandler for Proxy {
                 )
             }
             Err(error) => {
-                if matches!(error, Error::BrokerUnavailable) && request.name != "resume" {
+                if let Some(refusal) = restart_refusal(request.name.as_ref(), &error) {
+                    refusal
+                } else if matches!(error, Error::BrokerUnavailable) && request.name != "resume" {
                     crate::transport::mcp_text::error_result(
                         "BrokerUnavailable",
                         BROKER_UNAVAILABLE,
@@ -553,6 +574,25 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// A blocked start remains visibly unaccepted while carrying the receipt
+    /// used by the existing post-tool hook; no agent identity is invented.
+    #[test]
+    fn blocked_start_exposes_a_restart_receipt_without_an_agent() {
+        let error = crate::Error::Transition(agent_run_store::service_restart::blocked_message(7));
+        let result = super::restart_refusal("start", &error).unwrap();
+        let value = result.structured_content.unwrap();
+        assert_eq!(value["accepted"], false);
+        assert_eq!(value["agent_run_restart_id"], 7);
+        assert!(value.get("agent_id").is_none());
+        assert!(super::restart_refusal("answer", &error).is_none());
+        let broker = crate::Error::Broker {
+            message: error.to_string(),
+            broker_error_code: Some("StateTransitionError".into()),
+            broker_error_data: None,
+        };
+        assert!(super::restart_refusal("start", &broker).is_some());
+    }
+
     /// Supplemental sequence metadata must describe the same sealed execution.
     #[test]
     fn answer_sequence_refuses_changed_proof() {

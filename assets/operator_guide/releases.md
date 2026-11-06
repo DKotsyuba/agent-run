@@ -3,10 +3,9 @@
 Public versions come from annotated `vX.Y.Z` tags. The tag must match the
 workspace version in `Cargo.toml`.
 
-Release automation produces one sealed macOS Apple-silicon artifact. Linux
-x86-64 remains an unqualified, non-blocking validation target; its release is
-deferred. Each release also includes a verified source archive, `SHA256SUMS`,
-and provenance.
+Release automation builds sealed artifacts for macOS Apple Silicon and Linux
+x86-64 on their native runners. Both platform checks gate publication. Each
+release also includes a verified source archive, `SHA256SUMS`, and provenance.
 
 ## Local release check
 

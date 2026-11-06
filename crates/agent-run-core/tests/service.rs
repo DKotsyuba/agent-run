@@ -12,126 +12,6 @@ use agent_run_platform::{fs, verify};
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::Path, time::Duration};
 
-/// Status reads one captured cohort snapshot without mutating the database or
-/// exposing task content, session details, or restart-readiness claims.
-#[tokio::test]
-async fn maintenance_status_is_read_only_and_counts_captured_execution_states() {
-    let home = common::Home::new();
-    let service = Service::new(home.path.clone());
-    let mut store = home.store();
-    let inactive = json!({"state":"inactive","phase":null,"epoch":null,"captured":0,"active":0,"parked":0,"terminal":0,"unavailable":0});
-    assert_eq!(service.maintenance_status().unwrap(), inactive);
-    assert_eq!(
-        agent_run_core::dispatch::call(&service, "_cli_maintenance_status", json!({}))
-            .await
-            .unwrap(),
-        inactive
-    );
-    assert!(
-        agent_run_core::dispatch::call(&service, "_cli_maintenance_status", json!({"extra":true}))
-            .await
-            .is_err()
-    );
-    for id in [
-        "ag-20261101-000000-0000000001",
-        "ag-20261101-000000-0000000002",
-        "ag-20261101-000000-0000000003",
-    ] {
-        store.conn.execute(
-            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id) \
-             VALUES(?,'mock','fixture','review','private task text','private task text','/fixture','{}','running',1,'fixture',?)",
-            rusqlite::params![id,id],
-        ).unwrap();
-    }
-    let fence = store
-        .begin_maintenance_fence("fixture-maintenance", 5.0)
-        .unwrap();
-    store
-        .conn
-        .execute(
-            "UPDATE agents SET status='succeeded' WHERE id='ag-20261101-000000-0000000002'",
-            [],
-        )
-        .unwrap();
-    store
-        .conn
-        .execute(
-            "UPDATE agents SET sequence=2 WHERE id='ag-20261101-000000-0000000003'",
-            [],
-        )
-        .unwrap();
-    store.conn.execute(
-        "INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,ownership_active) VALUES('status-parked','ag-20261101-000000-0000000001',1,'maintenance_parked','{}',1,1)", [],
-    ).unwrap();
-    let before: i64 = store
-        .conn
-        .pragma_query_value(None, "data_version", |row| row.get(0))
-        .unwrap();
-    let expected = json!({"state":"fenced","phase":"preparing","epoch":fence.epoch,"captured":3,"active":1,"parked":1,"terminal":1,"unavailable":1});
-    let observed = agent_run_core::dispatch::call(&service, "_cli_maintenance_status", json!({}))
-        .await
-        .unwrap();
-    assert_eq!(observed, expected);
-    assert!(!observed.to_string().contains("private task text"));
-    assert_eq!(
-        store
-            .conn
-            .pragma_query_value(None, "data_version", |row| row.get::<_, i64>(0))
-            .unwrap(),
-        before
-    );
-    store.conn.execute("DELETE FROM maintenance_cohort WHERE epoch=? AND agent_id='ag-20261101-000000-0000000001'",[fence.epoch]).unwrap();
-    assert!(matches!(
-        service.maintenance_status(),
-        Err(Error::Integrity(_))
-    ));
-}
-
-/// Broker calls capture the same cohort on identical retries and cannot queue
-/// a pause for an unsupported historical worker.
-#[tokio::test]
-async fn maintenance_broker_fence_replays_and_refuses_legacy_pause() {
-    let home = common::Home::new();
-    let (id, _) = home
-        .store()
-        .admit(&home.request(), &home.config, &json!({}), None)
-        .unwrap();
-    let writer = common::writer::Harness::start(&home.path);
-    let service = Service::new(home.path.clone()).with_writer(writer.broker());
-    let first = service
-        .begin_maintenance("maintenance-service-fixture")
-        .await
-        .unwrap();
-    let replay = service
-        .begin_maintenance("maintenance-service-fixture")
-        .await
-        .unwrap();
-    assert_eq!(first, replay);
-    assert_eq!(first.member_count, 1);
-    assert!(
-        service
-            .request_maintenance_pause(first.epoch, &id, "legacy-attempt")
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        home.store()
-            .conn
-            .query_row("SELECT COUNT(*) FROM commands", [], |r| r.get::<_, i64>(0))
-            .unwrap(),
-        0
-    );
-}
-
-/// Missing state is unknown, not an inactive fence, and never creates a home.
-#[test]
-fn maintenance_status_does_not_create_missing_home_or_database() {
-    let root = tempfile::tempdir().unwrap();
-    let missing = root.path().join("missing-home");
-    assert!(Service::new(missing.clone()).maintenance_status().is_err());
-    assert!(!missing.exists());
-}
-
 /// Proves content-based configuration refresh skips identical bytes, accepts a
 /// valid changed revision, and rejects an invalid changed revision.
 #[test]
@@ -1061,5 +941,190 @@ fn negative_message_cursor_is_a_validation_error() {
         }
         .validate()
         .is_err()
+    );
+}
+
+/// A technically stopped agent stays visible as active until restart recovery.
+#[tokio::test]
+async fn restart_stopped_agent_is_listed_as_active() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let (id, _) = store
+        .admit(&home.request(), &home.config, &json!({}), None)
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='running' WHERE id=?",
+            [id.as_str()],
+        )
+        .unwrap();
+    let restart = store.begin_service_restart("list-restart", 1.0).unwrap();
+    let boot = agent_run_platform::monotonic::boot_id().unwrap();
+    for second in [1, 31, 61] {
+        store
+            .advance_service_restart(restart, &boot, second * 1_000_000_000)
+            .unwrap();
+    }
+    let mut outcome = Outcome::failure("cancelled");
+    outcome.status = Status::Cancelled;
+    store.finish(&id, &outcome, None, None).unwrap();
+    let service = Service::new(home.path.clone());
+    let page = service
+        .list_public(Query {
+            active: true,
+            ..Query::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page["total"], 1);
+    assert_eq!(page["items"][0]["agent_id"], id.as_str());
+    assert_eq!(page["items"][0]["status"], "running");
+    assert_eq!(page["items"][0]["phase"], "restarting");
+    assert_eq!(service.answer(&id).unwrap()["status"], "running");
+    let waited = service.wait(&id, Some(0.03)).await.unwrap();
+    assert_eq!(waited["status"], "running");
+    assert_eq!(waited["terminal"], false);
+
+    store
+        .conn
+        .execute(
+            "UPDATE service_restarts SET phase='complete',finished_at=100 WHERE id=?",
+            [restart],
+        )
+        .unwrap();
+    store.conn.execute(
+        "UPDATE service_restart_agents SET resume_status='failed',resume_error='history_unverifiable' WHERE restart_id=? AND agent_id=?",
+        rusqlite::params![restart,id.as_str()],
+    ).unwrap();
+    let failed = service.view(&store, &store.get(&id).unwrap()).unwrap();
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(failed["failure_kind"], "restart_resume_failed");
+    assert_eq!(failed["failure_text"], "history_unverifiable");
+    assert_eq!(service.answer(&id).unwrap()["status"], "failed");
+    assert_eq!(
+        service.wait(&id, Some(0.03)).await.unwrap()["status"],
+        "failed"
+    );
+
+    store.conn.execute(
+        "UPDATE service_restart_agents SET resume_status='unconfirmed',resume_error='outcome unknown' WHERE restart_id=? AND agent_id=?",
+        rusqlite::params![restart,id.as_str()],
+    ).unwrap();
+    let page = service
+        .list_public(Query {
+            active: true,
+            ..Query::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page["items"][0]["status"], "running");
+    assert_eq!(page["items"][0]["phase"], "restart_unconfirmed");
+    assert_eq!(page["items"][0]["failure_text"], "outcome unknown");
+    assert_eq!(
+        service.wait(&id, Some(0.03)).await.unwrap()["terminal"],
+        false
+    );
+
+    let child = agent_run_domain::domain::AgentId::new();
+    store.conn.execute(
+        "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,parent_agent_id,root_agent_id,sequence) \
+         SELECT ?1,runtime,model,profile,task,task_summary,workdir,request_json,'running',2,config_revision,id,root_agent_id,2 FROM agents WHERE id=?2",
+        rusqlite::params![child.as_str(),id.as_str()],
+    ).unwrap();
+    store.conn.execute(
+        "UPDATE service_restart_agents SET resume_status='started',resumed_execution_id=?,resume_error=NULL WHERE restart_id=? AND agent_id=?",
+        rusqlite::params![child.as_str(),restart,id.as_str()],
+    ).unwrap();
+    let waited = service.wait(&id, Some(0.03)).await.unwrap();
+    assert_eq!(waited["status"], "running");
+    assert_eq!(waited["terminal"], false);
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='failed' WHERE id=?",
+            [child.as_str()],
+        )
+        .unwrap();
+    assert_eq!(
+        service.wait(&id, Some(0.03)).await.unwrap()["status"],
+        "failed"
+    );
+}
+
+/// Cancelling a technically stopped agent exposes cancellation instead of the
+/// internal temporary completion and lets existing waiters finish.
+#[tokio::test]
+async fn restart_cancelled_paused_agent_is_visible_as_cancelled() {
+    let home = common::Home::new();
+    let mut store = home.store();
+    let (id, _) = store
+        .admit(&home.request(), &home.config, &json!({}), None)
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='running' WHERE id=?",
+            [id.as_str()],
+        )
+        .unwrap();
+    let restart = store.begin_service_restart("cancel-view", 1.0).unwrap();
+    let boot = agent_run_platform::monotonic::boot_id().unwrap();
+    for second in [1, 31, 61] {
+        store
+            .advance_service_restart(restart, &boot, second * 1_000_000_000)
+            .unwrap();
+    }
+    let mut outcome = Outcome::failure("cancelled");
+    outcome.status = Status::Cancelled;
+    store.finish(&id, &outcome, None, None).unwrap();
+    store.enqueue(&id, "cancel", &json!({})).unwrap();
+    let service = Service::new(home.path.clone());
+    let view = service.view(&store, &store.get(&id).unwrap()).unwrap();
+    assert_eq!(view["status"], "cancelled");
+    assert_eq!(view["phase"], "terminal");
+    assert_eq!(
+        service.wait(&id, Some(0.0)).await.unwrap()["status"],
+        "cancelled"
+    );
+    let active = service
+        .list_public(Query {
+            active: true,
+            ..Query::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(active["total"], 0);
+}
+
+/// A blocked start with an explicit caller records that caller before returning.
+#[tokio::test]
+async fn blocked_start_remembers_known_caller() {
+    let home = common::Home::new();
+    let writer = common::writer::Harness::start(&home.path);
+    let service = Service::new(home.path.clone()).with_writer(writer.broker());
+    let restart = service.begin_service_restart("known-caller").await.unwrap();
+    let request: agent_run_domain::ProviderStartRequest = serde_json::from_value(json!({
+        "provider":"codex", "model":"fixture", "profile":"review", "task":"test",
+        "workdir":home.path.display().to_string(),
+        "orchestrator":{"transport":"codex", "external_session_id":"caller"}
+    }))
+    .unwrap();
+    assert!(matches!(
+        service.start_provider(request).await,
+        Err(Error::Transition(_))
+    ));
+    let store = home.store();
+    assert_eq!(store.conn.query_row(
+        "SELECT COUNT(*) FROM service_restart_recipients WHERE restart_id=? AND external_session_id='caller' AND tried_start=1",
+        [restart], |row| row.get::<_,i64>(0),
+    ).unwrap(), 1);
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM agents", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
     );
 }

@@ -54,6 +54,8 @@ pub struct ProviderResume<'a> {
     pub prefer: &'a AccountId,
     /// Read-only system-worker proof of the unchanged parent and last attempt.
     pub preflight_digest: Option<&'a str>,
+    /// Broker-owned restart permitting this exact captured continuation.
+    pub restart_id: Option<i64>,
 }
 
 /// Fingerprints the exact parent and last-attempt evidence used by a system
@@ -580,7 +582,15 @@ impl Store<'_> {
             tx.commit()?;
             return Ok(replay);
         }
-        crate::maintenance::require_admissions_open(&tx)?;
+        if let Some(restart) = resume.and_then(|resume| resume.restart_id) {
+            crate::service_restart::require_restart_resume(
+                &tx,
+                restart,
+                resume.expect("checked").parent,
+            )?;
+        } else {
+            crate::service_restart::require_admissions_open(&tx)?;
+        }
         let lineage = match resume {
             Some(resume) => {
                 let lineage = lineage::resume_parent(&tx, resume.parent)?;
@@ -637,6 +647,15 @@ impl Store<'_> {
             &inputs,
             resume.zip(lineage.as_ref()),
         )?;
+        if let Some(restart) = resume.and_then(|resume| resume.restart_id) {
+            let changed = tx.execute(
+                "UPDATE service_restart_agents SET resumed_execution_id=? WHERE restart_id=? AND agent_id=? AND resumed_execution_id IS NULL",
+                params![admission.agent_id.as_str(), restart, resume.expect("checked").parent.as_str()],
+            )?;
+            if changed != 1 {
+                return Err(Error::Conflict);
+            }
+        }
         Store::advance_quota_capacity_revision(&tx)?;
         tx.commit()?;
         Ok(admission)

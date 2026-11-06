@@ -16,7 +16,7 @@ fn argument(args: &[String], name: &str) -> Option<String> {
 
 /// Completes a synthetic attempt through the real worker MCP and emits the
 /// matching native tool-use and receipt frames for supervisor observation.
-fn worker_finish(args: &[String], session: &str) {
+fn worker_finish(args: &[String], session: &str, summary: &str) {
     let config: Value = serde_json::from_slice(
         &std::fs::read(argument(args, "--mcp-config").expect("worker config path")).unwrap(),
     )
@@ -25,7 +25,7 @@ fn worker_finish(args: &[String], session: &str) {
     emit(
         json!({"type":"assistant","session_id":session,"message":{"role":"assistant","content":[
             {"type":"tool_use","id":"fixture-finish","name":"mcp__agent_run_worker__finish",
-             "input":{"summary":"fixture callback answer"}}
+             "input":{"summary":summary,"status":"done"}}
         ]}}),
     );
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -48,7 +48,7 @@ fn worker_finish(args: &[String], session: &str) {
             frame::read(&mut output, socket::MAX_FRAME).await.unwrap().unwrap();
             frame::write(&mut input, &json!({"jsonrpc":"2.0","method":"notifications/initialized"}), socket::MAX_FRAME).await.unwrap();
             frame::write(&mut input, &json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
-                "params":{"name":"finish","arguments":{"summary":"fixture callback answer","status":"done"}}}), socket::MAX_FRAME).await.unwrap();
+                "params":{"name":"finish","arguments":{"summary":summary,"status":"done"}}}), socket::MAX_FRAME).await.unwrap();
             let reply: Value = serde_json::from_slice(&frame::read(&mut output, socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
             assert_ne!(reply["result"]["isError"], true, "fixture worker refused finish");
             reply["result"]["content"][0]["text"].as_str().expect("finish receipt").to_owned()
@@ -327,6 +327,7 @@ fn main() {
         return;
     }
     let resume = argument(&args, "--resume");
+    let is_resumed = resume.is_some();
     let resume_path = resume.as_deref().and_then(|value| {
         let path = std::path::Path::new(value);
         (path.is_absolute() && path.extension().is_some_and(|ext| ext == "jsonl"))
@@ -416,7 +417,30 @@ fn main() {
         && task != "fixture:legacy-after-steer"
     {
         replay["isReplay"] = json!(true);
+        if is_resumed {
+            replay["session_id"] = json!(session);
+        }
         emit(replay);
+    }
+    if task == "fixture:restart-worker" {
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sent.send(control_input());
+        });
+        let mut replay = received
+            .recv_timeout(Duration::from_secs(20))
+            .expect("restart warning");
+        let warning = replay.to_string();
+        assert!(warning.contains("Agent Run is preparing to restart"));
+        let begin = warning
+            .find("[agent-run-restart-finish:")
+            .expect("restart marker");
+        let end = warning[begin..].find(']').expect("restart marker end") + begin + 1;
+        let summary = format!("{}\nfixture callback answer", &warning[begin..end]);
+        replay["isReplay"] = json!(true);
+        replay["session_id"] = json!(session);
+        emit(replay);
+        worker_finish(&args, &session, &summary);
     }
     if task == "fixture:legacy-after-steer" {
         let _ = control_input();
@@ -596,13 +620,11 @@ fn main() {
         }
     }
     if task == "fixture:worker-finish"
-        || (resume_path.is_some()
-            && matches!(
-                std::env::var(agent_run_domain::worker::FINISH_ENV).as_deref(),
-                Ok("1" | "5")
-            ))
+        || ((resume_path.is_some()
+            || (is_resumed && task.contains("Agent Run has finished its restart procedure.")))
+            && std::env::var(agent_run_domain::worker::FINISH_ENV).as_deref() == Ok("1"))
     {
-        worker_finish(&args, &session);
+        worker_finish(&args, &session, "fixture callback answer");
     }
     if task == "fixture:follow-tools" {
         // Phase one waits for the driver's marker, then one native tool

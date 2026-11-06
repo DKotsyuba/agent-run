@@ -414,84 +414,110 @@ async fn python_sigterm_completes_admitted_requests_and_releases_the_store() {
     assert!(agent_run_store::fixture::open(temp.path()).is_ok());
 }
 
-/// A real broker with an empty cohort records readiness, seals the stop on
-/// SIGTERM, and completes the same epoch after a new broker obtains the writer.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn planned_restart_recovers_exact_epoch_after_real_broker_exit() {
-    struct ChildGuard(std::process::Child);
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
+/// A real disposable broker preserves its admission fence across process
+/// replacement and queues a notice for a caller without an existing agent.
+#[tokio::test]
+async fn restart_recovers_after_real_broker_replacement() {
     let temp = tempfile::tempdir().unwrap();
     cli::init(temp.path()).unwrap();
-    let start = || {
-        ChildGuard(
-            Command::new(env!("CARGO_BIN_EXE_agent-run"))
-                .arg("--home")
-                .arg(temp.path())
-                .args(["api", "serve"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
-        )
-    };
-    let mut first = start();
     let path = temp.path().join("api.sock");
+    let spawn = || {
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_agent-run"))
+            .arg("--home")
+            .arg(temp.path())
+            .args(["api", "serve"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    };
+    let mut broker = spawn();
     wait_for_socket(&path).await;
-    let started = request(&path, json!({"jsonrpc":"2.0","id":1,"method":"_cli_maintenance_begin","params":{"request_id":"restart-test"}})).await;
-    let epoch = started["result"]["epoch"].as_i64().unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        let status = request(
-            &path,
-            json!({"jsonrpc":"2.0","id":2,"method":"_cli_maintenance_status","params":{}}),
-        )
-        .await;
-        if status["result"]["phase"] == "ready" {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "preparation did not become ready: {status}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert_eq!(
-        // SAFETY: the PID belongs to this test's own broker child.
-        unsafe { libc::kill(first.0.id() as libc::pid_t, libc::SIGTERM) },
-        0
-    );
-    let status = tokio::time::timeout(Duration::from_secs(15), async {
+    let started = request(
+        &path,
+        json!({"jsonrpc":"2.0","id":1,
+        "method":"_service_restart_begin","params":{"request_id":"fixture-restart"}}),
+    )
+    .await;
+    let id = started["result"]["restart_id"].as_i64().unwrap();
+    tokio::time::timeout(Duration::from_secs(8), async {
         loop {
-            if let Some(status) = first.0.try_wait().unwrap() {
-                break status;
+            let status = request(
+                &path,
+                json!({"jsonrpc":"2.0","id":2,
+                "method":"_service_restart_status","params":{"restart_id":id}}),
+            )
+            .await;
+            if status["result"]["phase"] == "ready" {
+                break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .expect("broker did not stop");
-    assert!(status.success());
-    let _second = start();
+    .unwrap();
+    let refused = request(&path, json!({"jsonrpc":"2.0","id":3,"method":"start","params":{
+        "provider":"codex","model":"fixture","profile":"review","task":"fixture",
+        "workdir":temp.path(),"orchestrator":{"transport":"codex","external_session_id":"waiting-chat"}
+    }})).await;
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("restarting")
+    );
+    let pid = broker.id().unwrap();
+    // SAFETY: this PID is the live fixture broker spawned above.
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) }, 0);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), broker.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+
+    let mut broker = spawn();
     wait_for_socket(&path).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        let status = request(&path, json!({"jsonrpc":"2.0","id":3,"method":"_cli_maintenance_epoch","params":{"epoch":epoch}})).await;
-        if status["result"]["phase"] == "complete" {
-            assert_eq!(status["result"]["outcome"], "completed");
-            break;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let status = request(
+                &path,
+                json!({"jsonrpc":"2.0","id":4,
+                "method":"_service_restart_status","params":{"restart_id":id}}),
+            )
+            .await;
+            if status["result"]["phase"] == "complete" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "recovery did not complete: {status}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    })
+    .await
+    .unwrap();
+    let pid = broker.id().unwrap();
+    // SAFETY: this PID is the replacement fixture broker spawned above.
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) }, 0);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), broker.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+
+    let store = agent_run_store::fixture::open(temp.path()).unwrap();
+    let agents: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM agents", [], |row| row.get(0))
+        .unwrap();
+    let notices: i64 = store.conn.query_row(
+        "SELECT COUNT(*) FROM service_restart_notices WHERE restart_id=? AND external_session_id='waiting-chat' AND stage='after'",
+        [id], |row| row.get(0),
+    ).unwrap();
+    assert_eq!((agents, notices), (0, 1));
 }
 
 /// Waits for the real test listener to publish without using a global socket.

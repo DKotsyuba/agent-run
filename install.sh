@@ -231,7 +231,7 @@ bounded tar -tvzf "$temporary/$asset" > "$temporary/types" || fail 'invalid arch
 LC_ALL=C awk '
     substr($0,1,1)!="-" && substr($0,1,1)!="d" { exit 1 }
     { mode=$1; if(mode !~ /^[-d][r-][w-][x-][r-]-[x-][r-]-[x-]$/)exit 1; size=($3~/^[0-9]+$/)?$3:$5; if(size!~/^[0-9]+$/)exit 1; total+=size; if(total>2147483648||NR>10000)exit 1;
-      name=$NF; sub(/^\.\//,"",name); if(substr(mode,1,1)=="-"&&mode~/x/&&name!~/^(bin\/(agent-run|agent-run-tui|agent-run-deploy)|collectors\/[A-Za-z0-9_.-]+|services\/agent-run-restart\.sh|systemd\/agent-run-service\.sh)$/)exit 1 }
+      name=$NF; sub(/^\.\//,"",name); if(substr(mode,1,1)=="-"&&mode~/x/&&name!~/^(bin\/(agent-run|agent-run-tui|agent-run-deploy)|collectors\/[A-Za-z0-9_.-]+|systemd\/agent-run-service\.sh)$/)exit 1 }
 ' "$temporary/types" || fail 'archive links and special files, modes or unpacked bounds refused'
 mkdir "$temporary/release"
 bounded tar -xzf "$temporary/$asset" --no-same-owner --no-same-permissions -C "$temporary/release" || fail 'archive extraction failed'

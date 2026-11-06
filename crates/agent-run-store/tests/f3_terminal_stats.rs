@@ -31,7 +31,7 @@ fn terminal_commit_writes_no_stats_and_projection_matches_legacy() {
     let usage = json!({"usage":{"input_tokens":3,"output_tokens":5},"num_turns":2});
     let mut outcome = Outcome::failure("engine_failed");
     outcome.status = Status::Failed;
-    terminal::commit_terminal(&store, &id, &outcome, None, Some(&usage)).unwrap();
+    terminal::commit_terminal(&mut store, &id, &outcome, None, Some(&usage)).unwrap();
     assert_eq!(stats_rows(&store, &id), 0);
     let projected = StoreReader::open(&home.path)
         .unwrap()

@@ -342,7 +342,6 @@ fn inspect_stream(mut input: impl Read, native: bool) -> Result<(), String> {
                     | "collectors/codex.sh"
                     | "collectors/claude.sh"
                     | "collectors/glm.sh"
-                    | "services/agent-run-restart.sh"
                     | "systemd/agent-run-service.sh"
             )
         {

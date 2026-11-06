@@ -1,15 +1,12 @@
 //! Claude-family launch planning and native stream completion. Input correlation
 //! separates task results from context acknowledgements; the supervisor retains
 //! process ownership, durable answer sealing and final cleanup authority.
-/// Passive maintenance-only native event correlation; never stops a worker.
-pub mod maintenance;
 use crate::commands;
 use crate::{
     Result,
     config::{Adapter, Config, Runtime},
     domain::{AgentId, Outcome, Status},
     error::invalid,
-    maintenance_execution::EngineExit,
     persist::Persist,
     profiles::Profile,
     state::Record,
@@ -235,6 +232,14 @@ struct ResultInputs {
     unframed_initial: bool,
     /// A failed write with open stdin may have partially sent a new task.
     uncertain_write: bool,
+}
+
+/// Recognize the native replay of the exact continuation submitted to Claude.
+fn is_resume_ack(frame: &Value, session: &str, input_id: &str) -> bool {
+    frame.get("type").and_then(Value::as_str) == Some("user")
+        && frame.get("isReplay").and_then(Value::as_bool) == Some(true)
+        && frame.get("uuid").and_then(Value::as_str) == Some(input_id)
+        && frame.get("session_id").and_then(Value::as_str) == Some(session)
 }
 
 /// Selection evidence for one terminal frame, independent of answer contents.
@@ -570,138 +575,18 @@ pub async fn run(
     logical_record: &Record,
     initial_input: Option<&str>,
 ) -> Result<EngineResult> {
-    run_maintenance(process, store, record, logical_record, initial_input, false)
-        .await?
-        .require_finished()
-}
-
-/// Run with a typed outcome for a maintenance-aware supervisor. Pause requires
-/// exact foreground evidence, a durable closing boundary and no native frames
-/// already buffered in the process. This does not prove OS-pipe emptiness or
-/// the absence of detached or remote effects.
-pub async fn run_maintenance(
-    process: &mut Process,
-    store: &mut Persist,
-    record: &Record,
-    logical_record: &Record,
-    initial_input: Option<&str>,
-    allow_pause: bool,
-) -> Result<EngineExit> {
-    run_maintenance_resume(
-        process,
-        store,
-        record,
-        logical_record,
-        initial_input,
-        allow_pause,
-        None,
-    )
-    .await
-}
-
-/// Run with an optional pinned continuation handoff supplied by the supervisor.
-pub(crate) async fn run_maintenance_resume(
-    process: &mut Process,
-    store: &mut Persist,
-    record: &Record,
-    logical_record: &Record,
-    initial_input: Option<&str>,
-    allow_pause: bool,
-    boundary: Option<&crate::maintenance_execution::ResumeBoundary>,
-) -> Result<EngineExit> {
-    run_engine(
-        process,
-        store,
-        record,
-        logical_record,
-        initial_input,
-        allow_pause,
-        boundary,
-    )
-    .await
-}
-
-/// Exercise the native continuation boundary without exposing it in production builds.
-#[cfg(feature = "test-fixtures")]
-#[doc(hidden)]
-pub async fn fixture_run_maintenance_resume(
-    process: &mut Process,
-    store: &mut Persist,
-    record: &Record,
-    logical_record: &Record,
-    initial_input: Option<&str>,
-    allow_pause: bool,
-    boundary: &crate::maintenance_execution::ResumeBoundary,
-) -> Result<EngineExit> {
-    run_maintenance_resume(
-        process,
-        store,
-        record,
-        logical_record,
-        initial_input,
-        allow_pause,
-        Some(boundary),
-    )
-    .await
-}
-
-/// Observe the native stream until it finishes or establishes a closing pause.
-async fn run_engine(
-    process: &mut Process,
-    store: &mut Persist,
-    record: &Record,
-    logical_record: &Record,
-    initial_input: Option<&str>,
-    allow_pause: bool,
-    boundary: Option<&crate::maintenance_execution::ResumeBoundary>,
-) -> Result<EngineExit> {
     if record.id != logical_record.id
         || record.sequence != logical_record.sequence
         || record.identity != logical_record.identity
     {
         return Err(invalid("native input and logical authority do not match"));
     }
-    if boundary.is_some_and(|boundary| {
-        store.bound_attempt() != Some(boundary.target_attempt_id.as_str())
-            || record
-                .resume_of_runtime_session_id
-                .as_deref()
-                .is_none_or(str::is_empty)
-    }) {
-        return Ok(EngineExit::MaintenanceUnconfirmed);
-    }
-    // A maintenance continuation inherits the verified parked boundary; an
-    // ordinary resume has no such foreground-work proof.
-    let mut maintenance_observer = maintenance::Observer::new(
-        store.bound_attempt().unwrap_or(""),
-        record.resume_of_runtime_session_id.is_some() && boundary.is_none(),
-    );
-    let mut maintenance_binding: Option<maintenance::TrackedSteer> = None;
-    let mut maintenance_recovery_pending = false;
-    // An uncertain write or already-buffered native activity cannot authorize
-    // cleanup, a repeated closing attempt, or any further native input.
-    let mut maintenance_hold = false;
-    let mut held_stream_ended = false;
-    // Bytes written to stdin are not a native-session acknowledgement.
-    let mut resume_ack: Option<(String, String)> = None;
     let mut inputs = ResultInputs::default();
+    let mut initial_input_id = None;
     if let Some(input) = initial_input {
         if let Ok(mut frame) = serde_json::from_str::<Value>(input)
             && frame.get("type").and_then(Value::as_str) == Some("user")
         {
-            if boundary.is_some()
-                && (frame.pointer("/message/role").and_then(Value::as_str)!=Some("user")
-                    || !frame.pointer("/message/content").and_then(Value::as_array)
-                        .is_some_and(|blocks|matches!(blocks.as_slice(),[block] if block["type"]=="text" && block["text"].is_string())))
-            {
-                return Ok(EngineExit::MaintenanceUnconfirmed);
-            }
-            let resume_text = boundary.map(|_| {
-                frame["message"]["content"][0]["text"]
-                    .as_str()
-                    .expect("checked continuation frame")
-                    .to_owned()
-            });
             let id = uuid::Uuid::new_v4().to_string();
             frame["uuid"] = json!(id);
             if let Some(digest) = initial_text_sha256(&frame, record, logical_record)
@@ -722,7 +607,7 @@ async fn run_engine(
                 .await?;
             if store.cancel_pending(&record.id)? {
                 process.input.take();
-                return Ok(EngineExit::Finished(EngineResult {
+                return Ok(EngineResult {
                     native_failure: None,
                     outcome: Outcome {
                         status: Status::Cancelled,
@@ -733,32 +618,21 @@ async fn run_engine(
                     },
                     answer: None,
                     usage: None,
-                }));
+                });
             }
             if let Err(error) = process.text(&format!("{frame}\n")).await {
                 // The frame may be partially written; its UUID must not be retried.
                 process.input.take();
                 return Err(error);
             }
-            if let Some(text) = resume_text {
-                resume_ack = Some((id.clone(), text));
-            }
-            maintenance_observer.input_sent(&id);
+            initial_input_id = Some(id.clone());
             inputs.sent(id, true);
         } else {
-            if boundary.is_some() {
-                return Ok(EngineExit::MaintenanceUnconfirmed);
-            }
             // Historical text fixtures remain one-shot; they provide no correlation.
-            maintenance_observer.unavailable(maintenance::Gap::InputCorrelation);
             inputs.unframed_initial = true;
             process.text(input).await?;
         }
     } else {
-        if boundary.is_some() {
-            return Ok(EngineExit::MaintenanceUnconfirmed);
-        }
-        maintenance_observer.unavailable(maintenance::Gap::MissingIdentity);
         process.input.take();
     }
     process
@@ -804,43 +678,26 @@ async fn run_engine(
             native_calls.finish(reply.clone());
             call.answer(reply);
             native_owner.take();
-            if !maintenance_hold {
-                return Err(invalid("native owner input acknowledgement is uncertain"));
-            }
+            return Err(invalid("native owner input acknowledgement is uncertain"));
         }
-        let finished = if record.request.explicit_finish {
-            match store.worker_finish_intent(&record.id, true) {
-                Ok(intent) => intent.is_some(),
-                Err(_) if maintenance_hold || resume_ack.is_some() => false,
-                Err(error) => return Err(error),
-            }
-        } else {
-            false
-        };
-        if finished && resume_ack.is_some() {
-            return Ok(EngineExit::MaintenanceUnconfirmed);
-        }
-        if finished {
+        if record.request.explicit_finish && store.worker_finish_intent(&record.id, true)?.is_some()
+        {
             if closing_at.is_none() {
                 closing_at = Some(tokio::time::Instant::now());
                 process.input.take();
             }
             if closing_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(2)) {
-                let recorded = process
+                process
                     .observing(store.event(
                         &record.id,
                         "finish_usage_incomplete_v1",
                         &json!({"protocol":"claude"}),
                     ))
-                    .await;
-                if !maintenance_hold {
-                    recorded?;
-                }
-                match crate::worker_finish::result(process, store, record, session.clone(), None) {
-                    Ok(Some(result)) => return Ok(EngineExit::Finished(result)),
-                    Ok(None) => {}
-                    Err(_) if maintenance_hold => {}
-                    Err(error) => return Err(error),
+                    .await?;
+                if let Some(result) =
+                    crate::worker_finish::result(process, store, record, session.clone(), None)?
+                {
+                    return Ok(result);
                 }
             }
         }
@@ -850,41 +707,28 @@ async fn run_engine(
                 use agent_run_adapters::native_owner::Reply;
                 let id=call.request.call_id.clone();
                 if let Err(reply)=native_calls.reserve(&call.request) {call.answer(reply);continue;}
-                if maintenance_hold || resume_ack.is_some() {
-                    let reply=Reply::unsent(&id,"maintenance_boundary_unavailable");
-                    native_calls.finish(reply.clone());call.answer(reply);continue;
-                }
                 let refusal=crate::native_owner::refusal(process,store,logical_record,&call,session.as_deref(),native_idle && native_pending.is_none(),closing_at.is_some()).unwrap_or(Some("unavailable"));
                 if let Some(reason)=refusal {let reply=Reply::unsent(&id,reason);native_calls.finish(reply.clone());call.answer(reply);continue;}
                 let input_id=uuid::Uuid::new_v4().to_string();
                 if !send_user_text(process,&call.request.text,&input_id,call.deadline).await {
-                    maintenance_observer.unavailable(maintenance::Gap::InputCorrelation);
                     let reply=Reply::unknown(&id);native_calls.finish(reply.clone());call.answer(reply);native_owner.take();
                     return Err(invalid("native owner input write is uncertain"));
                 }
-                maintenance_observer.input_sent(&input_id);
                 inputs.sent(input_id.clone(),false);
                 native_idle=false;
                 process.observing(store.worker_turn(&record.id,false,crate::domain::now())).await?;
                 native_pending=Some((call,input_id));
                 continue;
             }
-            event = process.next(), if !held_stream_ended => Some(event),
+            event = process.next() => Some(event),
             _ = tick.tick() => None,
         };
         // Journal rows wait at most one flush age while frames keep arriving and
         // are written at once when the engine goes quiet.
-        let flushed = if event.is_some() {
-            process.observing(store.flush_due()).await
+        if event.is_some() {
+            process.observing(store.flush_due()).await?;
         } else {
-            process.observing(store.flush()).await
-        };
-        if let Err(error) = flushed {
-            if maintenance_recovery_pending || maintenance_hold || resume_ack.is_some() {
-                maintenance_observer.unavailable(maintenance::Gap::InputCorrelation);
-            } else {
-                return Err(error);
-            }
+            process.observing(store.flush()).await?;
         }
         let Some(event) = event else {
             let deadline = tokio::time::Instant::now()
@@ -893,40 +737,15 @@ async fn run_engine(
                 if tokio::time::Instant::now() >= deadline {
                     break;
                 }
-                if maintenance_hold || resume_ack.is_some() {
-                    let pending: rusqlite::Result<bool> = store.conn().query_row(
-                        "SELECT EXISTS(SELECT 1 FROM commands WHERE agent_id=? AND kind='cancel' AND state='pending')",
-                        [record.id.as_str()], |row| row.get(0));
-                    if !matches!(pending, Ok(true)) {
-                        break;
-                    }
-                }
-                let claimed = process
+                let Some((cid, command, payload)) = process
                     .observing(store.claim_command_for_turn(
                         &record.id,
                         !record.request.explicit_finish || native_idle,
                     ))
-                    .await;
-                if maintenance_recovery_pending && store.unresolved_recoveries() == 0 {
-                    maintenance_recovery_pending = false;
-                }
-                let claimed = match claimed {
-                    Ok(claimed) => claimed,
-                    Err(_)
-                        if maintenance_recovery_pending
-                            || maintenance_hold
-                            || resume_ack.is_some() =>
-                    {
-                        break;
-                    }
-                    Err(error) => return Err(error),
-                };
-                let Some((cid, command, payload)) = claimed else {
+                    .await?
+                else {
                     break;
                 };
-                if (maintenance_hold || resume_ack.is_some()) && command != "cancel" {
-                    break;
-                }
                 if crate::health::command(
                     process,
                     store,
@@ -939,19 +758,14 @@ async fn run_engine(
                     continue;
                 }
                 if command == "cancel" {
-                    let completed = process
+                    process
                         .observing(store.complete_command(
                             &record.id,
                             cid,
                             &json!({"accepted":true}),
                         ))
-                        .await;
-                    match completed {
-                        Ok(()) => {}
-                        Err(_) if maintenance_hold || resume_ack.is_some() => break,
-                        Err(error) => return Err(error),
-                    }
-                    return Ok(EngineExit::Finished(EngineResult {
+                        .await?;
+                    return Ok(EngineResult {
                         native_failure: None,
                         outcome: Outcome {
                             status: Status::Cancelled,
@@ -962,186 +776,63 @@ async fn run_engine(
                         },
                         answer: None,
                         usage: None,
-                    }));
+                    });
                 }
-                let maintenance_steer =
-                    command == "steer" && maintenance::is_maintenance_steer(&payload);
-                let finished = if record.request.explicit_finish {
-                    match maintenance::finish_status(
-                        store.worker_finish_intent(&record.id, false),
-                        maintenance_steer,
-                    ) {
-                        Ok(Some(finished)) => finished,
-                        Ok(None) => {
-                            process
-                                .observing(maintenance::reject_unsent(
-                                    store,
-                                    &mut maintenance_observer,
-                                    &record.id,
-                                    cid,
-                                ))
-                                .await;
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                } else {
-                    false
-                };
-                if finished {
-                    if maintenance_steer {
-                        process
-                            .observing(maintenance::reject_unsent(
-                                store,
-                                &mut maintenance_observer,
-                                &record.id,
-                                cid,
-                            ))
-                            .await;
-                    } else {
-                        process
-                            .observing(store.complete_command(
-                                &record.id,
-                                cid,
-                                &json!({"accepted":false,"reason":"finish_accepted"}),
-                            ))
-                            .await?;
-                    }
+                if record.request.explicit_finish
+                    && store.worker_finish_intent(&record.id, false)?.is_some()
+                {
+                    process
+                        .observing(store.complete_command(
+                            &record.id,
+                            cid,
+                            &json!({"accepted":false,"reason":"finish_accepted"}),
+                        ))
+                        .await?;
                     continue;
                 }
                 if command == "steer" {
                     if let Some(text) = commands::steer_text(&payload) {
                         let id = uuid::Uuid::new_v4().to_string();
-                        let tracked = if maintenance_steer {
-                            match maintenance::track_steer(
-                                store,
-                                &record.id,
-                                cid,
-                                &payload,
-                                session.as_deref(),
-                                &id,
-                            ) {
-                                Ok(binding) if maintenance_binding.is_none() => {
-                                    match store.user_fragments(
-                                        &record.id,
-                                        &process.redact(
-                                            "Agent Run requested a maintenance checkpoint.",
-                                        ),
-                                    ) {
-                                        Ok(fragments) => Some((binding, fragments)),
-                                        Err(_) => {
-                                            process
-                                                .observing(maintenance::reject_unsent(
-                                                    store,
-                                                    &mut maintenance_observer,
-                                                    &record.id,
-                                                    cid,
-                                                ))
-                                                .await;
-                                            continue;
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    process
-                                        .observing(maintenance::reject_unsent(
-                                            store,
-                                            &mut maintenance_observer,
-                                            &record.id,
-                                            cid,
-                                        ))
-                                        .await;
-                                    continue;
-                                }
-                            }
-                        } else {
-                            None
-                        };
                         let open = process.input.is_some();
                         let accepted = send_user_text(process, text, &id, deadline).await;
                         if accepted {
                             native_idle = false;
-                            maintenance_observer.input_sent(&id);
                             inputs.sent(id, true);
                             // The bytes reached the engine: its observed result, the
                             // worker-turn effect and the transcript row are ONE
                             // atomic operation, never split and never replayed.
-                            if let Some((binding, fragments)) = tracked {
-                                let recorded = process
-                                    .observing(maintenance::record_sent(
-                                        store,
-                                        &mut maintenance_observer,
-                                        &record.id,
-                                        cid,
-                                        fragments,
-                                    ))
-                                    .await;
-                                if recorded {
-                                    maintenance_binding = Some(binding);
-                                } else {
-                                    maintenance_recovery_pending =
-                                        store.unresolved_recoveries() > 0;
-                                }
-                            } else {
-                                let fragments =
-                                    store.user_fragments(&record.id, &process.redact(text))?;
-                                process
-                                    .observing(store.observed_command_result(
-                                        &record.id,
-                                        cid,
-                                        &json!({"accepted":true}),
-                                        "stdin_written",
-                                        Some(false),
-                                        fragments,
-                                    ))
-                                    .await?;
-                            }
+                            let fragments =
+                                store.user_fragments(&record.id, &process.redact(text))?;
+                            process
+                                .observing(store.observed_command_result(
+                                    &record.id,
+                                    cid,
+                                    &json!({"accepted":true}),
+                                    "stdin_written",
+                                    Some(false),
+                                    fragments,
+                                ))
+                                .await?;
                         } else {
                             if open {
                                 inputs.uncertain_write = true;
-                                maintenance_observer
-                                    .unavailable(maintenance::Gap::InputCorrelation);
                             }
-                            if tracked.is_some() {
-                                maintenance_observer
-                                    .unavailable(maintenance::Gap::InputCorrelation);
-                                let result = if open {
-                                    json!({"accepted":null,"reason":"native_delivery_uncertain"})
-                                } else {
-                                    json!({"accepted":false,"reason":"native_input_closed"})
-                                };
-                                let _ = process
-                                    .observing(store.complete_command(&record.id, cid, &result))
-                                    .await;
-                            } else {
-                                process
-                                    .observing(store.complete_command(
-                                        &record.id,
-                                        cid,
-                                        &json!({"accepted":false}),
-                                    ))
-                                    .await?;
-                            }
-                        }
-                    } else {
-                        if maintenance_steer {
-                            process
-                                .observing(maintenance::reject_unsent(
-                                    store,
-                                    &mut maintenance_observer,
-                                    &record.id,
-                                    cid,
-                                ))
-                                .await;
-                        } else {
                             process
                                 .observing(store.complete_command(
                                     &record.id,
                                     cid,
-                                    &json!({"accepted":false,"reason":"empty_steer_text"}),
+                                    &json!({"accepted":false}),
                                 ))
                                 .await?;
                         }
+                    } else {
+                        process
+                            .observing(store.complete_command(
+                                &record.id,
+                                cid,
+                                &json!({"accepted":false,"reason":"empty_steer_text"}),
+                            ))
+                            .await?;
                     }
                 } else if command == "pool" {
                     // Same stdin path and deadline as steer. A successful
@@ -1156,16 +847,11 @@ async fn run_engine(
                             let open = process.input.is_some();
                             if send_user_text(process, &text, &id, deadline).await {
                                 native_idle = false;
-                                maintenance_observer.input_sent(&id);
                                 inputs.sent(id, false);
                                 written = true;
                                 commands::pool_result("written", "stdin_write")
                             } else {
                                 inputs.uncertain_write |= open;
-                                if open {
-                                    maintenance_observer
-                                        .unavailable(maintenance::Gap::InputCorrelation);
-                                }
                                 commands::pool_result("unknown", "stdin_write_failed")
                             }
                         }
@@ -1202,68 +888,6 @@ async fn run_engine(
             tick.reset();
             continue;
         };
-        // Do not confirm a continued session until the native stream itself
-        // acknowledges the exact UUID and content we just wrote.
-        let mut resume_acknowledged = false;
-        if let Some((expected_uuid, expected_text)) = resume_ack.as_ref() {
-            let expected_session = record
-                .resume_of_runtime_session_id
-                .as_deref()
-                .expect("checked resume session");
-            match &event {
-                Event::Json(frame)
-                    if frame.get("session_id").and_then(Value::as_str)
-                        == Some(expected_session) =>
-                {
-                    if maintenance::resume_queue_notice(frame, expected_session, expected_uuid)
-                        || maintenance::resume_request_notice(
-                            frame,
-                            expected_session,
-                            expected_uuid,
-                        )
-                    {
-                        continue;
-                    }
-                    let init = frame["type"] == "system"
-                        && frame["subtype"] == "init"
-                        && session.is_none();
-                    let replay = frame["type"] == "user"
-                        && frame["isReplay"] == true
-                        && frame["uuid"].as_str() == Some(expected_uuid.as_str())
-                        && frame.get("parent_tool_use_id").is_some_and(Value::is_null)
-                        && frame.pointer("/message/role").and_then(Value::as_str) == Some("user")
-                        && replay_text(frame) == Some(expected_text.as_str())
-                        && session.as_deref() == Some(expected_session);
-                    if replay {
-                        resume_acknowledged = true;
-                    } else if !init {
-                        return Ok(EngineExit::MaintenanceUnconfirmed);
-                    }
-                }
-                _ => return Ok(EngineExit::MaintenanceUnconfirmed),
-            }
-        }
-        if maintenance_hold {
-            match event {
-                Event::Json(frame) => {
-                    maintenance::observe_held_frame(
-                        process,
-                        store,
-                        record,
-                        session.as_deref(),
-                        &mut tool_names,
-                        &frame,
-                    )
-                    .await
-                }
-                Event::OwnershipFailure(_) | Event::Eof | Event::Failure(_) => {
-                    // Do not turn an uncertain closing boundary into a terminal
-                    // result; keep servicing cancellation and ownership checks.
-                    held_stream_ended = true;
-                }
-            }
-            continue;
-        }
         let v = match event {
             Event::Json(v) => v,
             Event::OwnershipFailure(error) => {
@@ -1301,7 +925,7 @@ async fn run_engine(
                         crate::worker_finish::result(process, store, record, session.clone(), None)?
                     {
                         result.outcome.exit_code = code;
-                        return Ok(EngineExit::Finished(result));
+                        return Ok(result);
                     }
                 }
                 process
@@ -1334,7 +958,7 @@ async fn run_engine(
                         result.outcome.status = Status::Failed;
                         result.outcome.failure_kind = Some("empty_result".into());
                     }
-                    return Ok(EngineExit::Finished(result));
+                    return Ok(result);
                 }
                 let diagnostic = process.diagnostic_tail();
                 let kind = if record.request.explicit_finish {
@@ -1357,12 +981,12 @@ async fn run_engine(
                 outcome.exit_code = code;
                 outcome.runtime_session_id = session;
                 outcome.failure_text = diagnostic;
-                return Ok(EngineExit::Finished(EngineResult {
+                return Ok(EngineResult {
                     native_failure: None,
                     outcome,
                     answer: None,
                     usage: None,
-                }));
+                });
             }
             Event::Failure(e) => {
                 process
@@ -1385,21 +1009,18 @@ async fn run_engine(
                 let mut outcome = Outcome::failure(e);
                 outcome.exit_code = code;
                 outcome.failure_text = process.diagnostic_tail();
-                return Ok(EngineExit::Finished(EngineResult {
+                return Ok(EngineResult {
                     native_failure: None,
                     outcome,
                     answer: None,
                     usage: None,
-                }));
+                });
             }
         };
         // Validate notification ownership before a frame can rebind a fresh session.
         if v.get("type").and_then(Value::as_str) == Some("user")
             && let Err(error) = inputs.replay(&v, session.as_deref())
         {
-            if resume_ack.is_some() {
-                return Ok(EngineExit::MaintenanceUnconfirmed);
-            }
             let reason = match &error {
                 crate::Error::Validation(message) => match message.as_str() {
                     "native user replay has unknown input correlation" => "unknown_input",
@@ -1419,27 +1040,18 @@ async fn run_engine(
                 .await;
             return Err(error);
         }
-        if resume_acknowledged {
-            let boundary =
-                boundary.expect("replay acknowledgement requires a continuation boundary");
-            let (turn, text) = resume_ack.as_ref().expect("checked replay acknowledgement");
-            let digest = crate::fs::sha256(text.as_bytes());
-            let input = crate::maintenance_execution::ResumeInputEvidence {
-                session: record
-                    .resume_of_runtime_session_id
-                    .as_deref()
-                    .expect("checked resume session"),
-                turn,
-                input_sha256: &digest,
-            };
-            if !crate::maintenance_execution::confirm_resume(
-                process, store, &record.id, boundary, &input,
-            )
-            .await
-            {
-                return Ok(EngineExit::MaintenanceUnconfirmed);
-            }
-            resume_ack = None;
+        if let (Some(expected_session), Some(input_id)) =
+            (&record.resume_of_runtime_session_id, &initial_input_id)
+            && is_resume_ack(&v, expected_session, input_id)
+        {
+            process
+                .observing(store.event_durable(
+                    &record.id,
+                    "native_resume_accepted",
+                    &json!({"session":expected_session,"input_id":input_id}),
+                ))
+                .await?;
+            initial_input_id = None;
         }
         if v.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification")
             || v.get("type").and_then(Value::as_str) == Some("assistant")
@@ -1488,33 +1100,6 @@ async fn run_engine(
         } else {
             None
         };
-        // Keep stricter maintenance evidence separate from permissive idle and
-        // normal task outcomes; this has no lifecycle or scheduling effects.
-        maintenance_observer.observe(&v, result_scope.map(|scope| scope == ResultScope::Task));
-        let receipt = maintenance_binding.as_mut().and_then(|binding| {
-            maintenance::accepted_receipt(
-                &mut maintenance_observer,
-                store,
-                &record.id,
-                binding,
-                |text| process.contains_secret(text),
-            )
-        });
-        if let Some(receipt) = receipt {
-            // This is one attempt-pinned, idempotent evidence write. An
-            // unavailable or unknown outcome never initiates a second write.
-            if let Some(binding) = maintenance_binding.as_mut() {
-                process
-                    .observing(maintenance::confirm_receipt(
-                        store,
-                        &mut maintenance_observer,
-                        &record.id,
-                        binding,
-                        receipt,
-                    ))
-                    .await;
-            }
-        }
         if let Some(s) = v
             .get("session_id")
             .and_then(Value::as_str)
@@ -1846,81 +1431,13 @@ async fn run_engine(
                     session.clone(),
                     Some(usage.clone()),
                 )? {
-                    return Ok(EngineExit::Finished(result));
+                    return Ok(result);
                 }
                 if record.request.explicit_finish && outcome.status == Status::Succeeded {
-                    if allow_pause
-                        && !maintenance_hold
-                        && maintenance_observer.assessment() == maintenance::Assessment::Settled
-                        && let Some(binding) = maintenance_binding.as_ref()
-                    {
-                        match maintenance::native_settlement(
-                            &maintenance_observer,
-                            store,
-                            &record.id,
-                            binding,
-                        ) {
-                            Ok(Some(proof)) => {
-                                // From this point an unknown write may have committed;
-                                // never resend native input or issue a new event.
-                                maintenance_hold = true;
-                                let committed = process
-                                    .observing(maintenance::commit_settlement(
-                                        store, &record.id, &proof,
-                                    ))
-                                    .await;
-                                if let Ok(native_event_seq) = committed
-                                    && matches!(store.cancel_pending(&record.id), Ok(false))
-                                {
-                                    match maintenance::drain_settled_notices(
-                                        process,
-                                        &mut maintenance_observer,
-                                        store,
-                                        record,
-                                        session.as_deref(),
-                                        &proof.turn_id,
-                                        &mut tool_names,
-                                        &mut signals,
-                                    )
-                                    .await
-                                    {
-                                        maintenance::BufferedSettlement::Clear
-                                            if matches!(
-                                                store.cancel_pending(&record.id),
-                                                Ok(false)
-                                            ) =>
-                                        {
-                                            return Ok(EngineExit::MaintenancePause {
-                                                epoch: proof.maintenance_epoch,
-                                                attempt_id: proof.attempt_id,
-                                                native_event_seq,
-                                            });
-                                        }
-                                        maintenance::BufferedSettlement::StreamEnded => {
-                                            held_stream_ended = true;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                maintenance_observer
-                                    .unavailable(maintenance::Gap::ActivityAfterCheckpoint);
-                            }
-                            Ok(None) => maintenance_observer
-                                .unavailable(maintenance::Gap::InvalidCheckpoint),
-                            Err(_) => {
-                                maintenance_hold = true;
-                                maintenance_observer
-                                    .unavailable(maintenance::Gap::InvalidCheckpoint);
-                            }
-                        }
-                    }
                     native_idle = true;
-                    let observed = process
+                    process
                         .observing(store.worker_turn(&record.id, true, crate::domain::now()))
-                        .await;
-                    if !maintenance_hold {
-                        observed?;
-                    }
+                        .await?;
                     continue;
                 }
                 if record.resume_of_runtime_session_id.is_some()
@@ -1974,20 +1491,6 @@ async fn run_engine(
             _ => {}
         }
     }
-}
-
-/// Extract exactly one replayed user text without retaining it in diagnostics.
-fn replay_text(frame: &Value) -> Option<&str> {
-    let content = frame.pointer("/message/content")?;
-    if let Some(text) = content.as_str() {
-        return Some(text);
-    }
-    let [block] = content.as_array()?.as_slice() else {
-        return None;
-    };
-    (block["type"] == "text")
-        .then(|| block["text"].as_str())
-        .flatten()
 }
 
 /// Hashes a single text block only when it matches the admitted task and native
@@ -2069,6 +1572,18 @@ async fn send_user_text(
 mod tests {
     use super::{native_result_metadata, result_failure_kind, result_text, runtime_result_usage};
     use serde_json::json;
+
+    /// A resume is acknowledged only by the matching native session and input.
+    #[test]
+    fn resume_ack_requires_matching_native_replay() {
+        let frame = json!({"type":"user","isReplay":true,"uuid":"input","session_id":"session"});
+        assert!(super::is_resume_ack(&frame, "session", "input"));
+        assert!(!super::is_resume_ack(&frame, "other", "input"));
+        assert!(!super::is_resume_ack(&frame, "session", "other"));
+        let mut missing = frame;
+        missing["isReplay"] = json!(false);
+        assert!(!super::is_resume_ack(&missing, "session", "input"));
+    }
 
     /// Runner replays retain task/steering authority and reject unknown or repeated results.
     #[test]

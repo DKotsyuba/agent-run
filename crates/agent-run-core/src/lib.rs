@@ -23,11 +23,6 @@ pub mod housekeeping;
 mod integration;
 pub mod lifecycle;
 pub mod logging;
-/// Staged maintenance continuation input; not connected to worker lifecycle.
-pub mod maintenance_control;
-pub mod maintenance_controller;
-/// Nonterminal native-execution disposition for planned maintenance.
-pub mod maintenance_execution;
 pub mod managed_services;
 /// Single-instance storage of Codex's unindexed native metadata caches.
 pub mod native_cache;
@@ -47,6 +42,8 @@ pub mod runtime_cache;
 /// Filesystem relocation of sealed managed trees into the shared store.
 pub mod runtime_storage;
 pub mod service;
+/// Planned restart coordination using the normal worker lifecycle.
+pub mod service_restart;
 /// Client lanes of the private writer socket.
 pub mod storage_client;
 /// Reference-aware collection of the shared managed-asset store.

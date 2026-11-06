@@ -1,7 +1,3 @@
-/// Conservative maintenance-only native event correlation; no lifecycle action.
-pub mod maintenance;
-/// Exact command/attempt binding and supervisor receipt persistence.
-pub mod maintenance_receipt;
 /// Model-visible pending-handle evidence shared by fresh and resumed native turns.
 mod native_returns;
 use crate::commands;
@@ -776,169 +772,11 @@ pub async fn run(
     role: &Profile,
     home: &Path,
 ) -> Result<EngineResult> {
-    let mode = if record.request.explicit_finish {
-        "1"
-    } else {
-        "0"
-    };
-    run_maintenance(
-        process,
-        store,
-        record,
-        logical_record,
-        runtime,
-        role,
-        home,
-        false,
-        mode,
-    )
-    .await?
-    .require_finished()
-}
-
-/// Run with a typed pause outcome. `finish_mode` must come from the exact
-/// supervisor-owned launch environment, never from native output. The default
-/// runner keeps v4; only the explicit staged value selects the v5 inventory.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Preserves the native runner inputs and explicit maintenance boundary."
-)]
-pub async fn run_maintenance(
-    process: &mut Process,
-    store: &mut Persist,
-    record: &Record,
-    logical_record: &Record,
-    runtime: &Runtime,
-    role: &Profile,
-    home: &Path,
-    allow_pause: bool,
-    finish_mode: &str,
-) -> Result<crate::maintenance_execution::EngineExit> {
-    run_maintenance_resume(
-        process,
-        store,
-        record,
-        logical_record,
-        runtime,
-        role,
-        home,
-        allow_pause,
-        finish_mode,
-        None,
-    )
-    .await
-}
-
-/// Run with an optional attempt-pinned continuation handoff from the supervisor.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Preserves the native runner inputs and explicit maintenance boundary."
-)]
-pub(crate) async fn run_maintenance_resume(
-    process: &mut Process,
-    store: &mut Persist,
-    record: &Record,
-    logical_record: &Record,
-    runtime: &Runtime,
-    role: &Profile,
-    home: &Path,
-    allow_pause: bool,
-    finish_mode: &str,
-    boundary: Option<&crate::maintenance_execution::ResumeBoundary>,
-) -> Result<crate::maintenance_execution::EngineExit> {
-    let staged_catalog = maintenance_catalog_mode(record.request.explicit_finish, finish_mode)?;
-    run_engine(
-        process,
-        store,
-        record,
-        logical_record,
-        runtime,
-        role,
-        home,
-        allow_pause && staged_catalog,
-        staged_catalog,
-        boundary,
-    )
-    .await
-}
-
-/// Exercise the native continuation boundary without exposing it in production builds.
-#[cfg(feature = "test-fixtures")]
-#[doc(hidden)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Preserves the native runner inputs and explicit maintenance boundary."
-)]
-pub async fn fixture_run_maintenance_resume(
-    process: &mut Process,
-    store: &mut Persist,
-    record: &Record,
-    logical_record: &Record,
-    runtime: &Runtime,
-    role: &Profile,
-    home: &Path,
-    allow_pause: bool,
-    finish_mode: &str,
-    boundary: &crate::maintenance_execution::ResumeBoundary,
-) -> Result<crate::maintenance_execution::EngineExit> {
-    run_maintenance_resume(
-        process,
-        store,
-        record,
-        logical_record,
-        runtime,
-        role,
-        home,
-        allow_pause,
-        finish_mode,
-        Some(boundary),
-    )
-    .await
-}
-
-/// Check the supervisor-selected worker catalog without trusting native output.
-fn maintenance_catalog_mode(explicit_finish: bool, mode: &str) -> Result<bool> {
-    match (explicit_finish, mode) {
-        (false, "0") | (true, "1") => Ok(false),
-        (true, agent_run_domain::worker::MAINTENANCE_PAUSE_ENV_VALUE) => Ok(true),
-        _ => Err(invalid(
-            "worker launch catalog mode does not match admission",
-        )),
-    }
-}
-
-/// Run one Codex attempt using the already checked launch catalog mode.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Preserves the native runner inputs and explicit maintenance boundary."
-)]
-async fn run_engine(
-    process: &mut Process,
-    store: &mut Persist,
-    record: &Record,
-    logical_record: &Record,
-    runtime: &Runtime,
-    role: &Profile,
-    home: &Path,
-    allow_pause: bool,
-    staged_catalog: bool,
-    boundary: Option<&crate::maintenance_execution::ResumeBoundary>,
-) -> Result<crate::maintenance_execution::EngineExit> {
-    use crate::maintenance_execution::EngineExit;
     if record.id != logical_record.id
         || record.sequence != logical_record.sequence
         || record.identity != logical_record.identity
     {
         return Err(invalid("native input and logical authority do not match"));
-    }
-    if boundary.is_some_and(|boundary| {
-        store.bound_attempt() != Some(boundary.target_attempt_id.as_str())
-            || record
-                .resume_of_runtime_session_id
-                .as_deref()
-                .is_none_or(str::is_empty)
-    }) {
-        return Ok(EngineExit::MaintenanceUnconfirmed);
     }
     agent_run_adapters::validate_role(runtime, role)?;
     initialize(process).await?;
@@ -1015,9 +853,6 @@ async fn run_engine(
             .pointer("/thread/status/type")
             .or_else(|| thread.pointer("/thread/status"))
             .and_then(Value::as_str);
-        if boundary.is_some() && status != Some("idle") {
-            return Ok(EngineExit::MaintenanceUnconfirmed);
-        }
         if matches!(status, Some("active") | Some("running")) {
             return Err(invalid("native thread is already active"));
         }
@@ -1029,24 +864,8 @@ async fn run_engine(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| invalid("thread start did not return an id"))?
         .to_owned();
-    if boundary.is_some() {
-        let expected = record
-            .resume_of_runtime_session_id
-            .as_deref()
-            .expect("checked resume session");
-        if tid != expected
-            || thread
-                .get("threadId")
-                .is_some_and(|id| id.as_str() != Some(expected))
-            || thread
-                .pointer("/thread/id")
-                .is_some_and(|id| id.as_str() != Some(expected))
-        {
-            return Ok(EngineExit::MaintenanceUnconfirmed);
-        }
-    }
     if record.request.explicit_finish {
-        finish_inventory_ready(process, &tid, role.research_tools_only(), staged_catalog).await?;
+        finish_inventory_ready(process, &tid, role.research_tools_only()).await?;
     }
     if role.research_tools_only() {
         let status = process
@@ -1060,9 +879,7 @@ async fn run_engine(
             .get("data")
             .and_then(Value::as_array)
             .ok_or_else(|| invalid("native research MCP inventory is missing"))?;
-        let expected = if record.request.explicit_finish && staged_catalog {
-            agent_run_domain::worker::maintenance_pause_tools_json(true)
-        } else if record.request.explicit_finish {
+        let expected = if record.request.explicit_finish {
             agent_run_domain::worker::finish_tools_json(true)
         } else {
             agent_run_domain::worker::research_tools_json()
@@ -1133,35 +950,7 @@ async fn run_engine(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| invalid("turn start did not return an id"))?
         .to_owned();
-    if boundary.is_some()
-        && (!agent_run_adapters::native_owner::valid_id(&turn_id)
-            || response
-                .get("threadId")
-                .is_some_and(|id| id.as_str() != Some(tid.as_str()))
-            || response
-                .pointer("/thread/id")
-                .is_some_and(|id| id.as_str() != Some(tid.as_str()))
-            || response
-                .pointer("/turn/threadId")
-                .is_some_and(|id| id.as_str() != Some(tid.as_str())))
-    {
-        return Ok(EngineExit::MaintenanceUnconfirmed);
-    }
     session.turn_started(&turn_id)?;
-    if let Some(boundary) = boundary {
-        let input = crate::maintenance_execution::ResumeInputEvidence {
-            session: &tid,
-            turn: &turn_id,
-            input_sha256: &input_sha256,
-        };
-        if !crate::maintenance_execution::confirm_resume(
-            process, store, &record.id, boundary, &input,
-        )
-        .await
-        {
-            return Ok(EngineExit::MaintenanceUnconfirmed);
-        }
-    }
     // Attempt-bound provenance for continuation: this attempt's own turn id
     // and the digest of the input it admitted (never the text itself).
     process
@@ -1171,6 +960,15 @@ async fn run_engine(
             &json!({"turn":turn_id,"input_sha256":input_sha256}),
         ))
         .await?;
+    if record.resume_of_runtime_session_id.is_some() {
+        process
+            .observing(store.event_durable(
+                &record.id,
+                "native_resume_accepted",
+                &json!({"session":tid,"turn":turn_id}),
+            ))
+            .await?;
+    }
     let mut streamed: BTreeMap<String, String> = BTreeMap::new();
     let mut emitted: BTreeMap<String, String> = BTreeMap::new();
     let mut redactors: BTreeMap<String, StreamingRedactor> = BTreeMap::new();
@@ -1183,15 +981,6 @@ async fn run_engine(
         .await?;
     let mut tools_started = BTreeSet::new();
     let mut tools_completed = BTreeSet::new();
-    // Only a verified maintenance continuation inherits the parked boundary;
-    // an ordinary resume still has unknown inherited foreground work.
-    let mut maintenance_observer = maintenance::Observer::new(
-        &tid,
-        record.resume_of_runtime_session_id.is_some() && boundary.is_none(),
-    );
-    let mut maintenance_control = None;
-    let mut maintenance_hold = false;
-    let mut held_stream_ended = false;
     let mut missing_tool_inputs: BTreeMap<String, MissingToolInput> = BTreeMap::new();
     let mut command_outputs = CommandOutputs::default();
     let mut pending_jobs: BTreeMap<String, PendingNativeJob> = BTreeMap::new();
@@ -1206,16 +995,8 @@ async fn run_engine(
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        let finished = if record.request.explicit_finish {
-            match store.worker_finish_intent(&record.id, true) {
-                Ok(intent) => intent.is_some(),
-                Err(_) if maintenance_hold => false,
-                Err(error) => return Err(error),
-            }
-        } else {
-            false
-        };
-        if finished {
+        if record.request.explicit_finish && store.worker_finish_intent(&record.id, true)?.is_some()
+        {
             if closing_at.is_none() {
                 closing_at = Some(tokio::time::Instant::now());
                 if !idle {
@@ -1226,35 +1007,27 @@ async fn run_engine(
                             Duration::from_millis(500),
                         )
                         .await;
-                    let recorded = process
+                    process
                         .observing(store.event(
                             &record.id,
                             "finish_interrupt_v1",
                             &json!({"exchange_returned":interrupted.is_ok()}),
                         ))
-                        .await;
-                    if !maintenance_hold {
-                        recorded?;
-                    }
+                        .await?;
                 }
             }
             if closing_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(2)) {
-                let recorded = process
+                process
                     .observing(store.event(
                         &record.id,
                         "finish_usage_incomplete_v1",
                         &json!({"protocol":"codex"}),
                     ))
-                    .await;
-                if !maintenance_hold {
-                    recorded?;
-                }
-                match crate::worker_finish::result(process, store, record, Some(tid.clone()), None)
+                    .await?;
+                if let Some(result) =
+                    crate::worker_finish::result(process, store, record, Some(tid.clone()), None)?
                 {
-                    Ok(Some(result)) => return Ok(EngineExit::Finished(result)),
-                    Ok(None) => {}
-                    Err(_) if maintenance_hold => {}
-                    Err(error) => return Err(error),
+                    return Ok(result);
                 }
             }
         }
@@ -1264,7 +1037,6 @@ async fn run_engine(
                 use agent_run_adapters::{native_owner::Reply,io::RpcDisposition};
                 let id=call.request.call_id.clone();
                 if let Err(reply)=native_calls.reserve(&call.request) {call.answer(reply);continue;}
-                if maintenance_hold {let reply=Reply::unsent(&id,"maintenance_boundary_unavailable");native_calls.finish(reply.clone());call.answer(reply);continue;}
                 let refusal=crate::native_owner::refusal(process,store,logical_record,&call,Some(&tid),idle,closing_at.is_some()).unwrap_or(Some("unavailable"));
                 if let Some(reason)=refusal {let reply=Reply::unsent(&id,reason);native_calls.finish(reply.clone());call.answer(reply);continue;}
                 let old_turn=turn_id.clone();
@@ -1280,22 +1052,18 @@ async fn run_engine(
                 if accepted {process.observing(store.worker_turn(&record.id,false,crate::domain::now())).await?;}
                 continue;
             }
-            event = process.next(), if !held_stream_ended => Some(event),
+            event = process.next() => Some(event),
             _ = tick.tick() => None,
         };
         // Journal rows wait at most one flush age while frames keep arriving and
         // are written at once when the engine goes quiet.
-        let flushed = if event.is_some() {
-            process.observing(store.flush_due()).await
+        if event.is_some() {
+            process.observing(store.flush_due()).await?;
         } else {
-            process.observing(store.flush()).await
-        };
-        if !maintenance_hold {
-            flushed?;
+            process.observing(store.flush()).await?;
         }
         let Some(event) = event else {
-            if !maintenance_hold
-                && closing_at.is_none()
+            if closing_at.is_none()
                 && pending_jobs
                     .values()
                     .any(|job| job.kind == "commandExecution")
@@ -1315,7 +1083,6 @@ async fn run_engine(
                     || (idle && native_returns.as_ref().is_some_and(|h| !h.ready())))
                     && !return_gap_reported
                 {
-                    maintenance_observer.unavailable(maintenance::Gap::AsyncCoverageUnavailable);
                     process
                         .observing(store.event(
                             &record.id,
@@ -1324,17 +1091,6 @@ async fn run_engine(
                         ))
                         .await?;
                     return_gap_reported = true;
-                }
-                if pending_jobs.values().any(|job| {
-                    job.process_id.as_deref().is_some_and(|handle| {
-                        native_returns
-                            .as_ref()
-                            .is_some_and(|history| history.pending(&job.turn, handle))
-                    })
-                }) {
-                    // A returned handle may schedule a later model wake. Until
-                    // that complete pipeline is fenced, it cannot prove pause.
-                    maintenance_observer.unavailable(maintenance::Gap::AsyncCoverageUnavailable);
                 }
                 let ambiguous = flush_native_jobs(
                     process,
@@ -1346,7 +1102,6 @@ async fn run_engine(
                 )
                 .await?;
                 if ambiguous && !return_gap_reported {
-                    maintenance_observer.unavailable(maintenance::Gap::AsyncCoverageUnavailable);
                     process
                         .observing(store.event(
                             &record.id,
@@ -1362,57 +1117,15 @@ async fn run_engine(
                 if started.elapsed() >= Duration::from_secs_f64(commands::COMMAND_PAGE_SECONDS) {
                     break;
                 }
-                if maintenance_hold {
-                    let pending:rusqlite::Result<bool>=store.conn().query_row(
-                        "SELECT EXISTS(SELECT 1 FROM commands WHERE agent_id=? AND kind='cancel' AND state='pending')",
-                        [record.id.as_str()],|row|row.get(0));
-                    if !matches!(pending, Ok(true)) {
-                        break;
-                    }
-                }
-                let claimed = process
+                let Some((cid, kind, payload)) = process
                     .observing(store.claim_command_for_turn(
                         &record.id,
                         !record.request.explicit_finish || idle,
                     ))
-                    .await;
-                let claimed = match claimed {
-                    Ok(value) => value,
-                    Err(_) if maintenance_hold => break,
-                    Err(error) => return Err(error),
-                };
-                let Some((cid, kind, payload)) = claimed else {
+                    .await?
+                else {
                     break;
                 };
-                if maintenance_hold {
-                    if kind != "cancel" {
-                        break;
-                    }
-                    match process
-                        .observing(store.complete_command(
-                            &record.id,
-                            cid,
-                            &json!({"accepted":true}),
-                        ))
-                        .await
-                    {
-                        Ok(()) => {
-                            return Ok(EngineExit::Finished(EngineResult {
-                                native_failure: None,
-                                outcome: Outcome {
-                                    status: Status::Cancelled,
-                                    exit_code: None,
-                                    failure_kind: None,
-                                    failure_text: None,
-                                    runtime_session_id: Some(tid.clone()),
-                                },
-                                answer: None,
-                                usage,
-                            }));
-                        }
-                        Err(_) => break,
-                    }
-                }
                 if crate::health::command(process, store, &record.id, (cid, &kind, &payload), idle)
                     .await?
                 {
@@ -1477,7 +1190,7 @@ async fn run_engine(
                         &mut redactors,
                     )
                     .await?;
-                    return Ok(EngineExit::Finished(EngineResult {
+                    return Ok(EngineResult {
                         native_failure: None,
                         outcome: Outcome {
                             status: Status::Cancelled,
@@ -1488,81 +1201,10 @@ async fn run_engine(
                         },
                         answer: None,
                         usage,
-                    }));
+                    });
                 }
                 if kind == "steer" {
                     if let Some(text) = commands::steer_text(&payload) {
-                        if maintenance_receipt::marked(&payload) {
-                            let binding = store
-                                .bound_attempt()
-                                .map(|attempt| {
-                                    maintenance_receipt::claimed_control(
-                                        store, &record.id, attempt, cid, &payload,
-                                    )
-                                })
-                                .transpose();
-                            let binding = match binding {
-                                Ok(Some(Some(binding))) => binding,
-                                _ => {
-                                    let _ = process.observing(store.complete_command(
-                                        &record.id, cid, &json!({"accepted":false,"reason":"maintenance_binding_unavailable"}),
-                                    )).await;
-                                    maintenance_observer.unavailable(
-                                        maintenance::Gap::ReceiptPersistenceUnavailable,
-                                    );
-                                    continue;
-                                }
-                            };
-                            // Maintenance input is never retried. Any uncertain
-                            // native outcome or failed write holds only the pause.
-                            let exchange = turn_input(
-                                process,
-                                &mut session,
-                                &tid,
-                                &mut turn_id,
-                                &mut idle,
-                                text,
-                                record.request.effort.as_deref(),
-                                tokio::time::Instant::now() + Duration::from_secs(30),
-                            )
-                            .await;
-                            let result = maintenance_receipt::send_result(exchange);
-                            let accepted = result["accepted"] == true;
-                            let persisted = if accepted {
-                                match store.user_fragments(
-                                    &record.id,
-                                    "Agent Run requested a maintenance checkpoint.",
-                                ) {
-                                    Ok(fragments) => process
-                                        .observing(store.observed_command_result(
-                                            &record.id,
-                                            cid,
-                                            &result,
-                                            "native_accepted",
-                                            Some(false),
-                                            fragments,
-                                        ))
-                                        .await
-                                        .map(|_| ()),
-                                    Err(error) => Err(error),
-                                }
-                            } else {
-                                process
-                                    .observing(store.complete_command(&record.id, cid, &result))
-                                    .await
-                            };
-                            if accepted && persisted.is_ok() {
-                                maintenance_control = Some(binding.accepted_turn(&turn_id));
-                            } else {
-                                maintenance_observer
-                                    .unavailable(maintenance::Gap::ReceiptPersistenceUnavailable);
-                                if let Some(logger) = crate::logging::configured() {
-                                    logger.log(crate::logging::Level::Warning,
-                                        "maintenance input was not confirmed; automatic pause held without replay");
-                                }
-                            }
-                            continue;
-                        }
                         let exchange = turn_input(
                             process,
                             &mut session,
@@ -1593,11 +1235,6 @@ async fn run_engine(
                                 json!({"accepted":false,"reason":"backlog_pressure_unsent"})
                             }
                             Ok(agent_run_adapters::io::RpcDisposition::Uncertain(reason)) => {
-                                // The input may have reached the native turn;
-                                // later silence or a late RPC reply cannot prove
-                                // that its side effects settled for maintenance.
-                                maintenance_observer
-                                    .unavailable(maintenance::Gap::AsyncCoverageUnavailable);
                                 if let agent_run_adapters::io::RpcUncertain::Transport(kind) =
                                     reason
                                 {
@@ -1682,19 +1319,10 @@ async fn run_engine(
                                 commands::pool_result("unsent", "backlog_pressure_unsent")
                             }
                             Ok(agent_run_adapters::io::RpcDisposition::Uncertain(reason)) => {
-                                maintenance_observer
-                                    .unavailable(maintenance::Gap::AsyncCoverageUnavailable);
                                 commands::pool_result("unknown", reason.reason())
                             }
                             // Only pre-send validation returns Err.
-                            Err(_) => {
-                                // The idle wake helper may map an uncertain
-                                // native response to an error; never infer that
-                                // background work is absent from it.
-                                maintenance_observer
-                                    .unavailable(maintenance::Gap::AsyncCoverageUnavailable);
-                                commands::pool_result("unsent", "exchange_not_sent")
-                            }
+                            Err(_) => commands::pool_result("unsent", "exchange_not_sent"),
                         },
                         Err(refusal) => refusal,
                     };
@@ -1727,20 +1355,6 @@ async fn run_engine(
             tick.reset();
             continue;
         };
-        if maintenance_hold {
-            match event {
-                Event::Json(frame) => {
-                    maintenance_receipt::observe_held_frame(
-                        process, store, record, &tid, &turn_id, &frame,
-                    )
-                    .await
-                }
-                Event::OwnershipFailure(_) | Event::Eof | Event::Failure(_) => {
-                    held_stream_ended = true
-                }
-            }
-            continue;
-        }
         let v = match event {
             Event::Json(v) => v,
             Event::OwnershipFailure(error) => {
@@ -1781,10 +1395,10 @@ async fn run_engine(
                         Some(tid.clone()),
                         None,
                     )? {
-                        return Ok(EngineExit::Finished(result));
+                        return Ok(result);
                     }
                 }
-                return Ok(EngineExit::Finished(EngineResult {
+                return Ok(EngineResult {
                     native_failure: None,
                     outcome: Outcome::failure(if record.request.explicit_finish {
                         "ended_without_finish"
@@ -1793,7 +1407,7 @@ async fn run_engine(
                     }),
                     answer: None,
                     usage,
-                }));
+                });
             }
             Event::Failure(e) => {
                 flush_pending_assistant(
@@ -1805,26 +1419,14 @@ async fn run_engine(
                     &mut redactors,
                 )
                 .await?;
-                return Ok(EngineExit::Finished(EngineResult {
+                return Ok(EngineResult {
                     native_failure: None,
                     outcome: Outcome::failure(e),
                     answer: None,
                     usage,
-                }));
+                });
             }
         };
-        // Maintenance uses stricter identity and ordering than normal legacy
-        // transcript handling, so observe before any permissive filtering.
-        maintenance_observer.observe(&v, &turn_id);
-        let maintenance_receipt_result = process
-            .observing(maintenance_receipt::observe(
-                store,
-                &record.id,
-                maintenance_control.as_ref(),
-                &mut maintenance_observer,
-            ))
-            .await;
-        maintenance_receipt::receipt_outcome(&mut maintenance_observer, maintenance_receipt_result);
         if v.get("method").is_some() && v.get("id").is_some() {
             process.deny_request(&v).await?;
             continue;
@@ -2201,7 +1803,6 @@ async fn run_engine(
                         item.get("type").and_then(Value::as_str),
                         Some("reasoning" | "plan" | "userMessage" | "contextCompaction")
                     ) {
-                        maintenance_observer.unavailable(maintenance::Gap::UnsupportedToolCoverage);
                         process
                             .observing(store.event(
                                 &record.id,
@@ -2270,7 +1871,7 @@ async fn run_engine(
                         usage.clone(),
                     )?
                 {
-                    return Ok(EngineExit::Finished(result));
+                    return Ok(result);
                 }
                 let mut outcome = match turn.get("status").and_then(Value::as_str) {
                     Some("completed") => Outcome::success(Some(tid.clone())),
@@ -2314,51 +1915,6 @@ async fn run_engine(
                         .observing(store.worker_turn(&record.id, true, crate::domain::now()))
                         .await?;
                     idle = true;
-                    if allow_pause
-                        && outcome.status == Status::Succeeded
-                        && pending_jobs.is_empty()
-                        && maintenance_observer.assessment() == maintenance::Assessment::Settled
-                        && let Some(binding) = maintenance_control.as_ref()
-                    {
-                        match maintenance_receipt::native_settlement(
-                            store,
-                            &record.id,
-                            binding,
-                            &maintenance_observer,
-                        ) {
-                            Ok(Some(proof)) => {
-                                // A possibly committed closing must never be retried
-                                // or followed by another native input.
-                                maintenance_hold = true;
-                                let committed = process
-                                    .observing(maintenance_receipt::commit_settlement(
-                                        store, &record.id, &proof,
-                                    ))
-                                    .await;
-                                if let Ok(native_event_seq) = committed
-                                    && drain_maintenance_frames(
-                                        process, store, &record.id, &tid, &turn_id, &mut usage,
-                                    )
-                                    .await
-                                {
-                                    return Ok(EngineExit::MaintenancePause {
-                                        epoch: proof.maintenance_epoch,
-                                        attempt_id: proof.attempt_id,
-                                        native_event_seq,
-                                    });
-                                }
-                                maintenance_observer
-                                    .unavailable(maintenance::Gap::ActivityAfterCheckpoint);
-                            }
-                            Ok(None) => maintenance_observer
-                                .unavailable(maintenance::Gap::InvalidCheckpoint),
-                            Err(_) => {
-                                maintenance_hold = true;
-                                maintenance_observer
-                                    .unavailable(maintenance::Gap::InvalidCheckpoint);
-                            }
-                        }
-                    }
                     streamed.clear();
                     emitted.clear();
                     completed.clear();
@@ -2368,120 +1924,16 @@ async fn run_engine(
                     tools_completed.clear();
                     continue;
                 }
-                return Ok(EngineExit::Finished(EngineResult {
+                return Ok(EngineResult {
                     native_failure,
                     outcome,
                     answer: final_answer.map(|text| process.redact(&text)),
                     usage,
-                }));
+                });
             }
             _ => record_native_event(process, store, &record.id, method, p).await?,
         }
     }
-}
-
-/// Project only existing numeric Codex usage counters into the existing
-/// cumulative usage event, keeping arbitrary native fields out of storage.
-fn maintenance_usage(value: &Value) -> Option<Value> {
-    let total = value.pointer("/tokenUsage/total")?.as_object()?;
-    let mut safe = serde_json::Map::new();
-    for key in [
-        "inputTokens",
-        "outputTokens",
-        "cachedInputTokens",
-        "cacheWriteInputTokens",
-        "reasoningOutputTokens",
-        "totalTokens",
-    ] {
-        if let Some(number) = total.get(key).filter(|value| value.is_number()) {
-            safe.insert(key.into(), number.clone());
-        }
-    }
-    Some(token_usage_event(&Value::Object(safe)))
-}
-
-/// Admit only a same-thread usage notification or an identifiable old RPC
-/// response. Unknown envelopes, new work and foreign turns invalidate closing.
-fn maintenance_buffered_frame(
-    process: &Process,
-    thread: &str,
-    turn: &str,
-    frame: &Value,
-) -> Option<Option<Value>> {
-    let object = frame.as_object()?;
-    if object
-        .get("jsonrpc")
-        .is_some_and(|version| version != "2.0")
-    {
-        return None;
-    }
-    if frame["method"] == "thread/tokenUsage/updated"
-        && !object.contains_key("id")
-        && object
-            .keys()
-            .all(|key| matches!(key.as_str(), "jsonrpc" | "method" | "params"))
-        && frame["params"]["threadId"] == thread
-        && frame["params"]
-            .get("turnId")
-            .is_none_or(|id| id.is_null() || id == turn)
-    {
-        return maintenance_usage(&frame["params"]).map(Some);
-    }
-    if process.rpc_reply_id(frame).is_some()
-        && object
-            .keys()
-            .all(|key| matches!(key.as_str(), "jsonrpc" | "id" | "result" | "error"))
-        && object.contains_key("result") != object.contains_key("error")
-    {
-        return Some(None);
-    }
-    None
-}
-
-/// Drain a bounded set of delivered harmless frames after closing, retaining
-/// the latest cumulative usage through its ordinary durable event. Any unknown
-/// frame, persistence uncertainty or cancellation leaves the attempt held.
-async fn drain_maintenance_frames(
-    process: &mut Process,
-    store: &mut Persist,
-    id: &AgentId,
-    thread: &str,
-    turn: &str,
-    usage: &mut Option<Value>,
-) -> bool {
-    let mut dirty = usage.is_some();
-    for _ in 0..64 {
-        if process.has_buffered_events() {
-            match process.next().await {
-                agent_run_adapters::io::Event::Json(frame) => {
-                    match maintenance_buffered_frame(process, thread, turn, &frame) {
-                        Some(Some(observed)) => {
-                            *usage = Some(observed);
-                            dirty = true;
-                        }
-                        Some(None) => {}
-                        None => return false,
-                    }
-                }
-                _ => return false,
-            }
-            continue;
-        }
-        if dirty {
-            dirty = false;
-            if let Some(observed) = usage.as_ref().and_then(maintenance_usage)
-                && process
-                    .observing(store.event_durable(id, "thread/tokenUsage/updated", &observed))
-                    .await
-                    .is_err()
-            {
-                return false;
-            }
-            continue;
-        }
-        return matches!(store.cancel_pending(id), Ok(false));
-    }
-    false
 }
 
 /// Append trusted completion semantics to the effective native developer
@@ -2498,7 +1950,7 @@ fn finish_developer_instructions(config: &Value) -> Result<String> {
         _ => return Err(invalid("native developer instructions have invalid type")),
     };
     Ok(format!(
-        "{existing}\n\nAgent Run runtime completion contract: an inference turn is not the logical run. End the turn while an owned background job or message is pending; the supervisor keeps this run and native thread alive and delivers its completion as a new step. Do not poll or sleep solely to keep inference alive. Before waiting, report newly completed work to its requester through the existing pool or orchestrator tool. Name the concrete pending job or message and its responsible actor; if no such event can advance the task, report the blocker. A result observed by the supervisor does not prove it was delivered into your model context. Do not call finish(failed) merely to suspend, from empty initial job output or speculation about a lost handle. A valid execution session_id is pending work, not failure. Call the private finish tool only when the assigned work is truly done, blocked or failed, with its exact final summary. Keep every configured global and role permission, approval and secret-protection rule."
+        "{existing}\n\nAgent Run runtime completion contract: an inference turn is not the logical run. End the turn while an owned background job or message is pending; the supervisor keeps this run and native thread alive and delivers its completion as a new step. Do not poll or sleep solely to keep inference alive. Before waiting, report newly completed work to its requester through the existing pool or orchestrator tool. Name the concrete pending job or message and its responsible actor; if no such event can advance the task, report the blocker. A result observed by the supervisor does not prove it was delivered into your model context. Do not call finish(failed) merely to suspend, from empty initial job output or speculation about a lost handle. A valid execution session_id is pending work, not failure. Call the private finish tool when the assigned work is truly done, blocked or failed, with its exact final summary. If Agent Run requests a planned service restart, call finish with status done, the exact marker from the request as the first summary line, and the context needed to continue. That summary is a temporary checkpoint. Keep every configured global and role permission, approval and secret-protection rule."
     ))
 }
 
@@ -2506,18 +1958,9 @@ fn finish_developer_instructions(config: &Value) -> Result<String> {
 /// first-party callback server is connected with the exact admitted catalog.
 /// The 30-second setup allowance never limits an admitted worker's lifetime.
 /// Other selected role servers remain governed by the existing native grant.
-async fn finish_inventory_ready(
-    process: &mut Process,
-    thread: &str,
-    research: bool,
-    staged: bool,
-) -> Result<()> {
+async fn finish_inventory_ready(process: &mut Process, thread: &str, research: bool) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let catalog = if staged {
-        agent_run_domain::worker::maintenance_pause_tools_json(research)
-    } else {
-        agent_run_domain::worker::finish_tools_json(research)
-    };
+    let catalog = agent_run_domain::worker::finish_tools_json(research);
     let expected: BTreeSet<&str> = catalog.iter().filter_map(|t| t["name"].as_str()).collect();
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -3272,33 +2715,6 @@ async fn turn_steer(
 
 #[cfg(test)]
 mod tests {
-    /// Only the trusted explicit-mode launch marker selects the staged catalog.
-    #[test]
-    fn maintenance_catalog_mode_preserves_v4_and_requires_explicit_v5() {
-        assert!(!super::maintenance_catalog_mode(false, "0").unwrap());
-        assert!(!super::maintenance_catalog_mode(true, "1").unwrap());
-        assert!(super::maintenance_catalog_mode(true, "5").unwrap());
-        for (explicit, mode) in [
-            (false, "5"),
-            (false, "1"),
-            (true, "0"),
-            (true, "unexpected"),
-        ] {
-            assert!(super::maintenance_catalog_mode(explicit, mode).is_err());
-        }
-        for research in [false, true] {
-            let v4 = agent_run_domain::worker::finish_tools_json(research);
-            let v5 = agent_run_domain::worker::maintenance_pause_tools_json(research);
-            assert!(v4.iter().all(|tool| tool["name"] != "maintenance_pause"));
-            assert_eq!(
-                v5.iter()
-                    .filter(|tool| tool["name"] == "maintenance_pause")
-                    .count(),
-                1
-            );
-        }
-    }
-
     /// The shared output budget never splits UTF-8 and reports omitted data.
     #[test]
     fn command_delta_shared_budget_marks_truncation() {
