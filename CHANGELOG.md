@@ -4,6 +4,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.30.0
+
 - feat(runtime): support planned service restarts with temporary agent finishes,
   automatic continuation, and one result summary per affected orchestrator.
 - feat(quotas): support optional account-owned subscription probes for the
