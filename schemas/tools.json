@@ -1016,6 +1016,1496 @@
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Atomically admit 1–20 independent ordinary agents, or admit none. request_id is required and permanently identifies the ordered normalized request in this Run home. Identical retries return the same receipt and never start replacements; changed intent conflicts. Admission is durable before separate supervisor handoffs; it does not prove every process started or completed. Preserve every agent_id, sequence and opaque execution_ref and inspect status yourself. Automatic multi-agent hook binding is not provided; pass an explicit orchestrator per job when needed. Optional preconditions require expected_store_id and 1–20 exact pinned terminal executions with confirmed lineage cleanup; any terminal outcome may qualify. The ordered list is part of the receipt and replay identity. A PreconditionFailed applies to this attempt only and never resolves an earlier unknown outcome. The whole encoded request must fit the existing transport and writer limits.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "preconditions"
+            ]
+          },
+          "then": {
+            "properties": {
+              "expected_store_id": {
+                "pattern": "^store_[0-9a-f]{32}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "expected_store_id"
+            ]
+          }
+        }
+      ],
+      "properties": {
+        "expected_store_id": {
+          "pattern": "^store_[0-9a-f]{32}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "jobs": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "account": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "display_name": {
+                "description": "Optional human display label for the agent, shown in list views and inherited by resumes that omit it. At most 64 Unicode characters, no control or bidi formatting; null or omission means unnamed.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "effort": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "explicit_finish": {
+                "default": true,
+                "description": "New admissions default to explicit callback completion: turn completion waits for events; only private finish ends the run. False selects legacy compatibility. No lifetime timeout.",
+                "type": "boolean"
+              },
+              "fast": {
+                "type": "boolean"
+              },
+              "idle_ping": {
+                "default": "observe",
+                "description": "Frozen health policy: observe invokes no model; recover permits one model control turn per task-progress episode; off preserves explicit holds. No automatic cancellation.",
+                "enum": [
+                  "off",
+                  "observe",
+                  "recover"
+                ],
+                "type": "string"
+              },
+              "model": {
+                "type": "string"
+              },
+              "orchestrator": {
+                "anyOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "external_session_id": {
+                        "type": "string"
+                      },
+                      "external_turn_id": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "transport": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "transport",
+                      "external_session_id"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Optional external session binding. transport accepts canonical codex_queue or claude_uds and aliases codex or claude."
+              },
+              "output_schema": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "profile": {
+                "type": "string"
+              },
+              "provider": {
+                "type": "string"
+              },
+              "read_roots": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "request_id": {
+                "description": "Individual batch jobs cannot have a request_id.",
+                "type": "null"
+              },
+              "required_constraints": {
+                "items": {
+                  "enum": [
+                    "web_tools_disabled",
+                    "external_network_isolation",
+                    "loopback_tcp_isolation",
+                    "unix_ipc_isolation",
+                    "mcp_ipc_isolation",
+                    "filesystem_write_isolation",
+                    "filesystem_read_isolation",
+                    "plugin_immutability",
+                    "research_tools_only"
+                  ],
+                  "type": "string"
+                },
+                "type": "array",
+                "uniqueItems": true
+              },
+              "required_mcp": {
+                "additionalProperties": {
+                  "items": {
+                    "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+                    "type": "string"
+                  },
+                  "maxItems": 32,
+                  "type": "array",
+                  "uniqueItems": true
+                },
+                "description": "Non-grant assertion on frozen selected MCP servers and exact unprefixed tools. Empty lists require server presence. Omitted or empty map adds no condition; null and duplicates are invalid.",
+                "maxProperties": 8,
+                "propertyNames": {
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              "task": {
+                "type": "string"
+              },
+              "workdir": {
+                "type": "string"
+              },
+              "write": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "provider",
+              "model",
+              "profile",
+              "task",
+              "workdir"
+            ],
+            "type": "object"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "type": "array"
+        },
+        "preconditions": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "agent_id": {
+                "pattern": "^ag-[0-9]{8}-[0-9]{6}-[0-9a-f]{10}$",
+                "type": "string"
+              },
+              "execution_ref": {
+                "pattern": "^ex1_[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "pin_id": {
+                "pattern": "^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$",
+                "type": "string"
+              },
+              "sequence": {
+                "maximum": 4294967295,
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "agent_id",
+              "sequence",
+              "execution_ref",
+              "pin_id"
+            ],
+            "type": "object"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "type": "array"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "retain_history": {
+          "default": false,
+          "description": "Create a durable history pin for each new lineage.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "request_id",
+        "jobs"
+      ],
+      "type": "object"
+    },
+    "name": "start_batch",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "receipt": {
+          "additionalProperties": false,
+          "properties": {
+            "jobs": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "agent_id": {
+                    "type": "string"
+                  },
+                  "execution_ref": {
+                    "pattern": "^ex1_[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "index": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "pin_id": {
+                    "pattern": "^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$",
+                    "type": "string"
+                  },
+                  "sequence": {
+                    "minimum": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "index",
+                  "agent_id",
+                  "sequence",
+                  "execution_ref"
+                ],
+                "type": "object"
+              },
+              "maxItems": 20,
+              "minItems": 1,
+              "type": "array"
+            },
+            "preconditions": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "agent_id": {
+                    "pattern": "^ag-[0-9]{8}-[0-9]{6}-[0-9a-f]{10}$",
+                    "type": "string"
+                  },
+                  "execution_ref": {
+                    "pattern": "^ex1_[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "pin_id": {
+                    "pattern": "^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$",
+                    "type": "string"
+                  },
+                  "sequence": {
+                    "maximum": 4294967295,
+                    "minimum": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "agent_id",
+                  "sequence",
+                  "execution_ref",
+                  "pin_id"
+                ],
+                "type": "object"
+              },
+              "maxItems": 20,
+              "minItems": 1,
+              "type": "array"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "store_id": {
+              "pattern": "^store_[0-9a-f]{32}$",
+              "type": "string"
+            },
+            "version": {
+              "const": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "version",
+            "store_id",
+            "request_id",
+            "jobs"
+          ],
+          "type": "object"
+        },
+        "replayed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "receipt",
+        "replayed"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read the permanent receipt for an exact normalized start_batch intent, with required expected_store_id. This does not read configuration or quota, admit work, launch processes, or change pins. found:false means only that no matching receipt was committed in this read snapshot; an earlier in-flight admission may still commit. Reuse the original exact intent, including ordered preconditions, and never infer a refusal from absence or from a later precondition failure.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_store_id": {
+          "pattern": "^store_[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "jobs": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "account": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "display_name": {
+                "description": "Optional human display label for the agent, shown in list views and inherited by resumes that omit it. At most 64 Unicode characters, no control or bidi formatting; null or omission means unnamed.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "effort": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "explicit_finish": {
+                "default": true,
+                "description": "New admissions default to explicit callback completion: turn completion waits for events; only private finish ends the run. False selects legacy compatibility. No lifetime timeout.",
+                "type": "boolean"
+              },
+              "fast": {
+                "type": "boolean"
+              },
+              "idle_ping": {
+                "default": "observe",
+                "description": "Frozen health policy: observe invokes no model; recover permits one model control turn per task-progress episode; off preserves explicit holds. No automatic cancellation.",
+                "enum": [
+                  "off",
+                  "observe",
+                  "recover"
+                ],
+                "type": "string"
+              },
+              "model": {
+                "type": "string"
+              },
+              "orchestrator": {
+                "anyOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "external_session_id": {
+                        "type": "string"
+                      },
+                      "external_turn_id": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "transport": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "transport",
+                      "external_session_id"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Optional external session binding. transport accepts canonical codex_queue or claude_uds and aliases codex or claude."
+              },
+              "output_schema": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "profile": {
+                "type": "string"
+              },
+              "provider": {
+                "type": "string"
+              },
+              "read_roots": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "request_id": {
+                "description": "Individual batch jobs cannot have a request_id.",
+                "type": "null"
+              },
+              "required_constraints": {
+                "items": {
+                  "enum": [
+                    "web_tools_disabled",
+                    "external_network_isolation",
+                    "loopback_tcp_isolation",
+                    "unix_ipc_isolation",
+                    "mcp_ipc_isolation",
+                    "filesystem_write_isolation",
+                    "filesystem_read_isolation",
+                    "plugin_immutability",
+                    "research_tools_only"
+                  ],
+                  "type": "string"
+                },
+                "type": "array",
+                "uniqueItems": true
+              },
+              "required_mcp": {
+                "additionalProperties": {
+                  "items": {
+                    "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+                    "type": "string"
+                  },
+                  "maxItems": 32,
+                  "type": "array",
+                  "uniqueItems": true
+                },
+                "description": "Non-grant assertion on frozen selected MCP servers and exact unprefixed tools. Empty lists require server presence. Omitted or empty map adds no condition; null and duplicates are invalid.",
+                "maxProperties": 8,
+                "propertyNames": {
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              "task": {
+                "type": "string"
+              },
+              "workdir": {
+                "type": "string"
+              },
+              "write": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "provider",
+              "model",
+              "profile",
+              "task",
+              "workdir"
+            ],
+            "type": "object"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "type": "array"
+        },
+        "preconditions": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "agent_id": {
+                "pattern": "^ag-[0-9]{8}-[0-9]{6}-[0-9a-f]{10}$",
+                "type": "string"
+              },
+              "execution_ref": {
+                "pattern": "^ex1_[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "pin_id": {
+                "pattern": "^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$",
+                "type": "string"
+              },
+              "sequence": {
+                "maximum": 4294967295,
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "agent_id",
+              "sequence",
+              "execution_ref",
+              "pin_id"
+            ],
+            "type": "object"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "type": "array"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "retain_history": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "request_id",
+        "jobs",
+        "expected_store_id"
+      ],
+      "type": "object"
+    },
+    "name": "batch_receipt",
+    "outputSchema": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "found": {
+              "const": false
+            }
+          },
+          "required": [
+            "found"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "found": {
+              "const": true
+            },
+            "receipt": {
+              "additionalProperties": false,
+              "properties": {
+                "jobs": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "agent_id": {
+                        "type": "string"
+                      },
+                      "execution_ref": {
+                        "pattern": "^ex1_[0-9a-f]{64}$",
+                        "type": "string"
+                      },
+                      "index": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "pin_id": {
+                        "pattern": "^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$",
+                        "type": "string"
+                      },
+                      "sequence": {
+                        "minimum": 1,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "index",
+                      "agent_id",
+                      "sequence",
+                      "execution_ref"
+                    ],
+                    "type": "object"
+                  },
+                  "maxItems": 20,
+                  "minItems": 1,
+                  "type": "array"
+                },
+                "preconditions": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "agent_id": {
+                        "pattern": "^ag-[0-9]{8}-[0-9]{6}-[0-9a-f]{10}$",
+                        "type": "string"
+                      },
+                      "execution_ref": {
+                        "pattern": "^ex1_[0-9a-f]{64}$",
+                        "type": "string"
+                      },
+                      "pin_id": {
+                        "pattern": "^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$",
+                        "type": "string"
+                      },
+                      "sequence": {
+                        "maximum": 4294967295,
+                        "minimum": 1,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "agent_id",
+                      "sequence",
+                      "execution_ref",
+                      "pin_id"
+                    ],
+                    "type": "object"
+                  },
+                  "maxItems": 20,
+                  "minItems": 1,
+                  "type": "array"
+                },
+                "request_id": {
+                  "type": "string"
+                },
+                "store_id": {
+                  "pattern": "^store_[0-9a-f]{32}$",
+                  "type": "string"
+                },
+                "version": {
+                  "const": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "version",
+                "store_id",
+                "request_id",
+                "jobs"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "found",
+            "receipt"
+          ],
+          "type": "object"
+        }
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "List durable lineage history pins or idempotently release one exact pin. Active pins retain lineage database history until release. A PinNotFound, timeout or missing response does not confirm release or recreate a tombstone. Listing uses an exclusive after_pin_id; limit defaults to 100 and is at most 1000. The pin ID grants no authority.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "status"
+                ]
+              },
+              {
+                "required": [
+                  "limit"
+                ]
+              },
+              {
+                "required": [
+                  "after_pin_id"
+                ]
+              }
+            ]
+          },
+          "properties": {
+            "action": {
+              "const": "release"
+            }
+          },
+          "required": [
+            "pin_id"
+          ]
+        },
+        {
+          "not": {
+            "required": [
+              "pin_id"
+            ]
+          },
+          "properties": {
+            "action": {
+              "const": "list"
+            }
+          }
+        }
+      ],
+      "properties": {
+        "action": {
+          "enum": [
+            "list",
+            "release"
+          ],
+          "type": "string"
+        },
+        "after_pin_id": {
+          "pattern": "^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expected_store_id": {
+          "pattern": "^store_[0-9a-f]{32}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "default": 100,
+          "maximum": 1000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "pin_id": {
+          "pattern": "^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$",
+          "type": "string"
+        },
+        "status": {
+          "default": "all",
+          "enum": [
+            "active",
+            "released",
+            "all"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    },
+    "name": "history_pins",
+    "outputSchema": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "already_released": {
+              "type": "boolean"
+            },
+            "pin_id": {
+              "pattern": "^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$",
+              "type": "string"
+            },
+            "status": {
+              "const": "released"
+            }
+          },
+          "required": [
+            "pin_id",
+            "status",
+            "already_released"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "next_after_pin_id": {
+              "pattern": "^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pins": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "agent_id": {
+                    "type": "string"
+                  },
+                  "pin_id": {
+                    "pattern": "^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$",
+                    "type": "string"
+                  },
+                  "status": {
+                    "enum": [
+                      "active",
+                      "released"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "pin_id",
+                  "agent_id",
+                  "status"
+                ],
+                "type": "object"
+              },
+              "maxItems": 1000,
+              "type": "array"
+            }
+          },
+          "required": [
+            "pins",
+            "next_after_pin_id"
+          ],
+          "type": "object"
+        }
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "Read 1–20 exact execution selectors from one database snapshot. expected_store_id fences the database. A retained_latest is latest-ever only with complete coverage; success_commit is historical database evidence, not current answer-file verification. include_view is allowed for one selector and returns a redacted selected-row AgentView only for verified or unverified matches. Its process state is separately sampled and is not authorization.",
+    "inputSchema": {
+      "$defs": {
+        "selector": {
+          "additionalProperties": false,
+          "properties": {
+            "agent_id": {
+              "type": "string"
+            },
+            "execution_ref": {
+              "pattern": "^ex1_[0-9a-f]{64}$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pin_id": {
+              "pattern": "^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sequence": {
+              "maximum": 4294967295,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "agent_id",
+            "sequence"
+          ],
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "include_view": {
+                "const": true
+              }
+            },
+            "required": [
+              "include_view"
+            ]
+          },
+          "then": {
+            "properties": {
+              "targets": {
+                "maxItems": 1
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "expected_store_id": {
+          "pattern": "^store_[0-9a-f]{32}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "include_view": {
+          "default": false,
+          "type": "boolean"
+        },
+        "targets": {
+          "items": {
+            "$ref": "#/$defs/selector"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "type": "array"
+        },
+        "version": {
+          "const": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "version",
+        "targets"
+      ],
+      "type": "object"
+    },
+    "name": "status",
+    "outputSchema": {
+      "$defs": {
+        "agent": {
+          "additionalProperties": false,
+          "properties": {
+            "acceptance": {
+              "type": "string"
+            },
+            "agent_id": {
+              "type": "string"
+            },
+            "answer_available": {
+              "type": "boolean"
+            },
+            "answer_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "answer_sha256": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "cleanup": {
+              "type": "null"
+            },
+            "completion_mode": {
+              "type": "string"
+            },
+            "created_at": {
+              "type": "number"
+            },
+            "delivery": {
+              "additionalProperties": false,
+              "properties": {
+                "agent_id": {
+                  "type": "string"
+                },
+                "ambiguous": {
+                  "type": "boolean"
+                },
+                "attempts": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "bound": {
+                  "type": "boolean"
+                },
+                "last_attempt": {
+                  "type": "null"
+                },
+                "last_error": {
+                  "type": "null"
+                },
+                "notification_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "orchestrator_session_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "state": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "agent_id",
+                "bound",
+                "orchestrator_session_id",
+                "notification_id",
+                "state",
+                "attempts",
+                "ambiguous",
+                "last_error",
+                "last_attempt"
+              ],
+              "type": "object"
+            },
+            "effort": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "elapsed_seconds": {
+              "type": "number"
+            },
+            "failure_kind": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "failure_text": {
+              "type": "null"
+            },
+            "finished_at": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "idle_seconds": {
+              "type": "number"
+            },
+            "last_progress_at": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "mcp": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "allowed_tools": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": [
+                      "array",
+                      "null"
+                    ]
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name",
+                  "source",
+                  "allowed_tools"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "model": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "observed_at": {
+              "type": "number"
+            },
+            "phase": {
+              "type": "string"
+            },
+            "phase_started_at": {
+              "type": "number"
+            },
+            "policy": {
+              "type": "null"
+            },
+            "process_state": {
+              "enum": [
+                "alive",
+                "dead",
+                "reused",
+                "unknown",
+                "denied",
+                "notstarted"
+              ]
+            },
+            "profile": {
+              "type": "string"
+            },
+            "runtime": {
+              "type": "string"
+            },
+            "runtime_outcome": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sequence": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "silence_seconds": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "started_at": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "status": {
+              "enum": [
+                "created",
+                "starting",
+                "running",
+                "cancelling",
+                "succeeded",
+                "failed",
+                "timed_out",
+                "cancelled",
+                "lost"
+              ]
+            },
+            "task_summary": {
+              "type": "string"
+            },
+            "tool_counts": {
+              "type": "object"
+            },
+            "turn_count": {
+              "type": "integer"
+            },
+            "usage": {
+              "type": "object"
+            },
+            "usage_cumulative": {
+              "type": "object"
+            },
+            "workdir": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "agent_id",
+            "runtime",
+            "model",
+            "profile",
+            "task_summary",
+            "status",
+            "created_at",
+            "started_at",
+            "finished_at",
+            "elapsed_seconds",
+            "last_progress_at",
+            "silence_seconds",
+            "failure_kind",
+            "failure_text",
+            "answer_available",
+            "answer_bytes",
+            "answer_sha256",
+            "effort",
+            "delivery",
+            "sequence",
+            "cleanup",
+            "policy",
+            "phase",
+            "phase_started_at",
+            "process_state",
+            "observed_at",
+            "runtime_outcome",
+            "acceptance"
+          ],
+          "type": "object"
+        },
+        "execution": {
+          "additionalProperties": false,
+          "properties": {
+            "execution_ref": {
+              "pattern": "^ex1_[0-9a-f]{64}$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "raw_status": {
+              "enum": [
+                "created",
+                "starting",
+                "running",
+                "cancelling",
+                "succeeded",
+                "failed",
+                "timed_out",
+                "cancelled",
+                "lost"
+              ]
+            },
+            "sequence": {
+              "maximum": 4294967295,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "sequence",
+            "execution_ref",
+            "raw_status"
+          ],
+          "type": "object"
+        },
+        "item": {
+          "additionalProperties": false,
+          "properties": {
+            "canonical_agent_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "cleanup": {
+              "additionalProperties": false,
+              "properties": {
+                "scope": {
+                  "const": "lineage"
+                },
+                "state": {
+                  "enum": [
+                    "confirmed",
+                    "pending",
+                    "unknown"
+                  ]
+                }
+              },
+              "required": [
+                "scope",
+                "state"
+              ],
+              "type": "object"
+            },
+            "coverage": {
+              "enum": [
+                "complete",
+                "unknown"
+              ]
+            },
+            "lineage_terminal": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "match": {
+              "enum": [
+                "verified",
+                "unverified",
+                "missing",
+                "mismatch",
+                "unknown"
+              ]
+            },
+            "pin_id": {
+              "pattern": "^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pin_state": {
+              "enum": [
+                "active",
+                "released",
+                "missing",
+                "mismatch",
+                "unknown"
+              ]
+            },
+            "restart_resume": {
+              "enum": [
+                "none",
+                "pending",
+                "unknown"
+              ]
+            },
+            "retained_latest": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/execution"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "selected": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/execution"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "selector": {
+              "$ref": "#/$defs/selector"
+            },
+            "success_commit": {
+              "enum": [
+                "recorded",
+                "unknown",
+                "not_succeeded"
+              ]
+            },
+            "terminal_outcome": {
+              "enum": [
+                "succeeded",
+                "failed",
+                "timed_out",
+                "cancelled",
+                "lost",
+                null
+              ]
+            }
+          },
+          "required": [
+            "selector",
+            "canonical_agent_id",
+            "match",
+            "pin_id",
+            "pin_state",
+            "selected",
+            "retained_latest",
+            "coverage",
+            "restart_resume",
+            "lineage_terminal",
+            "terminal_outcome",
+            "success_commit",
+            "cleanup"
+          ],
+          "type": "object"
+        },
+        "selector": {
+          "additionalProperties": false,
+          "properties": {
+            "agent_id": {
+              "type": "string"
+            },
+            "execution_ref": {
+              "pattern": "^ex1_[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "pin_id": {
+              "pattern": "^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$",
+              "type": "string"
+            },
+            "sequence": {
+              "maximum": 4294967295,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "agent_id",
+            "sequence"
+          ],
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "items": {
+            "$ref": "#/$defs/item"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "type": "array"
+        },
+        "observed_at": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "store_id": {
+          "pattern": "^store_[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "version": {
+          "const": 1
+        },
+        "view": {
+          "additionalProperties": false,
+          "properties": {
+            "agent": {
+              "$ref": "#/$defs/agent"
+            },
+            "match": {
+              "enum": [
+                "verified",
+                "unverified"
+              ]
+            },
+            "sampled_at": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "selector_index": {
+              "const": 0
+            },
+            "status_scope": {
+              "const": "selected_execution_raw"
+            }
+          },
+          "required": [
+            "selector_index",
+            "match",
+            "status_scope",
+            "sampled_at",
+            "agent"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "version",
+        "store_id",
+        "observed_at",
+        "items"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
       "readOnlyHint": true
     },
     "description": "Operator/service-only read of one exact execution and its native communication observation. Omitted sequence pins latest once. An observed address proves identity only, never idle, membership, or delivery. No worker capability exposes this operation.",
@@ -1045,10 +2535,19 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Read compiled product version, transport limits, and authoritative read method schemas. Source revision is null without verified build provenance. Does not inspect providers, collect quota, start work or change state. Keep ping/tools fallback for older brokers.",
+    "description": "Read compiled product version, transport limits, and authoritative read method schemas. Set include_store_id to read this database's stable public identity, or include_lineage_holds to discover operator-socket hold methods. Source revision is null without verified build provenance. Does not inspect providers, collect quota, start work or change state. Keep ping/tools fallback for older brokers.",
     "inputSchema": {
       "additionalProperties": false,
-      "properties": {},
+      "properties": {
+        "include_lineage_holds": {
+          "default": false,
+          "type": "boolean"
+        },
+        "include_store_id": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
       "type": "object"
     },
     "name": "capabilities",
@@ -1076,6 +2575,38 @@
             "answer_max_bytes",
             "answer_chunk_default_bytes",
             "answer_chunk_max_bytes"
+          ],
+          "type": "object"
+        },
+        "lineage_holds": {
+          "additionalProperties": false,
+          "properties": {
+            "acquire": {
+              "const": "_lineage_hold_acquire"
+            },
+            "list": {
+              "const": "_lineage_hold_list"
+            },
+            "lookup": {
+              "const": "_lineage_hold_lookup"
+            },
+            "release": {
+              "const": "_lineage_hold_release"
+            },
+            "transport": {
+              "const": "operator_socket"
+            },
+            "version": {
+              "const": 1
+            }
+          },
+          "required": [
+            "version",
+            "transport",
+            "acquire",
+            "lookup",
+            "list",
+            "release"
           ],
           "type": "object"
         },
@@ -1116,6 +2647,10 @@
             "string",
             "null"
           ]
+        },
+        "store_id": {
+          "pattern": "^store_[0-9a-f]{32}$",
+          "type": "string"
         },
         "transports": {
           "items": {
@@ -1232,6 +2767,222 @@
         "next_offset",
         "content",
         "complete"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Export one historical exact-execution transcript fragment. Requires expected_store_id and full selector (agent_id, sequence, execution_ref, active pin_id); every page verifies complete lineage coverage in the same database snapshot as content. Start with cursor \"0\", offset 0, no upper_seq/hash; echo upper_seq and returned next_cursor/next_offset thereafter, and supply expected_sha256 when next_offset is nonzero. Cursors/watermark are canonical decimal strings up to i64 maximum. Chunks contain at most 32 KiB of UTF-8 serialized immutable message JSON; assemble and verify its exact SHA-256 before decoding. Only content_complete=true rows export; incomplete/unknown rows, released pins or missing evidence abort with no fragment. All prior pages then remain partial historical data. snapshot_complete covers only the fixed watermark, never execution completion or authority. No spool expansion or truncation.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "maxLength": 19,
+          "pattern": "^(0|[1-9][0-9]{0,18})$",
+          "type": "string"
+        },
+        "expected_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "expected_store_id": {
+          "pattern": "^store_[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "offset": {
+          "maximum": 16777215,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "selector": {
+          "additionalProperties": false,
+          "properties": {
+            "agent_id": {
+              "maxLength": 29,
+              "minLength": 29,
+              "type": "string"
+            },
+            "execution_ref": {
+              "pattern": "^ex1_[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "pin_id": {
+              "pattern": "^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$",
+              "type": "string"
+            },
+            "sequence": {
+              "maximum": 4294967295,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "agent_id",
+            "sequence",
+            "execution_ref",
+            "pin_id"
+          ],
+          "type": "object"
+        },
+        "upper_seq": {
+          "maxLength": 19,
+          "pattern": "^(0|[1-9][0-9]{0,18})$",
+          "type": "string"
+        },
+        "version": {
+          "const": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "version",
+        "expected_store_id",
+        "selector",
+        "cursor",
+        "offset"
+      ],
+      "type": "object"
+    },
+    "name": "transcript_exact",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "maxLength": 19,
+          "pattern": "^(0|[1-9][0-9]{0,18})$",
+          "type": "string"
+        },
+        "message": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "complete": {
+                  "type": "boolean"
+                },
+                "end": {
+                  "maximum": 16777216,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "seq": {
+                  "maxLength": 19,
+                  "pattern": "^(0|[1-9][0-9]{0,18})$",
+                  "type": "string"
+                },
+                "sha256": {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                "start": {
+                  "maximum": 16777215,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "text": {
+                  "maxLength": 32768,
+                  "type": "string"
+                },
+                "total_bytes": {
+                  "maximum": 16777216,
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "seq",
+                "sha256",
+                "total_bytes",
+                "start",
+                "end",
+                "text",
+                "complete"
+              ],
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "next_cursor": {
+          "maxLength": 19,
+          "pattern": "^(0|[1-9][0-9]{0,18})$",
+          "type": "string"
+        },
+        "next_offset": {
+          "maximum": 16777215,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offset": {
+          "maximum": 16777215,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "selector": {
+          "additionalProperties": false,
+          "properties": {
+            "agent_id": {
+              "maxLength": 29,
+              "minLength": 29,
+              "type": "string"
+            },
+            "execution_ref": {
+              "pattern": "^ex1_[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "pin_id": {
+              "pattern": "^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$",
+              "type": "string"
+            },
+            "sequence": {
+              "maximum": 4294967295,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "agent_id",
+            "sequence",
+            "execution_ref",
+            "pin_id"
+          ],
+          "type": "object"
+        },
+        "snapshot_complete": {
+          "type": "boolean"
+        },
+        "store_id": {
+          "pattern": "^store_[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "upper_seq": {
+          "maxLength": 19,
+          "pattern": "^(0|[1-9][0-9]{0,18})$",
+          "type": "string"
+        },
+        "version": {
+          "const": 1
+        }
+      },
+      "required": [
+        "version",
+        "store_id",
+        "selector",
+        "cursor",
+        "upper_seq",
+        "offset",
+        "message",
+        "next_cursor",
+        "next_offset",
+        "snapshot_complete"
       ],
       "type": "object"
     }

@@ -66,7 +66,6 @@ pub fn implemented(kind: OpKindRef) -> bool {
             | K::RecordSupervisorLaunch
             | K::RecordStartupOwner
             | K::BeginSupervisorHandoff
-            | K::LatchNativeExhaustion
             | K::PrepareRuntimeLayout
             | K::CommitRuntimeLayout
             | K::RemoveRuntimeLayout
@@ -78,6 +77,10 @@ pub fn implemented(kind: OpKindRef) -> bool {
             | K::CaptureIncident
             | K::AdmitStart
             | K::AdmitProvider
+            | K::AdmitBatch
+            | K::ReleaseHistoryPin
+            | K::AcquireLineageHold
+            | K::ReleaseLineageHold
             | K::AdmitProviderResume
             | K::AdmitPool
             | K::ReplacePoolMember
@@ -89,9 +92,6 @@ pub fn implemented(kind: OpKindRef) -> bool {
             | K::ExpireUnboundDeliveries
             | K::PruneIncidentLedger
             | K::PruneReceipts
-            | K::PersistCapacitySamples
-            | K::PruneCapacitySamples
-            | K::RecordQuotaSnapshot
             | K::ClaimDelivery
             | K::CompleteDelivery
             | K::PrepareBridgeDelivery
@@ -229,10 +229,6 @@ pub(crate) fn remote_checks(op: &RemoteOp) -> Checks {
                 token: op.identity.token.clone(),
                 birth: Some(op.identity.birth),
             }),
-            ..Checks::default()
-        },
-        RemoteOp::LatchNativeExhaustion(op) => Checks {
-            account: Some(op.account.as_str().to_owned()),
             ..Checks::default()
         },
         _ => Checks::default(),
@@ -406,8 +402,6 @@ pub(crate) fn run_remote(store: &mut Store, op: RemoteOp) -> Result<Value> {
         R::ClaimDelivery(op) => out(store.claim_delivery_lease(&op)?),
         R::CompleteDelivery(op) => out(store.complete_delivery_attempt(&op.completion)?),
         R::PrepareBridgeDelivery(op) => out(store.prepare_bridge_delivery(&op)?),
-        R::PruneCapacitySamples(op) => out(store.prune_capacity_samples(op.retention)?),
-
         R::CancelDelivery(op) => out(store.cancel_delivery(&op.delivery_id)?),
         R::BindPool(op) => out(store.bind_pool(&op.pool_id, &op.reference, op.at)?),
         R::BootstrapServiceProcess(op) => {
@@ -416,16 +410,6 @@ pub(crate) fn run_remote(store: &mut Store, op: RemoteOp) -> Result<Value> {
         R::ClaimServiceProcessIdentity(op) => {
             out(store.claim_service_identity(&op.generation, &op.identity)?)
         }
-        R::LatchNativeExhaustion(op) => out(store.latch_native_exhaustion(
-            &op.account,
-            &op.runtime,
-            &op.lane,
-            &op.window,
-            &op.source,
-            &op.models,
-            op.observed_at,
-            op.reset_at,
-        )?),
         R::PrepareRuntimeLayout(op) => out(layout_receipt(
             store.prepare_runtime_storage_layout(&op.layout_json, op.owner.as_ref())?,
         )),
@@ -469,10 +453,10 @@ pub(crate) fn run_remote(store: &mut Store, op: RemoteOp) -> Result<Value> {
             })
         }
         R::PersistRecoveryObservation(op) => out(super::apply::record_recovery(&store.conn, &op)?),
-        R::PersistCapacitySamples(op) => out(store.persist_capacity_samples(&op)?),
-        R::RecordQuotaSnapshot(op) => {
-            out(store.record_quota_snapshot(&op.runtime, &op.snapshot, op.retention, op.at)?)
-        }
+        R::LatchNativeExhaustion(_)
+        | R::PersistCapacitySamples(_)
+        | R::PruneCapacitySamples(_)
+        | R::RecordQuotaSnapshot(_) => Err(invalid("retired quota operation")),
     }
 }
 
@@ -583,6 +567,32 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
                 spec.harness_cap,
                 spec.pinned.as_ref(),
             )?)
+        }
+        L::AdmitBatch(op) => {
+            let jobs = op
+                .jobs
+                .iter()
+                .map(|job| crate::batch_admission::BatchMember {
+                    id: job.id.clone(),
+                    inputs: inputs(&job.inputs),
+                })
+                .collect();
+            out(store.admit_batch(crate::batch_admission::BatchAdmission {
+                request_id: &op.request_id,
+                fingerprint: &op.fingerprint,
+                retain_history: op.retain_history,
+                expected_store_id: op.expected_store_id.as_ref(),
+                preconditions: op.preconditions.as_deref(),
+                catalog: &op.catalog,
+                jobs,
+            })?)
+        }
+        L::ReleaseHistoryPin(op) => {
+            out(store.release_history_pin_scoped(&op.pin_id, op.expected_store_id.as_ref())?)
+        }
+        L::AcquireLineageHold(op) => out(store.acquire_lineage_hold(&op.acquire)?),
+        L::ReleaseLineageHold(op) => {
+            out(store.release_lineage_hold(&op.hold_id, &op.expected_store_id, op.signature())?)
         }
         L::AdmitProviderResume(op) => {
             let spec = &op.inputs;

@@ -30,9 +30,9 @@ pub mod queued;
 /// Busy wait of the sole writer connection. Any wait means an unknown writer
 /// holds the WAL write lock, which the writer reports instead of hiding.
 pub const WRITER_BUSY: Duration = Duration::from_millis(250);
-/// SQL function registered only on authorized read-write connections; the
-/// schema's mutation-fence triggers call it, so unregistered (legacy or
-/// accidental) connections cannot change application rows.
+/// Compatibility marker registered on authorized read-write connections.
+/// The current schema does not use this function to authorize SQL writes:
+/// direct access to the database remains inside the operator trust boundary.
 pub const FENCE_FUNCTION: &str = "agent_run_writer_fence";
 
 /// One nested write scope on a connection.
@@ -450,7 +450,7 @@ pub struct OnlineWriterFence {
     home: PathBuf,
 }
 
-/// Registers the mutation-fence function on an authorized connection.
+/// Registers the compatibility marker on an authorized connection.
 pub(crate) fn register_fence(conn: &Connection) -> Result<()> {
     conn.create_scalar_function(
         FENCE_FUNCTION,
@@ -593,15 +593,19 @@ impl StoreWriter<'_> {
     }
 
     /// Applies one remote envelope as one top-level transaction with its
-    /// receipt (see `ops::apply`). Rows without a store implementation yet are
-    /// refused as typed `Unsupported` before any transaction, leaving no
-    /// receipt. A degradation signal is remembered for [`Self::degraded`].
+    /// receipt (see `ops::apply`). Retired rows replay an identical receipt or
+    /// are refused without a mutation; other unimplemented rows are refused
+    /// before a transaction. A degradation signal is remembered for
+    /// [`Self::degraded`].
     pub fn apply(
         &mut self,
         authority: &WriteAuthority,
         envelope: &crate::ops::WriteEnvelope,
     ) -> SubmitResult {
         let kind = envelope.kind();
+        if kind.retired() {
+            return self.replay_retired(authority, kind, envelope.header());
+        }
         if !crate::ops::implemented(kind) {
             return SubmitResult::Rejected(crate::ops::unsupported(kind));
         }
@@ -702,6 +706,9 @@ impl StoreWriter<'_> {
         envelope: crate::ops::WriteEnvelope,
     ) -> SubmitResult {
         let kind = envelope.kind();
+        if kind.retired() {
+            return self.replay_retired(authority, kind, envelope.header());
+        }
         if !crate::ops::implemented(kind) {
             return SubmitResult::Rejected(crate::ops::unsupported(kind));
         }
@@ -727,6 +734,24 @@ impl StoreWriter<'_> {
             checks,
             |store| crate::ops::dispatch::run_remote(store, op),
         )
+    }
+
+    /// Resolves old receipts without executing a retired quota operation.
+    fn replay_retired(
+        &self,
+        authority: &WriteAuthority,
+        kind: crate::ops::OpKindRef,
+        header: &crate::ops::EnvelopeHeader,
+    ) -> SubmitResult {
+        match crate::ops::apply::replay_retired(&self.store.conn, authority, kind, header) {
+            Ok(Some(result)) => result,
+            Ok(None) => SubmitResult::Rejected(crate::ops::unsupported(kind)),
+            Err(_) => SubmitResult::Rejected(agent_run_domain::storage::StorageRejection::new(
+                agent_run_domain::storage::RejectCode::StorageUnavailable,
+                agent_run_domain::storage::RejectStage::Gate,
+                "retired operation receipt lookup failed",
+            )),
+        }
     }
 
     /// Stored outcome of `id` regardless of authority (trusted writer-thread

@@ -119,15 +119,17 @@ the same exact optional `provider`, `model`, and `profile` filters, with typed
 agent-run delegation-guide --provider codex --model gpt-main --profile review
 ```
 
-Omitted filters retain the default guide. One committed snapshot renders a
-compact operating header, providers in capacity order with harness/guidance,
-and each exact selectable model: cached quota status/evidence, sample age and
-reset horizon derived from `ranked_at`, admissible canonical profiles
+Omitted filters retain the default guide. One Quota response and one local
+read snapshot render a compact operating header, providers in capacity order
+with harness/guidance, and each exact selectable model: quota status/evidence,
+sample age and reset horizon derived from Run's `ranked_at`, admissible canonical profiles
 (`profiles: none` means no role may use it), nonempty default/allowed params,
 restrictions and configured guidance. Schema 1 is `Unsupported`; an empty
 catalog is explicit. Text omits skills, MCP arrays, hashes, accounts,
 credentials and endpoints, normalizes recommendation whitespace/control
-characters, and adds no model-ability ranking or facts beyond its snapshot.
+characters, and adds no model-ability ranking or facts beyond its inputs.
+Quota standings are evaluated at Quota's separate `evaluated_at`; the two
+services do not share an atomic snapshot.
 
 Before delegating a task, the orchestrator must call this tool and read its
 output before choosing provider, model, effort or profile. Keep task-suitability

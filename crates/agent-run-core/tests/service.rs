@@ -713,8 +713,8 @@ fn python_test_service_commands_are_typed_and_terminal_cancel_is_refused() {
 }
 
 /// Mirrors `tests/test_service.py::AgentServiceTests::test_binding_models_and_current_limits_share_the_service`.
-#[test]
-fn python_test_service_binding_and_limits_share_durable_state() {
+#[tokio::test]
+async fn python_test_service_binding_and_limits_share_durable_state() {
     let home = common::Home::new();
     let id = admit(&home, home.request(), json!({}));
     let reference = OrchestratorRef {
@@ -725,8 +725,8 @@ fn python_test_service_binding_and_limits_share_durable_state() {
     home.store()
         .bind_orchestrator(&id, &reference, 1.0)
         .unwrap();
-    let limits = Service::new(home.path.clone()).limits().unwrap();
-    assert!(limits["items"].is_array());
+    let error = Service::new(home.path.clone()).limits().await.unwrap_err();
+    assert_eq!(error.machine_code().as_str(), "Unsupported");
 }
 
 /// Mirrors `tests/test_service.py::AgentServiceTests::test_delivery_view_exposes_only_the_latest_typed_attempt_evidence`.

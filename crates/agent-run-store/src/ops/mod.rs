@@ -226,6 +226,10 @@ inventory! {
     101 FailServiceRestartResume "fail_service_restart_resume" L C n;
     102 RefreshServiceRestart "refresh_service_restart" L C n;
     105 ClaimServiceRestart "claim_service_restart" L C n;
+    106 AdmitBatch "admit_batch" L N n;
+    107 ReleaseHistoryPin "release_history_pin" L N n;
+    108 AcquireLineageHold "acquire_lineage_hold" L N n;
+    109 ReleaseLineageHold "release_lineage_hold" L N n;
 }
 
 /// Seals one payload and binds it to its inventory row and typed output.
@@ -252,6 +256,10 @@ op! {
     ClaimServiceRestart => bool;
     AdmitStart => AdmitStartOutput;
     AdmitProvider => crate::provider_admission::ProviderAdmission;
+    AdmitBatch => agent_run_domain::batch::StartBatchResult;
+    ReleaseHistoryPin => Option<agent_run_domain::batch::HistoryPinRelease>;
+    AcquireLineageHold => crate::lineage_holds::LineageHoldAcquireResult;
+    ReleaseLineageHold => Option<crate::lineage_holds::LineageHoldRelease>;
     AdmitProviderResume => crate::provider_admission::ProviderAdmission;
     AdmitPool => crate::pool_admission::PoolAdmission;
     ReplacePoolMember => PoolOutcome<crate::pool_replace::PoolReplacement>;
@@ -449,6 +457,10 @@ op_enum! {
         ClaimServiceRestart,
         AdmitStart,
         AdmitProvider,
+        AdmitBatch,
+        ReleaseHistoryPin,
+        AcquireLineageHold,
+        ReleaseLineageHold,
         AdmitProviderResume,
         AdmitPool,
         ReplacePoolMember,
@@ -494,11 +506,24 @@ op_enum! {
 }
 
 impl OpKindRef {
+    /// Retired wire operations retain their ids and payloads for receipt replay only.
+    pub fn retired(self) -> bool {
+        matches!(
+            self,
+            Self::LatchNativeExhaustion
+                | Self::PersistCapacitySamples
+                | Self::PruneCapacitySamples
+                | Self::RecordQuotaSnapshot
+        )
+    }
+
     /// Decoded op bound D in compact UTF-8 JSON bytes (contract section 5a).
     pub fn decoded_max(self) -> usize {
         const KIB: usize = 1024;
         const MIB: usize = 1024 * KIB;
         match self {
+            Self::AcquireLineageHold => 16 * KIB,
+            Self::ReleaseLineageHold => KIB,
             Self::RememberProcesses
             | Self::AppendJournal
             | Self::ObservedCommandResult
@@ -516,6 +541,7 @@ impl OpKindRef {
             | Self::RegisterAccount => 256 * KIB,
             Self::AdmitStart
             | Self::AdmitProvider
+            | Self::AdmitBatch
             | Self::AdmitProviderResume
             | Self::AdmitPool
             | Self::ReplacePoolMember => 16 * MIB,

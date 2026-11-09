@@ -156,7 +156,7 @@ async fn python_hook_context_injects_once_then_returns_an_empty_object() {
         first["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .expect("context")
-            .starts_with("Runtime priorities (highest first).")
+            .contains("migrate configuration to schema_version 2")
     );
     assert_eq!(second, json!({}));
 }

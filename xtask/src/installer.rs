@@ -6,11 +6,52 @@ use rusqlite::{Connection, OpenFlags};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
     time::Duration,
 };
+
+/// Exact sealed compatibility payload, not a marker accepted from a candidate.
+const TUI_COMPAT: &[u8] = include_bytes!("../../assets/tui-compat.sh");
+
+/// Identifies the exact executable compatibility payload without following a final symlink.
+fn tui_compat(release: &Path) -> Result<Option<bool>, String> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(release.join("bin/agent-run-tui"))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if !file
+        .metadata()
+        .map_err(|error| error.to_string())?
+        .is_file()
+    {
+        return Err("TUI must be a regular file".into());
+    }
+    let mut bytes = Vec::new();
+    (&file)
+        .take((TUI_COMPAT.len() + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let compat = bytes == TUI_COMPAT;
+    if compat
+        && file
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .permissions()
+            .mode()
+            & 0o100
+            == 0
+    {
+        return Err("TUI compatibility shim must be executable".into());
+    }
+    Ok(Some(compat))
+}
 
 /// Parses the deliberately small, non-forcing standalone installer interface.
 pub fn command(arguments: &[String]) -> Result<(), String> {
@@ -116,7 +157,8 @@ fn copy_release(source: &Path, destination: &Path) -> Result<(), String> {
 /// The caller downloads into a disposable directory. This copies it into the
 /// permanent prefix before using the journalled deployer. Broker and SQLite
 /// writer locks stay held through backup, pointer switch and launcher placement.
-/// All bundled launchers are ownership-checked and prepared before cutover.
+/// Bundled launchers are ownership-checked before cutover, except that the exact
+/// compatibility shim leaves the existing TUI launcher untouched.
 /// Legacy releases without a TUI remain supported. Every release involved (the
 /// candidate, its staged copy and an existing same-version destination) must pass
 /// the closed regular-file inventory check of [`release::verify`], so an unlisted
@@ -139,6 +181,7 @@ pub fn install(
         return Err("version must be X.Y.Z".into());
     }
     release::verify(candidate)?;
+    let compat = tui_compat(candidate)?;
     let metadata: serde_json::Value = serde_json::from_slice(
         &fs::read(candidate.join("metadata.json")).map_err(|e| e.to_string())?,
     )
@@ -166,7 +209,7 @@ pub fn install(
     for name in ["agent-run", "agent-run-tui"] {
         // Legacy releases have no observer; leave unrelated commands untouched. A verified
         // release lists every file, so existence here means the observer is sealed.
-        if name == "agent-run-tui" && !candidate.join("bin/agent-run-tui").is_file() {
+        if name == "agent-run-tui" && compat != Some(false) {
             continue;
         }
         let launcher = bin.join(name);
@@ -217,6 +260,9 @@ pub fn install(
             return Err("release destination must not be a symlink".into());
         }
         release::verify(&destination)?;
+        if tui_compat(&destination)? != compat {
+            return Err("release TUI changed during installation".into());
+        }
         if fs::read(destination.join("SHA256SUMS")).map_err(|e| e.to_string())?
             != fs::read(candidate.join("SHA256SUMS")).map_err(|e| e.to_string())?
         {
@@ -280,6 +326,9 @@ pub fn install(
                 .map_err(|e| e.to_string())?;
             copy_release(candidate, staging.path())?;
             release::verify(staging.path())?;
+            if tui_compat(staging.path())? != compat {
+                return Err("release TUI changed during installation".into());
+            }
             fs::rename(staging.path(), &destination).map_err(|e| e.to_string())?;
         }
         deploy::deploy(&prefix, &home, &destination, false)?;

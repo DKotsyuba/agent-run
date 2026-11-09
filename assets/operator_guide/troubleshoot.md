@@ -46,14 +46,13 @@ detail — don't parse `failure_text` to decide behavior.
 
 ## limits: honest-unknown, not always-fresh
 
-Quota collection runs independently of model runs. `agent-run limits` reads
-the latest stored sample per quota identity without calling providers. It
-reports `known`, `remaining_percent`, `reset_at`, `observed_at`, and
-`valid_until`, plus account/pool identity for account-bound samples. Freshness
-depends on those timestamps, not a fixed interval after the last model run;
-unusable samples have no displayed remaining percentage. It does not expose
-burn-rate, forecast, or pacing fields. Unknown means no usable known standing,
-not proof that a sample's validity timestamp expired.
+Agent Quota collects independently of model runs. `agent-run limits` reads its
+latest snapshot without calling providers and reports available windows plus a
+completeness marker. Unreported or unusable quota is unknown, not zero; Run
+can still attempt a launch and receive a provider refusal. Window timestamps
+describe the observation, while the Quota evaluation time describes when its
+standing was calculated. `agent-quota limits` exposes the service's quota
+details, and `agent-quota doctor` checks service availability.
 
 ## Optional prompt context
 
@@ -64,8 +63,9 @@ context is still injected. Repeated context is possible on that recovery path;
 normal successful writes retain changed-only injection. Independently readable
 components survive another component's failure. Unavailable data is not invented.
 
-SQL preparation has a 250 ms cooperative deadline; the whole context operation
-has a 750 ms budget, including at most 500 ms for its writer acknowledgement.
+The Quota read and SQL preparation share a 250 ms cooperative deadline; the
+whole context operation has a 750 ms budget, including at most 500 ms for its
+writer acknowledgement.
 `hook_context_unavailable` in the bounded CLI log records closed failure facts,
 not prompt/configuration text. An empty successful hook response alone is not
 proof that context works: verify a first injection and a deduplicated second one.

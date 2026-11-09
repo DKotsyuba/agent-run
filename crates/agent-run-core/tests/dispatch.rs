@@ -135,13 +135,41 @@ async fn list_pools_service_and_dispatch_share_strict_read_projection() {
     }
 }
 
-/// Mirrors `tests/test_dispatch.py::test_restored_operator_tools_dispatch`
+/// Legacy models remain callable; quota reads demand schema 2 and never
+/// fabricate a complete empty result when Quota is unavailable.
 #[tokio::test]
 async fn restored_operator_tools_dispatch() {
     let home = common::Home::new();
-    let service = Service::new(home.path);
-    dispatch::call(&service, "models", json!({})).await.unwrap();
-    dispatch::call(&service, "limits", json!({})).await.unwrap();
+    let service = Service::new(home.path.clone());
+    let legacy = dispatch::call(&service, "models", json!({})).await.unwrap();
+    assert!(legacy.get("mock").is_some());
+    for method in ["limits", "capacity_order"] {
+        let error = dispatch::call(&service, method, json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, agent_run_domain::Error::Unsupported(_)),
+            "{method}: {error}"
+        );
+        assert!(error.to_string().contains("schema_version 2"));
+    }
+
+    std::fs::write(home.path.join("config.toml"), "schema_version=2\n").unwrap();
+    let models = dispatch::call(&service, "models", json!({})).await.unwrap();
+    assert_eq!(models["schema_version"], 2);
+    assert_eq!(models["providers"], json!([]));
+    assert_eq!(models["quota_coverage"]["state"], "unknown");
+    assert_eq!(models["quota_coverage"]["incomplete"], true);
+    let limits = dispatch::call(&service, "limits", json!({})).await.unwrap();
+    assert_eq!(limits["items"], json!([]));
+    assert_eq!(limits["coverage"]["state"], "unknown");
+    assert_eq!(limits["coverage"]["incomplete"], true);
+    let order = dispatch::call(&service, "capacity_order", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(order["providers"], json!([]));
+    assert_eq!(order["quota_coverage"]["state"], "unknown");
+    assert_eq!(order["quota_coverage"]["incomplete"], true);
 }
 
 /// Mirrors `tests/test_dispatch.py::test_cancel_returns_the_current_agent_view`.

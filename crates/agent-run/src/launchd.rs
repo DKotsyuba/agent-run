@@ -25,7 +25,7 @@ fn absolute(path: PathBuf, field: &str) -> Result<PathBuf> {
 
 /// Renders one Python-compatible LaunchAgent descriptor without registering it.
 ///
-/// `kind` is one of `api`, `capacity`, or `delivery`; `interval` is used only
+/// `kind` is `api` or `delivery`; `interval` is used only
 /// by one-shot workers. The function never calls `launchctl`, so callers may
 /// safely render a plist in a disposable directory. Linux is explicitly
 /// unsupported because systemd is a separate product surface.
@@ -51,14 +51,11 @@ pub fn render(
     let stderr_log = absolute(stderr_log, "stderr_log")?;
     let args: &[&str] = match kind {
         "api" => &["api", "serve"],
-        "capacity" => &["capacity", "collect", "--once"],
         "delivery" => &["delivery", "dispatch"],
         _ => return Err(invalid("unknown launchd job")),
     };
     let mut argv = vec![binary.display().to_string()];
-    if kind != "capacity" {
-        argv.extend(["--home".into(), home.display().to_string()]);
-    }
+    argv.extend(["--home".into(), home.display().to_string()]);
     argv.extend(args.iter().map(|value| (*value).into()));
     let program_arguments = argv
         .iter()

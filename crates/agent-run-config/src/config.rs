@@ -131,6 +131,9 @@ pub struct Capacity {
     pub sample_retention: usize,
     /// Maximum host-injected context characters; zero disables context injection.
     pub context_max_chars: usize,
+    /// Optional independent Quota service; absent keeps capacity unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<QuotaEndpoint>,
     /// Retired `codexbar_binary` spelling, kept only so historical schema-1
     /// files still parse for the one-time v1→v2 migration. Nothing invokes
     /// it; when present it must be absolute, schema 2 rejects it, and the
@@ -144,9 +147,21 @@ impl Default for Capacity {
             collect_interval_seconds: 300,
             sample_retention: 1000,
             context_max_chars: 2500,
+            quota: None,
             legacy_codexbar_binary: None,
         }
     }
+}
+
+/// Read-only local Quota endpoint; OS permissions still authorize the caller.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuotaEndpoint {
+    /// Unix socket serving versioned Quota snapshots.
+    pub socket: PathBuf,
+    /// Expected service UID; absent means the current effective UID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_service_uid: Option<u32>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]

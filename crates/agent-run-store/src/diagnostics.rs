@@ -11,13 +11,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::Path};
 
-/// A doctor-safe point-in-time view of active agents and newest capacity samples per identity.
+/// A doctor-safe point-in-time view of active agents.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiagnosticSnapshot {
     /// Active agent rows ordered by newest admission, with no parsed secret-bearing fields.
     pub agents: Vec<Value>,
-    /// Newest sample for each `(runtime, lane, window, target, source)` identity.
-    pub capacity: Vec<Value>,
 }
 
 /// Converts a SQLite row into the unmodified Python `dict(row)` wire representation.
@@ -54,9 +52,9 @@ fn resolved(path: &Path) -> Result<std::path::PathBuf> {
 ///
 /// The connection is an ordinary WAL-aware read-only `query_only` handle (never
 /// `immutable=1`, which would skip locking and change detection on a live
-/// database) and both queries run in one short read transaction, so the
-/// snapshot is consistent and includes committed rows still in the WAL. The
-/// file is never created, migrated or written.
+/// database) and the query runs in a short read transaction, so the snapshot
+/// includes committed rows still in the WAL. The file is never created,
+/// migrated or written.
 pub fn diagnostic_snapshot(
     path: &Path,
     observed_at: f64,
@@ -93,12 +91,9 @@ pub fn diagnostic_snapshot(
     let agents = agents_stmt
         .query_map([limit as i64], row_object)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut capacity_stmt = snapshot.prepare("SELECT id,runtime,lane,window,target,source,observed_at,valid_until FROM (SELECT *,ROW_NUMBER() OVER (PARTITION BY runtime,lane,window,target,source ORDER BY observed_at DESC,id DESC) AS position FROM capacity_samples) WHERE position=1 ORDER BY observed_at DESC,id DESC LIMIT ?")?;
-    let capacity = capacity_stmt.query_map([limit as i64], |row| Ok(json!({ "id": row.get::<_, i64>(0)?, "runtime": row.get::<_, String>(1)?, "lane": row.get::<_, String>(2)?, "window": row.get::<_, String>(3)?, "target": row.get::<_, Option<String>>(4)?, "source": row.get::<_, String>(5)?, "observed_at": row.get::<_, Option<f64>>(6)?, "valid_until": row.get::<_, Option<f64>>(7)? })))?.collect::<rusqlite::Result<Vec<_>>>()?;
     drop(agents_stmt);
-    drop(capacity_stmt);
     snapshot.finish()?;
-    Ok(DiagnosticSnapshot { agents, capacity })
+    Ok(DiagnosticSnapshot { agents })
 }
 
 /// Reads only configured account identities from the current WAL-aware store

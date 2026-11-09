@@ -3,68 +3,40 @@
 mod common;
 
 use agent_run_core::{
-    capacity::{self, Key, Pool, Route, Sample, Slice, Topology},
     domain::{AgentId, OrchestratorRef, Outcome, Status, now},
     hooks::{bind, context},
 };
-use serde_json::json;
-use std::collections::BTreeSet;
+use agent_run_domain::catalog::{AccountRecord, AccountStatus};
+use serde_json::{Value, json};
+use std::{path::Path, time::Duration};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::UnixListener,
+};
 
-/// Persist deterministic fresh routes for context-rendering tests.
+/// Configure synthetic providers with registered accounts but no Quota service.
 async fn routes(home: &common::Home, entries: &[(&str, f64)]) {
-    for (index, (runtime, remaining)) in entries.iter().enumerate() {
-        let mut config = std::fs::read_to_string(home.path.join("config.toml")).expect("config");
-        let section = format!("[runtimes.{}]", toml::Value::String((*runtime).into()));
-        if !config.contains(&section) {
-            config.push_str(&format!(
-                "\n{section}\nenabled=true\nadapter='claude'\nbinary='/usr/bin/true'\nhome='{}'\nmodels=['fixture']\nlimits_source='none'\n",
-                home.path.join("runtime").display()
-            ));
-            std::fs::write(home.path.join("config.toml"), config).expect("route config");
+    let root = home.path.display();
+    let mut config = format!(
+        "schema_version=2\n[harnesses.codex]\nbinary='/usr/bin/true'\nhome='{root}/codex'\n[harnesses.claude-code]\nbinary='/usr/bin/true'\nhome='{root}/claude'\n"
+    );
+    let mut store = home.store();
+    for (provider, multiplier) in entries {
+        let account = format!("acct-{provider}");
+        let id = account.parse().unwrap();
+        if store.account(&id).unwrap().is_none() {
+            store
+                .register_account(&AccountRecord {
+                    account_id: id,
+                    auth_family: "openai".parse().unwrap(),
+                    secret_ref: format!("named:codex:{account}").parse().unwrap(),
+                    status: AccountStatus::Enabled,
+                })
+                .unwrap();
         }
-        let observed_at = agent_run_core::domain::now();
-        let key = Key {
-            runtime: (*runtime).into(),
-            lane: "standard".into(),
-            window: "window".into(),
-            target: None,
-            source: "fixture".into(),
-        };
-        let pool_id = format!("pool-{runtime}-{index}");
-        capacity::persist(
-            &home.path,
-            &Slice {
-                runtime: (*runtime).into(),
-                scope_id: "fixture".into(),
-                samples: vec![Sample {
-                    key: key.clone(),
-                    remaining_percent: Some(*remaining),
-                    reset_at: None,
-                    observed_at: Some(observed_at),
-                    valid_until: Some(observed_at + 100_000.0),
-                }],
-                topology: Topology {
-                    pools: vec![Pool {
-                        pool_id: pool_id.clone(),
-                        keys: BTreeSet::from([key]),
-                    }],
-                    routes: vec![Route {
-                        route_id: format!("route-{index}"),
-                        runtime: (*runtime).into(),
-                        account: None,
-                        quota_lane: "standard".into(),
-                        pool_ids: vec![pool_id],
-                        reset_credits: None,
-                    }],
-                },
-                observed_at,
-                valid_until: observed_at + 100_000.0,
-            },
-            1_000,
-        )
-        .await
-        .expect("fresh context route");
+        config.push_str(&format!("[providers.{provider}]\nharness='codex'\nconnection={{kind='native'}}\nauth_family='openai'\nlimits_source='none'\npriority_multiplier={multiplier:.1}\n[[providers.{provider}.models]]\nid='fixture'\n[[providers.{provider}.bindings]]\nlabel='private-{provider}'\naccount='{account}'\n"));
     }
+    std::fs::write(home.path.join("config.toml"), config).expect("provider config");
 }
 
 /// Change the persisted context budget for a test home.
@@ -90,6 +62,58 @@ fn budget(home: &common::Home, chars: usize) {
         format!("{config}\n[capacity]\n{line}\n")
     };
     std::fs::write(home.path.join("config.toml"), config).expect("budget config");
+}
+
+/// Connects a synthetic schema-2 home to a test-owned Quota socket.
+fn quota_endpoint(home: &common::Home, socket: &Path) {
+    let path = home.path.join("config.toml");
+    let config = std::fs::read_to_string(&path).unwrap();
+    let endpoint = format!(
+        "schema_version=2\n[capacity.quota]\nsocket={}\n",
+        toml::Value::String(socket.to_string_lossy().into_owned())
+    );
+    std::fs::write(path, config.replacen("schema_version=2\n", &endpoint, 1)).unwrap();
+}
+
+/// Creates a private short socket path for the local fake service.
+fn quota_listener() -> (tempfile::TempDir, UnixListener) {
+    let base = std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = tempfile::Builder::new()
+        .prefix("hook-q-")
+        .tempdir_in(base)
+        .unwrap();
+    let listener = UnixListener::bind(dir.path().join("quota.sock")).unwrap();
+    (dir, listener)
+}
+
+/// Moves every fixture timestamp by the same amount without changing quota facts.
+fn shift_quota_times(value: &mut Value, offset: f64) {
+    match value {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                if matches!(
+                    key.as_str(),
+                    "at" | "evaluated_at"
+                        | "observed_at"
+                        | "newest_observed_at"
+                        | "valid_until"
+                        | "reset_at"
+                        | "last_reset_at"
+                        | "exhausted_until"
+                ) {
+                    if let Some(time) = value.as_f64() {
+                        *value = json!(time + offset);
+                    }
+                } else {
+                    shift_quota_times(value, offset);
+                }
+            }
+        }
+        Value::Array(values) => values.iter_mut().for_each(|v| shift_quota_times(v, offset)),
+        _ => {}
+    }
 }
 
 /// Admit one active agent bound to the supplied orchestrator reference.
@@ -270,7 +294,7 @@ async fn python_context_hook_is_bounded_changed_only_and_session_scoped() {
     assert!(
         first
             .text
-            .starts_with("Runtime priorities (highest first).")
+            .contains("migrate configuration to schema_version 2")
     );
     assert!(first.text.chars().count() <= context::CONTEXT_HARD_LIMIT_CHARS);
     assert!(!second.injected);
@@ -333,8 +357,10 @@ async fn python_context_active_appearance_keeps_priority_allocation_fixed() {
         second_priority["components"]["priority"]
     );
     assert!(first.injected);
+    assert!(first.text.contains("\"fixture\":unknown"));
+    assert!(!first.text.contains("acct-alpha"));
     assert!(second.injected);
-    assert!(!second.text.contains("Runtime priorities"));
+    assert!(!second.text.contains("Provider capacity order"));
 }
 
 /// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_malformed_component_payloads_are_legacy_not_crashes`.
@@ -398,9 +424,9 @@ async fn python_context_malformed_component_receipts_are_replaced_safely() {
     );
 }
 
-/// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_changed_only_priority_resends_after_returning_to_an_order`.
+/// Priority changes are delivered again when the provider configuration returns to its prior state.
 #[tokio::test]
-async fn python_context_priority_order_changes_are_a_b_a_and_then_silent() {
+async fn context_provider_changes_are_a_b_a_and_then_silent() {
     let home = common::Home::new();
     let writer = common::writer::Harness::start(&home.path);
     let _socket = writer.serve_unix(&home.path);
@@ -409,17 +435,17 @@ async fn python_context_priority_order_changes_are_a_b_a_and_then_silent() {
         external_session_id: "session-1".into(),
         external_turn_id: None,
     };
-    routes(&home, &[("alpha", 90.0), ("beta", 50.0)]).await;
+    routes(&home, &[("alpha", 90.0)]).await;
     let first = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
         .await
         .expect("first context");
     assert!(first.injected, "first={:?}", first);
-    routes(&home, &[("beta", 90.0), ("alpha", 50.0)]).await;
+    routes(&home, &[("beta", 90.0)]).await;
     let second = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
         .await
         .expect("second context");
     assert!(second.injected && second.text.contains("beta"));
-    routes(&home, &[("alpha", 90.0), ("beta", 50.0)]).await;
+    routes(&home, &[("alpha", 90.0)]).await;
     let third = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
         .await
         .expect("third context");
@@ -465,7 +491,7 @@ async fn python_context_active_only_change_omits_priority_block() {
     .expect("tight active context");
     assert!(third.injected);
     assert!(third.text.contains("Active agents"));
-    assert!(!third.text.contains("Runtime priorities"));
+    assert!(!third.text.contains("Provider capacity order"));
 }
 
 /// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_zero_budget_writes_no_receipt_and_restored_budget_delivers`.
@@ -500,7 +526,7 @@ async fn python_context_zero_budget_writes_no_receipt_then_restores_delivery() {
         .await
         .expect("restored context");
     assert!(restored.injected);
-    assert!(restored.text.contains("Runtime priorities"));
+    assert!(restored.text.contains("Provider capacity order"));
 }
 
 /// Mirrors `tests/test_priority_context_regressions.py::ContextRegressionTests::test_tight_budget_clips_priority_and_growth_delivers_the_full_summary`.
@@ -515,19 +541,19 @@ async fn python_context_tight_budget_hides_then_reveals_priority_lines() {
         external_turn_id: None,
     };
     routes(&home, &[("alpha", 90.0), ("beta", 50.0), ("gamma", 10.0)]).await;
-    budget(&home, 1_000);
+    budget(&home, 940);
     let clipped = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
         .await
         .expect("clipped context");
     assert!(clipped.injected);
     assert!(clipped.text.contains("More routes omitted"));
     assert!(clipped.text.contains("alpha"));
-    assert!(!clipped.text.contains("beta"));
+    assert!(!clipped.text.contains("gamma"));
     budget(&home, 2500);
     let grown = context::build(&home.path, &reference, Some(agent_run_core::domain::now()))
         .await
         .expect("grown context");
-    assert!(grown.injected && grown.text.contains("beta"));
+    assert!(grown.injected && grown.text.contains("gamma"));
     assert!(!grown.text.contains("More routes omitted"));
 }
 
@@ -1077,17 +1103,143 @@ async fn start_pool_receipt_binds_the_whole_pool_atomically() {
     .is_err());
 }
 
+/// A slow or missing Quota response stays unknown and cannot consume the active block.
+#[tokio::test]
+async fn quota_hook_timeout_preserves_active_and_zero_budget_makes_no_request() {
+    let home = common::Home::new();
+    let reference = reference();
+    routes(&home, &[("codex", 1.0)]).await;
+    active_agent(&home, &reference);
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
+    let (dir, listener) = quota_listener();
+    quota_endpoint(&home, &dir.path().join("quota.sock"));
+    budget(&home, 0);
+    let disabled = context::build_for_hook(&home.path, &reference, None)
+        .await
+        .unwrap();
+    assert!(!disabled.injected);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), listener.accept())
+            .await
+            .is_err()
+    );
+    budget(&home, 2500);
+    let (release, released) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        stream.read_to_end(&mut request).await.unwrap();
+        released.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+        request
+    });
+    let started = std::time::Instant::now();
+    let result = context::build_for_hook(&home.path, &reference, None)
+        .await
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(result.text.contains("Active agents (1)"));
+    assert!(
+        result.text.contains("\"fixture\":unknown"),
+        "{}",
+        result.text
+    );
+    assert!(
+        result
+            .text
+            .contains("quota cannot be determined from available data")
+    );
+    assert!(!result.text.contains("acct-codex"));
+    assert!(!result.text.contains("private-codex"));
+    release.send(()).unwrap();
+    let request = tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&request).unwrap()["method"],
+        "snapshot"
+    );
+}
+
+/// The actual socket snapshot supplies standings and respects explicit and live clocks.
+#[tokio::test]
+async fn quota_hook_uses_validated_snapshot_and_clock_after_fetch() {
+    let home = common::Home::new();
+    routes(&home, &[("codex", 1.0)]).await;
+    let writer = common::writer::Harness::start(&home.path);
+    let _socket = writer.serve_unix(&home.path);
+    let (dir, listener) = quota_listener();
+    quota_endpoint(&home, &dir.path().join("quota.sock"));
+    let server = tokio::spawn(async move {
+        for live in [false, false, true] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).await.unwrap();
+            let mut frame: Value = serde_json::from_str(
+                &include_str!("fixtures/quota-client-v1/snapshot-v2.json")
+                    .replace("acct-test", "acct-codex")
+                    .replace("model-a", "fixture"),
+            )
+            .unwrap();
+            if live {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                shift_quota_times(&mut frame, now() - 10000.0);
+            }
+            let mut bytes = serde_json::to_vec(&frame).unwrap();
+            bytes.push(b'\n');
+            stream.write_all(&bytes).await.unwrap();
+        }
+    });
+    let reference = reference();
+    let before = context::build(&home.path, &reference, Some(9999.0))
+        .await
+        .unwrap();
+    assert!(
+        before.text.contains("\"fixture\":unknown"),
+        "{}",
+        before.text
+    );
+    let current = context::build(&home.path, &reference, Some(10002.0))
+        .await
+        .unwrap();
+    assert!(
+        current.text.contains("\"fixture\":available"),
+        "{}",
+        current.text
+    );
+    assert!(!current.text.contains("acct-codex"));
+    let live_reference = OrchestratorRef {
+        external_session_id: "live-clock".into(),
+        ..reference
+    };
+    let live = context::build(&home.path, &live_reference, None)
+        .await
+        .unwrap();
+    assert!(live.text.contains("\"fixture\":available"), "{}", live.text);
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 /// A failed independent SQL component cannot discard the available component;
 /// strict operator context still reports the storage failure rather than success.
 #[tokio::test]
 async fn advisory_context_preserves_independently_available_components() {
-    for broken_table in ["capacity_samples", "messages"] {
+    for broken_table in ["binding_cooldowns", "messages"] {
         let home = common::Home::new();
         let reference = OrchestratorRef {
             transport: "claude_uds".into(),
             external_session_id: "partial-context".into(),
             external_turn_id: None,
         };
+        routes(&home, &[("alpha", 1.0)]).await;
         active_agent(&home, &reference);
         home.store()
             .conn
@@ -1099,11 +1251,11 @@ async fn advisory_context_preserves_independently_available_components() {
             .await
             .unwrap();
         assert!(result.injected);
-        if broken_table == "capacity_samples" {
+        if broken_table == "binding_cooldowns" {
             assert!(result.text.contains("Active agents (1)"));
-            assert!(!result.text.contains("Runtime priorities"));
+            assert!(!result.text.contains("Provider capacity order"));
         } else {
-            assert!(result.text.contains("Runtime priorities"));
+            assert!(result.text.contains("Provider capacity order"));
             assert!(!result.text.contains("Active agents"));
         }
         assert!(context::build(&home.path, &reference, None).await.is_err());
@@ -1120,16 +1272,16 @@ async fn advisory_context_bounds_sql_work_and_keeps_the_prepared_active_block() 
         external_session_id: "slow-context".into(),
         external_turn_id: None,
     };
+    routes(&home, &[("alpha", 1.0)]).await;
     active_agent(&home, &reference);
     home.store()
         .conn
         .execute_batch(
-            "DROP TABLE capacity_samples;
-        CREATE VIEW capacity_samples AS WITH RECURSIVE n(x) AS
+            "DROP TABLE binding_cooldowns;
+        CREATE VIEW binding_cooldowns AS WITH RECURSIVE n(x) AS
         (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000000)
-        SELECT x AS id,'mock' AS runtime,'standard' AS lane,'window' AS window,
-        NULL AS target,'fixture' AS source,50 AS remaining_percent,
-        x AS observed_at,NULL AS reset_at,NULL AS valid_until FROM n;",
+        SELECT 'alpha' AS provider_id,'acct-alpha' AS account_id,
+        'billing_unavailable' AS reason,2000000000+x AS blocked_until FROM n;",
         )
         .unwrap();
     let writer = common::writer::Harness::start(&home.path);
@@ -1140,7 +1292,7 @@ async fn advisory_context_bounds_sql_work_and_keeps_the_prepared_active_block() 
         .unwrap();
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
     assert!(result.text.contains("Active agents (1)"));
-    assert!(!result.text.contains("Runtime priorities"));
+    assert!(!result.text.contains("Provider capacity order"));
     assert_eq!(
         home.store()
             .conn

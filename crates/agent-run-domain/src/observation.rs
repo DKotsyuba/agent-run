@@ -9,6 +9,20 @@ pub const DEFAULT_CHUNK_BYTES: usize = 64 * 1024;
 pub const MAX_CHUNK_BYTES: usize = 128 * 1024;
 /// Complete newline-terminated socket frame ceiling shared with discovery.
 pub const SOCKET_MAX_FRAME_BYTES: usize = 1024 * 1024;
+/// Maximum serialized correlation ID accepted by the bounded public transports.
+pub const MAX_RPC_ID_BYTES: usize = 1024;
+
+/// Optional opt-in to reading the current database identity.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilitiesQuery {
+    /// False keeps discovery independent of the database.
+    #[serde(default)]
+    pub include_store_id: bool,
+    /// Opt in to discovery of operator-only lineage-hold socket methods.
+    #[serde(default)]
+    pub include_lineage_holds: bool,
+}
 
 /// Strict current-execution selection and byte cursor; never accepts a path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +113,9 @@ pub struct CapabilitiesView {
     pub schema_version: u32,
     /// Product name, agent-run.
     pub product: String,
+    /// Current database identity only when explicitly requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_id: Option<crate::StoreId>,
     /// Compiled Cargo package version, independent of protocol versions.
     pub version: String,
     /// Verified build source identity, null when no build input supplies it.

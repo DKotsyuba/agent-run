@@ -1,12 +1,8 @@
 //! Ported capacity-order CLI behaviors with a complete injectable service fake.
 
-#[path = "support/test_broker.rs"]
-mod test_broker;
-
 use agent_run::{
-    capacity::{self, Key, Pool, Route, Sample, Slice, Topology},
     cli::{Cli, CliBroker, CliDependencies, CliFuture, CliService},
-    domain::{AgentId, now},
+    domain::AgentId,
     error::invalid,
     service::Query,
 };
@@ -14,7 +10,6 @@ use clap::Parser;
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
-    process::Command,
     sync::{Arc, Mutex},
 };
 
@@ -73,22 +68,21 @@ impl CliService for CapacityServiceFake {
     }
 
     /// Returns an empty limit projection for commands outside this fixture's scope.
-    fn limits(&self) -> agent_run::Result<Value> {
-        Ok(json!({}))
+    fn limits(&self) -> CliFuture<'_> {
+        Box::pin(async { Ok(json!({})) })
     }
 
     /// Returns the fixed order payload and records one service-shaped call.
-    fn capacity_order(
-        &self,
-        _query: agent_run_domain::CapacityOrderQuery,
-    ) -> agent_run::Result<Value> {
-        *self.calls.lock().expect("call counter lock") += 1;
-        Ok(self.payload.clone())
+    fn capacity_order(&self, _query: agent_run_domain::CapacityOrderQuery) -> CliFuture<'_> {
+        Box::pin(async move {
+            *self.calls.lock().expect("call counter lock") += 1;
+            Ok(self.payload.clone())
+        })
     }
 
     /// Returns empty guide text for commands outside this fixture's scope.
-    fn delegation_guide(&self, _query: agent_run_domain::ModelsQuery) -> agent_run::Result<Value> {
-        Ok(Value::String(String::new()))
+    fn delegation_guide(&self, _query: agent_run_domain::ModelsQuery) -> CliFuture<'_> {
+        Box::pin(async { Ok(Value::String(String::new())) })
     }
 
     /// Returns an empty delivery status for commands outside this fixture's scope.
@@ -143,45 +137,6 @@ fn fake_dependencies(
     }
 }
 
-/// Builds one valid route snapshot with a current observation.
-fn quota_slice(runtime: &str, remaining: f64, observed: f64) -> Slice {
-    let key = Key {
-        runtime: runtime.into(),
-        lane: format!("{runtime}-lane"),
-        window: "window".into(),
-        target: None,
-        source: "source".into(),
-    };
-    let pool = Pool {
-        pool_id: format!("{runtime}-pool"),
-        keys: [key.clone()].into_iter().collect(),
-    };
-    Slice {
-        runtime: runtime.into(),
-        scope_id: "scope".into(),
-        samples: vec![Sample {
-            key,
-            remaining_percent: Some(remaining),
-            reset_at: Some(observed + 20_000.0),
-            observed_at: Some(observed),
-            valid_until: Some(observed + 10_000.0),
-        }],
-        topology: Topology {
-            pools: vec![pool.clone()],
-            routes: vec![Route {
-                route_id: format!("{runtime}-route"),
-                runtime: runtime.into(),
-                account: None,
-                quota_lane: format!("{runtime}-lane"),
-                pool_ids: vec![pool.pool_id],
-                reset_credits: None,
-            }],
-        },
-        observed_at: observed,
-        valid_until: observed + 10_000.0,
-    }
-}
-
 /// Writes a capacity-order configuration with enabled and disabled runtimes.
 fn order_config(home: &Path) {
     let mut text = String::from("schema_version=1\n");
@@ -199,24 +154,6 @@ fn order_config(home: &Path) {
     }
     std::fs::write(home.join("config.toml"), text).expect("order config writes");
     agent_run_store::fixture::initialize(home).expect("order store initializes");
-}
-
-/// Persists one current sample for the named runtime.
-async fn persist_sample(home: &Path, runtime: &str, remaining: f64, observed: f64) {
-    let _broker = test_broker::broker_for(home).await;
-    capacity::persist(home, &quota_slice(runtime, remaining, observed), 1000)
-        .await
-        .expect("quota sample persists");
-}
-
-/// Returns the runtime names in a JSON route array.
-fn route_runtimes(value: &Value) -> Vec<String> {
-    value["routes"]
-        .as_array()
-        .expect("order routes array")
-        .iter()
-        .map(|route| route["runtime"].as_str().expect("route runtime").into())
-        .collect()
 }
 
 /// Mirrors `tests/test_capacity_cli.py::CapacityOrderCliTests::test_order_emits_the_service_shape_once`
@@ -257,38 +194,11 @@ async fn test_order_rejects_unexpected_arguments() {
     assert!(Cli::try_parse_from(["agent-run", "capacity", "order", "--model", "m"]).is_ok());
 }
 
-/// Mirrors `tests/test_capacity_cli.py::CapacityOrderCliTests::test_real_state_reorders_and_explains_nonworking_runtimes`
-#[tokio::test]
-async fn test_real_state_reorders_and_explains_nonworking_runtimes() {
-    let scratch = tempfile::tempdir().expect("capacity home");
-    order_config(scratch.path());
-    let at = now();
-    for (runtime, remaining) in [("alpha", 80.0), ("beta", 60.0), ("empty", 0.0)] {
-        persist_sample(scratch.path(), runtime, remaining, at).await;
-    }
-
-    let service = agent_run_core::service::Service::new(scratch.path().into());
-    let first = service
-        .capacity_order(Default::default())
-        .expect("first order");
-    assert_eq!(route_runtimes(&first), vec!["alpha", "beta"]);
-    assert_eq!(first["omitted"][0]["runtime"], "empty");
-    assert_eq!(first["unavailable_runtimes"], json!(["missing"]));
-
-    persist_sample(scratch.path(), "alpha", 20.0, now()).await;
-    persist_sample(scratch.path(), "beta", 90.0, now()).await;
-    let second = service
-        .capacity_order(Default::default())
-        .expect("second order");
-    assert_eq!(route_runtimes(&second), vec!["beta", "alpha"]);
-}
-
 /// Mirrors `tests/test_capacity_cli.py::CapacityOrderCliTests::test_default_facade_serves_capacity_order_without_injection`
 #[tokio::test]
 async fn test_default_facade_serves_capacity_order_without_injection() {
     let scratch = tempfile::tempdir().expect("capacity home");
     order_config(scratch.path());
-    persist_sample(scratch.path(), "alpha", 80.0, now()).await;
 
     let mut dependencies = CliDependencies::production(PathBuf::from(scratch.path()));
     let output = Arc::new(Mutex::new(Vec::new()));
@@ -298,7 +208,7 @@ async fn test_default_facade_serves_capacity_order_without_injection() {
         Ok(())
     });
 
-    let code = agent_run::cli::run_with(
+    let error = agent_run::cli::run_with(
         parse(&[
             "--home",
             scratch.path().to_str().expect("home path"),
@@ -308,54 +218,8 @@ async fn test_default_facade_serves_capacity_order_without_injection() {
         dependencies,
     )
     .await
-    .expect("default capacity facade runs");
-
-    assert_eq!(code, 0);
-    assert_eq!(output.lock().expect("output lock").len(), 1);
-    assert_eq!(
-        route_runtimes(&output.lock().expect("output lock")[0]),
-        vec!["alpha"]
-    );
-}
-
-/// Mirrors `tests/test_capacity_outcomes.py::CapacityOutcomeRegressionTests::test_capacity_collect_cli_preserves_status_counts_and_degraded_exit`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn collect_once_prints_the_report_and_returns_degraded_exit_status() {
-    let scratch = tempfile::tempdir().expect("capacity home");
-    let auth = scratch.path().join("auth.json");
-    std::fs::write(&auth, "{}").expect("fixture auth source");
-    let missing_home = scratch.path().join("missing-runtime-home");
-    std::fs::write(
-        scratch.path().join("config.toml"),
-        format!(
-            "schema_version=1\n[runtimes.codex]\nenabled=true\nadapter=\"codex\"\nbinary=\"/bin/true\"\nhome=\"{}\"\nmodels=[\"fixture\"]\nlimits_source=\"codex_appserver\"\n[runtimes.codex.auth]\nkind=\"file_link\"\nsource=\"{}\"\ntarget=\"auth.json\"\n",
-            missing_home.display(),
-            auth.display()
-        ),
-    )
-    .expect("collect config writes");
-    agent_run_store::fixture::initialize(scratch.path()).expect("capacity store initializes");
-
-    // The blocking CLI child needs the actual fixture writer socket served concurrently.
-    let _broker = test_broker::broker_for(scratch.path()).await;
-
-    let output = Command::new(env!("CARGO_BIN_EXE_agent-run"))
-        .args([
-            "--home",
-            scratch.path().to_str().expect("home path"),
-            "capacity",
-            "collect",
-            "--once",
-        ])
-        .output()
-        .expect("collect CLI starts");
-    assert_eq!(output.status.code(), Some(2));
-    let report: Value = serde_json::from_slice(&output.stdout).expect("printed report");
-    assert_eq!(report["ok"], false);
-    assert_eq!(report["results"][0]["status"], "failed");
-    assert!(
-        output.stderr.is_empty(),
-        "unexpected stderr: {:?}",
-        output.stderr
-    );
+    .expect_err("legacy capacity order requires migration");
+    assert_eq!(error.machine_code().as_str(), "Unsupported");
+    assert!(error.to_string().contains("schema_version 2"));
+    assert!(output.lock().expect("output lock").is_empty());
 }

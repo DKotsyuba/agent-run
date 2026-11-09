@@ -3,9 +3,10 @@
 ## Existing schema-2 homes
 
 When upgrading a schema-2 home to database schema 27, prepare a complete replacement
-configuration using external quota commands as described in
-[quota collectors](quota-collectors.md). Run the **new candidate binary** while
-the old broker and other agent-run writers are stopped:
+configuration. Current quota collection is configured separately in Agent Quota;
+old Run quota history is retained but is not imported into Quota. Run the
+**new candidate binary** while the old broker and other
+agent-run writers are stopped:
 
 For schema 27, an already valid schema-2 configuration can be supplied unchanged.
 The numbered migration creates the incident ledger without changing provider

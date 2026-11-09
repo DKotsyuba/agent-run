@@ -468,11 +468,49 @@ async fn python_partial_frame_hits_idle_deadline() {
     drop(home);
 }
 
-/// Mirrors `tests/test_api_socket.py::ApiSocketTests::test_slow_capacity_order_lane_does_not_delay_durable_cancel`.
+/// A held Quota read must not block a durable cancel on the separate lane.
+/// The legacy schema-1 order explicitly advises migration before this test
+/// switches only its own synthetic config to schema 2.
 #[tokio::test]
 async fn python_capacity_order_and_durable_cancel_use_independent_paths() {
     let (home, path, task) = broker().await;
     let id = admitted(&home);
+    let legacy = request(
+        &path,
+        json!({"jsonrpc":"2.0","id":0,"method":"capacity_order","params":{}}),
+    )
+    .await;
+    assert_eq!(legacy["error"]["data"]["code"], "Unsupported");
+    assert!(
+        legacy["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("schema_version 2")
+    );
+
+    let quota_path = home.path().join("quota.sock");
+    let listener = tokio::net::UnixListener::bind(&quota_path).unwrap();
+    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let quota_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await.unwrap();
+        let request: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(request["method"], "snapshot");
+        assert_eq!(request["accounts"], json!([]));
+        let _ = seen_tx.send(());
+        let _ = release_rx.await;
+        // EOF models an unavailable Quota source after the proven held read.
+    });
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "schema_version=2\n[capacity.quota]\nsocket={}\n",
+            toml::Value::String(quota_path.to_string_lossy().into_owned()),
+        ),
+    )
+    .unwrap();
     let order = tokio::spawn({
         let path = path.clone();
         async move {
@@ -483,6 +521,10 @@ async fn python_capacity_order_and_durable_cancel_use_independent_paths() {
             .await
         }
     });
+    tokio::time::timeout(Duration::from_secs(3), seen_rx)
+        .await
+        .unwrap()
+        .unwrap();
     let started = tokio::time::Instant::now();
     let response = request(
         &path,
@@ -493,7 +535,15 @@ async fn python_capacity_order_and_durable_cancel_use_independent_paths() {
     .await;
     assert!(response.get("result").is_some(), "response={response}");
     assert!(started.elapsed() < Duration::from_secs(1));
-    assert!(order.await.unwrap().get("result").is_some());
+    assert!(
+        !order.is_finished(),
+        "order must still be waiting for Quota"
+    );
+    release_tx.send(()).unwrap();
+    let order = order.await.unwrap();
+    assert_eq!(order["result"]["quota_coverage"]["state"], "unknown");
+    assert_eq!(order["result"]["quota_coverage"]["incomplete"], true);
+    quota_task.await.unwrap();
     stop(task).await;
     drop(home);
 }
@@ -583,7 +633,7 @@ fn python_socket_surface_is_shared_tools_plus_controls() {
         .map(|tool| tool.name.clone())
         .collect();
     assert_eq!(names, registry, "the socket surface is the shared table");
-    assert_eq!(names.len(), 18);
+    assert_eq!(names.len(), 23);
     assert!(!names.contains("models"));
     assert!(!names.contains("capacity_order"));
 }

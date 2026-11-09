@@ -80,7 +80,7 @@ fn write_asset(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// Creates a sealed legacy release from an already-built native binary.
 ///
-/// The resulting `releases/<version>` contains the binary, external collectors, metadata,
+/// The resulting `releases/<version>` contains the binary, service assets, metadata,
 /// SHA256SUMS and COMPLETE marker. Existing complete releases are verified and
 /// reused; incomplete candidates are rejected to retain forensic evidence.
 /// This shape bundles no `agent-run-tui` observer; deploy fixtures and the
@@ -167,7 +167,7 @@ fn build_inner(
             );
         }
     }
-    for directory in ["collectors", "services", "systemd"] {
+    for directory in ["services", "systemd"] {
         let scripts = scripts_root.join(directory);
         for relative in files(&scripts).map_err(|_| "source asset inventory unavailable")? {
             expected.insert(
@@ -218,7 +218,7 @@ fn build_inner(
         copy_asset(tui, &release.join("bin/agent-run-tui")).map_err(|error| error.to_string())?;
     }
     // External integration scripts remain ordinary files, never embedded executable logic.
-    for directory in ["collectors", "services", "systemd"] {
+    for directory in ["services", "systemd"] {
         let scripts = scripts_root.join(directory);
         create_directories(&release.join(directory)).map_err(|error| error.to_string())?;
         for relative in files(&scripts).map_err(|error| error.to_string())? {
@@ -286,8 +286,9 @@ mod tests {
         fs::write(&binary, "native binary").expect("fixture binary");
         let release = build(temporary.path(), "0.12.0", &binary).expect("sealed release");
         verify(&release).expect("valid manifest");
-        assert!(release.join("collectors/codex.sh").is_file());
-        assert!(release.join("collectors/glm.jq").is_file());
+        assert!(!release.join("collectors").exists());
+        assert!(!release.join("systemd/agent-run-quota-collect.sh").exists());
+        assert!(!release.join("systemd/agent-run-quota-probe.sh").exists());
         assert!(release.join("services/codegraph-probe.cjs").is_file());
         assert_eq!(
             super::schema_version(&release).expect("metadata schema"),
@@ -319,6 +320,9 @@ mod tests {
                 )
                 .unwrap();
             } else {
+                if let Some(parent) = release.join(changed).parent() {
+                    fs::create_dir_all(parent).unwrap();
+                }
                 fs::write(release.join(changed), b"older fixture asset").unwrap();
             }
             let sums = super::files(&release)

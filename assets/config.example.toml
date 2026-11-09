@@ -29,9 +29,4 @@ sample_retention = 1000
 # models = ["sonnet", "opus"]
 # limits_source = "none"
 #
-# Native Claude quota collection requires an explicitly exported OAuth token:
-# [runtimes.claude.auth]
-# kind = "environment"
-# names = ["CLAUDE_CODE_OAUTH_TOKEN"]
-# Then set limits_source = "native" in runtimes.claude.
-# ANTHROPIC_API_KEY is not an OAuth token.
+# Configure quota collection separately in Agent Quota.

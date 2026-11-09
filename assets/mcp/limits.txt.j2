@@ -1,9 +1,15 @@
-agent-run limits — latest stored capacity samples
+agent-run limits — quota capacity samples
+
+{% if coverage_note %}
+{{ coverage_note }}
+{% endif %}
 
 {% for item in items %}
 - {{ item.runtime }}/{{ item.lane }}/{{ item.window }}: {% if item.known %}{{ item.remaining_percent }}% remaining{% if item.resets_in is not none %}, resets in {{ item.resets_in }}{% endif %}{% else %}no current sample (stale or expired){% endif %}{{ "" }}
 {% else %}
+{% if not coverage_incomplete %}
 no stored capacity samples
+{% endif %}
 {% endfor %}
 {% if ranking %}
 Provider/model standing — capacity revision {{ ranking.capacity_revision }} (quota standing, not model ability)

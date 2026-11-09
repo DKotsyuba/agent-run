@@ -60,8 +60,8 @@ account = "acct-glm"
     .unwrap();
 }
 
-/// A disposable v2 home with two roles, two accounts, and one fresh sample
-/// making `glm-5.3` available while codex stays unobserved.
+/// A disposable v2 home with two roles, two accounts, and a historical local
+/// sample that public Quota-backed reads must not treat as current evidence.
 fn home() -> tempfile::TempDir {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
@@ -118,6 +118,158 @@ fn footprint(root: &Path) -> Vec<i64> {
     })
     .chain([store.quota_capacity_revision().unwrap()])
     .collect()
+}
+
+const QUOTA_AT: f64 = 10001.0;
+const QUOTA_KNOWN: &str = include_str!("fixtures/quota-client-v1/snapshot-v2.json");
+const QUOTA_UNKNOWN: &str = include_str!("fixtures/quota-client-v1/unknown-snapshot-v2.json");
+const QUOTA_EXHAUSTED: &str = include_str!("fixtures/quota-client-v1/exhausted-snapshot-v2.json");
+
+/// Builds an account from the checked-in v2 service fixture with explicit source scores.
+fn quota_account(id: &str, provider: &str, offerings: &[(&str, &str, f64)]) -> Value {
+    let fixture: Value = serde_json::from_str(&QUOTA_KNOWN.replace("acct-test", id)).unwrap();
+    let mut account = fixture["result"]["accounts"][0].clone();
+    let model = account["models"][0].clone();
+    let window = account["windows"][0].clone();
+    let mut models = Vec::new();
+    let mut windows = Vec::new();
+    for &(name, native, score) in offerings {
+        let pool = format!("{id}::{name}");
+        let mut m = model.clone();
+        m["provider"] = json!(provider);
+        m["model"] = json!(name);
+        m["native_model"] = json!(native);
+        m["quota_score"] = json!(score);
+        m["limiting_window"]["pool"] = json!(pool);
+        m["pools"] = json!([pool]);
+        m["state_validity"]["at"] = json!(QUOTA_AT + 600.0);
+        m["newest_observed_at"] = json!(QUOTA_AT - 10.0);
+        m["reset_at"] = json!(QUOTA_AT + 7200.0);
+        models.push(m);
+        let mut w = window.clone();
+        w["runtime"] = json!(provider);
+        w["lane"] = json!(name);
+        w["pool"] = json!(pool);
+        w["models"] = json!([native]);
+        w["observed_at"] = json!(QUOTA_AT - 10.0);
+        w["valid_until"] = json!(QUOTA_AT + 600.0);
+        w["last_reset_at"] = json!(QUOTA_AT + 7200.0);
+        w["forecast"]["observed_at"] = json!(QUOTA_AT - 10.0);
+        w["forecast"]["reset_at"] = json!(QUOTA_AT + 7200.0);
+        w["evaluation"]["reset_at"] = json!(QUOTA_AT + 7200.0);
+        windows.push(w);
+    }
+    account["models"] = json!(models);
+    account["windows"] = json!(windows);
+    account
+}
+
+/// Source facts are synthetic and independent of the old Run quota tables.
+fn quota_snapshot(stale_and_exhausted: bool) -> agent_run_core::quota_client::Snapshot {
+    let mut source: Value = serde_json::from_str(QUOTA_UNKNOWN).unwrap();
+    let mut codex = source["result"]["accounts"][0].clone();
+    codex["account"] = json!("acct-codex");
+    let mut main = codex["models"][0].clone();
+    main["model"] = json!("gpt-main");
+    main["native_model"] = json!("gpt-native");
+    let mut review = main.clone();
+    review["model"] = json!("gpt-review");
+    review["native_model"] = json!("gpt-review");
+    codex["models"] = json!([main, review]);
+    let glm = quota_account("acct-glm", "glm", &[("glm-5.3", "glm-5.3", 1.2)]);
+    let mut a = quota_account(
+        "acct-a",
+        "a",
+        &[("a-locked", "a-locked", 1.8), ("a-open", "a-open", 0.2)],
+    );
+    let mut b = quota_account("acct-b", "b", &[("b-open", "b-open", 1.2)]);
+    if stale_and_exhausted {
+        let exhausted: Value = serde_json::from_str(QUOTA_EXHAUSTED).unwrap();
+        let mut model = exhausted["result"]["accounts"][0]["models"][0].clone();
+        model["provider"] = json!("a");
+        model["model"] = json!("a-locked");
+        model["native_model"] = json!("a-locked");
+        model["limiting_window"]["pool"] = json!("acct-a::a-locked");
+        model["pools"] = json!(["acct-a::a-locked"]);
+        model["state_validity"]["at"] = json!(QUOTA_AT + 7200.0);
+        model["reset_at"] = json!(QUOTA_AT + 7200.0);
+        model["exhausted_until"] = json!(QUOTA_AT + 7200.0);
+        model["newest_observed_at"] = json!(QUOTA_AT - 10.0);
+        a["models"][0] = model;
+        b["models"][0]["state_validity"]["at"] = json!(QUOTA_AT);
+    }
+    source["result"]["evaluated_at"] = json!(QUOTA_AT);
+    source["result"]["accounts"] = json!([codex, glm, a, b]);
+    serde_json::from_value(source["result"].clone()).unwrap()
+}
+
+fn synthetic_models(
+    root: &Path,
+    query: &ModelsQuery,
+    source: &agent_run_core::quota_client::Snapshot,
+) -> Value {
+    let (config, revision) = agent_run_config::provider_config::ProviderConfig::load(root).unwrap();
+    let store = agent_run_store::fixture::open(root).unwrap();
+    agent_run_core::capacity::quota_projection::models_at(
+        &store,
+        root,
+        &config,
+        &revision,
+        query,
+        Some(source),
+        QUOTA_AT,
+    )
+    .unwrap()
+}
+
+fn synthetic_order(
+    root: &Path,
+    query: &CapacityOrderQuery,
+    source: &agent_run_core::quota_client::Snapshot,
+) -> Value {
+    let (config, revision) = agent_run_config::provider_config::ProviderConfig::load(root).unwrap();
+    let store = agent_run_store::fixture::open(root).unwrap();
+    agent_run_core::capacity::quota_projection::order_at(
+        &store,
+        &config,
+        &revision,
+        query,
+        Some(source),
+        QUOTA_AT,
+    )
+    .unwrap()
+}
+
+fn synthetic_limits(
+    root: &Path,
+    source: &agent_run_core::quota_client::Snapshot,
+    at: f64,
+) -> Value {
+    let (config, revision) = agent_run_config::provider_config::ProviderConfig::load(root).unwrap();
+    let store = agent_run_store::fixture::open(root).unwrap();
+    agent_run_core::capacity::quota_projection::limits_at(
+        &store,
+        &config,
+        &revision,
+        Some(source),
+        at,
+    )
+    .unwrap()
+}
+
+fn synthetic_guide(root: &Path, source: &agent_run_core::quota_client::Snapshot) -> Value {
+    let (config, revision) = agent_run_config::provider_config::ProviderConfig::load(root).unwrap();
+    let store = agent_run_store::fixture::open(root).unwrap();
+    agent_run_core::capacity::quota_projection::delegation_guide_at(
+        &store,
+        root,
+        &config,
+        &revision,
+        &ModelsQuery::default(),
+        Some(source),
+        QUOTA_AT,
+    )
+    .unwrap()
 }
 
 /// Records routed handoffs without starting a model or claiming a successful run.
@@ -342,11 +494,12 @@ async fn catalog_is_revisioned_ordered_and_account_free() {
     assert_eq!(catalog["capacity_revision"], before[4]);
     let providers = catalog["providers"].as_array().unwrap();
     assert_eq!(
-        providers[0]["provider"], "glm",
-        "known capacity ranks first"
+        providers[0]["provider"], "codex",
+        "unavailable Quota leaves both providers unknown"
     );
-    assert_eq!(providers[0]["models"][0]["quota"]["status"], "available");
-    let codex = &providers[1];
+    assert_eq!(providers[1]["models"][0]["quota"]["status"], "unknown");
+    assert_eq!(catalog["quota_coverage"]["incomplete"], true);
+    let codex = &providers[0];
     assert_eq!(codex["recommendations"], json!(["native subscription"]));
     assert_eq!(codex["connection"], json!({"kind": "native"}));
     let main = &codex["models"][0];
@@ -378,6 +531,7 @@ async fn catalog_is_revisioned_ordered_and_account_free() {
     }
     let order = service
         .capacity_order(CapacityOrderQuery::default())
+        .await
         .unwrap();
     assert_eq!(order["capacity_revision"], before[4]);
     assert!(!order.to_string().contains("acct-"));
@@ -450,6 +604,7 @@ async fn filters_are_exact_and_typed() {
         .capacity_order(CapacityOrderQuery {
             model: Some("glm-5.3".into()),
         })
+        .await
         .unwrap();
     assert_eq!(order["providers"].as_array().unwrap().len(), 1);
     assert_eq!(order["providers"][0]["provider"], "glm");
@@ -500,8 +655,7 @@ async fn recommendation_edits_are_reflected_by_revision() {
     assert!(service.models(ModelsQuery::default()).await.is_err());
 }
 
-/// Schema-1 homes keep their historical reads; new filters are unsupported
-/// there rather than silently ignored.
+/// Schema-1 order and limits explicitly require migration to schema 2.
 #[tokio::test]
 async fn schema_one_filters_are_unsupported() {
     let temp = tempfile::tempdir().unwrap();
@@ -520,12 +674,18 @@ async fn schema_one_filters_are_unsupported() {
         .capacity_order(CapacityOrderQuery {
             model: Some("x".into()),
         })
+        .await
         .unwrap_err();
     assert_eq!(error.machine_code().as_str(), "Unsupported");
-    let value: Value = service
+    let error = service
         .capacity_order(CapacityOrderQuery::default())
-        .unwrap();
-    assert!(value.get("routes").is_some());
+        .await
+        .unwrap_err();
+    assert_eq!(error.machine_code().as_str(), "Unsupported");
+    assert!(error.to_string().contains("schema_version 2"));
+    let error = service.limits().await.unwrap_err();
+    assert_eq!(error.machine_code().as_str(), "Unsupported");
+    assert!(error.to_string().contains("schema_version 2"));
 }
 
 /// Inserts one account-bound sample on `lane` with explicit freshness.
@@ -643,16 +803,18 @@ fn standing(catalog: &Value) -> Vec<(String, f64, Vec<String>)> {
 #[tokio::test]
 async fn profile_filter_ranks_only_retained_offerings() {
     let temp = ranking_home();
-    let service = Service::new(temp.path().to_path_buf());
-    let all = standing(&service.models(ModelsQuery::default()).await.unwrap());
+    let root = temp.path();
+    let source = quota_snapshot(false);
+    let all = standing(&synthetic_models(root, &ModelsQuery::default(), &source));
     assert_eq!(all[0].0, "a", "a-locked has the most capacity: {all:?}");
-    let research = service
-        .models(ModelsQuery {
+    let research = synthetic_models(
+        root,
+        &ModelsQuery {
             profile: Some("research".into()),
             ..Default::default()
-        })
-        .await
-        .unwrap();
+        },
+        &source,
+    );
     let filtered = standing(&research);
     assert_eq!(filtered[0].0, "b", "{filtered:?}");
     assert_eq!(filtered[1].0, "a");
@@ -672,29 +834,10 @@ async fn profile_filter_ranks_only_retained_offerings() {
 async fn quota_standing_reports_freshness_and_exhaustion() {
     let temp = ranking_home();
     let root = temp.path();
-    // b-open's only sample expires; a-locked gets an active exhaustion latch.
-    agent_run_store::fixture::open(root)
-        .unwrap()
-        .conn
-        .execute(
-            "UPDATE capacity_samples SET valid_until=observed_at+1 WHERE lane='b-open'",
-            [],
-        )
-        .unwrap();
-    let reset = agent_run_core::domain::now() + 7200.0;
-    agent_run_store::fixture::open(root)
-        .unwrap()
-        .conn
-        .execute(
-            "INSERT INTO quota_exhaustion(account_id,quota_key,source,window_id,observed_at,reset_at) \
-             VALUES('acct-a','acct-a::a-locked','collector','5h',?1,?2)",
-            rusqlite::params![reset - 7300.0, reset],
-        )
-        .unwrap();
+    let source = quota_snapshot(true);
+    let reset = QUOTA_AT + 7200.0;
     let service = Service::new(root.to_path_buf());
-    let order = service
-        .capacity_order(CapacityOrderQuery::default())
-        .unwrap();
+    let order = synthetic_order(root, &CapacityOrderQuery::default(), &source);
     let quota = |provider: &str, model: &str| {
         order["providers"]
             .as_array()
@@ -723,10 +866,11 @@ async fn quota_standing_reports_freshness_and_exhaustion() {
     let codexless = catalog.to_string();
     assert!(!codexless.contains("acct-"));
     let missing = home();
-    let missing_catalog = Service::new(missing.path().to_path_buf())
-        .models(ModelsQuery::default())
-        .await
-        .unwrap();
+    let missing_catalog = synthetic_models(
+        missing.path(),
+        &ModelsQuery::default(),
+        &quota_snapshot(false),
+    );
     assert_eq!(
         missing_catalog["providers"][1]["models"][0]["quota"]["evidence"],
         "missing"
@@ -741,8 +885,7 @@ async fn quota_standing_reports_freshness_and_exhaustion() {
 async fn delegation_guide_renders_guidance_order_and_privacy() {
     let temp = home();
     let root = temp.path();
-    let service = Service::new(root.to_path_buf());
-    let guide = service.delegation_guide().unwrap();
+    let guide = synthetic_guide(root, &quota_snapshot(false));
     let text = guide.as_str().expect("guide is a string result");
     let glm = text.find("provider glm").expect("glm listed");
     let codex = text.find("provider codex").expect("codex listed");
@@ -788,27 +931,7 @@ async fn delegation_guide_renders_guidance_order_and_privacy() {
 async fn delegation_guide_reports_stale_and_exhausted_standings() {
     let temp = ranking_home();
     let root = temp.path();
-    agent_run_store::fixture::open(root)
-        .unwrap()
-        .conn
-        .execute(
-            "UPDATE capacity_samples SET valid_until=observed_at+1 WHERE lane='b-open'",
-            [],
-        )
-        .unwrap();
-    let reset = agent_run_core::domain::now() + 7200.0;
-    agent_run_store::fixture::open(root)
-        .unwrap()
-        .conn
-        .execute(
-            "INSERT INTO quota_exhaustion(account_id,quota_key,source,window_id,observed_at,reset_at) \
-             VALUES('acct-a','acct-a::a-locked','collector','5h',?1,?2)",
-            rusqlite::params![reset - 7300.0, reset],
-        )
-        .unwrap();
-    let text = Service::new(root.to_path_buf())
-        .delegation_guide()
-        .unwrap()
+    let text = synthetic_guide(root, &quota_snapshot(true))
         .as_str()
         .unwrap()
         .to_owned();
@@ -837,6 +960,7 @@ async fn delegation_guide_is_strict_schema2_and_states_empty_catalogs() {
     assert_eq!(
         service
             .delegation_guide()
+            .await
             .unwrap_err()
             .machine_code()
             .as_str(),
@@ -853,6 +977,7 @@ async fn delegation_guide_is_strict_schema2_and_states_empty_catalogs() {
     fs::write(empty.path().join("config.toml"), "schema_version = 2\n").unwrap();
     let text = Service::new(empty.path().to_path_buf())
         .delegation_guide()
+        .await
         .unwrap()
         .as_str()
         .unwrap()
@@ -898,86 +1023,109 @@ async fn consolidated_guide_filters_and_limits_scores_are_read_only() {
             .unwrap_err();
         assert_eq!(error.machine_code().as_str(), "ValidationError");
     }
-    let limits = service.limits().unwrap();
+    let limits = service.limits().await.unwrap();
     assert_eq!(limits["observed_at"], limits["ranking"]["ranked_at"]);
     assert_eq!(limits["ranking"]["schema_version"], 2);
-    let item = &limits["items"][0];
-    assert_eq!(item["remaining_percent"], 60.0);
-    assert_eq!(item["known"], true);
-    assert!(item["reset_at"].as_f64().unwrap() > item["observed_at"].as_f64().unwrap());
-    assert!(item["valid_until"].as_f64().unwrap() > limits["observed_at"].as_f64().unwrap());
-    let provider = &limits["ranking"]["providers"][0];
-    assert_eq!(provider["provider"], "glm");
-    assert_eq!(provider["priority_multiplier"], 1.0);
-    assert!(provider["score"].as_f64().unwrap() > 0.0);
+    assert!(limits["items"].as_array().unwrap().is_empty());
+    assert_eq!(limits["coverage"]["state"], "unknown");
+    assert_eq!(limits["coverage"]["incomplete"], true);
     assert!(
-        provider["models"][0]["quota"]["best_priority"]
-            .as_f64()
+        limits["ranking"]["providers"]
+            .as_array()
             .unwrap()
-            > 0.0
+            .iter()
+            .all(|provider| provider["score"].is_null())
     );
     assert!(!limits["ranking"].to_string().contains("acct-"));
     assert_eq!(before, footprint(root));
 }
 
-/// A quota commit between registry and windows cannot split the diagnostic
-/// response: old windows/standing/revision stay together until the next read.
-#[cfg(feature = "test-fixtures")]
+/// Quota windows and local eligibility are projected from one local read snapshot.
 #[test]
 fn diagnostic_windows_and_ranking_share_one_committed_snapshot() {
     let temp = home();
     let root = temp.path();
     let (config, revision) = agent_run_config::provider_config::ProviderConfig::load(root).unwrap();
-    let before = footprint(root)[4];
-    let at = agent_run_core::domain::now();
-    let value = agent_run_core::capacity::provider_catalog::diagnostics_observed(
-        root, &config, &revision, &mut || {
-            let mut store = agent_run_store::fixture::open(root).unwrap();
-            store.disable_account(&"acct-glm".parse().unwrap()).unwrap();
-            store.conn.execute(
-                "UPDATE capacity_samples SET remaining_percent=0, valid_until=?1 WHERE account_id='acct-glm'",
-                [at + 600.0],
-            ).unwrap();
-        },
-    ).unwrap();
-    assert_eq!(value["ranking"]["capacity_revision"], before);
-    assert_eq!(value["observed_at"], value["ranking"]["ranked_at"]);
-    assert_eq!(value["items"][0]["remaining_percent"], 60.0);
+    let store = agent_run_store::fixture::open(root).unwrap();
+    let source = quota_snapshot(false);
+    let read = store.conn.unchecked_transaction().unwrap();
+    let before = agent_run_core::capacity::quota_projection::limits_at(
+        &store,
+        &config,
+        &revision,
+        Some(&source),
+        QUOTA_AT,
+    )
+    .unwrap();
+    agent_run_store::fixture::open(root)
+        .unwrap()
+        .disable_account(&"acct-glm".parse().unwrap())
+        .unwrap();
+    let same = agent_run_core::capacity::quota_projection::limits_at(
+        &store,
+        &config,
+        &revision,
+        Some(&source),
+        QUOTA_AT,
+    )
+    .unwrap();
     assert_eq!(
-        value["ranking"]["providers"][0]["models"][0]["quota"]["status"],
-        "available"
+        same["ranking"]["capacity_revision"],
+        before["ranking"]["capacity_revision"]
     );
-    let after =
-        agent_run_core::capacity::provider_catalog::diagnostics(root, &config, &revision).unwrap();
-    assert_eq!(after["items"][0]["remaining_percent"], 0.0);
+    assert_eq!(same["items"], before["items"]);
+    assert_eq!(same["ranking"], before["ranking"]);
+    read.commit().unwrap();
+    let after = agent_run_core::capacity::quota_projection::limits_at(
+        &store,
+        &config,
+        &revision,
+        Some(&source),
+        QUOTA_AT,
+    )
+    .unwrap();
+    assert_eq!(after["items"], before["items"]);
     let glm = after["ranking"]["providers"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|entry| entry["provider"] == "glm")
+        .find(|provider| provider["provider"] == "glm")
         .unwrap();
     assert_eq!(glm["models"][0]["quota"]["status"], "no_eligible_account");
+    assert_ne!(
+        after["ranking"]["capacity_revision"],
+        before["ranking"]["capacity_revision"]
+    );
 }
 
-/// A healthy short window never hides an exhausted weekly window. Expired
-/// diagnostics keep reset timestamps and explicit stale/unknown standing.
+/// Two raw windows survive even when the source class is exhausted, and
+/// stale windows retain reset facts without inventing remaining quota.
 #[test]
 fn diagnostic_standing_uses_all_windows_and_keeps_stale_facts() {
+    use agent_run_core::quota_client::{ModelState, StateValidity};
     let temp = home();
     let root = temp.path();
-    let at = agent_run_core::domain::now();
-    let store = agent_run_store::fixture::open(root).unwrap();
-    store
-        .conn
-        .execute("UPDATE capacity_samples SET remaining_percent=100", [])
+    let mut source = quota_snapshot(false);
+    let account = source
+        .accounts
+        .iter_mut()
+        .find(|a| a.account == "acct-glm")
         .unwrap();
-    store.conn.execute(
-        "INSERT INTO capacity_samples(runtime,lane,window,target,source,remaining_percent,reset_at,observed_at,valid_until,payload_json,account_id,quota_key)
-         VALUES('glm','glm-5.3','weekly',NULL,'collector',0,?1,?2,?3,'null','acct-glm','acct-glm::glm-5.3')",
-        rusqlite::params![at + 7200.0, at, at + 600.0],
-    ).unwrap();
-    let service = Service::new(root.to_path_buf());
-    let limits = service.limits().unwrap();
+    account.windows[0].forecast.remaining_percent = Some(100.0);
+    let mut weekly =
+        quota_account("acct-glm", "glm", &[("glm-5.3", "glm-5.3", 1.2)])["windows"][0].clone();
+    weekly["window"] = json!("weekly");
+    weekly["forecast"]["remaining_percent"] = json!(0.0);
+    account
+        .windows
+        .push(serde_json::from_value(weekly).unwrap());
+    account.models[0].state = ModelState::Exhausted;
+    account.models[0].state_validity = StateValidity::Until {
+        at: QUOTA_AT + 600.0,
+    };
+    account.models[0].quota_score = None;
+    account.models[0].exhausted_until = Some(QUOTA_AT + 7200.0);
+    let limits = synthetic_limits(root, &source, QUOTA_AT);
     let items = limits["items"].as_array().unwrap();
     assert!(items.iter().any(|item| item["remaining_percent"] == 100.0));
     assert!(items.iter().any(|item| item["remaining_percent"] == 0.0));
@@ -988,11 +1136,7 @@ fn diagnostic_standing_uses_all_windows_and_keeps_stale_facts() {
         .find(|provider| provider["provider"] == "glm")
         .unwrap();
     assert_eq!(glm["models"][0]["quota"]["status"], "exhausted");
-    store
-        .conn
-        .execute("UPDATE capacity_samples SET valid_until=?1", [at - 1.0])
-        .unwrap();
-    let stale = service.limits().unwrap();
+    let stale = synthetic_limits(root, &source, QUOTA_AT + 601.0);
     for item in stale["items"].as_array().unwrap() {
         assert_eq!(item["known"], false);
         assert!(item["remaining_percent"].is_null());
@@ -1013,8 +1157,16 @@ fn diagnostic_standing_uses_all_windows_and_keeps_stale_facts() {
 fn limits_keep_account_bound_rows_distinct() {
     let temp = ranking_home();
     let root = temp.path();
-    sample(root, "a", "acct-b", "a-open", 70.0, 600.0);
-    let limits = Service::new(root.to_path_buf()).limits().unwrap();
+    let mut source = quota_snapshot(false);
+    let extra = quota_account("acct-b", "a", &[("a-open", "a-open", 1.0)])["windows"][0].clone();
+    source
+        .accounts
+        .iter_mut()
+        .find(|a| a.account == "acct-b")
+        .unwrap()
+        .windows
+        .push(serde_json::from_value(extra).unwrap());
+    let limits = synthetic_limits(root, &source, QUOTA_AT);
     let pools: Vec<(String, String)> = limits["items"]
         .as_array()
         .unwrap()
@@ -1037,51 +1189,6 @@ fn limits_keep_account_bound_rows_distinct() {
     assert!(!limits.to_string().contains("keychain"));
 }
 
-/// Registry and quota changes committed between the former separate reads
-/// cannot mix: the whole result reflects the one read snapshot.
-#[cfg(feature = "test-fixtures")]
-#[test]
-fn registry_and_quota_come_from_one_committed_read() {
-    let temp = home();
-    let root = temp.path();
-    let (config, revision) = agent_run_config::provider_config::ProviderConfig::load(root).unwrap();
-    let before = footprint(root)[4];
-    let catalog = agent_run_core::capacity::provider_catalog::models_observed(
-        root,
-        &config,
-        &revision,
-        &ModelsQuery::default(),
-        &mut || {
-            let mut store = agent_run_store::fixture::open(root).unwrap();
-            // Disabling advances the capacity revision in its own
-            // transaction; no separate collector round is needed.
-            store.disable_account(&"acct-glm".parse().unwrap()).unwrap();
-        },
-    )
-    .unwrap();
-    assert_eq!(catalog["capacity_revision"], before);
-    assert_eq!(catalog["providers"][0]["provider"], "glm");
-    assert_eq!(
-        catalog["providers"][0]["models"][0]["quota"]["status"],
-        "available"
-    );
-    let after = agent_run_core::capacity::provider_catalog::models(
-        root,
-        &config,
-        &revision,
-        &ModelsQuery::default(),
-    )
-    .unwrap();
-    assert_eq!(after["capacity_revision"], before + 1);
-    let glm = after["providers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|provider| provider["provider"] == "glm")
-        .unwrap();
-    assert_eq!(glm["models"][0]["quota"]["status"], "no_eligible_account");
-}
-
 /// A provider score is the best priority times an unrestricted positive
 /// finite multiplier; when that product overflows it saturates at
 /// `f64::MAX`, so the public order stays finite JSON (never `null`, NaN or
@@ -1099,7 +1206,6 @@ async fn overflowing_provider_scores_saturate_in_the_public_order() {
     );
     assert_ne!(huge, config);
     fs::write(&path, &huge).unwrap();
-    let service = Service::new(root.to_path_buf());
     let scores = |order: &serde_json::Value| -> Vec<(String, serde_json::Value)> {
         order["providers"]
             .as_array()
@@ -1113,9 +1219,7 @@ async fn overflowing_provider_scores_saturate_in_the_public_order() {
             })
             .collect()
     };
-    let order = service
-        .capacity_order(CapacityOrderQuery::default())
-        .unwrap();
+    let order = synthetic_order(root, &CapacityOrderQuery::default(), &quota_snapshot(false));
     let wire: serde_json::Value = serde_json::from_str(&order.to_string()).unwrap();
     assert_eq!(
         scores(&wire),
@@ -1126,11 +1230,11 @@ async fn overflowing_provider_scores_saturate_in_the_public_order() {
         "{wire}"
     );
     assert_eq!(
-        scores(
-            &service
-                .capacity_order(CapacityOrderQuery::default())
-                .unwrap()
-        ),
+        scores(&synthetic_order(
+            root,
+            &CapacityOrderQuery::default(),
+            &quota_snapshot(false)
+        )),
         scores(&wire),
         "deterministic"
     );
@@ -1142,9 +1246,7 @@ async fn overflowing_provider_scores_saturate_in_the_public_order() {
     );
     assert_ne!(mixed, config);
     fs::write(&path, &mixed).unwrap();
-    let order = service
-        .capacity_order(CapacityOrderQuery::default())
-        .unwrap();
+    let order = synthetic_order(root, &CapacityOrderQuery::default(), &quota_snapshot(false));
     let listed = scores(&order);
     assert_eq!(
         listed[0],
@@ -1154,90 +1256,10 @@ async fn overflowing_provider_scores_saturate_in_the_public_order() {
     assert!(listed[1].1.as_f64().is_some_and(f64::is_finite), "{order}");
 }
 
-/// A collector source switch with a carried latch stays source-scoped from
-/// the normalizer through the store, the ranker, the public order and
-/// ordinary admission: source `s1` exhausted only `m-a`'s `five_hour`
-/// window; source `s2` then reports the same pool/window name for `m-b`
-/// only. `m-a` stays exhausted (its carried latch is not released by
-/// `s2`'s unrelated fact) and `m-b` stays available (it never inherits
-/// `s1`'s exhaustion).
+/// Historical samples from different sources and their exhaustion latch do
+/// not affect admission when the independent Quota service is unavailable.
 #[tokio::test]
-async fn source_switch_with_carried_latch_stays_scoped_through_admission() {
-    use agent_run_core::capacity::quota::{CollectorScope, normalize_collector_output};
-    let temp = ranking_home();
-    let root = temp.path();
-    fs::write(
-        root.join("config.toml"),
-        format!(
-            "schema_version = 2\n[harnesses.codex]\nbinary = \"/usr/bin/true\"\nhome = \"{r}/codex\"\n[harnesses.claude-code]\nbinary = \"/usr/bin/true\"\nhome = \"{r}/claude\"\n[providers.g]\nharness = \"claude-code\"\nconnection = {{ kind = \"custom\", endpoint = \"https://g.example.com/api\", protocol = \"messages\" }}\nauth_family = \"anthropic\"\nlimits_source = \"none\"\n[[providers.g.models]]\nid = \"m-a\"\n[[providers.g.models]]\nid = \"m-b\"\n[[providers.g.bindings]]\nlabel = \"main\"\naccount = \"acct-a\"\n",
-            r = root.display()
-        ),
-    )
-    .unwrap();
-    agent_run_store::fixture::open(root)
-        .unwrap()
-        .conn
-        .execute("DELETE FROM capacity_samples", [])
-        .unwrap();
-    let account = "acct-a".parse().unwrap();
-    let now = agent_run_core::domain::now();
-    let round = |source: &str, model: &str, remaining: f64, observed: f64| {
-        let scope = CollectorScope {
-            runtime: "g".into(),
-            source: source.into(),
-            models: ["m-a".to_owned(), "m-b".to_owned()].into(),
-        };
-        let raw = json!({"version":1,"windows":[{"pool":"primary","window":"five_hour",
-            "models":[model],"remaining_percent":remaining,"reset_at":now + 3600.0,
-            "observed_at":observed}]});
-        let snapshot = normalize_collector_output(&account, &scope, &raw, now, 256, 256).unwrap();
-        agent_run_store::fixture::open(root)
-            .unwrap()
-            .record_quota_snapshot("g", &snapshot, 100, now)
-            .unwrap();
-    };
-    round("s1", "m-a", 0.0, now - 5.0);
-    round("s2", "m-b", 50.0, now - 1.0);
-    let writer = common::writer::Harness::start(root);
-    let service = Service::new(root.to_path_buf()).with_writer(writer.broker());
-    let status = |model: &str| {
-        let order = service
-            .capacity_order(CapacityOrderQuery {
-                model: Some(model.into()),
-            })
-            .unwrap();
-        order["providers"][0]["models"][0]["quota"]["status"]
-            .as_str()
-            .unwrap()
-            .to_owned()
-    };
-    assert_eq!(status("m-a"), "exhausted");
-    assert_eq!(status("m-b"), "available");
-    let request = |model: &str, id: &str| -> agent_run_domain::ProviderStartRequest {
-        serde_json::from_value(json!({"provider":"g","model":model,"profile":"review",
-            "task":"task","workdir":root,"request_id":id}))
-        .unwrap()
-    };
-    let refused = service
-        .admit_provider(request("m-a", "adm-a"))
-        .await
-        .unwrap_err();
-    assert_eq!(refused.public().kind, "quota_exhausted", "{refused:?}");
-    service
-        .admit_provider(request("m-b", "adm-b"))
-        .await
-        .unwrap();
-}
-
-/// Retention `1` source switch: `s1` exhausted `m-a` on `primary/five_hour`;
-/// a newer `s2` observation of the same pool/window covering only `m-b`
-/// (unknown or positive) neither prunes the `s1` membership the latch needs
-/// nor releases it, so `m-a` stays excluded through the order and ordinary
-/// admission while `m-b` is admitted. A stale `s2` positive that covers
-/// `m-a` cannot release it; a fresh one can.
-#[tokio::test]
-async fn cross_source_latch_survives_small_retention_and_releases_only_on_coverage() {
-    use agent_run_core::capacity::quota::{CollectorScope, normalize_collector_output};
+async fn historical_quota_sources_do_not_drive_admission() {
     for second in [None, Some(50.0)] {
         let temp = ranking_home();
         let root = temp.path();
@@ -1249,94 +1271,53 @@ async fn cross_source_latch_survives_small_retention_and_releases_only_on_covera
             ),
         )
         .unwrap();
-        agent_run_store::fixture::open(root)
-            .unwrap()
+        let now = agent_run_core::domain::now();
+        let store = agent_run_store::fixture::open(root).unwrap();
+        store
             .conn
             .execute("DELETE FROM capacity_samples", [])
             .unwrap();
-        let account = "acct-a".parse().unwrap();
-        let now = agent_run_core::domain::now();
-        let round =
-            |source: &str, models: &[&str], remaining: Option<f64>, observed: f64, valid: f64| {
-                let scope = CollectorScope {
-                    runtime: "g".into(),
-                    source: source.into(),
-                    models: ["m-a".to_owned(), "m-b".to_owned()].into(),
-                };
-                let raw = json!({"version":1,"windows":[{"pool":"primary","window":"five_hour",
-                "models":models,"remaining_percent":remaining,"reset_at":now + 3600.0,
-                "observed_at":observed,"valid_until":valid}]});
-                let snapshot =
-                    normalize_collector_output(&account, &scope, &raw, now, 256, 256).unwrap();
-                agent_run_store::fixture::open(root)
-                    .unwrap()
-                    .record_quota_snapshot("g", &snapshot, 1, now)
-                    .unwrap();
-            };
-        round("s1", &["m-a"], Some(0.0), now - 5.0, now + 3600.0);
-        round("s2", &["m-b"], second, now - 1.0, now + 600.0);
+        for (source, model, remaining, observed) in [
+            ("s1", "m-a", Some(0.0), now - 5.0),
+            ("s2", "m-b", second, now - 1.0),
+        ] {
+            store.conn.execute(
+                "INSERT INTO capacity_samples(runtime,lane,window,target,source,remaining_percent,reset_at,observed_at,valid_until,payload_json,account_id,quota_key) \
+                 VALUES('g','primary','five_hour','acct-a',?1,?2,?3,?4,?5,?6,'acct-a','acct-a::primary')",
+                rusqlite::params![source, remaining, now + 3600.0, observed, now + 600.0, json!({"models":[model]}).to_string()],
+            ).unwrap();
+        }
+        store.conn.execute(
+            "INSERT INTO quota_exhaustion(account_id,quota_key,source,window_id,observed_at,reset_at) \
+             VALUES('acct-a','acct-a::primary','s1','five_hour',?1,?2)",
+            rusqlite::params![now - 5.0, now + 3600.0],
+        ).unwrap();
+        drop(store);
+
         let writer = common::writer::Harness::start(root);
         let service = Service::new(root.to_path_buf()).with_writer(writer.broker());
-        let status = |model: &str| {
-            let order = service
-                .capacity_order(CapacityOrderQuery {
-                    model: Some(model.into()),
-                })
-                .unwrap();
-            order["providers"][0]["models"][0]["quota"]["status"]
-                .as_str()
-                .unwrap()
-                .to_owned()
-        };
-        let latches = || -> Vec<String> {
-            let store = agent_run_store::fixture::open(root).unwrap();
-            let mut statement = store
-                .conn
-                .prepare("SELECT source||'/'||window_id FROM quota_exhaustion ORDER BY source")
-                .unwrap();
-            statement
-                .query_map([], |row| row.get(0))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap()
-        };
-        assert_eq!(status("m-a"), "exhausted", "{second:?}");
-        assert_eq!(latches(), ["s1/five_hour"], "{second:?}");
-        let request = |model: &str, id: &str| -> agent_run_domain::ProviderStartRequest {
-            serde_json::from_value(json!({"provider":"g","model":model,"profile":"review",
-                "task":"task","workdir":root,"request_id":id}))
-            .unwrap()
-        };
-        let refused = service
-            .admit_provider(request("m-a", "adm-a"))
-            .await
-            .unwrap_err();
-        assert_eq!(
-            refused.public().kind,
-            "quota_exhausted",
-            "{second:?}: {refused:?}"
-        );
-        service
-            .admit_provider(request("m-b", "adm-b"))
-            .await
+        for (model, id) in [("m-a", "adm-a"), ("m-b", "adm-b")] {
+            let request = serde_json::from_value(json!({"provider":"g","model":model,
+                "profile":"review","task":"task","workdir":root,"request_id":id}))
             .unwrap();
-        // A stale s2 positive covering m-a (validity already expired) keeps
-        // the latch; a fresh one releases it.
-        round("s2", &["m-a", "m-b"], Some(40.0), now - 1.0, now - 0.5);
-        assert_eq!(status("m-a"), "exhausted", "{second:?}: stale positive");
-        assert_eq!(latches(), ["s1/five_hour"], "{second:?}");
-        round("s2", &["m-a", "m-b"], Some(40.0), now - 0.5, now + 600.0);
-        assert_eq!(
-            latches(),
-            Vec::<String>::new(),
-            "{second:?}: fresh covering positive"
-        );
-        assert_ne!(status("m-a"), "exhausted", "{second:?}");
+            let admitted = service.admit_provider(request).await.unwrap();
+            assert_eq!(admitted["created"], true, "{second:?}");
+        }
+        let store = agent_run_store::fixture::open(root).unwrap();
+        let latches: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM quota_exhaustion WHERE source='s1' AND window_id='five_hour'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(latches, 1);
     }
 }
 
 /// Current schema-2 provider advice survives a missing writer, retains exact
-/// cached quota standing and privacy, then resumes normal per-session deduplication.
+/// unknown quota standing and privacy, then resumes normal per-session deduplication.
 #[tokio::test]
 async fn advisory_provider_context_survives_writer_failure_for_both_clients() {
     use agent_run_core::hooks::context;
@@ -1352,7 +1333,7 @@ async fn advisory_provider_context_survives_writer_failure_for_both_clients() {
             .unwrap();
         assert!(fallback.injected);
         assert!(fallback.text.starts_with("Provider capacity order"));
-        assert!(fallback.text.contains("\"glm-5.3\":available"));
+        assert!(fallback.text.contains("\"glm-5.3\":unknown"));
         for private in [
             "private-codex-label",
             "acct-codex",

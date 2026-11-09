@@ -2,8 +2,8 @@
 //!
 //! This target has no libtest harness (`harness = false`). Run bare (as
 //! `cargo test` does) it is only a launcher: it re-executes itself as the
-//! single-threaded `inner` driver with `Command::env_clear()`, a minimal `PATH`
-//! and ONLY synthetic sentinel values, so no real token, flag, home or
+//! single-threaded `inner` driver with `Command::env_clear()`, a minimal `PATH`,
+//! explicitly selected temporary paths and ONLY synthetic sentinel values, so no real token, flag, home or
 //! credential of the executing environment can reach any scenario, probe or
 //! control child, and nothing in this process or its parent is mutated. The
 //! `inner` role runs the scenarios in order and exits non-zero with a closed
@@ -43,8 +43,9 @@ fn main() {
 }
 
 /// Re-execute this binary as the inner driver in a controlled environment: the
-/// whole environment is cleared, then only a minimal `PATH` and the synthetic
-/// sentinels are set on the child `Command`. This process is never modified.
+/// whole environment is cleared, then only a minimal `PATH`, configured
+/// temporary paths and synthetic sentinels are set on the child `Command`.
+/// This process is never modified.
 fn launcher() {
     let me = std::env::current_exe().unwrap_or_else(|_| fail("current_exe"));
     let mut command = Command::new(me);
@@ -52,6 +53,11 @@ fn launcher() {
         .arg("inner")
         .env_clear()
         .env("PATH", "/usr/bin:/bin");
+    for name in ["TMPDIR", "TMP", "TEMP"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
     for (name, value) in SENTINELS {
         command.env(name, value);
     }
@@ -161,6 +167,11 @@ echo $$ >&4; exec 4>&-; echo ready >&3"#;
 /// sees all of them; only presence is recorded and this process is unchanged.
 fn env_scrub_scenario() {
     let temp = tempfile::tempdir().unwrap_or_else(|_| fail("tempdir"));
+    if let Some(root) = std::env::var_os("TMPDIR")
+        && !temp.path().starts_with(Path::new(&root))
+    {
+        fail("temporary directory escaped the configured root");
+    }
     let scrubbed = temp.path().join("scrubbed");
     let launched = launch::launch_detached(
         Path::new("/usr/bin/env"),

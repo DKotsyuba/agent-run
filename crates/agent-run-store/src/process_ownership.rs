@@ -155,14 +155,19 @@ const PROCESS_OBSERVATIONS: &str = "WITH observations AS (
 
 /// Replaces detailed process evidence with one bounded event after terminal, fully proven cleanup.
 /// Runs inside the caller's transaction: summary insertion and deletions roll back together.
-/// Active/uncertain attempts retain every identity. Repetition after compaction is a no-op.
+/// Active/uncertain attempts and actively pinned lineages retain every identity.
+/// Repetition after compaction is a no-op.
 /// Counts observed process starts, not exec transitions or unobserved short-lived children.
 pub fn compact_terminal_processes(conn: &rusqlite::Connection, id: &str) -> Result<bool> {
     if conn.is_autocommit() {
         return Err(invalid("process compaction requires a transaction"));
     }
+    // Pins are created with their new root in the admission transaction, before
+    // any process evidence can be compacted. Every resumed child uses that root;
+    // any active pin protects its evidence until permanent release.
     let eligible: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM agents a WHERE a.id=?1 AND a.status IN ('succeeded','failed','cancelled','lost','timed_out')
+         AND NOT EXISTS(SELECT 1 FROM history_pins hp WHERE hp.root_agent_id=COALESCE(NULLIF(a.root_agent_id,''),a.id) AND hp.released=0)
          AND NOT EXISTS(SELECT 1 FROM attempts t WHERE t.agent_id=a.id AND (t.ownership_active=1
          OR t.phase IS NOT 'cleanup_complete' OR (COALESCE(json_extract(t.cleanup_proof_json,'$.confirmed'),0) != 1 AND NOT (COALESCE(json_extract(t.cleanup_proof_json,'$.never_spawned'),0)=1 AND t.process_identity IS NULL AND NOT EXISTS(SELECT 1 FROM process_ownership x WHERE x.owner_kind='attempt' AND x.owner_id=t.id))))))",
         [id], |row| row.get(0))?;

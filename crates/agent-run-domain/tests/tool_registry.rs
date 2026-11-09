@@ -5,7 +5,7 @@ use serde_json::Value;
 
 /// Tools added after the frozen Python table: the guide read and the five
 /// cooperative-pool operator tools and native integration and observation reads, pinned separately.
-const ADDITIVE: [&str; 9] = [
+const ADDITIVE: [&str; 14] = [
     "delegation_guide",
     "start_pool",
     "pool_post",
@@ -15,6 +15,11 @@ const ADDITIVE: [&str; 9] = [
     "agent_integration",
     "capabilities",
     "answer_chunk",
+    "start_batch",
+    "history_pins",
+    "status",
+    "batch_receipt",
+    "transcript_exact",
 ];
 
 /// Observation methods share strict schemas, stable errors and read-only hints;
@@ -57,6 +62,251 @@ fn observation_tools_declare_strict_read_contracts() {
     }
 }
 
+/// A batch with an unknown commit has a distinct machine-readable class.
+#[test]
+fn batch_unknown_has_a_stable_registered_error_class() {
+    use agent_run_domain::{Error, MachineCode};
+    let error = Error::BatchOutcomeUnknown {
+        source: Box::new(Error::BrokerUnavailable),
+    };
+    assert_eq!(error.machine_code(), MachineCode::BatchOutcomeUnknown);
+    assert_eq!(
+        MachineCode::from_wire("BatchOutcomeUnknown"),
+        Some(MachineCode::BatchOutcomeUnknown)
+    );
+    assert_eq!(error.rpc_code(), -32000);
+    assert_eq!(error.public().kind, "BatchOutcomeUnknown");
+    assert!(
+        tool("start_batch")
+            .unwrap()
+            .error_classes()
+            .contains(&MachineCode::BatchOutcomeUnknown)
+    );
+}
+
+/// Receipt lookup requires the exact scoped batch shape and never emits null for absence.
+#[test]
+fn batch_receipt_schema_and_output_are_strict() {
+    use agent_run_domain::batch::{BatchReceiptLookup, StartBatchRequest};
+    use serde_json::json;
+    let input = json!({"request_id":"key","expected_store_id":"store_0123456789abcdef0123456789abcdef","retain_history":true,
+        "jobs":[{"provider":"p","model":"m","profile":"review","task":"fixture","workdir":"/missing"}]});
+    let mut request: StartBatchRequest = serde_json::from_value(input.clone()).unwrap();
+    request.validate_receipt_lookup().unwrap();
+    let tool = tool("batch_receipt").unwrap();
+    assert!(tool.annotations.read_only_hint);
+    assert!(
+        !agent_run_domain::tools::worker_registry()
+            .iter()
+            .any(|t| t.name == "batch_receipt")
+    );
+    let input_schema = jsonschema::validator_for(&tool.input_schema).unwrap();
+    let output_schema = jsonschema::validator_for(tool.output_schema.as_ref().unwrap()).unwrap();
+    assert!(input_schema.is_valid(&input));
+    let mut unscoped = input.clone();
+    unscoped
+        .as_object_mut()
+        .unwrap()
+        .remove("expected_store_id");
+    assert!(!input_schema.is_valid(&unscoped));
+    assert!(
+        serde_json::from_value::<StartBatchRequest>(unscoped)
+            .unwrap()
+            .validate_receipt_lookup()
+            .is_err()
+    );
+    let missing = json!({"found":false});
+    assert!(output_schema.is_valid(&missing));
+    serde_json::from_value::<BatchReceiptLookup>(missing)
+        .unwrap()
+        .validate_for(&request)
+        .unwrap();
+    assert!(!output_schema.is_valid(&json!({"found":false,"receipt":null})));
+    assert!(
+        serde_json::from_value::<BatchReceiptLookup>(json!({"found":false,"receipt":null}))
+            .is_err()
+    );
+    let found = json!({"found":true,"receipt":{"version":1,"store_id":"store_0123456789abcdef0123456789abcdef","request_id":"key","jobs":[{
+        "index":0,"agent_id":"ag-20260826-120000-0123456789","sequence":1,"execution_ref":format!("ex1_{}","a".repeat(64)),"pin_id":"pin_550e8400e29b41d4a716446655440000"}]}});
+    assert!(output_schema.is_valid(&found), "{found}");
+    serde_json::from_value::<BatchReceiptLookup>(found)
+        .unwrap()
+        .validate_for(&request)
+        .unwrap();
+}
+
+/// Both batch operations advertise the same scoped prerequisite and receipt contracts.
+#[test]
+fn batch_preconditions_schema_and_receipt_are_consistent() {
+    use agent_run_domain::batch::{BatchReceiptLookup, StartBatchRequest, StartBatchResult};
+    let start = tool("start_batch").unwrap();
+    let lookup = tool("batch_receipt").unwrap();
+    for field in ["jobs", "preconditions"] {
+        assert_eq!(
+            start.input_schema["properties"][field], lookup.input_schema["properties"][field],
+            "{field}"
+        );
+    }
+    assert!(
+        start
+            .error_classes()
+            .contains(&agent_run_domain::MachineCode::PreconditionFailed)
+    );
+    assert_eq!(
+        start
+            .arguments()
+            .iter()
+            .find(|a| a.name == "preconditions")
+            .unwrap()
+            .default,
+        None
+    );
+    let start_schema = jsonschema::validator_for(&start.input_schema).unwrap();
+    let lookup_schema = jsonschema::validator_for(&lookup.input_schema).unwrap();
+    let condition = serde_json::json!({"agent_id":"ag-20260826-120000-0123456789","sequence":1,
+        "execution_ref":format!("ex1_{}","a".repeat(64)),"pin_id":"pin_550e8400e29b41d4a716446655440000"});
+    let mut input = serde_json::json!({"request_id":"key","jobs":[{"provider":"p","model":"m","profile":"review","task":"fixture","workdir":"/missing"}]});
+    assert!(start_schema.is_valid(&input));
+    input["preconditions"] = serde_json::json!([condition]);
+    assert!(!start_schema.is_valid(&input));
+    input["expected_store_id"] = serde_json::json!("store_0123456789abcdef0123456789abcdef");
+    assert!(start_schema.is_valid(&input));
+    assert!(lookup_schema.is_valid(&input));
+    for invalid in [serde_json::json!(null), serde_json::json!([])] {
+        let mut bad = input.clone();
+        bad["preconditions"] = invalid;
+        assert!(!start_schema.is_valid(&bad));
+        assert!(!lookup_schema.is_valid(&bad));
+    }
+    let typed: StartBatchRequest = serde_json::from_value(input.clone()).unwrap();
+    let receipt = serde_json::json!({"version":1,"store_id":input["expected_store_id"],"request_id":"key",
+        "preconditions":input["preconditions"],"jobs":[{"index":0,"agent_id":"ag-20260826-120001-0123456789","sequence":1,"execution_ref":format!("ex1_{}","b".repeat(64))}]});
+    let result = serde_json::json!({"replayed":false,"receipt":receipt});
+    let start_output = jsonschema::validator_for(start.output_schema.as_ref().unwrap()).unwrap();
+    let lookup_output = jsonschema::validator_for(lookup.output_schema.as_ref().unwrap()).unwrap();
+    let found = serde_json::json!({"found":true,"receipt":receipt});
+    assert!(start_output.is_valid(&result));
+    assert!(lookup_output.is_valid(&found));
+    serde_json::from_value::<StartBatchResult>(result.clone())
+        .unwrap()
+        .validate_for_request(&typed)
+        .unwrap();
+    serde_json::from_value::<BatchReceiptLookup>(found.clone())
+        .unwrap()
+        .validate_for(&typed)
+        .unwrap();
+    let start_selector = &start.output_schema.as_ref().unwrap()["properties"]["receipt"]["properties"]
+        ["preconditions"];
+    let lookup_selector = &lookup.output_schema.as_ref().unwrap()["oneOf"][1]["properties"]["receipt"]
+        ["properties"]["preconditions"];
+    assert_eq!(start_selector, lookup_selector);
+    let mut malformed = result;
+    malformed["receipt"]["preconditions"][0]["sequence"] = serde_json::json!(0);
+    assert!(!start_output.is_valid(&malformed));
+    let mut malformed = found;
+    malformed["receipt"]["preconditions"][0]["extra"] = serde_json::json!(true);
+    assert!(!lookup_output.is_valid(&malformed));
+}
+
+/// Status discovery, typed result and redacted view agree on the shared shape.
+#[test]
+fn status_schema_matches_typed_redacted_output() {
+    use agent_run_domain::status::{StatusOutput, StatusRequest};
+    use serde_json::json;
+    let id = "ag-20260826-120000-0123456789";
+    let request = json!({"version":1,"targets":[{"agent_id":id,"sequence":1}],"include_view":true});
+    let agent = json!({"agent_id":id,"runtime":"mock","model":"fixture","profile":"review","task_summary":"fixture",
+        "status":"running","created_at":1.0,"started_at":null,"finished_at":null,"elapsed_seconds":1.0,
+        "last_progress_at":null,"silence_seconds":1.0,"failure_kind":null,"failure_text":null,
+        "answer_available":false,"answer_bytes":null,"answer_sha256":null,"effort":null,
+        "delivery":{"agent_id":id,"bound":false,"orchestrator_session_id":null,"notification_id":null,"state":"not_created","attempts":0,"ambiguous":false,"last_error":null,"last_attempt":null},
+        "sequence":1,"cleanup":null,"policy":null,"phase":"running","phase_started_at":1.0,
+        "process_state":"notstarted","observed_at":2.0,"runtime_outcome":null,"acceptance":"pending"});
+    let mut output = json!({"version":1,"store_id":"store_0123456789abcdef0123456789abcdef","observed_at":1.0,"items":[{
+        "selector":{"agent_id":id,"sequence":1},"canonical_agent_id":id,"match":"unverified","pin_id":null,"pin_state":"missing",
+        "selected":{"sequence":1,"execution_ref":null,"raw_status":"running"},"retained_latest":{"sequence":1,"execution_ref":null,"raw_status":"running"},
+        "coverage":"unknown","restart_resume":"unknown","lineage_terminal":null,"terminal_outcome":null,"success_commit":"unknown","cleanup":{"scope":"lineage","state":"unknown"}}],
+        "view":{"selector_index":0,"match":"unverified","status_scope":"selected_execution_raw","sampled_at":2.0,"agent":agent}});
+    let tool = tool("status").unwrap();
+    let input_schema = jsonschema::validator_for(&tool.input_schema).unwrap();
+    let output_schema = jsonschema::validator_for(tool.output_schema.as_ref().unwrap()).unwrap();
+    assert!(input_schema.is_valid(&request));
+    assert!(!input_schema.is_valid(&json!({"agent_id":id})));
+    assert!(output_schema.is_valid(&output), "{output}");
+    let typed_request: StatusRequest = serde_json::from_value(request).unwrap();
+    let typed: StatusOutput = serde_json::from_value(output.clone()).unwrap();
+    typed.validate_for(&typed_request).unwrap();
+    let mut wrong_scope = output.clone();
+    wrong_scope["view"]["status_scope"] = json!("lineage_latest");
+    assert!(!output_schema.is_valid(&wrong_scope));
+    assert!(
+        serde_json::from_value::<StatusOutput>(wrong_scope)
+            .unwrap()
+            .validate_for(&typed_request)
+            .is_err()
+    );
+    let mut wrong_index = output.clone();
+    wrong_index["view"]["selector_index"] = json!(1);
+    assert!(!output_schema.is_valid(&wrong_index));
+    assert!(
+        serde_json::from_value::<StatusOutput>(wrong_index)
+            .unwrap()
+            .validate_for(&typed_request)
+            .is_err()
+    );
+    output["view"]["agent"]["pid"] = json!(4242);
+    assert!(!output_schema.is_valid(&output));
+    assert!(
+        serde_json::from_value::<StatusOutput>(output)
+            .unwrap()
+            .validate_for(&typed_request)
+            .is_err()
+    );
+}
+
+/// Status clients reject reordered items or selectors even when each is valid alone.
+#[test]
+fn status_output_rejects_reordered_items_and_selectors() {
+    use agent_run_domain::status::{StatusOutput, StatusRequest};
+    use serde_json::json;
+    let ids = [
+        "ag-20260826-120000-0123456789",
+        "ag-20260826-120001-0123456789",
+    ];
+    let request: StatusRequest = serde_json::from_value(json!({"version":1,"targets":[
+        {"agent_id":ids[0],"sequence":1},{"agent_id":ids[1],"sequence":1}
+    ]}))
+    .unwrap();
+    let item = |id| {
+        json!({"selector":{"agent_id":id,"sequence":1},"canonical_agent_id":null,
+        "match":"missing","pin_id":null,"pin_state":"missing","selected":null,"retained_latest":null,
+        "coverage":"unknown","restart_resume":"unknown","lineage_terminal":null,"terminal_outcome":null,
+        "success_commit":"unknown","cleanup":{"scope":"lineage","state":"unknown"}})
+    };
+    let output = json!({"version":1,"store_id":"store_0123456789abcdef0123456789abcdef",
+        "observed_at":1.0,"items":[item(ids[0]),item(ids[1])]});
+    let valid: StatusOutput = serde_json::from_value(output.clone()).unwrap();
+    valid.validate_for(&request).unwrap();
+    let mut swapped_items = output.clone();
+    swapped_items["items"].as_array_mut().unwrap().swap(0, 1);
+    assert!(
+        serde_json::from_value::<StatusOutput>(swapped_items)
+            .unwrap()
+            .validate_for(&request)
+            .is_err()
+    );
+    let mut swapped_selectors = output;
+    let first = swapped_selectors["items"][0]["selector"].clone();
+    swapped_selectors["items"][0]["selector"] = swapped_selectors["items"][1]["selector"].clone();
+    swapped_selectors["items"][1]["selector"] = first;
+    assert!(
+        serde_json::from_value::<StatusOutput>(swapped_selectors)
+            .unwrap()
+            .validate_for(&request)
+            .is_err()
+    );
+}
+
 /// Parses the captured Python discovery payload shared by all registry assertions.
 fn golden() -> Vec<Value> {
     serde_json::from_str(include_str!("../../../tests/fixtures/baseline/tools.json"))
@@ -77,7 +327,7 @@ fn registry_matches_python_golden_field_by_field() {
         .map(|definition| serde_json::to_value(definition).unwrap())
         .filter(|tool| !ADDITIVE.contains(&tool["name"].as_str().unwrap_or_default()))
         .collect();
-    assert_eq!(tools_json().len(), 18);
+    assert_eq!(tools_json().len(), 23);
     for (name, canonical) in [("models", "delegation_guide"), ("capacity_order", "limits")] {
         assert_eq!(tool(name).unwrap().legacy_for.as_deref(), Some(canonical));
         assert!(!tools_json().iter().any(|entry| entry["name"] == name));
@@ -335,12 +585,23 @@ fn annotations_preserve_effect_and_worker_boundaries() {
         let hints = &definition.annotations;
         let write = matches!(
             definition.name.as_str(),
-            "start" | "resume" | "cancel" | "steer" | "start_pool" | "pool_post" | "pool_replace"
+            "start"
+                | "start_batch"
+                | "history_pins"
+                | "resume"
+                | "cancel"
+                | "steer"
+                | "start_pool"
+                | "pool_post"
+                | "pool_replace"
         );
         assert_eq!(hints.read_only_hint, !write, "{}", definition.name);
         assert_eq!(
             hints.destructive_hint,
-            matches!(definition.name.as_str(), "cancel" | "pool_replace"),
+            matches!(
+                definition.name.as_str(),
+                "cancel" | "pool_replace" | "history_pins"
+            ),
             "{}",
             definition.name
         );
@@ -354,6 +615,7 @@ fn annotations_preserve_effect_and_worker_boundaries() {
         let external = matches!(
             definition.name.as_str(),
             "start"
+                | "start_batch"
                 | "resume"
                 | "cancel"
                 | "steer"
@@ -361,14 +623,23 @@ fn annotations_preserve_effect_and_worker_boundaries() {
                 | "start_pool"
                 | "pool_replace"
                 | "agent_integration"
+                | "status"
         );
         assert_eq!(hints.open_world_hint, external, "{}", definition.name);
-        if write && !unkeyed {
+        if write && !unkeyed && definition.name != "history_pins" {
             assert!(
                 definition
                     .arguments()
                     .iter()
                     .any(|argument| argument.name == "request_id" && argument.required)
+            );
+        }
+        if definition.name == "history_pins" {
+            assert!(
+                definition
+                    .arguments()
+                    .iter()
+                    .any(|argument| argument.name == "pin_id")
             );
         }
     }

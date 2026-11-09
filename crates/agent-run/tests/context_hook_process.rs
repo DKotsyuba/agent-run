@@ -109,7 +109,10 @@ fn preserved(output: &Output, agent: &str) {
     let text = value["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .expect("prepared context must survive");
-    assert!(text.contains("Runtime priorities"), "{text}");
+    assert!(
+        text.contains("migrate configuration to schema_version 2"),
+        "{text}"
+    );
     assert!(text.contains(agent), "{text}");
     assert!(text.chars().count() <= 2500);
     assert!(
@@ -165,7 +168,7 @@ async fn no_writer_retains_context_and_recovery_restores_deduplication() {
             .unwrap();
         assert!(text.contains(&unbound));
         assert!(
-            !text.contains("Runtime priorities"),
+            !text.contains("migrate configuration to schema_version 2"),
             "unchanged priority must stay deduplicated"
         );
         broker.stop().await;
@@ -508,7 +511,7 @@ async fn context_failure_does_not_break_binding_or_result_delivery_for_either_cl
         let receiver = bridge::start(home.path(), false);
         let context = hook(home.path(), "context", transport, prompt()).await;
         assert_eq!(context.status.code(), Some(0));
-        assert!(serde_json::from_slice::<Value>(&context.stdout).unwrap()["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("Runtime priorities"));
+        assert!(serde_json::from_slice::<Value>(&context.stdout).unwrap()["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("migrate configuration to schema_version 2"));
         let broker = test_broker::TestBroker::start(home.path()).await;
         let payload = json!({"hook_event_name":"PostToolUse", "session_id":"context-probe", "tool_response":{"agent_id":id}});
         for _ in 0..2 {

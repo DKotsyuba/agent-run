@@ -16,6 +16,54 @@ use agent_run_platform::process::{Cleanup, Identity};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
+#[cfg(feature = "test-fixtures")]
+thread_local! {
+    /// Fail one owner inspection after a specified number of successful probes.
+    static OWNER_FAILURE_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Arms a single synthetic owner-inspection failure on the calling test thread.
+#[cfg(feature = "test-fixtures")]
+pub(crate) fn fixture_fail_owner_after(successful: usize) {
+    OWNER_FAILURE_AFTER.with(|state| state.set(Some(successful)));
+}
+
+/// Captures the admitting process's native identity or refuses the whole admission.
+fn admission_owner() -> Result<Identity> {
+    #[cfg(feature = "test-fixtures")]
+    if OWNER_FAILURE_AFTER.with(|state| match state.get() {
+        Some(0) => {
+            state.set(None);
+            true
+        }
+        Some(remaining) => {
+            state.set(Some(remaining - 1));
+            false
+        }
+        None => false,
+    }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "synthetic owner inspection failure",
+        )
+        .into());
+    }
+    let pid = i32::try_from(std::process::id())
+        .map_err(|_| invalid("admitting process identity is unavailable"))?;
+    let owner = process::inspect(pid)?;
+    if pid <= 1
+        || owner.pid != pid
+        || owner.zombie
+        || !owner.birth.is_finite()
+        || owner.birth < 0.0
+        || owner.token.len() > 256
+        || !(owner.token.starts_with("linux:") || owner.token.starts_with("darwin:"))
+    {
+        return Err(invalid("admitting process identity is invalid"));
+    }
+    Ok(owner)
+}
+
 /// SQL predicate on an `attempts` row `t` that provably never spawned a
 /// child: its execution's only owned attempt, still `prepared`, with no
 /// recorded engine identity or birth, no cleanup proof yet and no process
@@ -657,6 +705,7 @@ impl Store<'_> {
             }
         }
         Store::advance_quota_capacity_revision(&tx)?;
+        check_quota_decision(candidates)?;
         tx.commit()?;
         Ok(admission)
     }
@@ -732,7 +781,8 @@ fn check_ordered_snapshot(identity: &Value, definition: &ProviderDefinition) -> 
 /// revision against the committed one, and the global and harness caps and
 /// reservations against rows already written in this transaction, so earlier
 /// batch members count. The caller commits and advances the quota capacity
-/// revision exactly once; this function does neither.
+/// revision exactly once; this function does neither. External quota evidence
+/// is clock-fenced after the local revision check and before any selection/write.
 pub(crate) fn admit_in_tx(
     tx: &rusqlite::Connection,
     catalog: &ProviderCatalog,
@@ -794,6 +844,7 @@ pub(crate) fn admit_in_tx(
         }
         .into());
     }
+    check_quota_decision(candidates)?;
     let global: i64 = tx.query_row(
         &format!("SELECT COUNT(*) FROM agents WHERE status IN {ACTIVE_SQL}"),
         [],
@@ -818,6 +869,7 @@ pub(crate) fn admit_in_tx(
         &std::collections::BTreeSet::new(),
     )?;
     let at = now();
+    candidates.check_quota_decision(at)?;
     let session = admission::upsert_session(tx, effective, at)?;
     let attempt_id = format!("att_{}", uuid::Uuid::new_v4().simple());
     let summary: String = request
@@ -864,12 +916,11 @@ pub(crate) fn admit_in_tx(
             other?;
         }
     }
-    if let Ok(owner) = process::inspect(std::process::id() as i32) {
-        tx.execute(
-            "UPDATE agents SET startup_owner_pid_identity=?,startup_owner_birth_time=? WHERE id=?",
-            params![serde_json::to_string(&owner)?, owner.birth, id.as_str()],
-        )?;
-    }
+    let owner = admission_owner()?;
+    tx.execute(
+        "UPDATE agents SET startup_owner_pid_identity=?,startup_owner_birth_time=? WHERE id=?",
+        params![serde_json::to_string(&owner)?, owner.birth, id.as_str()],
+    )?;
     tx.execute(
             "INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,selected_account_id,phase,ownership_active) \
              VALUES(?,?,1,'prepared','{}',?,?,'prepared',1)",
@@ -898,10 +949,13 @@ pub(crate) fn admit_in_tx(
         "start_accepted",
         Some(Status::Created),
         Some(Status::Starting),
-        &match resume {
-            Some(resume) => json!({"durable_admission":true,"resume_of":resume.parent}),
-            None => json!({"durable_admission":true}),
-        },
+        &quota_decision_metadata(
+            match resume {
+                Some(resume) => json!({"durable_admission":true,"resume_of":resume.parent}),
+                None => json!({"durable_admission":true}),
+            },
+            candidates,
+        ),
     )?;
     Ok(ProviderAdmission {
         agent_id: id,
@@ -909,6 +963,26 @@ pub(crate) fn admit_in_tx(
         account_id: candidate.account.clone(),
         created: true,
     })
+}
+
+/// Rechecks optional external evidence at a transaction's current wall-clock
+/// boundary; callers must roll back staged mutations when this refuses.
+pub(crate) fn check_quota_decision(candidates: &QuotaCandidateSet) -> Result<()> {
+    candidates.check_quota_decision(now())
+}
+
+/// Adds only the bounded source reference to an existing admission event.
+/// The validated deadline and clock policy stay transient, not stored quota state.
+fn quota_decision_metadata(mut metadata: Value, candidates: &QuotaCandidateSet) -> Value {
+    if let Some(decision) = &candidates.quota_decision {
+        metadata["quota_decision"] = json!({
+            "source_epoch": decision.source_epoch,
+            "revision": decision.revision,
+            "config_revision": decision.config_revision,
+            "evaluated_at": decision.evaluated_at,
+        });
+    }
+    metadata
 }
 
 /// Chooses one candidate inside an admission or allocation transaction.
@@ -1083,8 +1157,10 @@ impl Store<'_> {
     /// its physical-key reservations) is released and the new attempt, its
     /// keys and an `attempt_allocated` event are written exactly once; the
     /// unique owned-attempt invariant still holds under concurrent callers,
-    /// and a losing or cancelled caller gets an error with nothing written.
+    /// and a losing, held or cancelled caller gets an error with nothing written.
     /// `candidates` must come from trusted internal ranking, never a caller.
+    /// External quota evidence is clock-fenced independently of local revision
+    /// contention before changing the previous or next attempt.
     pub fn allocate_next_attempt(
         &mut self,
         id: &AgentId,
@@ -1092,6 +1168,7 @@ impl Store<'_> {
         candidates: &QuotaCandidateSet,
     ) -> Result<NextAttempt> {
         let tx = crate::writer::WriteTx::begin(&self.conn)?;
+        crate::lineage_holds::require_unheld(&tx, id)?;
         let record = tx.query_row(
             "SELECT * FROM agents WHERE id=?",
             [id.as_str()],
@@ -1235,6 +1312,7 @@ impl Store<'_> {
             }
             .into());
         }
+        check_quota_decision(candidates)?;
         let definition = catalog.provider(&authority.provider).ok_or_else(|| {
             QuotaAdmissionError::NoEligibleAccount {
                 provider: authority.provider.clone(),
@@ -1272,6 +1350,7 @@ impl Store<'_> {
             None,
             &tried,
         )?;
+        check_quota_decision(candidates)?;
         // Close the failed attempt durably and release its ownership (and
         // with it its physical-key reservations) in the same transaction.
         let released = tx.execute(
@@ -1302,8 +1381,12 @@ impl Store<'_> {
             "attempt_allocated",
             None,
             None,
-            &json!({"previous":previous,"number":number,"account":candidate.account}),
+            &quota_decision_metadata(
+                json!({"previous":previous,"number":number,"account":candidate.account}),
+                candidates,
+            ),
         )?;
+        check_quota_decision(candidates)?;
         tx.commit()?;
         Ok(NextAttempt {
             attempt_id,

@@ -241,6 +241,7 @@ impl WriterHandle {
                 envelope.kind(),
                 OpKindRef::AdmitStart
                     | OpKindRef::AdmitProvider
+                    | OpKindRef::AdmitBatch
                     | OpKindRef::AdmitProviderResume
                     | OpKindRef::AdmitPool
                     | OpKindRef::ReplacePoolMember

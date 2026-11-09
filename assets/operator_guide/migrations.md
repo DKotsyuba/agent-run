@@ -29,10 +29,9 @@ Use the new candidate binary with an explicit complete target configuration:
 
 This upgrades the database and configuration as one recoverable pair. Existing
 accounts, references and history are preserved; account registration is not
-part of this path. The target must use current settings, including configured
-external quota executables instead of retired Lua bindings. agent-run never
-chooses a vendor collector automatically. The target is checked against the
-read-only account registry and again against the staged database.
+part of this path. The target must use current settings instead of retired Lua
+bindings. Configure quota collection separately in Agent Quota. The target is
+checked against the read-only account registry and again against the staged database.
 
 `--mapping` and `--target-config` are mutually exclusive. Rollback uses the
 printed snapshot exactly as below. Historical snapshot filenames and v1/v2
@@ -68,8 +67,7 @@ provider = "codex"
 harness = "codex"
 connection = { kind = "native" }
 auth_family = "openai"
-limits_source = "exec"
-collector = { command = "/bin/bash", args = ["/opt/agent-run/collectors/codex.sh"], source = "codex-appserver" }
+limits_source = "none"
 global_account = "acct-codex-native"
 labelled_accounts = { personal2 = "acct-codex-personal2" }
 [runtimes.codex.native_models]

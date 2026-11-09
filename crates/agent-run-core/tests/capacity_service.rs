@@ -5,7 +5,6 @@ use agent_run_core::{dispatch, service::Service};
 use agent_run_domain::domain::now;
 use rusqlite::params;
 use serde_json::{Value, json};
-use std::cell::Cell;
 
 /// Replaces the fixture config with the three runtime states used by the service contract.
 fn config(home: &common::Home) {
@@ -54,47 +53,42 @@ fn seed(home: &common::Home, runtime: &str, remaining: f64, route_ids: &[&str]) 
     ).unwrap();
 }
 
-/// Mirrors `tests/test_capacity_service.py::CapacityServiceTests::test_service_reads_clock_once_and_filters_runtime_availability`
-#[test]
-fn service_reads_clock_once_and_filters_runtime_availability() {
-    let home = common::Home::new();
-    config(&home);
-    seed(&home, "enabled", 60.0, &["route"]);
-    seed(&home, "disabled", 90.0, &["disabled-route"]);
-    let calls = Cell::new(0);
-    let result = agent_run_core::capacity::order_with_clock(&home.path, || {
-        calls.set(calls.get() + 1);
-        now()
-    })
-    .unwrap();
-    assert_eq!(calls.get(), 1);
-    assert_eq!(
-        result["routes"].as_array().unwrap()[0]["runtime"],
-        "enabled"
-    );
-    assert!(
-        result["unavailable_runtimes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value == "empty")
-    );
-    assert!(!result.to_string().contains("disabled"));
-}
-
-/// Mirrors `tests/test_capacity_service.py::CapacityServiceTests::test_dispatch_serializes_routes_and_current_limits`
+/// Legacy quota facts cannot bypass the schema-2 migration requirement.
 #[tokio::test]
-async fn dispatch_serializes_routes_and_current_limits() {
+async fn dispatch_requires_schema_two_even_with_legacy_quota_facts() {
     let home = common::Home::new();
     config(&home);
     seed(&home, "enabled", 20.0, &["route-a", "route-b"]);
-    let service = Service::new(home.path);
-    let order = dispatch::call(&service, "capacity_order", json!({}))
-        .await
-        .unwrap();
-    assert_eq!(order["routes"][0]["runtime"], "enabled");
-    assert_eq!(order["routes"][0]["aliases"].as_array().unwrap().len(), 2);
-    let limits = dispatch::call(&service, "limits", json!({})).await.unwrap();
-    assert!(limits["items"].is_array());
-    assert!(limits["items"][0].get("remaining_percent").is_some());
+    let service = Service::new(home.path.clone());
+    for method in ["capacity_order", "limits"] {
+        let error = dispatch::call(&service, method, json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, agent_run_domain::Error::Unsupported(_)),
+            "{method}: {error}"
+        );
+        assert!(
+            error.to_string().contains("schema_version 2"),
+            "{method}: {error}"
+        );
+    }
+}
+
+/// Legacy runtime configuration still resolves its own explicit priority overrides.
+#[test]
+fn route_weight_precedence_is_account_then_lane_then_runtime_default() {
+    let h = common::Home::new();
+    let mut runtime = h.config.runtime("mock").unwrap().clone();
+    runtime.priority_multiplier = 1.0;
+    runtime
+        .priority_lane_multipliers
+        .insert("new-lane".into(), 2.0);
+    runtime
+        .priority_account_multipliers
+        .insert("new-account".into(), 3.0);
+    assert_eq!(runtime.weight(Some("new-account"), "new-lane"), 3.0);
+    assert_eq!(runtime.weight(None, "new-lane"), 2.0);
+    assert_eq!(runtime.weight(None, "other-lane"), 1.0);
+    assert_eq!(runtime.weight(Some("unknown-account"), "new-lane"), 2.0);
 }

@@ -74,6 +74,9 @@ async fn main() {
                 if let Some(failure_stage) = public.failure_stage {
                     object.insert("failure_stage".into(), failure_stage.into());
                 }
+                if let Some(reason) = public.reason {
+                    object.insert("reason".into(), serde_json::json!(reason));
+                }
                 if object.contains_key("failure_kind") {
                     object.insert("status".into(), "failed".into());
                 }

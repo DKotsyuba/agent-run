@@ -67,8 +67,9 @@ cargo xtask archive --revision HEAD \
 ```
 
 `build-native` seals the current host binaries. The sealed directory contains the
-runtime, the separate `bin/agent-run-tui` observer, `bin/agent-run-deploy` (the native xtask deployment entry point), external
-quota scripts, systemd examples, metadata, `SHA256SUMS`, and the `COMPLETE` marker. It contains no
+runtime, the separate `bin/agent-run-tui` observer, `bin/agent-run-deploy` (the native xtask deployment entry point),
+systemd examples, metadata, `SHA256SUMS`, and the `COMPLETE` marker. Quota collector assets belong to Agent Quota.
+It contains no
 interpreter, virtual environment, or package installation. `release verify` and the
 installer treat that directory as a closed inventory of regular files: every file
 except `SHA256SUMS` and `COMPLETE` must be listed with a matching hash, and an
@@ -205,7 +206,9 @@ steps:
 
 1. Stop admission and verify no active agents or birth-verified writers remain.
 2. Run the xtask install/update command against the verified release.
-3. Restart the API, capacity, and delivery launchd jobs on macOS.
+3. Restart the API and delivery launchd jobs on macOS. An existing capacity
+   collector job needs a separate migration to Agent Quota before it can be
+   relied on with this CLI; this procedure does not migrate or remove that job.
 4. Verify release metadata, database integrity, `agent-run doctor`, API
    `ping`/`tools`, and the applicable MCP lifecycle (legacy initialize or modern
    `server/discover` and per-request `tools/list`).

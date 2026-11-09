@@ -45,6 +45,7 @@ const SCANNED_CANDIDATES: usize = 256;
 const POOL_AGENT_EXPIRED: &str = "(x.status IN ('succeeded','failed','timed_out','cancelled','lost') \
      AND x.finished_at IS NOT NULL \
      AND (x.finished_at < ?1 OR COALESCE(NULLIF(x.root_agent_id,''),x.id) IN (SELECT root FROM retention_roots)) \
+     AND NOT EXISTS (SELECT 1 FROM history_pins hp WHERE hp.root_agent_id=COALESCE(NULLIF(x.root_agent_id,''),x.id) AND hp.released=0) \
      AND NOT EXISTS (SELECT 1 FROM attempts t WHERE t.agent_id=x.id \
           AND (t.ownership_active=1 OR t.cleanup_proof_json IS NULL OR t.phase!='cleanup_complete')) \
      AND NOT EXISTS (SELECT 1 FROM service_restart_agents ra JOIN service_restarts rs ON rs.id=ra.restart_id \
@@ -78,6 +79,7 @@ fn agent_eligible(at: &str) -> String {
          AND (a.finished_at < ?1 \
               OR (a.finished_at IS NOT NULL \
                   AND COALESCE(NULLIF(a.root_agent_id,''),a.id) IN (SELECT root FROM retention_roots))) \
+         AND NOT EXISTS (SELECT 1 FROM history_pins hp WHERE hp.root_agent_id=COALESCE(NULLIF(a.root_agent_id,''),a.id) AND hp.released=0) \
          AND NOT EXISTS (SELECT 1 FROM attempts t WHERE t.agent_id=a.id AND t.ownership_active=1) \
          AND NOT EXISTS (SELECT 1 FROM service_restart_agents ra JOIN service_restarts rs ON rs.id=ra.restart_id \
            WHERE rs.finished_at IS NULL AND (ra.agent_id=a.id OR ra.resumed_execution_id=a.id)) \
@@ -582,6 +584,7 @@ impl Store<'_> {
                   AND (a.finished_at < ?1
                        OR (a.finished_at IS NOT NULL
                            AND COALESCE(NULLIF(a.root_agent_id,''),a.id) IN (SELECT root FROM retention_roots)))
+                  AND NOT EXISTS (SELECT 1 FROM history_pins hp WHERE hp.root_agent_id=COALESCE(NULLIF(a.root_agent_id,''),a.id) AND hp.released=0)
                   AND NOT EXISTS (SELECT 1 FROM pool_members m
                                   WHERE m.agent_id=COALESCE(NULLIF(a.root_agent_id,''),a.id)))
              OR EXISTS(SELECT 1 FROM pools p WHERE {releasable})

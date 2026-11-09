@@ -528,6 +528,12 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
         findings: Vec::new(),
         ..Report::default()
     };
+    report.diagnostics.checks.push(check(
+        "quota",
+        CheckStatus::NotChecked,
+        "Agent Run does not check quota status",
+        "run agent-quota limits to inspect quotas and agent-quota doctor to check service availability",
+    ));
     let executing = std::env::current_exe().ok().and_then(|binary| {
         let bin = binary.parent()?;
         (bin.file_name()? == "bin" && bin.parent()?.join("COMPLETE").exists())
@@ -625,12 +631,6 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
             &mut report.findings,
         );
     }
-    capacity(
-        &config,
-        &snapshot.capacity,
-        report.checked_at,
-        &mut report.findings,
-    );
     supervisors(&snapshot.agents, &mut report.findings);
     terminal_attempt_ownership(&report.home, &mut report.findings);
     match state::incidents::read_summary(&report.home.join("state.db")) {
@@ -1559,49 +1559,6 @@ fn keychain_present_with(name: &str, lookup: impl FnOnce(Option<&str>, &str) -> 
     fallback.is_some_and(|(account, service)| lookup(account, service))
 }
 
-/// Flags capacity samples whose validity window or age has expired.
-fn capacity(config: &Config, rows: &[Value], at: f64, findings: &mut Vec<Finding>) {
-    let stale_after = config.capacity.collect_interval_seconds.max(1) as f64 * 2.0;
-    let mut latest = BTreeSet::new();
-    for row in rows {
-        let identity = (
-            row.get("runtime").and_then(Value::as_str),
-            row.get("lane").and_then(Value::as_str),
-            row.get("window").and_then(Value::as_str),
-            row.get("target").and_then(Value::as_str),
-            row.get("source").and_then(Value::as_str),
-        );
-        if !latest.insert(identity) {
-            continue;
-        }
-        let stale = match row.get("valid_until").and_then(Value::as_f64) {
-            Some(valid_until) => valid_until < at,
-            None => row
-                .get("observed_at")
-                .and_then(Value::as_f64)
-                .is_some_and(|observed| at - observed > stale_after),
-        };
-        if stale {
-            let runtime = row
-                .get("runtime")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let detail = ["lane", "window", "target", "source"]
-                .iter()
-                .map(|key| row.get(*key).and_then(Value::as_str).unwrap_or("-"))
-                .collect::<Vec<_>>()
-                .join("/");
-            add(
-                findings,
-                "capacity_stale",
-                "warning",
-                &format!("capacity:{runtime}"),
-                detail,
-            );
-        }
-    }
-}
-
 /// Reports missing active supervisor PIDs and safely observes recorded PID births.
 ///
 /// A native identity observation is the only death proof accepted here.  When
@@ -2328,6 +2285,13 @@ readiness={command="/bin/true"}
                 .detail
                 .contains(&format!("expected v{}", crate::state::VERSION))
         );
+        assert!(
+            report
+                .diagnostics
+                .checks
+                .iter()
+                .any(|check| { check.name == "quota" && check.status == CheckStatus::NotChecked })
+        );
         assert!(!report.ok());
     }
 
@@ -2487,75 +2451,79 @@ readiness={command="/bin/true"}
         assert_eq!(findings[0].severity, "warning");
     }
 
-    /// Builds one capacity snapshot row shaped like Python's `_row`.
-    fn capacity_row(lane: &str, observed_at: f64, valid_until: Option<f64>) -> Value {
-        json!({
-            "runtime": "fixture",
-            "lane": lane,
-            "window": "5h",
-            "target": null,
-            "source": "omniroute",
-            "observed_at": observed_at,
-            "valid_until": valid_until,
-        })
-    }
+    /// Legacy quota rows never create current findings; unrelated checks stay read-only.
+    #[test]
+    fn doctor_ignores_legacy_quota_samples_and_reports_quota_not_checked() {
+        let home = tempfile::tempdir().unwrap();
+        fs::write(
+            home.path().join("config.toml"),
+            "schema_version = 1\n[capacity]\ncollect_interval_seconds = 30\n",
+        )
+        .unwrap();
+        let store = agent_run_store::fixture::initialize(home.path()).unwrap();
+        store.conn.execute(
+            "INSERT INTO capacity_samples(runtime,lane,window,source,observed_at,valid_until,payload_json) \
+             VALUES('codex','tokens','5h','legacy',1,2,'{}')",
+            [],
+        ).unwrap();
+        store.conn.execute(
+            "INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision) \
+             VALUES('ag-20260101-000000-0000000001','fixture','model','','task','task',?,'{}','running',1,'fixture')",
+            [home.path().to_str().unwrap()],
+        ).unwrap();
+        let data_version: i64 = store
+            .conn
+            .pragma_query_value(None, "data_version", |row| row.get(0))
+            .unwrap();
 
-    /// Returns the stale lanes for `rows`, mirroring Python's `_lanes`.
-    fn capacity_lanes(rows: &[Value]) -> Vec<String> {
-        let config: Config =
-            serde_json::from_value(json!({"schema_version": 1})).expect("default config");
-        let mut findings = Vec::new();
-        capacity(&config, rows, 1_000., &mut findings);
-        findings
+        let dependencies = Dependencies::new(Some(home.path().join("missing-canary")), Vec::new);
+        let report = run_with(home.path(), &dependencies).unwrap();
+
+        let quota = report
+            .diagnostics
+            .checks
             .iter()
-            .map(|finding| {
-                finding
-                    .detail
-                    .split('/')
-                    .next()
-                    .unwrap_or_default()
-                    .to_owned()
-            })
-            .collect()
-    }
-
-    /// Mirrors `test_doctor.py::CapacityStalenessTests::test_a_sample_still_within_its_validity_is_never_stale`.
-    #[test]
-    fn python_doctor_sample_within_its_validity_is_never_stale() {
-        assert!(capacity_lanes(&[capacity_row("fresh", 100., Some(2_000.))]).is_empty());
-    }
-
-    /// Mirrors `test_doctor.py::CapacityStalenessTests::test_an_expired_sample_is_stale_even_when_recently_observed`.
-    #[test]
-    fn python_doctor_expired_sample_is_stale_even_when_recently_observed() {
+            .find(|check| check.name == "quota")
+            .unwrap();
+        assert_eq!(quota.status, CheckStatus::NotChecked);
         assert_eq!(
-            capacity_lanes(&[capacity_row("expired", 999., Some(500.))]),
-            ["expired"]
+            serde_json::to_value(quota).unwrap()["status"],
+            "not_checked"
         );
-    }
-
-    /// Mirrors `test_doctor.py::CapacityStalenessTests::test_a_sample_without_validity_keeps_the_age_bound`.
-    #[test]
-    fn python_doctor_sample_without_validity_keeps_the_age_bound() {
-        assert_eq!(
-            capacity_lanes(&[
-                capacity_row("aged", 100., None),
-                capacity_row("recent", 900., None),
-            ]),
-            ["aged"]
-        );
-    }
-
-    /// Keeps only the newest row for each capacity identity before staleness checks.
-    /// Mirrors `tests/test_capacity_diagnostics.py::CapacityDiagnosticTests::test_frequent_healthy_samples_do_not_hide_stale_identity`.
-    #[test]
-    fn capacity_staleness_deduplicates_identity_before_reporting() {
+        assert!(quota.remediation.contains("agent-quota limits"));
+        assert!(quota.remediation.contains("agent-quota doctor"));
         assert!(
-            capacity_lanes(&[
-                capacity_row("same", 900., Some(2_000.)),
-                capacity_row("same", 100., Some(500.)),
-            ])
-            .is_empty()
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.code == "capacity_stale")
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.code == "dead_supervisor" && finding.severity == "error")
+        );
+        assert!(
+            report
+                .diagnostics
+                .checks
+                .iter()
+                .any(|check| check.name == "state" && check.status == CheckStatus::Ok)
+        );
+        assert!(!report.ok());
+        let after: i64 = store
+            .conn
+            .pragma_query_value(None, "data_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, data_version);
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM capacity_samples", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
         );
     }
 

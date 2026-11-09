@@ -195,7 +195,7 @@ pub enum ProducerKind {
     ServiceExec,
     /// A same-user command-line process.
     Cli,
-    /// A capacity/quota collector process.
+    /// A retired capacity/quota collector retained for historical receipt replay.
     Collector,
 }
 
@@ -289,7 +289,7 @@ pub enum WriteAuthority {
         /// Peer process identity token.
         token: String,
     },
-    /// A same-user capacity collector peer.
+    /// A retired same-user collector peer, accepted only for historical receipt replay.
     Collector {
         /// Peer user id.
         uid: u32,
@@ -466,6 +466,10 @@ pub enum RejectCode {
     Conflict,
     /// A referenced record does not exist.
     NotFound,
+    /// The operation expected a different database identity.
+    StoreIdentityMismatch,
+    /// An atomic batch prerequisite was false or could not be proven.
+    PreconditionFailed,
     /// A lifecycle transition is not permitted.
     Transition,
     /// Stored evidence failed an integrity check.
@@ -513,6 +517,8 @@ pub struct PersistenceDiag {
 pub enum RejectionPayload {
     /// Provider admission refusal including `SelectionStale` rerank data.
     QuotaAdmission(QuotaAdmissionError),
+    /// Closed reason for a refused transactional batch prerequisite.
+    PreconditionFailed(crate::error::PreconditionFailureReason),
 }
 
 /// A refused submission.
@@ -560,6 +566,15 @@ impl StorageRejection {
                 refusal.domain = Some(RejectionPayload::QuotaAdmission(payload.clone()));
                 return refusal;
             }
+            Error::PreconditionFailed { reason } => {
+                let mut refusal = Self::new(
+                    RejectCode::PreconditionFailed,
+                    stage,
+                    "batch precondition failed",
+                );
+                refusal.domain = Some(RejectionPayload::PreconditionFailed(*reason));
+                return refusal;
+            }
             Error::Persistence {
                 operation,
                 elapsed_ms,
@@ -586,6 +601,14 @@ impl StorageRejection {
             Error::Validation(text) => (RejectCode::Validation, text.clone()),
             Error::PathEscape(text) => (RejectCode::PathEscape, text.clone()),
             Error::NotFound(text) => (RejectCode::NotFound, text.clone()),
+            Error::PinNotFound(_) => (
+                RejectCode::StorageRolledBack,
+                "history pin lookup failed".to_owned(),
+            ),
+            Error::StoreIdentityMismatch => (
+                RejectCode::StoreIdentityMismatch,
+                "store identity mismatch".to_owned(),
+            ),
             Error::Transition(text) => (RejectCode::Transition, text.clone()),
             Error::Conflict => (RejectCode::Conflict, error.to_string()),
             Error::Capacity => (RejectCode::Capacity, error.to_string()),
@@ -596,11 +619,18 @@ impl StorageRejection {
             Error::ExecutionChanged => (RejectCode::ExecutionChanged, error.to_string()),
             Error::AnswerHashMismatch => (RejectCode::AnswerHashMismatch, error.to_string()),
             Error::AnswerUnavailable => (RejectCode::AnswerUnavailable, error.to_string()),
+            // Exact export is a read-only API, never an admitted writer operation.
+            // Refuse an accidental writer use without persisting transcript data.
+            Error::TranscriptExportAborted(_) => (
+                RejectCode::StorageRolledBack,
+                "exact transcript read aborted".to_owned(),
+            ),
             Error::Json(_) => (RejectCode::Validation, "invalid JSON payload".to_owned()),
             Error::Sql(_)
             | Error::Io(_)
             | Error::Runtime(_)
             | Error::WriterFailure(_)
+            | Error::BatchOutcomeUnknown { .. }
             | Error::BrokerUnavailable
             | Error::Broker { .. }
             | Error::Bootstrap { .. } => (
@@ -619,6 +649,14 @@ impl StorageRejection {
     /// primary/extended pair survive the writer boundary.
     pub fn into_error(self) -> Error {
         let inner = match (&self.code, self.domain.clone()) {
+            (
+                RejectCode::PreconditionFailed,
+                Some(RejectionPayload::PreconditionFailed(reason)),
+            ) => Error::PreconditionFailed { reason },
+            (RejectCode::PreconditionFailed, _)
+            | (_, Some(RejectionPayload::PreconditionFailed(_))) => Error::BatchOutcomeUnknown {
+                source: Box::new(Error::Runtime("invalid precondition rejection".into())),
+            },
             (_, Some(RejectionPayload::QuotaAdmission(payload))) => Error::QuotaAdmission(payload),
             (RejectCode::Conflict | RejectCode::ReplayConflict, _) => Error::Conflict,
             (RejectCode::Capacity, _) => Error::Capacity,
@@ -626,6 +664,7 @@ impl StorageRejection {
             (RejectCode::NotFound | RejectCode::UnknownScope, _) => {
                 Error::NotFound(self.message.clone())
             }
+            (RejectCode::StoreIdentityMismatch, _) => Error::StoreIdentityMismatch,
             (RejectCode::Transition, _) => Error::Transition(self.message.clone()),
             (RejectCode::Integrity, _) => Error::Integrity(self.message.clone()),
             (RejectCode::ExecutionChanged, _) => Error::ExecutionChanged,

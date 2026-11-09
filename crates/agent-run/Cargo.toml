@@ -30,6 +30,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 bridge-sdk.workspace = true
+ed25519-dalek.workspace = true
 # Fenced raw store access for test fixtures; never part of a production build.
 agent-run-store = { path = "../agent-run-store", features = ["test-fixtures"] }
 rusqlite.workspace = true

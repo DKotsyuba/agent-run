@@ -25,6 +25,8 @@ bridge-sdk = { git = "https://github.com/DKotsyuba/agent-bridge.git", rev = "ae3
 jsonschema = { version = "=0.33.0", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.5", features = ["derive", "env"] }
+curve25519-dalek = { version = "=4.1.3", default-features = false }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
 fs2 = "0.4"
 libc = "0.2"
 minijinja = { version = "=2.24.0", default-features = false, features = ["serde", "fuel"] }

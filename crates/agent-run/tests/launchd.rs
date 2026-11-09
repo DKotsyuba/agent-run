@@ -4,15 +4,23 @@ use agent_run::{Error, launchd};
 use std::path::Path;
 use tempfile::tempdir;
 
-/// Mirrors `tests/test_capacity_launchd.py` configured one-shot capacity plist.
+/// A removed capacity job cannot be rendered on any supported platform.
 #[test]
-fn python_capacity_launchd_has_one_shot_contract() {
+fn retired_capacity_launchd_job_is_rejected() {
     let temporary = tempdir().expect("temporary paths");
-    let home = temporary.path().join("home");
-    let binary = std::env::current_exe().expect("test executable");
-    let rendered = launchd::render(
-        &home,
-        binary,
+    let legacy = agent_run::cli::launchd(
+        temporary.path(),
+        std::env::current_exe().expect("test executable"),
+        "capacity",
+        321,
+        "com.example.capacity",
+        temporary.path().join("capacity.out"),
+        temporary.path().join("capacity.err"),
+    );
+    assert!(matches!(legacy, Err(Error::Validation(_))));
+    let result = launchd::render(
+        temporary.path(),
+        std::env::current_exe().expect("test executable"),
         "capacity",
         321,
         "com.example.capacity",
@@ -20,15 +28,9 @@ fn python_capacity_launchd_has_one_shot_contract() {
         temporary.path().join("capacity.err"),
     );
     if cfg!(target_os = "macos") {
-        let value = rendered.expect("macOS launchd descriptor");
-        assert_eq!(value["interval_seconds"], 321);
-        assert_eq!(value["argv"][1], "capacity");
-        let plist = value["plist"].as_str().expect("plist text");
-        assert!(plist.contains("<key>StartInterval</key><integer>321</integer>"));
-        assert!(plist.contains("<key>RunAtLoad</key><false/>"));
-        assert!(!plist.contains("<key>KeepAlive</key>"));
+        assert!(matches!(result, Err(Error::Validation(_))));
     } else {
-        assert!(rendered.is_err(), "Linux must explicitly reject launchd");
+        assert!(matches!(result, Err(Error::Unsupported(_))));
     }
 }
 
@@ -69,7 +71,7 @@ fn python_api_and_delivery_launchd_keep_distinct_contracts() {
     }
 }
 
-/// Mirrors `tests/test_capacity_launchd.py::test_interval_must_be_a_positive_integer`.
+/// Delivery launchd rejects a zero scheduling interval.
 ///
 /// Python's `build_job` also rejects `bool` and non-integer (e.g. `1.5`)
 /// interval values; Rust's `interval: u64` parameter makes those inputs
@@ -77,16 +79,16 @@ fn python_api_and_delivery_launchd_keep_distinct_contracts() {
 /// least 1" edge (`0`) is a live behavior to port here
 /// (crates/agent-run/src/launchd.rs render, the `schedule` match).
 #[test]
-fn python_capacity_launchd_rejects_zero_interval() {
+fn delivery_launchd_rejects_zero_interval() {
     let temporary = tempdir().expect("temporary paths");
     let home = temporary.path().join("home");
     let binary = std::env::current_exe().expect("test executable");
     let result = launchd::render(
         &home,
         binary,
-        "capacity",
+        "delivery",
         0,
-        "com.example.capacity",
+        "com.example.delivery",
         temporary.path().join("out.log"),
         temporary.path().join("err.log"),
     );
@@ -100,25 +102,18 @@ fn python_capacity_launchd_rejects_zero_interval() {
     }
 }
 
-/// Mirrors `tests/test_capacity_launchd.py::test_configured_job_consumes_the_capacity_interval`.
-///
-/// Python routes `CapacityConfig.collect_interval_seconds` through a
-/// dedicated `build_configured_job` helper; Rust's CLI arm
-/// (crates/agent-run/src/cli.rs, `Capacity::Launchd`) reads the same config
-/// field and passes it straight through as `render`'s `interval` argument, so
-/// the behavior this test protects -- the configured interval reaching the
-/// rendered job unchanged -- is exercised directly against `render`.
+/// Delivery launchd keeps the configured interval and includes its home.
 #[test]
-fn python_capacity_launchd_configured_job_consumes_interval() {
+fn delivery_launchd_preserves_interval_and_home() {
     let temporary = tempdir().expect("temporary paths");
     let home = temporary.path().join("home");
     let binary = Path::new("/opt/agent&run").to_path_buf();
     let rendered = launchd::render(
         &home,
         binary,
-        "capacity",
+        "delivery",
         17,
-        "com.example.capacity",
+        "com.example.delivery",
         temporary.path().join("out.log"),
         temporary.path().join("err.log"),
     );
@@ -127,49 +122,52 @@ fn python_capacity_launchd_configured_job_consumes_interval() {
         assert_eq!(value["interval_seconds"], 17);
         assert_eq!(
             value["argv"],
-            serde_json::json!(["/opt/agent&run", "capacity", "collect", "--once"])
+            serde_json::json!([
+                "/opt/agent&run",
+                "--home",
+                home.display().to_string(),
+                "delivery",
+                "dispatch"
+            ])
         );
     } else {
         assert!(rendered.is_err(), "Linux must explicitly reject launchd");
     }
 }
 
-/// Mirrors `tests/test_capacity_launchd.py::test_plist_is_escaped_bounded_and_one_shot`.
+/// Delivery launchd keeps escaped paths and one-shot scheduling.
 #[test]
-fn python_capacity_launchd_plist_is_escaped_bounded_and_one_shot() {
+fn delivery_launchd_plist_is_escaped_and_one_shot() {
     let temporary = tempdir().expect("temporary paths");
     let home = temporary.path().join("home");
     let rendered = launchd::render(
         &home,
         Path::new("/opt/agent&run").to_path_buf(),
-        "capacity",
+        "delivery",
         60,
-        "com.example.<capacity&>",
-        Path::new("/tmp/capacity<out>.log").to_path_buf(),
-        Path::new("/tmp/capacity&err.log").to_path_buf(),
+        "com.example.<delivery&>",
+        Path::new("/synthetic/delivery<out>.log").to_path_buf(),
+        Path::new("/synthetic/delivery&err.log").to_path_buf(),
     );
     if cfg!(target_os = "macos") {
         let value = rendered.expect("macOS launchd descriptor");
         let plist = value["plist"].as_str().expect("plist text");
-        assert!(plist.contains("com.example.&lt;capacity&amp;&gt;"));
+        assert!(plist.contains("com.example.&lt;delivery&amp;&gt;"));
         assert!(plist.contains("<key>StartInterval</key><integer>60</integer>"));
         assert!(plist.contains("<key>RunAtLoad</key><false/>"));
         assert!(!plist.contains("<key>KeepAlive</key>"));
-        assert!(
-            plist.contains(
-                "<key>StandardOutPath</key><string>/tmp/capacity&lt;out&gt;.log</string>"
-            )
-        );
-        assert!(
-            plist
-                .contains("<key>StandardErrorPath</key><string>/tmp/capacity&amp;err.log</string>")
-        );
+        assert!(plist.contains(
+            "<key>StandardOutPath</key><string>/synthetic/delivery&lt;out&gt;.log</string>"
+        ));
+        assert!(plist.contains(
+            "<key>StandardErrorPath</key><string>/synthetic/delivery&amp;err.log</string>"
+        ));
     } else {
         assert!(rendered.is_err(), "Linux must explicitly reject launchd");
     }
 }
 
-/// Mirrors `tests/test_capacity_launchd.py::test_plist_copies_only_invoking_home_and_path`.
+/// API launchd copies only the invoking HOME and PATH.
 ///
 /// Python mocks `Path.home()` and clears `os.environ` down to `PATH` and a
 /// `SECRET_TOKEN`, then asserts the rendered `EnvironmentVariables` dict is
@@ -181,15 +179,15 @@ fn python_capacity_launchd_plist_is_escaped_bounded_and_one_shot() {
 /// these two names (crates/agent-run/src/launchd.rs render) -- is verified
 /// here against the ambient test-process environment instead.
 #[test]
-fn python_capacity_launchd_env_copies_only_home_and_path() {
+fn api_launchd_env_copies_only_home_and_path() {
     let temporary = tempdir().expect("temporary paths");
     let home = temporary.path().join("home");
     let rendered = launchd::render(
         &home,
         std::env::current_exe().expect("test executable"),
-        "capacity",
+        "api",
         60,
-        "com.example.capacity",
+        "com.example.api",
         temporary.path().join("out.log"),
         temporary.path().join("err.log"),
     );

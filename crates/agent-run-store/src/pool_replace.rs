@@ -10,7 +10,7 @@ use crate::{
     Store,
     pool_admission::PoolMemberRecord,
     pool_log::{fanout_entry, lineage_cleanup_complete, tip_of},
-    provider_admission::{AdmissionInputs, admit_in_tx},
+    provider_admission::{AdmissionInputs, admit_in_tx, check_quota_decision},
     tx_event,
 };
 use agent_run_domain::{
@@ -329,7 +329,8 @@ impl Store<'_> {
     /// roster revision, appends one broker roster entry, fans it out to the
     /// other current members and records the request digest as an event on
     /// the new agent. Votes of the old revision stop counting by derivation.
-    /// The quota capacity revision advances once. Nothing is launched.
+    /// The quota capacity revision advances once. The replacement's quota clock
+    /// fence is rechecked before committing the roster change. Nothing is launched.
     pub fn replace_pool_member(
         &mut self,
         input: PoolReplaceInput<'_>,
@@ -410,6 +411,7 @@ impl Store<'_> {
         )?;
         Store::advance_quota_capacity_revision(&tx)?;
         let new = record_of(&tx, pool, input.new_id.as_str())?;
+        check_quota_decision(input.inputs.candidates)?;
         tx.commit()?;
         Ok(Ok(PoolReplacement {
             pool_id: input.pool_id.clone(),

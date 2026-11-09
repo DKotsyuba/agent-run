@@ -1,7 +1,17 @@
 use crate::catalog::QuotaAdmissionError;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Closed reason why an atomic admission precondition could not be satisfied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreconditionFailureReason {
+    /// Available evidence proves at least one condition is false.
+    NotMet,
+    /// The required evidence is absent, incomplete, or cannot be established.
+    Unknown,
+}
 
 /// Stable public machine codes carried by CLI, JSON-RPC, and MCP error envelopes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -24,6 +34,12 @@ pub enum MachineCode {
     PathEscapeError,
     /// The requested durable agent does not exist.
     AgentNotFound,
+    /// No permanent history-pin record exists for this key.
+    PinNotFound,
+    /// The supplied expected database identity differs from the active store.
+    StoreIdentityMismatch,
+    /// A batch's transactional prerequisite is false or cannot be established.
+    PreconditionFailed,
     /// The requested lifecycle transition is not in the frozen state machine.
     StateTransitionError,
     /// A replay identity conflicts with an admitted request.
@@ -34,6 +50,8 @@ pub enum MachineCode {
     Unsupported,
     /// The resident broker cannot be reached.
     BrokerUnavailable,
+    /// Batch admission may have committed; reconcile the original key and intent.
+    BatchOutcomeUnknown,
     /// Answer evidence is malformed, missing, oversized, or inconsistent.
     AnswerIntegrityError,
     /// The requested receipt no longer identifies the current execution.
@@ -42,6 +60,8 @@ pub enum MachineCode {
     AnswerHashMismatch,
     /// The current execution has no recorded sealed answer.
     AnswerUnavailable,
+    /// Exact transcript export cannot continue without complete fenced evidence.
+    TranscriptExportAborted,
     /// A safe runtime failure that has no more specific public category.
     RuntimeError,
     /// Local filesystem or descriptor I/O failed without exposing the source message.
@@ -62,15 +82,20 @@ impl MachineCode {
             Self::ValidationError => "ValidationError",
             Self::PathEscapeError => "PathEscapeError",
             Self::AgentNotFound => "AgentNotFound",
+            Self::PinNotFound => "PinNotFound",
+            Self::StoreIdentityMismatch => "StoreIdentityMismatch",
+            Self::PreconditionFailed => "PreconditionFailed",
             Self::StateTransitionError => "StateTransitionError",
             Self::RequestConflict => "RequestConflict",
             Self::CapacityExhausted => "CapacityExhausted",
             Self::Unsupported => "Unsupported",
             Self::BrokerUnavailable => "BrokerUnavailable",
+            Self::BatchOutcomeUnknown => "BatchOutcomeUnknown",
             Self::AnswerIntegrityError => "AnswerIntegrityError",
             Self::ExecutionChanged => "ExecutionChanged",
             Self::AnswerHashMismatch => "AnswerHashMismatch",
             Self::AnswerUnavailable => "AnswerUnavailable",
+            Self::TranscriptExportAborted => "TranscriptExportAborted",
             Self::RuntimeError => "RuntimeError",
             Self::IOError => "IOError",
             Self::StorageError => "StorageError",
@@ -78,7 +103,7 @@ impl MachineCode {
     }
 
     /// Every public machine code, in declaration order.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 25] = [
         Self::SelectionStale,
         Self::SelectionBusy,
         Self::NoEligibleAccount,
@@ -87,15 +112,20 @@ impl MachineCode {
         Self::ValidationError,
         Self::PathEscapeError,
         Self::AgentNotFound,
+        Self::PinNotFound,
+        Self::StoreIdentityMismatch,
+        Self::PreconditionFailed,
         Self::StateTransitionError,
         Self::RequestConflict,
         Self::CapacityExhausted,
         Self::Unsupported,
         Self::BrokerUnavailable,
+        Self::BatchOutcomeUnknown,
         Self::AnswerIntegrityError,
         Self::ExecutionChanged,
         Self::AnswerHashMismatch,
         Self::AnswerUnavailable,
+        Self::TranscriptExportAborted,
         Self::RuntimeError,
         Self::IOError,
         Self::StorageError,
@@ -181,6 +211,18 @@ pub enum Error {
     /// The requested agent id was not found.
     #[error("unknown agent: {0}")]
     NotFound(String),
+    /// The exact history-pin key does not have a durable record.
+    #[error("unknown history pin: {0}")]
+    PinNotFound(String),
+    /// A request is scoped to a different database; prior outcomes remain unknown.
+    #[error("store identity does not match expected store_id; reconcile the original request")]
+    StoreIdentityMismatch,
+    /// No new job was admitted because a required prior lineage was not proven safe.
+    #[error("batch precondition failed")]
+    PreconditionFailed {
+        /// Closed, non-identifying explanation of the failed proof.
+        reason: PreconditionFailureReason,
+    },
     /// A lifecycle transition is not permitted.
     #[error("invalid agent transition: {0}")]
     Transition(String),
@@ -211,6 +253,9 @@ pub enum Error {
     /// No sealed answer is recorded for the current execution.
     #[error("current execution has no sealed answer")]
     AnswerUnavailable,
+    /// Stops export without returning any fragment; prior pages remain historical.
+    #[error("{0}")]
+    TranscriptExportAborted(&'static str),
     /// Legacy integrity name retained temporarily for existing migration callers.
     #[error("{0}")]
     Integrity(String),
@@ -220,6 +265,13 @@ pub enum Error {
     /// Closed writer outcome; payload-free diagnostic source, never durability proof.
     #[error("writer operation did not complete")]
     WriterFailure(crate::storage::WriterFailure),
+    /// A batch admission may have committed; only its original key and intent may reconcile it.
+    #[error("batch admission outcome unknown; retry the same request_id and jobs")]
+    BatchOutcomeUnknown {
+        /// Original closed writer or receipt-decoding failure.
+        #[source]
+        source: Box<Error>,
+    },
     /// An ownership observer/checkpoint failed. The typed source stays private;
     /// diagnostics retain only closed stage/category and safe numeric codes.
     #[error("runtime ownership checkpoint failed")]
@@ -293,6 +345,9 @@ pub struct PublicError {
     pub kind: &'static str,
     /// Human-readable, bounded, secret-safe message.
     pub message: String,
+    /// Closed precondition reason, omitted for all unrelated failures.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<PreconditionFailureReason>,
     /// Agent associated with a detached bootstrap failure, when applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
@@ -304,6 +359,23 @@ pub struct PublicError {
     pub failure_stage: Option<String>,
 }
 impl Error {
+    /// Extracts a closed precondition reason across writer and broker boundaries.
+    /// Unknown broker codes or malformed reason values never become a refusal.
+    pub fn precondition_reason(&self) -> Option<PreconditionFailureReason> {
+        match self {
+            Self::PreconditionFailed { reason } => Some(*reason),
+            Self::Persistence { source, .. } => source.precondition_reason(),
+            Self::Broker {
+                broker_error_code: Some(code),
+                broker_error_data: Some(data),
+                ..
+            } if code == MachineCode::PreconditionFailed.as_str() => {
+                serde_json::from_value(data.get("reason")?.clone()).ok()
+            }
+            _ => None,
+        }
+    }
+
     /// Wraps an observer failure with a closed phase, preserving an already
     /// wrapped first cause rather than replacing it during later cleanup.
     pub fn ownership_checkpoint(stage: OwnershipStage, source: Self) -> Self {
@@ -412,9 +484,12 @@ impl Error {
     /// broker code stays `RuntimeError`.
     pub fn machine_code(&self) -> MachineCode {
         match self {
-            Self::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }) => {
-                MachineCode::SelectionStale
-            }
+            Self::QuotaAdmission(
+                QuotaAdmissionError::SelectionStale { .. }
+                | QuotaAdmissionError::QuotaDecisionStale
+                | QuotaAdmissionError::QuotaClockRollback
+                | QuotaAdmissionError::QuotaDecisionInvalid,
+            ) => MachineCode::SelectionStale,
             Self::QuotaAdmission(QuotaAdmissionError::SelectionBusy { .. }) => {
                 MachineCode::SelectionBusy
             }
@@ -430,15 +505,20 @@ impl Error {
             Self::Validation(_) | Self::Json(_) => MachineCode::ValidationError,
             Self::PathEscape(_) => MachineCode::PathEscapeError,
             Self::NotFound(_) => MachineCode::AgentNotFound,
+            Self::PinNotFound(_) => MachineCode::PinNotFound,
+            Self::StoreIdentityMismatch => MachineCode::StoreIdentityMismatch,
+            Self::PreconditionFailed { .. } => MachineCode::PreconditionFailed,
             Self::Transition(_) => MachineCode::StateTransitionError,
             Self::Conflict => MachineCode::RequestConflict,
             Self::Capacity => MachineCode::CapacityExhausted,
             Self::Unsupported(_) => MachineCode::Unsupported,
             Self::BrokerUnavailable => MachineCode::BrokerUnavailable,
+            Self::BatchOutcomeUnknown { .. } => MachineCode::BatchOutcomeUnknown,
             Self::AnswerIntegrity(_) | Self::Integrity(_) => MachineCode::AnswerIntegrityError,
             Self::ExecutionChanged => MachineCode::ExecutionChanged,
             Self::AnswerHashMismatch => MachineCode::AnswerHashMismatch,
             Self::AnswerUnavailable => MachineCode::AnswerUnavailable,
+            Self::TranscriptExportAborted(_) => MachineCode::TranscriptExportAborted,
             Self::Broker {
                 broker_error_code: Some(code),
                 ..
@@ -491,6 +571,7 @@ impl Error {
         PublicError {
             kind: self.machine_code().as_str(),
             message: message.chars().take(512).collect(),
+            reason: self.precondition_reason(),
             agent_id: match self {
                 Self::Bootstrap { agent_id, .. } => Some(agent_id.clone()),
                 _ => None,
@@ -518,6 +599,62 @@ pub fn invalid(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod writer_identity_tests {
     use super::*;
+    /// A closed reason survives rejection and broker wrapping, never an unknown outcome.
+    #[test]
+    fn precondition_reason_survives_writer_and_broker_without_guessing() {
+        use crate::storage::{RejectCode, RejectStage, StorageRejection};
+        for reason in [
+            PreconditionFailureReason::NotMet,
+            PreconditionFailureReason::Unknown,
+        ] {
+            let original = Error::persistence(
+                PersistenceOperation::WriterApply,
+                std::time::Duration::from_millis(1),
+                Error::PreconditionFailed { reason },
+            );
+            let refusal = StorageRejection::from_error(&original, RejectStage::Statement);
+            assert_eq!(refusal.code, RejectCode::PreconditionFailed);
+            let wire = serde_json::to_value(refusal).unwrap();
+            let recovered: StorageRejection = serde_json::from_value(wire).unwrap();
+            let recovered = recovered.into_error();
+            assert_eq!(recovered.machine_code(), MachineCode::PreconditionFailed);
+            assert_eq!(recovered.precondition_reason(), Some(reason));
+            assert_eq!(recovered.public().reason, Some(reason));
+            let broker = Error::Broker {
+                message: "safe".into(),
+                broker_error_code: Some("PreconditionFailed".into()),
+                broker_error_data: Some(serde_json::json!({"reason":reason})),
+            };
+            assert_eq!(broker.precondition_reason(), Some(reason));
+        }
+        let invalid = Error::Broker {
+            message: "safe".into(),
+            broker_error_code: Some("PreconditionFailed".into()),
+            broker_error_data: Some(serde_json::json!({"reason":"invented"})),
+        };
+        assert_eq!(invalid.precondition_reason(), None);
+        let wrong_code = Error::Broker {
+            message: "safe".into(),
+            broker_error_code: Some("RuntimeError".into()),
+            broker_error_data: Some(serde_json::json!({"reason":"not_met"})),
+        };
+        assert_eq!(wrong_code.precondition_reason(), None);
+        let ambiguous = Error::BatchOutcomeUnknown {
+            source: Box::new(Error::PreconditionFailed {
+                reason: PreconditionFailureReason::NotMet,
+            }),
+        };
+        assert_eq!(ambiguous.machine_code(), MachineCode::BatchOutcomeUnknown);
+        assert_eq!(ambiguous.precondition_reason(), None);
+        let malformed = StorageRejection::new(
+            RejectCode::PreconditionFailed,
+            RejectStage::Statement,
+            "safe",
+        )
+        .into_error();
+        assert!(matches!(malformed, Error::BatchOutcomeUnknown { .. }));
+    }
+
     /// Safe identity metadata cannot broaden or remove the existing proven
     /// ownership-BEGIN contention retry; numeric totals stay replaceable.
     #[test]

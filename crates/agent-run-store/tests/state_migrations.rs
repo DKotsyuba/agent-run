@@ -140,6 +140,93 @@ fn every_historical_version_migrates_to_a_schema_indistinguishable_from_fresh() 
     }
 }
 
+/// V37 adds hold storage without rewriting existing identity, pins, receipts or agent history.
+#[test]
+fn v36_hold_migration_preserves_identity_pins_receipts_and_history() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("state.db");
+    let conn = build_fixture(&path, 36);
+    agent_run_store::fixture::fenced(&conn).unwrap();
+    let root: String = conn
+        .query_row("SELECT id FROM agents ORDER BY id LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    for (digit, released) in [('1', 0), ('2', 1)] {
+        conn.execute(
+            "INSERT INTO history_pins(pin_id,root_agent_id,released) VALUES(?,?,?)",
+            params![
+                format!("pin_{}", digit.to_string().repeat(32)),
+                root,
+                released
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO start_batch_receipts(request_id,fingerprint_version,fingerprint,receipt_json) VALUES(?,1,?,?)",
+        params!["fixture-batch", "a".repeat(64), r#"{"fixture":true}"#],
+    )
+    .unwrap();
+    let identity: String = conn
+        .query_row(
+            "SELECT store_id FROM store_identity WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let pins_sql = "SELECT json_group_array(json_array(pin_id,root_agent_id,released)) FROM (SELECT * FROM history_pins ORDER BY pin_id)";
+    let receipts_sql = "SELECT json_group_array(json_array(request_id,fingerprint_version,fingerprint,receipt_json)) FROM (SELECT * FROM start_batch_receipts ORDER BY request_id)";
+    let pins: String = conn.query_row(pins_sql, [], |row| row.get(0)).unwrap();
+    let receipts: String = conn.query_row(receipts_sql, [], |row| row.get(0)).unwrap();
+    assert_ne!(pins, "[]");
+    assert_ne!(receipts, "[]");
+    let agents = agent_count(&conn);
+    drop(conn);
+    assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
+    let migrated = open_ro(&path);
+    assert_eq!(
+        migrated
+            .query_row(
+                "SELECT store_id FROM store_identity WHERE singleton=1",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        identity
+    );
+    assert_eq!(
+        migrated
+            .query_row(pins_sql, [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        pins
+    );
+    assert_eq!(
+        migrated
+            .query_row(receipts_sql, [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        receipts
+    );
+    assert_eq!(agent_count(&migrated), agents);
+    assert_eq!(
+        migrated
+            .query_row("SELECT count(*) FROM lineage_holds", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        migrated
+            .query_row("SELECT count(*) FROM lineage_hold_targets", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+        0
+    );
+    assert_eq!(schema_objects(&migrated), fresh_schema_objects());
+}
+
 /// Empty v34 maintenance tables can be removed without altering delivery history.
 #[test]
 fn v34_empty_maintenance_upgrades_and_preserves_deliveries() {
@@ -155,9 +242,9 @@ fn v34_empty_maintenance_upgrades_and_preserves_deliveries() {
     let agents = agent_count(&conn);
     drop(conn);
 
-    assert_eq!(migrations::migrate(&path).unwrap(), 35);
+    assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
     let conn = Connection::open(&path).unwrap();
-    assert_eq!(user_version(&conn), 35);
+    assert_eq!(user_version(&conn), VERSION);
     assert_eq!(agent_count(&conn), agents);
     assert_eq!(
         conn.query_row(deliveries_sql, [], |row| row.get::<_, String>(0))
@@ -397,6 +484,28 @@ fn current_binary_fixture_matches_fresh_schema() {
             .unwrap(),
         0
     );
+}
+
+/// Separate legacy databases receive independent stable IDs on migration.
+#[test]
+fn migration_assigns_independent_persistent_store_ids() {
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        drop(build_fixture(&path, 35));
+        assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
+        let conn = open_ro(&path);
+        let id = agent_run_store::store_identity::read(&conn).unwrap();
+        drop(conn);
+        assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
+        assert_eq!(
+            agent_run_store::store_identity::read(&open_ro(&path)).unwrap(),
+            id
+        );
+        ids.push(id);
+    }
+    assert_ne!(ids[0], ids[1]);
 }
 
 /// Physical preparation may survive a failed schema step; rows/version/backup stay recoverable.

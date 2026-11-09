@@ -144,6 +144,7 @@ fn replacement_with_name(
         intent: SelectionIntent::Auto,
         candidates: vec![],
         capacity_revision: 0,
+        quota_decision: None,
     };
     let digest = "a".repeat(64);
     let identity = json!({});

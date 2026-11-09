@@ -108,19 +108,19 @@ The home defaults to `~/.agent-run`; override it with `AGENT_RUN_HOME` or
 Configuration lives in `<home>/config.toml`. Schema 2 declares native harnesses,
 named providers, explicit models and account bindings. See
 [provider configuration](docs/provider-config-v2.md) for a complete example.
-Each provider selects its external quota executable:
+Agent Quota collects and evaluates quotas independently. Configure Run to read
+its local socket:
 
 ```toml
-# Inside an existing provider declaration:
-limits_source = "exec"
-collector = { command = "/bin/bash", args = ["/opt/agent-run/collectors/glm.sh"], source = "glm-quota" }
+[capacity.quota]
+socket = "/absolute/path/to/agent-quota.sock"
+# expected_service_uid = 1000  # optional; defaults to Run's effective UID
 ```
 
-The same contract accepts Python scripts or native programs: private JSON on
-stdin, normalized quota JSON on stdout. The native archive includes external
-scripts under `collectors/`; those examples require Bash/jq, plus curl for HTTP.
-See [quota collectors](docs/quota-collectors.md) for credentials, dependencies,
-the output contract and migration from retired Lua/app-server settings.
+If Quota is unavailable, Run treats quota as unknown and can still start an
+agent; the provider may then refuse it. Run does not send native quota failures
+back to Quota. Previously installed collection jobs must be migrated separately
+to Agent Quota; they do not supply the new Quota service.
 Credentials stay in protected account stores. The broker checks configuration
 every minute and on requests; invalid revisions keep the last valid settings.
 
@@ -208,13 +208,27 @@ The MCP process is a thin stdio proxy over the resident broker:
 {"command":"agent-run","args":["--home","/absolute/path/to/agent-run-home","mcp"]}
 ```
 
-It advertises 15 tools: `start`, `resume`, `cancel`, `steer`, `list_agents`,
-`answer`, `transcript`, `doc`, `delegation_guide`, `limits`, `start_pool`,
-`pool_post`, `pool_replace`, `pool`, and `list_pools`. Use `delegation_guide`
+It advertises 23 tools: `start`, `start_batch`, `batch_receipt`, `status`, `history_pins`, `resume`, `cancel`, `steer`, `list_agents`,
+`answer`, `transcript`, `transcript_exact`, `doc`, `delegation_guide`, `limits`, `start_pool`,
+`pool_post`, `pool_replace`, `pool`, `list_pools`, `agent_integration`,
+`capabilities`, and `answer_chunk`. Use `delegation_guide`
 with optional exact `provider`, `model`, and `profile` filters for routing;
 use `limits` for quota windows plus numerical provider/model standing.
 `models` and `capacity_order` remain callable compatibility methods with their
 original CLI/socket JSON shapes, but do not appear in MCP discovery.
+
+`start_batch` atomically admits 1–20 independent jobs and returns a permanent
+receipt of their stable IDs, execution sequences and opaque execution references. An identical request ID
+and intent replay that receipt without starting another job. Admission does not
+promise every supervisor starts; inspect each agent's status. The complete
+request still has to fit the existing transport and writer limits. Automatic
+multi-agent hook binding is not provided: pass an explicit `orchestrator` for
+each job that needs its own completion notice.
+
+Set `retain_history:true` to keep each admitted lineage's database history until
+its returned pin is released with `agent-run history-pins release --pin-id PIN_ID`.
+Active pins also retain process-ownership evidence and recovery details for the
+lineage. They do not grant additional authority.
 
 New schema-2 workers receive a separate built-in MCP with five fixed tools:
 `notify_orchestrator` plus four pool tools authorized by live membership.

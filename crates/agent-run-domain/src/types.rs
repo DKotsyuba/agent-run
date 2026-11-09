@@ -12,6 +12,48 @@ pub use crate::domain::{
     AgentId, Constraint, OrchestratorRef, Outcome, StartRequest, external_id, nonblank, now,
 };
 
+/// Persistent database identity; neither a secret nor an authorization capability.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct StoreId(String);
+
+impl StoreId {
+    /// Returns the canonical 38-byte public spelling.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for StoreId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for StoreId {
+    type Err = Error;
+    fn from_str(value: &str) -> Result<Self> {
+        let raw = value.strip_prefix("store_").unwrap_or("");
+        if raw.len() == 32
+            && raw
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            Ok(Self(value.into()))
+        } else {
+            Err(invalid("invalid store_id"))
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StoreId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// The immutable role of one stored transcript message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

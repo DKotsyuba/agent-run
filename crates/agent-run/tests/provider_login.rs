@@ -337,12 +337,8 @@ fn login_resolves_provider_harness_and_bound_account() {
         "acct-claude-work"
     );
     let (ok, plist) = run(&home, &["capacity", "launchd", "--binary", "/bin/true"]);
-    if cfg!(target_os = "macos") {
-        assert!(ok, "{plist}");
-    } else {
-        assert!(!ok, "launchd must be refused outside macOS: {plist}");
-        assert_eq!(plist["error"]["type"], "Unsupported", "{plist}");
-    }
+    assert!(!ok, "retired capacity launchd must be refused: {plist}");
+    assert_eq!(plist["error"]["type"], "ValidationError", "{plist}");
 
     let calls = fs::read_to_string(&log).unwrap();
     let lines: Vec<&str> = calls.lines().collect();

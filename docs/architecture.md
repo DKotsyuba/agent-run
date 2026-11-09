@@ -120,8 +120,8 @@ Native process identity and signalling are described in
   cannot replace a task answer. Unknown, duplicate, malformed or foreign-session
   replays fail closed. A bounded refusal event retains only a fixed reason tag.
 - Engine binaries and authentication remain external. Agent tasks execute through
-  adapters and the supervisor. Quota metadata comes from separately configured,
-  bounded executables; the shipped Codex collector starts no model turn.
+  adapters and the supervisor. Agent Quota collects and evaluates quota separately;
+  Run reads its results. Old Run history does not populate Quota.
 
 `resume` keeps the public `agent_id` and admits a new internal execution linked
 to the latest terminal run. Each predecessor can
@@ -137,7 +137,7 @@ require existing canonical directories.
 
 SQLite is the source of truth for agents, events, messages, answers, native
 session lineage, deliveries, cleanup evidence, capacity, and statistics. The
-current schema is version 34. Numbered migrations live in `sql/migrations/`
+current schema is version 37. Numbered migrations live in `sql/migrations/`
 and apply transactionally after a pre-version backup. Ordinary commands and
 the broker refuse an older database with `migration_required` until the paired
 `agent-run config migrate` runs. The step to 17 also introduces the schema-2
@@ -312,21 +312,22 @@ acknowledgement or its evidence.
 
 ## Capacity and diagnostics
 
-Capacity collectors store timestamped provider observations and explicit
-physical quota topology. With schema 2, `delegation_guide` provides compact routing guidance
-with exact provider/model/profile filters. Optional `limits` diagnostics retain
-quota percentages, resets and freshness and add numerical provider/model
-standing from the same committed snapshot and advice clock, without calling
-providers. `models` and `capacity_order` remain call-only compatibility views
-with their original CLI/socket responses; they are absent from discovery.
-Schema 1 retains its historical limits windows and compatibility views; the
-guide is Unsupported there. Missing or stale evidence becomes unknown rather
-than an invented zero.
+Agent Quota collects observations and computes quota standings independently.
+With schema 2, Run reads one Quota snapshot and combines it with its own local
+account, cooldown and reservation snapshot. `delegation_guide` provides compact
+routing guidance with exact provider/model/profile filters; `limits`, `models`
+and `capacity_order` expose the corresponding standings and completeness. The
+Quota evaluation time and Run's local ranking time are separate, and the read
+does not make the two services atomic. Schema-1 `limits` and `capacity_order`
+require migration to schema 2. Missing, stale or unavailable quota is unknown,
+not an invented zero; Run may still attempt a launch.
 
 `agent-run doctor` checks configuration, binaries, role assets, state,
 schema-2 provider bindings against a read-only account-registry snapshot,
-supervisor identity, MCP processes, delivery, and capacity freshness. Its
-provider-free canary exercises the production detach, identity, and READY path.
+supervisor identity, MCP processes and delivery. It does not check quota
+freshness: use `agent-quota limits` for quota evidence and `agent-quota doctor`
+for service availability. Its provider-free canary exercises the production
+detach, identity, and READY path.
 
 ## Releases
 

@@ -244,38 +244,27 @@ fn callback_authority_and_validation_are_closed() {
     }
 }
 
-/// Migration from an exact historical schema 28 (the current schema with the
-/// schema-29 lifecycle, schema-30 writer, schema-31 Bridge and schema-33
-/// cooldown and schema-35 restart tables and columns removed) through every later migration leaves
-/// legacy request JSON intact and adds no implicit lifecycle/finish state.
+/// A preserved schema-28 running request survives migration without an
+/// invented worker lifecycle or finish state.
 #[test]
 fn migration_28_to_29_preserves_legacy_requests() {
-    let (home, mut store, run) = running(false);
-    let request: String = store
-        .conn
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("state.db");
+    let historical = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/baseline/db/current-v28.sqlite");
+    std::fs::copy(historical, &path).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let (run, request): (String, String) = conn
         .query_row(
-            "SELECT request_json FROM agents WHERE id=?",
-            [run.as_str()],
-            |r| r.get(0),
+            "SELECT id,request_json FROM agents WHERE status='running' ORDER BY id LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    store
-        .conn
-        .execute_batch(
-            "DROP TABLE service_restart_notices; DROP TABLE service_restart_recipients; DROP TABLE service_restart_agents; DROP TABLE service_restarts; \
-             DROP TABLE binding_cooldowns; \
-             DROP TABLE worker_native_wakes; DROP TABLE worker_lifecycle; \
-             DROP TABLE operation_receipts; DROP TABLE writer_producers; DROP TABLE writer_authority; \
-             DROP TABLE bridge_delivery_intents; \
-             ALTER TABLE agents DROP COLUMN supervisor_capability_sha256; \
-             ALTER TABLE managed_service_generations DROP COLUMN exec_capability_sha256; \
-             DROP INDEX idx_events_agent_kind_seq; \
-             PRAGMA user_version=28;",
-        )
-        .unwrap();
-    drop(store);
-    agent_run_store::migrations::migrate(&home.path().join("state.db")).unwrap();
-    store = agent_run_store::fixture::open(home.path()).unwrap();
+    let run: AgentId = run.parse().unwrap();
+    drop(conn);
+    agent_run_store::migrations::migrate(&path).unwrap();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
     assert_eq!(
         store
             .conn

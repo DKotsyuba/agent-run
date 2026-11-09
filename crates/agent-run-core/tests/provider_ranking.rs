@@ -1,36 +1,31 @@
-//! Read-only provider ranking: real candidate sets, per-model provider
-//! order, exhaustion semantics, pinning, and snapshot consistency.
-
-use agent_run_core::{
-    capacity::provider_ranking::{
-        ProviderCapacityOrder, provider_candidates_at, provider_order_at,
-    },
-    state::Store,
-};
+//! Local selection rules driven only by synthetic Quota v2 standings.
+use agent_run_core::{capacity::quota_adapter, quota_client::Snapshot, state::Store};
 use agent_run_domain::{
-    Error, ProviderStartRequest,
+    Error,
     catalog::{
-        AccountId, AccountRecord, AccountStatus, AuthFamily, PhysicalQuotaKey, ProviderCatalog,
-        QuotaAdmissionError, SelectionIntent,
+        AccountRecord, AccountStatus, BindingCooldownReason, ProviderCatalog, ProviderDefinition,
+        QuotaAdmissionError, QuotaCandidateSet, SelectionIntent,
     },
 };
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
-/// Fixed ranking clock every fixture sample is fresh at.
-const AT: f64 = 1000.0;
+const AT: f64 = 10001.0;
+const KNOWN: &str = include_str!("fixtures/quota-client-v1/snapshot-v2.json");
+const UNKNOWN: &str = include_str!("fixtures/quota-client-v1/unknown-snapshot-v2.json");
+const EXHAUSTED: &str = include_str!("fixtures/quota-client-v1/exhausted-snapshot-v2.json");
 
-/// Opens one initialized disposable store with fake account references.
-fn home(accounts: &[(&str, &str)]) -> tempfile::TempDir {
+/// Isolated local registry; no credential contents are read.
+fn home() -> tempfile::TempDir {
     let home = tempfile::tempdir().unwrap();
     agent_run_store::fixture::initialize(home.path()).unwrap();
     let mut store = agent_run_store::fixture::open(home.path()).unwrap();
-    for (id, name) in accounts {
+    for (id, name) in [("acct-a", "A"), ("acct-b", "B"), ("acct-c", "C")] {
         store
             .register_account(&AccountRecord {
                 account_id: id.parse().unwrap(),
-                auth_family: "anthropic".parse::<AuthFamily>().unwrap(),
-                secret_ref: format!("env:{name}").parse().unwrap(),
+                auth_family: "anthropic".parse().unwrap(),
+                secret_ref: format!("env:SYNTHETIC_{name}").parse().unwrap(),
                 status: AccountStatus::Enabled,
             })
             .unwrap();
@@ -38,1183 +33,446 @@ fn home(accounts: &[(&str, &str)]) -> tempfile::TempDir {
     home
 }
 
-/// One Claude Messages provider catalog over the registered accounts.
+/// Two provider aliases share account A; duplicate labels never add weight.
 fn catalog(store: &Store) -> ProviderCatalog {
-    let providers = serde_json::from_value(json!([
-        {
-            "id":"glm-user","harness":"claude-code",
-            "connection":{"kind":"custom","endpoint":"https://gateway.example/api","protocol":"messages"},
-            "auth_family":"anthropic","limits_source":"none","priority_multiplier":1.5,
-            "models":[{"id":"fixture"},{"id":"other","native_model":"other-native"}],
-            "bindings":[
-                {"label":"alpha","account":"acct-a","priority_multiplier":2.0},
-                {"label":"alpha-two","account":"acct-a","priority_multiplier":3.0},
-                {"label":"beta","account":"acct-b"},
-                {"label":"heavy","account":"acct-c","priority_multiplier":100.0},
-                {"label":"other-only","account":"acct-b","models":["other"]}
-            ]
-        },
-        {
-            "id":"glm-alias","harness":"claude-code",
-            "connection":{"kind":"custom","endpoint":"https://gateway.example/api","protocol":"messages"},
-            "auth_family":"anthropic","limits_source":"none",
-            "models":[{"id":"fixture"}],
-            "bindings":[{"label":"shared","account":"acct-a"}]
-        },
-        {
-            "id":"glm-empty","harness":"claude-code",
-            "connection":{"kind":"custom","endpoint":"https://gateway.example/api","protocol":"messages"},
-            "auth_family":"anthropic","limits_source":"none",
-            "models":[{"id":"fixture"}],
-            "bindings":[]
-        }
-    ]))
-    .unwrap();
-    ProviderCatalog::new(store.list_accounts().unwrap(), providers).unwrap()
+    let definitions = serde_json::from_value(json!([
+        {"id":"glm-user","harness":"claude-code","connection":{"kind":"custom","endpoint":"https://example.invalid/api","protocol":"messages"},"auth_family":"anthropic","limits_source":"none",
+         "models":[{"id":"fixture"},{"id":"other","native_model":"other-native"}],
+         "bindings":[{"label":"alpha","account":"acct-a","priority_multiplier":2.0},{"label":"alpha-two","account":"acct-a","priority_multiplier":3.0},{"label":"beta","account":"acct-b"},{"label":"heavy","account":"acct-c","priority_multiplier":100.0},{"label":"other-only","account":"acct-b","models":["other"]}]},
+        {"id":"glm-alias","harness":"claude-code","connection":{"kind":"custom","endpoint":"https://example.invalid/api","protocol":"messages"},"auth_family":"anthropic","limits_source":"none",
+         "models":[{"id":"fixture"}],"bindings":[{"label":"shared","account":"acct-a"}]}
+    ])).unwrap();
+    ProviderCatalog::new(store.list_accounts().unwrap(), definitions).unwrap()
 }
 
-/// Inserts one account-bound quota sample row with an explicit identity.
-fn sample(store: &Store, account: &str, lane: &str, remaining: f64) {
-    sample_full(
-        store,
-        account,
-        lane,
-        remaining,
-        AT - 100.0,
-        AT + 100.0,
-        AT + 200.0,
-    );
-}
-
-/// Inserts one account-bound sample with explicit freshness bounds.
-fn sample_full(
-    store: &Store,
-    account: &str,
-    lane: &str,
-    remaining: f64,
-    observed: f64,
-    valid: f64,
-    reset: f64,
-) {
-    store
-        .conn
-        .execute(
-            "INSERT INTO capacity_samples(runtime,lane,window,target,source,remaining_percent,reset_at,observed_at,valid_until,payload_json,account_id,quota_key) \
-             VALUES('claude-code',?1,'5h',NULL,'collector',?2,?3,?4,?5,'null',?6,?7)",
-            rusqlite::params![
-                lane,
-                remaining,
-                reset,
-                observed,
-                valid,
-                account,
-                format!("{account}::{lane}")
-            ],
-        )
-        .unwrap();
-}
-
-/// Inserts one legacy NULL-identity sample that must never rank.
-fn legacy_sample(store: &Store, remaining: f64) {
-    store
-        .conn
-        .execute(
-            "INSERT INTO capacity_samples(runtime,lane,window,target,source,remaining_percent,reset_at,observed_at,valid_until,payload_json) \
-             VALUES('claude-code','fixture','5h',NULL,'collector',?1,?2,?3,?4,'null')",
-            rusqlite::params![remaining, AT + 200.0, AT - 100.0, AT + 100.0],
-        )
-        .unwrap();
-}
-
-/// Inserts one durable exhaustion latch on an account's lane.
-fn latch(store: &Store, account: &str, lane: &str, reset: Option<f64>) {
-    store
-        .conn
-        .execute(
-            "INSERT INTO quota_exhaustion(account_id,quota_key,source,window_id,observed_at,reset_at) \
-             VALUES(?1,?2,'collector','5h',?3,?4)",
-            rusqlite::params![account, format!("{account}::{lane}"), AT - 50.0, reset],
-        )
-        .unwrap();
-}
-
-/// The empty hard-ineligible set used unless a test types its own evidence.
-fn none_ineligible() -> BTreeSet<AccountId> {
-    BTreeSet::new()
-}
-
-/// Binding cooldowns affect only their provider/account, expire exactly at the
-/// recorded instant, and report the nearest retry without calling it quota.
-#[test]
-fn binding_cooldowns_scope_selection_and_report_nearest_expiry() {
-    let home = home(&[("acct-a", "A"), ("acct-b", "B"), ("acct-c", "C")]);
-    let store = agent_run_store::fixture::open(home.path()).unwrap();
-    let catalog = catalog(&store);
-    for (account, reason, until) in [
-        ("acct-a", "billing_unavailable", AT + 3599.25),
-        ("acct-b", "quota_exhausted", AT + 20.1),
-        ("acct-c", "billing_unavailable", AT + 3000.0),
-    ] {
-        store.conn.execute(
-            "INSERT INTO binding_cooldowns(provider_id,account_id,reason,observed_at,blocked_until,attempt_id) VALUES('glm-user',?1,?2,?3,?4,'fixture-attempt')",
-            rusqlite::params![account, reason, AT, until],
-        ).unwrap();
+/// Supplies explicit source classes and scores, with no local forecast math.
+fn account(id: &str, fixture: &str, score: Option<f64>) -> Value {
+    let raw: Value = serde_json::from_str(&fixture.replace("acct-test", id)).unwrap();
+    let mut account = raw["result"]["accounts"][0].clone();
+    account["models"][0]["provider"] = json!("glm-user");
+    account["models"][0]["model"] = json!("fixture");
+    account["models"][0]["native_model"] = json!("fixture");
+    if let Some(score) = score {
+        account["models"][0]["quota_score"] = json!(score);
     }
-    let provider = "glm-user".parse().unwrap();
-    let error = provider_candidates_at(
-        &store,
-        &catalog,
-        &provider,
-        "fixture",
-        None,
-        &none_ineligible(),
-        AT,
-    )
-    .unwrap_err();
-    assert!(
-        matches!(error, Error::QuotaAdmission(QuotaAdmissionError::BindingCooldown {
-        account, reason: agent_run_domain::catalog::BindingCooldownReason::QuotaExhausted,
-        retry_after_seconds: 21, ..
-    }) if account.as_str() == "acct-b")
-    );
-    let pinned = provider_candidates_at(
-        &store,
-        &catalog,
-        &provider,
-        "fixture",
-        Some("alpha"),
-        &none_ineligible(),
-        AT,
-    )
-    .unwrap_err();
-    assert!(
-        matches!(pinned, Error::QuotaAdmission(QuotaAdmissionError::BindingCooldown {
-        account, reason: agent_run_domain::catalog::BindingCooldownReason::BillingUnavailable,
-        retry_after_seconds: 3600, ..
-    }) if account.as_str() == "acct-a")
-    );
-    let other = provider_candidates_at(
-        &store,
-        &catalog,
-        &"glm-alias".parse().unwrap(),
-        "fixture",
-        None,
-        &none_ineligible(),
-        AT,
-    )
-    .unwrap();
-    assert_eq!(other.candidates[0].account.as_str(), "acct-a");
-    store
-        .conn
-        .execute(
-            "DELETE FROM binding_cooldowns WHERE provider_id='glm-user' AND account_id='acct-b'",
-            [],
-        )
-        .unwrap();
-    latch(&store, "acct-b", "fixture", Some(AT + 5.0));
-    let mixed = provider_candidates_at(
-        &store,
-        &catalog,
-        &provider,
-        "fixture",
-        None,
-        &none_ineligible(),
-        AT,
-    )
-    .unwrap_err();
-    assert!(
-        matches!(mixed, Error::QuotaAdmission(QuotaAdmissionError::QuotaExhausted { account, .. }) if account.as_str() == "acct-b")
-    );
-    store
-        .conn
-        .execute("DELETE FROM quota_exhaustion WHERE account_id='acct-b'", [])
-        .unwrap();
-    store.conn.execute(
-        "INSERT INTO binding_cooldowns(provider_id,account_id,reason,observed_at,blocked_until,attempt_id) VALUES('glm-user','acct-b','quota_exhausted',?1,?2,'fixture-attempt')",
-        rusqlite::params![AT, AT + 20.1],
-    ).unwrap();
-    let after = provider_candidates_at(
-        &store,
-        &catalog,
-        &provider,
-        "fixture",
-        None,
-        &none_ineligible(),
-        AT + 20.1,
-    )
-    .unwrap();
-    assert_eq!(after.candidates.len(), 1);
-    assert_eq!(after.candidates[0].account.as_str(), "acct-b");
-    assert_eq!(
-        store
-            .conn
-            .query_row("SELECT COUNT(*) FROM quota_exhaustion", [], |row| row
-                .get::<_, i64>(0))
-            .unwrap(),
-        0
-    );
+    for window in account["windows"].as_array_mut().unwrap() {
+        window["models"] = json!(["fixture"]);
+    }
+    for latch in account["latches"].as_array_mut().unwrap() {
+        latch["models"] = json!(["fixture"]);
+    }
+    account
 }
-
-/// Produces candidates for the main provider at the fixed clock.
-fn candidates(
+fn snapshot() -> Snapshot {
+    let mut raw: Value = serde_json::from_str(UNKNOWN).unwrap();
+    let mut a = account("acct-a", KNOWN, Some(0.4));
+    let mut alias = a["models"][0].clone();
+    alias["provider"] = json!("glm-alias");
+    a["models"].as_array_mut().unwrap().push(alias);
+    raw["result"]["evaluated_at"] = json!(AT);
+    raw["result"]["accounts"] = json!([
+        a,
+        account("acct-b", KNOWN, Some(0.6)),
+        account("acct-c", UNKNOWN, None)
+    ]);
+    serde_json::from_value(raw["result"].clone()).unwrap()
+}
+fn select(
     store: &Store,
     catalog: &ProviderCatalog,
+    provider: &str,
     model: &str,
-) -> agent_run_domain::catalog::QuotaCandidateSet {
-    provider_candidates_at(
+    pin: Option<&str>,
+    source: Option<&Snapshot>,
+    at: f64,
+) -> agent_run_domain::Result<QuotaCandidateSet> {
+    Ok(quota_adapter::candidates_at(
         store,
         catalog,
-        &"glm-user".parse().unwrap(),
+        &provider.parse().unwrap(),
         model,
-        None,
-        &none_ineligible(),
-        AT,
-    )
-    .unwrap()
+        pin,
+        &BTreeSet::new(),
+        source,
+        at,
+    )?
+    .candidates)
 }
-
-/// Produces candidates for the main provider and expects the typed error.
-fn candidates_err(
-    store: &Store,
-    catalog: &ProviderCatalog,
-    model: &str,
-) -> agent_run_domain::Error {
-    provider_candidates_at(
-        store,
-        catalog,
-        &"glm-user".parse().unwrap(),
-        model,
-        None,
-        &none_ineligible(),
-        AT,
-    )
-    .unwrap_err()
-}
-
-/// Summarizes a candidate set as `(account, rank, multiplier, known)` rows.
-fn summary(set: &agent_run_domain::catalog::QuotaCandidateSet) -> Vec<(String, u32, f64, bool)> {
+fn summary(set: &QuotaCandidateSet) -> Vec<(String, u32, f64, bool)> {
     set.candidates
         .iter()
-        .map(|candidate| {
+        .map(|c| {
             (
-                candidate.account.as_str().to_owned(),
-                candidate.rank,
-                candidate.multiplier.get(),
-                candidate.quota_known,
+                c.account.as_str().into(),
+                c.rank,
+                c.multiplier.get(),
+                c.quota_known,
             )
         })
         .collect()
 }
 
-/// Ordered bindings outrank quota knowledge, preserve declaration ties, and
-/// still exclude exhausted or disabled accounts and honor a pinned label.
+/// Known source scores use maximum alias weight; unknown stays last and ties
+/// remain stable across input order while physical pools stay account-bound.
 #[test]
-fn ordered_accounts_use_configured_order_across_quota_states() {
-    let home = home(&[
-        ("acct-a", "FAKE_A"),
-        ("acct-b", "FAKE_B"),
-        ("acct-c", "FAKE_C"),
-    ]);
-    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
-    let mut provider = catalog(&store)
-        .provider(&"glm-user".parse().unwrap())
-        .unwrap()
-        .clone();
-    provider.ordered_accounts = true;
-    provider.bindings = serde_json::from_value(json!([
-        {"label":"beta", "account":"acct-b", "priority_multiplier":1.0},
-        {"label":"gamma", "account":"acct-c", "priority_multiplier":1.0},
-        {"label":"alpha", "account":"acct-a", "priority_multiplier":3.0}
-    ]))
-    .unwrap();
-    let catalog =
-        ProviderCatalog::new(store.list_accounts().unwrap(), vec![provider.clone()]).unwrap();
-    sample(&store, "acct-b", "fixture", 80.0);
-    assert_eq!(
-        summary(&candidates(&store, &catalog, "fixture")),
-        vec![
-            ("acct-a".into(), 0, 3.0, false),
-            ("acct-b".into(), 1, 1.0, true),
-            ("acct-c".into(), 2, 1.0, false),
-        ]
-    );
-    let pinned = provider_candidates_at(
-        &store,
-        &catalog,
-        &"glm-user".parse().unwrap(),
-        "fixture",
-        Some("beta"),
-        &none_ineligible(),
-        AT,
-    )
-    .unwrap();
-    assert_eq!(
-        pinned.intent,
-        SelectionIntent::Pinned("acct-b".parse().unwrap())
-    );
-    assert_eq!(pinned.candidates.len(), 1);
-    assert_eq!(pinned.candidates[0].account.as_str(), "acct-b");
-
-    // A finite ordering weight is not multiplied into quota score: even a
-    // large weight cannot overflow and wrongly remove a known account.
-    provider.bindings[2].multiplier = f64::MAX.try_into().unwrap();
-    let large_weight =
-        ProviderCatalog::new(store.list_accounts().unwrap(), vec![provider]).unwrap();
-    sample(&store, "acct-a", "fixture", 80.0);
-    assert_eq!(
-        candidates(&store, &large_weight, "fixture").candidates[0]
-            .account
-            .as_str(),
-        "acct-a"
-    );
-
-    latch(&store, "acct-a", "fixture", Some(AT + 100.0));
-    assert_eq!(
-        candidates(&store, &catalog, "fixture")
-            .candidates
-            .iter()
-            .map(|candidate| candidate.account.as_str())
-            .collect::<Vec<_>>(),
-        vec!["acct-b", "acct-c"]
-    );
-    store.disable_account(&"acct-b".parse().unwrap()).unwrap();
-    assert_eq!(
-        candidates(&store, &catalog, "fixture")
-            .candidates
-            .iter()
-            .map(|candidate| candidate.account.as_str())
-            .collect::<Vec<_>>(),
-        vec!["acct-c"]
-    );
-    let error = provider_candidates_at(
-        &store,
-        &catalog,
-        &"glm-user".parse().unwrap(),
-        "fixture",
-        Some("beta"),
-        &none_ineligible(),
-        AT,
-    )
-    .unwrap_err();
-    assert!(matches!(
-        error,
-        Error::QuotaAdmission(QuotaAdmissionError::NoEligibleAccount { .. })
-    ));
-}
-
-/// Ordered binding weights select fallback order, not the provider's quota score.
-#[test]
-fn ordered_provider_score_does_not_scale_subscription_quota() {
-    let home = home(&[
-        ("acct-a", "FAKE_A"),
-        ("acct-b", "FAKE_B"),
-        ("acct-c", "FAKE_C"),
-    ]);
-    let store = agent_run_store::fixture::open(home.path()).unwrap();
-    let mut provider = catalog(&store)
-        .provider(&"glm-user".parse().unwrap())
-        .unwrap()
-        .clone();
-    provider.ordered_accounts = true;
-    provider.bindings = serde_json::from_value(json!([
-        {"label":"api", "account":"acct-a", "priority_multiplier":1.0},
-        {"label":"subscription", "account":"acct-b", "priority_multiplier":0.5}
-    ]))
-    .unwrap();
-    sample(&store, "acct-b", "fixture", 55.0);
-    let ordered =
-        ProviderCatalog::new(store.list_accounts().unwrap(), vec![provider.clone()]).unwrap();
-    let score = provider_order_at(&store, &ordered, &none_ineligible(), AT)
-        .unwrap()
-        .providers[0]
-        .models[0]
-        .best_priority
-        .unwrap();
-    provider.bindings[1].multiplier = 1.0.try_into().unwrap();
-    let equal_weights =
-        ProviderCatalog::new(store.list_accounts().unwrap(), vec![provider]).unwrap();
-    let unweighted = provider_order_at(&store, &equal_weights, &none_ineligible(), AT)
-        .unwrap()
-        .providers[0]
-        .models[0]
-        .best_priority
-        .unwrap();
-    assert_eq!(score, unweighted);
-    assert_eq!(
-        candidates(&store, &ordered, "fixture").candidates[0]
-            .account
-            .as_str(),
-        "acct-a"
-    );
-}
-
-/// Governing-window scores multiply by binding weights, the provider
-/// multiplier scales the order view, and unknown capacity never outranks
-/// known capacity regardless of weight.
-#[test]
-fn known_scores_weight_and_order_before_unknown() {
-    let home = home(&[
-        ("acct-a", "FAKE_A"),
-        ("acct-b", "FAKE_B"),
-        ("acct-c", "FAKE_C"),
-    ]);
+fn known_scores_alias_weights_unknown_and_ties_are_stable() {
+    let home = home();
     let store = agent_run_store::fixture::open(home.path()).unwrap();
     let catalog = catalog(&store);
-    sample(&store, "acct-a", "fixture", 20.0);
-    sample(&store, "acct-b", "fixture", 30.0);
-    let set = candidates(&store, &catalog, "fixture");
-    set.validate().unwrap();
-    // score .4 * max label weight 3 (never 2+3+1) beats .6 * 1; acct-c is
-    // unknown with weight 100 and still ranks last.
-    assert_eq!(
-        summary(&set),
-        vec![
-            ("acct-a".into(), 0, 3.0, true),
-            ("acct-b".into(), 1, 1.0, true),
-            ("acct-c".into(), 2, 100.0, false),
-        ]
-    );
+    let mut source = snapshot();
+    let expected = vec![
+        ("acct-a".into(), 0, 3.0, true),
+        ("acct-b".into(), 1, 1.0, true),
+        ("acct-c".into(), 2, 100.0, false),
+    ];
+    let set = select(
+        &store,
+        &catalog,
+        "glm-user",
+        "fixture",
+        None,
+        Some(&source),
+        AT,
+    )
+    .unwrap();
+    assert_eq!(summary(&set), expected);
     assert_eq!(
         set.capacity_revision,
         store.quota_capacity_revision().unwrap()
     );
-    assert_eq!(set.intent, SelectionIntent::Auto);
-    let key = PhysicalQuotaKey::new(&"acct-a".parse().unwrap(), "fixture").unwrap();
-    assert_eq!(set.candidates[0].physical_keys, vec![key]);
-    assert!(set.candidates[2].physical_keys.is_empty());
-
-    let order = provider_order_at(&store, &catalog, &none_ineligible(), AT).unwrap();
-    let entry = order
-        .providers
-        .iter()
-        .find(|entry| entry.provider.as_str() == "glm-user")
-        .unwrap();
-    // Provider score = best account priority (.4*3) * provider weight 1.5.
-    assert!((entry.score.unwrap() - 1.8).abs() < 1e-9);
-    assert_eq!(entry.models[0].status, "available");
-    assert!((entry.models[0].best_priority.unwrap() - 1.2).abs() < 1e-9);
-    // The other model has no observations of its own native lane.
-    assert_eq!(entry.models[1].status, "unknown");
-    assert_eq!(entry.models[1].best_priority, None);
-}
-
-/// One global account under several labels and providers stays one physical
-/// candidate with one reservation identity, without summing factors.
-#[test]
-fn labels_and_aliases_deduplicate_to_one_physical_candidate() {
-    let home = home(&[
-        ("acct-a", "FAKE_A"),
-        ("acct-b", "FAKE_B"),
-        ("acct-c", "FAKE_C"),
-    ]);
-    let store = agent_run_store::fixture::open(home.path()).unwrap();
-    let catalog = catalog(&store);
-    sample(&store, "acct-a", "fixture", 20.0);
-    let set = candidates(&store, &catalog, "fixture");
-    // One physical candidate for the doubly-bound account, maximum factor
-    // 3 (never 2+3), ahead of the unknown fallbacks.
     assert_eq!(
-        summary(&set),
-        vec![
-            ("acct-a".into(), 0, 3.0, true),
-            ("acct-b".into(), 1, 1.0, false),
-            ("acct-c".into(), 1, 100.0, false),
-        ]
+        set.candidates[0].physical_keys[0].as_str(),
+        "acct-a::primary"
     );
-    // The alias provider resolves the same physical key, not a second pool.
-    let alias = provider_candidates_at(
-        &store,
-        &catalog,
-        &"glm-alias".parse().unwrap(),
-        "fixture",
-        None,
-        &none_ineligible(),
-        AT,
-    )
-    .unwrap();
+    source.accounts.reverse();
     assert_eq!(
-        alias.candidates[0].physical_keys,
-        set.candidates[0].physical_keys
-    );
-    // A pin resolves to its account only; the ineligible label's subset
-    // never falls over to the known account under another label.
-    let pinned = provider_candidates_at(
-        &store,
-        &catalog,
-        &"glm-user".parse().unwrap(),
-        "fixture",
-        Some("other-only"),
-        &none_ineligible(),
-        AT,
-    )
-    .unwrap();
-    assert_eq!(
-        pinned.intent,
-        SelectionIntent::Pinned("acct-b".parse().unwrap())
-    );
-    assert_eq!(summary(&pinned), vec![("acct-b".into(), 0, 1.0, false)]);
-}
-
-/// A renamed collector alias must keep one physical window history, so an
-/// expired old row cannot poison the newer fresh observation. The same-alias
-/// control verifies that only the stored runtime label changed.
-#[test]
-fn renamed_alias_keeps_fresh_physical_window_known() {
-    for renamed in [false, true] {
-        let home = home(&[
-            ("acct-a", "FAKE_A"),
-            ("acct-b", "FAKE_B"),
-            ("acct-c", "FAKE_C"),
-        ]);
-        let store = agent_run_store::fixture::open(home.path()).unwrap();
-        let catalog = catalog(&store);
-        for (runtime, observed, valid, remaining) in [
-            (if renamed { "a-old" } else { "b-new" }, 800.0, 900.0, 70.0),
-            ("b-new", 950.0, 1100.0, 80.0),
-        ] {
-            store.conn.execute(
-                "INSERT INTO capacity_samples(runtime,lane,window,target,source,remaining_percent,reset_at,observed_at,valid_until,payload_json,account_id,quota_key) \
-                 VALUES(?1,'fixture','5h',NULL,'collector',?2,1200,?3,?4,'{\"models\":[\"fixture\"]}','acct-a','acct-a::fixture')",
-                rusqlite::params![runtime, remaining, observed, valid],
-            ).unwrap();
-        }
-        let set = provider_candidates_at(
-            &store,
-            &catalog,
-            &"glm-user".parse().unwrap(),
-            "fixture",
-            Some("alpha"),
-            &none_ineligible(),
-            AT,
-        )
-        .unwrap();
-        assert_eq!(
-            summary(&set),
-            vec![("acct-a".into(), 0, 3.0, true)],
-            "renamed={renamed}"
-        );
-        if renamed {
-            store.conn.execute(
-                "INSERT INTO capacity_samples(runtime,lane,window,target,source,remaining_percent,reset_at,observed_at,valid_until,payload_json,account_id,quota_key) \
-                 VALUES('b-new','secondary','5h',NULL,'collector',70,1200,800,900,'{\"models\":[\"fixture\"]}','acct-a','acct-a::secondary')",
-                [],
-            ).unwrap();
-            let distinct = provider_candidates_at(
+        summary(
+            &select(
                 &store,
                 &catalog,
-                &"glm-user".parse().unwrap(),
+                "glm-user",
                 "fixture",
-                Some("alpha"),
-                &none_ineligible(),
-                AT,
+                None,
+                Some(&source),
+                AT
             )
-            .unwrap();
-            assert_eq!(summary(&distinct), vec![("acct-a".into(), 0, 3.0, false)]);
-        }
-    }
-}
-
-/// A model-specific exhausted lane excludes only that model; unrelated
-/// unknown windows never mask exhaustion, and durable latches survive stale
-/// samples and failed sources.
-#[test]
-fn exhaustion_is_model_specific_and_latches_survive_stale_evidence() {
-    let home = home(&[
-        ("acct-a", "FAKE_A"),
-        ("acct-b", "FAKE_B"),
-        ("acct-c", "FAKE_C"),
-    ]);
-    let store = agent_run_store::fixture::open(home.path()).unwrap();
-    let catalog = catalog(&store);
-    // acct-a: fresh authoritative zero on the fixture lane only.
-    sample(&store, "acct-a", "fixture", 0.0);
-    sample(&store, "acct-a", "other-native", 40.0);
-    // acct-b: only a stale sample plus an active durable latch on fixture.
-    sample_full(
-        &store,
-        "acct-b",
-        "fixture",
-        80.0,
-        AT - 300.0,
-        AT - 100.0,
-        AT + 200.0,
-    );
-    latch(&store, "acct-b", "fixture", Some(AT + 500.0));
-
-    let fixture = candidates(&store, &catalog, "fixture");
-    assert_eq!(summary(&fixture), vec![("acct-c".into(), 0, 100.0, false)]);
-    // The other model keeps acct-a: its own lane is fresh and positive, and
-    // the exhausted fixture lane plus the latched account do not leak in.
-    let other = candidates(&store, &catalog, "other");
-    assert_eq!(
-        summary(&other),
-        vec![
-            ("acct-a".into(), 0, 3.0, true),
-            ("acct-b".into(), 1, 1.0, false),
-            ("acct-c".into(), 1, 100.0, false),
-        ]
-    );
-
-    // Removing every candidate by exhaustion reports the typed verdict;
-    // the earliest finite latch reset is the account the fact attaches to.
-    store
-        .conn
-        .execute("DELETE FROM capacity_samples", [])
-        .unwrap();
-    latch(&store, "acct-a", "fixture", Some(AT + 400.0));
-    latch(&store, "acct-c", "fixture", None);
-    let exhausted = candidates_err(&store, &catalog, "fixture");
-    assert!(
-        matches!(
-            &exhausted,
-            Error::QuotaAdmission(QuotaAdmissionError::QuotaExhausted { account, .. })
-                if account.as_str() == "acct-a"
+            .unwrap()
         ),
-        "{exhausted:?}"
+        expected
     );
-
-    // A passed reset releases the latch without inventing fresh capacity.
-    store
-        .conn
-        .execute(
-            "UPDATE quota_exhaustion SET reset_at=? WHERE account_id='acct-b'",
-            [AT - 10.0],
-        )
-        .unwrap();
-    store
-        .conn
-        .execute("DELETE FROM quota_exhaustion WHERE account_id='acct-c'", [])
-        .unwrap();
-    let released = candidates(&store, &catalog, "fixture");
-    assert_eq!(
-        summary(&released),
-        vec![
-            ("acct-b".into(), 0, 1.0, false),
-            ("acct-c".into(), 0, 100.0, false),
-        ]
-    );
-}
-
-/// Exactly equal priorities share one rank group; output is independent of
-/// row order, and account activity never reorders different quota scores.
-#[test]
-fn equal_priorities_share_rank_and_output_is_row_order_independent() {
-    let first_home = home(&[("acct-a", "FAKE_A"), ("acct-b", "FAKE_B")]);
-    let store = agent_run_store::fixture::open(first_home.path()).unwrap();
-    let providers = serde_json::from_value(json!([
-        {
-            "id":"glm-user","harness":"claude-code",
-            "connection":{"kind":"custom","endpoint":"https://gateway.example/api","protocol":"messages"},
-            "auth_family":"anthropic","limits_source":"none",
-            "models":[{"id":"fixture"}],
-            "bindings":[
-                {"label":"alpha","account":"acct-a"},
-                {"label":"beta","account":"acct-b"}
-            ]
-        }
-    ]))
-    .unwrap();
-    let catalog = ProviderCatalog::new(store.list_accounts().unwrap(), providers).unwrap();
-    sample(&store, "acct-a", "fixture", 20.0);
-    sample(&store, "acct-b", "fixture", 20.0);
-    let set = candidates(&store, &catalog, "fixture");
-    assert_eq!(
-        summary(&set),
-        vec![
-            ("acct-a".into(), 0, 1.0, true),
-            ("acct-b".into(), 0, 1.0, true),
-        ]
-    );
-
-    // Reversed physical row order produces the identical set.
-    let other_home = home(&[("acct-a", "FAKE_A"), ("acct-b", "FAKE_B")]);
-    let second = agent_run_store::fixture::open(other_home.path()).unwrap();
-    let second_catalog = ProviderCatalog::new(
-        second.list_accounts().unwrap(),
-        serde_json::from_value(json!([
-            {
-                "id":"glm-user","harness":"claude-code",
-                "connection":{"kind":"custom","endpoint":"https://gateway.example/api","protocol":"messages"},
-                "auth_family":"anthropic","limits_source":"none",
-                "models":[{"id":"fixture"}],
-                "bindings":[
-                    {"label":"alpha","account":"acct-a"},
-                    {"label":"beta","account":"acct-b"}
-                ]
-            }
-        ]))
-        .unwrap(),
+    let mut tied = snapshot();
+    tied.accounts
+        .iter_mut()
+        .find(|a| a.account == "acct-a")
+        .unwrap()
+        .models[0]
+        .quota_score = Some(0.5);
+    tied.accounts
+        .iter_mut()
+        .find(|a| a.account == "acct-b")
+        .unwrap()
+        .models[0]
+        .quota_score = Some(1.5);
+    let tie = select(
+        &store,
+        &catalog,
+        "glm-user",
+        "fixture",
+        None,
+        Some(&tied),
+        AT,
     )
     .unwrap();
-    sample(&second, "acct-b", "fixture", 20.0);
-    sample(&second, "acct-a", "fixture", 20.0);
-    let reversed = candidates(&second, &second_catalog, "fixture");
-    assert_eq!(set, reversed);
-
-    // Activity on the better-scoring account never reorders producer output:
-    // different quota scores keep their order across reproductions.
-    let tilted_home = home(&[("acct-a", "FAKE_A"), ("acct-b", "FAKE_B")]);
-    let mut busy = agent_run_store::fixture::open(tilted_home.path()).unwrap();
-    let busy_catalog = ProviderCatalog::new(busy.list_accounts().unwrap(), serde_json::from_value(json!([
-        {
-            "id":"glm-user","harness":"claude-code",
-            "connection":{"kind":"custom","endpoint":"https://gateway.example/api","protocol":"messages"},
-            "auth_family":"anthropic","limits_source":"none",
-            "models":[{"id":"fixture"}],
-            "bindings":[
-                {"label":"alpha","account":"acct-a"},
-                {"label":"beta","account":"acct-b"}
-            ]
-        }
-    ]))
-    .unwrap())
-    .unwrap();
-    sample(&busy, "acct-a", "fixture", 20.0);
-    sample(&busy, "acct-b", "fixture", 30.0);
-    let before = candidates(&busy, &busy_catalog, "fixture");
     assert_eq!(
-        summary(&before),
-        vec![
-            ("acct-b".into(), 0, 1.0, true),
-            ("acct-a".into(), 1, 1.0, true),
+        summary(&tie)[..2],
+        [
+            ("acct-a".into(), 0, 3.0, true),
+            ("acct-b".into(), 0, 1.0, true)
         ]
     );
-    let request = provider_request(tilted_home.path(), "activity");
-    let authority = authority(&busy_catalog, tilted_home.path());
-    busy.admit_provider(
-        &request,
-        &request.storage_projection(),
-        &busy_catalog,
-        &authority,
-        &before,
-        &identity(&request, &authority),
-        4,
+    tied.accounts.reverse();
+    let reversed = select(
+        &store,
+        &catalog,
+        "glm-user",
+        "fixture",
         None,
-        None,
+        Some(&tied),
+        AT,
     )
     .unwrap();
-    let after = candidates(&busy, &busy_catalog, "fixture");
-    assert_eq!(summary(&after), summary(&before));
-    assert_eq!(after.capacity_revision, before.capacity_revision + 1);
-}
-
-/// Pinning resolves one provider-local label to one global account without
-/// failover; disabled or model-ineligible pins refuse typed; a never
-/// collected account is admitted on account-level ownership alone.
-#[test]
-fn pinning_resolves_one_account_and_unknown_accounts_admit() {
-    let home = home(&[
-        ("acct-a", "FAKE_A"),
-        ("acct-b", "FAKE_B"),
-        ("acct-fresh", "FAKE_F"),
-    ]);
-    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
-    sample(&store, "acct-a", "fixture", 20.0);
-    let catalog = {
-        let providers = serde_json::from_value(json!([
-        {
-            "id":"glm-user","harness":"claude-code",
-            "connection":{"kind":"custom","endpoint":"https://gateway.example/api","protocol":"messages"},
-            "auth_family":"anthropic","limits_source":"none",
-            "models":[{"id":"fixture"},{"id":"other"}],
-            "bindings":[
-                {"label":"alpha","account":"acct-a"},
-                {"label":"fresh","account":"acct-fresh"},
-                {"label":"other-only","account":"acct-b","models":["other"]}
-            ]
-        }]))
-        .unwrap();
-        ProviderCatalog::new(store.list_accounts().unwrap(), providers).unwrap()
-    };
-    let pin = |store: &Store, label: &str| {
-        provider_candidates_at(
-            store,
-            &catalog,
-            &"glm-user".parse().unwrap(),
-            "fixture",
-            Some(label),
-            &none_ineligible(),
-            AT,
-        )
-    };
-    let pinned = pin(&store, "alpha").unwrap();
+    assert_eq!(summary(&reversed), summary(&tie));
+    let alias = select(
+        &store,
+        &catalog,
+        "glm-alias",
+        "fixture",
+        None,
+        Some(&source),
+        AT,
+    )
+    .unwrap();
+    assert_eq!(
+        alias.candidates[0].physical_keys[0].as_str(),
+        "acct-a::primary"
+    );
+    let pinned = select(
+        &store,
+        &catalog,
+        "glm-user",
+        "fixture",
+        Some("alpha-two"),
+        Some(&source),
+        AT,
+    )
+    .unwrap();
     assert_eq!(
         pinned.intent,
         SelectionIntent::Pinned("acct-a".parse().unwrap())
     );
-    assert_eq!(summary(&pinned), vec![("acct-a".into(), 0, 1.0, true)]);
-
-    let ineligible = pin(&store, "other-only").unwrap_err();
-    assert!(
-        matches!(
-            ineligible,
-            Error::QuotaAdmission(QuotaAdmissionError::NoEligibleAccount { .. })
-        ),
-        "{ineligible:?}"
+    assert_eq!(pinned.candidates.len(), 1);
+    let pinned_unknown = select(
+        &store,
+        &catalog,
+        "glm-user",
+        "fixture",
+        Some("heavy"),
+        Some(&source),
+        AT,
+    )
+    .unwrap();
+    assert_eq!(
+        pinned_unknown.intent,
+        SelectionIntent::Pinned("acct-c".parse().unwrap())
     );
-    let unbound = pin(&store, "missing").unwrap_err();
-    assert!(unbound.to_string().contains("label"), "{unbound:?}");
+    assert_eq!(pinned_unknown.candidates.len(), 1);
+    assert!(!pinned_unknown.candidates[0].quota_known);
+    assert!(pinned_unknown.candidates[0].physical_keys.is_empty());
+    let other = select(
+        &store,
+        &catalog,
+        "glm-user",
+        "other",
+        None,
+        Some(&source),
+        AT,
+    )
+    .unwrap();
+    assert!(other.candidates.iter().all(|c| !c.quota_known));
+}
 
-    store.disable_account(&"acct-a".parse().unwrap()).unwrap();
-    let disabled = pin(&store, "alpha").unwrap_err();
+/// Cooldowns are local to provider/account, exact at expiry and retain their
+/// original billing/quota reason even when source standings are available.
+#[test]
+fn cooldown_scope_nearest_expiry_and_exhausted_precedence() {
+    let home = home();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
+    let catalog = catalog(&store);
+    for (id, reason, until) in [
+        ("acct-a", "billing_unavailable", AT + 3599.25),
+        ("acct-b", "quota_exhausted", AT + 20.1),
+        ("acct-c", "billing_unavailable", AT + 3000.0),
+    ] {
+        store.conn.execute("INSERT INTO binding_cooldowns(provider_id,account_id,reason,observed_at,blocked_until,attempt_id) VALUES('glm-user',?1,?2,?3,?4,'synthetic')",rusqlite::params![id,reason,AT,until]).unwrap();
+    }
+    let mut source = snapshot();
+    let err = select(
+        &store,
+        &catalog,
+        "glm-user",
+        "fixture",
+        None,
+        Some(&source),
+        AT,
+    )
+    .unwrap_err();
     assert!(
-        matches!(
-            disabled,
-            Error::QuotaAdmission(QuotaAdmissionError::NoEligibleAccount { .. })
-        ),
-        "{disabled:?}"
+        matches!(err,Error::QuotaAdmission(QuotaAdmissionError::BindingCooldown{account,reason:BindingCooldownReason::QuotaExhausted,retry_after_seconds:21,..}) if account.as_str()=="acct-b")
+    );
+    let err = select(
+        &store,
+        &catalog,
+        "glm-user",
+        "fixture",
+        Some("alpha"),
+        Some(&source),
+        AT,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err,Error::QuotaAdmission(QuotaAdmissionError::BindingCooldown{account,reason:BindingCooldownReason::BillingUnavailable,retry_after_seconds:3600,..}) if account.as_str()=="acct-a")
+    );
+    assert_eq!(
+        select(
+            &store,
+            &catalog,
+            "glm-alias",
+            "fixture",
+            None,
+            Some(&source),
+            AT
+        )
+        .unwrap()
+        .candidates[0]
+            .account
+            .as_str(),
+        "acct-a"
     );
     store
         .conn
         .execute(
-            "UPDATE provider_accounts SET status='enabled' WHERE account_id='acct-a'",
+            "DELETE FROM binding_cooldowns WHERE account_id='acct-b'",
             [],
         )
         .unwrap();
-
-    // A pinned unknown account stays itself: the real store admits it on
-    // account-level ownership alone, with no fabricated pool keys.
-    let fresh = pin(&store, "fresh").unwrap();
-    assert_eq!(summary(&fresh), vec![("acct-fresh".into(), 0, 1.0, false)]);
-    assert!(fresh.candidates[0].physical_keys.is_empty());
-    let request = provider_request(home.path(), "fresh-admit");
-    let mut fresh_authority = authority(&catalog, home.path());
-    fresh_authority.eligible_accounts = vec!["acct-fresh".parse().unwrap()];
-    let admitted = store
-        .admit_provider(
-            &request,
-            &request.storage_projection(),
-            &catalog,
-            &fresh_authority,
-            &fresh,
-            &identity(&request, &fresh_authority),
-            4,
-            None,
-            Some(&"acct-fresh".parse().unwrap()),
-        )
-        .unwrap();
-    assert_eq!(admitted.account_id.as_str(), "acct-fresh");
-    let reserved: i64 = store
-        .conn
-        .query_row(
-            "SELECT COUNT(*) FROM attempt_quota_keys k JOIN attempts a ON a.id=k.attempt_id \
-             WHERE a.agent_id=?",
-            [admitted.agent_id.as_str()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(reserved, 0);
-
-    // The same pinned account refuses typed once its lane is latched.
-    latch(&store, "acct-fresh", "fixture", Some(AT + 10.0));
-    let refused = pin(&store, "fresh").unwrap_err();
+    let mut exhausted: Value = account("acct-b", EXHAUSTED, None);
+    exhausted["models"][0]["state_validity"] = json!({"kind":"until","at":AT+5.0});
+    exhausted["models"][0]["exhausted_until"] = json!(AT + 5.0);
+    source.accounts.retain(|view| view.account != "acct-b");
+    source
+        .accounts
+        .push(serde_json::from_value(exhausted).unwrap());
+    let err = select(
+        &store,
+        &catalog,
+        "glm-user",
+        "fixture",
+        None,
+        Some(&source),
+        AT,
+    )
+    .unwrap_err();
     assert!(
-        matches!(
-            &refused,
-            Error::QuotaAdmission(QuotaAdmissionError::QuotaExhausted { account, .. })
-                if account.as_str() == "acct-fresh"
-        ),
-        "{refused:?}"
+        matches!(err,Error::QuotaAdmission(QuotaAdmissionError::QuotaExhausted{account,..}) if account.as_str()=="acct-b")
+    );
+    store.conn.execute("INSERT INTO binding_cooldowns(provider_id,account_id,reason,observed_at,blocked_until,attempt_id) VALUES('glm-user','acct-b','quota_exhausted',?1,?2,'synthetic')",rusqlite::params![AT,AT+20.1]).unwrap();
+    assert_eq!(
+        select(
+            &store,
+            &catalog,
+            "glm-user",
+            "fixture",
+            None,
+            None,
+            AT + 20.1
+        )
+        .unwrap()
+        .candidates[0]
+            .account
+            .as_str(),
+        "acct-b"
     );
 }
 
-/// Producing candidates and orders changes no row and opens no transport;
-/// the returned revision matches the snapshot and stays admission-fresh.
+/// Ordered provider weights choose fallback order, without scaling the source
+/// score; disabled and exhausted accounts are still excluded.
 #[test]
-fn producing_candidates_is_read_only_and_revision_consistent() {
-    let home = home(&[
-        ("acct-a", "FAKE_A"),
-        ("acct-b", "FAKE_B"),
-        ("acct-c", "FAKE_C"),
-    ]);
+fn ordered_bindings_keep_fallback_order_and_exclude_blocked_accounts() {
+    let home = home();
     let mut store = agent_run_store::fixture::open(home.path()).unwrap();
-    let catalog = catalog(&store);
-    sample(&store, "acct-a", "fixture", 20.0);
-    sample(&store, "acct-b", "fixture", 30.0);
-    legacy_sample(&store, 99.0);
-    let before: (i64, i64, i64, i64) = store
-        .conn
-        .query_row(
-            "SELECT (SELECT COUNT(*) FROM capacity_samples),\
-             (SELECT COUNT(*) FROM quota_exhaustion),\
-             (SELECT COUNT(*) FROM attempts),\
-             (SELECT revision FROM quota_capacity_revision WHERE id=1)",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .unwrap();
-    let set = candidates(&store, &catalog, "fixture");
-    let order: ProviderCapacityOrder =
-        provider_order_at(&store, &catalog, &none_ineligible(), AT).unwrap();
-    let after: (i64, i64, i64, i64) = store
-        .conn
-        .query_row(
-            "SELECT (SELECT COUNT(*) FROM capacity_samples),\
-             (SELECT COUNT(*) FROM quota_exhaustion),\
-             (SELECT COUNT(*) FROM attempts),\
-             (SELECT revision FROM quota_capacity_revision WHERE id=1)",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .unwrap();
-    assert_eq!(before, after);
-    assert_eq!(set.capacity_revision, after.3);
-    assert_eq!(order.capacity_revision, after.3);
-    // The legacy NULL-identity row never became account quota: the known
-    // accounts keep the exact scores it would have inflated.
-    assert_eq!(
-        summary(&set),
-        vec![
-            ("acct-a".into(), 0, 3.0, true),
-            ("acct-b".into(), 1, 1.0, true),
-            ("acct-c".into(), 2, 100.0, false),
-        ]
-    );
-
-    // Admission against the produced revision commits and moves it.
-    let request = provider_request(home.path(), "ranked");
-    let authority = authority(&catalog, home.path());
-    let admitted = store
-        .admit_provider(
-            &request,
-            &request.storage_projection(),
-            &catalog,
-            &authority,
-            &set,
-            &identity(&request, &authority),
-            4,
-            None,
-            None,
-        )
-        .unwrap();
-    assert_eq!(admitted.account_id.as_str(), "acct-a");
-    assert_eq!(
-        store.quota_capacity_revision().unwrap(),
-        set.capacity_revision + 1
-    );
-    let second = provider_request(home.path(), "ranked-two");
-    let stale = store
-        .admit_provider(
-            &second,
-            &second.storage_projection(),
-            &catalog,
-            &authority,
-            &set,
-            &identity(&second, &authority),
-            4,
-            None,
-            None,
-        )
-        .unwrap_err();
-    assert!(
-        matches!(
-            stale,
-            Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. })
-        ),
-        "{stale:?}"
-    );
-    let refreshed = candidates(&store, &catalog, "fixture");
-    assert_eq!(refreshed.capacity_revision, set.capacity_revision + 1);
-}
-
-/// Invalid input, overflow, malformed, future, and conflicting alias
-/// mappings are all accounted for explicitly.
-#[test]
-fn invalid_input_overflow_and_alias_conflicts_are_explicit() {
-    let home = home(&[("acct-a", "FAKE_A")]);
-    let store = agent_run_store::fixture::open(home.path()).unwrap();
-    let providers = serde_json::from_value(json!([
-        {
-            "id":"plus","harness":"claude-code",
-            "connection":{"kind":"custom","endpoint":"https://gateway.example/api","protocol":"messages"},
-            "auth_family":"anthropic","limits_source":"none",
-            "models":[{"id":"fast","native_model":"lane-a"}],
-            "bindings":[{"label":"main","account":"acct-a","priority_multiplier":1e308}]
-        },
-        {
-            "id":"pro","harness":"claude-code",
-            "connection":{"kind":"custom","endpoint":"https://gateway.example/api","protocol":"messages"},
-            "auth_family":"anthropic","limits_source":"none",
-            "models":[{"id":"fast","native_model":"lane-b"}],
-            "bindings":[{"label":"main","account":"acct-a"}]
-        }
+    let mut provider: ProviderDefinition = catalog(&store)
+        .provider(&"glm-user".parse().unwrap())
+        .unwrap()
+        .clone();
+    provider.ordered_accounts = true;
+    provider.bindings = serde_json::from_value(json!([
+        {"label":"beta","account":"acct-b","priority_multiplier":1.0},
+        {"label":"gamma","account":"acct-c","priority_multiplier":1.0},
+        {"label":"alpha","account":"acct-a","priority_multiplier":1.7976931348623157e308}
     ]))
     .unwrap();
-    let catalog = ProviderCatalog::new(store.list_accounts().unwrap(), providers).unwrap();
-    sample(&store, "acct-a", "lane-a", 100.0);
-
-    let blank = provider_candidates_at(
-        &store,
-        &catalog,
-        &"plus".parse().unwrap(),
-        " ",
-        None,
-        &none_ineligible(),
-        AT,
-    )
-    .unwrap_err();
-    assert!(blank.to_string().contains("nonblank"), "{blank:?}");
-    let unknown_provider = provider_candidates_at(
-        &store,
-        &catalog,
-        &"missing".parse().unwrap(),
-        "fast",
-        None,
-        &none_ineligible(),
-        AT,
-    )
-    .unwrap_err();
-    assert!(unknown_provider.to_string().contains("not configured"));
-    let unoffered = provider_candidates_at(
-        &store,
-        &catalog,
-        &"plus".parse().unwrap(),
-        "slow",
-        None,
-        &none_ineligible(),
-        AT,
-    )
-    .unwrap_err();
-    assert!(
-        unoffered.to_string().contains("not offered"),
-        "{unoffered:?}"
-    );
-
-    // The huge weight overflows the priority; the account is excluded and
-    // the producer reports overflow instead of sorting an infinity.
-    let overflow = provider_candidates_at(
-        &store,
-        &catalog,
-        &"plus".parse().unwrap(),
-        "fast",
-        None,
-        &none_ineligible(),
-        AT,
-    )
-    .unwrap_err();
-    assert!(overflow.to_string().contains("overflow"), "{overflow:?}");
-    let order = provider_order_at(&store, &catalog, &none_ineligible(), AT).unwrap();
-    let plus = order
-        .providers
+    let catalog = ProviderCatalog::new(store.list_accounts().unwrap(), vec![provider]).unwrap();
+    let mut source = snapshot();
+    assert_eq!(
+        select(
+            &store,
+            &catalog,
+            "glm-user",
+            "fixture",
+            None,
+            Some(&source),
+            AT
+        )
+        .unwrap()
+        .candidates
         .iter()
-        .find(|p| p.provider.as_str() == "plus")
-        .unwrap();
-    assert_eq!(plus.models[0].status, "priority_overflow");
-    assert_eq!(plus.score, None);
-
-    // The same model id under the other provider maps to its own native
-    // lane; membership is not merged across the aliases.
-    let pro = provider_candidates_at(
+        .map(|c| c.account.as_str())
+        .collect::<Vec<_>>(),
+        ["acct-a", "acct-b", "acct-c"]
+    );
+    source.accounts.retain(|view| view.account != "acct-a");
+    source
+        .accounts
+        .push(serde_json::from_value(account("acct-a", EXHAUSTED, None)).unwrap());
+    store.disable_account(&"acct-b".parse().unwrap()).unwrap();
+    let set = select(
         &store,
         &catalog,
-        &"pro".parse().unwrap(),
-        "fast",
+        "glm-user",
+        "fixture",
         None,
-        &none_ineligible(),
+        Some(&source),
         AT,
     )
     .unwrap();
-    assert_eq!(summary(&pro), vec![("acct-a".into(), 0, 1.0, false)]);
-
-    // Malformed and future observations are unknown, never known zero.
-    store
-        .conn
-        .execute("DELETE FROM capacity_samples", [])
-        .unwrap();
-    sample_full(
-        &store,
-        "acct-a",
-        "lane-a",
-        150.0,
-        AT - 10.0,
-        AT + 10.0,
-        AT + 20.0,
-    );
-    sample_full(
-        &store,
-        "acct-a",
-        "lane-b",
-        50.0,
-        AT + 10.0,
-        AT + 20.0,
-        AT + 30.0,
-    );
-    let malformed = provider_candidates_at(
+    assert_eq!(set.candidates.len(), 1);
+    assert_eq!(set.candidates[0].account.as_str(), "acct-c");
+    assert!(!set.candidates[0].quota_known);
+    let err = select(
         &store,
         &catalog,
-        &"pro".parse().unwrap(),
-        "fast",
-        None,
-        &none_ineligible(),
+        "glm-user",
+        "fixture",
+        Some("beta"),
+        Some(&source),
         AT,
     )
-    .unwrap();
-    assert_eq!(summary(&malformed), vec![("acct-a".into(), 0, 1.0, false)]);
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        Error::QuotaAdmission(QuotaAdmissionError::NoEligibleAccount { .. })
+    ));
 }
 
-/// A provider with no bindings accounts for its models explicitly.
+/// Bad identities and overflowing local weights refuse explicitly rather than
+/// manufacturing unknown or a finite priority.
 #[test]
-fn empty_providers_are_accounted_explicitly() {
-    let home = home(&[
-        ("acct-a", "FAKE_A"),
-        ("acct-b", "FAKE_B"),
-        ("acct-c", "FAKE_C"),
-    ]);
+fn invalid_selection_and_priority_overflow_are_explicit() {
+    let home = home();
     let store = agent_run_store::fixture::open(home.path()).unwrap();
-    let catalog = catalog(&store);
-    let order = provider_order_at(&store, &catalog, &none_ineligible(), AT).unwrap();
-    let bare = order
-        .providers
-        .iter()
-        .find(|p| p.provider.as_str() == "glm-empty")
-        .unwrap();
-    assert_eq!(bare.models[0].status, "no_eligible_account");
-    assert_eq!(bare.score, None);
-}
-
-/// Strict provider request fixture reused from the admission contract.
-fn provider_request(home: &std::path::Path, id: &str) -> ProviderStartRequest {
-    let mut request: ProviderStartRequest = serde_json::from_value(json!({
-        "provider":"glm-user","model":"fixture","profile":"review",
-        "task":"fixture","workdir":home,"request_id":id
-    }))
+    let mut provider = catalog(&store)
+        .provider(&"glm-user".parse().unwrap())
+        .unwrap()
+        .clone();
+    provider.bindings = serde_json::from_value(
+        json!([{"label":"alpha","account":"acct-a","priority_multiplier":1.7976931348623157e308}]),
+    )
     .unwrap();
-    request.validate().unwrap();
-    request
-}
-
-/// Frozen launch authority fixture reused from the admission contract.
-fn authority(
-    catalog: &ProviderCatalog,
-    workdir: &std::path::Path,
-) -> agent_run_domain::catalog::ResolvedLaunchAuthority {
-    let provider = catalog.provider(&"glm-user".parse().unwrap()).unwrap();
-    let mut role = json!({"role_name":"review"});
-    role["config_revision"] = json!(agent_run_domain::canonical::sha256_hex(&role, true));
-    agent_run_domain::catalog::ResolvedLaunchAuthority {
-        provider: provider.id.clone(),
-        harness: provider.harness,
-        connection: provider.connection.clone(),
-        model: "fixture".into(),
-        effort: None,
-        profile: "review".into(),
-        workdir: workdir.canonicalize().unwrap(),
-        role_payload: role,
-        assets_sha256: "0".repeat(64).parse().unwrap(),
-        eligible_accounts: vec!["acct-a".parse().unwrap(), "acct-b".parse().unwrap()],
+    let catalog = ProviderCatalog::new(store.list_accounts().unwrap(), vec![provider]).unwrap();
+    let mut source = snapshot();
+    source
+        .accounts
+        .iter_mut()
+        .find(|a| a.account == "acct-a")
+        .unwrap()
+        .models[0]
+        .quota_score = Some(2.0);
+    for (provider, model) in [
+        ("glm-user", " "),
+        ("missing", "fixture"),
+        ("glm-user", "missing"),
+    ] {
+        assert!(select(&store, &catalog, provider, model, None, Some(&source), AT).is_err());
     }
-}
-
-/// Replay identity fixture reused from the admission contract.
-fn identity(
-    request: &ProviderStartRequest,
-    authority: &agent_run_domain::catalog::ResolvedLaunchAuthority,
-) -> Value {
-    json!({
-        "provider_identity_version":2,
-        "provider_request":request,
-        "replay_request_sha256":agent_run_domain::canonical::sha256_hex(
-            &serde_json::to_value(request).unwrap(), true),
-        "authority":authority,
-    })
+    let error = select(
+        &store,
+        &catalog,
+        "glm-user",
+        "fixture",
+        None,
+        Some(&source),
+        AT,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("overflow"));
 }

@@ -279,6 +279,172 @@ fn terminal_compaction_requires_cleanup_and_is_atomic_and_idempotent() {
     assert!(compact.get("candidate").is_some());
 }
 
+/// Every active root pin preserves root/child process evidence, even with an old summary.
+/// Release and compaction roll back together; the last committed release permits reclamation.
+#[test]
+fn pinned_lineage_preserves_process_evidence_until_last_release() {
+    use agent_run_core::housekeeping::compact_process_artifacts;
+    use agent_run_domain::{batch::PinId, domain::Outcome};
+    use agent_run_store::{process_ownership::compact_terminal_processes, writer::WriteTx};
+    use rusqlite::params;
+    use serde_json::json;
+
+    let home = common::Home::new();
+    let mut store = home.store();
+    let (root, _) = store
+        .admit(&home.request(), &home.config, &json!({}), None)
+        .unwrap();
+    let pins = [PinId::new(), PinId::new()];
+    for pin in &pins {
+        store
+            .conn
+            .execute(
+                "INSERT INTO history_pins(pin_id,root_agent_id) VALUES(?,?)",
+                params![pin.as_str(), root.as_str()],
+            )
+            .unwrap();
+    }
+    // A later resume inherits its root's already-active pins.
+    let (child, _) = store
+        .admit(&home.request(), &home.config, &json!({}), None)
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET root_agent_id=?,parent_agent_id=?,sequence=2 WHERE id=?",
+            params![root.as_str(), root.as_str(), child.as_str()],
+        )
+        .unwrap();
+    let mut evidence = Vec::new();
+    for (index, id) in [&root, &child].into_iter().enumerate() {
+        store.running(id, 10 + index as i32).unwrap();
+        let attempt = format!("{id}:1");
+        let leader = identity(10 + index as i32, &format!("root-{index}"));
+        let snapshot = OwnershipSnapshot {
+            leader: leader.clone(),
+            members: vec![leader],
+            descendants_observed: true,
+        };
+        store
+            .remember_processes("attempt", &attempt, &snapshot)
+            .unwrap();
+        store.conn.execute(
+            "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?,1,'mcp_discovery_ownership',?)",
+            params![id.as_str(), serde_json::to_string(&snapshot).unwrap()],
+        ).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE attempts SET phase='cleanup_complete',cleanup_proof_json=? WHERE id=?",
+                params![
+                    json!({"confirmed":true,"group_gone":true,"descendants_gone":true}).to_string(),
+                    attempt
+                ],
+            )
+            .unwrap();
+        store
+            .finish(id, &Outcome::failure("fixture"), None, None)
+            .unwrap();
+        assert!(
+            store
+                .remembered_processes("attempt", &attempt)
+                .unwrap()
+                .is_some()
+        );
+        let summaries: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='process_summary_v1'",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(summaries, 0, "terminal commit must preserve pinned details");
+        // An old summary must not bypass the independent filesystem pin guard.
+        store.conn.execute(
+            "INSERT INTO events(agent_id,at,kind,data_json) VALUES(?,1,'process_summary_v1','{}')",
+            [id.as_str()],
+        ).unwrap();
+        let directory = home.path.join("agents").join(id.as_str());
+        agent_run_platform::fs::private_dir(&directory).unwrap();
+        let recovery = directory.join(format!("recovery.{attempt}.json"));
+        let receipt = json!({"ownership":snapshot,"candidate":{"path":"answer.md"}}).to_string();
+        std::fs::write(&recovery, &receipt).unwrap();
+        evidence.push((id, attempt, recovery, receipt));
+    }
+    store.release_history_pin(&pins[0]).unwrap().unwrap();
+    for (id, attempt, recovery, receipt) in &evidence {
+        let tx = WriteTx::begin(&store.conn).unwrap();
+        assert!(!compact_terminal_processes(&tx, id.as_str()).unwrap());
+        tx.commit().unwrap();
+        assert!(
+            store
+                .remembered_processes("attempt", attempt)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            compact_process_artifacts(&home.path, &store.conn, id.as_str(), 64).unwrap(),
+            0
+        );
+        assert_eq!(std::fs::read_to_string(recovery).unwrap(), *receipt);
+    }
+    {
+        let tx = WriteTx::begin(&store.conn).unwrap();
+        tx.execute(
+            "UPDATE history_pins SET released=1 WHERE pin_id=?",
+            [pins[1].as_str()],
+        )
+        .unwrap();
+        for (id, _, _, _) in &evidence {
+            assert!(compact_terminal_processes(&tx, id.as_str()).unwrap());
+        }
+        // Drop rolls back the release and both compactions as one transaction.
+    }
+    for (id, attempt, recovery, receipt) in &evidence {
+        assert!(
+            store
+                .remembered_processes("attempt", attempt)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            compact_process_artifacts(&home.path, &store.conn, id.as_str(), 64).unwrap(),
+            0
+        );
+        assert_eq!(std::fs::read_to_string(recovery).unwrap(), *receipt);
+        let discoveries: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE agent_id=? AND kind='mcp_discovery_ownership'",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(discoveries, 1);
+    }
+    store.release_history_pin(&pins[1]).unwrap().unwrap();
+    for (id, attempt, recovery, _) in &evidence {
+        let tx = WriteTx::begin(&store.conn).unwrap();
+        assert!(compact_terminal_processes(&tx, id.as_str()).unwrap());
+        tx.commit().unwrap();
+        assert!(
+            store
+                .remembered_processes("attempt", attempt)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            compact_process_artifacts(&home.path, &store.conn, id.as_str(), 64).unwrap(),
+            1
+        );
+        let receipt: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(recovery).unwrap()).unwrap();
+        assert!(receipt.get("ownership").is_none());
+        assert!(receipt.get("candidate").is_some());
+    }
+}
+
 /// Old JSON stays readable and basename validation rejects paths/control data without altering identity fences.
 #[test]
 fn program_metadata_is_optional_and_names_are_basenames() {

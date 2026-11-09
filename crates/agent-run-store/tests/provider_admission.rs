@@ -16,6 +16,9 @@ use std::{
     sync::{Arc, Barrier},
 };
 
+#[path = "provider_admission/quota_decision.rs"]
+mod quota_decision_fence;
+
 /// Opens one initialized disposable store with four fake account references.
 fn home() -> tempfile::TempDir {
     let home = tempfile::tempdir().unwrap();
@@ -79,6 +82,395 @@ fn provider_request(home: &Path, id: &str) -> ProviderStartRequest {
     request
 }
 
+/// Batch rollback, replay and retention share the ordinary admission transaction.
+#[test]
+fn generic_batch_is_atomic_and_receipt_survives_history_retention() {
+    use agent_run_domain::{batch::StartBatchRequest, domain::AgentId};
+    use agent_run_store::{
+        batch_admission::{BatchAdmission, BatchMember},
+        provider_admission::AdmissionInputs,
+    };
+
+    let home = home();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
+    let store_id = agent_run_store::store_identity::read(&store.conn).unwrap();
+    let catalog = catalog(&store);
+    let authority = authority(&catalog, home.path());
+    let mut first = provider_request(home.path(), "temporary-a");
+    first.request_id = None;
+    first.task = "first".into();
+    let mut second = first.clone();
+    second.task = "second".into();
+    let first_effective = first.storage_projection();
+    let second_effective = second.storage_projection();
+    let first_identity = identity(&first, &authority);
+    let second_identity = identity(&second, &authority);
+    let candidates = candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+    let mut request = StartBatchRequest {
+        request_id: "batch-key".into(),
+        jobs: vec![first.clone(), second.clone()],
+        retain_history: true,
+        expected_store_id: Some(store_id.clone()),
+        preconditions: None,
+    };
+    request.validate_intent().unwrap();
+    let fingerprint = request.fingerprint().unwrap();
+    let ids = [AgentId::new(), AgentId::new()];
+    let jobs = |cap| {
+        vec![
+            BatchMember {
+                id: ids[0].clone(),
+                inputs: AdmissionInputs {
+                    request: &first,
+                    effective: &first_effective,
+                    authority: &authority,
+                    candidates: &candidates,
+                    identity: &first_identity,
+                    global_cap: cap,
+                    harness_cap: None,
+                    pinned: None,
+                },
+            },
+            BatchMember {
+                id: ids[1].clone(),
+                inputs: AdmissionInputs {
+                    request: &second,
+                    effective: &second_effective,
+                    authority: &authority,
+                    candidates: &candidates,
+                    identity: &second_identity,
+                    global_cap: cap,
+                    harness_cap: None,
+                    pinned: None,
+                },
+            },
+        ]
+    };
+    let revision = store.quota_capacity_revision().unwrap();
+    // Fail the second owner observation after the first job was written in the
+    // same transaction. Neither the partial job nor the receipt may survive.
+    agent_run_store::fixture::fail_owner_inspection_after(1);
+    let owner_failure = store.admit_batch(BatchAdmission {
+        request_id: &request.request_id,
+        fingerprint: &fingerprint,
+        retain_history: true,
+        expected_store_id: Some(&store_id),
+        preconditions: None,
+        catalog: &catalog,
+        jobs: jobs(4),
+    });
+    assert!(matches!(owner_failure, Err(Error::Io(_))));
+    for table in ["agents", "attempts", "start_batch_receipts", "history_pins"] {
+        let count: i64 = store
+            .conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "{table} must roll back after owner failure");
+    }
+    assert_eq!(store.quota_capacity_revision().unwrap(), revision);
+    let result = store.admit_batch(BatchAdmission {
+        request_id: &request.request_id,
+        fingerprint: &fingerprint,
+        retain_history: true,
+        expected_store_id: Some(&store_id),
+        preconditions: None,
+        catalog: &catalog,
+        jobs: jobs(1),
+    });
+    assert!(matches!(result, Err(Error::Capacity)));
+    for table in ["agents", "attempts", "start_batch_receipts", "history_pins"] {
+        let count: i64 = store
+            .conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "{table} must roll back");
+    }
+    assert_eq!(store.quota_capacity_revision().unwrap(), revision);
+
+    // The writer rechecks the restart fence even if preflight ran earlier.
+    let restart = store.begin_service_restart("batch-restart", 1.0).unwrap();
+    let blocked = store.admit_batch(BatchAdmission {
+        request_id: &request.request_id,
+        fingerprint: &fingerprint,
+        retain_history: true,
+        expected_store_id: Some(&store_id),
+        preconditions: None,
+        catalog: &catalog,
+        jobs: jobs(4),
+    });
+    assert!(matches!(blocked, Err(Error::Transition(_))));
+    let count: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM start_batch_receipts", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
+    store
+        .conn
+        .execute(
+            "UPDATE service_restarts SET phase='complete',finished_at=2 WHERE id=?",
+            [restart],
+        )
+        .unwrap();
+
+    let accepted = store
+        .admit_batch(BatchAdmission {
+            request_id: &request.request_id,
+            fingerprint: &fingerprint,
+            retain_history: true,
+            expected_store_id: Some(&store_id),
+            preconditions: None,
+            catalog: &catalog,
+            jobs: jobs(4),
+        })
+        .unwrap();
+    assert!(!accepted.replayed);
+    assert_eq!(accepted.receipt.store_id, store_id);
+    let pins: Vec<_> = accepted
+        .receipt
+        .jobs
+        .iter()
+        .map(|job| job.pin_id.clone().unwrap())
+        .collect();
+    assert_ne!(pins[0], pins[1]);
+    let other_home = self::home();
+    let mut other_store = agent_run_store::fixture::open(other_home.path()).unwrap();
+    let other_id = agent_run_store::store_identity::read(&other_store.conn).unwrap();
+    assert_ne!(store_id, other_id);
+    let mut foreign_receipt = accepted.receipt.clone();
+    foreign_receipt.store_id = other_id.clone();
+    other_store.conn.execute(
+        "INSERT INTO start_batch_receipts(request_id,fingerprint_version,fingerprint,receipt_json) VALUES(?,1,?,?)",
+        rusqlite::params![request.request_id, "a".repeat(64), serde_json::to_string(&foreign_receipt).unwrap()],
+    ).unwrap();
+    assert!(matches!(
+        other_store.replay_batch_scoped(&request.request_id, &fingerprint, Some(&store_id)),
+        Err(Error::StoreIdentityMismatch)
+    ));
+    let wrong_writer = other_store.admit_batch(BatchAdmission {
+        request_id: &request.request_id,
+        fingerprint: &fingerprint,
+        retain_history: true,
+        expected_store_id: Some(&store_id),
+        preconditions: None,
+        catalog: &catalog,
+        jobs: jobs(4),
+    });
+    assert!(matches!(wrong_writer, Err(Error::StoreIdentityMismatch)));
+    for table in ["agents", "attempts", "history_pins"] {
+        let count: i64 = other_store
+            .conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "mismatch cannot admit {table}");
+    }
+    assert!(matches!(
+        store.release_history_pin_scoped(&pins[0], Some(&other_id)),
+        Err(Error::StoreIdentityMismatch)
+    ));
+    assert!(matches!(
+        store.history_pins_scoped(
+            agent_run_domain::batch::HistoryPinFilter::All,
+            10,
+            None,
+            Some(&other_id)
+        ),
+        Err(Error::StoreIdentityMismatch)
+    ));
+    let active: i64 = store
+        .conn
+        .query_row(
+            "SELECT released FROM history_pins WHERE pin_id=?",
+            [pins[0].as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(active, 0);
+    let mut unpinned = request.clone();
+    unpinned.retain_history = false;
+    assert!(matches!(
+        store.replay_batch(&request.request_id, &unpinned.fingerprint().unwrap()),
+        Err(Error::Conflict)
+    ));
+    let mut unscoped = request.clone();
+    unscoped.expected_store_id = None;
+    assert!(matches!(
+        store.replay_batch_scoped(
+            &request.request_id,
+            &unscoped.fingerprint().unwrap(),
+            Some(&store_id)
+        ),
+        Err(Error::Conflict)
+    ));
+    assert_eq!(
+        accepted
+            .receipt
+            .jobs
+            .iter()
+            .map(|job| &job.agent_id)
+            .collect::<Vec<_>>(),
+        vec![&ids[0], &ids[1]]
+    );
+    for job in &accepted.receipt.jobs {
+        let first_attempt: String = store
+            .conn
+            .query_row(
+                "SELECT id FROM attempts WHERE agent_id=? AND number=1",
+                [job.agent_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            job.execution_ref,
+            agent_run_domain::batch::ExecutionRef::from_first_provider_attempt(
+                &job.agent_id,
+                &first_attempt
+            )
+            .unwrap()
+        );
+    }
+    assert_ne!(
+        accepted.receipt.jobs[0].execution_ref,
+        accepted.receipt.jobs[1].execution_ref
+    );
+    // A later provider attempt is not a new execution and cannot replace the
+    // number-one attempt used to derive the retained identity.
+    let later = format!("att_{}", uuid::Uuid::new_v4().simple());
+    store.conn.execute(
+        "INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,phase,ownership_active) VALUES(?,?,2,'prepared','{}',1,'prepared',0)",
+        rusqlite::params![later, ids[0].as_str()],
+    ).unwrap();
+    let replay = store
+        .admit_batch(BatchAdmission {
+            request_id: &request.request_id,
+            fingerprint: &fingerprint,
+            retain_history: true,
+            expected_store_id: Some(&store_id),
+            preconditions: None,
+            catalog: &catalog,
+            jobs: jobs(1),
+        })
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.receipt, accepted.receipt);
+    // Exact replay bypasses the owner probe, while a new scalar admission fails closed.
+    agent_run_store::fixture::fail_owner_inspection_after(0);
+    assert!(
+        store
+            .admit_batch(BatchAdmission {
+                request_id: &request.request_id,
+                fingerprint: &fingerprint,
+                retain_history: true,
+                expected_store_id: Some(&store_id),
+                preconditions: None,
+                catalog: &catalog,
+                jobs: jobs(1),
+            })
+            .unwrap()
+            .replayed
+    );
+    let fresh_candidates =
+        self::candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+    let scalar = store.admit_provider(
+        &first,
+        &first_effective,
+        &catalog,
+        &authority,
+        &fresh_candidates,
+        &first_identity,
+        4,
+        None,
+        None,
+    );
+    assert!(matches!(scalar, Err(Error::Io(_))));
+    for pin in &pins {
+        let first_release = store.release_history_pin(pin).unwrap().unwrap();
+        assert!(!first_release.already_released);
+        assert!(
+            store
+                .release_history_pin(pin)
+                .unwrap()
+                .unwrap()
+                .already_released
+        );
+    }
+    assert_eq!(
+        store
+            .replay_batch(&request.request_id, &fingerprint)
+            .unwrap()
+            .unwrap()
+            .receipt,
+        accepted.receipt
+    );
+    assert!(matches!(
+        store.replay_batch(&request.request_id, &"a".repeat(64)),
+        Err(Error::Conflict)
+    ));
+    store.conn.execute("INSERT INTO start_batch_receipts(request_id,fingerprint_version,fingerprint,receipt_json) VALUES('unknown-codec',99,?,'{}')", [&fingerprint]).unwrap();
+    assert!(matches!(
+        store.replay_batch("unknown-codec", &fingerprint),
+        Err(Error::Unsupported(_))
+    ));
+    let mut malformed = serde_json::to_value(&accepted.receipt).unwrap();
+    malformed["request_id"] = json!("missing-incarnation");
+    malformed["jobs"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("execution_ref");
+    store.conn.execute("INSERT INTO start_batch_receipts(request_id,fingerprint_version,fingerprint,receipt_json) VALUES('missing-incarnation',1,?,?)",
+        rusqlite::params![fingerprint, malformed.to_string()]).unwrap();
+    assert!(matches!(
+        store.replay_batch("missing-incarnation", &fingerprint),
+        Err(Error::Integrity(_))
+    ));
+    assert!(
+        store
+            .conn
+            .execute(
+                "DELETE FROM start_batch_receipts WHERE request_id='batch-key'",
+                []
+            )
+            .is_err()
+    );
+
+    store.conn.execute("UPDATE attempts SET ownership_active=0,phase='cleanup_complete',cleanup_proof_json='{\"never_spawned\":true}',finished_at=1", []).unwrap();
+    store
+        .conn
+        .execute("UPDATE agents SET status='failed',finished_at=1", [])
+        .unwrap();
+    for _ in 0..20 {
+        if store
+            .prune_history(agent_run_domain::domain::now() + 15.0 * 86400.0)
+            .unwrap()
+            == 0
+        {
+            break;
+        }
+    }
+    let remaining: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM agents", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(remaining, 0);
+    drop(store);
+    let reopened = agent_run_store::fixture::open(home.path()).unwrap();
+    assert_eq!(
+        agent_run_store::store_identity::read(&reopened.conn).unwrap(),
+        store_id
+    );
+    assert_eq!(
+        reopened
+            .replay_batch_scoped(&request.request_id, &fingerprint, Some(&store_id))
+            .unwrap()
+            .unwrap()
+            .receipt,
+        accepted.receipt
+    );
+}
+
 /// Freezes the provider/model/account scope with a valid role revision.
 fn authority(catalog: &ProviderCatalog, workdir: &Path) -> ResolvedLaunchAuthority {
     let provider = catalog.provider(&"glm-user".parse().unwrap()).unwrap();
@@ -126,6 +518,7 @@ fn candidates(revision: i64, items: &[(&str, u32)]) -> QuotaCandidateSet {
             .map(|(id, rank)| candidate(id, *rank))
             .collect(),
         capacity_revision: revision,
+        quota_decision: None,
     }
 }
 
@@ -1594,6 +1987,407 @@ fn prepared_storage_layout_gates_provider_resume_only() {
         .unwrap();
     assert!(!replay.created);
     assert_eq!(replay.agent_id, resumed.agent_id);
+}
+
+/// The writer evaluates exact lineage proofs atomically and never rechecks a replay.
+#[test]
+fn batch_preconditions_fence_resume_and_preserve_replay() {
+    use agent_run_domain::{
+        PreconditionFailureReason,
+        batch::{BatchPrecondition, ExecutionRef, PinId, StartBatchRequest},
+        domain::AgentId,
+        status::{StatusRequest, StatusSelector, SuccessCommit},
+    };
+    use agent_run_store::{
+        batch_admission::{BatchAdmission, BatchMember},
+        provider_admission::{AdmissionInputs, ProviderResume},
+    };
+    let home = home();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
+    let mut other = agent_run_store::fixture::open(home.path()).unwrap();
+    let store_id = agent_run_store::store_identity::read(&store.conn).unwrap();
+    let catalog = catalog(&store);
+    let authority = authority(&catalog, home.path());
+    let mut job = provider_request(home.path(), "temporary-job");
+    job.request_id = None;
+    let submit = |store: &mut Store<'_>, request: &StartBatchRequest| {
+        let fingerprint = request.fingerprint().unwrap();
+        let candidate = candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+        let effective = request.jobs[0].storage_projection();
+        let frozen = identity(&request.jobs[0], &authority);
+        store.admit_batch(BatchAdmission {
+            request_id: &request.request_id,
+            fingerprint: &fingerprint,
+            retain_history: request.retain_history,
+            expected_store_id: request.expected_store_id.as_ref(),
+            preconditions: request.preconditions.as_deref(),
+            catalog: &catalog,
+            jobs: vec![BatchMember {
+                id: AgentId::new(),
+                inputs: AdmissionInputs {
+                    request: &request.jobs[0],
+                    effective: &effective,
+                    authority: &authority,
+                    candidates: &candidate,
+                    identity: &frozen,
+                    global_cap: 8,
+                    harness_cap: None,
+                    pinned: None,
+                },
+            }],
+        })
+    };
+    let request = |key: &str| StartBatchRequest {
+        request_id: key.into(),
+        jobs: vec![job.clone()],
+        retain_history: true,
+        expected_store_id: Some(store_id.clone()),
+        preconditions: None,
+    };
+    let seed_a = submit(&mut store, &request("prior-a"))
+        .unwrap()
+        .receipt
+        .jobs
+        .remove(0);
+    let seed_b = submit(&mut store, &request("prior-b"))
+        .unwrap()
+        .receipt
+        .jobs
+        .remove(0);
+    for seed in [&seed_a, &seed_b] {
+        store.conn.execute(
+            "UPDATE agents SET status='failed',finished_at=10,runtime_session_id='fixture-session' WHERE id=?",
+            [seed.agent_id.as_str()],
+        ).unwrap();
+        store.conn.execute(
+            "UPDATE attempts SET state='failed',finished_at=10,phase='cleanup_complete',ownership_active=0,cleanup_proof_json=? WHERE agent_id=?",
+            rusqlite::params![json!({"confirmed":true,"group_gone":true,"descendants_gone":true}).to_string(), seed.agent_id.as_str()],
+        ).unwrap();
+    }
+    let condition = |job: &agent_run_domain::batch::BatchJobReceipt| BatchPrecondition {
+        agent_id: job.agent_id.clone(),
+        sequence: job.sequence,
+        execution_ref: job.execution_ref.clone(),
+        pin_id: job.pin_id.clone().unwrap(),
+    };
+    let a = condition(&seed_a);
+    let b = condition(&seed_b);
+    let status = |store: &Store<'_>, c: &BatchPrecondition| {
+        store
+            .status_snapshot(&StatusRequest {
+                version: 1,
+                expected_store_id: Some(store_id.clone()),
+                include_view: false,
+                targets: vec![StatusSelector {
+                    agent_id: c.agent_id.clone(),
+                    sequence: c.sequence,
+                    execution_ref: Some(c.execution_ref.clone()),
+                    pin_id: Some(c.pin_id.clone()),
+                }],
+            })
+            .unwrap()
+    };
+    let snapshot = status(&store, &a);
+    assert_eq!(snapshot.items[0].lineage_terminal, Some(true));
+    assert_eq!(snapshot.items[0].success_commit, SuccessCommit::Unknown);
+    let counts = |store: &Store<'_>| -> Vec<i64> {
+        ["agents", "attempts", "start_batch_receipts", "history_pins"]
+            .iter()
+            .map(|table| {
+                store
+                    .conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+            })
+            .collect()
+    };
+    let before = counts(&store);
+    let mut guarded = request("guarded");
+    let mut missing = a.clone();
+    missing.agent_id = AgentId::new();
+    missing.pin_id = PinId::new();
+    guarded.preconditions = Some(vec![a.clone(), missing]);
+    assert!(matches!(
+        submit(&mut store, &guarded),
+        Err(Error::PreconditionFailed {
+            reason: PreconditionFailureReason::Unknown
+        })
+    ));
+    assert_eq!(counts(&store), before);
+    let mut wrong_ref = a.clone();
+    wrong_ref.execution_ref = format!("ex1_{}", "f".repeat(64))
+        .parse::<ExecutionRef>()
+        .unwrap();
+    guarded.preconditions = Some(vec![wrong_ref]);
+    assert!(matches!(
+        submit(&mut store, &guarded),
+        Err(Error::PreconditionFailed {
+            reason: PreconditionFailureReason::NotMet
+        })
+    ));
+    assert_eq!(counts(&store), before);
+    store
+        .conn
+        .execute(
+            "UPDATE attempts SET cleanup_proof_json='invalid' WHERE agent_id=?",
+            [a.agent_id.as_str()],
+        )
+        .unwrap();
+    guarded.preconditions = Some(vec![a.clone()]);
+    assert!(matches!(
+        submit(&mut store, &guarded),
+        Err(Error::PreconditionFailed {
+            reason: PreconditionFailureReason::Unknown
+        })
+    ));
+    assert_eq!(counts(&store), before);
+    store
+        .conn
+        .execute(
+            "UPDATE attempts SET cleanup_proof_json=? WHERE agent_id=?",
+            rusqlite::params![
+                json!({"confirmed":true,"group_gone":true,"descendants_gone":true}).to_string(),
+                a.agent_id.as_str()
+            ],
+        )
+        .unwrap();
+
+    // This independent connection resumes A after the earlier successful read,
+    // before admission takes its own writer snapshot.
+    let resume = |store: &mut Store<'_>, parent: &AgentId, key: &str| {
+        let request = provider_request(home.path(), key);
+        let effective = request.storage_projection();
+        let frozen = identity(&request, &authority);
+        let candidate = candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+        let account = "acct-a".parse().unwrap();
+        store
+            .admit_provider_resume(
+                &request,
+                &effective,
+                &catalog,
+                &authority,
+                &candidate,
+                &frozen,
+                8,
+                None,
+                None,
+                ProviderResume {
+                    parent,
+                    prefer: &account,
+                    preflight_digest: None,
+                    restart_id: None,
+                },
+            )
+            .unwrap()
+    };
+    let child_a = resume(&mut other, &a.agent_id, "resume-prior-a");
+    let after_resume = counts(&store);
+    assert!(matches!(
+        submit(&mut store, &guarded),
+        Err(Error::PreconditionFailed {
+            reason: PreconditionFailureReason::NotMet
+        })
+    ));
+    assert_eq!(counts(&store), after_resume);
+    let alias = BatchPrecondition {
+        agent_id: child_a.agent_id.clone(),
+        sequence: 2,
+        execution_ref: ExecutionRef::from_first_provider_attempt(
+            &child_a.agent_id,
+            &child_a.attempt_id,
+        )
+        .unwrap(),
+        pin_id: a.pin_id.clone(),
+    };
+    guarded.preconditions = Some(vec![a.clone(), alias]);
+    assert!(matches!(
+        submit(&mut store, &guarded),
+        Err(Error::Validation(_))
+    ));
+    assert_eq!(counts(&store), after_resume);
+
+    // B is still complete and clean. Admission succeeds even without success
+    // answer evidence, then a resume remains legal after this transaction.
+    guarded.preconditions = Some(vec![b.clone()]);
+    let accepted = submit(&mut store, &guarded).unwrap();
+    assert!(!accepted.replayed);
+    assert_eq!(accepted.receipt.preconditions, guarded.preconditions);
+    let child_b = resume(&mut other, &b.agent_id, "resume-prior-b");
+    assert!(child_b.created);
+    let replay = submit(&mut store, &guarded).unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.receipt, accepted.receipt);
+    assert_eq!(
+        store
+            .replay_batch_scoped(
+                &guarded.request_id,
+                &guarded.fingerprint().unwrap(),
+                Some(&store_id)
+            )
+            .unwrap()
+            .unwrap()
+            .receipt,
+        accepted.receipt
+    );
+    store.release_history_pin(&b.pin_id).unwrap().unwrap();
+    let mut released = guarded.clone();
+    released.request_id = "released".into();
+    assert!(matches!(
+        submit(&mut store, &released),
+        Err(Error::PreconditionFailed {
+            reason: PreconditionFailureReason::NotMet
+        })
+    ));
+}
+
+/// A pending technical restart refuses atomic admission until it is resolved.
+#[test]
+fn batch_precondition_restart_pending_blocks_until_resolved() {
+    use agent_run_domain::{
+        PreconditionFailureReason,
+        batch::{BatchPrecondition, StartBatchRequest},
+        domain::AgentId,
+        status::{RestartResume, StatusRequest, StatusSelector},
+    };
+    use agent_run_store::{
+        batch_admission::{BatchAdmission, BatchMember},
+        provider_admission::AdmissionInputs,
+    };
+    let home = home();
+    let mut store = agent_run_store::fixture::open(home.path()).unwrap();
+    let store_id = agent_run_store::store_identity::read(&store.conn).unwrap();
+    let catalog = catalog(&store);
+    let authority = authority(&catalog, home.path());
+    let mut job = provider_request(home.path(), "temporary-job");
+    job.request_id = None;
+    let submit = |store: &mut Store<'_>, request: &StartBatchRequest| {
+        let fingerprint = request.fingerprint().unwrap();
+        let candidate = candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+        let effective = request.jobs[0].storage_projection();
+        let frozen = identity(&request.jobs[0], &authority);
+        store.admit_batch(BatchAdmission {
+            request_id: &request.request_id,
+            fingerprint: &fingerprint,
+            retain_history: request.retain_history,
+            expected_store_id: request.expected_store_id.as_ref(),
+            preconditions: request.preconditions.as_deref(),
+            catalog: &catalog,
+            jobs: vec![BatchMember {
+                id: AgentId::new(),
+                inputs: AdmissionInputs {
+                    request: &request.jobs[0],
+                    effective: &effective,
+                    authority: &authority,
+                    candidates: &candidate,
+                    identity: &frozen,
+                    global_cap: 8,
+                    harness_cap: None,
+                    pinned: None,
+                },
+            }],
+        })
+    };
+    let request = |key: &str| StartBatchRequest {
+        request_id: key.into(),
+        jobs: vec![job.clone()],
+        retain_history: true,
+        expected_store_id: Some(store_id.clone()),
+        preconditions: None,
+    };
+    let seed = submit(&mut store, &request("restart-source"))
+        .unwrap()
+        .receipt
+        .jobs
+        .remove(0);
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET status='failed',finished_at=10 WHERE id=?",
+            [seed.agent_id.as_str()],
+        )
+        .unwrap();
+    store.conn.execute("UPDATE attempts SET state='failed',finished_at=10,phase='cleanup_complete',ownership_active=0,cleanup_proof_json=? WHERE agent_id=?",
+        rusqlite::params![json!({"confirmed":true,"group_gone":true,"descendants_gone":true}).to_string(),seed.agent_id.as_str()]).unwrap();
+    let condition = BatchPrecondition {
+        agent_id: seed.agent_id.clone(),
+        sequence: seed.sequence,
+        execution_ref: seed.execution_ref.clone(),
+        pin_id: seed.pin_id.unwrap(),
+    };
+    let restart = store
+        .begin_service_restart("pending-precondition", 1.0)
+        .unwrap();
+    store.conn.execute("INSERT INTO service_restart_agents(restart_id,agent_id,cancelled_before_restart,resume_status) VALUES(?,?,0,'pending')",
+        rusqlite::params![restart,condition.agent_id.as_str()]).unwrap();
+    let status = |store: &Store<'_>| {
+        store
+            .status_snapshot(&StatusRequest {
+                version: 1,
+                expected_store_id: Some(store_id.clone()),
+                include_view: false,
+                targets: vec![StatusSelector {
+                    agent_id: condition.agent_id.clone(),
+                    sequence: condition.sequence,
+                    execution_ref: Some(condition.execution_ref.clone()),
+                    pin_id: Some(condition.pin_id.clone()),
+                }],
+            })
+            .unwrap()
+    };
+    assert_eq!(
+        status(&store).items[0].restart_resume,
+        RestartResume::Pending
+    );
+    let counts = |store: &Store<'_>| -> Vec<i64> {
+        ["agents", "attempts", "history_pins", "start_batch_receipts"]
+            .iter()
+            .map(|table| {
+                store
+                    .conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+            })
+            .collect()
+    };
+    let before = counts(&store);
+    let mut guarded = request("after-restart");
+    guarded.preconditions = Some(vec![condition.clone()]);
+    assert!(matches!(
+        submit(&mut store, &guarded),
+        Err(Error::PreconditionFailed {
+            reason: PreconditionFailureReason::NotMet
+        })
+    ));
+    assert_eq!(counts(&store), before);
+    store
+        .conn
+        .execute(
+            "UPDATE service_restart_agents SET resume_status='finished' WHERE restart_id=?",
+            [restart],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE service_restarts SET phase='complete',finished_at=2 WHERE id=?",
+            [restart],
+        )
+        .unwrap();
+    assert_eq!(status(&store).items[0].restart_resume, RestartResume::None);
+    let admitted = submit(&mut store, &guarded).unwrap();
+    assert!(!admitted.replayed);
+    assert_eq!(admitted.receipt.preconditions, guarded.preconditions);
+    assert_eq!(
+        counts(&store),
+        before
+            .into_iter()
+            .map(|count| count + 1)
+            .collect::<Vec<_>>()
+    );
 }
 
 /// Only a captured restart member may use the ordinary resume admission while

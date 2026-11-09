@@ -202,22 +202,11 @@ multiple native store namespaces of the same harness until per-chat namespace
 binding is available: the wrong store can misroute a notification. A message
 accepted by Bridge is not, by itself, proof that a user read it.
 
-Provider quota collectors are optional. `limits_source = "none"` disables the
-configured collector; availability remains unknown unless an account-bound
-observation is recorded separately. Unknown must not be treated as unlimited.
-
-For a shared Linux broker, the optional system quota scripts run each native
-probe under the Unix user that owns its login. Only the bounded, normalized
-quota result crosses back to the broker account; credentials do not. The
-`system_quota_ingest` example verifies the configured account, native model
-membership and unchanged configuration before sending the result through the
-normal broker writer. A root-owned scheduler may run the two probes periodically;
-it must prevent overlapping runs and keep its scripts and settings non-writable
-by the worker accounts. The broker service and its workers need no restart for
-an external quota observation. See [quota collectors](quota-collectors.md) for
-the observation protocol and freshness rules. The standard release currently
-does not install this example or configure its schedule; an operator who installs
-it separately must rebuild and verify it against each broker upgrade.
+Agent Quota owns provider collection. Configure it separately and grant the
+broker access to its socket. `limits_source = "none"` does not disable Quota;
+if the service is unavailable, availability remains unknown. Unknown must not
+be treated as unlimited. Existing collection schedules require a separate
+operational migration and qualification; see [quota sources](quota-collectors.md).
 
 Linux release and host qualification depend on the checks recorded for each
 release; do not assume every architecture or host configuration has been tested.

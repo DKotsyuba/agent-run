@@ -1,12 +1,13 @@
 //! The server side of one writer-socket connection.
 //!
 //! Every process other than the resident broker (detached supervisors,
-//! managed-service executors, CLI commands, capacity collectors) reaches the
+//! managed-service executors and CLI commands) reaches the
 //! one authoritative SQLite writer through a private Unix socket. This module
 //! is the bounded, fail-closed adapter between one such connection and the
 //! resident [`crate::writer::WriterHandle`]; the broker's accept loop (kernel peer identity,
 //! socket binding, shutdown) lives in the `agent-run` transport and calls
 //! [`crate::writer_server::serve_connection`] with the kernel-attested [`crate::writer_server::PeerIdentity`].
+//! Historical collector peers may connect only to reconcile their existing receipts.
 //!
 //! * identity comes from the kernel, never from the peer: the hello's role,
 //!   execution, attempt and capability are only claims that select which

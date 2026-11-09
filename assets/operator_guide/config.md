@@ -25,8 +25,7 @@ home = "/absolute/path/to/agent-run/claude"
 harness = "codex"
 connection = { kind = "native" }
 auth_family = "openai"
-limits_source = "exec"
-collector = { command = "/bin/bash", args = ["/opt/agent-run/collectors/codex.sh"], source = "codex-appserver" }
+limits_source = "none"
 [[providers.codex.models]]
 id = "gpt-6.1-sol"
 [[providers.codex.bindings]]
@@ -41,23 +40,20 @@ separate native Claude login with `connection = { kind = "native" }` and a
 registered `named:claude-code:<label>` account. Billing failure on a custom
 binding or an authoritative quota rejection can continue the verified session
 on the next binding; pinned runs never switch. Billing is not proof of a zero
-balance, and without a collector each new task tries the first eligible binding
-again. An unproven input, unfinished tool or unconfirmed cleanup stops the
+balance, and without usable Quota data each new task tries the first eligible
+binding again. An unproven input, unfinished tool or unconfirmed cleanup stops the
 handoff. See `docs/provider-config-v2.md` for the complete example.
 
-Quota collection executes the configured command and literal arguments.
-Python, Bash and native programs share one JSON stdin/stdout contract. Stdin
-contains account identity, explicit model scope, time and protected authentication
-context. Stdout must be a single version-1 quota document. Never put credentials
-in arguments or script logs. Example scripts remain external files under
-`collectors/` in the native archive and require Bash/jq, plus curl for HTTP.
+Agent Quota owns collection and quota calculations. Configure its service
+separately, then set `capacity.quota.socket` to its absolute Unix socket path.
+An optional `capacity.quota.expected_service_uid` specifies the trusted service
+UID; when absent, Run expects its own effective UID. A missing or unavailable
+service leaves quota unknown and does not block a launch. Run does not send
+native quota failures back to Quota.
 
-The collector's `timeout_seconds` defaults to 30 (1–300 allowed). `env_from`
-grants additional environment variable names. Missing commands, nonzero exit,
-timeout, oversized output and invalid quota facts fail without replacing the
-last good observations. `limits_source = "none"` disables collection. Former
-`lua` and `codex_appserver` sources require migration; there is no built-in
-fallback. Account aliases share observations and failure backoff.
+Older collector settings remain as migration inputs, but Run does not execute
+them. Previously installed collection jobs require a separate migration to
+Agent Quota; they do not supply the new Run selection path.
 
 Canonical Markdown profiles select skills, MCP servers, permissions and required
 constraints. Entries in `[skills].directory` may be directory symlinks to shared
@@ -97,7 +93,9 @@ requires workspace roots and retains the harness's normal approval policy.
 
 The broker checks configuration every 60 seconds and at request boundaries.
 Invalid revisions retain the last valid configuration. Existing runs keep their
-frozen settings; new runs receive the validated revision. Script edits are read
-on each collection and do not require a binary rebuild. Use `agent-run doctor`
-to inspect configuration and freshness, and `agent-run capacity collect --once`
-to execute one collection round.
+frozen settings; new runs receive the validated revision. Agent Quota owns quota
+collection; see its operator documentation to configure collection. Use
+`agent-run limits` to inspect available quota and its completeness marker.
+The old `agent-run capacity collect` and `capacity launchd` commands are no
+longer available. Existing scheduled jobs are not changed automatically;
+moving a macOS launchd job requires a separate migration.

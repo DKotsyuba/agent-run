@@ -1,8 +1,10 @@
 # Provider configuration v2
 
-Schema v2 requires Codex and Claude Code declarations and accepts optional OpenCode, with any number of named providers.
-Capacity sources are `exec` and `none`. Every collector is an external
-executable explicitly selected by its provider; no collector code is embedded.
+Schema v2 permits an empty catalog; configured providers require Codex and
+Claude Code declarations and may also use OpenCode. Agent Quota owns quota
+collection and calculations. The retained provider `limits_source` and
+collector settings are legacy migration inputs, not the source of Run's new
+quota decisions.
 Provider ids are operator-chosen; names such as `codex-plus` and `glm` carry
 no built-in subscription or model-intelligence meaning. The orchestrator
 selects a configured model id. Profiles, skills, and MCP definitions remain
@@ -25,6 +27,10 @@ subscription usage or credit rates; see [OpenAI Fast mode documentation](https:/
 ```toml
 schema_version = 2
 
+[capacity.quota]
+socket = "/absolute/path/to/agent-quota.sock"
+# expected_service_uid = 1000 # optional; defaults to Run's effective UID
+
 [harnesses.codex]
 fast_mode = false # set true to force Fast across this harness
 binary = "/usr/local/bin/codex"
@@ -38,8 +44,7 @@ home = "/var/lib/agent-run/claude"
 harness = "codex"
 connection = { kind = "native" }
 auth_family = "openai"
-limits_source = "exec"
-collector = { command = "/bin/bash", args = ["/opt/agent-run/collectors/codex.sh"], source = "codex-appserver" }
+limits_source = "none"
 recommendations = ["Use for coding work."]
 
 [[providers.codex.models]]
@@ -57,8 +62,7 @@ account = "acct-personal"
 harness = "codex"
 connection = { kind = "native" }
 auth_family = "openai"
-limits_source = "exec"
-collector = { command = "/bin/bash", args = ["/opt/agent-run/collectors/codex.sh"], source = "codex-appserver" }
+limits_source = "none"
 priority_multiplier = 5.0
 
 [[providers.codex-plus.models]]
@@ -74,8 +78,7 @@ models = ["gpt"]
 harness = "claude-code"
 connection = { kind = "custom", endpoint = "https://gateway.example/api/anthropic", protocol = "messages" }
 auth_family = "anthropic"
-limits_source = "exec"
-collector = { command = "/bin/bash", args = ["/opt/agent-run/collectors/glm.sh"], source = "glm-quota" }
+limits_source = "none"
 
 [[providers.glm.models]]
 id = "glm-5.3"
@@ -235,13 +238,14 @@ rights and never expands a previous session's frozen cap. Tool filtering is a
 harness feature, not operating-system isolation or server-side authorization
 against separate connections made with other granted tools.
 
-## External quota execution
+## Quota service
 
-For current configurations, use `limits_source = "exec"` and a collector with
-an absolute `command` and optional literal `args`, or `limits_source = "none"`.
-The former `lua` and `codex_appserver` choices are retired. See
-[the executable contract](quota-collectors.md) for stdin/stdout, credentials,
-script installation, source identity and replacement behavior.
+Configure collection in Agent Quota and point Run to its local socket as shown
+above. The required provider `limits_source` field may be `"none"`; that value
+does not disable Agent Quota. Retained `exec` collector settings are compatibility and migration
+inputs; Run no longer executes them. Previously installed collection jobs
+must be migrated separately; old Run history does not feed new selection.
+The former `lua` and `codex_appserver` choices are retired.
 
 ## OpenCode v2
 
@@ -273,7 +277,8 @@ Register `acct-opencode-public` with family `opencode` and reference
 host login/database. Zen API keys may instead use an existing environment,
 file or Keychain reference; only the selected value reaches child
 `OPENCODE_API_KEY`. Named native accounts and custom gateways are unsupported.
-`none` means unknown capacity, not an unlimited quota or a measured balance.
+If Agent Quota has no usable observation for this model, capacity is unknown,
+not an unlimited quota or a measured balance.
 
 The managed role supplies exact MCP caps and skill permissions. Native editor
 access is scoped to the workdir; read-only shell asks are rejected. These are

@@ -520,6 +520,29 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
                 .await?;
             agent_identity::admission(result)
         }
+        "start_batch" => Ok(serde_json::to_value(
+            service.start_batch(args(raw)?).await?,
+        )?),
+        "batch_receipt" => Ok(serde_json::to_value(
+            service.batch_receipt(args(raw)?).await?,
+        )?),
+        "status" => Ok(serde_json::to_value(service.status(args(raw)?).await?)?),
+        "transcript_exact" => {
+            let request: agent_run_domain::transcript_exact::TranscriptExactRequest = args(raw)?;
+            request.validate()?;
+            service
+                .read(move |store| {
+                    Ok(serde_json::to_value(
+                        agent_run_store::transcript_exact::read(store.conn(), &request)?,
+                    )?)
+                })
+                .await
+        }
+        "history_pins" => service.history_pins(args(raw)?).await,
+        "_lineage_hold_acquire"
+        | "_lineage_hold_lookup"
+        | "_lineage_hold_list"
+        | "_lineage_hold_release" => crate::lineage_holds::call(service, name, raw).await,
         "resume" => {
             let a: Resume = args(raw)?;
             service
@@ -577,8 +600,29 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
             .map_err(|_| crate::Error::Runtime("answer chunk read failed".into()))?
         }
         "capabilities" => {
-            let _: Empty = args(raw)?;
-            Ok(crate::observation::capabilities())
+            let query: agent_run_domain::observation::CapabilitiesQuery = args(raw)?;
+            let mut result = crate::observation::capabilities();
+            if query.include_store_id {
+                let home = service.home.clone();
+                let id = tokio::task::spawn_blocking(move || {
+                    let store = crate::state::Store::open(&home)?;
+                    agent_run_store::store_identity::read(&store.conn)
+                })
+                .await
+                .map_err(|_| crate::Error::Runtime("store identity read failed".into()))??;
+                result["store_id"] = serde_json::to_value(id)?;
+            }
+            if query.include_lineage_holds {
+                result["lineage_holds"] = json!({
+                    "version": 1,
+                    "transport": "operator_socket",
+                    "acquire": "_lineage_hold_acquire",
+                    "lookup": "_lineage_hold_lookup",
+                    "list": "_lineage_hold_list",
+                    "release": "_lineage_hold_release"
+                });
+            }
+            Ok(result)
         }
         "transcript" => {
             let a: Transcript = args(raw)?;
@@ -673,10 +717,10 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
         "models" => service.models(args(raw)?).await,
         "limits" => {
             let _: Empty = args(raw)?;
-            service.limits()
+            service.limits().await
         }
-        "capacity_order" => service.capacity_order(args(raw)?),
-        "delegation_guide" => service.delegation_guide_filtered(args(raw)?),
+        "capacity_order" => service.capacity_order(args(raw)?).await,
+        "delegation_guide" => service.delegation_guide_filtered(args(raw)?).await,
         // Socket-only control/discovery methods; absent from public tool discovery.
         "tools" => {
             let _: Empty = args(raw)?;

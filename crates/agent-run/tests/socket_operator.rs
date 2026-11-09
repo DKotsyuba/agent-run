@@ -18,8 +18,10 @@ use tokio::{
 
 /// Owns the isolated home and a protected operator directory on the prepared filesystem.
 struct Fixture {
-    /// Cleanup owner; all fixture paths are below this directory.
+    /// Cleanup owner for the protected socket directory.
     directory: tempfile::TempDir,
+    /// Cleanup owner for the synthetic database and home.
+    home_directory: tempfile::TempDir,
     /// Initialized synthetic broker home.
     home: PathBuf,
     /// Explicit group-authorized endpoint.
@@ -29,14 +31,22 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// Creates fixtures under the prepared socket root, falling back to TMPDIR.
+    /// Separates the protected socket root from project-owned fixture data.
     fn new() -> Self {
-        let base = std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
+        let base = std::env::var_os("AGENT_RUN_OPERATOR_SOCKET_TMP")
+            .or_else(|| std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP"))
             .or_else(|| std::env::var_os("TMPDIR"))
             .expect("prepare an owned socket test directory");
         let directory = tempfile::Builder::new()
             .prefix("op-")
             .tempdir_in(base)
+            .unwrap();
+        let home_base = std::env::var_os("AGENT_RUN_TEST_TMP")
+            .or_else(|| std::env::var_os("TMPDIR"))
+            .expect("prepare an owned test-data directory");
+        let home_directory = tempfile::Builder::new()
+            .prefix("op-home-")
+            .tempdir_in(home_base)
             .unwrap();
         // Only this newly created fixture wrapper is made searchable. The
         // prepared root and every pre-existing home/ancestor remain untouched.
@@ -44,7 +54,7 @@ impl Fixture {
         let gid = unsafe { libc::getegid() };
         std::os::unix::fs::chown(directory.path(), None, Some(gid)).unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o750)).unwrap();
-        let home = directory.path().join("home");
+        let home = home_directory.path().join("home");
         configure(&home);
         let parent = directory.path().join("operator");
         fs::create_dir(&parent).unwrap();
@@ -52,6 +62,7 @@ impl Fixture {
         std::os::unix::fs::chown(&parent, None, Some(gid)).unwrap();
         Self {
             directory,
+            home_directory,
             home,
             operator: parent.join("api.sock"),
             gid,
@@ -282,7 +293,7 @@ async fn rejects_unsafe_directories_and_malformed_configuration() {
 async fn operator_lock_and_guard_preserve_existing_entries() {
     let fixture = Fixture::new();
     let mut running = fixture.start(socket::ServeOptions::default()).await;
-    let other_home = fixture.directory.path().join("other");
+    let other_home = fixture.home_directory.path().join("other");
     configure(&other_home);
     assert!(
         socket::serve_with_operator(

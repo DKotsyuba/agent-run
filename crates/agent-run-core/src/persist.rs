@@ -1474,13 +1474,6 @@ impl Persist {
         .await
     }
 
-    /// Latches native quota exhaustion for the bound account.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn latch_native_exhaustion(&mut self, op: ops::LatchNativeExhaustion) -> Result<i64> {
-        self.own(&op.execution)?;
-        self.critical(op).await
-    }
-
     /// Allocates the next attempt after an account switch.
     pub async fn allocate_next_attempt(
         &mut self,
@@ -1684,16 +1677,6 @@ pub fn cli_hello() -> Hello {
 /// and never fall back to a local writable database when the broker is absent.
 pub fn operator_producer(home: &Path) -> Producer {
     Producer::connect(&home.join("writer.sock"), cli_hello(), cli_producer_id())
-}
-
-/// Build the metadata collector's authenticated writer client, without opening SQL.
-/// Its authority only permits collector operations, never ownership or completion.
-pub fn collector_producer(home: &Path) -> Producer {
-    let mut hello = cli_hello();
-    hello.role = "collector".into();
-    let mut id = cli_producer_id();
-    id.kind = ProducerKind::Collector;
-    Producer::connect(&home.join("writer.sock"), hello, id)
 }
 
 /// Whether `execution` owns an attempt that was prepared but never spawned a

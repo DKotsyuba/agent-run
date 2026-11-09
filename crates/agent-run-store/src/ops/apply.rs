@@ -64,9 +64,6 @@ pub(crate) struct Checks {
     /// Process identity the payload records (rows 12, 74 and 75); it must be the
     /// authenticated principal's own identity.
     pub claimed: Option<Claimed>,
-    /// Account the payload names (row 31); it must be the account selected
-    /// by the supervisor's pinned owned attempt.
-    pub account: Option<String>,
     /// Runtime home whose recorded layout owner is the authorization target
     /// (row 89), read inside the transaction.
     pub layout: Option<String>,
@@ -190,6 +187,43 @@ fn replay(id: &OperationId, row: StoredRow, replayed: bool) -> Result<SubmitResu
         replayed,
         result: serde_json::from_str(&row.result_json)?,
     }))
+}
+
+/// Replays an identical retired request without starting a write transaction.
+/// A missing receipt is left to the caller to reject as unsupported.
+pub(crate) fn replay_retired(
+    conn: &Connection,
+    authority: &WriteAuthority,
+    kind: OpKindRef,
+    header: &EnvelopeHeader,
+) -> Result<Option<SubmitResult>> {
+    if !conn.is_autocommit() {
+        return Err(agent_run_domain::error::invalid(
+            "writer receipt lookup requires a settled connection",
+        ));
+    }
+    if !kind.permits(authority) {
+        return Ok(Some(refuse(
+            RejectCode::Unauthorized,
+            RejectStage::Authorization,
+            "authority may not submit this operation",
+        )));
+    }
+    let Some(row) = stored(conn, &header.operation_id)? else {
+        return Ok(None);
+    };
+    if row.digest != header.digest.as_str()
+        || row.producer_key != header.producer.key()
+        || row.ordinal != header.ordinal as i64
+        || row.fingerprint != authority.fingerprint()
+    {
+        return Ok(Some(refuse(
+            RejectCode::ReplayConflict,
+            RejectStage::Gate,
+            "operation id was used for different content",
+        )));
+    }
+    replay(&header.operation_id, row, true).map(Some)
 }
 
 /// Looks up the stored outcome of `id` for `authority` (status/replay path).
@@ -382,37 +416,6 @@ fn pinned_attempt(
         None => Err(RejectCode::UnknownScope),
         Some(owner) if owner == execution.as_str() => Ok(()),
         Some(_) => Err(RejectCode::Unauthorized),
-    })
-}
-
-/// Checks that `account` is exactly the account selected by the supervisor's
-/// pinned owned attempt of `execution` (the legacy `<execution>:1` attempt
-/// when none is pinned); any other or absent selection refuses.
-fn pinned_account(
-    conn: &Connection,
-    authority: &WriteAuthority,
-    execution: &AgentId,
-    account: &str,
-) -> Result<std::result::Result<(), RejectCode>> {
-    let WriteAuthority::Supervisor {
-        attempt: pinned, ..
-    } = authority
-    else {
-        return Ok(Err(RejectCode::Unauthorized));
-    };
-    let attempt = pinned
-        .clone()
-        .unwrap_or_else(|| format!("{}:1", execution.as_str()));
-    let selected: Option<Option<String>> = conn
-        .query_row(
-            "SELECT selected_account_id FROM attempts WHERE id=? AND agent_id=? AND ownership_active=1",
-            [attempt.as_str(), execution.as_str()],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(match selected.flatten() {
-        Some(selected) if selected == account => Ok(()),
-        _ => Err(RejectCode::Unauthorized),
     })
 }
 
@@ -675,13 +678,6 @@ fn prepare(
         };
         execution = owner.and_then(|owner| owner.parse().ok());
     }
-    // A supervisor's quota observation is scoped to its own execution.
-    if execution.is_none()
-        && sub.kind == OpKindRef::RecordQuotaSnapshot
-        && let WriteAuthority::Supervisor { execution: own, .. } = authority
-    {
-        execution = Some(own.clone());
-    }
     if attempt.is_none()
         && derives_owned_attempt(sub.kind)
         && let Some(execution) = &execution
@@ -743,13 +739,6 @@ fn prepare(
         Some(claimed) if !claimed_is_principal(authority, claimed) => Err(RejectCode::Unauthorized),
         _ => Ok(()),
     });
-    let checked = match (checked, &sub.checks.account, &execution) {
-        (Ok(()), Some(account), Some(execution)) => {
-            pinned_account(conn, authority, execution, account)?
-        }
-        (Ok(()), Some(_), None) => Err(RejectCode::Unauthorized),
-        (checked, _, _) => checked,
-    };
     Ok(match checked {
         Ok(()) => Prepared::Run,
         Err(RejectCode::UnknownScope) => Prepared::Refuse(

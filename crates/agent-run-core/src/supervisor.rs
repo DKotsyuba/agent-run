@@ -2128,23 +2128,6 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             data["account"] = json!(account);
             data["provider"] = json!(identity.authority.provider);
             data["model"] = json!(identity.authority.model);
-            if let Some((lane, window)) = latch_mapping(&identity, failure) {
-                let reset = data["resets_at"].as_f64();
-                store
-                    .latch_native_exhaustion(ops::LatchNativeExhaustion {
-                        execution: id.clone(),
-                        account: account.clone(),
-                        runtime: identity.authority.provider.as_str().to_owned(),
-                        lane: lane.clone(),
-                        window: window.clone(),
-                        source: "native-quota-exhaustion".to_owned(),
-                        models: governed_lanes(&identity, &account),
-                        observed_at: domain::now(),
-                        reset_at: reset,
-                    })
-                    .await?;
-                data["latched"] = json!({"lane":lane,"window":window});
-            }
             store.event(id, "native_failure", &data).await?;
             state["native_failure"] = data;
         }
@@ -2342,15 +2325,38 @@ async fn failover(
                 .collect()
         })
         .unwrap_or_default();
-    for _ in 0..=crate::service::PROVIDER_STALE_RETRIES {
-        let candidates = crate::capacity::provider_ranking::provider_candidates(
-            store,
-            &frozen,
-            &authority.provider,
-            &authority.model,
-            None,
-            &hard,
-        )
+    let mut submission = 0;
+    let mut decisions = crate::capacity::quota_adapter::DecisionSnapshots::default();
+    loop {
+        let snapshot = decisions
+            .read(identity.provider_config.capacity.quota.as_ref())
+            .await;
+        let ranked_home = home.to_path_buf();
+        let ranked_catalog = frozen.clone();
+        let ranked_provider = authority.provider.clone();
+        let ranked_model = authority.model.clone();
+        let ranked_hard = hard.clone();
+        let candidates = tokio::task::spawn_blocking(move || {
+            let local = agent_run_store::writer::StoreReader::open_with(
+                &ranked_home,
+                crate::service::READ_ALLOWANCE,
+            )?;
+            Ok::<_, Error>(
+                crate::capacity::quota_adapter::candidates_at(
+                    &local,
+                    &ranked_catalog,
+                    &ranked_provider,
+                    &ranked_model,
+                    None,
+                    &ranked_hard,
+                    snapshot.as_deref(),
+                    domain::now(),
+                )?
+                .candidates,
+            )
+        })
+        .await
+        .map_err(|_| "no_eligible_account".to_owned())?
         .map_err(|_| "no_eligible_account".to_owned())?;
         let catalog = serde_json::to_value(&frozen).map_err(|error| error.to_string())?;
         let allocation = store
@@ -2367,7 +2373,22 @@ async fn failover(
             }
             Err(Error::QuotaAdmission(
                 agent_run_domain::catalog::QuotaAdmissionError::SelectionStale { .. },
-            )) => continue,
+            )) if submission < crate::service::PROVIDER_STALE_RETRIES => {
+                submission += 1;
+                decisions.require_fresh();
+            }
+            Err(Error::QuotaAdmission(
+                agent_run_domain::catalog::QuotaAdmissionError::SelectionStale { .. },
+            )) => return Err("selection_busy".into()),
+            Err(Error::QuotaAdmission(
+                agent_run_domain::catalog::QuotaAdmissionError::QuotaClockRollback
+                | agent_run_domain::catalog::QuotaAdmissionError::QuotaDecisionInvalid,
+            )) if decisions
+                .retry_invalidated(&mut submission, crate::service::PROVIDER_STALE_RETRIES) => {}
+            Err(Error::QuotaAdmission(
+                agent_run_domain::catalog::QuotaAdmissionError::QuotaDecisionStale,
+            )) if decisions
+                .retry_expired(&mut submission, crate::service::PROVIDER_STALE_RETRIES) => {}
             Err(Error::QuotaAdmission(
                 agent_run_domain::catalog::QuotaAdmissionError::NoEligibleAccount { .. },
             )) => return Err("no_eligible_account".into()),
@@ -2377,7 +2398,6 @@ async fn failover(
             Err(error) => return Err(error.to_string().into()),
         }
     }
-    Err("selection_busy".into())
 }
 
 /// Test-only controlled failure injection: `AGENT_RUN_INJECT_QUOTA=<n>` makes
@@ -2563,75 +2583,6 @@ fn history_root(
             }),
     }
 }
-/// The exact physical pool of an authoritative exhaustion, when the
-/// provider's own collector mapping establishes it: a Claude Code provider
-/// whose limits come from the first-party `anthropic_usage` collector maps
-/// `five_hour` to `primary`/`five_hour` and `seven_day` to
-/// `secondary`/`seven_day` (both over every bound model, as that collector
-/// records them). Model-scoped weekly windows, overage, Codex's windowless
-/// `usageLimitExceeded` and every other provider stay unmapped: they only
-/// exclude the account for this run.
-fn latch_mapping(
-    identity: &ProviderLaunchIdentity,
-    failure: &adapters::native_failure::NativeFailure,
-) -> Option<(String, String)> {
-    let adapters::native_failure::NativeFailure::QuotaExhausted {
-        window: Some(window),
-        ..
-    } = failure
-    else {
-        return None;
-    };
-    let provider = identity
-        .provider_config
-        .providers
-        .get(&identity.authority.provider)?;
-    if provider.limits_source != agent_run_domain::LimitsSource::Exec {
-        return None;
-    }
-    let pool = provider
-        .collector
-        .as_ref()?
-        .exhaustion_windows
-        .get(window)?;
-    Some((pool.clone(), window.clone()))
-}
-
-/// The model lanes (native alias, else id) an explicitly configured native exhaustion pool
-/// of `account` governs for this provider: every provider model the
-/// account's bindings admit, exactly as that collector builds its unit.
-fn governed_lanes(
-    identity: &ProviderLaunchIdentity,
-    account: &agent_run_domain::catalog::AccountId,
-) -> std::collections::BTreeSet<String> {
-    let Some(provider) = identity
-        .provider_config
-        .providers
-        .get(&identity.authority.provider)
-    else {
-        return Default::default();
-    };
-    provider
-        .bindings
-        .iter()
-        .filter(|binding| &binding.account == account)
-        .flat_map(|binding| {
-            provider.models.iter().filter(move |model| {
-                binding
-                    .models
-                    .as_ref()
-                    .is_none_or(|ids| ids.contains(&model.id))
-            })
-        })
-        .map(|model| {
-            model
-                .native_model
-                .clone()
-                .unwrap_or_else(|| model.id.clone())
-        })
-        .collect()
-}
-
 /// Completes one refused handoff only after proving its attempt never spawned.
 async fn finish_blocked_handoff(
     store: &mut Persist,

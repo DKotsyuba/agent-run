@@ -11,12 +11,12 @@
 use agent_run_config::config::Config;
 use agent_run_domain::{
     catalog::{
-        AccountId, AccountRecord, ProviderCatalog, QuotaCandidateSet, ResolvedLaunchAuthority,
+        AccountId, AccountRecord, PhysicalQuotaKey, ProviderCatalog, QuotaCandidateSet,
+        ResolvedLaunchAuthority,
     },
     domain::{AgentId, OrchestratorRef, Outcome, StartRequest},
     pool::{AcceptanceCriterion, PoolDenial, PoolId, PoolMessage, PoolPropose, PoolVote},
     provider_start::ProviderStartRequest,
-    quota_snapshot::NormalizedQuotaSnapshot,
     storage::{OperationId, PayloadDigest},
     worker::{FinishGuard, FinishRequest, NotifyRequest, WorkerCatalogProof},
 };
@@ -170,6 +170,104 @@ pub struct AdmitProvider {
     pub catalog: ProviderCatalog,
     /// Admission inputs.
     pub inputs: AdmissionSpec,
+}
+
+/// One pre-minted independent job and its trusted provider inputs.
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchMemberSpec {
+    /// Stable public identity minted by the broker.
+    pub id: AgentId,
+    /// Frozen ordinary provider admission facts.
+    pub inputs: AdmissionSpec,
+}
+
+/// Admit all independent jobs and their permanent receipt in one transaction.
+#[derive(Clone, Serialize)]
+pub struct AdmitBatch {
+    /// Permanent batch key in this Run home.
+    pub request_id: String,
+    /// Versioned digest of normalized ordered client intent.
+    pub fingerprint: String,
+    /// Whether each new lineage receives a durable retention pin.
+    pub retain_history: bool,
+    /// Database identity the writer must verify before replay or mutation.
+    pub expected_store_id: Option<agent_run_domain::StoreId>,
+    /// Ordered prerequisites enforced in the admission transaction.
+    pub preconditions: Option<Vec<agent_run_domain::batch::BatchPrecondition>>,
+    /// One frozen catalog for the whole request.
+    pub catalog: ProviderCatalog,
+    /// Prepared jobs in the caller's order.
+    pub jobs: Vec<BatchMemberSpec>,
+}
+
+/// Idempotently release one exact permanent history pin.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReleaseHistoryPin {
+    /// Opaque pin key; never grants worker authority.
+    pub pin_id: agent_run_domain::batch::PinId,
+    /// Optional database identity checked in the same release transaction.
+    pub expected_store_id: Option<agent_run_domain::StoreId>,
+}
+
+/// Atomically hold the exact successful lineage tails under broker authority.
+#[derive(Clone, Serialize)]
+pub struct AcquireLineageHold {
+    /// Ordered acquisition intent; the Store validates every prerequisite.
+    pub acquire: agent_run_domain::lineage_hold::LineageHoldAcquire,
+}
+
+/// Broker-local release proof, retained only in memory and in the payload digest.
+/// A new public invocation must create a new envelope so even a released hold
+/// authenticates again. Exact internal envelope retries retain their receipt.
+#[derive(Clone, Serialize)]
+pub struct ReleaseLineageHold {
+    /// Exact permanent hold identity; it grants no release authority alone.
+    pub hold_id: agent_run_domain::lineage_hold::HoldId,
+    /// Store scope checked before looking up or releasing the hold.
+    pub expected_store_id: agent_run_domain::StoreId,
+    /// Serialized only while computing the local envelope's digest and size.
+    #[serde(serialize_with = "serialize_release_signature")]
+    signature: [u8; 64],
+}
+
+impl ReleaseLineageHold {
+    /// Retains a fixed-size proof for transactional verification, without logging it.
+    pub fn new(
+        hold_id: agent_run_domain::lineage_hold::HoldId,
+        expected_store_id: agent_run_domain::StoreId,
+        signature: [u8; 64],
+    ) -> Self {
+        Self {
+            hold_id,
+            expected_store_id,
+            signature,
+        }
+    }
+
+    /// Borrows the proof only for the Store's signature verifier.
+    pub(super) fn signature(&self) -> &[u8; 64] {
+        &self.signature
+    }
+}
+
+impl std::fmt::Debug for ReleaseLineageHold {
+    /// Identifies the operation without exposing its release capability.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReleaseLineageHold")
+            .field("hold_id", &self.hold_id)
+            .field("expected_store_id", &self.expected_store_id)
+            .field("signature", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Includes all proof bytes in the transient digest input; none enter receipts.
+fn serialize_release_signature<S: serde::Serializer>(
+    signature: &[u8; 64],
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    signature.as_slice().serialize(serializer)
 }
 
 /// 3 — admit one explicit provider resume of a terminal parent.
@@ -602,7 +700,7 @@ pub struct RecordResumeUsageBaseline {
     pub execution: AgentId,
 }
 
-/// 31 — latch an observed native quota exhaustion.
+/// 31 — retired native quota latch, retained for decoding historical requests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LatchNativeExhaustion {
     /// Execution whose attempt observed it.
@@ -1379,7 +1477,7 @@ pub struct ClaimServiceProcessIdentity {
     pub identity: Identity,
 }
 
-/// One capacity sample row.
+/// Retired capacity sample row, retained for decoding historical requests.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapacitySampleRow {
     /// Runtime.
@@ -1402,7 +1500,7 @@ pub struct CapacitySampleRow {
     pub valid_until: f64,
 }
 
-/// 76 — persist one validated capacity slice atomically.
+/// 76 — retired capacity slice request, retained for receipt replay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistCapacitySamples {
     /// Runtime.
@@ -1421,27 +1519,71 @@ pub struct PersistCapacitySamples {
     pub retention: usize,
 }
 
-/// 77 — trim capacity history.
+/// 77 — retired capacity retention request, retained for receipt replay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PruneCapacitySamples {
     /// Retention row bound.
     pub retention: usize,
 }
 
-/// 78 — persist one normalized quota snapshot.
+/// Retired quota window, retained only for decoding historical requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetiredQuotaWindow {
+    /// Collector source identity.
+    pub source: String,
+    /// Provider-native window name.
+    pub name: String,
+    /// Remaining percentage, if known.
+    pub remaining_percent: Option<f64>,
+    /// Provider-reported Unix reset time, if known.
+    pub reset_at: Option<f64>,
+    /// Observation time in Unix seconds.
+    pub observed_at: f64,
+    /// Expiry time in Unix seconds.
+    pub valid_until: f64,
+}
+
+/// Retired physical pool observation in a historical request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetiredQuotaPool {
+    /// Account and quota lane.
+    pub key: PhysicalQuotaKey,
+    /// Provider-reported windows.
+    pub windows: Vec<RetiredQuotaWindow>,
+}
+
+/// Retired model observation in a historical request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetiredQuotaModel {
+    /// Catalog model identifier.
+    pub model: String,
+    /// Physical pools associated with the model.
+    pub pools: Vec<RetiredQuotaPool>,
+}
+
+/// Retired account observation, retained only for decoding historical requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetiredQuotaSnapshot {
+    /// Account that owned the observation.
+    pub account: AccountId,
+    /// Observed model memberships.
+    pub models: Vec<RetiredQuotaModel>,
+}
+
+/// 78 — retired quota snapshot request, retained for receipt replay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordQuotaSnapshot {
     /// Runtime.
     pub runtime: String,
     /// Snapshot.
-    pub snapshot: NormalizedQuotaSnapshot,
+    pub snapshot: RetiredQuotaSnapshot,
     /// Retention row bound.
     pub retention: usize,
     /// Evaluation time.
     pub at: f64,
 }
 
-/// 79 — exhaustion retention; an internal unit of row 78, refused standalone.
+/// 79 — retired internal quota retention unit, refused standalone.
 #[derive(Debug, Clone, Serialize)]
 pub struct RetainExhausted {
     /// Account.

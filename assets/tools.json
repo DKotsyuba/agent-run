@@ -1107,6 +1107,650 @@
     }
   },
   {
+    "name": "start_batch",
+    "description": "Atomically admit 1–20 independent ordinary agents, or admit none. request_id is required and permanently identifies the ordered normalized request in this Run home. Identical retries return the same receipt and never start replacements; changed intent conflicts. Admission is durable before separate supervisor handoffs; it does not prove every process started or completed. Preserve every agent_id, sequence and opaque execution_ref and inspect status yourself. Automatic multi-agent hook binding is not provided; pass an explicit orchestrator per job when needed. Optional preconditions require expected_store_id and 1–20 exact pinned terminal executions with confirmed lineage cleanup; any terminal outcome may qualify. The ordered list is part of the receipt and replay identity. A PreconditionFailed applies to this attempt only and never resolves an earlier unknown outcome. The whole encoded request must fit the existing transport and writer limits.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [{"if":{"required":["preconditions"]},"then":{"required":["expected_store_id"],"properties":{"expected_store_id":{"type":"string","pattern":"^store_[0-9a-f]{32}$"}}}}],
+      "properties": {
+        "request_id": {
+          "type": "string"
+        },
+        "retain_history": {
+          "type": "boolean",
+          "default": false,
+          "description": "Create a durable history pin for each new lineage."
+        },
+        "expected_store_id": {
+          "type": ["string", "null"],
+          "pattern": "^store_[0-9a-f]{32}$"
+        },
+        "preconditions": {"type":"array","minItems":1,"maxItems":20,"items":{"type":"object","additionalProperties":false,"properties":{"agent_id":{"type":"string","pattern":"^ag-[0-9]{8}-[0-9]{6}-[0-9a-f]{10}$"},"sequence":{"type":"integer","minimum":1,"maximum":4294967295},"execution_ref":{"type":"string","pattern":"^ex1_[0-9a-f]{64}$"},"pin_id":{"type":"string","pattern":"^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$"}},"required":["agent_id","sequence","execution_ref","pin_id"]}},
+        "jobs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "account": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "display_name": {
+                "description": "Optional human display label for the agent, shown in list views and inherited by resumes that omit it. At most 64 Unicode characters, no control or bidi formatting; null or omission means unnamed.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "effort": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "fast": {
+                "type": "boolean"
+              },
+              "model": {
+                "type": "string"
+              },
+              "orchestrator": {
+                "description": "Optional external session binding. transport accepts canonical codex_queue or claude_uds and aliases codex or claude.",
+                "anyOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "external_session_id": {
+                        "type": "string"
+                      },
+                      "external_turn_id": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "transport": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "transport",
+                      "external_session_id"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "output_schema": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "profile": {
+                "type": "string"
+              },
+              "read_roots": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "request_id": {
+                "type": "null",
+                "description": "Individual batch jobs cannot have a request_id."
+              },
+              "required_constraints": {
+                "items": {
+                  "enum": [
+                    "web_tools_disabled",
+                    "external_network_isolation",
+                    "loopback_tcp_isolation",
+                    "unix_ipc_isolation",
+                    "mcp_ipc_isolation",
+                    "filesystem_write_isolation",
+                    "filesystem_read_isolation",
+                    "plugin_immutability",
+                    "research_tools_only"
+                  ],
+                  "type": "string"
+                },
+                "type": "array",
+                "uniqueItems": true
+              },
+              "provider": {
+                "type": "string"
+              },
+              "task": {
+                "type": "string"
+              },
+              "workdir": {
+                "type": "string"
+              },
+              "write": {
+                "type": "boolean"
+              },
+              "explicit_finish": {
+                "type": "boolean",
+                "default": true,
+                "description": "New admissions default to explicit callback completion: turn completion waits for events; only private finish ends the run. False selects legacy compatibility. No lifetime timeout."
+              },
+              "required_mcp": {
+                "type": "object",
+                "maxProperties": 8,
+                "propertyNames": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+                },
+                "additionalProperties": {
+                  "type": "array",
+                  "maxItems": 32,
+                  "uniqueItems": true,
+                  "items": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_.-]{1,128}$"
+                  }
+                },
+                "description": "Non-grant assertion on frozen selected MCP servers and exact unprefixed tools. Empty lists require server presence. Omitted or empty map adds no condition; null and duplicates are invalid."
+              },
+              "idle_ping": {
+                "type": "string",
+                "enum": [
+                  "off",
+                  "observe",
+                  "recover"
+                ],
+                "default": "observe",
+                "description": "Frozen health policy: observe invokes no model; recover permits one model control turn per task-progress episode; off preserves explicit holds. No automatic cancellation."
+              }
+            },
+            "required": [
+              "provider",
+              "model",
+              "profile",
+              "task",
+              "workdir"
+            ],
+            "type": "object"
+          }
+        }
+      },
+      "required": [
+        "request_id",
+        "jobs"
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "receipt": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "version": {
+              "type": "integer",
+              "const": 1
+            },
+            "store_id": {
+              "type": "string",
+              "pattern": "^store_[0-9a-f]{32}$"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "preconditions": {"type":"array","minItems":1,"maxItems":20,"items":{"type":"object","additionalProperties":false,"properties":{"agent_id":{"type":"string","pattern":"^ag-[0-9]{8}-[0-9]{6}-[0-9a-f]{10}$"},"sequence":{"type":"integer","minimum":1,"maximum":4294967295},"execution_ref":{"type":"string","pattern":"^ex1_[0-9a-f]{64}$"},"pin_id":{"type":"string","pattern":"^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$"}},"required":["agent_id","sequence","execution_ref","pin_id"]}},
+            "jobs": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 20,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "index": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "agent_id": {
+                    "type": "string"
+                  },
+                  "sequence": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "execution_ref": {
+                    "type": "string",
+                    "pattern": "^ex1_[0-9a-f]{64}$"
+                  },
+                  "pin_id": {
+                    "type": "string",
+                    "pattern": "^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$"
+                  }
+                },
+                "required": [
+                  "index",
+                  "agent_id",
+                  "sequence",
+                  "execution_ref"
+                ]
+              }
+            }
+          },
+          "required": [
+            "version",
+            "store_id",
+            "request_id",
+            "jobs"
+          ]
+        },
+        "replayed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "receipt",
+        "replayed"
+      ]
+    },
+    "resultShape": null,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "batch_receipt",
+    "description": "Read the permanent receipt for an exact normalized start_batch intent, with required expected_store_id. This does not read configuration or quota, admit work, launch processes, or change pins. found:false means only that no matching receipt was committed in this read snapshot; an earlier in-flight admission may still commit. Reuse the original exact intent, including ordered preconditions, and never infer a refusal from absence or from a later precondition failure.",
+    "inputSchema": {
+      "type":"object","additionalProperties":false,
+      "properties":{
+        "request_id":{"type":"string"},
+        "jobs":{
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "account": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "display_name": {
+                "description": "Optional human display label for the agent, shown in list views and inherited by resumes that omit it. At most 64 Unicode characters, no control or bidi formatting; null or omission means unnamed.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "effort": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "fast": {
+                "type": "boolean"
+              },
+              "model": {
+                "type": "string"
+              },
+              "orchestrator": {
+                "description": "Optional external session binding. transport accepts canonical codex_queue or claude_uds and aliases codex or claude.",
+                "anyOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "external_session_id": {
+                        "type": "string"
+                      },
+                      "external_turn_id": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "transport": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "transport",
+                      "external_session_id"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "output_schema": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "profile": {
+                "type": "string"
+              },
+              "read_roots": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "request_id": {
+                "type": "null",
+                "description": "Individual batch jobs cannot have a request_id."
+              },
+              "required_constraints": {
+                "items": {
+                  "enum": [
+                    "web_tools_disabled",
+                    "external_network_isolation",
+                    "loopback_tcp_isolation",
+                    "unix_ipc_isolation",
+                    "mcp_ipc_isolation",
+                    "filesystem_write_isolation",
+                    "filesystem_read_isolation",
+                    "plugin_immutability",
+                    "research_tools_only"
+                  ],
+                  "type": "string"
+                },
+                "type": "array",
+                "uniqueItems": true
+              },
+              "provider": {
+                "type": "string"
+              },
+              "task": {
+                "type": "string"
+              },
+              "workdir": {
+                "type": "string"
+              },
+              "write": {
+                "type": "boolean"
+              },
+              "explicit_finish": {
+                "type": "boolean",
+                "default": true,
+                "description": "New admissions default to explicit callback completion: turn completion waits for events; only private finish ends the run. False selects legacy compatibility. No lifetime timeout."
+              },
+              "required_mcp": {
+                "type": "object",
+                "maxProperties": 8,
+                "propertyNames": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+                },
+                "additionalProperties": {
+                  "type": "array",
+                  "maxItems": 32,
+                  "uniqueItems": true,
+                  "items": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_.-]{1,128}$"
+                  }
+                },
+                "description": "Non-grant assertion on frozen selected MCP servers and exact unprefixed tools. Empty lists require server presence. Omitted or empty map adds no condition; null and duplicates are invalid."
+              },
+              "idle_ping": {
+                "type": "string",
+                "enum": [
+                  "off",
+                  "observe",
+                  "recover"
+                ],
+                "default": "observe",
+                "description": "Frozen health policy: observe invokes no model; recover permits one model control turn per task-progress episode; off preserves explicit holds. No automatic cancellation."
+              }
+            },
+            "required": [
+              "provider",
+              "model",
+              "profile",
+              "task",
+              "workdir"
+            ],
+            "type": "object"
+          }
+        },
+        "preconditions":{"type":"array","minItems":1,"maxItems":20,"items":{"type":"object","additionalProperties":false,"properties":{"agent_id":{"type":"string","pattern":"^ag-[0-9]{8}-[0-9]{6}-[0-9a-f]{10}$"},"sequence":{"type":"integer","minimum":1,"maximum":4294967295},"execution_ref":{"type":"string","pattern":"^ex1_[0-9a-f]{64}$"},"pin_id":{"type":"string","pattern":"^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$"}},"required":["agent_id","sequence","execution_ref","pin_id"]}},
+        "retain_history":{"type":"boolean","default":false},
+        "expected_store_id":{"type":"string","pattern":"^store_[0-9a-f]{32}$"}
+      },
+      "required":["request_id","jobs","expected_store_id"]
+    },
+    "outputSchema": {
+      "type":"object","oneOf":[
+        {"type":"object","additionalProperties":false,"properties":{"found":{"const":false}},"required":["found"]},
+        {"type":"object","additionalProperties":false,"properties":{"found":{"const":true},"receipt":{
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "version": {
+              "type": "integer",
+              "const": 1
+            },
+            "store_id": {
+              "type": "string",
+              "pattern": "^store_[0-9a-f]{32}$"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "preconditions": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 20,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "agent_id": {
+                    "type": "string",
+                    "pattern": "^ag-[0-9]{8}-[0-9]{6}-[0-9a-f]{10}$"
+                  },
+                  "sequence": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4294967295
+                  },
+                  "execution_ref": {
+                    "type": "string",
+                    "pattern": "^ex1_[0-9a-f]{64}$"
+                  },
+                  "pin_id": {
+                    "type": "string",
+                    "pattern": "^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$"
+                  }
+                },
+                "required": [
+                  "agent_id",
+                  "sequence",
+                  "execution_ref",
+                  "pin_id"
+                ]
+              }
+            },
+            "jobs": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 20,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "index": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "agent_id": {
+                    "type": "string"
+                  },
+                  "sequence": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "execution_ref": {
+                    "type": "string",
+                    "pattern": "^ex1_[0-9a-f]{64}$"
+                  },
+                  "pin_id": {
+                    "type": "string",
+                    "pattern": "^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$"
+                  }
+                },
+                "required": [
+                  "index",
+                  "agent_id",
+                  "sequence",
+                  "execution_ref"
+                ]
+              }
+            }
+          },
+          "required": [
+            "version",
+            "store_id",
+            "request_id",
+            "jobs"
+          ]
+        }},"required":["found","receipt"]}
+      ]
+    },
+    "resultShape":null,
+    "annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}
+  },
+  {
+    "name": "history_pins",
+    "description": "List durable lineage history pins or idempotently release one exact pin. Active pins retain lineage database history until release. A PinNotFound, timeout or missing response does not confirm release or recreate a tombstone. Listing uses an exclusive after_pin_id; limit defaults to 100 and is at most 1000. The pin ID grants no authority.",
+    "inputSchema": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "action": {"type":"string","enum":["list","release"]},
+        "pin_id": {"type":"string","pattern":"^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$"},
+        "expected_store_id": {"type":["string","null"],"pattern":"^store_[0-9a-f]{32}$"},
+        "status": {"type":"string","enum":["active","released","all"],"default":"all"},
+        "limit": {"type":"integer","minimum":1,"maximum":1000,"default":100},
+        "after_pin_id": {"type":["string","null"],"pattern":"^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$"}
+      },
+      "required": ["action"],
+      "oneOf": [
+        {"properties":{"action":{"const":"release"}},"required":["pin_id"],"not":{"anyOf":[{"required":["status"]},{"required":["limit"]},{"required":["after_pin_id"]}]}},
+        {"properties":{"action":{"const":"list"}},"not":{"required":["pin_id"]}}
+      ]
+    },
+    "outputSchema": {
+      "type": "object",
+      "oneOf": [
+        {"type":"object","additionalProperties":false,"properties":{
+          "pin_id":{"type":"string","pattern":"^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$"},
+          "status":{"const":"released"},"already_released":{"type":"boolean"}},
+         "required":["pin_id","status","already_released"]},
+        {"type":"object","additionalProperties":false,"properties":{
+          "pins":{"type":"array","maxItems":1000,"items":{"type":"object","additionalProperties":false,"properties":{
+            "pin_id":{"type":"string","pattern":"^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$"},"agent_id":{"type":"string"},
+            "status":{"type":"string","enum":["active","released"]}},"required":["pin_id","agent_id","status"]}},
+          "next_after_pin_id":{"type":["string","null"],"pattern":"^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$"}},
+         "required":["pins","next_after_pin_id"]}
+      ]
+    },
+    "resultShape": null,
+    "annotations": {"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false}
+  },
+  {
+    "name": "status",
+    "description": "Read 1–20 exact execution selectors from one database snapshot. expected_store_id fences the database. A retained_latest is latest-ever only with complete coverage; success_commit is historical database evidence, not current answer-file verification. include_view is allowed for one selector and returns a redacted selected-row AgentView only for verified or unverified matches. Its process state is separately sampled and is not authorization.",
+    "inputSchema": {
+      "type":"object", "additionalProperties":false,
+      "properties":{
+        "version":{"type":"integer","const":1},
+        "expected_store_id":{"type":["string","null"],"pattern":"^store_[0-9a-f]{32}$"},
+        "targets":{"type":"array","minItems":1,"maxItems":20,"items":{"$ref":"#/$defs/selector"}},
+        "include_view":{"type":"boolean","default":false}
+      },
+      "required":["version","targets"],
+      "allOf":[{"if":{"properties":{"include_view":{"const":true}},"required":["include_view"]},"then":{"properties":{"targets":{"maxItems":1}}}}],
+      "$defs":{"selector":{"type":"object","additionalProperties":false,"properties":{
+        "agent_id":{"type":"string"},"sequence":{"type":"integer","minimum":1,"maximum":4294967295},
+        "execution_ref":{"type":["string","null"],"pattern":"^ex1_[0-9a-f]{64}$"},
+        "pin_id":{"type":["string","null"],"pattern":"^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$"}},
+        "required":["agent_id","sequence"]}}
+    },
+    "outputSchema": {
+      "type":"object", "additionalProperties":false,
+      "properties":{
+        "version":{"const":1},"store_id":{"type":"string","pattern":"^store_[0-9a-f]{32}$"},
+        "observed_at":{"type":"number","minimum":0},
+        "items":{"type":"array","minItems":1,"maxItems":20,"items":{"$ref":"#/$defs/item"}},
+        "view":{"type":"object","additionalProperties":false,"properties":{
+          "selector_index":{"const":0},"match":{"enum":["verified","unverified"]},"status_scope":{"const":"selected_execution_raw"},
+          "sampled_at":{"type":"number","minimum":0},"agent":{"$ref":"#/$defs/agent"}},
+          "required":["selector_index","match","status_scope","sampled_at","agent"]}
+      },
+      "required":["version","store_id","observed_at","items"],
+      "$defs":{
+        "selector":{"type":"object","additionalProperties":false,"properties":{
+          "agent_id":{"type":"string"},"sequence":{"type":"integer","minimum":1,"maximum":4294967295},
+          "execution_ref":{"type":"string","pattern":"^ex1_[0-9a-f]{64}$"},
+          "pin_id":{"type":"string","pattern":"^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$"}},"required":["agent_id","sequence"]},
+        "execution":{"type":"object","additionalProperties":false,"properties":{
+          "sequence":{"type":"integer","minimum":1,"maximum":4294967295},
+          "execution_ref":{"type":["string","null"],"pattern":"^ex1_[0-9a-f]{64}$"},
+          "raw_status":{"enum":["created","starting","running","cancelling","succeeded","failed","timed_out","cancelled","lost"]}},"required":["sequence","execution_ref","raw_status"]},
+        "item":{"type":"object","additionalProperties":false,"properties":{
+          "selector":{"$ref":"#/$defs/selector"},"canonical_agent_id":{"type":["string","null"]},
+          "match":{"enum":["verified","unverified","missing","mismatch","unknown"]},
+          "pin_id":{"type":["string","null"],"pattern":"^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$"},
+          "pin_state":{"enum":["active","released","missing","mismatch","unknown"]},
+          "selected":{"anyOf":[{"$ref":"#/$defs/execution"},{"type":"null"}]},
+          "retained_latest":{"anyOf":[{"$ref":"#/$defs/execution"},{"type":"null"}]},
+          "coverage":{"enum":["complete","unknown"]},"restart_resume":{"enum":["none","pending","unknown"]},
+          "lineage_terminal":{"type":["boolean","null"]},
+          "terminal_outcome":{"enum":["succeeded","failed","timed_out","cancelled","lost",null]},
+          "success_commit":{"enum":["recorded","unknown","not_succeeded"]},
+          "cleanup":{"type":"object","additionalProperties":false,"properties":{"scope":{"const":"lineage"},"state":{"enum":["confirmed","pending","unknown"]}},"required":["scope","state"]}},
+          "required":["selector","canonical_agent_id","match","pin_id","pin_state","selected","retained_latest","coverage","restart_resume","lineage_terminal","terminal_outcome","success_commit","cleanup"]},
+        "agent":{"type":"object","additionalProperties":false,"properties":{
+          "agent_id":{"type":"string"},"name":{"type":"string"},"runtime":{"type":"string"},"model":{"type":"string"},"profile":{"type":"string"},"task_summary":{"type":"string"},
+          "status":{"enum":["created","starting","running","cancelling","succeeded","failed","timed_out","cancelled","lost"]},
+          "created_at":{"type":"number"},"started_at":{"type":["number","null"]},"finished_at":{"type":["number","null"]},"elapsed_seconds":{"type":"number"},
+          "last_progress_at":{"type":["number","null"]},"silence_seconds":{"type":["number","null"]},"failure_kind":{"type":["string","null"]},"failure_text":{"type":"null"},
+          "answer_available":{"type":"boolean"},"answer_bytes":{"type":["integer","null"]},"answer_sha256":{"type":["string","null"]},"effort":{"type":["string","null"]},
+          "delivery":{"type":"object","additionalProperties":false,"properties":{
+            "agent_id":{"type":"string"},"bound":{"type":"boolean"},"orchestrator_session_id":{"type":["string","null"]},"notification_id":{"type":["string","null"]},
+            "state":{"type":"string"},"attempts":{"type":"integer","minimum":0},"ambiguous":{"type":"boolean"},"last_error":{"type":"null"},"last_attempt":{"type":"null"}},
+            "required":["agent_id","bound","orchestrator_session_id","notification_id","state","attempts","ambiguous","last_error","last_attempt"]},
+          "sequence":{"type":"integer","minimum":1},"cleanup":{"type":"null"},"policy":{"type":"null"},"phase":{"type":"string"},"phase_started_at":{"type":"number"},
+          "completion_mode":{"type":"string"},"turn_count":{"type":"integer"},"idle_seconds":{"type":"number"},
+          "process_state":{"enum":["alive","dead","reused","unknown","denied","notstarted"]},"observed_at":{"type":"number"},
+          "runtime_outcome":{"type":["string","null"]},"acceptance":{"type":"string"},"workdir":{"type":"string"},
+          "usage":{"type":"object"},"usage_cumulative":{"type":"object"},"tool_counts":{"type":"object"},
+          "mcp":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"name":{"type":"string"},"source":{"type":"string"},"allowed_tools":{"type":["array","null"],"items":{"type":"string"}}},"required":["name","source","allowed_tools"]}}},
+          "required":["agent_id","runtime","model","profile","task_summary","status","created_at","started_at","finished_at","elapsed_seconds","last_progress_at","silence_seconds","failure_kind","failure_text","answer_available","answer_bytes","answer_sha256","effort","delivery","sequence","cleanup","policy","phase","phase_started_at","process_state","observed_at","runtime_outcome","acceptance"]}
+      }
+    },
+    "resultShape": null,
+    "annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}
+  },
+  {
     "name": "agent_integration",
     "description": "Operator/service-only read of one exact execution and its native communication observation. Omitted sequence pins latest once. An observed address proves identity only, never idle, membership, or delivery. No worker capability exposes this operation.",
     "inputSchema": {
@@ -1137,7 +1781,7 @@
   },
   {
     "name": "capabilities",
-    "description": "Read compiled product version, transport limits, and authoritative read method schemas. Source revision is null without verified build provenance. Does not inspect providers, collect quota, start work or change state. Keep ping/tools fallback for older brokers.",
+    "description": "Read compiled product version, transport limits, and authoritative read method schemas. Set include_store_id to read this database's stable public identity, or include_lineage_holds to discover operator-socket hold methods. Source revision is null without verified build provenance. Does not inspect providers, collect quota, start work or change state. Keep ping/tools fallback for older brokers.",
     "annotations": {
       "readOnlyHint": true,
       "destructiveHint": false,
@@ -1146,7 +1790,10 @@
     },
     "inputSchema": {
       "type": "object",
-      "properties": {},
+      "properties": {
+        "include_store_id": {"type":"boolean","default":false},
+        "include_lineage_holds": {"type":"boolean","default":false}
+      },
       "additionalProperties": false
     },
     "outputSchema": {
@@ -1167,6 +1814,23 @@
         },
         "product": {
           "const": "agent-run"
+        },
+        "store_id": {
+          "type": "string",
+          "pattern": "^store_[0-9a-f]{32}$"
+        },
+        "lineage_holds": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["version", "transport", "acquire", "lookup", "list", "release"],
+          "properties": {
+            "version": {"const": 1},
+            "transport": {"const": "operator_socket"},
+            "acquire": {"const": "_lineage_hold_acquire"},
+            "lookup": {"const": "_lineage_hold_lookup"},
+            "list": {"const": "_lineage_hold_list"},
+            "release": {"const": "_lineage_hold_release"}
+          }
         },
         "version": {
           "type": "string"
@@ -1332,5 +1996,222 @@
         }
       }
     }
+  },
+{
+  "name": "transcript_exact",
+  "description": "Export one historical exact-execution transcript fragment. Requires expected_store_id and full selector (agent_id, sequence, execution_ref, active pin_id); every page verifies complete lineage coverage in the same database snapshot as content. Start with cursor \"0\", offset 0, no upper_seq/hash; echo upper_seq and returned next_cursor/next_offset thereafter, and supply expected_sha256 when next_offset is nonzero. Cursors/watermark are canonical decimal strings up to i64 maximum. Chunks contain at most 32 KiB of UTF-8 serialized immutable message JSON; assemble and verify its exact SHA-256 before decoding. Only content_complete=true rows export; incomplete/unknown rows, released pins or missing evidence abort with no fragment. All prior pages then remain partial historical data. snapshot_complete covers only the fixed watermark, never execution completion or authority. No spool expansion or truncation.",
+  "inputSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "version": {
+        "type": "integer",
+        "const": 1
+      },
+      "expected_store_id": {
+        "type": "string",
+        "pattern": "^store_[0-9a-f]{32}$"
+      },
+      "selector": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "type": "string",
+            "minLength": 29,
+            "maxLength": 29
+          },
+          "sequence": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4294967295
+          },
+          "execution_ref": {
+            "type": "string",
+            "pattern": "^ex1_[0-9a-f]{64}$"
+          },
+          "pin_id": {
+            "type": "string",
+            "pattern": "^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$"
+          }
+        },
+        "required": [
+          "agent_id",
+          "sequence",
+          "execution_ref",
+          "pin_id"
+        ]
+      },
+      "cursor": {
+        "type": "string",
+        "pattern": "^(0|[1-9][0-9]{0,18})$",
+        "maxLength": 19
+      },
+      "upper_seq": {
+        "type": "string",
+        "pattern": "^(0|[1-9][0-9]{0,18})$",
+        "maxLength": 19
+      },
+      "offset": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 16777215
+      },
+      "expected_sha256": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$"
+      }
+    },
+    "required": [
+      "version",
+      "expected_store_id",
+      "selector",
+      "cursor",
+      "offset"
+    ]
+  },
+  "outputSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "version": {
+        "const": 1
+      },
+      "store_id": {
+        "type": "string",
+        "pattern": "^store_[0-9a-f]{32}$"
+      },
+      "selector": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "type": "string",
+            "minLength": 29,
+            "maxLength": 29
+          },
+          "sequence": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4294967295
+          },
+          "execution_ref": {
+            "type": "string",
+            "pattern": "^ex1_[0-9a-f]{64}$"
+          },
+          "pin_id": {
+            "type": "string",
+            "pattern": "^pin_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$"
+          }
+        },
+        "required": [
+          "agent_id",
+          "sequence",
+          "execution_ref",
+          "pin_id"
+        ]
+      },
+      "cursor": {
+        "type": "string",
+        "pattern": "^(0|[1-9][0-9]{0,18})$",
+        "maxLength": 19
+      },
+      "upper_seq": {
+        "type": "string",
+        "pattern": "^(0|[1-9][0-9]{0,18})$",
+        "maxLength": 19
+      },
+      "offset": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 16777215
+      },
+      "message": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "seq": {
+                "type": "string",
+                "pattern": "^(0|[1-9][0-9]{0,18})$",
+                "maxLength": 19
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "total_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 16777216
+              },
+              "start": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 16777215
+              },
+              "end": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 16777216
+              },
+              "text": {
+                "type": "string",
+                "maxLength": 32768
+              },
+              "complete": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "seq",
+              "sha256",
+              "total_bytes",
+              "start",
+              "end",
+              "text",
+              "complete"
+            ]
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "next_cursor": {
+        "type": "string",
+        "pattern": "^(0|[1-9][0-9]{0,18})$",
+        "maxLength": 19
+      },
+      "next_offset": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 16777215
+      },
+      "snapshot_complete": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "version",
+      "store_id",
+      "selector",
+      "cursor",
+      "upper_seq",
+      "offset",
+      "message",
+      "next_cursor",
+      "next_offset",
+      "snapshot_complete"
+    ]
+  },
+  "resultShape": null,
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
   }
+}
 ]

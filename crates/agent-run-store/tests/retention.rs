@@ -87,6 +87,247 @@ fn count(store: &Store, table: &str) -> i64 {
         .unwrap()
 }
 
+/// Pins protect full lineages and their cleanup evidence until exact release.
+#[test]
+fn history_pin_preserves_future_resumes_and_attempts_until_release() {
+    use agent_run_domain::batch::PinId;
+    let home = common::Home::new();
+    let mut store = home.store();
+    let old = NOW - HISTORY_SECONDS - 100.0;
+    let first = run(&home, &mut store, old, old);
+    let second = run(&home, &mut store, old, old);
+    let pins = [PinId::new(), PinId::new()];
+    for (pin, root) in pins.iter().zip([&first, &second]) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO history_pins(pin_id,root_agent_id) VALUES(?,?)",
+                params![pin.as_str(), root.as_str()],
+            )
+            .unwrap();
+    }
+    // Resume descendants arrive after both pins are already committed.
+    let first_child = run(&home, &mut store, old + 1.0, old + 1.0);
+    let second_child = run(&home, &mut store, old + 2.0, old + 2.0);
+    resume(&mut store, &first, &first_child);
+    resume(&mut store, &second, &second_child);
+    for id in [&first, &first_child, &second, &second_child] {
+        let attempt = store.create_attempt(id, "succeeded", &json!({})).unwrap();
+        store.conn.execute("UPDATE attempts SET ownership_active=0,phase='cleanup_complete',cleanup_proof_json='{\"confirmed\":true}' WHERE id=?", [&attempt]).unwrap();
+    }
+    let unpinned = run(&home, &mut store, old, old);
+    drain(&mut store, 12);
+    assert!(store.get(&unpinned).is_err());
+    for id in [&first, &first_child, &second, &second_child] {
+        assert!(store.get(id).is_ok());
+        let proofs: i64 = store.conn.query_row("SELECT COUNT(*) FROM attempts WHERE agent_id=? AND cleanup_proof_json='{\"confirmed\":true}'", [id.as_str()], |row| row.get(0)).unwrap();
+        assert_eq!(proofs, 1, "cleanup proof must survive for {id}");
+    }
+    assert!(
+        !store
+            .release_history_pin(&pins[0])
+            .unwrap()
+            .unwrap()
+            .already_released
+    );
+    assert!(
+        store
+            .release_history_pin(&pins[0])
+            .unwrap()
+            .unwrap()
+            .already_released
+    );
+    drain(&mut store, 12);
+    assert!(store.get(&first).is_err() && store.get(&first_child).is_err());
+    assert!(store.get(&second).is_ok() && store.get(&second_child).is_ok());
+    assert!(
+        !store
+            .release_history_pin(&pins[1])
+            .unwrap()
+            .unwrap()
+            .already_released
+    );
+    drain(&mut store, 12);
+    assert!(store.get(&second).is_err() && store.get(&second_child).is_err());
+    assert_eq!(
+        count(&store, "history_pins"),
+        2,
+        "released tombstones survive history GC"
+    );
+    integrity(&store);
+}
+
+/// A pin wins count expiry even when a future resume remains outside the cap.
+#[test]
+fn history_pin_beats_count_expiry_for_whole_lineage() {
+    use agent_run_domain::batch::PinId;
+    let home = common::Home::new();
+    let mut store = home.store();
+    let root = run(&home, &mut store, NOW - 5_000.0, NOW - 4_900.0);
+    let pin = PinId::new();
+    store
+        .conn
+        .execute(
+            "INSERT INTO history_pins(pin_id,root_agent_id) VALUES(?,?)",
+            params![pin.as_str(), root.as_str()],
+        )
+        .unwrap();
+    let child = run(&home, &mut store, NOW - 4_000.0, NOW - 3_900.0);
+    resume(&mut store, &root, &child);
+    for index in 0..100 {
+        run(&home, &mut store, NOW - 100.0 + index as f64, NOW - 1.0);
+    }
+    drain(&mut store, 12);
+    assert!(store.get(&root).is_ok() && store.get(&child).is_ok());
+    assert_eq!(sessions(&store), 101);
+    store.release_history_pin(&pin).unwrap().unwrap();
+    drain(&mut store, 12);
+    assert!(store.get(&root).is_err() && store.get(&child).is_err());
+    assert_eq!(sessions(&store), 100);
+    integrity(&store);
+}
+
+/// An uncommitted concurrent release cannot make history eligible early.
+#[test]
+fn history_pin_release_serializes_with_retention() {
+    use agent_run_domain::batch::PinId;
+    let home = common::Home::new();
+    let mut store = home.store();
+    let old = NOW - HISTORY_SECONDS - 100.0;
+    let root = run(&home, &mut store, old, old);
+    let pin = PinId::new();
+    store
+        .conn
+        .execute(
+            "INSERT INTO history_pins(pin_id,root_agent_id) VALUES(?,?)",
+            params![pin.as_str(), root.as_str()],
+        )
+        .unwrap();
+    let holder = home.store();
+    holder.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let mut releasing = home.store();
+    releasing
+        .conn
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let release_pin = pin.clone();
+    let thread = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        releasing
+            .release_history_pin(&release_pin)
+            .unwrap()
+            .unwrap()
+    });
+    started_rx.recv().unwrap();
+    assert_eq!(store.prune_history(NOW).unwrap(), 0);
+    assert!(store.get(&root).is_ok());
+    holder.conn.execute_batch("COMMIT").unwrap();
+    assert!(!thread.join().unwrap().already_released);
+    drain(&mut store, 8);
+    assert!(store.get(&root).is_err());
+    assert!(
+        store
+            .release_history_pin(&pin)
+            .unwrap()
+            .unwrap()
+            .already_released
+    );
+    integrity(&store);
+}
+
+/// Pin listing uses exclusive stable pagination and never recreates missing keys.
+#[test]
+fn history_pin_list_is_bounded_and_release_is_permanent() {
+    use agent_run_domain::batch::{HistoryPinFilter, HistoryPinState, PinId};
+    let home = common::Home::new();
+    let mut store = home.store();
+    let root = run(&home, &mut store, NOW - 100.0, NOW - 90.0);
+    let pins: Vec<PinId> = [
+        "pin_550e8400e29b41d4a716446655440000",
+        "pin_550e8400e29b41d4a716446655440001",
+        "pin_550e8400e29b41d4a716446655440002",
+    ]
+    .into_iter()
+    .map(|s| s.parse().unwrap())
+    .collect();
+    for pin in pins.iter().rev() {
+        store
+            .conn
+            .execute(
+                "INSERT INTO history_pins(pin_id,root_agent_id) VALUES(?,?)",
+                params![pin.as_str(), root.as_str()],
+            )
+            .unwrap();
+    }
+    let first = store.history_pins(HistoryPinFilter::All, 2, None).unwrap();
+    assert_eq!(
+        first.pins.iter().map(|p| &p.pin_id).collect::<Vec<_>>(),
+        vec![&pins[0], &pins[1]]
+    );
+    assert_eq!(first.next_after_pin_id, Some(pins[1].clone()));
+    let last = store
+        .history_pins(HistoryPinFilter::All, 2, first.next_after_pin_id.as_ref())
+        .unwrap();
+    assert_eq!(last.pins.len(), 1);
+    assert_eq!(last.pins[0].pin_id, pins[2]);
+    assert_eq!(last.next_after_pin_id, None);
+    assert!(store.history_pins(HistoryPinFilter::All, 0, None).is_err());
+    assert!(
+        store
+            .history_pins(HistoryPinFilter::All, 1001, None)
+            .is_err()
+    );
+    assert!(
+        !store
+            .release_history_pin(&pins[0])
+            .unwrap()
+            .unwrap()
+            .already_released
+    );
+    assert!(
+        store
+            .release_history_pin(&pins[0])
+            .unwrap()
+            .unwrap()
+            .already_released
+    );
+    let released = store
+        .history_pins(HistoryPinFilter::Released, 100, None)
+        .unwrap();
+    assert_eq!(released.pins.len(), 1);
+    assert_eq!(released.pins[0].status, HistoryPinState::Released);
+    assert_eq!(
+        store
+            .history_pins(HistoryPinFilter::Active, 100, None)
+            .unwrap()
+            .pins
+            .len(),
+        2
+    );
+    assert!(
+        store
+            .conn
+            .execute(
+                "UPDATE history_pins SET released=0 WHERE pin_id=?",
+                [pins[0].as_str()]
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .conn
+            .execute(
+                "DELETE FROM history_pins WHERE pin_id=?",
+                [pins[0].as_str()]
+            )
+            .is_err()
+    );
+    let missing: PinId = "pin_550e8400e29b41d4a716446655440003".parse().unwrap();
+    assert!(store.release_history_pin(&missing).unwrap().is_none());
+    assert_eq!(count(&store, "history_pins"), 3);
+}
+
 /// Asserts every persisted reference still resolves, including relationships without cascade deletion.
 fn integrity(store: &Store) {
     assert_eq!(

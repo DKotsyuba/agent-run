@@ -51,11 +51,11 @@ redirects. `CredentialReader` is injectable for synthetic tests;
 `SystemCredentialReader` uses the existing host environment, file, or
 platform Keychain. Native providers cannot mint an exportable HTTP token.
 Prepared request headers stay out of logs, snapshots and response bodies.
-External quota executables receive account-bound credentials through private
-stdin; see the [collector protocol](quota-collectors.md).
+Quota collection is configured separately in Agent Quota; see
+[quota sources](quota-collectors.md).
 
 Custom gateway `auth_header = "bearer"` is the default; the explicit
 `x_api_key` form is available for compatible Messages gateways. This
 inference-gateway header choice does not define GLM's separate quota-endpoint
 Authorization behavior; that endpoint and its authorized origin belong to
-the quota collector integration.
+Agent Quota's collector configuration.
