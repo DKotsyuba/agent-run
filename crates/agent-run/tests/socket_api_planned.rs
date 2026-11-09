@@ -991,6 +991,7 @@ bridge_reader_credential_sha256="{token_hash}"
         json!([
             "attempt_current_ingress_v1",
             "attempt_current_egress_v1",
+            "attempt_egress_actor_recovery_v1",
             "attempt_consensus_v1",
             "attempt_admission_v1",
             "attempt_namespace_retirement_v1"
@@ -1001,6 +1002,11 @@ bridge_reader_credential_sha256="{token_hash}"
     let result: Value =
         serde_json::from_str(&r2_fake_peer(&executable, &private, &frame, &output).await).unwrap();
     assert_eq!(result["error"]["code"], "binding_unavailable");
+    let frame=json!({"id":"three","method":"_attempt_current_v1","params":{"version":1,"expected_store_id":sid,"request_id":"opt-in","lineage_root_id":id,"bound_execution_id":id,"purpose":"egress","actor_recovery_version":1}}).to_string();
+    let result: Value =
+        serde_json::from_str(&r2_fake_peer(&executable, &private, &frame, &output).await).unwrap();
+    assert_eq!(result["error"]["code"], "binding_unavailable");
+    assert!(result["error"].get("actor_recovery").is_none());
     broker.abort();
     let _ = broker.await;
 }

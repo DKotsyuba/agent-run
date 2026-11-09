@@ -103,6 +103,40 @@ pub(crate) struct BridgeActor {
     pub issuer_epoch: Option<String>,
 }
 
+/// Bridge's authenticated classification for one exact original incarnation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ActorRecoveryState {
+    Current,
+    AwaitingRootHook,
+    RelaunchRequired,
+    Unavailable,
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BridgeActorRecovery {
+    pub version: u32,
+    pub store_id: String,
+    pub producer: String,
+    pub incarnation: Incarnation,
+    pub launch_id: String,
+    pub state: ActorRecoveryState,
+}
+
+/// A classification is a negative hint, never actor or receipt authority.
+#[derive(Debug)]
+pub(crate) struct ActorRecoveryRefusal {
+    pub request_id: String,
+    pub state: ActorRecoveryState,
+    pub incarnation: Incarnation,
+    pub launch_id: String,
+}
+#[derive(Debug)]
+pub(crate) enum EgressOutcome {
+    Current(Box<CurrentReceipt>),
+    ActorRecovery(ActorRecoveryRefusal),
+}
+
 /// Implementations must authenticate the configured reader grant, same-UID
 /// peer, executable/build and exact pinned route before returning a response.
 pub(crate) trait BridgeReader: Send + Sync {
@@ -118,6 +152,19 @@ pub(crate) trait BridgeReader: Send + Sync {
         _launch_id: &'a str,
     ) -> PeerFuture<'a, BridgeActor> {
         Box::pin(async { Err(Error::Unsupported("Bridge actor lookup unavailable".into())) })
+    }
+    fn actor_recovery<'a>(
+        &'a self,
+        _route: &'a Route,
+        _producer: &'a str,
+        _incarnation: &'a Incarnation,
+        _launch_id: &'a str,
+    ) -> PeerFuture<'a, BridgeActorRecovery> {
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "Bridge actor recovery unavailable".into(),
+            ))
+        })
     }
 }
 
@@ -237,6 +284,23 @@ impl Service {
         bridge: &dyn BridgeReader,
         request: EgressCurrent,
     ) -> Result<CurrentReceipt> {
+        match self
+            .attempt_current_egress_with_recovery(grant, bridge, request, false)
+            .await?
+        {
+            EgressOutcome::Current(receipt) => Ok(*receipt),
+            EgressOutcome::ActorRecovery(_) => Err(invalid("egress binding unavailable")),
+        }
+    }
+
+    /// Opt-in recovery reports only a separately authenticated Bridge result.
+    pub(crate) async fn attempt_current_egress_with_recovery(
+        &self,
+        grant: &PeerGrant,
+        bridge: &dyn BridgeReader,
+        request: EgressCurrent,
+        recovery_enabled: bool,
+    ) -> Result<EgressOutcome> {
         grant.validate()?;
         request.validate()?;
         if request.pool_route != grant.pool_route
@@ -259,13 +323,13 @@ impl Service {
             )
             .await?;
         if let Some(receipt) = begin.receipt {
-            return Ok(receipt);
+            return Ok(EgressOutcome::Current(Box::new(receipt)));
         }
         let candidate = begin
             .candidate
             .ok_or_else(|| invalid("egress binding unavailable"))?;
         inspect(&candidate.incarnation, grant)?;
-        let found = bridge
+        let mut found = bridge
             .actor(
                 &request.bridge_route,
                 &request.producer,
@@ -273,6 +337,71 @@ impl Service {
                 &candidate.attempt.launch_id,
             )
             .await?;
+        let matches_candidate = |found: &BridgeActor| {
+            found.version == 1
+                && found.store_id == request.bridge_route.component_store_id
+                && found.producer == request.producer
+                && found.incarnation == candidate.incarnation
+                && found.launch_id == candidate.attempt.launch_id
+        };
+        if !matches_candidate(&found)
+            || !matches!(
+                found.state.as_str(),
+                "current" | "historical" | "unavailable"
+            )
+        {
+            return Err(invalid("egress binding unavailable"));
+        }
+        if found.state != "current" {
+            if !recovery_enabled {
+                return Err(invalid("egress binding unavailable"));
+            }
+            let status = bridge
+                .actor_recovery(
+                    &request.bridge_route,
+                    &request.producer,
+                    &candidate.incarnation,
+                    &candidate.attempt.launch_id,
+                )
+                .await?;
+            if status.version != 1
+                || status.store_id != request.bridge_route.component_store_id
+                || status.producer != request.producer
+                || status.incarnation != candidate.incarnation
+                || status.launch_id != candidate.attempt.launch_id
+            {
+                return Err(invalid("egress binding unavailable"));
+            }
+            inspect(&candidate.incarnation, grant)?;
+            if status.state != ActorRecoveryState::Current {
+                return Ok(EgressOutcome::ActorRecovery(ActorRecoveryRefusal {
+                    request_id: request.request_id,
+                    state: status.state,
+                    incarnation: status.incarnation,
+                    launch_id: status.launch_id,
+                }));
+            }
+            found = bridge
+                .actor(
+                    &request.bridge_route,
+                    &request.producer,
+                    &candidate.incarnation,
+                    &candidate.attempt.launch_id,
+                )
+                .await?;
+            if !matches_candidate(&found) {
+                return Err(invalid("egress binding unavailable"));
+            }
+            if !matches!(
+                found.state.as_str(),
+                "current" | "historical" | "unavailable"
+            ) {
+                return Err(invalid("egress binding unavailable"));
+            }
+            if found.state != "current" {
+                return Err(invalid("actor recovery in progress"));
+            }
+        }
         if found.version != 1
             || found.store_id != request.bridge_route.component_store_id
             || found.producer != request.producer
@@ -292,7 +421,8 @@ impl Service {
         actor.validate()?;
         let inspected = inspect(&candidate.incarnation, grant)?;
         let enabled = self.attempt_enabled(grant).is_ok();
-        self.lane("attempt-current")?
+        let receipt = self
+            .lane("attempt-current")?
             .local(
                 FinishAttemptEgress {
                     request,
@@ -303,7 +433,8 @@ impl Service {
                 },
                 BROKER_BUDGET,
             )
-            .await
+            .await?;
+        Ok(EgressOutcome::Current(Box::new(receipt)))
     }
 
     /// Use only the still-current original Bridge context for new ingress.
@@ -833,6 +964,98 @@ mod tests {
         assert_eq!(bridge.retire_calls.load(Ordering::SeqCst), 2);
     }
 
+    struct RecoveryBridge {
+        actor: wire::Actor,
+        state: ActorRecoveryState,
+        actor_calls: AtomicUsize,
+        recovery_calls: AtomicUsize,
+        fail_actor: bool,
+        fail_recovery: bool,
+        mismatch: bool,
+        current_on_retry: bool,
+        foreign_on_retry: bool,
+    }
+    #[test]
+    fn bridge_actor_recovery_dto_rejects_unknown_state_and_fields() {
+        let value = json!({"version":1,"store_id":"00000000-0000-4000-8000-000000000001","producer":"pool","incarnation":{"host_id":"host","boot_id":"00000000-0000-4000-8000-000000000002","pid_namespace_inode":1,"uid":1000,"pid":2,"start_ticks":1},"launch_id":"00000000-0000-4000-8000-000000000003","state":"awaiting_root_hook"});
+        assert!(serde_json::from_value::<BridgeActorRecovery>(value.clone()).is_ok());
+        let mut invalid = value.clone();
+        invalid["state"] = json!("future_unknown");
+        assert!(serde_json::from_value::<BridgeActorRecovery>(invalid).is_err());
+        let mut extra = value;
+        extra["actor"] = json!({});
+        assert!(serde_json::from_value::<BridgeActorRecovery>(extra).is_err());
+    }
+    impl BridgeReader for RecoveryBridge {
+        fn context<'a>(&'a self, _: &'a IngressCurrent) -> PeerFuture<'a, BridgeContext> {
+            Box::pin(async { Err(Error::Conflict) })
+        }
+        fn consume<'a>(&'a self, _: &'a AdmissionRequest) -> PeerFuture<'a, BridgeConsume> {
+            Box::pin(async { Err(Error::Conflict) })
+        }
+        fn issuer<'a>(&'a self, _: &'a NamespaceRequest) -> PeerFuture<'a, BridgeIssuer> {
+            Box::pin(async { Err(Error::Conflict) })
+        }
+        fn retire<'a>(&'a self, _: &'a NamespaceRequest) -> PeerFuture<'a, BridgeRetired> {
+            Box::pin(async { Err(Error::Conflict) })
+        }
+        fn actor<'a>(
+            &'a self,
+            route: &'a Route,
+            producer: &'a str,
+            incarnation: &'a Incarnation,
+            launch_id: &'a str,
+        ) -> PeerFuture<'a, BridgeActor> {
+            Box::pin(async move {
+                let count = self.actor_calls.fetch_add(1, Ordering::SeqCst);
+                if self.fail_actor {
+                    return Err(invalid("attempt peer unavailable"));
+                }
+                let current = self.current_on_retry && count > 0;
+                Ok(BridgeActor {
+                    version: 1,
+                    store_id: route.component_store_id.clone(),
+                    producer: producer.into(),
+                    incarnation: incarnation.clone(),
+                    launch_id: if self.foreign_on_retry && count > 0 {
+                        uuid::Uuid::new_v4().to_string()
+                    } else {
+                        launch_id.into()
+                    },
+                    state: if current { "current" } else { "unavailable" }.into(),
+                    actor: current.then(|| self.actor.clone()),
+                    issuer_epoch: current.then(|| "issuer".into()),
+                })
+            })
+        }
+        fn actor_recovery<'a>(
+            &'a self,
+            route: &'a Route,
+            producer: &'a str,
+            incarnation: &'a Incarnation,
+            launch_id: &'a str,
+        ) -> PeerFuture<'a, BridgeActorRecovery> {
+            Box::pin(async move {
+                self.recovery_calls.fetch_add(1, Ordering::SeqCst);
+                if self.fail_recovery {
+                    return Err(invalid("attempt peer unavailable"));
+                }
+                Ok(BridgeActorRecovery {
+                    version: 1,
+                    store_id: route.component_store_id.clone(),
+                    producer: producer.into(),
+                    incarnation: incarnation.clone(),
+                    launch_id: if self.mismatch {
+                        uuid::Uuid::new_v4().to_string()
+                    } else {
+                        launch_id.into()
+                    },
+                    state: self.state,
+                })
+            })
+        }
+    }
+
     struct ObservationBridge {
         receipt: ConsumeReceipt,
         calls: AtomicUsize,
@@ -1074,6 +1297,210 @@ mod tests {
             calls: AtomicUsize::new(0),
             context_calls: AtomicUsize::new(0),
         };
+        let make_recovery = |state| RecoveryBridge {
+            actor: actor.clone(),
+            state,
+            actor_calls: AtomicUsize::new(0),
+            recovery_calls: AtomicUsize::new(0),
+            fail_actor: false,
+            fail_recovery: false,
+            mismatch: false,
+            current_on_retry: false,
+            foreign_on_retry: false,
+        };
+        let base = json!({"version":1,"expected_store_id":sid,"purpose":"egress","lineage_root_id":id,"bound_execution_id":id,"actor_recovery_version":1});
+        for (version, code) in [
+            (json!(null), "binding_unavailable"),
+            (json!(2), "unsupported_version"),
+        ] {
+            let fake = make_recovery(ActorRecoveryState::AwaitingRootHook);
+            let mut params = base.clone();
+            params["request_id"] = json!("invalid-recovery-version");
+            params["actor_recovery_version"] = version;
+            let error = crate::attempt_wire::dispatch(
+                &service,
+                &grant,
+                &fake,
+                &OutcomePool,
+                "_attempt_current_v1",
+                params,
+            )
+            .await
+            .unwrap_err();
+            let response = crate::attempt_wire::dispatch_error(
+                &error,
+                "_attempt_current_v1",
+                &sid.to_string(),
+            );
+            assert_eq!(response["code"], code);
+            assert!(response.get("actor_recovery").is_none());
+            assert_eq!(fake.actor_calls.load(Ordering::SeqCst), 0);
+        }
+        for (index, state, label, recovery) in [
+            (
+                0,
+                ActorRecoveryState::AwaitingRootHook,
+                "awaiting_root_hook",
+                "same_key_lookup",
+            ),
+            (
+                1,
+                ActorRecoveryState::RelaunchRequired,
+                "relaunch_required",
+                "operator",
+            ),
+            (
+                2,
+                ActorRecoveryState::Unavailable,
+                "unavailable",
+                "operator",
+            ),
+        ] {
+            let fake = make_recovery(state);
+            let mut params = base.clone();
+            params["request_id"] = json!(format!("actor-recovery-{index}"));
+            let error = crate::attempt_wire::dispatch(
+                &service,
+                &grant,
+                &fake,
+                &OutcomePool,
+                "_attempt_current_v1",
+                params.clone(),
+            )
+            .await
+            .unwrap_err();
+            let response = crate::attempt_wire::dispatch_error(
+                &error,
+                "_attempt_current_v1",
+                &sid.to_string(),
+            );
+            assert_eq!(response["code"], "binding_unavailable");
+            assert_eq!(response["actor_recovery"], label);
+            assert_eq!(response["actor_recovery_version"], 1);
+            assert_eq!(response["request_id"], params["request_id"]);
+            assert_eq!(response["recovery"], recovery);
+            assert_eq!(response["launch_id"], binding.attempt.launch_id);
+            assert_eq!(response["incarnation"], json!(inc));
+            assert_eq!(fake.actor_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fake.recovery_calls.load(Ordering::SeqCst), 1);
+        }
+        // The original pending key can succeed after a fresh root hook, and its
+        // committed receipt then replays even if Bridge is unavailable.
+        let mut retry = base.clone();
+        retry["request_id"] = json!("actor-recovery-0");
+        let recovered = crate::attempt_wire::dispatch(
+            &service,
+            &grant,
+            &bridge,
+            &OutcomePool,
+            "_attempt_current_v1",
+            retry.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered["state"], "current");
+        let mut unavailable = make_recovery(ActorRecoveryState::Unavailable);
+        unavailable.fail_actor = true;
+        let replayed = crate::attempt_wire::dispatch(
+            &service,
+            &grant,
+            &unavailable,
+            &OutcomePool,
+            "_attempt_current_v1",
+            retry,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replayed, recovered);
+        assert_eq!(unavailable.actor_calls.load(Ordering::SeqCst), 0);
+        let mut fake = make_recovery(ActorRecoveryState::Current);
+        fake.current_on_retry = true;
+        let mut params = base.clone();
+        params["request_id"] = json!("actor-recovery-raced-current");
+        let current = crate::attempt_wire::dispatch(
+            &service,
+            &grant,
+            &fake,
+            &OutcomePool,
+            "_attempt_current_v1",
+            params,
+        )
+        .await
+        .unwrap();
+        assert_eq!(current["receipt"]["actor"]["native_id"], "native");
+        assert_eq!(fake.actor_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fake.recovery_calls.load(Ordering::SeqCst), 1);
+        for mode in [
+            "actor-error",
+            "status-error",
+            "foreign-echo",
+            "current-race",
+            "foreign-on-retry",
+            "legacy",
+        ] {
+            let mut fake = make_recovery(if matches!(mode, "current-race" | "foreign-on-retry") {
+                ActorRecoveryState::Current
+            } else {
+                ActorRecoveryState::AwaitingRootHook
+            });
+            fake.fail_actor = mode == "actor-error";
+            fake.fail_recovery = mode == "status-error";
+            fake.mismatch = mode == "foreign-echo";
+            fake.current_on_retry = mode == "foreign-on-retry";
+            fake.foreign_on_retry = mode == "foreign-on-retry";
+            let mut params = base.clone();
+            params["request_id"] = json!(format!("actor-{mode}"));
+            if mode == "legacy" {
+                params
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("actor_recovery_version");
+            }
+            let error = crate::attempt_wire::dispatch(
+                &service,
+                &grant,
+                &fake,
+                &OutcomePool,
+                "_attempt_current_v1",
+                params,
+            )
+            .await
+            .unwrap_err();
+            let response = crate::attempt_wire::dispatch_error(
+                &error,
+                "_attempt_current_v1",
+                &sid.to_string(),
+            );
+            assert!(response.get("actor_recovery").is_none(), "{mode}");
+            if mode == "current-race" {
+                assert_eq!(response["code"], "request_in_progress");
+                assert_eq!(response["recovery"], "same_key_lookup");
+            }
+            if mode == "foreign-on-retry" {
+                assert_eq!(response["code"], "binding_unavailable");
+            }
+            assert_eq!(
+                fake.recovery_calls.load(Ordering::SeqCst),
+                usize::from(!matches!(mode, "actor-error" | "legacy"))
+            );
+        }
+        // Response negotiation does not alter the frozen egress fingerprint.
+        let fake = make_recovery(ActorRecoveryState::AwaitingRootHook);
+        let mut params = base.clone();
+        params["request_id"] = json!("actor-legacy");
+        let error = crate::attempt_wire::dispatch(
+            &service,
+            &grant,
+            &fake,
+            &OutcomePool,
+            "_attempt_current_v1",
+            params,
+        )
+        .await
+        .unwrap_err();
+        let response =
+            crate::attempt_wire::dispatch_error(&error, "_attempt_current_v1", &sid.to_string());
+        assert_eq!(response["actor_recovery"], "awaiting_root_hook");
         // The Pool supplies only the original context reference and invocation;
         // the actor, process, launch and root all come from Run/Bridge evidence.
         let params = json!({"version":1,"expected_store_id":sid,"request_id":"wire-current","purpose":"ingress","observation_ref":"context","invocation_key":"invocation"});

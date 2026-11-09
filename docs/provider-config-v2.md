@@ -326,12 +326,18 @@ authority: before exact native qualification is durable it returns the definitiv
 `qualification_pending` refusal without writing model input. Egress currentness
 uses the pinned Bridge `run_actor_lookup_v1` and a fresh exact leader check; a
 missing or historical actor cannot be substituted by an ingress observation.
+Pool can discover `attempt_egress_actor_recovery_v1` and opt into a correlated
+negative hint for that exact launch: retry the same key for `awaiting_root_hook`,
+request operator/relaunch action for `relaunch_required`, and fail closed for
+`unavailable`. The hint never supplies actor authority or a current receipt.
 
 `[[managed_attempt_binding.bridge_custody_readers]]` grants effect recovery to
 separately configured same-UID Bridge builds. Each entry pins `reader_id`,
 `worker_uid`, `executable`, `executable_sha256`, `run_route`, `bridge_route`,
-and a nonempty, unique `producer_scopes` list. Scopes may occur in only one
-custody grant. Recovery retains each effect's original run and Bridge routes;
+and one or both of `producer_scopes` and `producer_scope_prefixes`. Prefixes
+end in `/` and authorize only nonempty descendants with no empty path segments;
+all prefixes are non-overlapping and cannot overlap another reader's literal.
+Recovery retains each effect's original run and Bridge routes;
 repointing a grant cannot retarget an existing effect or tombstone. Disabling the
 switch refuses new delivery while configured readers retain exact-key recovery.
 Operator-reviewed builds must be actual native components: interpreter names,

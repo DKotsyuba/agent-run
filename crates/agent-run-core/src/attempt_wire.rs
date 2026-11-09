@@ -3,7 +3,10 @@
 #![allow(dead_code)]
 use crate::{
     Error, Result,
-    attempt_binding::{BridgeReader, PeerGrant, PoolReader},
+    attempt_binding::{
+        ActorRecoveryRefusal, ActorRecoveryState, BridgeReader, EgressOutcome, PeerGrant,
+        PoolReader,
+    },
     attempt_transport::{PeerPin, strict, verify_peer},
     error::invalid,
     service::Service,
@@ -51,6 +54,8 @@ enum Current {
         request_id: String,
         lineage_root_id: AgentId,
         bound_execution_id: AgentId,
+        #[serde(default)]
+        actor_recovery_version: Option<u32>,
     },
     Consensus {
         version: u32,
@@ -228,6 +233,9 @@ fn closed_error(error: &Error, _method: &str, store: &str) -> Value {
         Error::Validation(message) if message == "namespace recovery in progress" => {
             ("request_in_progress", "same_key_lookup")
         }
+        Error::Validation(message) if message == "actor recovery in progress" => {
+            ("request_in_progress", "same_key_lookup")
+        }
         Error::Validation(message) if message == "namespace recovery incomplete" => {
             ("recovery_required", "operator")
         }
@@ -242,6 +250,37 @@ fn closed_error(error: &Error, _method: &str, store: &str) -> Value {
     json!({"version":1,"store_id":store,"code":code,"recovery":recovery})
 }
 
+#[derive(Debug)]
+pub(crate) enum DispatchFailure {
+    Domain(Box<Error>),
+    ActorRecovery(Box<ActorRecoveryRefusal>),
+}
+impl From<Error> for DispatchFailure {
+    fn from(error: Error) -> Self {
+        Self::Domain(Box::new(error))
+    }
+}
+
+pub(crate) fn dispatch_error(error: &DispatchFailure, method: &str, store: &str) -> Value {
+    match error {
+        DispatchFailure::Domain(error) => closed_error(error, method, store),
+        DispatchFailure::ActorRecovery(refusal) => {
+            let recovery = match refusal.state {
+                ActorRecoveryState::AwaitingRootHook => "same_key_lookup",
+                ActorRecoveryState::RelaunchRequired | ActorRecoveryState::Unavailable => {
+                    "operator"
+                }
+                ActorRecoveryState::Current => {
+                    return closed_error(&invalid("actor recovery in progress"), method, store);
+                }
+            };
+            json!({"version":1,"store_id":store,"code":"binding_unavailable","recovery":recovery,
+                "request_id":refusal.request_id,"actor_recovery_version":1,"actor_recovery":refusal.state,
+                "incarnation":refusal.incarnation,"launch_id":refusal.launch_id})
+        }
+    }
+}
+
 /// Dispatch one already authenticated request. Each caller is tied to the
 /// configured grant; request data never chooses a socket, executable or token.
 pub(crate) async fn dispatch(
@@ -251,7 +290,7 @@ pub(crate) async fn dispatch(
     pool: &dyn PoolReader,
     method: &str,
     params: Value,
-) -> Result<Value> {
+) -> std::result::Result<Value, DispatchFailure> {
     match method {
         "_attempt_capabilities_v1" => {
             let req: Discovery = parse(params)?;
@@ -263,6 +302,7 @@ pub(crate) async fn dispatch(
                 vec![
                     "attempt_current_ingress_v1",
                     "attempt_current_egress_v1",
+                    "attempt_egress_actor_recovery_v1",
                     "attempt_consensus_v1",
                     "attempt_admission_v1",
                     "attempt_namespace_retirement_v1",
@@ -308,8 +348,18 @@ pub(crate) async fn dispatch(
                     request_id,
                     lineage_root_id,
                     bound_execution_id,
+                    actor_recovery_version,
                 } => {
                     version(n)?;
+                    if params
+                        .get("actor_recovery_version")
+                        .is_some_and(Value::is_null)
+                    {
+                        return Err(invalid("attempt request invalid").into());
+                    }
+                    if actor_recovery_version.is_some_and(|version| version != 1) {
+                        return Err(Error::Unsupported("attempt version unsupported".into()).into());
+                    }
                     let req = agent_run_domain::attempt_binding::EgressCurrent {
                         expected_store_id: expected_store_id.clone(),
                         request_id,
@@ -321,12 +371,22 @@ pub(crate) async fn dispatch(
                         producer: grant.producer.clone(),
                         host_id: grant.host_id.clone(),
                     };
-                    let receipt = service
-                        .attempt_current_egress_v1(grant, bridge, req)
-                        .await?;
-                    Ok(
-                        json!({"version":1,"store_id":expected_store_id,"state":"current","receipt":receipt}),
-                    )
+                    match service
+                        .attempt_current_egress_with_recovery(
+                            grant,
+                            bridge,
+                            req,
+                            actor_recovery_version == Some(1),
+                        )
+                        .await?
+                    {
+                        EgressOutcome::Current(receipt) => Ok(
+                            json!({"version":1,"store_id":expected_store_id,"state":"current","receipt":receipt}),
+                        ),
+                        EgressOutcome::ActorRecovery(refusal) => {
+                            Err(DispatchFailure::ActorRecovery(Box::new(refusal)))
+                        }
+                    }
                 }
                 Current::Consensus {
                     version: n,
@@ -421,12 +481,12 @@ pub(crate) async fn dispatch(
         "_attempt_admission_abort_v1" => {
             require_object(&params, "/pool_route")?;
             if params.get("pool_outcome_digest").is_none() {
-                return Err(invalid("attempt request invalid"));
+                return Err(invalid("attempt request invalid").into());
             }
             let req: Abort = parse(params)?;
             version(req.version)?;
             if req.request_id != req.intent_id || req.pool_route != grant.pool_route {
-                return Err(Error::Conflict);
+                return Err(Error::Conflict.into());
             }
             let result = service
                 .attempt_abort_v1(
@@ -482,7 +542,7 @@ pub(crate) async fn dispatch(
                 json!({"version":1,"store_id":req.expected_store_id,"state":result.state,"bridge_route":request.bridge_route,"producer":request.producer,"issuer_epoch":request.issuer_epoch,"retirement_key":request.retirement_key,"retired_count":result.retired_count}),
             )
         }
-        _ => Err(Error::Unsupported("attempt method unsupported".into())),
+        _ => Err(Error::Unsupported("attempt method unsupported".into()).into()),
     }
 }
 fn wire_id(value: &str) -> Result<()> {
@@ -536,7 +596,9 @@ pub(crate) async fn serve_one(
     .await
     {
         Ok(result) => json!({"id":request.id,"result":result}),
-        Err(error) => json!({"id":request.id,"error":closed_error(&error,&request.method,&store)}),
+        Err(error) => {
+            json!({"id":request.id,"error":dispatch_error(&error,&request.method,&store)})
+        }
     };
     let mut bytes = serde_json::to_vec(&reply)?;
     if bytes.len() + 1 > 1024 * 1024 {
@@ -639,7 +701,7 @@ async fn serve_bridge_private_one(
                 {
                     return Err(Error::StoreIdentityMismatch);
                 }
-                if !reader.producer_scopes.contains(&parsed.producer_scope) {
+                if !reader.authorizes_scope(&parsed.producer_scope) {
                     return Err(peer_not_authorized());
                 }
                 let route = agent_run_store::owner_v2::EffectRoute {
@@ -1015,7 +1077,7 @@ pool_route={{component_store_id="pool-store",route_id="pool-route",worker_uid={u
             resident_hash = "b".repeat(64),
             python = executable.display()
         );
-        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        std::fs::write(home.path().join("config.toml"), &config).unwrap();
         let service = Service::new(home.path().to_path_buf());
         let socket = dir.path().join("read.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -1056,19 +1118,30 @@ pool_route={{component_store_id="pool-store",route_id="pool-route",worker_uid={u
         let home = tempfile::tempdir().unwrap();
         let store = agent_run_store::fixture::initialize(home.path()).unwrap();
         let sid = agent_run_store::store_identity::read(&store.conn).unwrap();
+        // SAFETY: geteuid is read-only and has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let run_route = Route {
+            component_store_id: sid.to_string(),
+            route_id: "run".into(),
+            worker_uid: uid,
+        };
+        let bridge_route = Route {
+            component_store_id: "00000000-0000-4000-8000-000000000001".into(),
+            route_id: "bridge".into(),
+            worker_uid: uid,
+        };
+        store.conn.execute("INSERT INTO owner_effects(producer_scope,effect_id,effect_digest,run_route_json,bridge_route_json,outbox_json,dispatch_token,state,protocol,native_id) VALUES(?,?,?,?,?,'{}','token','accepted','codex_turn','turn-id')",rusqlite::params!["pool/store/pool/member","confirmed","d".repeat(64),serde_json::to_string(&run_route).unwrap(),serde_json::to_string(&bridge_route).unwrap()]).unwrap();
         drop(store);
         let executable = crate::attempt_transport::test_peer::copy_peer(dir.path());
         let digest = agent_run_platform::fs::sha256(&std::fs::read(&executable).unwrap());
-        // SAFETY: geteuid is read-only and has no preconditions.
-        let uid = unsafe { libc::geteuid() };
         let config = format!(
-            "schema_version=2\n[managed_attempt_binding]\nenabled=false\nrole_name='managed'\npool_server='pool'\npool_executable_sha256='{frontend}'\nbridge_hook_sha256='{hook}'\nhost_id='host'\npool_resident_executable='/usr/bin/false'\npool_resident_sha256='{pool}'\n[[managed_attempt_binding.bridge_custody_readers]]\nreader_id='custody'\nworker_uid={uid}\nexecutable='{executable}'\nexecutable_sha256='{digest}'\nrun_route={{component_store_id='{sid}',route_id='run',worker_uid={uid}}}\nbridge_route={{component_store_id='00000000-0000-4000-8000-000000000001',route_id='bridge',worker_uid={uid}}}\nproducer_scopes=['scope']\n",
+            "schema_version=2\n[managed_attempt_binding]\nenabled=false\nrole_name='managed'\npool_server='pool'\npool_executable_sha256='{frontend}'\nbridge_hook_sha256='{hook}'\nhost_id='host'\npool_resident_executable='/usr/bin/false'\npool_resident_sha256='{pool}'\n[[managed_attempt_binding.bridge_custody_readers]]\nreader_id='custody'\nworker_uid={uid}\nexecutable='{executable}'\nexecutable_sha256='{digest}'\nrun_route={{component_store_id='{sid}',route_id='run',worker_uid={uid}}}\nbridge_route={{component_store_id='00000000-0000-4000-8000-000000000001',route_id='bridge',worker_uid={uid}}}\nproducer_scopes=['scope']\nproducer_scope_prefixes=['pool/store/pool/']\n",
             frontend = "a".repeat(64),
             hook = "c".repeat(64),
             pool = "b".repeat(64),
             executable = executable.display(),
         );
-        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        std::fs::write(home.path().join("config.toml"), &config).unwrap();
         let writer = crate::writer_test_harness::Harness::start(home.path());
         let service = Service::new(home.path().into()).with_writer(writer.broker());
         let socket = dir.path().join("reader.sock");
@@ -1081,6 +1154,43 @@ pool_route={{component_store_id="pool-store",route_id="pool-route",worker_uid={u
             ("_owner_effect_lookup_v2", "scope", "absent", None),
             ("_owner_effect_abort_v2", "scope", "aborted", None),
             ("_owner_effect_lookup_v2", "scope", "aborted", None),
+            (
+                "_owner_effect_lookup_v2",
+                "pool/store/pool/member",
+                "absent",
+                None,
+            ),
+            (
+                "_owner_effect_abort_v2",
+                "pool/store/pool/member/final-notice",
+                "aborted",
+                None,
+            ),
+            // Bridge compaction confirmation uses this same exact-key lookup.
+            (
+                "_owner_effect_lookup_v2",
+                "pool/store/pool/member/final-notice",
+                "aborted",
+                None,
+            ),
+            (
+                "_owner_effect_lookup_v2",
+                "pool/store/pool/",
+                "",
+                Some("peer_not_authorized"),
+            ),
+            (
+                "_owner_effect_abort_v2",
+                "pool/store/pool/member//other",
+                "",
+                Some("peer_not_authorized"),
+            ),
+            (
+                "_owner_effect_lookup_v2",
+                "pool/store/poolish/member",
+                "",
+                Some("peer_not_authorized"),
+            ),
             (
                 "_owner_effect_abort_v2",
                 "foreign",
@@ -1111,5 +1221,45 @@ pool_route={{component_store_id="pool-store",route_id="pool-route",worker_uid={u
                 assert_eq!(reply["result"]["version"], 2);
             }
         }
+        // Bridge's post-retirement compaction confirms this original accepted
+        // receipt using the very same prefix-authorized lookup route.
+        let frame=json!({"id":"confirm","method":"_owner_effect_lookup_v2","params":{"version":2,"expected_store_id":sid,"producer_scope":"pool/store/pool/member","effect_id":"confirmed","effect_digest":digest}}).to_string();
+        let mut child =
+            crate::attempt_transport::test_peer::child_at(&executable, "client", &socket)
+                .env("RUN_R2_PEER_FRAME", frame)
+                .env("RUN_R2_PEER_OUTPUT", &output)
+                .spawn()
+                .unwrap();
+        let (stream, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        serve_bridge_receipt(stream, &service).await.unwrap();
+        assert!(child.wait().await.unwrap().success());
+        let reply: Value = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(reply["result"]["state"], "accepted");
+        assert_eq!(reply["result"]["native_id"], "turn-id");
+        std::fs::write(
+            home.path().join("config.toml"),
+            config.replace("producer_scope_prefixes=['pool/store/pool/']\n", ""),
+        )
+        .unwrap();
+        let frame=json!({"id":"revoked","method":"_owner_effect_lookup_v2","params":{"version":2,"expected_store_id":sid,"producer_scope":"pool/store/pool/member","effect_id":"confirmed","effect_digest":digest}}).to_string();
+        let mut child =
+            crate::attempt_transport::test_peer::child_at(&executable, "client", &socket)
+                .env("RUN_R2_PEER_FRAME", frame)
+                .env("RUN_R2_PEER_OUTPUT", &output)
+                .spawn()
+                .unwrap();
+        let (stream, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        serve_bridge_receipt(stream, &service).await.unwrap();
+        assert!(child.wait().await.unwrap().success());
+        let reply: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(reply["error"]["code"], "peer_not_authorized");
     }
 }

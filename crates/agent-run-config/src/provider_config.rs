@@ -265,7 +265,7 @@ pub struct BridgeReceiptReader {
     pub pool_route: agent_run_domain::attempt_binding::Route,
 }
 
-/// One separately pinned Bridge effect custody principal and its exact scopes.
+/// One separately pinned Bridge effect custody principal and its scoped grants.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BridgeCustodyReader {
@@ -275,7 +275,34 @@ pub struct BridgeCustodyReader {
     pub executable_sha256: String,
     pub run_route: agent_run_domain::attempt_binding::Route,
     pub bridge_route: agent_run_domain::attempt_binding::Route,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub producer_scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub producer_scope_prefixes: Vec<String>,
+}
+
+fn valid_scope_prefix(prefix: &str) -> bool {
+    prefix.len() < 256
+        && agent_run_domain::attempt_binding::validate_id(prefix).is_ok()
+        && prefix.strip_suffix('/').is_some_and(|path| {
+            !path.is_empty() && path.split('/').all(|segment| !segment.is_empty())
+        })
+}
+fn scope_below_prefix(scope: &str, prefix: &str) -> bool {
+    scope.strip_prefix(prefix).is_some_and(|remainder| {
+        !remainder.is_empty() && remainder.split('/').all(|segment| !segment.is_empty())
+    })
+}
+impl BridgeCustodyReader {
+    /// Exact literals or a nonempty, well-formed descendant of an owned prefix.
+    pub fn authorizes_scope(&self, scope: &str) -> bool {
+        agent_run_domain::attempt_binding::validate_id(scope).is_ok()
+            && (self.producer_scopes.iter().any(|literal| literal == scope)
+                || self
+                    .producer_scope_prefixes
+                    .iter()
+                    .any(|prefix| valid_scope_prefix(prefix) && scope_below_prefix(scope, prefix)))
+    }
 }
 
 /// Pinned private Pool/Bridge routes and credential reference for R2.
@@ -551,7 +578,9 @@ impl ProviderConfig {
             let mut custody_paths = std::collections::BTreeSet::new();
             let mut custody_digests = std::collections::BTreeSet::new();
             let mut scopes = std::collections::BTreeSet::new();
-            for reader in &managed.bridge_custody_readers {
+            let mut prefixes: Vec<(&str, usize)> = Vec::new();
+            let mut literals: Vec<(&str, usize)> = Vec::new();
+            for (owner, reader) in managed.bridge_custody_readers.iter().enumerate() {
                 reader.run_route.validate()?;
                 reader.bridge_route.validate()?;
                 agent_run_domain::attempt_binding::validate_uuid(
@@ -583,18 +612,50 @@ impl ProviderConfig {
                     || !custody_ids.insert(&reader.reader_id)
                     || !custody_paths.insert(&reader.executable)
                     || !custody_digests.insert(&reader.executable_sha256)
-                    || reader.producer_scopes.is_empty()
-                    || reader.producer_scopes.len() > 128
+                    || (reader.producer_scopes.is_empty()
+                        && reader.producer_scope_prefixes.is_empty())
+                    || reader
+                        .producer_scopes
+                        .len()
+                        .saturating_add(reader.producer_scope_prefixes.len())
+                        > 128
                     || reader.producer_scopes.iter().any(|scope| {
                         agent_run_domain::attempt_binding::validate_id(scope).is_err()
                             || !scopes.insert(scope)
                     })
+                    || reader
+                        .producer_scope_prefixes
+                        .iter()
+                        .any(|prefix| !valid_scope_prefix(prefix))
                     || managed.bridge_receipt_readers.iter().any(|receipt| {
                         (receipt.executable == reader.executable)
                             != (receipt.executable_sha256 == reader.executable_sha256)
                     })
                 {
                     return Err(invalid("invalid managed custody reader"));
+                }
+                literals.extend(
+                    reader
+                        .producer_scopes
+                        .iter()
+                        .map(|scope| (scope.as_str(), owner)),
+                );
+                prefixes.extend(
+                    reader
+                        .producer_scope_prefixes
+                        .iter()
+                        .map(|prefix| (prefix.as_str(), owner)),
+                );
+            }
+            for (index, (prefix, owner)) in prefixes.iter().enumerate() {
+                if prefixes[..index]
+                    .iter()
+                    .any(|(other, _)| prefix.starts_with(*other) || other.starts_with(*prefix))
+                    || literals.iter().any(|(scope, literal_owner)| {
+                        literal_owner != owner && scope_below_prefix(scope, prefix)
+                    })
+                {
+                    return Err(invalid("overlapping managed custody scopes"));
                 }
             }
         }
@@ -904,9 +965,83 @@ producer_scopes=['scope']
                 "producer_scopes=['scope']",
                 "producer_scopes=['scope','scope']",
             ),
+            config.replace(
+                "producer_scopes=['scope']",
+                "producer_scope_prefixes=['pool/store/pool']",
+            ),
+            config.replace(
+                "producer_scopes=['scope']",
+                "producer_scope_prefixes=['pool//pool/']",
+            ),
+            config.replace(
+                "producer_scopes=['scope']",
+                "producer_scope_prefixes=['pool/store/','pool/store/member/']",
+            ),
         ] {
             assert!(parse(&invalid).is_err());
         }
+        let with_prefix = config.replace(
+            "producer_scopes=['scope']",
+            "producer_scopes=['scope']\nproducer_scope_prefixes=['pool/store/pool/']",
+        );
+        let mut parsed = parse(&with_prefix).unwrap();
+        let settings = parsed.managed_attempt_binding.as_ref().unwrap();
+        let reader = &settings.bridge_custody_readers[0];
+        for scope in [
+            "scope",
+            "pool/store/pool/member",
+            "pool/store/pool/member/final-notice",
+        ] {
+            assert!(reader.authorizes_scope(scope), "{scope}");
+        }
+        for scope in [
+            "pool/store/pool/",
+            "pool/store/pool",
+            "pool/store/poolish/member",
+            "pool/store/pool//member",
+            "pool/store/pool/member/",
+        ] {
+            assert!(!reader.authorizes_scope(scope), "{scope}");
+        }
+        assert!(
+            parse(&config.replace(
+                "producer_scopes=['scope']",
+                "producer_scope_prefixes=['pool/store/pool/']"
+            ))
+            .is_ok()
+        );
+        let mut other = reader.clone();
+        other.reader_id = "other".into();
+        other.executable = "/opt/other-bridge".into();
+        other.executable_sha256 = "f".repeat(64);
+        other.producer_scopes = vec!["pool/store/pool/member".into()];
+        other.producer_scope_prefixes.clear();
+        parsed
+            .managed_attempt_binding
+            .as_mut()
+            .unwrap()
+            .bridge_custody_readers
+            .push(other);
+        assert!(parsed.validate(Path::new("/fixture")).is_err());
+        let other = parsed
+            .managed_attempt_binding
+            .as_mut()
+            .unwrap()
+            .bridge_custody_readers
+            .last_mut()
+            .unwrap();
+        other.producer_scopes.clear();
+        other.producer_scope_prefixes = vec!["pool/store/pool/member/".into()];
+        assert!(parsed.validate(Path::new("/fixture")).is_err());
+        parsed
+            .managed_attempt_binding
+            .as_mut()
+            .unwrap()
+            .bridge_custody_readers
+            .last_mut()
+            .unwrap()
+            .producer_scope_prefixes = vec!["pool/other/".into()];
+        assert!(parsed.validate(Path::new("/fixture")).is_ok());
     }
 
     #[test]

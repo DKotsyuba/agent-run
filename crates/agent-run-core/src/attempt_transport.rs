@@ -627,6 +627,30 @@ fn decode<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result<T>
     serde_json::from_value(value).map_err(|_| invalid("attempt response invalid"))
 }
 impl super::attempt_binding::BridgeReader for AuthenticatedBridge {
+    fn actor_recovery<'a>(
+        &'a self,
+        route: &'a agent_run_domain::attempt_binding::Route,
+        producer: &'a str,
+        incarnation: &'a agent_run_domain::attempt_binding::Incarnation,
+        launch_id: &'a str,
+    ) -> super::attempt_binding::PeerFuture<'a, super::attempt_binding::BridgeActorRecovery> {
+        Box::pin(async move {
+            if *route != self.route {
+                return Err(Error::Conflict);
+            }
+            let value = self
+                .call(
+                    "run_actor_recovery_status_v1",
+                    serde_json::json!({
+                        "version":1,"expected_store_id":route.component_store_id,
+                        "producer":producer,"incarnation":incarnation,"launch_id":launch_id
+                    }),
+                )
+                .await?;
+            object_at(&value, "/incarnation")?;
+            decode(value)
+        })
+    }
     fn actor<'a>(
         &'a self,
         route: &'a agent_run_domain::attempt_binding::Route,
@@ -995,6 +1019,72 @@ mod tests {
         assert_eq!(result.actor.unwrap().native_id, "native");
         assert!(child.wait().await.unwrap().success());
     }
+
+    #[tokio::test]
+    async fn bridge_actor_recovery_uses_pinned_reader_and_exact_echo() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = tempfile::Builder::new()
+            .prefix("p2-recovery-")
+            .tempdir_in(base)
+            .unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.path().join("bridge.sock");
+        let executable = super::test_peer::copy_peer(dir.path());
+        let sha = agent_run_platform::fs::sha256(&std::fs::read(&executable).unwrap());
+        super::test_peer::wait_build_age(&executable).await;
+        let ready = dir.path().join("ready");
+        let mut child = super::test_peer::child_at(&executable, "bridge-recovery", &socket)
+            .env("RUN_R2_PEER_READY", &ready)
+            .spawn()
+            .unwrap();
+        super::test_peer::wait_file(&ready).await;
+        // SAFETY: geteuid is read-only and has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let route = agent_run_domain::attempt_binding::Route {
+            component_store_id: "00000000-0000-4000-8000-000000000001".into(),
+            route_id: "bridge".into(),
+            worker_uid: uid,
+        };
+        let incarnation = agent_run_domain::attempt_binding::Incarnation {
+            host_id: "host".into(),
+            boot_id: "00000000-0000-4000-8000-000000000002".into(),
+            pid_namespace_inode: 1,
+            uid,
+            pid: 2,
+            start_ticks: 1,
+        };
+        let client = AuthenticatedBridge {
+            endpoint: Endpoint {
+                socket,
+                pin: PeerPin {
+                    uid,
+                    executable,
+                    sha256: sha,
+                },
+            },
+            credential: "synthetic".into(),
+            route: route.clone(),
+        };
+        let result = client
+            .actor_recovery(
+                &route,
+                "pool",
+                &incarnation,
+                "00000000-0000-4000-8000-000000000003",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.state,
+            crate::attempt_binding::ActorRecoveryState::AwaitingRootHook
+        );
+        assert_eq!(result.incarnation, incarnation);
+        assert_eq!(result.launch_id, "00000000-0000-4000-8000-000000000003");
+        assert!(child.wait().await.unwrap().success());
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -1022,7 +1112,7 @@ pub(crate) mod test_peer {
             return;
         };
         let socket = std::env::var_os("RUN_R2_PEER_SOCKET").unwrap();
-        if mode == "pool-server" || mode == "bridge-server" {
+        if mode == "pool-server" || mode == "bridge-server" || mode == "bridge-recovery" {
             let listener = UnixListener::bind(&socket).unwrap();
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -1034,7 +1124,10 @@ pub(crate) mod test_peer {
                 .unwrap();
             let request: Value = serde_json::from_str(&line).unwrap();
             let p = &request["params"];
-            let response = if mode == "bridge-server" {
+            let response = if mode == "bridge-recovery" {
+                assert_eq!(request["op"], "run_actor_recovery_status_v1");
+                json!({"api_version":1,"request_id":request["request_id"],"success":true,"result":{"op":"run_actor_recovery_status_v1","value":{"status":"ok","value":{"version":1,"store_id":p["expected_store_id"],"producer":p["producer"],"incarnation":p["incarnation"],"launch_id":p["launch_id"],"state":"awaiting_root_hook"}}}})
+            } else if mode == "bridge-server" {
                 assert_eq!(request["op"], "run_actor_lookup_v1");
                 json!({"api_version":1,"request_id":request["request_id"],"success":true,"result":{"op":"run_actor_lookup_v1","value":{"status":"ok","value":{"version":1,"store_id":p["expected_store_id"],"producer":p["producer"],"incarnation":p["incarnation"],"launch_id":p["launch_id"],"state":"current","actor":{"address":"host/codex/native","role":"root","native_id":"native","epoch":1},"issuer_epoch":"issuer"}}}})
             } else {
