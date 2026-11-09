@@ -192,6 +192,14 @@ impl BrokerClient {
                         *connection = None;
                         return Err(Error::Runtime("invalid exact transcript response".into()));
                     }
+                    if method == "initial_task"
+                        && params
+                            .as_ref()
+                            .is_none_or(|params| !valid_initial_task_response(&value, params))
+                    {
+                        *connection = None;
+                        return Err(Error::Runtime("invalid initial task response".into()));
+                    }
                     if method == "status"
                         && params
                             .as_ref()
@@ -1003,6 +1011,7 @@ async fn respond_with_access(service: &Service, v: Value, access: SocketAccess) 
             | "status"
             | "batch_receipt"
             | "transcript_exact"
+            | "initial_task"
             | "_lineage_hold_acquire"
             | "_lineage_hold_lookup"
             | "_lineage_hold_list"
@@ -1196,6 +1205,7 @@ async fn connection(
                             "status"
                                 | "batch_receipt"
                                 | "transcript_exact"
+                                | "initial_task"
                                 | "_lineage_hold_lookup"
                                 | "_lineage_hold_list"
                         ) {
@@ -1204,6 +1214,8 @@ async fn connection(
                                 "status read failed"
                             } else if method == "transcript_exact" {
                                 "exact transcript read failed"
+                            } else if method == "initial_task" {
+                                "initial task read failed"
                             } else if method == "batch_receipt" {
                                 "batch receipt read failed"
                             } else {
@@ -1335,6 +1347,11 @@ fn valid_start_frame(raw: &[u8], method: &str) -> bool {
         >(raw)
         .map(|frame| frame.params)
         .is_ok(),
+        "initial_task" => {
+            serde_json::from_slice::<Frame<agent_run_domain::initial_task::InitialTaskRequest>>(raw)
+                .map(|frame| frame.params)
+                .is_ok()
+        }
         "status" => serde_json::from_slice::<Frame<agent_run_domain::status::StatusRequest>>(raw)
             .map(|frame| frame.params)
             .is_ok(),
@@ -1904,6 +1921,33 @@ async fn serve_endpoints(
         Some(settings) => Some(bind_shared(&settings.writer_socket).await?),
         None => None,
     };
+    // Explicitly configured readers retain exact-key recovery after disabling
+    // the managed switch, including across a broker restart.
+    let bridge_receipt_endpoint = if system.is_none()
+        && agent_run_config::provider_config::ProviderConfig::load(home)
+            .ok()
+            .is_some_and(|(config, _)| {
+                config.managed_attempt_binding.is_some_and(|settings| {
+                    !settings.bridge_receipt_readers.is_empty()
+                        || !settings.bridge_custody_readers.is_empty()
+                })
+            }) {
+        Some(bind_private(&home.join("attempt-receipts.sock")).await?)
+    } else {
+        None
+    };
+    let pool_attempt_endpoint = if system.is_none()
+        && agent_run_config::provider_config::ProviderConfig::load(home)
+            .ok()
+            .is_some_and(|(config, _)| {
+                config
+                    .managed_attempt_binding
+                    .is_some_and(|settings| settings.transport.is_some())
+            }) {
+        Some(bind_private(&home.join("attempt.sock")).await?)
+    } else {
+        None
+    };
     let launcher = system.as_ref().map(|settings| settings.launcher.clone());
     let system_group = system.is_some();
     // The one resident writer: acquires the home-wide writer lease and opens the
@@ -1954,6 +1998,40 @@ async fn serve_endpoints(
     // JoinSet aborts maintenance on every exit path, including cancellation of
     // serve_at itself; dropping a bare JoinHandle would detach these loops.
     let mut workers = JoinSet::new();
+    if let Some((listener, guard)) = pool_attempt_endpoint {
+        let attempt_service = service.clone();
+        workers.spawn(async move {
+            let _guard=guard;let capacity=Arc::new(Semaphore::new(32));let mut handlers=JoinSet::new();
+            loop {tokio::select! {
+                accepted=listener.accept()=>match accepted {
+                    Ok((stream,_))=>{let Ok(permit)=capacity.clone().try_acquire_owned() else {continue};let service=attempt_service.clone();handlers.spawn(async move {let _permit=permit;let _=agent_run_core::attempt_wire::serve_pool_attempt(stream,&service).await;});},
+                    Err(_)=>break,
+                },
+                Some(_)=handlers.join_next(),if !handlers.is_empty()=>{},
+            }}
+        });
+    }
+    if let Some((listener, guard)) = bridge_receipt_endpoint {
+        let receipt_service = service.clone();
+        workers.spawn(async move {
+            let _guard=guard;
+            let capacity=Arc::new(Semaphore::new(32));
+            let mut readers=JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted=listener.accept()=>match accepted {
+                        Ok((stream,_))=>{
+                            let Ok(permit)=capacity.clone().try_acquire_owned() else {continue};
+                            let service=receipt_service.clone();
+                            readers.spawn(async move {let _permit=permit;let _=agent_run_core::attempt_wire::serve_bridge_receipt(stream,&service).await;});
+                        }
+                        Err(_)=>break,
+                    },
+                    Some(_)=readers.join_next(), if !readers.is_empty()=>{},
+                }
+            }
+        });
+    }
     workers.spawn(agent_run_core::service_restart::run(service.clone()));
     let history_home = home.to_owned();
     let retention_lane = broker_writer.lane("retention");
@@ -2772,11 +2850,18 @@ fn malformed_response_error(method: &str, message: &str) -> Error {
 
 /// Requires a canonical database identity only when capabilities opted in.
 pub(crate) fn valid_capabilities_scope(value: &Value, params: &Value) -> bool {
-    params.get("include_store_id") != Some(&json!(true))
+    (params.get("include_store_id") != Some(&json!(true))
         || value
             .get("store_id")
             .and_then(Value::as_str)
-            .is_some_and(|id| id.parse::<agent_run_domain::StoreId>().is_ok())
+            .is_some_and(|id| id.parse::<agent_run_domain::StoreId>().is_ok()))
+        && (params.get("include_initial_task") != Some(&json!(true))
+            || value.get("initial_task").is_some_and(|capability| {
+                serde_json::from_value::<agent_run_domain::initial_task::InitialTaskCapability>(
+                    capability.clone(),
+                )
+                .is_ok()
+            }))
 }
 
 /// Rejects wrong-store/selector or inconsistent exact-export continuations.
@@ -2789,6 +2874,21 @@ pub(crate) fn valid_transcript_exact_response(value: &Value, params: &Value) -> 
     let Ok(response) = serde_json::from_value::<
         agent_run_domain::transcript_exact::TranscriptExactResponse,
     >(value.clone()) else {
+        return false;
+    };
+    response.validate_for(&request).is_ok()
+}
+
+/// Rejects wrong-store/agent/fence or inconsistent initial-task pages.
+pub(crate) fn valid_initial_task_response(value: &Value, params: &Value) -> bool {
+    let Ok(request) = serde_json::from_value::<agent_run_domain::initial_task::InitialTaskRequest>(
+        params.clone(),
+    ) else {
+        return false;
+    };
+    let Ok(response) = serde_json::from_value::<agent_run_domain::initial_task::InitialTaskResponse>(
+        value.clone(),
+    ) else {
         return false;
     };
     response.validate_for(&request).is_ok()
@@ -3009,6 +3109,9 @@ async fn client_with_wait_deadlines(
         }
         if method == "transcript_exact" && !valid_transcript_exact_response(&result, &params) {
             return Err(Error::Runtime("invalid exact transcript response".into()));
+        }
+        if method == "initial_task" && !valid_initial_task_response(&result, &params) {
+            return Err(Error::Runtime("invalid initial task response".into()));
         }
         if method == "status" && !valid_status_response(&result, &params) {
             return Err(Error::Runtime("invalid status response".into()));

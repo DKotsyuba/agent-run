@@ -2,6 +2,8 @@
 pub mod accounts;
 /// Atomic durable admission, replay, and active-capacity reservation.
 pub mod admission;
+/// Durable attempt-binding admissions and recovery fences; private to the broker.
+pub mod attempt_binding;
 /// Permanent, atomic receipts for generic batch admission.
 pub mod batch_admission;
 /// Durable delivery outbox rows, binding, expiry, and evidence verdicts.
@@ -18,6 +20,7 @@ pub mod history_pins;
 mod hold_crypto;
 /// Bounded, content-free incident phases independent of expirable history.
 pub mod incidents;
+pub mod initial_task;
 /// Durable append-only journal operations and bounded transcript spooling.
 pub mod journal;
 /// Resume-parent proof and one-child lineage admission helpers.
@@ -29,6 +32,8 @@ pub mod managed_services;
 pub mod migrations;
 /// Closed storage operation inventory, envelopes and authority matrix.
 pub mod ops;
+/// Durable one-effect owner-v2 reservation and recovery journal.
+pub mod owner_v2;
 pub mod pool_admission;
 /// Exact-attempt enrollment of active independent workers into one pool.
 pub mod pool_enrollment;

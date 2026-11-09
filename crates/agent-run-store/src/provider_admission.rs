@@ -243,6 +243,37 @@ impl Store<'_> {
             .parse()
     }
 
+    /// Durably prepares one launch for an existing owned provider attempt.
+    /// Replays return the original identifier and never change its state.
+    pub fn prepare_attempt_launch(&self, id: &AgentId, attempt: &str) -> Result<String> {
+        use rusqlite::OptionalExtension;
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
+        let existing: Option<(String, String)> = tx
+            .query_row(
+                "SELECT execution_id,launch_id FROM attempt_launches WHERE spawn_key=?",
+                [attempt],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((owner, launch)) = existing {
+            if owner != id.as_str() {
+                return Err(Error::Conflict);
+            }
+            tx.commit()?;
+            return Ok(launch);
+        }
+        let sequence: i64 = tx.query_row(
+            "SELECT a.sequence FROM agents a JOIN attempts t ON t.agent_id=a.id \
+             WHERE a.id=? AND t.id=? AND t.ownership_active=1 AND t.phase='prepared' AND t.process_identity IS NULL",
+            params![id.as_str(), attempt], |row| row.get(0),
+        ).optional()?.ok_or(Error::Conflict)?;
+        let launch = uuid::Uuid::new_v4().to_string();
+        tx.execute("INSERT INTO attempt_launches(spawn_key,execution_id,sequence,attempt_id,launch_id,state) VALUES(?,?,?,?,?,'prepared')",
+            params![attempt, id.as_str(), sequence, attempt, launch])?;
+        tx.commit()?;
+        Ok(launch)
+    }
+
     /// Claims the owned prepared attempt for spawning before any child is
     /// created. Returns `false`, changing nothing, when a cancel is pending or
     /// claimed: the claim and the cancel check are one statement, so an
@@ -250,7 +281,8 @@ impl Store<'_> {
     /// Configured service gates and leased generations must still be ready in
     /// the same statement; a readiness race returns Conflict without spawning.
     pub fn provider_spawning(&self, id: &AgentId, attempt: &str) -> Result<bool> {
-        let changed = self.conn.execute(
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
+        let changed = tx.execute(
             "UPDATE attempts SET phase='spawning',state='starting' \
              WHERE id=?1 AND agent_id=?2 AND ownership_active=1 AND phase='prepared' \
              AND NOT EXISTS (SELECT 1 FROM commands WHERE agent_id=?2 AND kind='cancel' AND state IN ('pending','claimed')) \
@@ -259,9 +291,18 @@ impl Store<'_> {
             params![attempt, id.as_str()],
         )?;
         if changed == 1 {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM attempt_launches WHERE attempt_id=?)",
+                [attempt],
+                |row| row.get(0),
+            )?;
+            if exists && tx.execute("UPDATE attempt_launches SET state='spawning' WHERE attempt_id=? AND execution_id=? AND state='prepared'", params![attempt, id.as_str()])? != 1 {
+                return Err(Error::Conflict);
+            }
+            tx.commit()?;
             return Ok(true);
         }
-        let cancelled: bool = self.conn.query_row(
+        let cancelled: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM commands WHERE agent_id=? AND kind='cancel' AND state IN ('pending','claimed'))",
             [id.as_str()],
             |row| row.get(0),
@@ -276,7 +317,8 @@ impl Store<'_> {
     /// Returns a pre-child validation or OS spawn refusal to the prepared phase
     /// so the supervisor can certify never-spawned cleanup and close ownership.
     pub fn provider_spawn_failed(&self, id: &AgentId, attempt: &str) -> Result<()> {
-        let changed = self.conn.execute(
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
+        let changed = tx.execute(
             "UPDATE attempts SET phase='prepared' \
              WHERE id=? AND agent_id=? AND ownership_active=1 AND phase='spawning' AND process_identity IS NULL",
             params![attempt, id.as_str()],
@@ -284,6 +326,15 @@ impl Store<'_> {
         if changed != 1 {
             return Err(Error::Conflict);
         }
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attempt_launches WHERE attempt_id=?)",
+            [attempt],
+            |row| row.get(0),
+        )?;
+        if exists && tx.execute("UPDATE attempt_launches SET state='failed' WHERE attempt_id=? AND execution_id=? AND state='spawning'", params![attempt, id.as_str()])? != 1 {
+            return Err(Error::Conflict);
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -303,13 +354,50 @@ impl Store<'_> {
         leader: &Identity,
         integration: Option<&agent_run_domain::integration::NativeIntegration>,
     ) -> Result<()> {
+        self.provider_process_launch_evidence(id, attempt, leader, integration, None)
+    }
+
+    /// Atomically binds a journaled launch and the existing process evidence.
+    pub fn provider_process_launch_evidence(
+        &self,
+        id: &AgentId,
+        attempt: &str,
+        leader: &Identity,
+        integration: Option<&agent_run_domain::integration::NativeIntegration>,
+        incarnation: Option<&agent_run_platform::process::KernelIncarnation>,
+    ) -> Result<()> {
         if let Some(evidence) = integration {
             evidence.validate()?;
             if evidence.session.is_some() {
                 return Err(invalid("native session must be observed by the adapter"));
             }
         }
-        let changed = self.conn.execute(
+        let tx = crate::writer::WriteTx::begin(&self.conn)?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attempt_launches WHERE attempt_id=?)",
+            [attempt],
+            |row| row.get(0),
+        )?;
+        if exists {
+            let changed = if let Some(inc) = incarnation {
+                if inc.pid != leader.pid as u32
+                    || leader.token != format!("linux:{}:{}", inc.boot_id, inc.start_ticks)
+                {
+                    return Err(invalid("launch incarnation does not match leader"));
+                }
+                tx.execute("UPDATE attempt_launches SET state='bound',boot_id=?,pid_namespace_inode=?,uid=?,pid=?,start_ticks=? WHERE attempt_id=? AND execution_id=? AND state='spawning'", params![inc.boot_id, inc.pid_namespace_inode, inc.uid, inc.pid, inc.start_ticks, attempt, id.as_str()])?
+            } else {
+                // The ordinary PID-reuse fence is still recorded below, but
+                // the missing full identity cannot authorize managed binding.
+                tx.execute("UPDATE attempt_launches SET state='unknown' WHERE attempt_id=? AND execution_id=? AND state='spawning'", params![attempt, id.as_str()])?
+            };
+            if changed != 1 {
+                return Err(Error::Conflict);
+            }
+        } else if incarnation.is_some() {
+            return Err(Error::Conflict);
+        }
+        let changed = tx.execute(
             "UPDATE attempts SET process_identity=?,process_birth_time=?,session_facts_json=? \
              WHERE id=? AND agent_id=? AND ownership_active=1 AND phase='spawning' AND process_identity IS NULL",
             params![leader.token, leader.birth, integration.map(serde_json::to_string).transpose()?, attempt, id.as_str()],
@@ -317,6 +405,7 @@ impl Store<'_> {
         if changed != 1 {
             return Err(Error::Conflict);
         }
+        tx.commit()?;
         Ok(())
     }
 

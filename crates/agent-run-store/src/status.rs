@@ -143,6 +143,24 @@ fn optional_text(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Opti
 
 /// Checks frozen provider-v2 request and authority without resolving paths or reading secrets.
 fn provider_identity(conn: &Connection, id: &AgentId, budget: &mut Budget) -> Result<bool> {
+    Ok(provider_request(conn, id, budget)?.is_some_and(|(request, task)| request.task == task))
+}
+
+/// Frozen provider-v2 request of one execution with every identity check passed
+/// except task agreement; the caller compares `request.task` with its own source.
+pub(crate) fn verified_provider_request(
+    conn: &Connection,
+    id: &AgentId,
+) -> Result<Option<ProviderStartRequest>> {
+    Ok(provider_request(conn, id, &mut Budget::default())?.map(|(request, _)| request))
+}
+
+/// Shared body of [`provider_identity`]: the verified frozen request plus the row's task.
+fn provider_request(
+    conn: &Connection,
+    id: &AgentId,
+    budget: &mut Budget,
+) -> Result<Option<(ProviderStartRequest, String)>> {
     let row: (
         Option<String>,
         String,
@@ -171,17 +189,17 @@ fn provider_identity(conn: &Connection, id: &AgentId, budget: &mut Budget) -> Re
         },
     )?;
     let (Some(raw), runtime, model, profile, Some(task), Some(workdir)) = row else {
-        return Ok(false);
+        return Ok(None);
     };
     if !budget.bytes(
         raw.len()
             .saturating_add(task.len())
             .saturating_add(workdir.len()),
     ) {
-        return Ok(false);
+        return Ok(None);
     }
     let Ok(identity) = serde_json::from_str::<Value>(&raw) else {
-        return Ok(false);
+        return Ok(None);
     };
     let original = &identity["provider_request"];
     if identity["provider_identity_version"] != 2
@@ -189,29 +207,29 @@ fn provider_identity(conn: &Connection, id: &AgentId, budget: &mut Budget) -> Re
         || identity["replay_request_sha256"].as_str()
             != Some(canonical::sha256_hex(original, true).as_str())
     {
-        return Ok(false);
+        return Ok(None);
     }
     let Ok(mut request) = ProviderStartRequest::from_history(original.clone()) else {
-        return Ok(false);
+        return Ok(None);
     };
     if request.validate_intent().is_err() {
-        return Ok(false);
+        return Ok(None);
     }
     let Ok(authority) =
         serde_json::from_value::<ResolvedLaunchAuthority>(identity["authority"].clone())
     else {
-        return Ok(false);
+        return Ok(None);
     };
-    Ok(authority.validate().is_ok()
+    let consistent = authority.validate().is_ok()
         && request.provider.as_str() == runtime
         && request.model == model
         && request.profile == profile
-        && request.task == task
         && request.workdir.to_string_lossy() == workdir
         && authority.provider == request.provider
         && authority.model == request.model
         && authority.profile == request.profile
-        && authority.workdir == request.workdir)
+        && authority.workdir == request.workdir;
+    Ok(consistent.then_some((request, task)))
 }
 
 /// Validates all retained attempts in sequence, never exposing native identities.

@@ -140,6 +140,98 @@ fn every_historical_version_migrates_to_a_schema_indistinguishable_from_fresh() 
     }
 }
 
+/// Historical attempts gain no manufactured launch or kernel identity.
+#[test]
+fn v37_launch_migration_preserves_historical_attempts_unqualified() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("state.db");
+    let conn = build_fixture(&path, 37);
+    let before: String = conn.query_row("SELECT json_group_array(json_array(id,agent_id,process_identity,phase)) FROM (SELECT * FROM attempts ORDER BY id)", [], |r| r.get(0)).unwrap();
+    drop(conn);
+    assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
+    let migrated = open_ro(&path);
+    let after: String = migrated.query_row("SELECT json_group_array(json_array(id,agent_id,process_identity,phase)) FROM (SELECT * FROM attempts ORDER BY id)", [], |r| r.get(0)).unwrap();
+    assert_eq!(before, after);
+    assert_eq!(
+        migrated
+            .query_row("SELECT count(*) FROM attempt_launches", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+/// R2 upgrades a bound R1 launch without manufacturing an admission or receipt.
+#[test]
+fn v38_attempt_migration_preserves_launch_and_starts_authority_empty() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("state.db");
+    let conn = build_fixture(&path, 38);
+    conn.execute("INSERT INTO attempt_launches(spawn_key,execution_id,sequence,attempt_id,launch_id,state,boot_id,pid_namespace_inode,uid,pid,start_ticks) VALUES('fixture-key','fixture-execution',1,'fixture-attempt','00000000-0000-4000-8000-000000000001','bound','00000000-0000-4000-8000-000000000002',11,1000,123,456)", []).unwrap();
+    let before:String=conn.query_row("SELECT json_array(spawn_key,execution_id,sequence,attempt_id,launch_id,state,boot_id,pid_namespace_inode,uid,pid,start_ticks) FROM attempt_launches WHERE spawn_key='fixture-key'",[],|r|r.get(0)).unwrap();
+    drop(conn);
+    assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
+    let conn = open_ro(&path);
+    let after:String=conn.query_row("SELECT json_array(spawn_key,execution_id,sequence,attempt_id,launch_id,state,boot_id,pid_namespace_inode,uid,pid,start_ticks) FROM attempt_launches WHERE spawn_key='fixture-key'",[],|r|r.get(0)).unwrap();
+    assert_eq!(before, after);
+    for table in [
+        "attempt_pending_checks",
+        "attempt_pending_current",
+        "attempt_role_qualifications",
+        "attempt_admissions",
+        "attempt_current_receipts",
+        "attempt_namespace_retirements",
+    ] {
+        assert_eq!(
+            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+    }
+}
+
+/// R3 never invents old native effects when upgrading an R2 store.
+#[test]
+fn v39_owner_effect_migration_preserves_r2_receipts() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("state.db");
+    let conn = build_fixture(&path, 39);
+    conn.execute("INSERT INTO attempt_admissions(intent_id,security_digest,pool_route_json,state) VALUES('old-intent',?,'{}','aborted_before_admit')",["a".repeat(64)]).unwrap();
+    let before:String=conn.query_row("SELECT json_array(intent_id,security_digest,pool_route_json,state) FROM attempt_admissions WHERE intent_id='old-intent'",[],|r|r.get(0)).unwrap();
+    drop(conn);
+    assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
+    let conn = open_ro(&path);
+    let after:String=conn.query_row("SELECT json_array(intent_id,security_digest,pool_route_json,state) FROM attempt_admissions WHERE intent_id='old-intent'",[],|r|r.get(0)).unwrap();
+    assert_eq!(before, after);
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM owner_effects", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    for trigger in [
+        "attempt_launches_no_delete",
+        "attempt_role_qualifications_no_delete",
+        "attempt_pending_checks_no_delete",
+        "attempt_admissions_no_delete",
+        "attempt_pending_current_no_delete",
+        "attempt_current_receipts_no_delete",
+        "attempt_namespace_retirements_no_delete",
+        "owner_effects_no_delete",
+    ] {
+        assert!(
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?)",
+                [trigger],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap(),
+            "{trigger}"
+        );
+    }
+}
+
 /// V37 adds hold storage without rewriting existing identity, pins, receipts or agent history.
 #[test]
 fn v36_hold_migration_preserves_identity_pins_receipts_and_history() {

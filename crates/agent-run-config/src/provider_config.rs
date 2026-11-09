@@ -23,6 +23,139 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Generic interpreters cannot identify their supplied program by executable hash.
+pub fn forbidden_interpreter(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return true;
+    };
+    let name = name.to_ascii_lowercase();
+    [
+        "python",
+        "pypy",
+        "awk",
+        "gawk",
+        "mawk",
+        "nawk",
+        "expect",
+        "rscript",
+        "julia",
+        "erl",
+        "escript",
+        "ld",
+        "ld.so",
+        "ld-linux",
+        "ld-musl",
+        "node",
+        "nodejs",
+        "deno",
+        "bun",
+        "bash",
+        "dash",
+        "zsh",
+        "ksh",
+        "fish",
+        "sh",
+        "csh",
+        "tcsh",
+        "pwsh",
+        "powershell",
+        "perl",
+        "ruby",
+        "lua",
+        "php",
+        "tclsh",
+        "wish",
+        "gjs",
+        "qjs",
+        "jsc",
+        "wasmtime",
+        "wasmer",
+        "env",
+        "busybox",
+        "java",
+        "dotnet",
+    ]
+    .iter()
+    .any(|prefix| {
+        name == *prefix
+            || (name.starts_with(prefix)
+                && name
+                    .as_bytes()
+                    .get(prefix.len())
+                    .is_some_and(|b| b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'_')))
+    })
+}
+
+/// Reject renamed copies of installed common interpreters as well as their
+/// ordinary names. The operator still pins and reviews the actual native build.
+pub fn forbidden_interpreter_build(path: &Path, digest: &str, size: u64) -> bool {
+    if forbidden_interpreter(path) {
+        return true;
+    }
+    let mut roots: Vec<(PathBuf, bool)> = ["/bin", "/usr/bin", "/usr/local/bin"]
+        .into_iter()
+        .map(|path| (path.into(), false))
+        .collect();
+    roots.extend([("/opt".into(), true), ("/usr/lib".into(), true)]);
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push((PathBuf::from(home).join(".nvm"), true));
+    }
+    interpreter_in_roots(roots, digest, size)
+}
+
+fn interpreter_in_roots(mut roots: Vec<(PathBuf, bool)>, digest: &str, size: u64) -> bool {
+    let mut visited = 0usize;
+    while let Some((directory, recursive)) = roots.pop() {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > 200_000 {
+                return true;
+            }
+            let candidate = entry.path();
+            if recursive && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                roots.push((candidate.clone(), true));
+            }
+            if !forbidden_interpreter(&candidate) {
+                continue;
+            }
+            let Ok(metadata) = std::fs::metadata(&candidate) else {
+                continue;
+            };
+            if metadata.is_file()
+                && metadata.len() == size
+                && metadata.len() <= 512 * 1024 * 1024
+                && std::fs::read(&candidate)
+                    .ok()
+                    .is_some_and(|bytes| fs::sha256(&bytes) == digest)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn preload_file_safe(path: &Path) -> bool {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    let mut bytes = Vec::new();
+    file.take(65_537).read_to_end(&mut bytes).is_ok()
+        && bytes.len() <= 65_536
+        && bytes.iter().all(u8::is_ascii_whitespace)
+}
+
+/// A global loader preload undermines executable-build identity; fail closed.
+pub fn loader_preload_safe() -> bool {
+    preload_file_safe(Path::new("/etc/ld.so.preload"))
+}
+
 /// Stable native launch settings for one supported harness, independent of
 /// provider aliases, account selection, and canonical role grants.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +228,72 @@ pub struct ProviderSettings {
     pub collector: Option<CollectorBinding>,
 }
 
+/// Opt-in selector for the dedicated no-shell managed role. No historical
+/// configuration gains this field or a managed route when it is absent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedAttemptBinding {
+    #[serde(default)]
+    pub enabled: bool,
+    pub role_name: String,
+    pub pool_server: String,
+    pub pool_executable_sha256: String,
+    pub bridge_hook_sha256: String,
+    pub host_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_resident_executable: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_resident_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<ManagedAttemptTransport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bridge_receipt_readers: Vec<BridgeReceiptReader>,
+    /// Separately scoped Bridge principals permitted effect recovery only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bridge_custody_readers: Vec<BridgeCustodyReader>,
+}
+
+/// Distinct, pinned Bridge principal permitted only the R2 receipt lookup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeReceiptReader {
+    pub reader_id: String,
+    pub worker_uid: u32,
+    pub executable: PathBuf,
+    pub executable_sha256: String,
+    pub run_route: agent_run_domain::attempt_binding::Route,
+    pub pool_route: agent_run_domain::attempt_binding::Route,
+}
+
+/// One separately pinned Bridge effect custody principal and its exact scopes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeCustodyReader {
+    pub reader_id: String,
+    pub worker_uid: u32,
+    pub executable: PathBuf,
+    pub executable_sha256: String,
+    pub run_route: agent_run_domain::attempt_binding::Route,
+    pub bridge_route: agent_run_domain::attempt_binding::Route,
+    pub producer_scopes: Vec<String>,
+}
+
+/// Pinned private Pool/Bridge routes and credential reference for R2.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedAttemptTransport {
+    pub run_route: agent_run_domain::attempt_binding::Route,
+    pub pool_route: agent_run_domain::attempt_binding::Route,
+    pub bridge_route: agent_run_domain::attempt_binding::Route,
+    pub producer: String,
+    pub pool_socket: PathBuf,
+    pub bridge_socket: PathBuf,
+    pub bridge_executable: PathBuf,
+    pub bridge_executable_sha256: String,
+    pub bridge_reader_credential_file: PathBuf,
+    pub bridge_reader_credential_sha256: String,
+}
+
 /// Returns the validated default ranking multiplier.
 fn one() -> PositiveFinite {
     PositiveFinite::try_from(1.0).expect("one is positive")
@@ -109,6 +308,9 @@ fn one() -> PositiveFinite {
 pub struct ProviderConfig {
     /// Must be exactly two.
     pub schema_version: u32,
+    /// Explicit opt-in; absent means no managed selector or capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_attempt_binding: Option<Box<ManagedAttemptBinding>>,
     /// Existing service lifecycle controls.
     #[serde(default)]
     pub core: Core,
@@ -211,6 +413,191 @@ impl ProviderConfig {
     /// A file with neither harnesses nor providers is the explicitly empty
     /// catalog a fresh `init` writes: valid, with nothing to start or collect.
     pub fn validate(&mut self, home: &Path) -> Result<()> {
+        if let Some(managed) = &self.managed_attempt_binding {
+            let name = |s: &str| {
+                !s.is_empty()
+                    && s.len() <= 128
+                    && s.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+            };
+            if !name(&managed.role_name)
+                || !name(&managed.pool_server)
+                || !name(&managed.host_id)
+                || managed
+                    .pool_executable_sha256
+                    .parse::<agent_run_domain::Sha256Digest>()
+                    .is_err()
+                || managed
+                    .bridge_hook_sha256
+                    .parse::<agent_run_domain::Sha256Digest>()
+                    .is_err()
+            {
+                return Err(invalid("invalid managed attempt selector"));
+            }
+            if managed.bridge_receipt_readers.len() > 32
+                || managed.bridge_custody_readers.len() > 32
+            {
+                return Err(invalid("too many managed receipt readers"));
+            }
+            if managed.pool_resident_sha256.as_ref() == Some(&managed.bridge_hook_sha256) {
+                return Err(invalid("managed component identity is ambiguous"));
+            }
+            if (!managed.bridge_receipt_readers.is_empty()
+                || !managed.bridge_custody_readers.is_empty())
+                && (managed
+                    .pool_resident_executable
+                    .as_ref()
+                    .is_none_or(|path| !path.is_absolute() || forbidden_interpreter(path))
+                    || managed.pool_resident_sha256.as_ref().is_none_or(|digest| {
+                        digest.parse::<agent_run_domain::Sha256Digest>().is_err()
+                    }))
+            {
+                return Err(invalid("managed Pool principal is not pinned"));
+            }
+            if let Some(transport) = &managed.transport {
+                transport.run_route.validate()?;
+                transport.pool_route.validate()?;
+                transport.bridge_route.validate()?;
+                agent_run_domain::attempt_binding::validate_uuid(
+                    &transport.bridge_route.component_store_id,
+                )?;
+                let absolute = |p: &Path| {
+                    p.is_absolute()
+                        && !p.components().any(|c| {
+                            matches!(
+                                c,
+                                std::path::Component::ParentDir | std::path::Component::CurDir
+                            )
+                        })
+                };
+                if managed
+                    .pool_resident_executable
+                    .as_deref()
+                    .is_none_or(|path| !absolute(path) || forbidden_interpreter(path))
+                    || managed
+                        .pool_resident_sha256
+                        .as_ref()
+                        .is_none_or(|s| s.parse::<agent_run_domain::Sha256Digest>().is_err())
+                    || !name(&transport.producer)
+                    || !absolute(&transport.pool_socket)
+                    || !absolute(&transport.bridge_socket)
+                    || !absolute(&transport.bridge_executable)
+                    || forbidden_interpreter(&transport.bridge_executable)
+                    || !absolute(&transport.bridge_reader_credential_file)
+                    || transport
+                        .bridge_executable_sha256
+                        .parse::<agent_run_domain::Sha256Digest>()
+                        .is_err()
+                    || transport
+                        .bridge_reader_credential_sha256
+                        .parse::<agent_run_domain::Sha256Digest>()
+                        .is_err()
+                    || managed.pool_resident_executable.as_ref()
+                        == Some(&transport.bridge_executable)
+                    || managed.pool_resident_sha256.as_ref()
+                        == Some(&transport.bridge_executable_sha256)
+                    || managed.pool_resident_sha256.as_ref()
+                        == Some(&managed.pool_executable_sha256)
+                    || managed.pool_resident_sha256.as_ref() == Some(&managed.bridge_hook_sha256)
+                    || transport.bridge_executable_sha256 == managed.bridge_hook_sha256
+                    || transport
+                        .run_route
+                        .component_store_id
+                        .parse::<agent_run_domain::StoreId>()
+                        .is_err()
+                    || transport.run_route.worker_uid != transport.pool_route.worker_uid
+                    || transport.run_route.worker_uid != transport.bridge_route.worker_uid
+                {
+                    return Err(invalid("invalid managed attempt transport"));
+                }
+            }
+            let mut ids = std::collections::BTreeSet::new();
+            let mut paths = std::collections::BTreeSet::new();
+            let mut digests = std::collections::BTreeSet::new();
+            for reader in &managed.bridge_receipt_readers {
+                reader.run_route.validate()?;
+                reader.pool_route.validate()?;
+                if !name(&reader.reader_id)
+                    || !reader.executable.is_absolute()
+                    || forbidden_interpreter(&reader.executable)
+                    || reader.executable.components().any(|p| {
+                        matches!(
+                            p,
+                            std::path::Component::ParentDir | std::path::Component::CurDir
+                        )
+                    })
+                    || reader
+                        .executable_sha256
+                        .parse::<agent_run_domain::Sha256Digest>()
+                        .is_err()
+                    || reader
+                        .run_route
+                        .component_store_id
+                        .parse::<agent_run_domain::StoreId>()
+                        .is_err()
+                    || reader.worker_uid != reader.run_route.worker_uid
+                    || reader.worker_uid != reader.pool_route.worker_uid
+                    || managed.pool_resident_executable.as_ref() == Some(&reader.executable)
+                    || managed.pool_resident_sha256.as_ref() == Some(&reader.executable_sha256)
+                    || managed.bridge_hook_sha256 == reader.executable_sha256
+                    || !ids.insert(&reader.reader_id)
+                    || !paths.insert(&reader.executable)
+                    || !digests.insert(&reader.executable_sha256)
+                {
+                    return Err(invalid("invalid managed receipt reader"));
+                }
+            }
+            let mut custody_ids = std::collections::BTreeSet::new();
+            let mut custody_paths = std::collections::BTreeSet::new();
+            let mut custody_digests = std::collections::BTreeSet::new();
+            let mut scopes = std::collections::BTreeSet::new();
+            for reader in &managed.bridge_custody_readers {
+                reader.run_route.validate()?;
+                reader.bridge_route.validate()?;
+                agent_run_domain::attempt_binding::validate_uuid(
+                    &reader.bridge_route.component_store_id,
+                )?;
+                if !name(&reader.reader_id)
+                    || !reader.executable.is_absolute()
+                    || forbidden_interpreter(&reader.executable)
+                    || reader.executable.components().any(|p| {
+                        matches!(
+                            p,
+                            std::path::Component::ParentDir | std::path::Component::CurDir
+                        )
+                    })
+                    || reader
+                        .executable_sha256
+                        .parse::<agent_run_domain::Sha256Digest>()
+                        .is_err()
+                    || reader
+                        .run_route
+                        .component_store_id
+                        .parse::<agent_run_domain::StoreId>()
+                        .is_err()
+                    || reader.worker_uid != reader.run_route.worker_uid
+                    || reader.worker_uid != reader.bridge_route.worker_uid
+                    || managed.pool_resident_executable.as_ref() == Some(&reader.executable)
+                    || managed.pool_resident_sha256.as_ref() == Some(&reader.executable_sha256)
+                    || managed.bridge_hook_sha256 == reader.executable_sha256
+                    || !custody_ids.insert(&reader.reader_id)
+                    || !custody_paths.insert(&reader.executable)
+                    || !custody_digests.insert(&reader.executable_sha256)
+                    || reader.producer_scopes.is_empty()
+                    || reader.producer_scopes.len() > 128
+                    || reader.producer_scopes.iter().any(|scope| {
+                        agent_run_domain::attempt_binding::validate_id(scope).is_err()
+                            || !scopes.insert(scope)
+                    })
+                    || managed.bridge_receipt_readers.iter().any(|receipt| {
+                        (receipt.executable == reader.executable)
+                            != (receipt.executable_sha256 == reader.executable_sha256)
+                    })
+                {
+                    return Err(invalid("invalid managed custody reader"));
+                }
+            }
+        }
         if self.services.len() > 32 {
             return Err(invalid("at most 32 managed services may be configured"));
         }
@@ -451,5 +838,115 @@ impl ProviderConfig {
             bindings: provider.bindings.clone(),
             ordered_accounts: provider.ordered_accounts,
         }
+    }
+}
+
+#[cfg(test)]
+mod managed_peer_tests {
+    use super::*;
+
+    #[test]
+    fn managed_pins_reject_shared_builds_interpreters_and_ambiguous_custody_scopes() {
+        let config = format!(
+            r#"schema_version=2
+[managed_attempt_binding]
+enabled=true
+role_name='managed'
+pool_server='pool'
+pool_executable_sha256='{frontend}'
+bridge_hook_sha256='{hook}'
+host_id='host'
+pool_resident_executable='/opt/pool-resident'
+pool_resident_sha256='{resident}'
+[managed_attempt_binding.transport]
+run_route={{component_store_id='store_0123456789abcdef0123456789abcdef',route_id='run',worker_uid=1000}}
+pool_route={{component_store_id='pool-store',route_id='pool',worker_uid=1000}}
+bridge_route={{component_store_id='00000000-0000-4000-8000-000000000001',route_id='bridge',worker_uid=1000}}
+producer='pool'
+pool_socket='/opt/pool.sock'
+bridge_socket='/opt/bridge.sock'
+bridge_executable='/opt/bridge-daemon'
+bridge_executable_sha256='{bridge}'
+bridge_reader_credential_file='/opt/reader'
+bridge_reader_credential_sha256='{credential}'
+[[managed_attempt_binding.bridge_custody_readers]]
+reader_id='custody'
+worker_uid=1000
+executable='/opt/bridge-daemon'
+executable_sha256='{bridge}'
+run_route={{component_store_id='store_0123456789abcdef0123456789abcdef',route_id='run',worker_uid=1000}}
+bridge_route={{component_store_id='00000000-0000-4000-8000-000000000001',route_id='bridge',worker_uid=1000}}
+producer_scopes=['scope']
+"#,
+            frontend = "a".repeat(64),
+            hook = "c".repeat(64),
+            resident = "b".repeat(64),
+            bridge = "d".repeat(64),
+            credential = "e".repeat(64)
+        );
+        let parse = |text: &str| ProviderConfig::parse(text, Path::new("/fixture"));
+        assert!(parse(&config).is_ok());
+        for invalid in [
+            config.replacen(
+                &format!("bridge_executable_sha256='{}'", "d".repeat(64)),
+                &format!("bridge_executable_sha256='{}'", "c".repeat(64)),
+                1,
+            ),
+            config.replacen(
+                &format!("pool_resident_sha256='{}'", "b".repeat(64)),
+                &format!("pool_resident_sha256='{}'", "c".repeat(64)),
+                1,
+            ),
+            config.replace("/opt/bridge-daemon", "/usr/bin/python3"),
+            config.replace("/opt/bridge-daemon", "/usr/bin/nodejs"),
+            config.replace("/opt/bridge-daemon", "/usr/bin/pypy3"),
+            config.replace(
+                "producer_scopes=['scope']",
+                "producer_scopes=['scope','scope']",
+            ),
+        ] {
+            assert!(parse(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn interpreter_aliases_recursive_copies_and_loader_preload_fail_closed() {
+        for name in [
+            "awk",
+            "gawk",
+            "expect",
+            "Rscript",
+            "julia",
+            "erl",
+            "escript",
+            "ld.so",
+            "ld-linux-x86-64.so.2",
+        ] {
+            assert!(
+                forbidden_interpreter(&PathBuf::from("/fixture").join(name)),
+                "{name}"
+            );
+        }
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("versions/node/v1/bin");
+        std::fs::create_dir_all(&nested).unwrap();
+        let bytes = b"synthetic interpreter build";
+        std::fs::write(nested.join("node"), bytes).unwrap();
+        assert!(interpreter_in_roots(
+            vec![(root.path().into(), true)],
+            &fs::sha256(bytes),
+            bytes.len() as u64
+        ));
+        assert!(!interpreter_in_roots(
+            vec![(root.path().into(), true)],
+            &"0".repeat(64),
+            bytes.len() as u64
+        ));
+        let preload = root.path().join("ld.so.preload");
+        assert!(preload_file_safe(&preload));
+        std::fs::write(&preload, b" \n\t").unwrap();
+        assert!(preload_file_safe(&preload));
+        std::fs::write(&preload, b"/synthetic/library.so\n").unwrap();
+        assert!(!preload_file_safe(&preload));
     }
 }

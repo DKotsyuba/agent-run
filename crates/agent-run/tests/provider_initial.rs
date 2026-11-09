@@ -1349,6 +1349,30 @@ async fn provider_start_completes_one_owned_fake_engine_attempt() {
     assert_eq!(replay["agent_id"], admitted["agent_id"]);
 }
 
+/// Missing managed-only identity evidence must not fail an ordinary launch.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn ordinary_provider_runs_when_managed_incarnation_is_unavailable() {
+    let (_temp, home) = home();
+    fs::write(home.join("fixture-unavailable-incarnation"), "").unwrap();
+    let service = fixture_service(home.clone()).await;
+    let admitted = service
+        .admit_provider_trusted(request(&home), candidates(committed(&home)))
+        .await
+        .unwrap();
+    let id: AgentId = serde_json::from_value(admitted["agent_id"].clone()).unwrap();
+    run_to_end(&home, &id).await;
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    assert_eq!(store.get(&id).unwrap().status, Status::Succeeded);
+    let (state, pid, leader): (String, Option<u32>, Option<String>) = store.conn.query_row(
+        "SELECT l.state,l.pid,t.process_identity FROM attempt_launches l JOIN attempts t ON t.id=l.attempt_id WHERE l.execution_id=?",
+        [id.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+    ).unwrap();
+    assert_eq!(state, "unknown");
+    assert!(pid.is_none());
+    assert!(leader.is_some());
+}
+
 /// Provider admission records the revision of the skill bytes the configured
 /// plugin will actually supply, not of a differing catalog duplicate, and the
 /// detached supervisor then launches that unchanged plugin to completion.
@@ -5281,6 +5305,30 @@ async fn crash_after_the_switch_reconciles_without_a_duplicate() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let root = held.expect("attempt B reached the barrier");
+    #[cfg(target_os = "linux")]
+    {
+        let store = agent_run_store::fixture::open(&home).unwrap();
+        let (launch, pid, boot, ticks): (String, u32, String, u64) = store.conn.query_row(
+            "SELECT launch_id,pid,boot_id,start_ticks FROM attempt_launches WHERE execution_id=? AND state='bound' ORDER BY rowid DESC LIMIT 1",
+            [id.as_str()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).unwrap();
+        let before = agent_run_platform::process::inspect(pid as i32).unwrap();
+        let incarnation = agent_run_platform::process::kernel_incarnation(&before).unwrap();
+        assert_eq!(
+            (incarnation.boot_id.as_str(), incarnation.start_ticks),
+            (boot.as_str(), ticks)
+        );
+        let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+        let values: Vec<_> = environ
+            .split(|byte| *byte == 0)
+            .filter_map(|entry| entry.strip_prefix(b"AGENT_RUN_LAUNCH_ID="))
+            .collect();
+        assert_eq!(values.as_slice(), &[launch.as_bytes()]);
+        assert_eq!(
+            agent_run_platform::process::kernel_incarnation(&before).unwrap(),
+            incarnation
+        );
+    }
     child.kill().await.unwrap();
     let _ = child.wait().await;
     assert_eq!(attempts(&home, &id).len(), 2);

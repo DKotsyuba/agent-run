@@ -15,6 +15,28 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn fixture_temp_base() -> std::ffi::OsString {
+    std::env::var_os("AGENT_RUN_TEST_TMP").unwrap_or_else(|| std::env::temp_dir().into_os_string())
+}
+
+#[test]
+fn fixture_temp_base_falls_back_to_tmpdir() {
+    const CHILD: &str = "RUN_FIXTURE_TMPDIR_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        assert_eq!(fixture_temp_base(), std::env::var_os("TMPDIR").unwrap());
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "fixture_temp_base_falls_back_to_tmpdir"])
+        .env_clear()
+        .env("TMPDIR", dir.path())
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+}
+
 /// One disposable schema-2 home with one Claude Messages provider bound to
 /// one fake environment reference, and its real resident broker.
 struct Broker {
@@ -198,7 +220,7 @@ impl Broker {
     /// Starts an isolated synthetic broker with a fixture-only active limit;
     /// production configuration, credentials and running jobs are untouched.
     fn start_with_limit(environment: &[(&str, &str)], active_limit: usize) -> Self {
-        let base = std::env::var_os("AGENT_RUN_TEST_TMP").unwrap_or_else(|| "/tmp".into());
+        let base = fixture_temp_base();
         let temp = tempfile::Builder::new()
             .prefix("ar-pb-")
             .tempdir_in(base)
@@ -1462,12 +1484,12 @@ async fn consolidated_routing_discovery_and_legacy_aliases_work_live() {
         discovery["result"]["tools"]
     );
     let tools = discovery["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 23, "{discovery}");
+    assert_eq!(tools.len(), 24, "{discovery}");
     for name in ["models", "capacity_order"] {
         assert!(!tools.iter().any(|tool| tool["name"] == name));
     }
     let socket_tools = client.call("tools", Some(json!({}))).await.unwrap();
-    assert_eq!(socket_tools.as_array().unwrap().len(), 23);
+    assert_eq!(socket_tools.as_array().unwrap().len(), 24);
     let filtered_cli = cli(
         &broker.home,
         &[

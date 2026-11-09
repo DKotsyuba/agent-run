@@ -8,9 +8,10 @@
 //!
 //! Envelopes ([`crate::ops::WriteEnvelope`], [`crate::ops::LocalEnvelope`]) are constructed only by
 //! their constructors, which compute the canonical digest and encoded size in
-//! the producer or transport thread; the writer thread never hashes, encodes
-//! requests or reads files. A queued remote envelope retains only its
-//! verified canonical body bytes.
+//! the producer or transport thread. A queued remote envelope retains only its
+//! verified canonical body bytes. Managed owner reservation is a narrow
+//! exception: it revalidates the bounded local config inside the writer scope
+//! before creating or reopening a reservation.
 
 pub(crate) mod apply;
 pub(crate) mod dispatch;
@@ -230,6 +231,25 @@ inventory! {
     107 ReleaseHistoryPin "release_history_pin" L N n;
     108 AcquireLineageHold "acquire_lineage_hold" L N n;
     109 ReleaseLineageHold "release_lineage_hold" L N n;
+    110 PrepareAttemptLaunch "prepare_attempt_launch" R C y;
+    111 BeginAttemptAdmission "begin_attempt_admission" L C n;
+    112 AdmitAttempt "admit_attempt" L C n;
+    113 AbortAttemptAdmission "abort_attempt_admission" L C n;
+    114 SettleAttemptAdmission "settle_attempt_admission" L C n;
+    115 FenceAttemptNamespace "fence_attempt_namespace" L C n;
+    116 InvokeAttemptRetirement "invoke_attempt_retirement" L C n;
+    117 CompleteAttemptRetirement "complete_attempt_retirement" L C n;
+    118 RecordAttemptIngress "record_attempt_ingress" L C n;
+    119 PrepareAttemptRetirement "prepare_attempt_retirement" L C n;
+    120 QualifyAttemptRole "qualify_attempt_role" R C y;
+    121 BeginAttemptCurrent "begin_attempt_current" L C n;
+    122 ObserveAttemptPoolSeal "observe_attempt_pool_seal" L C n;
+    123 ReserveOwnerEffect "reserve_owner_effect" R C y;
+    124 InvokeOwnerEffect "invoke_owner_effect" R C y;
+    125 FinishOwnerEffect "finish_owner_effect" R C y;
+    126 AbortOwnerEffect "abort_owner_effect" L C n;
+    127 BeginAttemptEgress "begin_attempt_egress" L C n;
+    128 FinishAttemptEgress "finish_attempt_egress" L C n;
 }
 
 /// Seals one payload and binds it to its inventory row and typed output.
@@ -277,6 +297,25 @@ op! {
     RememberProcesses => ();
     RetainCleanupEvidence => ();
     ProviderSpawning => bool;
+    PrepareAttemptLaunch => String;
+    QualifyAttemptRole => ();
+    ReserveOwnerEffect => crate::owner_v2::Reservation;
+    InvokeOwnerEffect => ();
+    FinishOwnerEffect => crate::owner_v2::EffectView;
+    AbortOwnerEffect => crate::owner_v2::EffectView;
+    BeginAttemptEgress => crate::attempt_binding::EgressBegin;
+    FinishAttemptEgress => agent_run_domain::attempt_binding::CurrentReceipt;
+    BeginAttemptCurrent => ();
+    ObserveAttemptPoolSeal => crate::attempt_binding::NamespaceRecord;
+    BeginAttemptAdmission => ();
+    AdmitAttempt => crate::attempt_binding::AdmissionRecord;
+    AbortAttemptAdmission => crate::attempt_binding::AdmissionRecord;
+    SettleAttemptAdmission => crate::attempt_binding::AdmissionRecord;
+    FenceAttemptNamespace => crate::attempt_binding::NamespaceRecord;
+    InvokeAttemptRetirement => crate::attempt_binding::NamespaceRecord;
+    CompleteAttemptRetirement => crate::attempt_binding::NamespaceRecord;
+    RecordAttemptIngress => agent_run_domain::attempt_binding::CurrentReceipt;
+    PrepareAttemptRetirement => crate::attempt_binding::NamespaceRecord;
     ProviderSpawnFailed => ();
     ProviderProcess => ();
     ProviderCleanup => ();
@@ -397,6 +436,11 @@ op_enum! {
         RememberProcesses,
         RetainCleanupEvidence,
         ProviderSpawning,
+        PrepareAttemptLaunch,
+        QualifyAttemptRole,
+        ReserveOwnerEffect,
+        InvokeOwnerEffect,
+        FinishOwnerEffect,
         ProviderSpawnFailed,
         ProviderProcess,
         ProviderCleanup,
@@ -461,6 +505,20 @@ op_enum! {
         ReleaseHistoryPin,
         AcquireLineageHold,
         ReleaseLineageHold,
+        BeginAttemptAdmission,
+        AdmitAttempt,
+        AbortAttemptAdmission,
+        SettleAttemptAdmission,
+        FenceAttemptNamespace,
+        InvokeAttemptRetirement,
+        CompleteAttemptRetirement,
+        RecordAttemptIngress,
+        BeginAttemptCurrent,
+        ObserveAttemptPoolSeal,
+        AbortOwnerEffect,
+        BeginAttemptEgress,
+        FinishAttemptEgress,
+        PrepareAttemptRetirement,
         AdmitProviderResume,
         AdmitPool,
         ReplacePoolMember,
@@ -590,6 +648,11 @@ impl OpKindRef {
             | Self::RuntimeSession
             | Self::RetainCleanupEvidence
             | Self::ProviderSpawning
+            | Self::PrepareAttemptLaunch
+            | Self::QualifyAttemptRole
+            | Self::ReserveOwnerEffect
+            | Self::InvokeOwnerEffect
+            | Self::FinishOwnerEffect
             | Self::ProviderSpawnFailed
             | Self::ProviderProcess
             | Self::ProviderCleanup

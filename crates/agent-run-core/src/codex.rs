@@ -772,6 +772,83 @@ pub async fn run(
     role: &Profile,
     home: &Path,
 ) -> Result<EngineResult> {
+    run_inner(
+        process,
+        store,
+        record,
+        logical_record,
+        runtime,
+        role,
+        home,
+        None,
+    )
+    .await
+}
+
+/// Pinned values supplied by the explicitly enabled managed-role selector.
+/// The values themselves are not proof of trusted executable provenance.
+#[allow(dead_code)]
+pub(crate) struct ManagedCodexRole<'a> {
+    pub pre_tool_use: &'a Value,
+    pub permission_request: &'a Value,
+    pub hook_state: &'a Value,
+    pub inventory: &'a BTreeMap<String, BTreeSet<String>>,
+    pub selection: &'a agent_run_adapters::managed_role::Selection,
+}
+
+async fn verify_live_managed_config(
+    process: &mut Process,
+    cwd: &Path,
+    managed: &ManagedCodexRole<'_>,
+) -> Result<String> {
+    let config = process
+        .rpc("config/read", json!({"cwd":cwd}), Duration::from_secs(30))
+        .await?;
+    agent_run_adapters::managed_role::verify_managed_config(
+        &config,
+        managed.pre_tool_use,
+        managed.permission_request,
+        managed.hook_state,
+    )?;
+    Ok(agent_run_domain::canonical::sha256_hex(&config, true))
+}
+
+/// Managed Codex entry point, selected only after trusted component checks.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) async fn run_managed(
+    process: &mut Process,
+    store: &mut Persist,
+    record: &Record,
+    logical_record: &Record,
+    runtime: &Runtime,
+    role: &Profile,
+    home: &Path,
+    managed: &ManagedCodexRole<'_>,
+) -> Result<EngineResult> {
+    run_inner(
+        process,
+        store,
+        record,
+        logical_record,
+        runtime,
+        role,
+        home,
+        Some(managed),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_inner(
+    process: &mut Process,
+    store: &mut Persist,
+    record: &Record,
+    logical_record: &Record,
+    runtime: &Runtime,
+    role: &Profile,
+    home: &Path,
+    managed: Option<&ManagedCodexRole<'_>>,
+) -> Result<EngineResult> {
     if record.id != logical_record.id
         || record.sequence != logical_record.sequence
         || record.identity != logical_record.identity
@@ -779,7 +856,17 @@ pub async fn run(
         return Err(invalid("native input and logical authority do not match"));
     }
     agent_run_adapters::validate_role(runtime, role)?;
+    if managed.is_some()
+        && (!role.skills.is_empty() || !runtime.plugins.is_empty() || role.research_tools_only())
+    {
+        return Err(invalid("native managed role assets did not verify"));
+    }
     initialize(process).await?;
+    let managed_config_digest = if let Some(managed) = managed {
+        Some(verify_live_managed_config(process, &record.request.workdir, managed).await?)
+    } else {
+        None
+    };
     if role.research_tools_only() {
         let config = process
             .rpc(
@@ -840,6 +927,9 @@ pub async fn run(
         // Hosted web and the attempt-bound worker MCP remain available.
         params["environments"] = json!([]);
     }
+    if managed.is_some() {
+        agent_run_adapters::managed_role::codex_thread_parameters(&mut params)?;
+    }
     let method = if let Some(s) = &record.resume_of_runtime_session_id {
         params["threadId"] = json!(s);
         "thread/resume"
@@ -864,8 +954,29 @@ pub async fn run(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| invalid("thread start did not return an id"))?
         .to_owned();
-    if record.request.explicit_finish {
+    if record.request.explicit_finish && managed.is_none() {
         finish_inventory_ready(process, &tid, role.research_tools_only()).await?;
+    }
+    if let Some(managed) = managed {
+        let inventory = process
+            .rpc(
+                "mcpServerStatus/list",
+                json!({"threadId":tid,"limit":1000}),
+                Duration::from_secs(30),
+            )
+            .await?;
+        agent_run_adapters::managed_role::verify_inventory(&inventory, managed.inventory)?;
+        let inventory_digest = agent_run_domain::canonical::sha256_hex(&inventory, true);
+        crate::managed_qualification::record(
+            process,
+            store,
+            record,
+            managed.selection,
+            "codex",
+            managed_config_digest.ok_or_else(|| invalid("managed config unavailable"))?,
+            inventory_digest,
+        )
+        .await?;
     }
     if role.research_tools_only() {
         let status = process
@@ -989,6 +1100,7 @@ pub async fn run(
     let mut final_answer: Option<String> = None;
     let mut usage = None;
     let mut native_owner = process.native_owner.take();
+    let mut native_owner_v2 = process.native_owner_v2.take();
     let mut native_calls = agent_run_adapters::native_owner::Calls::default();
     let mut idle = false;
     let mut closing_at: Option<tokio::time::Instant> = None;
@@ -1033,6 +1145,27 @@ pub async fn run(
         }
         let event = tokio::select! {
             biased;
+            call = agent_run_adapters::native_owner_v2::Owner::receive(&mut native_owner_v2) => {
+                use agent_run_adapters::io::RpcDisposition;
+                let prepared = crate::native_owner::prepare_v2(process,store,logical_record,&call.request,call.deadline,&call.channel,Some(&tid),idle,closing_at.is_some()).await;
+                let token = match prepared {
+                    crate::native_owner::PreparedV2::Reply(reply) => {call.answer(reply);continue;}
+                    crate::native_owner::PreparedV2::Invoke(token) => token,
+                };
+                let old_turn=turn_id.clone();
+                let exchange=turn_input(process,&mut session,&tid,&mut turn_id,&mut idle,&call.request.text,record.request.effort.as_deref(),call.deadline).await;
+                let (state,protocol,native_id,reason)=match exchange {
+                    Ok(RpcDisposition::Replied(_)) if tokio::time::Instant::now()<call.deadline && turn_id!=old_turn && agent_run_adapters::native_owner::valid_id(&turn_id)=> ("accepted",Some("codex_turn"),Some(turn_id.as_str()),None),
+                    Ok(RpcDisposition::Rejected{..}|RpcDisposition::UnsentPressure)=>("known_unsent",None,None,Some("unavailable")),
+                    _=>("unknown",None,None,Some("native_uncertain")),
+                };
+                let reply=crate::native_owner::finish_v2(process,store,&call.request,&token,state,protocol,native_id,reason).await;
+                let accepted=reply.state=="accepted";let unknown=reply.state=="unknown";
+                call.answer(reply);
+                if unknown {native_owner_v2.take();return Err(invalid("native owner input outcome is uncertain"));}
+                if accepted {process.observing(store.worker_turn(&record.id,false,crate::domain::now())).await?;}
+                continue;
+            }
             call = agent_run_adapters::native_owner::Owner::receive(&mut native_owner) => {
                 use agent_run_adapters::{native_owner::Reply,io::RpcDisposition};
                 let id=call.request.call_id.clone();
@@ -2715,6 +2848,50 @@ async fn turn_steer(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn managed_codex_config_read_refuses_native_override() {
+        use serde_json::json;
+        use std::collections::BTreeMap;
+        let pre = json!([{"hooks":[{"type":"command","command":"/fixture/bridge"}]}]);
+        let permission = json!([{"hooks":[{"type":"command","command":"/fixture/run"}]}]);
+        let state = json!({"pre":{"trusted_hash":"a"},"permission":{"trusted_hash":"b"}});
+        let inventory = BTreeMap::new();
+        let selection = agent_run_adapters::managed_role::Selection {
+            host_id: "host".into(),
+            role_digest: "a".repeat(64),
+            inventory: BTreeMap::new(),
+        };
+        let role = super::ManagedCodexRole {
+            pre_tool_use: &pre,
+            permission_request: &permission,
+            hook_state: &state,
+            inventory: &inventory,
+            selection: &selection,
+        };
+        for widened in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = agent_run_adapters::managed_role::codex_settings();
+            config["hooks"] =
+                json!({"PreToolUse":pre,"PermissionRequest":permission,"state":state});
+            if widened {
+                config["features"]["shell_tool"] = json!(true);
+            }
+            let reply = json!({"id":1,"result":{"config":config}}).to_string();
+            let script = format!("IFS= read -r request\nprintf '%s\\n' '{}'", reply);
+            let plan = agent_run_adapters::LaunchPlan {
+                binary: "/bin/sh".into(),
+                args: vec!["-c".into(), script],
+                cwd: dir.path().into(),
+                environment: BTreeMap::new(),
+                initial_input: None,
+            };
+            let mut process = agent_run_adapters::io::Process::spawn(&plan).unwrap();
+            let result = super::verify_live_managed_config(&mut process, dir.path(), &role).await;
+            assert_eq!(result.is_ok(), !widened);
+            assert_eq!(process.reap().await, Some(0));
+        }
+    }
+
     /// The shared output budget never splits UTF-8 and reports omitted data.
     #[test]
     fn command_delta_shared_budget_marks_truncation() {

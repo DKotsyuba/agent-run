@@ -327,6 +327,8 @@ pub fn materialize_selected(
     }
     let role_profile = profile(&role);
     let mut runtime = runtime(config, definition.harness, model)?;
+    let managed =
+        crate::managed_role::select(config, definition.harness, &role, role.worker_mcp)?.is_some();
     crate::validate_executable(&runtime)?;
     crate::validate_role(&runtime, &role_profile)?;
     if definition.harness == HarnessId::ClaudeCode {
@@ -374,6 +376,7 @@ pub fn materialize_selected(
         native_model,
         &config_sha256,
         &role.skills,
+        managed,
     )?;
     Ok((snapshot, Sha256Digest::from_str(&digest)?))
 }
@@ -596,12 +599,10 @@ pub fn plan_selected_with(
         app_home,
         host,
     )?;
-    for name in agent_run_domain::worker::ENV_NAMES.into_iter().chain([
-        agent_run_domain::worker::FINISH_ENV,
-        agent_run_domain::worker::RESEARCH_ENV,
-    ]) {
-        environment.remove(name);
-    }
+    // Only the supervisor may install this attempt's worker capability and
+    // launch correlation. Never forward an upstream worker's environment.
+    environment
+        .retain(|name, _| !name.starts_with("AGENT_RUN_WORKER_") && name != "AGENT_RUN_LAUNCH_ID");
     if definition.ordered_accounts
         && sealed.harness == HarnessId::ClaudeCode
         && matches!(connection, ProviderConnection::Native)
@@ -716,6 +717,7 @@ pub fn plan_selected_with(
                 .into_owned(),
         );
     }
+    let managed = crate::managed_role::select(config, sealed.harness, &role, role.worker_mcp)?;
     let args = if sealed.harness == HarnessId::OpenCode {
         crate::opencode::model_ref(&sealed.native_model)?;
         let selected_key = if matches!(
@@ -794,6 +796,7 @@ pub fn plan_selected_with(
             authority.effort.as_deref(),
             resume_session,
             options.output_schema,
+            managed.as_ref(),
         )?
     };
     Ok(ProviderLaunchPlan {
@@ -824,6 +827,7 @@ fn claude_args(
     effort: Option<&str>,
     resume_session: Option<&str>,
     output_schema: Option<&serde_json::Map<String, serde_json::Value>>,
+    managed: Option<&crate::managed_role::Selection>,
 ) -> Result<Vec<String>> {
     let research = role.research_tools_only();
     let mut tools = if research {
@@ -883,14 +887,22 @@ fn claude_args(
     for root in &role.read_roots {
         args.extend(["--add-dir".into(), root.to_string_lossy().into_owned()]);
     }
-    args.extend([
-        "--tools".into(),
-        tools.join(","),
-        "--allowedTools".into(),
-        allowed.join(","),
-        "--disallowedTools".into(),
-        denied,
-    ]);
+    if let Some(selection) = managed {
+        args.extend(
+            crate::managed_role::claude_tool_arguments(&selection.inventory)?
+                .into_iter()
+                .filter(|arg| arg != "--strict-mcp-config"),
+        );
+    } else {
+        args.extend([
+            "--tools".into(),
+            tools.join(","),
+            "--allowedTools".into(),
+            allowed.join(","),
+            "--disallowedTools".into(),
+            denied,
+        ]);
+    }
     if !role.mcp.is_empty() || role.worker_mcp {
         args.extend([
             "--mcp-config".into(),
@@ -906,7 +918,11 @@ fn claude_args(
             "--no-chrome".into(),
         ]);
     }
-    for plugin in sealed.plugin_paths.iter().filter(|_| !research) {
+    for plugin in sealed
+        .plugin_paths
+        .iter()
+        .filter(|_| !research && managed.is_none())
+    {
         args.extend(["--plugin-dir".into(), plugin.to_string_lossy().into_owned()]);
     }
     if let Some(effort) = effort {

@@ -562,6 +562,157 @@ pub struct ProviderSpawning {
     pub target: AttemptTarget,
 }
 
+/// Prepare durable per-attempt launch correlation before an OS spawn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrepareAttemptLaunch {
+    /// Attempt owned by the supervisor.
+    pub target: AttemptTarget,
+}
+/// Owning supervisor records managed native role/config/inventory verification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualifyAttemptRole {
+    pub target: AttemptTarget,
+    pub qualification: agent_run_domain::attempt_binding::RoleQualification,
+}
+/// Reserve one frozen owner-v2 effect on the owning supervisor lane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReserveOwnerEffect {
+    pub target: AttemptTarget,
+    pub store: agent_run_domain::StoreId,
+    pub outbox: Box<agent_run_domain::owner_v2::OutboxIntent>,
+    pub effect_digest: String,
+    pub enabled: bool,
+}
+/// Commit the invoking fence before any native owner write.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvokeOwnerEffect {
+    pub target: AttemptTarget,
+    pub store: agent_run_domain::StoreId,
+    pub producer_scope: String,
+    pub effect_id: String,
+    pub effect_digest: String,
+    pub dispatch_token: String,
+}
+/// Persist the original native outcome; no model payload is included.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinishOwnerEffect {
+    pub target: AttemptTarget,
+    pub store: agent_run_domain::StoreId,
+    pub producer_scope: String,
+    pub effect_id: String,
+    pub effect_digest: String,
+    pub dispatch_token: String,
+    pub state: String,
+    pub protocol: Option<String>,
+    pub native_id: Option<String>,
+    pub reason: Option<String>,
+}
+/// Bridge-authorized broker abort, serialized against supervisor reservation.
+#[derive(Debug, Clone, Serialize)]
+pub struct AbortOwnerEffect {
+    pub store: agent_run_domain::StoreId,
+    pub producer_scope: String,
+    pub effect_id: String,
+    pub effect_digest: String,
+    pub route: crate::owner_v2::EffectRoute,
+}
+
+/// Freeze the current launch before an authenticated Bridge actor lookup.
+#[derive(Debug, Clone, Serialize)]
+pub struct BeginAttemptEgress {
+    pub request: agent_run_domain::attempt_binding::EgressCurrent,
+    pub enabled: bool,
+}
+/// Commit a Bridge actor only after the original launch still matches.
+#[derive(Debug, Clone, Serialize)]
+pub struct FinishAttemptEgress {
+    pub request: agent_run_domain::attempt_binding::EgressCurrent,
+    pub candidate: crate::attempt_binding::EgressCandidate,
+    pub actor: agent_run_domain::attempt_binding::Actor,
+    pub inspected: agent_run_domain::attempt_binding::Incarnation,
+    pub enabled: bool,
+}
+
+/// Reserve one immutable admission lookup before Bridge I/O.
+#[derive(Debug, Clone, Serialize)]
+pub struct BeginAttemptAdmission {
+    pub request: agent_run_domain::attempt_binding::AdmissionRequest,
+    pub enabled: bool,
+}
+/// Commit one authenticated original Bridge observation.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdmitAttempt {
+    pub request: agent_run_domain::attempt_binding::AdmissionRequest,
+    pub receipt: agent_run_domain::attempt_binding::ConsumeReceipt,
+    pub inspected: agent_run_domain::attempt_binding::Incarnation,
+    pub enabled: bool,
+}
+/// Install a permanent pre-admission rejecting tombstone.
+#[derive(Debug, Clone, Serialize)]
+pub struct AbortAttemptAdmission {
+    pub store: agent_run_domain::StoreId,
+    pub intent_id: String,
+    pub security_digest: String,
+    pub pool_route: agent_run_domain::attempt_binding::Route,
+    pub requested_outcome_digest: Option<String>,
+}
+/// Journal an authenticated terminal Pool result for one admission.
+#[derive(Debug, Clone, Serialize)]
+pub struct SettleAttemptAdmission {
+    pub store: agent_run_domain::StoreId,
+    pub admission_id: String,
+    pub intent_id: String,
+    pub security_digest: String,
+    pub pool_route: agent_run_domain::attempt_binding::Route,
+    pub state: String,
+    pub outcome_digest: String,
+}
+/// Fence a historical producer/issuer before Pool and Bridge I/O.
+#[derive(Debug, Clone, Serialize)]
+pub struct FenceAttemptNamespace {
+    pub request: crate::attempt_binding::NamespaceRequest,
+    pub current_issuer: String,
+}
+/// Persist the original retirement route before any outbound lookup.
+#[derive(Debug, Clone, Serialize)]
+pub struct PrepareAttemptRetirement {
+    pub request: crate::attempt_binding::NamespaceRequest,
+}
+/// Record an authenticated sealed Pool namespace before Bridge I/O.
+#[derive(Debug, Clone, Serialize)]
+pub struct InvokeAttemptRetirement {
+    pub request: crate::attempt_binding::NamespaceRequest,
+    pub seal: crate::attempt_binding::PoolSeal,
+}
+/// Pin the authenticated Pool seal ID even while that namespace drains.
+#[derive(Debug, Clone, Serialize)]
+pub struct ObserveAttemptPoolSeal {
+    pub request: crate::attempt_binding::NamespaceRequest,
+    pub seal: crate::attempt_binding::PoolSeal,
+}
+/// Persist an authenticated exact Bridge retirement response.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompleteAttemptRetirement {
+    pub request: crate::attempt_binding::NamespaceRequest,
+    pub pool_seal_id: String,
+    pub retired_count: u64,
+}
+/// Bind an authenticated original ingress observation to a current receipt.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordAttemptIngress {
+    pub request: agent_run_domain::attempt_binding::IngressCurrent,
+    pub observation: agent_run_domain::attempt_binding::Observation,
+    pub inspected: agent_run_domain::attempt_binding::Incarnation,
+    pub enabled: bool,
+}
+/// Freeze the authenticated Bridge launch before committing currentness.
+#[derive(Debug, Clone, Serialize)]
+pub struct BeginAttemptCurrent {
+    pub request: agent_run_domain::attempt_binding::IngressCurrent,
+    pub launch_id: String,
+    pub enabled: bool,
+}
+
 /// 20 — provider attempt never spawned.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderSpawnFailed {
@@ -580,6 +731,9 @@ pub struct ProviderProcess {
     /// Session must remain absent until the adapter observes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integration: Option<agent_run_domain::integration::NativeIntegration>,
+    /// Exact kernel incarnation for a journaled Linux launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<agent_run_platform::process::KernelIncarnation>,
 }
 
 /// 22 — provider attempt cleanup proof recorded.

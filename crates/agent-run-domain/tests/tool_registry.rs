@@ -5,7 +5,7 @@ use serde_json::Value;
 
 /// Tools added after the frozen Python table: the guide read and the five
 /// cooperative-pool operator tools and native integration and observation reads, pinned separately.
-const ADDITIVE: [&str; 14] = [
+const ADDITIVE: [&str; 15] = [
     "delegation_guide",
     "start_pool",
     "pool_post",
@@ -20,6 +20,7 @@ const ADDITIVE: [&str; 14] = [
     "status",
     "batch_receipt",
     "transcript_exact",
+    "initial_task",
 ];
 
 /// Observation methods share strict schemas, stable errors and read-only hints;
@@ -327,7 +328,7 @@ fn registry_matches_python_golden_field_by_field() {
         .map(|definition| serde_json::to_value(definition).unwrap())
         .filter(|tool| !ADDITIVE.contains(&tool["name"].as_str().unwrap_or_default()))
         .collect();
-    assert_eq!(tools_json().len(), 23);
+    assert_eq!(tools_json().len(), 24);
     for (name, canonical) in [("models", "delegation_guide"), ("capacity_order", "limits")] {
         assert_eq!(tool(name).unwrap().legacy_for.as_deref(), Some(canonical));
         assert!(!tools_json().iter().any(|entry| entry["name"] == name));

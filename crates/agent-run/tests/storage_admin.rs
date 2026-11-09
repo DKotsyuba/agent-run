@@ -24,7 +24,10 @@ struct Home {
 fn home() -> Home {
     let temp = tempfile::Builder::new()
         .prefix("ar-storage-")
-        .tempdir_in(std::env::var_os("AGENT_RUN_TEST_TMP").unwrap_or_else(|| "/tmp".into()))
+        .tempdir_in(
+            std::env::var_os("AGENT_RUN_TEST_TMP")
+                .unwrap_or_else(|| std::env::temp_dir().into_os_string()),
+        )
         .expect("fixture home");
     let path = temp.path().canonicalize().expect("canonical home");
     fs::private_dir(&path).expect("private home");

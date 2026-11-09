@@ -644,6 +644,11 @@ impl Config {
             }
             expand(&mut m.command)?;
             unique(&m.env_from, "MCP env_from")?;
+            if m.env_from.iter().any(|name| name.starts_with("AGENT_RUN_")) {
+                return Err(invalid(
+                    "MCP env_from cannot forward private agent-run variables",
+                ));
+            }
             if m.env_from.iter().any(|s| !env_name(s)) || m.args.iter().any(|s| s.contains('\0')) {
                 return Err(invalid("invalid MCP argument/environment declaration"));
             }

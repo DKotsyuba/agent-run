@@ -1692,6 +1692,18 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             },
             Some(&shared_assets),
         )?;
+        let managed_selection = adapters::managed_role::select(
+            &config,
+            identity.authority.harness,
+            &planned.role,
+            row.request.explicit_finish,
+        )?;
+        #[cfg(not(target_os = "linux"))]
+        if managed_selection.is_some() {
+            return Err(Error::Unsupported(
+                "managed attempt binding requires Linux".into(),
+            ));
+        }
         // Codex keeps its original managed profile and its own native
         // sandbox: the shared store must stay provably outside every root that
         // profile can write and outside the temporary directories the native
@@ -1849,6 +1861,57 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             &planned.profile,
             owner_supported,
         );
+        // A selected managed launch always gets its own v2 address at exec.
+        // Missing local IPC settings fail before the journal's spawn claim.
+        let managed_owner_v2 = if managed_selection.is_some() {
+            let transport = config
+                .managed_attempt_binding
+                .as_ref()
+                .and_then(|settings| settings.transport.as_ref())
+                .ok_or_else(|| invalid("managed owner transport unavailable"))?;
+            let setting = |name: &str| -> Result<std::path::PathBuf> {
+                planned
+                    .launch
+                    .environment
+                    .get(name)
+                    .filter(|value| !value.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .ok_or_else(|| invalid("managed owner transport unavailable"))
+            };
+            let channel = setting(adapters::native_owner::SETTINGS[0])?;
+            if channel != transport.bridge_socket
+                || channel.canonicalize().ok().as_ref() != Some(&transport.bridge_socket)
+            {
+                return Err(invalid(
+                    "managed owner channel differs from pinned Bridge route",
+                ));
+            }
+            Some(adapters::native_owner_v2::Config {
+                channel,
+                expected_channel: transport.bridge_socket.clone(),
+                directory: setting(adapters::native_owner::SETTINGS[1])?,
+                bridge_executable: transport.bridge_executable.clone(),
+                bridge_sha256: transport.bridge_executable_sha256.clone(),
+            })
+        } else {
+            None
+        };
+        // Journal before the spawning claim and inject only the generated
+        // launch correlation. Legacy/OpenCode are not qualified managed paths.
+        #[cfg(target_os = "linux")]
+        let launch_journaled = matches!(
+            identity.authority.harness,
+            HarnessId::Codex | HarnessId::ClaudeCode
+        );
+        #[cfg(not(target_os = "linux"))]
+        let launch_journaled = false;
+        if launch_journaled {
+            let launch = store.prepare_attempt_launch(id, &attempt_id).await?;
+            planned
+                .launch
+                .environment
+                .insert("AGENT_RUN_LAUNCH_ID".into(), launch);
+        }
         if row.request.explicit_finish && planned.role.worker_mcp {
             // Before the spawn claim, give the broker this attempt's final
             // launch secrets: it refuses every first finish intent that
@@ -1915,7 +1978,9 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         }
         // Process::spawn yields Io only when the OS refused Command::spawn,
         // before a child exists; other failures retain ownership for recovery.
-        let spawned = if identity.authority.harness == HarnessId::OpenCode {
+        let spawned = if managed_selection.is_some() {
+            Process::spawn_managed(&planned.launch, managed_owner_v2)
+        } else if identity.authority.harness == HarnessId::OpenCode {
             Process::spawn_lease(&planned.launch)
         } else {
             Process::spawn(&planned.launch)
@@ -1939,6 +2004,24 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 .leader
                 .clone()
                 .ok_or_else(|| Error::Runtime("provider leader identity unavailable".into()))?;
+            #[cfg(target_os = "linux")]
+            let incarnation = if launch_journaled {
+                // Ordinary execution retains its existing ownership evidence
+                // when a full managed incarnation cannot be established.
+                #[cfg(feature = "test-fixtures")]
+                let unavailable = home.join("fixture-unavailable-incarnation").exists();
+                #[cfg(not(feature = "test-fixtures"))]
+                let unavailable = false;
+                if unavailable {
+                    None
+                } else {
+                    agent_run_platform::process::kernel_incarnation(&leader).ok()
+                }
+            } else {
+                None
+            };
+            #[cfg(not(target_os = "linux"))]
+            let incarnation = None;
             process
                 .observing(async {
                     fixture_hold(home, "provider-process").await;
@@ -1952,7 +2035,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                             })
                             .filter(|evidence| evidence.validate().is_ok());
                     store
-                        .provider_process(id, &attempt_id, &leader, integration)
+                        .provider_process(id, &attempt_id, &leader, integration, incarnation)
                         .await
                 })
                 .await?;
@@ -2001,25 +2084,91 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 .await
             } else if identity.authority.harness == HarnessId::Codex {
                 native_row.request.model = planned.native_model.clone();
-                crate::codex::run(
-                    &mut process,
-                    store,
-                    &native_row,
-                    &row,
-                    &planned.runtime,
-                    &planned.profile,
-                    &runtime_home,
-                )
-                .await
+                if let Some(selection) = &managed_selection {
+                    let bytes = std::fs::read(runtime_home.join("config.toml"))?;
+                    if bytes.len() > 1024 * 1024 {
+                        return Err(invalid("managed config unavailable"));
+                    }
+                    let text = std::str::from_utf8(&bytes)
+                        .map_err(|_| invalid("managed config unavailable"))?;
+                    let native: toml::Value =
+                        toml::from_str(text).map_err(|_| invalid("managed config unavailable"))?;
+                    let native = serde_json::to_value(native)?;
+                    let hooks = native
+                        .get("hooks")
+                        .ok_or_else(|| invalid("managed hooks unavailable"))?;
+                    let managed = crate::codex::ManagedCodexRole {
+                        pre_tool_use: &hooks["PreToolUse"],
+                        permission_request: &hooks["PermissionRequest"],
+                        hook_state: &hooks["state"],
+                        inventory: &selection.inventory,
+                        selection,
+                    };
+                    crate::codex::run_managed(
+                        &mut process,
+                        store,
+                        &native_row,
+                        &row,
+                        &planned.runtime,
+                        &planned.profile,
+                        &runtime_home,
+                        &managed,
+                    )
+                    .await
+                } else {
+                    crate::codex::run(
+                        &mut process,
+                        store,
+                        &native_row,
+                        &row,
+                        &planned.runtime,
+                        &planned.profile,
+                        &runtime_home,
+                    )
+                    .await
+                }
             } else {
-                crate::stream::run(
-                    &mut process,
-                    store,
-                    &native_row,
-                    &row,
-                    planned.launch.initial_input.as_deref(),
-                )
-                .await
+                if let Some(selection) = &managed_selection {
+                    let expected_mcp = runtime_home.join("mcp/mcp-config.json");
+                    let mcp_args: Vec<_> = planned
+                        .launch
+                        .args
+                        .windows(2)
+                        .filter(|pair| pair[0] == "--mcp-config")
+                        .map(|pair| std::path::Path::new(&pair[1]))
+                        .collect();
+                    if mcp_args != [expected_mcp.as_path()] {
+                        return Err(invalid("managed MCP configuration path did not verify"));
+                    }
+                    let settings = std::fs::read(runtime_home.join("settings.json"))?;
+                    if settings.len() > 1024 * 1024 {
+                        return Err(invalid("managed config unavailable"));
+                    }
+                    let config_digest = agent_run_domain::canonical::sha256_hex(
+                        &json!({"settings_sha256":fs::sha256(&settings),"args":planned.launch.args}),
+                        true,
+                    );
+                    crate::stream::run_managed(
+                        &mut process,
+                        store,
+                        &native_row,
+                        &row,
+                        planned.launch.initial_input.as_deref(),
+                        selection,
+                        &config_digest,
+                        &planned.launch.args,
+                    )
+                    .await
+                } else {
+                    crate::stream::run(
+                        &mut process,
+                        store,
+                        &native_row,
+                        &row,
+                        planned.launch.initial_input.as_deref(),
+                    )
+                    .await
+                }
             }
         };
         let execution = execution.await;

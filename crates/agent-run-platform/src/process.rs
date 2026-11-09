@@ -22,6 +22,84 @@ pub struct Identity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program: Option<String>,
 }
+
+/// Exact Linux process incarnation. These facts are correlation evidence, not
+/// a credential; an unavailable or changing procfs observation is not death.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelIncarnation {
+    pub boot_id: String,
+    pub pid_namespace_inode: u64,
+    pub uid: u32,
+    pub pid: u32,
+    pub start_ticks: u64,
+}
+
+/// Inspect the owned leader twice, requiring the same live generation and
+/// local PID namespace throughout. Never inspect the process environment.
+#[cfg(target_os = "linux")]
+pub fn kernel_incarnation(leader: &Identity) -> std::io::Result<KernelIncarnation> {
+    use std::os::unix::fs::MetadataExt;
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "kernel identity unavailable",
+        )
+    };
+    let read = || -> std::io::Result<KernelIncarnation> {
+        let observed = inspect(leader.pid)?;
+        if observed.zombie || observed.token != leader.token {
+            return Err(invalid());
+        }
+        let (boot, ticks) = observed
+            .token
+            .strip_prefix("linux:")
+            .and_then(|s| s.rsplit_once(':'))
+            .ok_or_else(invalid)?;
+        let parsed = uuid::Uuid::parse_str(boot).map_err(|_| invalid())?;
+        if parsed.to_string() != boot {
+            return Err(invalid());
+        }
+        let start_ticks = ticks
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or_else(invalid)?;
+        let local_ns = std::fs::metadata("/proc/self/ns/pid")?.ino();
+        let target_ns = std::fs::metadata(format!("/proc/{}/ns/pid", leader.pid))?.ino();
+        if target_ns == 0 || target_ns != local_ns {
+            return Err(invalid());
+        }
+        let status = std::fs::read_to_string(format!("/proc/{}/status", leader.pid))?;
+        let mut lines = status.lines().filter_map(|line| line.strip_prefix("Uid:"));
+        let uids = lines
+            .next()
+            .ok_or_else(invalid)?
+            .split_ascii_whitespace()
+            .map(str::parse::<u32>)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| invalid())?;
+        if lines.next().is_some() || uids.len() != 4 {
+            return Err(invalid());
+        }
+        // SAFETY: geteuid has no preconditions.
+        if uids[1] != unsafe { libc::geteuid() } {
+            return Err(invalid());
+        }
+        Ok(KernelIncarnation {
+            boot_id: boot.into(),
+            pid_namespace_inode: target_ns,
+            uid: uids[1],
+            pid: leader.pid.try_into().map_err(|_| invalid())?,
+            start_ticks,
+        })
+    };
+    let before = read()?;
+    if read()? != before {
+        return Err(invalid());
+    }
+    Ok(before)
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessState {
@@ -1020,6 +1098,20 @@ impl OwnedProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_kernel_incarnation_rejects_a_reused_leader() {
+        let mut leader = inspect(std::process::id() as i32).unwrap();
+        let facts = kernel_incarnation(&leader).unwrap();
+        assert_eq!(facts.pid, std::process::id());
+        assert_eq!(
+            leader.token,
+            format!("linux:{}:{}", facts.boot_id, facts.start_ticks)
+        );
+        leader.token.push('0');
+        assert!(kernel_incarnation(&leader).is_err());
+    }
 
     /// Procfs init and wildcard-like names never enter a process snapshot.
     #[test]

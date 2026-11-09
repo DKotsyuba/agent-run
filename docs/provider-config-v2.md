@@ -298,3 +298,62 @@ effort and output schemas are still refused. Bridge lifecycle plugin projection
 and standalone OpenCode root delivery require their separate trusted integration;
 other native background/subagent variants are not advertised as qualified. Larger native responses/snapshots retain the
 existing bounded transport and transcript limits.
+
+## Managed attempt selector (experimental)
+
+The `managed_attempt_binding` table is absent by default. An explicit table
+selects only the named dedicated role when `enabled = true`; ordinary roles
+remain ordinary. It requires `role_name`, `pool_server`, `host_id`, and the
+lowercase SHA-256 values `pool_executable_sha256` and `bridge_hook_sha256`.
+The selector refuses plugins, skills, non-stdio or unrestricted MCP servers,
+unapproved component binaries, non-explicit completion, research and broader
+roles. The selected Pool command must be the pinned binary with exactly
+`mcp --config <absolute-path>` and an explicit safe tool subset; the private
+worker surface is limited to `finish` and `health_reply`. Codex live configuration
+and native inventory are checked before input;
+their digests and exact bound launch/kernel identity are recorded by the owning
+supervisor. This switch does not itself enable a Pool-managed command or claim
+native-provider qualification. Do not point it at unreviewed executables.
+Worker capability variables remain in the harness environment in this revision;
+the managed native role must therefore exclude shell and unsafe subprocess tools.
+Scoping these variables solely to the worker MCP channel remains backlog work.
+
+A selected managed launch also requires the configured Bridge transport plus
+`BRIDGE_NATIVE_OWNER_CHANNEL` and `BRIDGE_NATIVE_OWNER_DIRECTORY` in its selected
+environment. Run creates a separate per-launch `BRIDGE_NATIVE_OWNER_SOCKET_V2`
+address before exec and suppresses the v1 owner socket. The address does not grant
+authority: before exact native qualification is durable it returns the definitive
+`qualification_pending` refusal without writing model input. Egress currentness
+uses the pinned Bridge `run_actor_lookup_v1` and a fresh exact leader check; a
+missing or historical actor cannot be substituted by an ingress observation.
+
+`[[managed_attempt_binding.bridge_custody_readers]]` grants effect recovery to
+separately configured same-UID Bridge builds. Each entry pins `reader_id`,
+`worker_uid`, `executable`, `executable_sha256`, `run_route`, `bridge_route`,
+and a nonempty, unique `producer_scopes` list. Scopes may occur in only one
+custody grant. Recovery retains each effect's original run and Bridge routes;
+repointing a grant cannot retarget an existing effect or tombstone. Disabling the
+switch refuses new delivery while configured readers retain exact-key recovery.
+Operator-reviewed builds must be actual native components: interpreter names,
+scripts and renamed copies of common installed interpreters are refused.
+Doctor reports active-currentness, admission, retirement, qualification and
+owner-effect headroom without
+exposing identities. Pending/resolved currentness entries count against active
+capacity only while their exact launch remains owned and active; historical
+entries remain immutable and cannot grant authority. Permanent-key compaction
+is not yet implemented: a future numbered migration must first prove Pool and
+Run recovery settled, commit Bridge namespace retirement, and retain a permanent
+rejecting namespace/key fence before removing any detailed records. Unknown
+issuer associations require operator reconciliation; neither age nor TTL is a
+proof and existing deletion triggers must not be bypassed. Accepted and unknown
+owner effects remain recoverable after retirement and cannot be discarded merely
+because their namespace was retired. Doctor warns when the permanent owner-effect
+ledger reaches 90% of its capacity; it does not silently evict those effects.
+Claude Code 2.1.311 emits `system/init` only after its first user input. Before
+that input, Run sends bare `initialize` and `mcp_status` control requests and
+requires no slash commands and exactly the configured connected MCP servers.
+The declarative agents list is digested; `--tools ""` disables native tools.
+MCP status may omit per-server tool inventories; Run therefore also checks the
+subsequent `system/init` tool list as a mandatory tripwire before
+durable qualification or v2 owner handoff. Mismatch closes stdin and fails the
+run. Actual provider and hook qualification still requires the approved dobi run.

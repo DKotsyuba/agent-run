@@ -1,4 +1,6 @@
 //! Validated product types and transport-safe errors.
+/// Private attempt-binding data, inactive until authenticated routing is enabled.
+pub mod attempt_binding;
 /// Generic durable batch admission contracts.
 pub mod batch;
 pub mod bridge;
@@ -10,6 +12,7 @@ pub mod error;
 pub mod fsm;
 /// Frozen ping policy and private model response contracts.
 pub mod health;
+pub mod initial_task;
 pub mod integration;
 mod legacy_provider;
 /// Draft byte codec for future generic lineage holds; no hold is admitted here.
@@ -17,6 +20,8 @@ pub mod lineage_hold;
 /// Draft strict JSON contracts for the future operator lineage-hold socket.
 pub mod lineage_hold_wire;
 pub mod observation;
+/// Strict managed native-owner v2 outbox and request contracts.
+pub mod owner_v2;
 pub mod pool;
 mod provider_connection;
 pub mod provider_start;

@@ -1204,3 +1204,202 @@ async fn lineage_hold_socket_keeps_proof_private_and_replays_safely() {
         }
     }
 }
+
+/// Exact initial task pages agree across live socket, CLI and MCP, and fail closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_task_crosses_live_socket_cli_and_mcp_in_both_modes() {
+    use agent_run_domain::initial_task::{
+        InitialTaskPage, InitialTaskRequest, InitialTaskResponse,
+    };
+
+    let broker = Broker::start().await;
+    let socket = BrokerClient::new(broker.home.join("api.sock"));
+    let capabilities = socket
+        .call(
+            "capabilities",
+            Some(json!({"include_store_id":true,"include_initial_task":true})),
+        )
+        .await
+        .unwrap();
+    let store_id = capabilities["store_id"].clone();
+    assert_eq!(capabilities["initial_task"]["method"], "initial_task");
+    assert_eq!(
+        capabilities["initial_task"]["modes"],
+        json!(["strict", "current"])
+    );
+    assert!(
+        capabilities["read_methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|method| method["name"] == "initial_task")
+    );
+    let default = socket.call("capabilities", Some(json!({}))).await.unwrap();
+    assert!(
+        default.get("initial_task").is_none(),
+        "support flag is opt-in"
+    );
+    let mcp_caps = mcp_call(
+        &broker.home,
+        "capabilities",
+        &json!({"include_initial_task":true}),
+    )
+    .await;
+    assert_eq!(
+        mcp_caps["result"]["structuredContent"]["initial_task"],
+        capabilities["initial_task"]
+    );
+    let (status, output, error) =
+        cli(&broker.home, &["capabilities", "--include-initial-task"]).await;
+    assert!(status.success(), "capabilities CLI: {error}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&output).unwrap()["initial_task"],
+        capabilities["initial_task"]
+    );
+
+    // Multi-byte text over two default pages; the filler keeps the fake-engine prefix.
+    let task = format!("fixture:answer\n{}", "Задача €🦀\n\"\\".repeat(6000));
+    assert!(task.len() > 65_536);
+    let admitted = socket
+        .call(
+            "start_batch",
+            Some(json!({
+                "request_id":"initial-task-seed","expected_store_id":store_id,
+                "retain_history":true,"jobs":[{"provider":"glm-user","model":"fixture",
+                "profile":"review","explicit_finish":false,"task":task,"workdir":broker.home}]
+            })),
+        )
+        .await
+        .unwrap();
+    let receipt = &admitted["receipt"]["jobs"][0];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !quiescent(&broker.home) {
+        assert!(
+            Instant::now() < deadline,
+            "initial-task fake engine did not stop"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let strict = json!({"version":1,"mode":"strict","expected_store_id":store_id,
+        "agent_id":receipt["agent_id"],"sequence":1,"execution_ref":receipt["execution_ref"],
+        "pin_id":receipt["pin_id"]});
+    let current = json!({"version":1,"mode":"current","agent_id":receipt["agent_id"]});
+
+    for base in [&strict, &current] {
+        let mut request: InitialTaskRequest = serde_json::from_value(base.clone()).unwrap();
+        let mut assembled = String::new();
+        let mut pages = 0;
+        loop {
+            assert!(pages < 20, "paging must make bounded progress");
+            let params = serde_json::to_value(&request).unwrap();
+            let value = socket
+                .call("initial_task", Some(params.clone()))
+                .await
+                .unwrap();
+            let mcp = mcp_call(&broker.home, "initial_task", &params).await;
+            assert_ne!(mcp["result"]["isError"], true, "{mcp}");
+            assert_eq!(mcp["result"]["structuredContent"], value);
+            let response: InitialTaskResponse = serde_json::from_value(value).unwrap();
+            response.validate_for(&request).unwrap();
+            let InitialTaskResponse::Available(page): InitialTaskResponse = response else {
+                panic!("initial task unavailable: {mcp}");
+            };
+            let InitialTaskPage {
+                text,
+                sha256,
+                total_bytes,
+                next_offset,
+                ..
+            } = page;
+            assert_eq!(page.offset, assembled.len());
+            assembled.push_str(&text);
+            pages += 1;
+            request.expected_sha256 = Some(sha256.clone());
+            request.expected_total_bytes = Some(total_bytes);
+            match next_offset {
+                Some(next) => request.offset = next,
+                None => {
+                    assert_eq!(assembled, task);
+                    assert_eq!(
+                        agent_run_platform::fs::sha256(assembled.as_bytes()),
+                        sha256.as_str()
+                    );
+                    break;
+                }
+            }
+        }
+        assert!(pages >= 2, "the task must cross a page boundary");
+    }
+    let spec = broker.home.join("initial-task.json");
+    std::fs::write(&spec, strict.to_string()).unwrap();
+    let (status, output, error) = cli(
+        &broker.home,
+        &["initial-task", "--spec", spec.to_str().unwrap()],
+    )
+    .await;
+    assert!(status.success(), "initial task CLI: {error}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&output).unwrap(),
+        socket
+            .call("initial_task", Some(strict.clone()))
+            .await
+            .unwrap()
+    );
+
+    // A wrong store is a typed error on every transport; a bad fence is typed unavailable.
+    let mut wrong = strict.clone();
+    wrong["expected_store_id"] = json!("store_00000000000000000000000000000000");
+    let error = socket
+        .call("initial_task", Some(wrong.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.machine_code().as_str(), "StoreIdentityMismatch");
+    let mcp_wrong = mcp_call(&broker.home, "initial_task", &wrong).await;
+    assert_eq!(mcp_wrong["result"]["isError"], true);
+    assert!(mcp_wrong["result"]["structuredContent"].is_null());
+    let mut bad_ref = current.clone();
+    bad_ref["execution_ref"] = json!(format!("ex1_{}", "0".repeat(64)));
+    let refused = socket
+        .call("initial_task", Some(bad_ref.clone()))
+        .await
+        .unwrap();
+    assert_eq!(refused["state"], "unavailable");
+    assert_eq!(refused["reason"], "execution_ref_mismatch");
+    assert!(refused.get("text").is_none());
+    assert_eq!(
+        mcp_call(&broker.home, "initial_task", &bad_ref).await["result"]["structuredContent"],
+        refused
+    );
+    let mut bad_sha = current.clone();
+    bad_sha["offset"] = json!(4);
+    bad_sha["expected_sha256"] = json!("0".repeat(64));
+    bad_sha["expected_total_bytes"] = json!(task.len());
+    let changed = socket.call("initial_task", Some(bad_sha)).await.unwrap();
+    assert_eq!(changed["reason"], "content_changed");
+
+    // Releasing the pin withholds the strict text; current mode makes no pin claim.
+    socket
+        .call(
+            "history_pins",
+            Some(
+                json!({"action":"release","expected_store_id":store_id,"pin_id":receipt["pin_id"]}),
+            ),
+        )
+        .await
+        .unwrap();
+    let released = socket
+        .call("initial_task", Some(strict.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        (released["state"].as_str(), released["reason"].as_str()),
+        (Some("unavailable"), Some("pin_released"))
+    );
+    assert_eq!(
+        mcp_call(&broker.home, "initial_task", &strict).await["result"]["structuredContent"],
+        released
+    );
+    let still = socket.call("initial_task", Some(current)).await.unwrap();
+    assert_eq!(still["state"], "available");
+    assert!(still.get("pin_id").is_none());
+}

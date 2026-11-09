@@ -23,7 +23,7 @@ use crate::{
     },
 };
 use agent_run_domain::{
-    error::PersistenceOperation,
+    error::{PersistenceOperation, invalid},
     storage::{
         MonoDeadline, NotEnqueuedReason, OperationId, PayloadDigest, ProducerId, ProducerKind,
         RejectStage, SubmitResult,
@@ -973,6 +973,114 @@ impl Persist {
     }
 
     /// Claims the provider attempt's spawn; false when a cancel is pending.
+    pub async fn prepare_attempt_launch(&mut self, id: &AgentId, attempt: &str) -> Result<String> {
+        self.own(id)?;
+        self.critical(ops::PrepareAttemptLaunch {
+            target: target(id, attempt),
+        })
+        .await
+    }
+
+    /// The owning supervisor records managed role qualification after native
+    /// checks; the writer ties it to the exact bound R1 leader and launch.
+    pub async fn qualify_attempt_role(
+        &mut self,
+        id: &AgentId,
+        attempt: &str,
+        qualification: agent_run_domain::attempt_binding::RoleQualification,
+    ) -> Result<()> {
+        self.own(id)?;
+        self.critical(ops::QualifyAttemptRole {
+            target: target(id, attempt),
+            qualification,
+        })
+        .await
+    }
+
+    /// Reserve a payload-free managed effect on the owning supervisor lane.
+    pub async fn reserve_owner_effect(
+        &mut self,
+        request: &agent_run_domain::owner_v2::RequestV2,
+        enabled: bool,
+    ) -> Result<agent_run_store::owner_v2::Reservation> {
+        let attempt = self
+            .attempt
+            .clone()
+            .ok_or_else(|| invalid("owner attempt unavailable"))?;
+        self.critical(ops::ReserveOwnerEffect {
+            target: target(&self.execution, &attempt),
+            store: request
+                .outbox_intent
+                .target_binding
+                .attempt
+                .run_store_id
+                .clone(),
+            outbox: Box::new(request.outbox_intent.clone()),
+            effect_digest: request.effect_digest.clone(),
+            enabled,
+        })
+        .await
+    }
+    /// Commit the no-resend fence before any possible native write.
+    pub async fn invoke_owner_effect(
+        &mut self,
+        request: &agent_run_domain::owner_v2::RequestV2,
+        token: &str,
+    ) -> Result<()> {
+        let attempt = self
+            .attempt
+            .clone()
+            .ok_or_else(|| invalid("owner attempt unavailable"))?;
+        self.critical(ops::InvokeOwnerEffect {
+            target: target(&self.execution, &attempt),
+            store: request
+                .outbox_intent
+                .target_binding
+                .attempt
+                .run_store_id
+                .clone(),
+            producer_scope: request.outbox_intent.producer_scope.clone(),
+            effect_id: request.outbox_intent.effect_id.clone(),
+            effect_digest: request.effect_digest.clone(),
+            dispatch_token: token.into(),
+        })
+        .await
+    }
+    /// Persist the native handoff outcome before returning it to Bridge.
+    pub async fn finish_owner_effect(
+        &mut self,
+        request: &agent_run_domain::owner_v2::RequestV2,
+        token: &str,
+        state: &str,
+        protocol: Option<&str>,
+        native_id: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<agent_run_store::owner_v2::EffectView> {
+        let attempt = self
+            .attempt
+            .clone()
+            .ok_or_else(|| invalid("owner attempt unavailable"))?;
+        self.critical(ops::FinishOwnerEffect {
+            target: target(&self.execution, &attempt),
+            store: request
+                .outbox_intent
+                .target_binding
+                .attempt
+                .run_store_id
+                .clone(),
+            producer_scope: request.outbox_intent.producer_scope.clone(),
+            effect_id: request.outbox_intent.effect_id.clone(),
+            effect_digest: request.effect_digest.clone(),
+            dispatch_token: token.into(),
+            state: state.into(),
+            protocol: protocol.map(str::to_owned),
+            native_id: native_id.map(str::to_owned),
+            reason: reason.map(str::to_owned),
+        })
+        .await
+    }
+
+    /// Claims the provider attempt's spawn; false when a cancel is pending.
     pub async fn provider_spawning(&mut self, id: &AgentId, attempt: &str) -> Result<bool> {
         self.own(id)?;
         self.critical(ops::ProviderSpawning {
@@ -998,12 +1106,14 @@ impl Persist {
         attempt: &str,
         leader: &agent_run_platform::process::Identity,
         integration: Option<agent_run_domain::integration::NativeIntegration>,
+        incarnation: Option<agent_run_platform::process::KernelIncarnation>,
     ) -> Result<()> {
         self.own(id)?;
         self.critical(ops::ProviderProcess {
             target: target(id, attempt),
             leader: leader.clone(),
             integration,
+            incarnation,
         })
         .await
     }

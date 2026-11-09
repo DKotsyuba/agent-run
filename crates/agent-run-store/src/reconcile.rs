@@ -299,6 +299,13 @@ impl Store<'_> {
         }
         current.status.transition(Status::Lost)?;
         let at = op.checked_at;
+        // A dead supervisor cannot prove whether an unanchored OS spawn took
+        // place. Preserve the ambiguity and never allocate another launch for
+        // this attempt from a negative lookup.
+        tx.execute(
+            "UPDATE attempt_launches SET state='unknown' WHERE execution_id=? AND state='spawning'",
+            [id.as_str()],
+        )?;
         tx.execute(
             "UPDATE agents SET status='lost',finished_at=?,failure_kind=?,failure_text=? WHERE id=?",
             params![at, op.failure_kind, op.failure_text, id.as_str()],

@@ -187,6 +187,18 @@ const PENDING_FILES: &[(i64, &str)] = &[
         37,
         include_str!("../../../sql/migrations/037_lineage_holds.sql"),
     ),
+    (
+        38,
+        include_str!("../../../sql/migrations/038_attempt_launch.sql"),
+    ),
+    (
+        39,
+        include_str!("../../../sql/migrations/039_attempt_admission.sql"),
+    ),
+    (
+        40,
+        include_str!("../../../sql/migrations/040_owner_effects.sql"),
+    ),
 ];
 
 /// Every migration file, ordered by the version it produces.

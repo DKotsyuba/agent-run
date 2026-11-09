@@ -31,6 +31,25 @@ pub fn implemented(kind: OpKindRef) -> bool {
             | K::RememberProcesses
             | K::RetainCleanupEvidence
             | K::ProviderSpawning
+            | K::PrepareAttemptLaunch
+            | K::QualifyAttemptRole
+            | K::ReserveOwnerEffect
+            | K::InvokeOwnerEffect
+            | K::FinishOwnerEffect
+            | K::AbortOwnerEffect
+            | K::BeginAttemptEgress
+            | K::FinishAttemptEgress
+            | K::BeginAttemptAdmission
+            | K::AdmitAttempt
+            | K::AbortAttemptAdmission
+            | K::SettleAttemptAdmission
+            | K::FenceAttemptNamespace
+            | K::InvokeAttemptRetirement
+            | K::CompleteAttemptRetirement
+            | K::RecordAttemptIngress
+            | K::BeginAttemptCurrent
+            | K::ObserveAttemptPoolSeal
+            | K::PrepareAttemptRetirement
             | K::ProviderSpawnFailed
             | K::ProviderProcess
             | K::ProviderCleanup
@@ -150,6 +169,11 @@ pub(crate) fn remote_facts(op: &RemoteOp) -> Facts {
         R::RememberProcesses(_) => (None, None, None),
         R::RetainCleanupEvidence(op) => attempt(&op.execution, &op.attempt),
         R::ProviderSpawning(op) => attempt(&op.target.execution, &op.target.attempt),
+        R::PrepareAttemptLaunch(op) => attempt(&op.target.execution, &op.target.attempt),
+        R::QualifyAttemptRole(op) => attempt(&op.target.execution, &op.target.attempt),
+        R::ReserveOwnerEffect(op) => attempt(&op.target.execution, &op.target.attempt),
+        R::InvokeOwnerEffect(op) => attempt(&op.target.execution, &op.target.attempt),
+        R::FinishOwnerEffect(op) => attempt(&op.target.execution, &op.target.attempt),
         R::ProviderSpawnFailed(op) => attempt(&op.target.execution, &op.target.attempt),
         R::ProviderProcess(op) => attempt(&op.target.execution, &op.target.attempt),
         R::ProviderCleanup(op) => attempt(&op.target.execution, &op.target.attempt),
@@ -311,14 +335,79 @@ pub(crate) fn run_remote(store: &mut Store, op: RemoteOp) -> Result<Value> {
         R::ProviderSpawning(op) => {
             out(store.provider_spawning(&op.target.execution, &op.target.attempt)?)
         }
+        R::PrepareAttemptLaunch(op) => {
+            out(store.prepare_attempt_launch(&op.target.execution, &op.target.attempt)?)
+        }
+        R::QualifyAttemptRole(op) => {
+            if op.qualification.attempt_id != op.target.attempt {
+                return Err(invalid("attempt qualification target mismatch"));
+            }
+            out(store.attempt_qualify_role(&op.target.execution, &op.qualification)?)
+        }
+        R::ReserveOwnerEffect(op) => {
+            let attempt = &op.outbox.target_binding.attempt;
+            if op.target.execution != attempt.execution_id
+                || op.target.attempt != attempt.attempt_id
+                || op.store != attempt.run_store_id
+            {
+                return Err(invalid("owner effect target mismatch"));
+            }
+            out(store.owner_effect_reserve_managed(
+                &op.store,
+                &op.outbox,
+                &op.effect_digest,
+                op.enabled,
+            )?)
+        }
+        R::InvokeOwnerEffect(op) => {
+            if !store.owner_effect_matches_target(
+                &op.producer_scope,
+                &op.effect_id,
+                &op.effect_digest,
+                &op.target.execution,
+                &op.target.attempt,
+            )? {
+                return Err(agent_run_domain::Error::Conflict);
+            }
+            out(store.owner_effect_invoke(
+                &op.store,
+                &op.producer_scope,
+                &op.effect_id,
+                &op.effect_digest,
+                &op.dispatch_token,
+            )?)
+        }
+        R::FinishOwnerEffect(op) => {
+            if !store.owner_effect_matches_target(
+                &op.producer_scope,
+                &op.effect_id,
+                &op.effect_digest,
+                &op.target.execution,
+                &op.target.attempt,
+            )? {
+                return Err(agent_run_domain::Error::Conflict);
+            }
+            out(store.owner_effect_finish(
+                &op.store,
+                &op.producer_scope,
+                &op.effect_id,
+                &op.effect_digest,
+                &op.dispatch_token,
+                &op.state,
+                op.protocol.as_deref(),
+                op.native_id.as_deref(),
+                op.reason.as_deref(),
+            )?)
+        }
         R::ProviderSpawnFailed(op) => {
             out(store.provider_spawn_failed(&op.target.execution, &op.target.attempt)?)
         }
-        R::ProviderProcess(op) => out(store.provider_process_evidence(
+        R::ProviderProcess(op) => out(store.provider_process_launch_evidence(
             &op.target.execution,
             &op.target.attempt,
             &op.leader,
             op.integration.as_ref(),
+            op.incarnation.as_ref(),
         )?),
         R::ProviderCleanup(op) => {
             out(store.provider_cleanup(&op.target.execution, &op.target.attempt, &op.proof)?)
@@ -594,6 +683,74 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
         L::ReleaseLineageHold(op) => {
             out(store.release_lineage_hold(&op.hold_id, &op.expected_store_id, op.signature())?)
         }
+        L::BeginAttemptAdmission(op) => {
+            out(store.attempt_begin_admission_gated(&op.request, op.enabled)?)
+        }
+        L::AdmitAttempt(op) => out(store.attempt_admit_gated(
+            &op.request,
+            &crate::attempt_binding::CurrentConsume {
+                receipt: &op.receipt,
+                inspected: &op.inspected,
+            },
+            op.enabled,
+        )?),
+        L::AbortAttemptAdmission(op) => out(store.attempt_abort_absent(
+            &op.store,
+            &op.intent_id,
+            &op.security_digest,
+            &op.pool_route,
+            op.requested_outcome_digest.as_deref(),
+        )?),
+        L::SettleAttemptAdmission(op) => out(store.attempt_settle(
+            &op.store,
+            &op.admission_id,
+            &crate::attempt_binding::TerminalOutcome {
+                pool_route: &op.pool_route,
+                intent_id: &op.intent_id,
+                security_digest: &op.security_digest,
+                state: &op.state,
+                outcome_digest: &op.outcome_digest,
+            },
+        )?),
+        L::FenceAttemptNamespace(op) => {
+            out(store.attempt_retirement_fence(&op.request, &op.current_issuer)?)
+        }
+        L::InvokeAttemptRetirement(op) => {
+            out(store.attempt_retirement_invoke(&op.request, &op.seal)?)
+        }
+        L::ObserveAttemptPoolSeal(op) => {
+            out(store.attempt_retirement_observe_seal(&op.request, &op.seal)?)
+        }
+        L::CompleteAttemptRetirement(op) => out(store.attempt_retirement_complete(
+            &op.request,
+            &op.pool_seal_id,
+            op.retired_count,
+        )?),
+        L::RecordAttemptIngress(op) => out(store.attempt_current_ingress_gated(
+            &op.request,
+            &op.observation,
+            &op.inspected,
+            op.enabled,
+        )?),
+        L::BeginAttemptCurrent(op) => {
+            out(store.attempt_begin_current_gated(&op.request, &op.launch_id, op.enabled)?)
+        }
+        L::PrepareAttemptRetirement(op) => out(store.attempt_retirement_prepare(&op.request)?),
+        L::AbortOwnerEffect(op) => out(store.owner_effect_abort(
+            &op.store,
+            &op.producer_scope,
+            &op.effect_id,
+            &op.effect_digest,
+            &op.route,
+        )?),
+        L::BeginAttemptEgress(op) => out(store.attempt_begin_egress(&op.request, op.enabled)?),
+        L::FinishAttemptEgress(op) => out(store.attempt_finish_egress(
+            &op.request,
+            &op.candidate,
+            &op.actor,
+            &op.inspected,
+            op.enabled,
+        )?),
         L::AdmitProviderResume(op) => {
             let spec = &op.inputs;
             out(store.admit_provider_resume(

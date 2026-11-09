@@ -22,6 +22,11 @@ impl StoreId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+    /// Codec-only fixture constructor; published vectors use placeholder IDs.
+    #[cfg(test)]
+    pub(crate) fn vector_placeholder(value: &str) -> Self {
+        Self(value.into())
+    }
 }
 
 impl fmt::Display for StoreId {

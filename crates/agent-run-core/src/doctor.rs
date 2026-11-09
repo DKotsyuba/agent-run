@@ -200,6 +200,15 @@ fn check(name: &str, status: CheckStatus, detail: &str, remediation: &str) -> Ch
     }
 }
 
+/// Warn while at least 90% of the permanent owner-effect ledger is used.
+fn owner_effect_capacity_status(used: u64, limit: u64) -> CheckStatus {
+    if limit == 0 || limit.saturating_sub(used) <= limit / 10 {
+        CheckStatus::Warning
+    } else {
+        CheckStatus::Ok
+    }
+}
+
 /// Represents unavailable release evidence without inventing a version or seal.
 fn unobserved_release(name: &str) -> ReleaseSummary {
     ReleaseSummary {
@@ -622,6 +631,38 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
         "read-only state snapshot obtained",
         "none",
     ));
+    match state::writer::StoreReader::open_with(&report.home, Duration::from_millis(100))
+        .and_then(|reader| reader.attempt_capacity_headroom())
+    {
+        Ok(headroom) => report.diagnostics.checks.push(check(
+            "attempt_binding_headroom",
+            owner_effect_capacity_status(headroom.owner_effects_used,headroom.owner_effects_limit),
+            &format!(
+                "active currentness remaining {} of {}; admission keys remaining {} of {}; retirements remaining {} of {}; qualifications remaining {} of {}; owner effects remaining {} of {}",
+                headroom
+                    .active_current_limit
+                    .saturating_sub(headroom.active_current_used),
+                headroom.active_current_limit,
+                headroom
+                    .admission_keys_limit
+                    .saturating_sub(headroom.admission_keys_used),
+                headroom.admission_keys_limit,
+                headroom.retirements_limit.saturating_sub(headroom.retirements_used),
+                headroom.retirements_limit,
+                headroom.qualifications_limit.saturating_sub(headroom.qualifications_used),
+                headroom.qualifications_limit,
+                headroom.owner_effects_limit.saturating_sub(headroom.owner_effects_used),
+                headroom.owner_effects_limit
+            ),
+            "retire fully settled namespaces before permanent-key compaction is available",
+        )),
+        Err(_) => report.diagnostics.checks.push(check(
+            "attempt_binding_headroom",
+            CheckStatus::NotChecked,
+            "attempt binding headroom unavailable",
+            "inspect the state store read-only",
+        )),
+    }
     if let Some(config) = &provider_config {
         provider_bindings(config, &report.home, &mut report.findings);
         managed_services(
@@ -1925,6 +1966,23 @@ fn executable(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owner_effect_headroom_warns_at_ninety_percent() {
+        use super::{CheckStatus, owner_effect_capacity_status};
+        assert_eq!(
+            owner_effect_capacity_status(89_999, 100_000),
+            CheckStatus::Ok
+        );
+        assert_eq!(
+            owner_effect_capacity_status(90_000, 100_000),
+            CheckStatus::Warning
+        );
+        assert_eq!(
+            owner_effect_capacity_status(100_000, 100_000),
+            CheckStatus::Warning
+        );
+        assert_eq!(owner_effect_capacity_status(0, 0), CheckStatus::Warning);
+    }
     /// Only a validated Bridge path is a reference; malformed/relative/inline fields remain findings.
     #[test]
     fn bridge_token_file_reference_is_not_plaintext_secret() {
@@ -2478,6 +2536,35 @@ readiness={command="/bin/true"}
 
         let dependencies = Dependencies::new(Some(home.path().join("missing-canary")), Vec::new);
         let report = run_with(home.path(), &dependencies).unwrap();
+
+        let headroom = report
+            .diagnostics
+            .checks
+            .iter()
+            .find(|check| check.name == "attempt_binding_headroom")
+            .unwrap();
+        assert_eq!(headroom.status, CheckStatus::Ok);
+        assert!(
+            headroom
+                .detail
+                .contains("active currentness remaining 100000 of 100000")
+        );
+        assert!(
+            headroom
+                .detail
+                .contains("retirements remaining 100000 of 100000")
+        );
+        assert!(
+            headroom
+                .detail
+                .contains("qualifications remaining 100000 of 100000")
+        );
+        assert!(
+            headroom
+                .detail
+                .contains("owner effects remaining 100000 of 100000")
+        );
+        assert!(!headroom.detail.contains("private-task-sentinel"));
 
         let quota = report
             .diagnostics

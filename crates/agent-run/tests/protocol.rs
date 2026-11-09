@@ -13,12 +13,12 @@ fn service() -> Service {
         "/nonexistent-agent-run-protocol-fixture",
     ))
 }
-/// Pins the shared twenty-three-entry discovery projection while compatibility
+/// Pins the shared twenty-four-entry discovery projection while compatibility
 /// calls retain their schemas in the same domain-owned registry.
 #[test]
-fn packaged_table_has_exactly_the_shared_twenty_three_tools() {
+fn packaged_table_has_exactly_the_shared_twenty_four_tools() {
     let tools = dispatch::tools();
-    assert_eq!(tools.len(), 23);
+    assert_eq!(tools.len(), 24);
     let names: std::collections::BTreeSet<_> =
         tools.iter().map(|v| v["name"].as_str().unwrap()).collect();
     assert_eq!(
@@ -46,7 +46,7 @@ async fn ping_and_discovery_do_not_require_database_access() {
     )
     .await
     .unwrap();
-    assert_eq!(response["result"].as_array().unwrap().len(), 23);
+    assert_eq!(response["result"].as_array().unwrap().len(), 24);
 }
 /// Mirrors `test_api_socket.py::test_unknown_method_and_validation_error`.
 #[tokio::test]

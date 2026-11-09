@@ -6,11 +6,15 @@ pub mod codex;
 pub mod command_policy;
 pub mod glm;
 pub mod io;
+/// Restricted managed-role controls, kept inactive until managed admission exists.
+pub mod managed_role;
 pub mod materialize;
 pub mod mcp_catalog;
 pub mod native_failure;
 /// Protected bounded handoff into the sole existing native owner loop.
 pub mod native_owner;
+/// Separate managed owner-v2 transport feeding the same core writer lane.
+pub mod native_owner_v2;
 /// Owned OpenCode v2 native settings and HTTP transport.
 pub mod opencode;
 pub mod plugins;

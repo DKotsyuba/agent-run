@@ -3,6 +3,10 @@
 #[cfg(test)]
 extern crate self as agent_run_core;
 pub mod agent_identity;
+mod attempt_binding;
+mod attempt_transport;
+/// Private authenticated attempt receipt and protocol transport.
+pub mod attempt_wire;
 /// Read-only lookup of permanently admitted batch receipts.
 pub mod batch_receipt;
 /// In-process producer lanes of the resident broker.
@@ -27,6 +31,7 @@ pub mod lifecycle;
 /// Generic writer-backed lineage holds and read-only recovery.
 pub mod lineage_holds;
 pub mod logging;
+mod managed_qualification;
 pub mod managed_services;
 /// Single-instance storage of Codex's unindexed native metadata caches.
 pub mod native_cache;

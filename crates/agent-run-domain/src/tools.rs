@@ -190,6 +190,14 @@ impl ToolDefinition {
                 MachineCode::IOError,
                 MachineCode::StorageError,
             ],
+            "initial_task" => &[
+                MachineCode::ValidationError,
+                MachineCode::StoreIdentityMismatch,
+                MachineCode::Unsupported,
+                MachineCode::RuntimeError,
+                MachineCode::IOError,
+                MachineCode::StorageError,
+            ],
             "status" => &[
                 MachineCode::ValidationError,
                 MachineCode::StoreIdentityMismatch,
@@ -389,8 +397,11 @@ fn argument_default(tool: &str, argument: &str) -> Option<ArgumentDefault> {
         ("status", "include_view") => Some(ArgumentDefault::Bool(false)),
         ("start_batch" | "batch_receipt", "retain_history") => Some(ArgumentDefault::Bool(false)),
         ("capabilities", "include_store_id") => Some(ArgumentDefault::Bool(false)),
-        ("capabilities", "include_lineage_holds") => Some(ArgumentDefault::Bool(false)),
-        ("answer_chunk", "max_bytes") => Some(ArgumentDefault::Integer(65536)),
+        ("capabilities", "include_lineage_holds" | "include_initial_task") => {
+            Some(ArgumentDefault::Bool(false))
+        }
+        ("answer_chunk" | "initial_task", "max_bytes") => Some(ArgumentDefault::Integer(65536)),
+        ("initial_task", "offset") => Some(ArgumentDefault::Integer(0)),
         ("list_pools" | "list_agents", "offset") | ("transcript", "cursor") => {
             Some(ArgumentDefault::Integer(0))
         }

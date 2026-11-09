@@ -538,6 +538,18 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
                 })
                 .await
         }
+        "initial_task" => {
+            let request: agent_run_domain::initial_task::InitialTaskRequest = args(raw)?;
+            request.validate()?;
+            service
+                .read(move |store| {
+                    Ok(serde_json::to_value(agent_run_store::initial_task::read(
+                        store.conn(),
+                        &request,
+                    )?)?)
+                })
+                .await
+        }
         "history_pins" => service.history_pins(args(raw)?).await,
         "_lineage_hold_acquire"
         | "_lineage_hold_lookup"
@@ -621,6 +633,11 @@ pub async fn call(service: &Service, name: &str, raw: Value) -> Result<Value> {
                     "list": "_lineage_hold_list",
                     "release": "_lineage_hold_release"
                 });
+            }
+            if query.include_initial_task {
+                result["initial_task"] = serde_json::to_value(
+                    agent_run_domain::initial_task::InitialTaskCapability::current(),
+                )?;
             }
             Ok(result)
         }

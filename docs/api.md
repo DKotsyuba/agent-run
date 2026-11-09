@@ -799,9 +799,15 @@ rendered as `RuntimeError`.
   an agent-run upgrade instead of caching schemas across versions.
 - Restart `api serve` after switching the verified sealed release at
   `~/.agent-run/standalone/current`.
-- The current database schema is version 35, reached through the paired
+- The current database schema is version 40, reached through the paired
   `agent-run config migrate`. Older resident processes refuse a newer database
   and must be restarted after an upgrade migrates it.
+
+Linux provider launches for Codex and Claude record an attempt launch journal
+and kernel incarnation. Launch correlation is not a credential or managed
+Pool authorization: managed enrollment remains unqualified until the separate
+role, admission and real-provider checks are complete. A spawning record left
+without a bound leader is unresolved; recovery must not infer that no child ran.
 
 ### Exact pinned transcript export (v1)
 
@@ -881,3 +887,126 @@ alone is not proof the client collected preceding pages. It never proves executi
 completion, success, present filesystem contents or authority. The empty captured
 snapshot is explicit (`message=null`, watermark/cursors `"0"`, completion true),
 and stays empty when its watermark is echoed after later appends.
+
+### Exact initial task (v1)
+
+`initial_task` is a read-only public tool on the same CLI/socket/MCP registry
+(one dispatcher entry). It returns the exact initial task text of one retained
+**root** execution (sequence 1), in verified pages, or a typed `unavailable`
+state. It never reconstructs a system prompt, a Pool binding or any text from
+another string, never truncates, and does not change retention. The CLI reads one
+page with `agent-run initial-task --spec request.json` (`--spec -` uses stdin).
+MCP returns the same complete JSON in `structuredContent` with a fixed text
+label; the task is data, not instructions or authority.
+
+**Capability.** `capabilities` with `{"include_initial_task":true}` (CLI:
+`agent-run capabilities --include-initial-task`) adds
+`"initial_task":{"version":1,"method":"initial_task","modes":["strict","current"],"max_task_bytes":524288,"max_page_bytes":65536}`.
+Without the flag the key is absent, like `lineage_holds`; `initial_task` also
+appears in `read_methods` with its schemas. A build that predates the method
+rejects the unknown flag and lacks the read method.
+
+**Request** (strict object; omit optional fields, explicit `null` is refused):
+
+| Field | Meaning |
+|---|---|
+| `version` | exactly `1` |
+| `mode` | `strict` or `current` |
+| `expected_store_id` | database identity fence; required for `strict`, optional for `current` |
+| `agent_id` | canonical root agent ID; a resume alias is never normalized |
+| `sequence` | `strict`: required; `current`: optional. Only `1` can be available |
+| `execution_ref` | `strict`: required `ex1_…` receipt of the first provider attempt; `current`: optional per-page identity fence |
+| `pin_id` | `strict`: required active history pin; `current`: rejected |
+| `offset` | UTF-8 byte offset of the page, default 0, must be a character boundary |
+| `max_bytes` | page budget 4..=65536, default 65536; the page ends at a character boundary |
+| `expected_sha256`, `expected_total_bytes` | whole-text fences from an earlier page; both or neither; required for a nonzero `offset` |
+
+**Strict mode** proves, in the same SQLite read snapshot as the bytes: store
+identity, canonical root/self (`id` = root, sequence 1, no parent), the first
+attempt's computed `execution_ref`, an **active** pin of this root, and
+*complete* lineage/attempt coverage (the `status` proof: every retained
+execution and attempt is continuous with verified provider-v2 identity). **Current mode**
+reads the currently retained root without a pin: it makes no pin, coverage or
+latest-ever claim, and an unpinned result proves nothing about an older Pool
+binding or system prompt. It still checks store (if given), canonical root, first
+provider-v2 attempt and ref (and the client's `execution_ref` fence, if any).
+
+Both modes require `agents.task`, `request_json.task` and the frozen provider-v2
+task (the replay-proven `provider_request.task`) to be byte-identical text of at
+most 512 KiB (524288 bytes), NUL-free and not blank.
+
+**Result.** `state` is `available` or `unavailable`:
+
+```json
+{"state":"available","version":1,"mode":"strict","store_id":"store_0123456789abcdef0123456789abcdef",
+ "agent_id":"ag-20261109-120000-0123456789","sequence":1,
+ "execution_ref":"ex1_0000000000000000000000000000000000000000000000000000000000000000",
+ "pin_id":"pin_00000000000040008000000000000000","total_bytes":70000,
+ "sha256":"<64 lowercase hex of the whole text>","offset":0,"end":65536,"next_offset":65536,
+ "text":"…first 65536 bytes…","complete":false}
+```
+
+`pin_id` appears only in `strict`. `total_bytes` and `sha256` describe the whole
+text and are identical on every page; `next_offset` is `null` on the last page
+(`complete: true`, `end == total_bytes`). Pages are split only at UTF-8
+boundaries, so a page may be shorter than `max_bytes`.
+
+```json
+{"state":"unavailable","version":1,"mode":"strict","store_id":"store_0123456789abcdef0123456789abcdef",
+ "agent_id":"ag-20261109-120000-0123456789","reason":"pin_released"}
+```
+
+`unavailable` is a successful result, never accompanied by text, and `reason`
+is one of:
+
+| `reason` | Meaning |
+|---|---|
+| `not_found` | no retained execution has this ID (absent, or removed with no pin tombstone) |
+| `retention_deleted` | `strict` only: the pin tombstone exists but retention removed the lineage |
+| `not_root_execution` | not a canonical root, or `sequence` is not 1 (resume executions are never exported) |
+| `execution_ref_unavailable` | no usable first provider attempt to derive a ref |
+| `execution_ref_mismatch` | the supplied ref differs from the computed ref |
+| `pin_missing`, `pin_released`, `pin_mismatch` | `strict` only: pin absent, released, or owned by another root |
+| `coverage_incomplete` | `strict` only: lineage/attempt continuity is not proven complete |
+| `task_missing` | a task source is absent, not text, blank, unparsable or beyond the read budget |
+| `task_mismatch` | the three task sources disagree |
+| `task_too_large` | a task source exceeds 512 KiB |
+| `provider_identity_invalid` | the frozen provider-v2 identity does not verify |
+| `content_changed` | the supplied `expected_sha256` or `expected_total_bytes` differs from the stored text |
+
+**Errors** stay typed on every transport: `ValidationError` (malformed request,
+`null`/unknown fields, a missing strict fence, a bad `offset`/`max_bytes`, an
+offset inside a character or past the text), `StoreIdentityMismatch` (a wrong
+`expected_store_id`; no content, and not an `unavailable` result), and the usual
+`StorageError`/`IOError`/`RuntimeError` classes.
+
+**Client protocol.** Start at `offset` 0 without fences. Buffer each page's
+`text`; continue with `offset = next_offset` and the first page's `sha256` as
+`expected_sha256` and `total_bytes` as `expected_total_bytes`, every time. Check
+that each page's `offset` equals the bytes buffered so far and that `store_id`,
+`agent_id`, `execution_ref` (and, in `strict`, `pin_id`) never change; cancel on
+any change or on a session change. Only after `complete`, verify the buffered
+byte length and the SHA-256 of the whole text; use nothing before that. Any
+`unavailable` page (including `content_changed`) discards the buffer: earlier
+pages are partial historical data. Each page is its own snapshot; the fences,
+not a retained snapshot, bind the pages together.
+
+Example `strict` request:
+
+```json
+{"version":1,"mode":"strict","expected_store_id":"store_0123456789abcdef0123456789abcdef",
+ "agent_id":"ag-20261109-120000-0123456789","sequence":1,
+ "execution_ref":"ex1_0000000000000000000000000000000000000000000000000000000000000000",
+ "pin_id":"pin_00000000000040008000000000000000"}
+```
+
+Example `current` continuation (second page):
+
+```json
+{"version":1,"mode":"current","agent_id":"ag-20261109-120000-0123456789",
+ "execution_ref":"ex1_0000000000000000000000000000000000000000000000000000000000000000",
+ "offset":65536,"expected_sha256":"<sha256 from page one>","expected_total_bytes":70000}
+```
+
+The identities above illustrate syntax. A page is bounded to fit the shared 1 MiB
+socket/MCP frame even with worst-case JSON escaping. No SQLite schema change.

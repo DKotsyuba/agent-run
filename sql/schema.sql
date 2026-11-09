@@ -958,4 +958,202 @@ WHEN EXISTS (SELECT 1 FROM agents a JOIN lineage_hold_targets t ON t.root_agent_
   JOIN lineage_holds h USING(hold_id) WHERE a.id IN (OLD.agent_id,OLD.resumed_execution_id) AND h.released=0)
 BEGIN SELECT RAISE(ABORT,'lineage has an active hold'); END;
 
-PRAGMA user_version = 37;
+PRAGMA user_version = 40;
+
+-- Launch correlation is never inferred for historical attempts. A spawning
+-- row without a bound incarnation is unresolved until explicitly reconciled.
+CREATE TABLE attempt_launches (
+  spawn_key TEXT PRIMARY KEY NOT NULL,
+  execution_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL CHECK (sequence > 0),
+  attempt_id TEXT NOT NULL UNIQUE,
+  launch_id TEXT NOT NULL UNIQUE CHECK (length(launch_id)=36),
+  state TEXT NOT NULL CHECK (state IN ('prepared','spawning','bound','failed','unknown')),
+  boot_id TEXT,
+  pid_namespace_inode INTEGER,
+  uid INTEGER,
+  pid INTEGER,
+  start_ticks INTEGER,
+  CHECK ((state='bound' AND boot_id IS NOT NULL AND pid_namespace_inode > 0
+          AND uid >= 0 AND pid > 1 AND start_ticks > 0)
+      OR (state!='bound' AND boot_id IS NULL AND pid_namespace_inode IS NULL
+          AND uid IS NULL AND pid IS NULL AND start_ticks IS NULL))
+);
+
+CREATE TRIGGER attempt_launch_identity_immutable BEFORE UPDATE ON attempt_launches
+WHEN NEW.spawn_key IS NOT OLD.spawn_key OR NEW.execution_id IS NOT OLD.execution_id
+  OR NEW.sequence IS NOT OLD.sequence OR NEW.attempt_id IS NOT OLD.attempt_id
+  OR NEW.launch_id IS NOT OLD.launch_id OR OLD.state IN ('bound','failed')
+  OR NOT ((OLD.state='prepared' AND NEW.state IN ('spawning','failed'))
+       OR (OLD.state='spawning' AND NEW.state IN ('bound','failed','unknown'))
+       OR (OLD.state='unknown' AND NEW.state IN ('bound','failed')))
+BEGIN SELECT RAISE(ABORT, 'invalid attempt launch transition'); END;
+
+-- Permanent v1 admission and abort records. Old attempts gain no authority.
+-- Installed only by the owning supervisor after managed-role native checks.
+CREATE TABLE attempt_role_qualifications (
+  launch_id TEXT PRIMARY KEY NOT NULL,
+  attempt_id TEXT NOT NULL UNIQUE,
+  harness TEXT NOT NULL CHECK(harness IN ('codex','claude-code')),
+  role_digest TEXT NOT NULL CHECK(length(role_digest)=64 AND role_digest NOT GLOB '*[^0-9a-f]*'),
+  config_digest TEXT NOT NULL CHECK(length(config_digest)=64 AND config_digest NOT GLOB '*[^0-9a-f]*'),
+  inventory_digest TEXT NOT NULL CHECK(length(inventory_digest)=64 AND inventory_digest NOT GLOB '*[^0-9a-f]*'),
+  boot_id TEXT NOT NULL,
+  pid_namespace_inode INTEGER NOT NULL CHECK(pid_namespace_inode>0),
+  uid INTEGER NOT NULL CHECK(uid>=0),
+  pid INTEGER NOT NULL CHECK(pid>1),
+  start_ticks INTEGER NOT NULL CHECK(start_ticks>0)
+);
+CREATE TRIGGER attempt_role_qualification_immutable BEFORE UPDATE ON attempt_role_qualifications
+BEGIN SELECT RAISE(ABORT, 'attempt qualification is immutable'); END;
+
+-- Created before any Bridge lookup so namespace retirement sees in-flight work.
+CREATE TABLE attempt_pending_checks (
+  intent_id TEXT PRIMARY KEY NOT NULL,
+  security_digest TEXT NOT NULL CHECK(length(security_digest)=64 AND security_digest NOT GLOB '*[^0-9a-f]*'),
+  request_fingerprint TEXT NOT NULL CHECK(length(request_fingerprint)=64 AND request_fingerprint NOT GLOB '*[^0-9a-f]*'),
+  pool_route_json TEXT NOT NULL CHECK(json_valid(pool_route_json)),
+  bridge_route_json TEXT NOT NULL CHECK(json_valid(bridge_route_json)),
+  producer TEXT NOT NULL,
+  issuer_epoch TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('pending','resolved'))
+);
+
+CREATE TRIGGER attempt_pending_checks_immutable BEFORE UPDATE ON attempt_pending_checks
+WHEN NEW.intent_id IS NOT OLD.intent_id OR NEW.security_digest IS NOT OLD.security_digest
+  OR NEW.request_fingerprint IS NOT OLD.request_fingerprint OR NEW.pool_route_json IS NOT OLD.pool_route_json
+  OR NEW.bridge_route_json IS NOT OLD.bridge_route_json OR NEW.producer IS NOT OLD.producer
+  OR NEW.issuer_epoch IS NOT OLD.issuer_epoch OR OLD.state!='pending' OR NEW.state!='resolved'
+BEGIN SELECT RAISE(ABORT, 'invalid attempt lookup transition'); END;
+
+CREATE TABLE attempt_admissions (
+  intent_id TEXT PRIMARY KEY NOT NULL,
+  security_digest TEXT NOT NULL CHECK(length(security_digest)=64 AND security_digest NOT GLOB '*[^0-9a-f]*'),
+  pool_route_json TEXT NOT NULL CHECK(json_valid(pool_route_json)),
+  request_fingerprint TEXT CHECK(request_fingerprint IS NULL OR (length(request_fingerprint)=64 AND request_fingerprint NOT GLOB '*[^0-9a-f]*')),
+  admission_id TEXT UNIQUE,
+  admission_json TEXT CHECK(admission_json IS NULL OR json_valid(admission_json)),
+  abort_request_digest TEXT CHECK(abort_request_digest IS NULL OR (length(abort_request_digest)=64 AND abort_request_digest NOT GLOB '*[^0-9a-f]*')),
+  state TEXT NOT NULL CHECK(state IN ('admitted','aborted_before_admit','settled_committed','settled_aborted')),
+  outcome_digest TEXT CHECK(outcome_digest IS NULL OR (length(outcome_digest)=64 AND outcome_digest NOT GLOB '*[^0-9a-f]*')),
+  CHECK ((state='aborted_before_admit' AND admission_id IS NULL AND admission_json IS NULL AND request_fingerprint IS NULL AND outcome_digest IS NULL)
+      OR (state='admitted' AND admission_id IS NOT NULL AND admission_json IS NOT NULL AND request_fingerprint IS NOT NULL AND outcome_digest IS NULL AND abort_request_digest IS NULL)
+      OR (state IN ('settled_committed','settled_aborted') AND admission_id IS NOT NULL AND admission_json IS NOT NULL AND request_fingerprint IS NOT NULL AND outcome_digest IS NOT NULL AND abort_request_digest IS NULL))
+);
+
+CREATE TRIGGER attempt_admissions_immutable BEFORE UPDATE ON attempt_admissions
+WHEN NEW.intent_id IS NOT OLD.intent_id OR NEW.security_digest IS NOT OLD.security_digest
+  OR NEW.pool_route_json IS NOT OLD.pool_route_json OR NEW.request_fingerprint IS NOT OLD.request_fingerprint
+  OR NEW.admission_id IS NOT OLD.admission_id OR NEW.admission_json IS NOT OLD.admission_json
+  OR NEW.abort_request_digest IS NOT OLD.abort_request_digest
+  OR OLD.state!='admitted' OR NEW.state NOT IN ('settled_committed','settled_aborted')
+BEGIN SELECT RAISE(ABORT, 'invalid attempt admission transition'); END;
+
+-- Stored request/receipt associations are immutable and cannot silently renew.
+CREATE TABLE attempt_pending_current (
+  request_id TEXT NOT NULL,
+  pool_route_json TEXT NOT NULL CHECK(json_valid(pool_route_json)),
+  bridge_route_json TEXT NOT NULL CHECK(json_valid(bridge_route_json)),
+  producer TEXT NOT NULL,
+  fingerprint TEXT NOT NULL CHECK(length(fingerprint)=64 AND fingerprint NOT GLOB '*[^0-9a-f]*'),
+  state TEXT NOT NULL CHECK(state IN ('pending','resolved')),
+  PRIMARY KEY(pool_route_json,request_id)
+);
+CREATE TRIGGER attempt_pending_current_immutable BEFORE UPDATE ON attempt_pending_current
+WHEN NEW.request_id IS NOT OLD.request_id OR NEW.pool_route_json IS NOT OLD.pool_route_json
+  OR NEW.bridge_route_json IS NOT OLD.bridge_route_json OR NEW.producer IS NOT OLD.producer
+  OR NEW.fingerprint IS NOT OLD.fingerprint OR OLD.state!='pending' OR NEW.state!='resolved'
+BEGIN SELECT RAISE(ABORT, 'invalid attempt current lookup transition'); END;
+
+CREATE TABLE attempt_current_receipts (
+  request_id TEXT NOT NULL,
+  pool_route_json TEXT NOT NULL CHECK(json_valid(pool_route_json)),
+  fingerprint TEXT NOT NULL CHECK(length(fingerprint)=64 AND fingerprint NOT GLOB '*[^0-9a-f]*'),
+  receipt_id TEXT NOT NULL UNIQUE,
+  receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)),
+  PRIMARY KEY(pool_route_json,request_id)
+);
+
+-- An intent is persisted before retirement I/O and remains a permanent fence.
+CREATE TABLE attempt_namespace_retirements (
+  retirement_key TEXT PRIMARY KEY NOT NULL,
+  request_id TEXT NOT NULL UNIQUE,
+  pool_seal_request_id TEXT NOT NULL UNIQUE,
+  bridge_route_json TEXT NOT NULL CHECK(json_valid(bridge_route_json)),
+  pool_route_json TEXT NOT NULL CHECK(json_valid(pool_route_json)),
+  producer TEXT NOT NULL,
+  issuer_epoch TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('prepared','fenced','invoking','retired')),
+  pool_seal_id TEXT,
+  retired_count INTEGER CHECK(retired_count IS NULL OR retired_count>=0),
+  UNIQUE(bridge_route_json,producer,issuer_epoch),
+  CHECK ((state='retired' AND retired_count IS NOT NULL AND pool_seal_id IS NOT NULL)
+      OR (state='invoking' AND retired_count IS NULL AND pool_seal_id IS NOT NULL)
+      OR (state='fenced' AND retired_count IS NULL)
+      OR (state='prepared' AND retired_count IS NULL AND pool_seal_id IS NULL))
+);
+
+CREATE TRIGGER attempt_retirements_immutable BEFORE UPDATE ON attempt_namespace_retirements
+WHEN NEW.retirement_key IS NOT OLD.retirement_key OR NEW.bridge_route_json IS NOT OLD.bridge_route_json
+  OR NEW.request_id IS NOT OLD.request_id OR NEW.pool_seal_request_id IS NOT OLD.pool_seal_request_id
+  OR NEW.pool_route_json IS NOT OLD.pool_route_json OR NEW.producer IS NOT OLD.producer
+  OR NEW.issuer_epoch IS NOT OLD.issuer_epoch
+  OR (OLD.pool_seal_id IS NOT NULL AND NEW.pool_seal_id IS NOT OLD.pool_seal_id)
+  OR NOT ((OLD.state='prepared' AND NEW.state='fenced')
+       OR (OLD.state='fenced' AND NEW.state='fenced' AND OLD.pool_seal_id IS NULL AND NEW.pool_seal_id IS NOT NULL)
+       OR (OLD.state='fenced' AND NEW.state='invoking') OR (OLD.state='invoking' AND NEW.state='retired'))
+BEGIN SELECT RAISE(ABORT, 'invalid namespace retirement transition'); END;
+
+-- One immutable effect across dispatch IDs and process restarts. Text is never stored.
+CREATE TABLE owner_effects (
+  producer_scope TEXT NOT NULL,
+  effect_id TEXT NOT NULL,
+  effect_digest TEXT NOT NULL CHECK(length(effect_digest)=64 AND effect_digest NOT GLOB '*[^0-9a-f]*'),
+  run_route_json TEXT NOT NULL CHECK(json_valid(run_route_json)),
+  bridge_route_json TEXT NOT NULL CHECK(json_valid(bridge_route_json)),
+  outbox_json TEXT CHECK(outbox_json IS NULL OR json_valid(outbox_json)),
+  dispatch_token TEXT,
+  state TEXT NOT NULL CHECK(state IN ('reserved','invoking','known_unsent','unknown','accepted','aborted')),
+  protocol TEXT CHECK(protocol IS NULL OR protocol IN ('codex_turn','claude_input')),
+  native_id TEXT,
+  reason TEXT,
+  CHECK ((state='accepted' AND outbox_json IS NOT NULL AND dispatch_token IS NOT NULL AND protocol IS NOT NULL AND native_id IS NOT NULL AND reason IS NULL)
+      OR (state IN ('reserved','invoking') AND outbox_json IS NOT NULL AND dispatch_token IS NOT NULL AND protocol IS NULL AND native_id IS NULL AND reason IS NULL)
+      OR (state IN ('known_unsent','unknown') AND outbox_json IS NOT NULL AND dispatch_token IS NOT NULL AND protocol IS NULL AND native_id IS NULL AND reason IS NOT NULL)
+      OR (state='aborted' AND protocol IS NULL AND native_id IS NULL AND reason IS NULL)),
+  PRIMARY KEY(producer_scope,effect_id)
+);
+
+CREATE TRIGGER owner_effects_immutable BEFORE UPDATE ON owner_effects
+WHEN NEW.producer_scope IS NOT OLD.producer_scope OR NEW.effect_id IS NOT OLD.effect_id
+  OR NEW.effect_digest IS NOT OLD.effect_digest OR NEW.outbox_json IS NOT OLD.outbox_json
+  OR NEW.run_route_json IS NOT OLD.run_route_json OR NEW.bridge_route_json IS NOT OLD.bridge_route_json
+  OR (NOT (OLD.state='known_unsent' AND NEW.state='reserved') AND NEW.dispatch_token IS NOT OLD.dispatch_token)
+  OR (OLD.state='known_unsent' AND NEW.state='reserved' AND (NEW.dispatch_token IS NULL OR NEW.dispatch_token IS OLD.dispatch_token))
+  OR NOT ((OLD.state='reserved' AND NEW.state IN ('invoking','known_unsent','aborted'))
+       OR (OLD.state='invoking' AND NEW.state IN ('accepted','known_unsent','unknown'))
+       OR (OLD.state='unknown' AND NEW.state='accepted')
+       OR (OLD.state='known_unsent' AND NEW.state IN ('reserved','aborted')))
+BEGIN SELECT RAISE(ABORT, 'invalid owner effect transition'); END;
+
+-- New currentness lookups carry their nonsecret launch key for active-capacity
+-- accounting. Historical rows remain intact and are not promoted to authority.
+ALTER TABLE attempt_pending_current ADD COLUMN launch_id TEXT;
+DROP TRIGGER attempt_pending_current_immutable;
+CREATE TRIGGER attempt_pending_current_immutable BEFORE UPDATE ON attempt_pending_current
+WHEN NEW.request_id IS NOT OLD.request_id OR NEW.pool_route_json IS NOT OLD.pool_route_json
+  OR NEW.bridge_route_json IS NOT OLD.bridge_route_json OR NEW.producer IS NOT OLD.producer
+  OR NEW.fingerprint IS NOT OLD.fingerprint OR NEW.launch_id IS NOT OLD.launch_id
+  OR OLD.state!='pending' OR NEW.state!='resolved'
+BEGIN SELECT RAISE(ABORT, 'invalid attempt current lookup transition'); END;
+
+-- Permanent exact-key fences and historical provenance never disappear via
+-- retention. Future compaction requires a separately reviewed namespace format.
+CREATE TRIGGER attempt_launches_no_delete BEFORE DELETE ON attempt_launches BEGIN SELECT RAISE(ABORT, 'attempt launch is permanent'); END;
+CREATE TRIGGER attempt_role_qualifications_no_delete BEFORE DELETE ON attempt_role_qualifications BEGIN SELECT RAISE(ABORT, 'attempt qualification is permanent'); END;
+CREATE TRIGGER attempt_pending_checks_no_delete BEFORE DELETE ON attempt_pending_checks BEGIN SELECT RAISE(ABORT, 'attempt admission key is permanent'); END;
+CREATE TRIGGER attempt_admissions_no_delete BEFORE DELETE ON attempt_admissions BEGIN SELECT RAISE(ABORT, 'attempt admission is permanent'); END;
+CREATE TRIGGER attempt_pending_current_no_delete BEFORE DELETE ON attempt_pending_current BEGIN SELECT RAISE(ABORT, 'attempt current key is permanent'); END;
+CREATE TRIGGER attempt_current_receipts_no_delete BEFORE DELETE ON attempt_current_receipts BEGIN SELECT RAISE(ABORT, 'attempt current receipt is permanent'); END;
+CREATE TRIGGER attempt_namespace_retirements_no_delete BEFORE DELETE ON attempt_namespace_retirements BEGIN SELECT RAISE(ABORT, 'attempt namespace fence is permanent'); END;
+CREATE TRIGGER owner_effects_no_delete BEFORE DELETE ON owner_effects BEGIN SELECT RAISE(ABORT, 'owner effect is permanent'); END;

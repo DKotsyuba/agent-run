@@ -356,6 +356,12 @@ pub enum Command {
         #[arg(long)]
         spec: String,
     },
+    /// Read one page of a root execution's exact initial task from JSON (`-` reads stdin).
+    InitialTask {
+        /// JSON file or `-`: mode, store, root agent, fences and page.
+        #[arg(long)]
+        spec: String,
+    },
     /// List or release durable lineage history pins.
     HistoryPins {
         #[command(subcommand)]
@@ -443,6 +449,9 @@ pub enum Command {
         /// Explicitly read the current database identity.
         #[arg(long)]
         include_store_id: bool,
+        /// Detect the `initial_task` read method, its modes and bounds.
+        #[arg(long)]
+        include_initial_task: bool,
     },
     /// Read an exact verified artifact chunk fenced to the current execution.
     AnswerChunk {
@@ -1782,6 +1791,7 @@ fn client_command(command: &Command) -> bool {
             | Command::BatchReceipt { .. }
             | Command::Status { .. }
             | Command::TranscriptExact { .. }
+            | Command::InitialTask { .. }
             | Command::HistoryPins { .. }
             | Command::Restart(_)
             | Command::Resume(_)
@@ -2557,6 +2567,22 @@ async fn run_client_command(
             }
             (output)(&result)?;
         }
+        Command::InitialTask { spec } => {
+            let text = if spec == "-" {
+                read_stdin(1024 * 1024)?
+            } else {
+                read_input(Path::new(&spec), 1024 * 1024)?
+            };
+            let request: agent_run_domain::initial_task::InitialTaskRequest =
+                serde_json::from_str(&text).map_err(|_| invalid("invalid initial task spec"))?;
+            request.validate()?;
+            let params = serde_json::to_value(request)?;
+            let result = broker.call("initial_task", params.clone()).await?;
+            if !transport::socket::valid_initial_task_response(&result, &params) {
+                return Err(Error::Runtime("invalid initial task response".into()));
+            }
+            (output)(&result)?;
+        }
         Command::HistoryPins { command } => {
             let (mut params, expected_store_id) = match command {
                 HistoryPinsCommand::List {
@@ -2669,12 +2695,17 @@ async fn run_client_command(
                 (output)(&result)?;
             }
         }
-        Command::Capabilities { include_store_id } => {
-            let params = if include_store_id {
-                json!({"include_store_id":true})
-            } else {
-                json!({})
-            };
+        Command::Capabilities {
+            include_store_id,
+            include_initial_task,
+        } => {
+            let mut params = json!({});
+            if include_store_id {
+                params["include_store_id"] = json!(true);
+            }
+            if include_initial_task {
+                params["include_initial_task"] = json!(true);
+            }
             let result = broker.call("capabilities", params).await?;
             if include_store_id
                 && !result
@@ -2683,6 +2714,16 @@ async fn run_client_command(
                     .is_some_and(|id| id.parse::<agent_run_domain::StoreId>().is_ok())
             {
                 return Err(Error::Runtime("invalid capabilities store identity".into()));
+            }
+            if include_initial_task
+                && serde_json::from_value::<agent_run_domain::initial_task::InitialTaskCapability>(
+                    result.get("initial_task").cloned().unwrap_or(Value::Null),
+                )
+                .is_err()
+            {
+                return Err(Error::Runtime(
+                    "invalid initial task capability response".into(),
+                ));
             }
             (output)(&result)?;
         }

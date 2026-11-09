@@ -734,6 +734,8 @@ fn native_provider_keeps_login_and_model_alias() {
             ("AGENT_RUN_WORKER_TOKEN".into(), "stale-capability".into()),
             (agent_run_domain::worker::FINISH_ENV.into(), "1".into()),
             (agent_run_domain::worker::RESEARCH_ENV.into(), "1".into()),
+            ("AGENT_RUN_WORKER_FUTURE".into(), "stale".into()),
+            ("AGENT_RUN_LAUNCH_ID".into(), "foreign".into()),
         ]),
         &FakeReader,
         "task",
@@ -771,6 +773,13 @@ fn native_provider_keeps_login_and_model_alias() {
     ]) {
         assert!(!plan.launch.environment.contains_key(name));
     }
+    assert!(
+        !plan
+            .launch
+            .environment
+            .contains_key("AGENT_RUN_WORKER_FUTURE")
+    );
+    assert!(!plan.launch.environment.contains_key("AGENT_RUN_LAUNCH_ID"));
     assert!(
         !fs::read_to_string(run_home.join("config.toml"))
             .unwrap()
@@ -1805,4 +1814,196 @@ fn research_profiles_keep_catalog_skill_sources() {
             .len(),
         1
     );
+}
+
+/// The opt-in selector seals only the pinned no-shell role for both harnesses.
+#[test]
+fn managed_selector_is_opt_in_and_materializes_both_profiles() {
+    use agent_run_config::provider_config::ManagedAttemptBinding;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mut config = config(&root, &fake_engine(&root));
+    fs::create_dir_all(root.join("accounts/codex/work")).unwrap();
+    fs::write(root.join("accounts/codex/work/auth.json"), "{}\n").unwrap();
+    let pool = root.join("pool-frontend");
+    let hook = root.join("bridge-hook");
+    fs::copy("/usr/bin/true", &pool).unwrap();
+    fs::copy("/usr/bin/false", &hook).unwrap();
+    fs::set_permissions(&pool, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+    config.mcp.insert("pool".into(),serde_json::from_value(serde_json::json!({"transport":"stdio","command":pool,"args":["mcp","--config",root.join("pool.toml")],"env_from":[],"approval_mode":"approve","allowed_tools":["pool_get"]})).unwrap());
+    for harness in config.harnesses.values_mut() {
+        harness.hooks = vec![agent_run_config::config::Hook {
+            event: "PreToolUse".into(),
+            command: vec![hook.to_string_lossy().into_owned()],
+            matcher: Some("mcp__pool__.*".into()),
+        }];
+    }
+    let profile = Profile {
+        name: "managed".into(),
+        body: "fixture".into(),
+        write: false,
+        network: false,
+        revision: "1".into(),
+        canonical: true,
+        allow_external_read_roots: false,
+        read_roots: vec![],
+        skills: vec![],
+        mcp: vec!["pool".into()],
+        mcp_tools: BTreeMap::new(),
+        required_constraints: BTreeSet::from([Constraint::WebToolsDisabled]),
+    };
+    let role = resolve_role_plan(&profile, &root, &config.mcp, "account", Some("work")).unwrap();
+    assert!(
+        agent_run_adapters::managed_role::select(&config, HarnessId::Codex, &role, true)
+            .unwrap()
+            .is_none()
+    );
+    config.managed_attempt_binding = Some(Box::new(ManagedAttemptBinding {
+        enabled: true,
+        role_name: "managed".into(),
+        pool_server: "pool".into(),
+        pool_executable_sha256: agent_run_platform::fs::sha256(&fs::read(&pool).unwrap()),
+        bridge_hook_sha256: agent_run_platform::fs::sha256(&fs::read(&hook).unwrap()),
+        host_id: "host".into(),
+        pool_resident_executable: None,
+        pool_resident_sha256: None,
+        transport: None,
+        bridge_receipt_readers: vec![],
+        bridge_custody_readers: vec![],
+    }));
+    assert!(
+        agent_run_adapters::managed_role::select(&config, HarnessId::Codex, &role, false).is_err()
+    );
+    assert!(
+        agent_run_adapters::managed_role::select(&config, HarnessId::OpenCode, &role, true)
+            .is_err()
+    );
+    let mut widened = role.clone();
+    widened.write = true;
+    assert!(
+        agent_run_adapters::managed_role::select(&config, HarnessId::Codex, &widened, true)
+            .is_err()
+    );
+    let mut unsafe_tool = role.clone();
+    unsafe_tool.mcp[0]
+        .allowed_tools
+        .as_mut()
+        .unwrap()
+        .push("pool_start_agent".into());
+    assert!(
+        agent_run_adapters::managed_role::select(&config, HarnessId::Codex, &unsafe_tool, true)
+            .is_err()
+    );
+    let catalog = catalog(&config);
+    for (provider, model, account) in [
+        ("codex-plus", "gpt", "acct-native"),
+        ("claude-main", "sonnet", "acct-claude"),
+    ] {
+        let home = root.join(format!("managed-{provider}"));
+        let provider: ProviderId = provider.parse().unwrap();
+        let account_id = account.parse().unwrap();
+        let (_, digest) = materialize_selected(
+            &config,
+            &catalog,
+            &provider,
+            model,
+            &account_id,
+            &role,
+            &root,
+            &home,
+            &root,
+        )
+        .unwrap();
+        let authority = make_authority(&catalog, &provider, model, &role, &root, digest, account);
+        let plan = plan_selected(
+            &config,
+            &catalog,
+            &authority,
+            &account_id,
+            &home,
+            &root,
+            &BTreeMap::from([("HOME".into(), root.display().to_string())]),
+            &FakeReader,
+            "fixture",
+            None,
+        )
+        .unwrap();
+        if provider.as_str() == "codex-plus" {
+            let native: toml::Value =
+                toml::from_str(&fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
+            assert_eq!(native["features"]["hooks"].as_bool(), Some(true));
+            assert_eq!(
+                native["features"]["code_mode"]["enabled"].as_bool(),
+                Some(false)
+            );
+            assert!(native["hooks"].get("PreToolUse").is_some());
+            assert!(native["hooks"].get("PermissionRequest").is_some());
+        } else {
+            let position = plan
+                .launch
+                .args
+                .iter()
+                .position(|arg| arg == "--disallowedTools")
+                .unwrap();
+            assert_eq!(plan.launch.args[position + 1], "Bash,Agent,Task,Skill");
+            assert!(!plan.launch.args.iter().any(|arg| arg == "--plugin-dir"));
+        }
+    }
+}
+
+/// Third-party MCPs cannot inherit private worker or system capability names,
+/// even when a programmatic configuration bypasses the normal parser.
+#[test]
+fn third_party_mcp_private_environment_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mut config = config(&root, &fake_engine(&root));
+    let mcp = agent_run_config::config::Mcp {
+        transport: "stdio".into(),
+        command: "/usr/bin/true".into(),
+        args: vec![],
+        env_from: vec!["AGENT_RUN_WORKER_TOKEN".into()],
+        approval_mode: "auto".into(),
+        global: false,
+        allowed_tools: None,
+    };
+    config.mcp.insert("foreign".into(), mcp);
+    assert!(config.clone().validate(&root).is_err());
+    let mut system = config.clone();
+    system.mcp.get_mut("foreign").unwrap().env_from = vec!["AGENT_RUN_SYSTEM_SOCKET".into()];
+    assert!(system.validate(&root).is_err());
+    let profile = Profile {
+        name: "review".into(),
+        body: "fixture".into(),
+        write: false,
+        network: false,
+        revision: "1".into(),
+        canonical: true,
+        allow_external_read_roots: false,
+        read_roots: vec![],
+        skills: vec![],
+        mcp: vec!["foreign".into()],
+        mcp_tools: BTreeMap::new(),
+        required_constraints: BTreeSet::new(),
+    };
+    let role = resolve_role_plan(&profile, &root, &config.mcp, "account", Some("work")).unwrap();
+    let catalog = catalog(&config);
+    for (provider, model, account) in [
+        ("codex-plus", "gpt", "acct-native"),
+        ("claude-main", "sonnet", "acct-claude"),
+    ] {
+        let result = materialize_selected(
+            &config,
+            &catalog,
+            &provider.parse().unwrap(),
+            model,
+            &account.parse().unwrap(),
+            &role,
+            &root,
+            &root.join(format!("unsafe-{provider}")),
+            &root,
+        );
+        assert!(result.is_err(), "{provider}");
+    }
 }

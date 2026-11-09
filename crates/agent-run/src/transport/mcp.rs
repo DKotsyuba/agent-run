@@ -99,6 +99,11 @@ fn validate_frame_id(frame: &mut Vec<u8>) -> std::io::Result<()> {
             >(frame)
             .map(|frame| frame.params.arguments)
             .is_ok(),
+            Some("initial_task") => serde_json::from_slice::<
+                Frame<agent_run_domain::initial_task::InitialTaskRequest>,
+            >(frame)
+            .map(|frame| frame.params.arguments)
+            .is_ok(),
             Some("status") => {
                 serde_json::from_slice::<Frame<agent_run_domain::status::StatusRequest>>(frame)
                     .map(|frame| frame.params.arguments)
@@ -421,6 +426,15 @@ impl ServerHandler for Proxy {
                     return Ok(super::mcp_text::error_result(
                         "RuntimeError",
                         "invalid exact transcript response",
+                    )
+                    .into());
+                }
+                if request.name == "initial_task"
+                    && !crate::transport::socket::valid_initial_task_response(&value, &arguments)
+                {
+                    return Ok(super::mcp_text::error_result(
+                        "RuntimeError",
+                        "invalid initial task response",
                     )
                     .into());
                 }

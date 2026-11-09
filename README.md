@@ -208,8 +208,8 @@ The MCP process is a thin stdio proxy over the resident broker:
 {"command":"agent-run","args":["--home","/absolute/path/to/agent-run-home","mcp"]}
 ```
 
-It advertises 23 tools: `start`, `start_batch`, `batch_receipt`, `status`, `history_pins`, `resume`, `cancel`, `steer`, `list_agents`,
-`answer`, `transcript`, `transcript_exact`, `doc`, `delegation_guide`, `limits`, `start_pool`,
+It advertises 24 tools: `start`, `start_batch`, `batch_receipt`, `status`, `history_pins`, `resume`, `cancel`, `steer`, `list_agents`,
+`answer`, `transcript`, `transcript_exact`, `initial_task`, `doc`, `delegation_guide`, `limits`, `start_pool`,
 `pool_post`, `pool_replace`, `pool`, `list_pools`, `agent_integration`,
 `capabilities`, and `answer_chunk`. Use `delegation_guide`
 with optional exact `provider`, `model`, and `profile` filters for routing;

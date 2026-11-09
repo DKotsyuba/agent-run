@@ -344,12 +344,34 @@ fn main() {
     let (task, input) = if let Some(task) = argument(&args, "-p") {
         (task, None)
     } else {
-        let mut line = String::new();
-        io::stdin()
-            .lock()
-            .read_line(&mut line)
-            .expect("fixture input");
-        let value: Value = serde_json::from_str(&line).expect("fixture JSON");
+        let mut input = io::stdin().lock();
+        let value: Value = loop {
+            let mut line = String::new();
+            input.read_line(&mut line).expect("fixture input");
+            let value: Value = serde_json::from_str(&line).expect("fixture JSON");
+            if value["type"] != "control_request" {
+                break value;
+            }
+            let subtype = value["request"]["subtype"].as_str().unwrap_or("");
+            let body = match subtype {
+                "initialize" => json!({"commands":[],"agents":[{"name":"Explore"}]}),
+                "mcp_status" => {
+                    let servers = argument(&args, "--mcp-config")
+                        .and_then(|path| std::fs::read(path).ok())
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                        .and_then(|config| config["mcpServers"].as_object().cloned())
+                        .unwrap_or_default()
+                        .keys()
+                        .map(|name| json!({"name":name,"status":"connected"}))
+                        .collect::<Vec<_>>();
+                    json!({"mcpServers":servers})
+                }
+                _ => panic!("unknown fixture control request"),
+            };
+            emit(
+                json!({"type":"control_response","response":{"subtype":"success","request_id":value["request_id"],"response":body}}),
+            );
+        };
         let task = value
             .pointer("/message/content/0/text")
             .and_then(Value::as_str)
@@ -402,7 +424,19 @@ fn main() {
             libc::signal(libc::SIGTERM, libc::SIG_IGN);
         }
     }
-    emit(json!({"type":"system","subtype":"init","session_id":session}));
+    if args.iter().any(|arg| arg == "--disable-slash-commands")
+        && argument(&args, "--tools").as_deref() == Some("")
+    {
+        let tools = argument(&args, "--allowedTools")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        emit(json!({"type":"system","subtype":"init","session_id":session,"tools":tools}));
+    } else {
+        emit(json!({"type":"system","subtype":"init","session_id":session}));
+    }
     if task == "fixture:context-then-result" {
         let context = control_input();
         let id = context.get("uuid").cloned().unwrap_or(Value::Null);

@@ -22,6 +22,9 @@ pub struct CapabilitiesQuery {
     /// Opt in to discovery of operator-only lineage-hold socket methods.
     #[serde(default)]
     pub include_lineage_holds: bool,
+    /// Opt in to discovery of the `initial_task` read method, its modes and bounds.
+    #[serde(default)]
+    pub include_initial_task: bool,
 }
 
 /// Strict current-execution selection and byte cursor; never accepts a path.
@@ -126,4 +129,7 @@ pub struct CapabilitiesView {
     pub limits: ObservationLimits,
     /// Actual read-only registry names and argument/result declarations.
     pub read_methods: Vec<ReadMethodView>,
+    /// Present only when `include_initial_task` was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_task: Option<crate::initial_task::InitialTaskCapability>,
 }

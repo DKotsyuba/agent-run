@@ -17,6 +17,72 @@ use tokio::{
     net::UnixStream,
 };
 
+/// Native fake peer for private socket tests; no interpreter is trusted.
+#[cfg(target_os = "linux")]
+#[test]
+fn r2_socket_fake_peer_child() {
+    use std::io::{Read, Write};
+    let Some(socket) = std::env::var_os("RUN_R2_PEER_SOCKET") else {
+        return;
+    };
+    let frame = std::env::var("RUN_R2_PEER_FRAME").unwrap();
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    let mut bytes = Vec::new();
+    let _ = writeln!(stream, "{frame}");
+    match stream.read_to_end(&mut bytes) {
+        Ok(_) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            ) => {}
+        Err(error) => panic!("fake peer read: {error}"),
+    };
+    std::fs::write(std::env::var_os("RUN_R2_PEER_OUTPUT").unwrap(), bytes).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+async fn r2_fake_peer(executable: &Path, socket: &Path, frame: &str, output: &Path) -> String {
+    let _ = std::fs::remove_file(output);
+    let child = tokio::process::Command::new(executable)
+        .args(["--exact", "r2_socket_fake_peer_child", "--nocapture"])
+        .env_clear()
+        .env("RUN_R2_PEER_SOCKET", socket)
+        .env("RUN_R2_PEER_FRAME", frame)
+        .env("RUN_R2_PEER_OUTPUT", output)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .unwrap();
+    assert!(child.status.success());
+    String::from_utf8(std::fs::read(output).unwrap()).unwrap()
+}
+
+#[cfg(target_os = "linux")]
+async fn r2_wait_build_age(executable: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(executable).unwrap();
+    let newest = metadata.mtime().max(metadata.ctime());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    if newest >= now {
+        tokio::time::sleep(Duration::from_secs((newest - now + 2) as u64)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn r2_copy_peer(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = dir.join("fixture-peer");
+    std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    executable.canonicalize().unwrap()
+}
+
 /// Starts a private broker on a short temporary socket path.
 async fn broker() -> (
     tempfile::TempDir,
@@ -32,6 +98,8 @@ async fn broker() -> (
         async move { socket::serve_at(&home, &path).await }
     });
     wait_for_socket(&path).await;
+    assert!(!home.path().join("attempt.sock").exists());
+    assert!(!home.path().join("attempt-receipts.sock").exists());
     (home, path, task)
 }
 
@@ -633,7 +701,7 @@ fn python_socket_surface_is_shared_tools_plus_controls() {
         .map(|tool| tool.name.clone())
         .collect();
     assert_eq!(names, registry, "the socket surface is the shared table");
-    assert_eq!(names.len(), 23);
+    assert_eq!(names.len(), 24);
     assert!(!names.contains("models"));
     assert!(!names.contains("capacity_order"));
 }
@@ -730,4 +798,209 @@ async fn list_long_poll_wakes_on_journal_progress() {
     );
     stop(task).await;
     drop(home);
+}
+
+/// A configured Bridge reader has a separate authenticated read-only socket;
+/// changing the pin revokes it, while disabling permits exact receipt recovery.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bridge_receipt_socket_live_smoke_and_config_revoke() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let home = tempfile::Builder::new()
+        .prefix("r2-broker-")
+        .tempdir_in(base)
+        .unwrap();
+    std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    cli::init(home.path()).unwrap();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
+    let sid = agent_run_store::store_identity::read(&store.conn).unwrap();
+    let id = agent_run::domain::AgentId::new();
+    let launch = uuid::Uuid::new_v4().to_string();
+    let receipt_id = uuid::Uuid::new_v4().to_string();
+    // SAFETY: geteuid is read-only and has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let route = agent_run_domain::attempt_binding::Route {
+        component_store_id: "pool-store".into(),
+        route_id: "pool-route".into(),
+        worker_uid: uid,
+    };
+    let receipt = json!({"receipt_id":receipt_id,"purpose":"ingress","lineage_root_id":id,"bound_execution_id":id,"attempt":{"run_store_id":sid,"lineage_root_id":id,"execution_id":id,"sequence":1,"attempt_id":"attempt","launch_id":launch},"incarnation":{"host_id":"host","boot_id":"00000000-0000-4000-8000-000000000001","pid_namespace_inode":1,"uid":uid,"pid":2,"start_ticks":1},"actor":{"address":"host/codex/s","role":"root","native_id":"s","epoch":1},"successor_proof":{"lineage_root_id":id,"bound_execution_id":id,"current_execution_id":id,"chain":[{"execution_id":id,"parent_execution_id":null,"sequence":1}]}});
+    store.conn.execute("INSERT INTO attempt_current_receipts(request_id,pool_route_json,fingerprint,receipt_id,receipt_json) VALUES(?,?,?,?,?)",rusqlite::params!["request",serde_json::to_string(&route).unwrap(),"a".repeat(64),receipt_id,receipt.to_string()]).unwrap();
+    drop(store);
+    let executable = r2_copy_peer(home.path());
+    let digest = agent_run_platform::fs::sha256(&std::fs::read(&executable).unwrap());
+    r2_wait_build_age(&executable).await;
+    let config = format!(
+        r#"schema_version=2
++[managed_attempt_binding]
++enabled=true
++role_name="managed"
++pool_server="pool"
++pool_executable_sha256="{pool_hash}"
++bridge_hook_sha256="{hook_hash}"
++host_id="host"
++pool_resident_executable="/usr/bin/false"
++pool_resident_sha256="{resident_hash}"
++[[managed_attempt_binding.bridge_receipt_readers]]
++reader_id="bridge"
++worker_uid={uid}
++executable="{python}"
++executable_sha256="{digest}"
++run_route={{component_store_id="{sid}",route_id="run",worker_uid={uid}}}
++pool_route={{component_store_id="pool-store",route_id="pool-route",worker_uid={uid}}}
++"#,
+        pool_hash = "a".repeat(64),
+        hook_hash = "c".repeat(64),
+        resident_hash = "b".repeat(64),
+        python = executable.display()
+    )
+    .replace("\n+", "\n");
+    std::fs::write(home.path().join("config.toml"), &config).unwrap();
+    let api = home.path().join("api.sock");
+    let receipt_socket = home.path().join("attempt-receipts.sock");
+    let broker = tokio::spawn({
+        let home = home.path().to_owned();
+        let api = api.clone();
+        async move { socket::serve_at(&home, &api).await }
+    });
+    wait_for_socket(&api).await;
+    wait_for_socket(&receipt_socket).await;
+    assert_eq!(
+        request(&api, json!({"jsonrpc":"2.0","id":1,"method":"ping"})).await["result"]["ok"],
+        true
+    );
+    let frame=json!({"id":"read","method":"_attempt_current_receipt_v1","params":{"version":1,"expected_store_id":sid,"receipt_id":receipt_id}}).to_string();
+    let output = home.path().join("fake-reply");
+    let invoke = || r2_fake_peer(&executable, &receipt_socket, &frame, &output);
+    let response: Value = serde_json::from_str(&invoke().await).unwrap();
+    assert_eq!(response["result"]["receipt"], receipt);
+    let forbidden =
+        json!({"id":"forbidden","method":"_attempt_admission_lookup_v1","params":{}}).to_string();
+    let refusal: Value = serde_json::from_str(
+        &r2_fake_peer(&executable, &receipt_socket, &forbidden, &output).await,
+    )
+    .unwrap();
+    assert_eq!(refusal["error"]["code"], "peer_not_authorized");
+    std::fs::write(
+        home.path().join("config.toml"),
+        config.replacen(&digest, &"f".repeat(64), 1),
+    )
+    .unwrap();
+    assert!(invoke().await.is_empty());
+    std::fs::write(
+        home.path().join("config.toml"),
+        config.replacen("enabled=true", "enabled=false", 1),
+    )
+    .unwrap();
+    let recovered: Value = serde_json::from_str(&invoke().await).unwrap();
+    assert_eq!(recovered["result"]["receipt"], receipt);
+    broker.abort();
+    let _ = broker.await;
+    let restarted = tokio::spawn({
+        let home = home.path().to_owned();
+        let api = api.clone();
+        async move { socket::serve_at(&home, &api).await }
+    });
+    wait_for_socket(&receipt_socket).await;
+    let recovered: Value = serde_json::from_str(&invoke().await).unwrap();
+    assert_eq!(recovered["result"]["receipt"], receipt);
+    restarted.abort();
+    let _ = restarted.await;
+}
+
+/// A switched-on private endpoint advertises currentness while unproven
+/// egress candidates still fail closed.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn pool_attempt_socket_live_smoke_keeps_managed_guard_closed() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let home = tempfile::Builder::new()
+        .prefix("r2-pool-")
+        .tempdir_in(base)
+        .unwrap();
+    std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    cli::init(home.path()).unwrap();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
+    let sid = agent_run_store::store_identity::read(&store.conn).unwrap();
+    drop(store);
+    // SAFETY: geteuid is read-only and has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let executable = r2_copy_peer(home.path());
+    let pool_hash = agent_run_platform::fs::sha256(&std::fs::read(&executable).unwrap());
+    r2_wait_build_age(&executable).await;
+    let bridge = std::fs::canonicalize("/usr/bin/false").unwrap();
+    let bridge_hash = agent_run_platform::fs::sha256(&std::fs::read(&bridge).unwrap());
+    let token = home.path().join("fixture-reader-token");
+    std::fs::write(&token, "synthetic-reader\n").unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let token_hash = agent_run_platform::fs::sha256(b"synthetic-reader");
+    let config = format!(
+        r#"schema_version=2
+[managed_attempt_binding]
+enabled=true
+role_name="managed"
+pool_server="pool"
+pool_executable_sha256="{frontend_hash}"
+bridge_hook_sha256="{hook_hash}"
+host_id="host"
+pool_resident_executable="{python}"
+pool_resident_sha256="{pool_hash}"
+[managed_attempt_binding.transport]
+run_route={{component_store_id="{sid}",route_id="run",worker_uid={uid}}}
+pool_route={{component_store_id="pool-store",route_id="pool",worker_uid={uid}}}
+bridge_route={{component_store_id="00000000-0000-4000-8000-000000000001",route_id="bridge",worker_uid={uid}}}
+producer="pool"
+pool_socket="{pool_socket}"
+bridge_socket="{bridge_socket}"
+bridge_executable="{bridge}"
+bridge_executable_sha256="{bridge_hash}"
+bridge_reader_credential_file="{token}"
+bridge_reader_credential_sha256="{token_hash}"
+"#,
+        frontend_hash = "a".repeat(64),
+        hook_hash = "c".repeat(64),
+        python = executable.display(),
+        bridge = bridge.display(),
+        token = token.display(),
+        pool_socket = home.path().join("pool.sock").display(),
+        bridge_socket = home.path().join("bridge.sock").display()
+    );
+    std::fs::write(home.path().join("config.toml"), config).unwrap();
+    let api = home.path().join("api.sock");
+    let private = home.path().join("attempt.sock");
+    let broker = tokio::spawn({
+        let home = home.path().to_owned();
+        let api = api.clone();
+        async move { socket::serve_at(&home, &api).await }
+    });
+    wait_for_socket(&api).await;
+    wait_for_socket(&private).await;
+    let output = home.path().join("fake-pool-reply");
+    let frame =
+        json!({"id":"one","method":"_attempt_capabilities_v1","params":{"version":1}}).to_string();
+    let result: Value =
+        serde_json::from_str(&r2_fake_peer(&executable, &private, &frame, &output).await).unwrap();
+    assert_eq!(
+        result["result"]["capabilities"],
+        json!([
+            "attempt_current_ingress_v1",
+            "attempt_current_egress_v1",
+            "attempt_consensus_v1",
+            "attempt_admission_v1",
+            "attempt_namespace_retirement_v1"
+        ])
+    );
+    let id = agent_run::domain::AgentId::new();
+    let frame=json!({"id":"two","method":"_attempt_current_v1","params":{"version":1,"expected_store_id":sid,"request_id":"r","lineage_root_id":id,"bound_execution_id":id,"purpose":"egress"}}).to_string();
+    let result: Value =
+        serde_json::from_str(&r2_fake_peer(&executable, &private, &frame, &output).await).unwrap();
+    assert_eq!(result["error"]["code"], "binding_unavailable");
+    broker.abort();
+    let _ = broker.await;
 }
