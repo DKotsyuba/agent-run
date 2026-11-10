@@ -421,3 +421,160 @@ fn opencode_is_an_optional_third_native_harness() {
         .is_err()
     );
 }
+
+/// Replaces the Claude gateway connection of the shared fixture.
+fn with_glm_connection(home: &Path, connection: &str) -> String {
+    document(home).replace(
+        "connection = { kind = \"custom\", endpoint = \"https://api.example.com/messages\", protocol = \"messages\" }",
+        &format!("connection = {connection}"),
+    )
+}
+
+/// Fixed custom headers validate at load, are sealed into the digest, and leave
+/// the serialized form and digest of header-free configurations unchanged.
+#[test]
+fn custom_headers_validate_and_stay_absent_without_configuration() {
+    let home = tempfile::tempdir().unwrap();
+    let custom = |headers: &str| {
+        format!(
+            "{{ kind = \"custom\", endpoint = \"https://api.example.com/messages\", protocol = \"messages\", headers = {headers} }}"
+        )
+    };
+    let base = ProviderConfig::parse(&document(home.path()), home.path()).unwrap();
+    let encoded = serde_json::to_value(&base).unwrap();
+    assert!(
+        encoded["providers"]["glm"]["connection"]
+            .get("headers")
+            .is_none()
+    );
+    let empty = ProviderConfig::parse(
+        &with_glm_connection(home.path(), &custom("{}")),
+        home.path(),
+    )
+    .unwrap();
+    assert_eq!(base.snapshot().unwrap(), empty.snapshot().unwrap());
+
+    let valid = ProviderConfig::parse(
+        &with_glm_connection(
+            home.path(),
+            &custom("{ \"x-opencode-session\" = \"{launch}\", X-Static = \"a b/c\" }"),
+        ),
+        home.path(),
+    )
+    .unwrap();
+    assert_ne!(base.snapshot().unwrap(), valid.snapshot().unwrap());
+    let reread: ProviderConfig =
+        serde_json::from_value(serde_json::to_value(&valid).unwrap()).unwrap();
+    assert_eq!(reread.snapshot().unwrap(), valid.snapshot().unwrap());
+    let definition = valid
+        .resolve_catalog(accounts())
+        .unwrap()
+        .provider(&"glm".parse().unwrap())
+        .unwrap()
+        .clone();
+    assert_eq!(
+        definition.connection.render_custom_headers("L1").unwrap(),
+        "X-Static: a b/c\nx-opencode-session: L1"
+    );
+}
+
+/// Every forbidden header class, malformed name or value, and unsupported
+/// connection or harness fails closed while parsing the configuration.
+#[test]
+fn custom_headers_reject_unsafe_names_values_and_placements() {
+    let home = tempfile::tempdir().unwrap();
+    let too_many = (0..9)
+        .map(|n| format!("\"x-h{n}\" = \"v\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let long_name = format!("\"{}\" = \"v\"", "x".repeat(65));
+    let long_value = format!("\"x-ok\" = \"{}\"", "v".repeat(257));
+    let mut bad: Vec<String> = [
+        "\"Authorization\" = \"v\"",
+        "\"proxy-authorization\" = \"v\"",
+        "\"X-Api-Key\" = \"v\"",
+        "\"cookie\" = \"v\"",
+        "\"Host\" = \"v\"",
+        "\"content-length\" = \"1\"",
+        "\"Content-Type\" = \"v\"",
+        "\"transfer-encoding\" = \"v\"",
+        "\"connection\" = \"v\"",
+        "\"anthropic-beta\" = \"v\"",
+        "\"X-Stainless-Lang\" = \"v\"",
+        "\"x-session-token\" = \"v\"",
+        "\"x-secret\" = \"v\"",
+        "\"x-password\" = \"v\"",
+        "\"x-apikey\" = \"v\"",
+        "\"x-credential-id\" = \"v\"",
+        "\"x-oauth\" = \"v\"",
+        "\"bad name\" = \"v\"",
+        "\"bad:name\" = \"v\"",
+        "\"\" = \"v\"",
+        "\"x-dup\" = \"a\", \"X-DUP\" = \"b\"",
+        "\"x-ok\" = \"line\\nbreak\"",
+        "\"x-ok\" = \"line\\rbreak\"",
+        "\"x-ok\" = \"nul\\u0000\"",
+        "\"x-ok\" = \"caf\\u00e9\"",
+        "\"x-ok\" = \"tab\\there\"",
+        "\"x-ok\" = \"\"",
+        "\"x-ok\" = \" padded\"",
+        "\"x-ok\" = \"{session}\"",
+        "\"x-ok\" = \"{{launch}}\"",
+        "\"x-ok\" = \"{launch\"",
+        "\"x-ok\" = \"{LAUNCH}\"",
+        "\"x-ok\" = \"launch}\"",
+        &too_many,
+        &long_name,
+        &long_value,
+    ]
+    .iter()
+    .map(|headers| {
+        with_glm_connection(
+            home.path(),
+            &format!(
+                "{{ kind = \"custom\", endpoint = \"https://api.example.com/messages\", protocol = \"messages\", headers = {{ {headers} }} }}"
+            ),
+        )
+    })
+    .collect();
+    // Native connections cannot carry headers.
+    bad.push(with_glm_connection(
+        home.path(),
+        "{ kind = \"native\", headers = { \"x-ok\" = \"v\" } }",
+    ));
+    // Codex custom headers are out of scope.
+    bad.push(document(home.path()).replace(
+        "connection = { kind = \"native\" }\nauth_family = \"openai\"\nlimits_source = \"none\"\nrecommendations",
+        "connection = { kind = \"custom\", endpoint = \"https://api.example.com\", protocol = \"responses\", headers = { \"x-ok\" = \"v\" } }\nauth_family = \"openai\"\nlimits_source = \"none\"\nrecommendations",
+    ));
+    for text in &bad {
+        assert!(ProviderConfig::parse(text, home.path()).is_err(), "{text}");
+    }
+    // The Codex variant parses without headers, proving the rejection is the header.
+    ProviderConfig::parse(
+        &document(home.path()).replace(
+            "connection = { kind = \"native\" }\nauth_family = \"openai\"\nlimits_source = \"none\"\nrecommendations",
+            "connection = { kind = \"custom\", endpoint = \"https://api.example.com\", protocol = \"responses\" }\nauth_family = \"openai\"\nlimits_source = \"none\"\nrecommendations",
+        ),
+        home.path(),
+    )
+    .unwrap();
+    // Exactly the limits are accepted.
+    let edge = format!("\"{}\" = \"{}\"", "x".repeat(64), "v".repeat(256));
+    let eight = (0..8)
+        .map(|n| format!("\"x-h{n}\" = \"v\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    for headers in [edge, eight] {
+        ProviderConfig::parse(
+            &with_glm_connection(
+                home.path(),
+                &format!(
+                    "{{ kind = \"custom\", endpoint = \"https://api.example.com/messages\", protocol = \"messages\", headers = {{ {headers} }} }}"
+                ),
+            ),
+            home.path(),
+        )
+        .unwrap();
+    }
+}

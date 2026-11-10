@@ -92,6 +92,7 @@ fn mappings() -> BTreeMap<String, RuntimeMapping> {
                     protocol: ProviderProtocol::Messages,
                     auth_header: Default::default(),
                     allow_loopback_http: false,
+                    headers: Default::default(),
                 },
                 auth_family: "anthropic".parse().unwrap(),
                 limits_source: LimitsSource::Exec,

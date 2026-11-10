@@ -519,7 +519,9 @@ pub fn plan_selected(
 /// and the admitted request's [`LaunchOptions`]; none can alter frozen
 /// model, grants, connection, binary, or assets. `reader` resolves custom
 /// credentials only into the child environment. Custom Claude bearer launches
-/// explicitly blank the API-key variable to prevent native credential fallback.
+/// explicitly blank the API-key variable to prevent native credential fallback,
+/// and set `ANTHROPIC_CUSTOM_HEADERS` only from the sealed fixed headers, with
+/// `{launch}` replaced by a fresh per-plan id; a host value is discarded.
 /// An ordered native Claude binding refuses MCP environment grants that would
 /// redirect its authentication, rather than silently changing those grants.
 /// `shared` names the
@@ -675,6 +677,16 @@ pub fn plan_selected_with(
             CredentialRef::Environment(_) | CredentialRef::File(_) | CredentialRef::Keychain { .. },
             HarnessId::ClaudeCode,
         ) => {
+            // Only the sealed fixed headers may reach the gateway; a host
+            // value is never inherited. `{launch}` is unique to this plan.
+            match connection.render_custom_headers(&uuid::Uuid::new_v4().simple().to_string()) {
+                Some(headers) => {
+                    environment.insert("ANTHROPIC_CUSTOM_HEADERS".into(), headers);
+                }
+                None => {
+                    environment.remove("ANTHROPIC_CUSTOM_HEADERS");
+                }
+            }
             environment.insert(
                 "CLAUDE_CONFIG_DIR".into(),
                 home.join("claude-config").to_string_lossy().into_owned(),
