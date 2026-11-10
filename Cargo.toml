@@ -11,6 +11,7 @@ members = [
     "crates/agent-run-tui",
     "xtask",
 ]
+exclude = ["vendor/tokio-rusqlite"]
 resolver = "3"
 
 [workspace.package]
@@ -34,7 +35,7 @@ minijinja = { version = "=2.24.0", default-features = false, features = ["serde"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
 regex = "1.11"
 reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls"] }
-rusqlite = { version = "0.40", features = ["bundled", "backup", "functions", "hooks", "fallible_uint"] }
+rusqlite = { version = "=0.41.1", features = ["bundled", "backup", "functions", "hooks", "fallible_uint"] }
 serde = { version = "1.0", features = ["derive"] }
 # Typed writer payload digests require lossless f64 parsing across JSON round trips.
 serde_json = { version = "1.0", features = ["float_roundtrip"] }
@@ -42,11 +43,11 @@ sha2 = "0.11"
 tempfile = "3.19"
 thiserror = "2.0"
 tokio = { version = "1.44", features = ["rt", "rt-multi-thread", "macros", "process", "net", "io-util", "io-std", "signal", "time", "sync"] }
-tokio-rusqlite = "=0.8.0"
+tokio-rusqlite = { path = "vendor/tokio-rusqlite", version = "=0.8.0" }
 toml = "1.1"
 uuid = { version = "1.16", features = ["v4"] }
 url = "2.5.8"
-rmcp = { version = "=3.4.0", default-features = false, features = ["server", "transport-io"] }
+rmcp = { version = "=3.9.0", default-features = false, features = ["server", "transport-io"] }
 
 [profile.release]
 lto = "thin"

@@ -423,7 +423,7 @@ impl Store<'_> {
     /// because a live service may hold a shared-tree file or working directory
     /// open directly. The progress handler is cleared
     /// on either outcome. OS I/O is not preempted.
-    pub fn storage_protection_snapshot(&self) -> Result<StorageProtection> {
+    pub fn storage_protection_snapshot(&mut self) -> Result<StorageProtection> {
         let deadline = Instant::now() + Duration::from_secs(2);
         self.conn
             .progress_handler(1_000, Some(move || Instant::now() >= deadline))?;
@@ -946,7 +946,7 @@ impl Store<'_> {
     /// Schema 19 prepares incremental mode during offline migration. This method
     /// never replaces the database file or changes schema/auto-vacuum mode.
     /// Callback setup/cleanup errors propagate; cleanup is attempted even if vacuum fails.
-    pub fn vacuum_history(&self) -> Result<bool> {
+    pub fn vacuum_history(&mut self) -> Result<bool> {
         let active: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM agents WHERE status IN ('created','starting','running','cancelling'))
              OR EXISTS(SELECT 1 FROM workflow_runs WHERE status IN ('created','running'))

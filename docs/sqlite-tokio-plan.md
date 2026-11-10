@@ -53,6 +53,12 @@ and source. No tokio-rusqlite advisory was found in the RustSec listing;
 this is not a guarantee against unknown defects. Registry API HTTP 403 is
 retained as unavailable metadata, not silently claimed verified.
 
+Update (0.31.0): RUSTSEC-2026-0459 requires libsqlite3-sys 0.39 and therefore
+rusqlite 0.41, which tokio-rusqlite 0.8.0 does not allow. The unmodified 0.8.0
+sources are vendored in `vendor/tokio-rusqlite` with only the rusqlite
+requirement changed (see its `UPSTREAM.md`); replace them with the registry
+release once upstream publishes rusqlite 0.41 support.
+
 Sources: https://docs.rs/tokio-rusqlite/0.8.0/tokio_rusqlite/
 https://docs.rs/crate/tokio-rusqlite/0.8.0/source/Cargo.toml
 https://github.com/programatik29/tokio-rusqlite

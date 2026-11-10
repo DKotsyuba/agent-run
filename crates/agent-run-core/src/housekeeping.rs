@@ -364,7 +364,7 @@ pub async fn sweep_shared_on<B: crate::runtime_storage::LayoutBackend>(
 pub fn sweep_account_runtime(
     home: &Path,
     now: f64,
-    store: &Store,
+    store: &mut Store,
     configured_paths: &[PathBuf],
 ) -> Result<usize> {
     if !now.is_finite() || now < STORAGE_SECONDS {
@@ -455,7 +455,7 @@ async fn sweep_inner<B: crate::runtime_storage::LayoutBackend>(
             "filesystem retention requires an owned home directory",
         ));
     }
-    let mut proof = store.reader().storage_protection_snapshot()?;
+    let mut proof = store.storage_protection()?;
     let config = current_config(home, &root)
         .ok_or_else(|| invalid("current configuration cannot prove filesystem retention safety"))?;
     collect_config_paths(&config, &mut proof);
@@ -1325,7 +1325,7 @@ mod tests {
     fn count_collection_rechecks_admission_after_protection_capture() {
         let home = tempfile::tempdir().unwrap();
         agent_run_store::fixture::initialize(home.path()).unwrap();
-        let store = agent_run_store::fixture::open(home.path()).unwrap();
+        let mut store = agent_run_store::fixture::open(home.path()).unwrap();
         let at = 2_000_000_000.0;
         for index in 0..100 {
             let id = format!("ag-20330518-040000-{index:010x}");

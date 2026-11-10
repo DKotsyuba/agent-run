@@ -468,7 +468,7 @@ pub fn contract(root: &Path, export: bool) -> Result<(), String> {
     let descriptor = serde_json::json!({
         "schema_version": 1,
         "product_version": env!("CARGO_PKG_VERSION"),
-        "sdk": {"name": "rmcp", "version": "3.4.0"},
+        "sdk": {"name": "rmcp", "version": "3.9.0"},
         "protocol_versions": ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"],
         "operator": {
             "server_name": "agent-run", "registration_name": "agent-run",

@@ -879,7 +879,7 @@ impl StoreWriter<'_> {
         if self.degraded.is_some() || !self.store.conn.is_autocommit() {
             return refuse("maintenance is refused while the writer is degraded or busy");
         }
-        let conn = &self.store.conn;
+        let conn = &mut self.store.conn;
         let outcome = maintain_bounded(conn, op, deadline, &refuse);
         if !settled(conn) || self.faults.settle() {
             // The connection may still hold a transaction or a shortened
@@ -1031,7 +1031,7 @@ fn settled(conn: &Connection) -> bool {
 /// by a progress handler that reads the clock itself and reports whether the
 /// free-page count decreased.
 fn maintain_bounded(
-    conn: &Connection,
+    conn: &mut Connection,
     op: crate::ops::MaintenanceOp,
     deadline: &MonoDeadline,
     refuse: &dyn Fn(&str) -> MaintenanceOutcome,
@@ -1230,6 +1230,13 @@ impl StoreReader {
     pub fn into_inner(self) -> Store<'static> {
         self.store
     }
+
+    /// Mutable access to the read-only store for operations that install a
+    /// SQLite progress handler. The connection stays `query_only`.
+    pub fn store_mut(&mut self) -> &mut Store<'static> {
+        &mut self.store
+    }
+
     /// Opens with the ordinary five-second busy allowance.
     pub fn open(home: &Path) -> Result<Self> {
         Self::open_with(home, WRITER_BUSY)
@@ -1471,7 +1478,7 @@ impl StoreReader {
     /// without one, which the writer defers. The writer rechecks every
     /// candidate and projection.
     pub fn history_batch(
-        &self,
+        &mut self,
         at: f64,
         limit: usize,
     ) -> agent_run_domain::Result<crate::ops::PruneHistoryBatch> {
@@ -1484,7 +1491,7 @@ impl StoreReader {
     /// eligibility and complete durable evidence remain mandatory for deletion.
     /// A failed page yields no new cursor. Every read shares one short snapshot.
     pub fn history_page(
-        &self,
+        &mut self,
         at: f64,
         limit: usize,
         after: Option<&crate::retention::HistoryCursor>,
@@ -1704,7 +1711,7 @@ mod tests {
     #[test]
     fn settled_reports_an_unconfirmed_rollback() {
         use rusqlite::hooks::{AuthAction, Authorization, TransactionOperation};
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         conn.authorizer(Some(
             |context: rusqlite::hooks::AuthContext<'_>| match context.action {

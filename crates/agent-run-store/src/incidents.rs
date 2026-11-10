@@ -490,7 +490,7 @@ pub fn prune(conn: &Connection, at: f64) -> Result<usize> {
 /// cooperative 200 ms query budget, without migration or model/config access.
 /// WAL-aware SQLite reads preserve fresh observations; failures remain explicit.
 pub fn read_summary(path: &std::path::Path) -> Result<Value> {
-    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.busy_timeout(std::time::Duration::from_millis(100))?;
     conn.pragma_update(None, "query_only", true)?;
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;

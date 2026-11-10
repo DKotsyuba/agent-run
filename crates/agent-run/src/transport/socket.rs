@@ -2055,7 +2055,7 @@ async fn serve_endpoints(
                 // short SQL deadlines also bound it if the broker task is aborted.
                 let result: Result<usize> = async {
                     let (batch, next_cursor, pending) = tokio::task::spawn_blocking(move || {
-                        let reader = crate::state::writer::StoreReader::open_with(
+                        let mut reader = crate::state::writer::StoreReader::open_with(
                             &home,
                             Duration::from_millis(100),
                         )?;

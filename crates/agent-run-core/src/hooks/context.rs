@@ -164,7 +164,8 @@ async fn build_inner(
         if remaining.is_zero() {
             return Err(Error::Runtime("context read budget exhausted".into()));
         }
-        let store = agent_run_store::writer::StoreReader::open_with(home, remaining)?.into_inner();
+        let mut store =
+            agent_run_store::writer::StoreReader::open_with(home, remaining)?.into_inner();
         store
             .conn
             .progress_handler(1000, Some(move || Instant::now() >= read_deadline))?;

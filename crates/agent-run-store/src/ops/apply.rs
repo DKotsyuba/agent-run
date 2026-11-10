@@ -1137,7 +1137,7 @@ const RECEIPT_PRUNE_LIMIT: usize = 500;
 /// expensive scan cannot consume the selected receipt page's mutation budget.
 /// The sole writer owns this
 /// connection's progress callback; it is cleared before primary-key mutations.
-pub(crate) fn prune_receipts(conn: &Connection, op: &super::PruneReceipts) -> Result<usize> {
+pub(crate) fn prune_receipts(conn: &mut Connection, op: &super::PruneReceipts) -> Result<usize> {
     prune_receipts_until(
         conn,
         op,
@@ -1158,7 +1158,7 @@ fn receipt_retention_interrupted() -> Error {
 /// return, then atomically prunes a budget-limited prefix in the caller's transaction.
 /// Only read probes are interruptible: SQLite may auto-roll back interrupted DML.
 fn prune_receipts_until(
-    conn: &Connection,
+    conn: &mut Connection,
     op: &super::PruneReceipts,
     deadline: Instant,
 ) -> Result<usize> {
@@ -1470,13 +1470,13 @@ mod tests {
     /// allowing the caller to roll back and execute later substantial SQL normally.
     #[test]
     fn receipt_pruning_deadline_interrupt_clears_callback() {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(include_str!("../../../../sql/schema.sql"))
             .unwrap();
         let (boot_id, now_ns) = agent_run_platform::monotonic::now().unwrap();
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         let error = prune_receipts_until(
-            &conn,
+            &mut conn,
             &super::super::PruneReceipts {
                 at: agent_run_domain::domain::now(),
                 boot_id,

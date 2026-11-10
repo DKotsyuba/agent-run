@@ -25,6 +25,10 @@ Released 2026-11-10.
 - fix(adapters): suppress native owner state during catalog discovery.
 - fix(core): isolate the GC memo by store incarnation.
 - build(deps): pin Bridge SDK to Agent Bridge v0.7.0.
+- build(deps): update rmcp to 3.9.0 (RUSTSEC-2026-0457, -0461, -0462) and
+  rusqlite to 0.41.1 with bundled SQLite from libsqlite3-sys 0.39.1
+  (RUSTSEC-2026-0459). tokio-rusqlite 0.8.0 is vendored in `vendor/tokio-rusqlite`
+  on rusqlite 0.41 until upstream releases it.
 
 ## 0.30.0
 

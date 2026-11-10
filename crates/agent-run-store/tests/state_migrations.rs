@@ -1009,7 +1009,12 @@ fn migration_commit_boundaries_leave_consistent_recovery_state() {
     let conn = build_fixture(&before_path, 1);
     insert_v1_agents(&conn);
     let before_backup = migrations::backup_path(&before_path, 2);
-    conn.backup(MAIN_DB, &before_backup, None).unwrap();
+    conn.backup(
+        MAIN_DB,
+        &before_backup,
+        None::<fn(rusqlite::backup::Progress)>,
+    )
+    .unwrap();
     conn.execute_batch("BEGIN IMMEDIATE; CREATE TABLE crash_before_commit(value TEXT)")
         .unwrap();
     drop(conn);
@@ -1063,7 +1068,13 @@ fn migration_commit_boundaries_leave_consistent_recovery_state() {
     assert_eq!(migrations::migrate(&after_path).unwrap(), VERSION);
     let after_backup = migrations::backup_path(&after_path, VERSION);
     let current = Connection::open(&after_path).unwrap();
-    current.backup(MAIN_DB, &after_backup, None).unwrap();
+    current
+        .backup(
+            MAIN_DB,
+            &after_backup,
+            None::<fn(rusqlite::backup::Progress)>,
+        )
+        .unwrap();
     drop(current);
     assert_eq!(migrations::migrate(&after_path).unwrap(), VERSION);
     assert_eq!(user_version(&open_ro(&after_path)), VERSION);

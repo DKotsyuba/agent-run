@@ -575,7 +575,11 @@ impl Store<'_> {
         if destination.exists() {
             return Err(invalid("backup destination already exists"));
         }
-        self.conn.backup(rusqlite::MAIN_DB, destination, None)?;
+        self.conn.backup(
+            rusqlite::MAIN_DB,
+            destination,
+            None::<fn(rusqlite::backup::Progress)>,
+        )?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o600))?;
         Ok(())

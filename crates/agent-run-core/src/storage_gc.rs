@@ -328,7 +328,7 @@ pub async fn sweep_on<B: crate::runtime_storage::LayoutBackend>(
     // Evidence first, under the lock. Evidence that cannot be collected
     // completely — a corrupt registry row, an oversized snapshot, an
     // unreadable configuration — retains every candidate; the caller retries.
-    let mut protected: Vec<PathBuf> = match store.reader().storage_protection_snapshot() {
+    let mut protected: Vec<PathBuf> = match store.storage_protection() {
         Ok(proof) => proof.protected_paths().map(Path::to_path_buf).collect(),
         Err(_) => {
             outcome.incomplete = true;
@@ -1324,7 +1324,7 @@ pub fn sweep(store: &mut Store, app_home: &Path, mode: Mode) -> Result<Outcome> 
 
 /// A preview pass over a read-only view: counts what a collecting pass would
 /// remove without any write authority (see [`Mode::Preview`]).
-pub fn preview(store: &Store, app_home: &Path) -> Result<Outcome> {
+pub fn preview(store: &mut Store, app_home: &Path) -> Result<Outcome> {
     crate::runtime_storage::ready(sweep_on(
         &mut crate::runtime_storage::ReadOnlyLayout(store),
         app_home,

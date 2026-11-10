@@ -479,6 +479,14 @@ struct Recovery {
 /// own directory.
 const RECOVERY_LOG: &str = "recovery-observations.jsonl";
 
+impl Persist {
+    /// Mutable read-only store handle for bounded reads that need a progress
+    /// handler; the connection stays `query_only`.
+    pub(crate) fn reader_mut(&mut self) -> &mut agent_run_store::Store<'static> {
+        self.reader.store_mut()
+    }
+}
+
 impl Deref for Persist {
     /// The read-only store handle every read goes through.
     type Target = StoreReader;

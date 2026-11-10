@@ -41,7 +41,10 @@ fn database_identity_is_canonical_stable_and_cloned_with_backup() {
             .is_err()
     );
     let backup = first.path.join("synthetic-backup.sqlite");
-    store.conn.backup(MAIN_DB, &backup, None).unwrap();
+    store
+        .conn
+        .backup(MAIN_DB, &backup, None::<fn(rusqlite::backup::Progress)>)
+        .unwrap();
     let copy = Connection::open(&backup).unwrap();
     assert_eq!(store_identity::read(&copy).unwrap(), id);
     drop(copy);

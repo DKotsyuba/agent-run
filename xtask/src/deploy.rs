@@ -257,7 +257,11 @@ fn backup_at(directory: &Path, home: &Path, old: Option<&Path>) -> Result<(), St
     if state.is_file() {
         let source = Connection::open(&state).map_err(|error| error.to_string())?;
         source
-            .backup(MAIN_DB, directory.join("state.db"), None)
+            .backup(
+                MAIN_DB,
+                directory.join("state.db"),
+                None::<fn(rusqlite::backup::Progress)>,
+            )
             .map_err(|error| error.to_string())?;
     }
     if home.join("config.toml").is_file() {

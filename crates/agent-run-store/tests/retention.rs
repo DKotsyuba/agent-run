@@ -913,7 +913,7 @@ fn storage_protection_rejects_corrupt_evidence_without_losing_history() {
 #[test]
 fn storage_protection_bounds_account_rows_and_clears_sql_handler() {
     let home = common::Home::new();
-    let store = home.store();
+    let mut store = home.store();
     store.conn.execute_batch(
         "WITH RECURSIVE ids(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM ids WHERE n<20001)
          INSERT INTO provider_accounts SELECT 'bounded-'||n,'fixture','env:BOUND_'||n,'disabled',0,0 FROM ids;"
@@ -1507,7 +1507,7 @@ fn count_expired_large_transcripts_drain_in_bounded_batches() {
 #[test]
 fn count_retirement_is_proved_by_a_fresh_row_not_id_timestamps() {
     let home = common::Home::new();
-    let store = home.store();
+    let mut store = home.store();
     // The stale snapshot a filesystem pass held when the racing admission
     // landed: it must not retain the racer, so only the fresh row read can.
     // The racer is a bare agents row, like one whose dependents never landed.

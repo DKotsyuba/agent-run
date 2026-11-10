@@ -891,7 +891,7 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
             out(store.expire_unbound_batch(op.at, Some(EXPIRY_BATCH))?)
         }
         L::PruneIncidentLedger(op) => out(crate::incidents::prune(&store.conn, op.at)?),
-        L::PruneReceipts(op) => out(super::apply::prune_receipts(&store.conn, &op)?),
+        L::PruneReceipts(op) => out(super::apply::prune_receipts(&mut store.conn, &op)?),
 
         L::ReconcileReapedAgent(op) => out(store.advance_reconcile_cursor(&op)?),
         L::ReleaseOrphanedAttempt(op) => out(store.release_orphaned_attempt(&op)?),

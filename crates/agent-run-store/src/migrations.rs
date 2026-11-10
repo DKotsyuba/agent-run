@@ -325,7 +325,7 @@ impl Drop for SchemaLock {
 fn snapshot(conn: &Connection, path: &Path, target: i64) -> Result<PathBuf> {
     let backup = backup_path(path, target);
     let _ = std::fs::remove_file(&backup);
-    conn.backup(MAIN_DB, &backup, None)?;
+    conn.backup(MAIN_DB, &backup, None::<fn(rusqlite::backup::Progress)>)?;
     std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600))?;
     Ok(backup)
 }

@@ -549,7 +549,7 @@ fn required_evidence_is_protected_and_verified_durable() {
 fn history_batch_bounds_its_inputs() {
     let f = Fixture::new();
     f.terminal("succeeded");
-    let reader = StoreReader::open(&f.home.path).unwrap();
+    let mut reader = StoreReader::open(&f.home.path).unwrap();
     assert!(reader.history_batch(AT, 0).is_err());
     assert!(reader.history_batch(AT, 2001).is_err());
     assert!(reader.history_batch(f64::NAN, 1).is_err());
@@ -953,7 +953,7 @@ fn history_batches_are_packed_within_the_decoded_bound() {
 fn history_batches_read_one_snapshot() {
     let mut f = Fixture::new();
     let id = f.terminal("failed");
-    let reader = StoreReader::open(&f.home.path).unwrap();
+    let mut reader = StoreReader::open(&f.home.path).unwrap();
     let home = f.home.path.clone();
     let changed = id.clone();
     reader.pause_history_batch(move || {
@@ -1006,7 +1006,7 @@ fn incident_source_lookups_seek_the_kind_index() {
         tx.commit().unwrap();
     }
     f.event(&present, "process_cleanup", json!({"confirmed":true}));
-    let store = f.home.store();
+    let mut store = f.home.store();
     for id in [&absent, &present] {
         let steps = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let counter = std::sync::Arc::clone(&steps);
@@ -1099,7 +1099,7 @@ fn bounded_keyset_cycles_reach_stored_candidate_after_two_thousand_deferred() {
         "UPDATE agents SET finished_at=2 WHERE id=?",
         [proven.as_str()],
     );
-    let reader = StoreReader::open(&f.home.path).unwrap();
+    let mut reader = StoreReader::open(&f.home.path).unwrap();
     assert!(matches!(
         f.apply(LocalOp::from(CaptureIncident {
             projection: reader.incident_projection(&proven, AT).unwrap()
