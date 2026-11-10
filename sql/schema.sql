@@ -958,7 +958,7 @@ WHEN EXISTS (SELECT 1 FROM agents a JOIN lineage_hold_targets t ON t.root_agent_
   JOIN lineage_holds h USING(hold_id) WHERE a.id IN (OLD.agent_id,OLD.resumed_execution_id) AND h.released=0)
 BEGIN SELECT RAISE(ABORT,'lineage has an active hold'); END;
 
-PRAGMA user_version = 41;
+PRAGMA user_version = 42;
 
 -- Launch correlation is never inferred for historical attempts. A spawning
 -- row without a bound incarnation is unresolved until explicitly reconciled.
@@ -1160,6 +1160,8 @@ CREATE TRIGGER owner_effects_no_delete BEFORE DELETE ON owner_effects BEGIN SELE
 
 -- Permanent Pool-resident enrollment keys. An abort is a rejecting tombstone;
 -- an admission and all of its member ownership rows commit in one transaction.
+-- Only a prepared key retains the start request body; the terminal transition
+-- clears it while the fingerprint, pin and receipt or tombstone stay permanent.
 CREATE TABLE managed_enrollments (
   pool_route_json TEXT NOT NULL CHECK(json_valid(pool_route_json)),
   pool_store_id TEXT NOT NULL,
@@ -1171,16 +1173,17 @@ CREATE TABLE managed_enrollments (
   grant_json TEXT CHECK(grant_json IS NULL OR json_valid(grant_json)),
   receipt_id TEXT UNIQUE,
   receipt_json TEXT CHECK(receipt_json IS NULL OR json_valid(receipt_json)),
-  CHECK ((state='admitted' AND request_json IS NOT NULL AND grant_json IS NOT NULL AND receipt_id IS NOT NULL AND receipt_json IS NOT NULL)
+  CHECK ((state='admitted' AND request_json IS NULL AND grant_json IS NOT NULL AND receipt_id IS NOT NULL AND receipt_json IS NOT NULL)
       OR (state='prepared' AND request_json IS NOT NULL AND grant_json IS NOT NULL AND receipt_id IS NULL AND receipt_json IS NULL)
-      OR (state='aborted' AND receipt_id IS NULL AND receipt_json IS NULL)),
+      OR (state='aborted' AND request_json IS NULL AND receipt_id IS NULL AND receipt_json IS NULL)),
   PRIMARY KEY(pool_route_json,pool_store_id,request_id),
   UNIQUE(pool_store_id,request_id)
 );
+CREATE INDEX managed_enrollments_prepared ON managed_enrollments(state) WHERE state='prepared';
 CREATE TRIGGER managed_enrollments_immutable BEFORE UPDATE ON managed_enrollments
 WHEN NEW.pool_route_json IS NOT OLD.pool_route_json OR NEW.pool_store_id IS NOT OLD.pool_store_id
   OR NEW.request_id IS NOT OLD.request_id OR NEW.fingerprint_version IS NOT OLD.fingerprint_version
-  OR NEW.fingerprint IS NOT OLD.fingerprint OR NEW.request_json IS NOT OLD.request_json OR NEW.grant_json IS NOT OLD.grant_json
+  OR NEW.fingerprint IS NOT OLD.fingerprint OR NEW.request_json IS NOT NULL OR NEW.grant_json IS NOT OLD.grant_json
   OR OLD.state!='prepared' OR NEW.state NOT IN ('admitted','aborted')
 BEGIN SELECT RAISE(ABORT, 'invalid managed enrollment transition'); END;
 CREATE TRIGGER managed_enrollments_no_delete BEFORE DELETE ON managed_enrollments

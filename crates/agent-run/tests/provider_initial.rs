@@ -6466,15 +6466,18 @@ async fn managed_claude_supervisor_qualifies_with_catalog_complement() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     let (_temp, home) = home_in(&base, "", &[]);
+    // Owner endpoints are bound at `<owner>/<32 hex>/v2.sock` (and the
+    // discovery probe's `o.sock`); keep the fixture names short so a long
+    // private TMPDIR still fits the 108-byte Unix socket path limit.
     let ipc = tempfile::Builder::new()
-        .prefix("p3-claude-")
+        .prefix("p3")
         .tempdir_in(base)
         .unwrap();
     fs::set_permissions(ipc.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let channel = ipc.path().join("bridge.sock");
     let _bridge = std::os::unix::net::UnixListener::bind(&channel).unwrap();
     fs::set_permissions(&channel, fs::Permissions::from_mode(0o600)).unwrap();
-    let owner = ipc.path().join("owner");
+    let owner = ipc.path().join("o");
     fs::create_dir(&owner).unwrap();
     fs::set_permissions(&owner, fs::Permissions::from_mode(0o700)).unwrap();
     let frontend = home.join("pool-frontend");

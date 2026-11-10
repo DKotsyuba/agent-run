@@ -268,6 +268,9 @@ fn closed_error(error: &Error, _method: &str, store: &str) -> Value {
         Error::Validation(message) if message == "namespace recovery incomplete" => {
             ("recovery_required", "operator")
         }
+        Error::Validation(message) if message == "attempt peer configuration unavailable" => {
+            ("recovery_required", "operator")
+        }
         Error::Validation(message) if message == "attempt capacity exhausted" => {
             ("capacity_exhausted", "operator")
         }
@@ -355,6 +358,7 @@ pub(crate) async fn dispatch(
                     invocation_key,
                 } => {
                     version(n)?;
+                    reserved(&request_id)?;
                     let req = IngressCurrent {
                         expected_store_id: expected_store_id.clone(),
                         request_id,
@@ -381,6 +385,7 @@ pub(crate) async fn dispatch(
                     actor_recovery_version,
                 } => {
                     version(n)?;
+                    reserved(&request_id)?;
                     if params
                         .get("actor_recovery_version")
                         .is_some_and(Value::is_null)
@@ -649,6 +654,13 @@ pub(crate) async fn dispatch(
 fn wire_id(value: &str) -> Result<()> {
     agent_run_domain::attempt_binding::validate_id(value)
 }
+/// Pool cannot pre-claim a currentness key that Run derives for enrollment.
+fn reserved(request_id: &str) -> Result<()> {
+    if agent_run_domain::batch::is_reserved_internal_key(request_id) {
+        return Err(Error::Conflict);
+    }
+    Ok(())
+}
 
 /// Compare the bytes actually emitted by a reply with a closed wire shape.
 #[cfg(test)]
@@ -665,6 +677,110 @@ pub(crate) fn assert_reply_keys(value: &Value, expected: &[&str]) {
     assert_eq!(actual, expected, "wire reply keys");
 }
 
+/// Configured peer readers, opened only by a method that performs their I/O.
+/// Original-key enrollment lookup/abort and receipt replay never depend on the
+/// Bridge reader credential or the Pool endpoint being available.
+pub(crate) trait PeerSource: Send + Sync {
+    fn bridge(&self) -> Result<Box<dyn BridgeReader + '_>>;
+    fn pool(&self) -> Result<Box<dyn PoolReader + '_>>;
+}
+
+fn needs_bridge(method: &str) -> bool {
+    matches!(
+        method,
+        "_attempt_current_v1"
+            | "_attempt_admit_v1"
+            | "_attempt_retire_namespace_v1"
+            | "_managed_enrollment_current_v1"
+    )
+}
+
+fn needs_pool(method: &str) -> bool {
+    matches!(
+        method,
+        "_attempt_admission_abort_v1" | "_attempt_settle_v1" | "_attempt_retire_namespace_v1"
+    )
+}
+
+/// Stands in for a peer that the selected method never contacts.
+struct Unopened;
+fn unopened<T>() -> crate::attempt_binding::PeerFuture<'static, T> {
+    Box::pin(async { Err(Error::Integrity("attempt peer not opened".into())) })
+}
+impl BridgeReader for Unopened {
+    fn context<'a>(
+        &'a self,
+        _: &'a IngressCurrent,
+    ) -> crate::attempt_binding::PeerFuture<'a, crate::attempt_binding::BridgeContext> {
+        unopened()
+    }
+    fn consume<'a>(
+        &'a self,
+        _: &'a AdmissionRequest,
+    ) -> crate::attempt_binding::PeerFuture<'a, crate::attempt_binding::BridgeConsume> {
+        unopened()
+    }
+    fn issuer<'a>(
+        &'a self,
+        _: &'a NamespaceRequest,
+    ) -> crate::attempt_binding::PeerFuture<'a, crate::attempt_binding::BridgeIssuer> {
+        unopened()
+    }
+    fn retire<'a>(
+        &'a self,
+        _: &'a NamespaceRequest,
+    ) -> crate::attempt_binding::PeerFuture<'a, crate::attempt_binding::BridgeRetired> {
+        unopened()
+    }
+}
+impl PoolReader for Unopened {
+    fn outcome<'a>(
+        &'a self,
+        _: &'a Route,
+        _: &'a str,
+        _: &'a str,
+    ) -> crate::attempt_binding::PeerFuture<'a, crate::attempt_binding::PoolOutcome> {
+        unopened()
+    }
+    fn seal<'a>(
+        &'a self,
+        _: &'a NamespaceRequest,
+    ) -> crate::attempt_binding::PeerFuture<'a, agent_run_store::attempt_binding::PoolSeal> {
+        unopened()
+    }
+}
+
+/// Open only the peers this method contacts; a configuration or credential
+/// failure becomes the closed operator-recovery error, never a dropped socket.
+async fn dispatch_with_peers(
+    service: &Service,
+    grant: &PeerGrant,
+    peers: &dyn PeerSource,
+    method: &str,
+    params: Value,
+) -> std::result::Result<Value, DispatchFailure> {
+    let unavailable = |_| invalid("attempt peer configuration unavailable");
+    let bridge: Box<dyn BridgeReader + '_> = if needs_bridge(method) {
+        peers.bridge().map_err(unavailable)?
+    } else {
+        Box::new(Unopened)
+    };
+    let pool: Box<dyn PoolReader + '_> = if needs_pool(method) {
+        peers.pool().map_err(unavailable)?
+    } else {
+        Box::new(Unopened)
+    };
+    dispatch(
+        service,
+        grant,
+        bridge.as_ref(),
+        pool.as_ref(),
+        method,
+        params,
+    )
+    .await
+}
+
 /// Serve one bounded frame after same-UID and executable/build authentication.
 /// The caller owns endpoint lifecycle and must not pass request-selected pins.
 pub(crate) async fn serve_one(
@@ -673,8 +789,7 @@ pub(crate) async fn serve_one(
     service: &Service,
     grant: &PeerGrant,
     expected_transport_pin: &str,
-    bridge: &dyn BridgeReader,
-    pool: &dyn PoolReader,
+    peers: &dyn PeerSource,
 ) -> Result<()> {
     let admitted_pin = pin.clone();
     let home = service.home.clone();
@@ -739,17 +854,12 @@ pub(crate) async fn serve_one(
         Ok(())
     });
     let response = match current {
-        Ok(()) => {
-            dispatch(
-                service,
-                grant,
-                bridge,
-                pool,
-                &request.method,
-                request.params,
-            )
-            .await
+        // An authenticated resident learns that this Run home is not the
+        // configured store from the closed envelope, not from a closed socket.
+        Ok(()) if grant.run_route.component_store_id != store => {
+            Err(DispatchFailure::from(Error::StoreIdentityMismatch))
         }
+        Ok(()) => dispatch_with_peers(service, grant, peers, &request.method, request.params).await,
         Err(_) => Err(DispatchFailure::from(peer_not_authorized())),
     };
     let reply = match response {
@@ -1017,11 +1127,42 @@ pub async fn serve_bridge_receipt(stream: UnixStream, service: &Service) -> Resu
     serve_bridge_private_one(stream, pin, service).await
 }
 
+/// Peer readers resolved only from current local configuration.
+struct ConfiguredPeers {
+    home: std::path::PathBuf,
+    pool_socket: std::path::PathBuf,
+    pool_pin: PeerPin,
+    pool_route: Route,
+    bridge_socket: std::path::PathBuf,
+    bridge_pin: PeerPin,
+    bridge_route: Route,
+    credential_file: std::path::PathBuf,
+    credential_sha256: String,
+}
+impl PeerSource for ConfiguredPeers {
+    fn bridge(&self) -> Result<Box<dyn BridgeReader + '_>> {
+        use crate::attempt_transport::{AuthenticatedBridge, Endpoint};
+        Ok(Box::new(AuthenticatedBridge::from_pinned_file(
+            Endpoint::configured(self.bridge_socket.clone(), self.bridge_pin.clone())?,
+            self.bridge_route.clone(),
+            &self.credential_file,
+            &self.credential_sha256,
+        )?))
+    }
+    fn pool(&self) -> Result<Box<dyn PoolReader + '_>> {
+        use crate::attempt_transport::{AuthenticatedPool, Endpoint};
+        Ok(Box::new(AuthenticatedPool::configured(
+            Endpoint::configured(self.pool_socket.clone(), self.pool_pin.clone())?,
+            self.pool_route.clone(),
+            self.home.clone(),
+        )?))
+    }
+}
+
 /// Serve one configured Pool resident on the separate R2 socket. Current
 /// configuration supplies all peer identities; no request selects a route or
 /// credential. Disabled configurations preserve only exact-key recovery.
 pub async fn serve_pool_attempt(stream: UnixStream, service: &Service) -> Result<()> {
-    use crate::attempt_transport::{AuthenticatedBridge, AuthenticatedPool, Endpoint};
     let (config, _) = service.current_provider_config()?;
     let transport_pin =
         agent_run_store::managed_enrollment::Grant::from_config(&config)?.transport_pin_sha256;
@@ -1072,23 +1213,17 @@ pub async fn serve_pool_attempt(stream: UnixStream, service: &Service) -> Result
     if verified.is_err() {
         return reject_pool_peer(stream, service).await;
     }
-    let store = service
-        .read(|reader| agent_run_store::store_identity::read(&reader.conn))
-        .await?;
-    if transport.run_route.component_store_id != store.to_string() {
-        return Err(Error::StoreIdentityMismatch);
-    }
-    let pool = AuthenticatedPool::configured(
-        Endpoint::configured(transport.pool_socket.clone(), pool_pin)?,
-        transport.pool_route.clone(),
-        service.home.clone(),
-    )?;
-    let bridge = AuthenticatedBridge::from_pinned_file(
-        Endpoint::configured(transport.bridge_socket.clone(), bridge_pin)?,
-        transport.bridge_route.clone(),
-        &transport.bridge_reader_credential_file,
-        &transport.bridge_reader_credential_sha256,
-    )?;
+    let peers = ConfiguredPeers {
+        home: service.home.clone(),
+        pool_socket: transport.pool_socket.clone(),
+        pool_pin,
+        pool_route: transport.pool_route.clone(),
+        bridge_socket: transport.bridge_socket.clone(),
+        bridge_pin,
+        bridge_route: transport.bridge_route.clone(),
+        credential_file: transport.bridge_reader_credential_file.clone(),
+        credential_sha256: transport.bridge_reader_credential_sha256.clone(),
+    };
     let grant = PeerGrant {
         enabled: settings.enabled,
         pool_route: transport.pool_route.clone(),
@@ -1097,16 +1232,7 @@ pub async fn serve_pool_attempt(stream: UnixStream, service: &Service) -> Result
         producer: transport.producer.clone(),
         host_id: settings.host_id.clone(),
     };
-    serve_one(
-        stream,
-        peer_pin,
-        service,
-        &grant,
-        &transport_pin,
-        &bridge,
-        &pool,
-    )
-    .await
+    serve_one(stream, peer_pin, service, &grant, &transport_pin, &peers).await
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -1138,6 +1264,58 @@ mod tests {
             assert_eq!(result["recovery"], recovery);
         }
     }
+    /// Pool cannot pre-claim the currentness key Run derives for enrollment.
+    #[tokio::test]
+    async fn current_request_ids_cannot_use_reserved_internal_prefixes() {
+        let home = tempfile::tempdir().unwrap();
+        let service = Service::new(home.path().to_path_buf());
+        let route = |store: &str, id: &str| Route {
+            component_store_id: store.into(),
+            route_id: id.into(),
+            worker_uid: 1,
+        };
+        let grant = PeerGrant {
+            enabled: true,
+            pool_route: route("00000000-0000-4000-8000-000000000041", "pool"),
+            run_route: route("store_0123456789abcdef0123456789abcdef", "run"),
+            bridge_route: route("00000000-0000-4000-8000-000000000042", "bridge"),
+            producer: "pool".into(),
+            host_id: "host".into(),
+        };
+        for (purpose, request_id) in [("egress", "p3c_0123"), ("egress", "p3_0123")] {
+            let params = json!({"version":1,"expected_store_id":"store_0123456789abcdef0123456789abcdef","request_id":request_id,"lineage_root_id":"ag-20261109-120000-0000000001","bound_execution_id":"ag-20261109-120000-0000000001","purpose":purpose});
+            let error = dispatch(
+                &service,
+                &grant,
+                &Fake,
+                &Fake,
+                "_attempt_current_v1",
+                params,
+            )
+            .await
+            .unwrap_err();
+            let reply = dispatch_error(&error, "_attempt_current_v1", "store");
+            assert_eq!(
+                (reply["code"].as_str(), reply["recovery"].as_str()),
+                (Some("intent_conflict"), Some("none"))
+            );
+        }
+        let params = json!({"version":1,"expected_store_id":"store_0123456789abcdef0123456789abcdef","request_id":"p3c_0123","observation_ref":"context","invocation_key":"invocation","purpose":"ingress"});
+        let error = dispatch(
+            &service,
+            &grant,
+            &Fake,
+            &Fake,
+            "_attempt_current_v1",
+            params,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            dispatch_error(&error, "_attempt_current_v1", "store")["code"],
+            "intent_conflict"
+        );
+    }
     impl BridgeReader for Fake {
         fn context<'a>(&'a self, _: &'a IngressCurrent) -> PeerFuture<'a, BridgeContext> {
             Box::pin(async { Err(Error::Conflict) })
@@ -1150,6 +1328,14 @@ mod tests {
         }
         fn retire<'a>(&'a self, _: &'a NamespaceRequest) -> PeerFuture<'a, BridgeRetired> {
             Box::pin(async { Err(Error::Conflict) })
+        }
+    }
+    impl PeerSource for Fake {
+        fn bridge(&self) -> Result<Box<dyn BridgeReader + '_>> {
+            Ok(Box::new(Fake))
+        }
+        fn pool(&self) -> Result<Box<dyn PoolReader + '_>> {
+            Ok(Box::new(Fake))
         }
     }
     impl PoolReader for Fake {
@@ -1243,17 +1429,9 @@ mod tests {
         )
         .unwrap()
         .transport_pin_sha256;
-        serve_one(
-            stream,
-            pin.clone(),
-            &service,
-            &grant,
-            &transport_pin,
-            &Fake,
-            &Fake,
-        )
-        .await
-        .unwrap();
+        serve_one(stream, pin.clone(), &service, &grant, &transport_pin, &Fake)
+            .await
+            .unwrap();
         assert!(child.wait().await.unwrap().success());
         let reply: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
         assert_eq!(reply["id"], "one");
@@ -1306,9 +1484,7 @@ mod tests {
                 let grant = grant.clone();
                 let pin = pin.clone();
                 let transport_pin = transport_pin.clone();
-                async move {
-                    serve_one(stream, pin, &service, &grant, &transport_pin, &Fake, &Fake).await
-                }
+                async move { serve_one(stream, pin, &service, &grant, &transport_pin, &Fake).await }
             });
             assert_ne!(changed, config);
             std::fs::write(store_home.path().join("config.toml"), changed).unwrap();
@@ -1322,6 +1498,128 @@ mod tests {
                 &["version", "store_id", "code", "recovery"],
             );
         }
+    }
+
+    /// Exact-key enrollment lookup/abort through the real resident endpoint
+    /// never needs the Bridge reader credential; a method that does need it,
+    /// and a wrong configured store, reply with the closed operator envelope.
+    #[tokio::test]
+    async fn pool_recovery_does_not_open_bridge_credential() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = tempfile::Builder::new()
+            .prefix("r2-lazy-")
+            .tempdir_in(base)
+            .unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store_home = tempfile::tempdir().unwrap();
+        let store = agent_run_store::fixture::initialize(store_home.path()).unwrap();
+        let sid = agent_run_store::store_identity::read(&store.conn).unwrap();
+        drop(store);
+        let writer = crate::writer_test_harness::Harness::start(store_home.path());
+        let service = Service::new(store_home.path().to_path_buf()).with_writer(writer.broker());
+        let socket = dir.path().join("r.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let executable = crate::attempt_transport::test_peer::copy_peer(dir.path());
+        let digest = agent_run_platform::fs::sha256(&std::fs::read(&executable).unwrap());
+        crate::attempt_transport::test_peer::wait_build_age(&executable).await;
+        // SAFETY: geteuid has no memory arguments or side effects.
+        let uid = unsafe { libc::geteuid() };
+        let pool_store = "00000000-0000-4000-8000-000000000031";
+        // The configured credential file does not exist.
+        let config = |run_store: &str| {
+            format!(
+                "schema_version=2\n[managed_attempt_binding]\nenabled=false\nrole_name='managed'\npool_server='pool'\npool_executable_sha256='{}'\nbridge_hook_sha256='{}'\nhost_id='host'\npool_resident_executable='{}'\npool_resident_sha256='{digest}'\n[managed_attempt_binding.transport]\nrun_route={{component_store_id='{run_store}',route_id='run',worker_uid={uid}}}\npool_route={{component_store_id='{pool_store}',route_id='pool',worker_uid={uid}}}\nbridge_route={{component_store_id='00000000-0000-4000-8000-000000000032',route_id='bridge',worker_uid={uid}}}\nproducer='pool'\npool_socket='{}/pool.sock'\nbridge_socket='{}/bridge.sock'\nbridge_executable='/usr/bin/false'\nbridge_executable_sha256='{}'\nbridge_reader_credential_file='{}/missing-reader'\nbridge_reader_credential_sha256='{}'\n",
+                "a".repeat(64),
+                "c".repeat(64),
+                executable.display(),
+                dir.path().display(),
+                dir.path().display(),
+                "d".repeat(64),
+                dir.path().display(),
+                "e".repeat(64)
+            )
+        };
+        let call = |method: &str, params: Value| {
+            let frame = json!({"id":"lazy","method":method,"params":params}).to_string();
+            let output = dir.path().join(format!("{method}-reply"));
+            let child =
+                crate::attempt_transport::test_peer::child_at(&executable, "client", &socket)
+                    .env("RUN_R2_PEER_FRAME", frame)
+                    .env("RUN_R2_PEER_OUTPUT", &output)
+                    .spawn()
+                    .unwrap();
+            (child, output)
+        };
+        let key = json!({"version":1,"expected_store_id":sid,"pool_store_id":pool_store,"request_id":"lazy-1","fingerprint":"a".repeat(64)});
+        let mut current = key.clone();
+        current["member_id"] = json!("member");
+        current["current_request_id"] = json!("observe-1");
+        std::fs::write(
+            store_home.path().join("config.toml"),
+            config(&sid.to_string()),
+        )
+        .unwrap();
+        let mut replies = Vec::new();
+        for (method, params) in [
+            ("_managed_start_lookup_v1", key.clone()),
+            ("_managed_start_abort_v1", key.clone()),
+            ("_managed_enrollment_current_v1", current),
+        ] {
+            let (mut child, output) = call(method, params);
+            let (stream, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            serve_pool_attempt(stream, &service).await.unwrap();
+            assert!(child.wait().await.unwrap().success());
+            replies.push(serde_json::from_slice::<Value>(&std::fs::read(output).unwrap()).unwrap());
+        }
+        assert_eq!(replies[0]["result"]["state"], "absent");
+        assert_eq!(replies[1]["result"]["state"], "aborted");
+        assert_reply_keys(
+            &replies[1]["result"],
+            &[
+                "version",
+                "store_id",
+                "request_id",
+                "fingerprint",
+                "state",
+                "receipt",
+                "jobs_state",
+            ],
+        );
+        assert_eq!(replies[2]["error"]["code"], "recovery_required");
+        assert_eq!(replies[2]["error"]["recovery"], "operator");
+        assert_reply_keys(
+            &replies[2]["error"],
+            &["version", "store_id", "code", "recovery"],
+        );
+        // A configured Run route naming another store is a typed refusal too.
+        std::fs::write(
+            store_home.path().join("config.toml"),
+            config(&format!("store_{}", "f".repeat(32))),
+        )
+        .unwrap();
+        let (mut child, output) = call("_managed_start_lookup_v1", key);
+        let (stream, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        serve_pool_attempt(stream, &service).await.unwrap();
+        assert!(child.wait().await.unwrap().success());
+        let reply: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(reply["error"]["code"], "recovery_required");
+        assert_eq!(reply["error"]["store_id"], sid.to_string());
+        assert_reply_keys(
+            &reply["error"],
+            &["version", "store_id", "code", "recovery"],
+        );
     }
 
     /// Bridge has a distinct read-only grant, and the route comes from that

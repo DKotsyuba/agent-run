@@ -10,8 +10,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// A hard bound on permanent keys, including pre-admission tombstones.
-const MAX_ENROLLMENTS: i64 = 16_384;
+/// A hard bound on prepared keys, each of which retains a full start request.
+/// Admitted and aborted keys keep only their fingerprint, pin and receipt or
+/// tombstone, so they remain replayable without consuming this bound.
+pub const MAX_PREPARED_ENROLLMENTS: i64 = 256;
 
 type EnrollmentRow = (
     String,
@@ -173,11 +175,17 @@ fn record(conn: &Connection, key: &Key, pool_route: &Route) -> Result<Option<Rec
     }))
 }
 
+/// Count only live keys; a terminal key's replay data is small and permanent.
+pub(crate) fn prepared_count(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT count(*) FROM managed_enrollments WHERE state='prepared'",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
 fn capacity(conn: &Connection) -> Result<()> {
-    let count: i64 = conn.query_row("SELECT count(*) FROM managed_enrollments", [], |row| {
-        row.get(0)
-    })?;
-    if count >= MAX_ENROLLMENTS {
+    if prepared_count(conn)? >= MAX_PREPARED_ENROLLMENTS {
         return Err(invalid("attempt capacity exhausted"));
     }
     Ok(())
@@ -202,8 +210,14 @@ impl Store<'_> {
         if &current != grant {
             return Err(invalid("enrollment transport changed"));
         }
-        if revision.is_some_and(|expected| expected != actual) || selected.role_name != role {
+        if selected.role_name != role {
             return Err(invalid("enrollment role mismatch"));
+        }
+        // A configuration edit between preparation and this writer check is
+        // not a role refusal: the prepared key stays prepared and the same-key
+        // retry re-resolves the role under the new revision.
+        if revision.is_some_and(|expected| expected != actual) {
+            return Err(invalid("enrollment in progress"));
         }
         Ok(())
     }
@@ -277,10 +291,9 @@ impl Store<'_> {
                 return Ok(existing);
             }
             Some(_) => {
-                tx.execute("UPDATE managed_enrollments SET state='aborted' WHERE pool_route_json=? AND pool_store_id=? AND request_id=? AND state='prepared'",params![route_json(route)?,key.pool_store_id,key.request_id])?;
+                tx.execute("UPDATE managed_enrollments SET state='aborted',request_json=NULL WHERE pool_route_json=? AND pool_store_id=? AND request_id=? AND state='prepared'",params![route_json(route)?,key.pool_store_id,key.request_id])?;
             }
             None => {
-                capacity(&tx)?;
                 tx.execute("INSERT INTO managed_enrollments(pool_route_json,pool_store_id,request_id,fingerprint_version,fingerprint,state) VALUES(?,?,?,1,?,'aborted')",params![route_json(route)?,key.pool_store_id,key.request_id,key.fingerprint])?;
             }
         }
@@ -407,7 +420,7 @@ impl Store<'_> {
             state: "admitted".into(),
             jobs,
         };
-        if tx.execute("UPDATE managed_enrollments SET state='admitted',receipt_id=?,receipt_json=? WHERE pool_route_json=? AND pool_store_id=? AND request_id=? AND state='prepared'",params![receipt.receipt_id,serde_json::to_string(&receipt)?,route_json(&grant.pool_route)?,key.pool_store_id,key.request_id])? != 1 { return Err(Error::Conflict); }
+        if tx.execute("UPDATE managed_enrollments SET state='admitted',request_json=NULL,receipt_id=?,receipt_json=? WHERE pool_route_json=? AND pool_store_id=? AND request_id=? AND state='prepared'",params![receipt.receipt_id,serde_json::to_string(&receipt)?,route_json(&grant.pool_route)?,key.pool_store_id,key.request_id])? != 1 { return Err(Error::Conflict); }
         for job in &receipt.jobs {
             tx.execute("INSERT INTO managed_enrollment_members(lineage_root_id,pool_route_json,pool_store_id,pool_id,request_id,member_id,member_index) VALUES(?,?,?,?,?,?,?)",params![job.lineage_root_id.as_str(),route_json(&grant.pool_route)?,key.pool_store_id,start.pool_id,key.request_id,job.member_id,job.index])?;
         }

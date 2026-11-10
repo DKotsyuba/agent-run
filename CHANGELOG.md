@@ -5,6 +5,8 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 ## [Unreleased]
 
 - feat(release): report CI job progress while observing an exact release.
+- fix(batch): reserve `p3_` and `p3c_` batch keys for private Pool enrollment;
+  public `start_batch` and `batch_receipt` refuse them.
 
 ## 0.30.0
 

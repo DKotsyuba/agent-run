@@ -60,6 +60,17 @@ pub const MAX_BATCH_JOBS: usize = 20;
 /// Persisted canonicalization contract; old versions must remain replayable.
 pub const FINGERPRINT_VERSION: u32 = 1;
 
+/// Key prefixes owned by the private Pool enrollment namespace: `p3_` names a
+/// managed admission batch and `p3c_` a managed currentness observation.
+pub const RESERVED_INTERNAL_PREFIXES: [&str; 2] = ["p3_", "p3c_"];
+
+/// Whether a caller-supplied key would alias an internal managed key.
+pub fn is_reserved_internal_key(id: &str) -> bool {
+    RESERVED_INTERNAL_PREFIXES
+        .iter()
+        .any(|prefix| id.starts_with(prefix))
+}
+
 /// Canonical permanent retention pin identity; release is idempotent by this key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
@@ -362,8 +373,18 @@ impl StartBatchRequest {
         Ok(canonical::sha256_hex(&intent, true))
     }
 
+    /// Public callers cannot pre-claim or read an internal managed batch key.
+    pub fn validate_public_key(&self) -> Result<()> {
+        if is_reserved_internal_key(&self.request_id) {
+            return Err(invalid("request_id uses a reserved internal prefix"));
+        }
+        Ok(())
+    }
+
     /// Validates the exact read-only lookup intent, requiring a database fence.
+    /// This is a public lookup, so reserved internal keys are refused.
     pub fn validate_receipt_lookup(&mut self) -> Result<()> {
+        self.validate_public_key()?;
         self.validate_intent()?;
         if self.expected_store_id.is_none() {
             return Err(invalid("batch receipt lookup requires expected_store_id"));
@@ -741,6 +762,35 @@ mod tests {
         assert!(request.validate_intent().is_err());
         request.jobs = vec![job("one"); MAX_BATCH_JOBS + 1];
         assert!(request.validate_intent().is_err());
+    }
+
+    /// Public start and lookup cannot alias a private managed enrollment key.
+    #[test]
+    fn public_batch_keys_cannot_use_reserved_internal_prefixes() {
+        let job: crate::ProviderStartRequest = serde_json::from_value(json!({
+            "provider":"p", "model":"m", "profile":"code", "task":"t",
+            "workdir":"/missing-batch-fixture"
+        }))
+        .unwrap();
+        let request = |id: &str| StartBatchRequest {
+            request_id: id.into(),
+            jobs: vec![job.clone()],
+            retain_history: true,
+            expected_store_id: Some("store_0123456789abcdef0123456789abcdef".parse().unwrap()),
+            preconditions: None,
+        };
+        for id in ["p3_0123", "p3c_0123", "p3_", "p3c_"] {
+            assert!(is_reserved_internal_key(id));
+            assert!(request(id).validate_public_key().is_err());
+            assert!(request(id).validate_receipt_lookup().is_err());
+            // Internal admission still validates the same intent shape.
+            request(id).validate_intent().unwrap();
+        }
+        for id in ["p3", "p3c", "p3x_1", "P3_1", "xp3_1"] {
+            assert!(!is_reserved_internal_key(id));
+            request(id).validate_public_key().unwrap();
+            request(id).validate_receipt_lookup().unwrap();
+        }
     }
 
     /// Preconditions are ordered immutable intent, never a nullable default.

@@ -618,6 +618,28 @@ impl agent_run_core::system_launch::SystemLauncher for PanickingLauncher {
     }
 }
 
+/// Public start and receipt lookup refuse the private enrollment key namespace
+/// before any store read, so a caller can neither pre-claim nor observe it.
+#[tokio::test]
+async fn public_batch_refuses_reserved_enrollment_keys() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    agent_run_store::fixture::initialize(&root).unwrap();
+    let service = Service::new(root.clone());
+    for id in ["p3_0123", "p3c_0123"] {
+        let request: StartBatchRequest = serde_json::from_value(json!({"request_id":id,
+            "expected_store_id":"store_0123456789abcdef0123456789abcdef","retain_history":true,
+            "jobs":[{"provider":"codex","model":"m","profile":"review","task":"one","workdir":root}]}))
+        .unwrap();
+        assert!(
+            matches!(service.start_batch(request.clone()).await, Err(Error::Validation(ref m)) if m.contains("reserved"))
+        );
+        assert!(
+            matches!(service.batch_receipt(request).await, Err(Error::Validation(ref m)) if m.contains("reserved"))
+        );
+    }
+}
+
 /// A panic leaves its job unknown, does not skip the next job or replay either handoff.
 #[tokio::test]
 async fn batch_handoff_panic_does_not_skip_later_job() {

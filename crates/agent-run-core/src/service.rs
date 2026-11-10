@@ -918,6 +918,7 @@ impl Service {
                  dyn FnMut(u32, &mut [agent_run_store::ops::BatchMemberSpec]) -> Result<()> + Send
              ),
     ) -> Result<agent_run_domain::batch::StartBatchResult> {
+        request.validate_public_key()?;
         request.validate_intent()?;
         let fingerprint = request.fingerprint()?;
         if let Some(replay) = Store::open(&self.home)?.replay_batch_scoped(
@@ -1267,15 +1268,7 @@ impl Service {
         };
         if !outcome.replayed {
             for job in &outcome.receipt.jobs {
-                let service = self.clone();
-                let id = job.execution_id.clone();
-                let handoff = tokio::spawn(async move {
-                    let mut single = json!({"created":true,"agent_id":id});
-                    service.hand_off_provider(&mut single).await
-                });
-                if let Ok(Err(error)) = handoff.await {
-                    batch_handoff_log(&job.execution_id, error.public().kind);
-                }
+                self.hand_off_admitted(&job.execution_id).await;
             }
         }
         Ok(outcome.receipt)
@@ -1319,43 +1312,50 @@ impl Service {
         };
         if !result.replayed {
             for job in &result.receipt.jobs {
-                let service = self.clone();
-                let id = job.agent_id.clone();
-                // Isolate the complete handoff, including synchronous launcher
-                // code. A panic says nothing about whether a child was created.
-                let handoff = tokio::spawn(async move {
-                    let mut single = json!({"created":true,"agent_id":id});
-                    service.hand_off_provider(&mut single).await
-                });
-                match handoff.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => batch_handoff_log(&job.agent_id, error.public().kind),
-                    Err(error) => {
-                        let reason = if error.is_panic() {
-                            "panic"
-                        } else {
-                            "cancelled"
-                        };
-                        let recorded = match self.lane("admission") {
-                            Ok(lane) => {
-                                lane.event(
-                                    &job.agent_id,
-                                    "supervisor_handoff_error",
-                                    json!({"kind":"RuntimeError","reason":reason}),
-                                )
-                                .await
-                            }
-                            Err(error) => Err(error),
-                        };
-                        if let Err(error) = recorded {
-                            batch_handoff_log(&job.agent_id, error.public().kind);
-                        }
-                        batch_handoff_log(&job.agent_id, "unknown");
-                    }
-                }
+                self.hand_off_admitted(&job.agent_id).await;
             }
         }
         Ok(result)
+    }
+
+    /// Hand one newly admitted job to its supervisor. The complete handoff,
+    /// including synchronous launcher code, is isolated in its own task: a
+    /// panic or cancellation says nothing about whether a child was created,
+    /// so it is durably recorded as `supervisor_handoff_error` and the caller
+    /// continues with the next job.
+    async fn hand_off_admitted(&self, id: &AgentId) {
+        let service = self.clone();
+        let owned = id.clone();
+        let handoff = tokio::spawn(async move {
+            let mut single = json!({"created":true,"agent_id":owned});
+            service.hand_off_provider(&mut single).await
+        });
+        match handoff.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => batch_handoff_log(id, error.public().kind),
+            Err(error) => {
+                let reason = if error.is_panic() {
+                    "panic"
+                } else {
+                    "cancelled"
+                };
+                let recorded = match self.lane("admission") {
+                    Ok(lane) => {
+                        lane.event(
+                            id,
+                            "supervisor_handoff_error",
+                            json!({"kind":"RuntimeError","reason":reason}),
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = recorded {
+                    batch_handoff_log(id, error.public().kind);
+                }
+                batch_handoff_log(id, "unknown");
+            }
+        }
     }
 
     /// Record each distinct explicitly bound caller refused by a restart fence.

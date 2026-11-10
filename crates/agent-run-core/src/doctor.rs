@@ -638,7 +638,7 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
             "attempt_binding_headroom",
             owner_effect_capacity_status(headroom.owner_effects_used,headroom.owner_effects_limit),
             &format!(
-                "active currentness remaining {} of {}; admission keys remaining {} of {}; retirements remaining {} of {}; qualifications remaining {} of {}; owner effects remaining {} of {}",
+                "active currentness remaining {} of {}; admission keys remaining {} of {}; retirements remaining {} of {}; qualifications remaining {} of {}; owner effects remaining {} of {}; prepared enrollments remaining {} of {}; terminal enrollments {}",
                 headroom
                     .active_current_limit
                     .saturating_sub(headroom.active_current_used),
@@ -652,7 +652,12 @@ pub fn run_with(home: &Path, dependencies: &Dependencies) -> Result<Report> {
                 headroom.qualifications_limit.saturating_sub(headroom.qualifications_used),
                 headroom.qualifications_limit,
                 headroom.owner_effects_limit.saturating_sub(headroom.owner_effects_used),
-                headroom.owner_effects_limit
+                headroom.owner_effects_limit,
+                headroom
+                    .enrollments_prepared_limit
+                    .saturating_sub(headroom.enrollments_prepared_used),
+                headroom.enrollments_prepared_limit,
+                headroom.enrollments_terminal
             ),
             "retire fully settled namespaces before permanent-key compaction is available",
         )),

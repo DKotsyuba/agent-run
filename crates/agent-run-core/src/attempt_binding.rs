@@ -347,22 +347,22 @@ impl Service {
             producer: grant.producer.clone(),
             host_id: grant.host_id.clone(),
         };
-        let receipt = self
-            .attempt_current_egress_v1(grant, bridge, request)
-            .await
-            .map_err(|error| match error {
-                Error::Validation(message)
-                    if matches!(
-                        message.as_str(),
-                        "egress binding unavailable"
-                            | "attempt peer unavailable"
-                            | "binding unavailable"
-                    ) =>
-                {
-                    invalid("attempt not ready")
-                }
-                other => other,
-            })?;
+        // Only an authenticated, exact-launch Bridge report that the root hook
+        // has not yet been captured is "not ready". Foreign or malformed
+        // echoes, a lineage with no live candidate, relaunch/unavailable
+        // recovery states and transport failures keep plain R2 egress codes.
+        let receipt = match self
+            .attempt_current_egress_with_recovery(grant, bridge, request, true)
+            .await?
+        {
+            EgressOutcome::Current(receipt) => *receipt,
+            EgressOutcome::ActorRecovery(refusal)
+                if refusal.state == ActorRecoveryState::AwaitingRootHook =>
+            {
+                return Err(invalid("attempt not ready"));
+            }
+            EgressOutcome::ActorRecovery(_) => return Err(invalid("egress binding unavailable")),
+        };
         // Bridge I/O is outside SQLite. A re-pin while that lookup is in flight
         // must not let the old transport's result escape as P3 authority.
         if self.managed_enrollment_grant(grant)? != original_grant {
@@ -1424,7 +1424,7 @@ mod tests {
                 .0,
         )
         .unwrap();
-        store.conn.execute("INSERT INTO managed_enrollments(pool_route_json,pool_store_id,request_id,fingerprint_version,fingerprint,state,request_json,grant_json,receipt_id,receipt_json) VALUES(?,?,?,1,?,'admitted','{}',?,?,?)",rusqlite::params![route_json,key.pool_store_id,key.request_id,key.fingerprint,serde_json::to_string(&pinned).unwrap(),receipt.receipt_id,serde_json::to_string(&receipt).unwrap()]).unwrap();
+        store.conn.execute("INSERT INTO managed_enrollments(pool_route_json,pool_store_id,request_id,fingerprint_version,fingerprint,state,request_json,grant_json,receipt_id,receipt_json) VALUES(?,?,?,1,?,'admitted',NULL,?,?,?)",rusqlite::params![route_json,key.pool_store_id,key.request_id,key.fingerprint,serde_json::to_string(&pinned).unwrap(),receipt.receipt_id,serde_json::to_string(&receipt).unwrap()]).unwrap();
         store.conn.execute("INSERT INTO managed_enrollment_members(lineage_root_id,pool_route_json,pool_store_id,pool_id,request_id,member_id,member_index) VALUES(?,?,?,'pool',?,'member',0)",rusqlite::params![id.as_str(),route_json,key.pool_store_id,key.request_id]).unwrap();
         drop(store);
         let writer = crate::writer_test_harness::Harness::start(home.path());
@@ -1539,6 +1539,56 @@ mod tests {
         assert!(
             matches!(service.managed_enrollment_current(&grant,&unavailable,key.clone(),"member".into(),"observation-1".into()).await,Err(Error::Validation(ref message)) if message == "attempt not ready")
         );
+        // Only that exact awaiting-root-hook report is "not ready": transport
+        // failure, relaunch-required and a foreign echo keep plain R2 codes.
+        let refusal = |state, fail_actor, foreign_on_retry| RecoveryBridge {
+            actor: actor.clone(),
+            state,
+            actor_calls: AtomicUsize::new(0),
+            recovery_calls: AtomicUsize::new(0),
+            fail_actor,
+            fail_recovery: false,
+            mismatch: false,
+            current_on_retry: foreign_on_retry,
+            foreign_on_retry,
+        };
+        for (peer, code, recovery) in [
+            (
+                refusal(ActorRecoveryState::AwaitingRootHook, true, false),
+                "outcome_unknown",
+                "same_key_lookup",
+            ),
+            (
+                refusal(ActorRecoveryState::RelaunchRequired, false, false),
+                "binding_unavailable",
+                "operator",
+            ),
+            (
+                refusal(ActorRecoveryState::Current, false, true),
+                "binding_unavailable",
+                "operator",
+            ),
+        ] {
+            let error = service
+                .managed_enrollment_current(
+                    &grant,
+                    &peer,
+                    key.clone(),
+                    "member".into(),
+                    "observation-1".into(),
+                )
+                .await
+                .unwrap_err();
+            let reply = crate::attempt_wire::dispatch_error(
+                &error.into(),
+                "_managed_enrollment_current_v1",
+                &sid.to_string(),
+            );
+            assert_eq!(
+                (reply["code"].as_str(), reply["recovery"].as_str()),
+                (Some(code), Some(recovery))
+            );
+        }
         let ingress = service
             .attempt_current_ingress_v1(
                 &grant,
@@ -1651,18 +1701,27 @@ mod tests {
         );
     }
 
-    /// Exercise exact selector, real writer replay and a synthetic pre-spawn
-    /// refusal; no native provider or Bridge service is started.
-    #[cfg(all(target_os = "linux", feature = "test-fixtures"))]
-    #[tokio::test]
-    async fn p3_owner_only_exact_selector_and_single_enrollment() {
+    /// A synthetic enrolled Run home: managed role, pinned Pool frontend and
+    /// Bridge hook, one enabled account and a configurable Pool tool subset.
+    #[cfg(target_os = "linux")]
+    struct P3Home {
+        sid: agent_run_domain::StoreId,
+        pool: Route,
+        grant: PeerGrant,
+        config: P3Config,
+    }
+
+    /// Renders the fixture configuration for `(enabled, allowed Pool tool)`.
+    #[cfg(target_os = "linux")]
+    type P3Config = Box<dyn Fn(bool, &str) -> String>;
+
+    #[cfg(target_os = "linux")]
+    fn p3_home(root: &std::path::Path) -> P3Home {
         use std::os::unix::fs::PermissionsExt;
-        let home = tempfile::tempdir().unwrap();
-        let root = home.path().canonicalize().unwrap();
+        let root = root.to_path_buf();
         std::fs::create_dir_all(root.join("profiles")).unwrap();
         std::fs::create_dir(root.join("work")).unwrap();
         std::fs::write(root.join("profiles/managed.md"),"+++\nrevision='1'\nwrite=false\nnetwork=false\nallow_external_read_roots=false\nskills=[]\nmcp=['pool']\nrequired_constraints=[]\n+++\nManaged.\n").unwrap();
-        std::fs::write(root.join("fixture-supervisor-spawn-error"), "").unwrap();
         let frontend = root.join("pool-frontend");
         let hook = root.join("bridge-hook");
         std::fs::copy("/usr/bin/true", &frontend).unwrap();
@@ -1706,12 +1765,17 @@ mod tests {
             producer: "pool".into(),
             host_id: "host".into(),
         };
-        let config = |enabled: bool, tool: &str| {
+        let (pool_store, bridge_store) = (
+            pool.component_store_id.clone(),
+            grant.bridge_route.component_store_id.clone(),
+        );
+        let run_store = sid.to_string();
+        let config = move |enabled: bool, tool: &str| {
             format!(
-                "schema_version=2\n[core]\nmax_active_agents=4\n[managed_attempt_binding]\nenabled={enabled}\nrole_name='managed'\npool_server='pool'\npool_executable_sha256='{frontend_sha}'\nbridge_hook_sha256='{hook_sha}'\nhost_id='host'\npool_resident_executable='/usr/bin/printf'\npool_resident_sha256='{}'\n[managed_attempt_binding.transport]\nrun_route={{component_store_id='{sid}',route_id='run',worker_uid={uid}}}\npool_route={{component_store_id='{}',route_id='pool',worker_uid={uid}}}\nbridge_route={{component_store_id='{}',route_id='bridge',worker_uid={uid}}}\nproducer='pool'\npool_socket='{}/pool.sock'\nbridge_socket='{}/bridge.sock'\nbridge_executable='/usr/bin/cat'\nbridge_executable_sha256='{}'\nbridge_reader_credential_file='{}/reader'\nbridge_reader_credential_sha256='{}'\n[harnesses.codex]\nbinary='/usr/bin/true'\nhome='{}/codex'\nhooks=[{{event='PreToolUse',command=['{}'],matcher='mcp__pool__.*'}}]\n[mcp.pool]\ntransport='stdio'\ncommand='{}'\nargs=['mcp','--config','{}/pool.toml']\nenv_from=[]\napproval_mode='approve'\nallowed_tools=['{tool}']\n[providers.codex]\nharness='codex'\nconnection={{kind='native'}}\nauth_family='openai'\nlimits_source='none'\n[[providers.codex.models]]\nid='m'\n[[providers.codex.bindings]]\nlabel='test'\naccount='acct'\n",
+                "schema_version=2\n[core]\nmax_active_agents=4\n[managed_attempt_binding]\nenabled={enabled}\nrole_name='managed'\npool_server='pool'\npool_executable_sha256='{frontend_sha}'\nbridge_hook_sha256='{hook_sha}'\nhost_id='host'\npool_resident_executable='/usr/bin/printf'\npool_resident_sha256='{}'\n[managed_attempt_binding.transport]\nrun_route={{component_store_id='{run_store}',route_id='run',worker_uid={uid}}}\npool_route={{component_store_id='{}',route_id='pool',worker_uid={uid}}}\nbridge_route={{component_store_id='{}',route_id='bridge',worker_uid={uid}}}\nproducer='pool'\npool_socket='{}/pool.sock'\nbridge_socket='{}/bridge.sock'\nbridge_executable='/usr/bin/cat'\nbridge_executable_sha256='{}'\nbridge_reader_credential_file='{}/reader'\nbridge_reader_credential_sha256='{}'\n[harnesses.codex]\nbinary='/usr/bin/true'\nhome='{}/codex'\nhooks=[{{event='PreToolUse',command=['{}'],matcher='mcp__pool__.*'}}]\n[mcp.pool]\ntransport='stdio'\ncommand='{}'\nargs=['mcp','--config','{}/pool.toml']\nenv_from=[]\napproval_mode='approve'\nallowed_tools=['{tool}']\n[providers.codex]\nharness='codex'\nconnection={{kind='native'}}\nauth_family='openai'\nlimits_source='none'\n[[providers.codex.models]]\nid='m'\n[[providers.codex.bindings]]\nlabel='test'\naccount='acct'\n",
                 "b".repeat(64),
-                pool.component_store_id,
-                grant.bridge_route.component_store_id,
+                pool_store,
+                bridge_store,
                 root.display(),
                 root.display(),
                 "c".repeat(64),
@@ -1723,15 +1787,47 @@ mod tests {
                 root.display()
             ).replace("[mcp.pool]", &format!("[harnesses.claude-code]\nbinary='/usr/bin/true'\nhome='{}/claude'\n[mcp.pool]", root.display()))
         };
+        drop(store);
+        P3Home {
+            sid,
+            pool,
+            grant,
+            config: Box::new(config),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn p3_request(
+        root: &std::path::Path,
+        sid: &agent_run_domain::StoreId,
+        pool: &Route,
+        id: &str,
+    ) -> serde_json::Value {
+        json!({"version":1,"expected_store_id":sid,"pool_store_id":pool.component_store_id,"pool_id":"pool","request_id":id,"mode":"start","jobs":[{"member_id":format!("member-{id}"),"selector":{"version":1,"role_name":"managed"},"spec":{"provider":"codex","model":"m","profile":"managed","task":"fixture","workdir":root.join("work"),"write":false,"explicit_finish":true}}],"preconditions":[]})
+    }
+
+    /// Exercise exact selector, real writer replay and a synthetic pre-spawn
+    /// refusal; no native provider or Bridge service is started.
+    #[cfg(all(target_os = "linux", feature = "test-fixtures"))]
+    #[tokio::test]
+    async fn p3_owner_only_exact_selector_and_single_enrollment() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().canonicalize().unwrap();
+        std::fs::write(root.join("fixture-supervisor-spawn-error"), "").unwrap();
+        let P3Home {
+            sid,
+            pool,
+            grant,
+            config,
+        } = p3_home(&root);
         std::fs::write(root.join("config.toml"), config(false, "pool_get")).unwrap();
         agent_run_config::provider_config::ProviderConfig::load(&root).unwrap();
-        drop(store);
         let writer = crate::writer_test_harness::Harness::start(&root);
         let service = Service::new(root.clone()).with_writer(writer.broker());
         let bridge = FakeBridge {
             retire_calls: AtomicUsize::new(0),
         };
-        let request = |id: &str| json!({"version":1,"expected_store_id":sid,"pool_store_id":pool.component_store_id,"pool_id":"pool","request_id":id,"mode":"start","jobs":[{"member_id":format!("member-{id}"),"selector":{"version":1,"role_name":"managed"},"spec":{"provider":"codex","model":"m","profile":"managed","task":"fixture","workdir":root.join("work"),"write":false,"explicit_finish":true}}],"preconditions":[]});
+        let request = |id: &str| p3_request(&root, &sid, &pool, id);
         let error = crate::attempt_wire::dispatch(
             &service,
             &grant,
@@ -1931,6 +2027,87 @@ mod tests {
             !agent_run_domain::tools::worker_registry()
                 .iter()
                 .any(|tool| tool.name.starts_with("_managed_start"))
+        );
+    }
+
+    /// Panics inside launcher code, before any child could be observed.
+    struct PanickingLauncher(std::path::PathBuf);
+    impl crate::system_launch::SystemLauncher for PanickingLauncher {
+        fn route(
+            &self,
+            provider: &agent_run_domain::ProviderId,
+            harness: agent_run_domain::HarnessId,
+        ) -> Result<crate::system_launch::SystemRoute> {
+            Ok(crate::system_launch::SystemRoute {
+                provider: provider.clone(),
+                harness,
+                state_home: self.0.clone(),
+                private_home: self.0.clone(),
+                operator_socket: self.0.join("operator.sock"),
+                writer_socket: self.0.join("writer.sock"),
+                worker_socket: self.0.join("worker.sock"),
+                fingerprint: "a".repeat(64).parse().unwrap(),
+            })
+        }
+        fn launch(
+            &self,
+            _: std::path::PathBuf,
+            _: AgentId,
+            _: crate::system_launch::SystemRoute,
+            _: crate::broker_writer::BrokerLane,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>> {
+            panic!("synthetic enrollment handoff panic");
+        }
+    }
+
+    /// A panicking supervisor handoff after a managed admission is recorded
+    /// durably like an ordinary batch handoff; the receipt is still returned.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn p3_handoff_panic_records_supervisor_handoff_error() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().canonicalize().unwrap();
+        let P3Home {
+            sid,
+            pool,
+            grant,
+            config,
+        } = p3_home(&root);
+        std::fs::write(root.join("config.toml"), config(true, "pool_get")).unwrap();
+        let writer = crate::writer_test_harness::Harness::start(&root);
+        let service = Service::new(root.clone())
+            .with_writer(writer.broker())
+            .with_system_launcher(std::sync::Arc::new(PanickingLauncher(root.clone())));
+        let bridge = FakeBridge {
+            retire_calls: AtomicUsize::new(0),
+        };
+        let receipt = crate::attempt_wire::dispatch(
+            &service,
+            &grant,
+            &bridge,
+            &OutcomePool,
+            "_managed_start_batch_v1",
+            p3_request(&root, &sid, &pool, "panic"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt["state"], "admitted");
+        let id = receipt["jobs"][0]["lineage_root_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let store = agent_run_store::fixture::open(&root).unwrap();
+        let event: String = store
+            .conn
+            .query_row(
+                "SELECT data_json FROM events WHERE agent_id=? AND kind='supervisor_handoff_error'",
+                [id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&event).unwrap()["reason"],
+            "panic"
         );
     }
 

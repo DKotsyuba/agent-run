@@ -33,6 +33,11 @@ pub struct AttemptCapacityHeadroom {
     pub qualifications_limit: u64,
     pub owner_effects_used: u64,
     pub owner_effects_limit: u64,
+    /// Prepared enrollment keys, each retaining a start request until admitted or aborted.
+    pub enrollments_prepared_used: u64,
+    pub enrollments_prepared_limit: u64,
+    /// Permanent admitted/aborted enrollment keys; replayable, never evicted.
+    pub enrollments_terminal: u64,
 }
 
 /// The frozen launch candidate or an immutable exact-key replay.
@@ -478,6 +483,10 @@ impl Store<'_> {
         let current: i64 = self.conn.query_row(ACTIVE_CURRENT_SQL, [], |r| r.get(0))?;
         let admission:i64=self.conn.query_row("SELECT count(*) FROM (SELECT intent_id FROM attempt_pending_checks UNION SELECT intent_id FROM attempt_admissions)",[],|r|r.get(0))?;
         let (retirements,qualifications,effects):(i64,i64,i64)=self.conn.query_row("SELECT (SELECT count(*) FROM attempt_namespace_retirements),(SELECT count(*) FROM attempt_role_qualifications),(SELECT count(*) FROM owner_effects)",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+        let prepared = crate::managed_enrollment::prepared_count(&self.conn)?;
+        let enrollments: i64 =
+            self.conn
+                .query_row("SELECT count(*) FROM managed_enrollments", [], |r| r.get(0))?;
         Ok(AttemptCapacityHeadroom {
             active_current_used: current.max(0) as u64,
             active_current_limit: MAX_RECORDS as u64,
@@ -489,6 +498,9 @@ impl Store<'_> {
             qualifications_limit: MAX_RECORDS as u64,
             owner_effects_used: effects.max(0) as u64,
             owner_effects_limit: crate::owner_v2::MAX_EFFECTS as u64,
+            enrollments_prepared_used: prepared.max(0) as u64,
+            enrollments_prepared_limit: crate::managed_enrollment::MAX_PREPARED_ENROLLMENTS as u64,
+            enrollments_terminal: (enrollments - prepared).max(0) as u64,
         })
     }
     /// Freeze the authenticated Bridge launch; only the request digest persists.

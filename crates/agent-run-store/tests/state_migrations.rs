@@ -615,6 +615,132 @@ fn p3_historical_migration_and_permanent_enrollment_fence() {
     assert_eq!(user_version(&open_ro(&path)), VERSION + 1);
 }
 
+/// v41 terminal enrollment keys lose only their retained start request body;
+/// fingerprints, pins, receipts, tombstones and ownership rows are unchanged,
+/// and the new transition may clear the body only on its terminal update.
+#[test]
+fn p3_v41_to_v42_discards_terminal_request_bodies() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("state.db");
+    let old = build_fixture(&path, 41);
+    assert_eq!(user_version(&old), 41);
+    let insert = "INSERT INTO managed_enrollments(pool_route_json,pool_store_id,request_id,fingerprint_version,fingerprint,state,request_json,grant_json,receipt_id,receipt_json) VALUES('{}','pool',?,1,?,?,?,?,?,?)";
+    let task = r#"{"jobs":[{"spec":{"task":"secret task text"}}]}"#;
+    for (id, state, request, grant, receipt) in [
+        (
+            "admitted",
+            "admitted",
+            Some(task),
+            Some("{}"),
+            Some("receipt"),
+        ),
+        ("prepared", "prepared", Some(task), Some("{}"), None),
+        ("aborted-prepared", "aborted", Some(task), Some("{}"), None),
+        ("aborted-absent", "aborted", None, None, None),
+    ] {
+        old.execute(
+            insert,
+            rusqlite::params![
+                id,
+                "a".repeat(64),
+                state,
+                request,
+                grant,
+                receipt,
+                receipt.map(|_| r#"{"receipt":"kept"}"#)
+            ],
+        )
+        .unwrap();
+    }
+    old.execute("INSERT INTO managed_enrollment_members(lineage_root_id,pool_route_json,pool_store_id,pool_id,request_id,member_id,member_index) VALUES('root','{}','pool','pool','admitted','member',0)", []).unwrap();
+    drop(old);
+    assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(schema_objects(&conn), fresh_schema_objects());
+    type Row = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let rows: Vec<Row> = conn
+        .prepare("SELECT request_id,state,fingerprint,request_json,grant_json,receipt_json FROM managed_enrollments ORDER BY request_id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let kept = Some(r#"{"receipt":"kept"}"#.to_owned());
+    let pin = Some("{}".to_owned());
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "aborted-absent".into(),
+                "aborted".into(),
+                "a".repeat(64),
+                None,
+                None,
+                None
+            ),
+            (
+                "aborted-prepared".into(),
+                "aborted".into(),
+                "a".repeat(64),
+                None,
+                pin.clone(),
+                None
+            ),
+            (
+                "admitted".into(),
+                "admitted".into(),
+                "a".repeat(64),
+                None,
+                pin.clone(),
+                kept
+            ),
+            (
+                "prepared".into(),
+                "prepared".into(),
+                "a".repeat(64),
+                Some(task.into()),
+                pin,
+                None
+            ),
+        ]
+    );
+    let member: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM managed_enrollment_members WHERE request_id='admitted'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(member, 1);
+    // A terminal transition that retains the body, or a later rewrite, is refused.
+    assert!(conn.execute("UPDATE managed_enrollments SET state='admitted',receipt_id='r2',receipt_json='{}' WHERE request_id='prepared'", []).is_err());
+    assert!(
+        conn.execute(
+            "UPDATE managed_enrollments SET request_json='{}' WHERE request_id='admitted'",
+            []
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "DELETE FROM managed_enrollments WHERE request_id='aborted-absent'",
+            []
+        )
+        .is_err()
+    );
+    assert_eq!(
+        conn.execute("UPDATE managed_enrollments SET state='aborted',request_json=NULL WHERE request_id='prepared'", []).unwrap(),
+        1
+    );
+}
+
 /// Separate legacy databases receive independent stable IDs on migration.
 #[test]
 fn migration_assigns_independent_persistent_store_ids() {

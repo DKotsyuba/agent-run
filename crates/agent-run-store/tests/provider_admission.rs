@@ -826,6 +826,16 @@ mod p3 {
             .managed_enrollment_admit(&key, &grant, &revision, &digests, submit())
             .unwrap();
         assert!(!accepted.replayed);
+        // The admitted key keeps its fingerprint and receipt, not the task text.
+        let (body, fingerprint): (Option<String>, String) = store
+            .conn
+            .query_row(
+                "SELECT request_json,fingerprint FROM managed_enrollments WHERE request_id='batch'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((body, fingerprint), (None, key.fingerprint.clone()));
         assert_eq!(accepted.receipt.jobs.len(), 2);
         for (index, job) in accepted.receipt.jobs.iter().enumerate() {
             assert_eq!(job.index, index);
@@ -1332,6 +1342,208 @@ mod p3 {
             .unwrap();
         assert_eq!(result.receipt.jobs[0].lineage_root_id, new_id);
         assert_ne!(result.receipt.jobs[0].lineage_root_id, old_id);
+    }
+
+    /// A configuration edit between prepare and the admission writer is a
+    /// retryable in-progress state, not a definitive role refusal.
+    #[test]
+    fn p3_config_revision_race_is_retryable() {
+        let (home, store, grant, revision) = fixture();
+        let (raw, key) = intent(home.path(), &store, &grant, "revision-race", 1);
+        let (start, _) = Start::parse(&raw).unwrap();
+        store
+            .managed_enrollment_prepare(&key, &grant, &raw)
+            .unwrap();
+        let catalog = super::catalog(&store);
+        let authority = super::authority(&catalog, home.path());
+        let role_digest = authority.role_payload["config_revision"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut request: ProviderStartRequest =
+            serde_json::from_value(start.jobs[0].spec.clone()).unwrap();
+        request.validate().unwrap();
+        let effective = request.storage_projection();
+        let stale = "0".repeat(64);
+        let mut identity = super::identity(&request, &authority);
+        identity["provider_config_sha256"] = json!(stale);
+        let candidates =
+            super::candidates(store.quota_capacity_revision().unwrap(), &[("acct-a", 0)]);
+        macro_rules! submit {
+            ($identity:expr) => {
+                BatchAdmission {
+                    request_id: "revision-race-internal",
+                    fingerprint: &key.fingerprint,
+                    retain_history: true,
+                    expected_store_id: Some(&key.expected_store_id),
+                    preconditions: None,
+                    catalog: &catalog,
+                    jobs: vec![BatchMember {
+                        id: AgentId::new(),
+                        inputs: AdmissionInputs {
+                            request: &request,
+                            effective: &effective,
+                            authority: &authority,
+                            candidates: &candidates,
+                            identity: $identity,
+                            global_cap: 4,
+                            harness_cap: None,
+                            pinned: None,
+                        },
+                    }],
+                }
+            };
+        }
+        assert!(
+            matches!(store.managed_enrollment_admit(&key,&grant,&stale,std::slice::from_ref(&role_digest),submit!(&identity)),Err(Error::Validation(ref text)) if text == "enrollment in progress")
+        );
+        assert_eq!(
+            store
+                .managed_enrollment_lookup(&key, &grant.pool_route)
+                .unwrap()
+                .unwrap()
+                .state,
+            "prepared"
+        );
+        // A genuine role difference stays a definitive refusal.
+        let mut changed = settings(home.path(), &grant, true);
+        changed = changed.replace("role_name='review'", "role_name='other'");
+        std::fs::write(home.path().join("config.toml"), changed).unwrap();
+        let (_, other) =
+            agent_run_config::provider_config::ProviderConfig::load(home.path()).unwrap();
+        assert!(
+            matches!(store.managed_enrollment_admit(&key,&grant,&other,std::slice::from_ref(&role_digest),submit!(&identity)),Err(Error::Validation(ref text)) if text == "enrollment role mismatch")
+        );
+        std::fs::write(
+            home.path().join("config.toml"),
+            settings(home.path(), &grant, true),
+        )
+        .unwrap();
+        identity["provider_config_sha256"] = json!(revision);
+        let admitted = store
+            .managed_enrollment_admit(
+                &key,
+                &grant,
+                &revision,
+                std::slice::from_ref(&role_digest),
+                submit!(&identity),
+            )
+            .unwrap();
+        assert!(!admitted.replayed);
+    }
+
+    /// Only prepared keys retain request bodies and count against capacity;
+    /// terminal keys stay replayable after the body is discarded.
+    #[test]
+    fn p3_terminal_keys_drop_request_and_free_prepared_capacity() {
+        use agent_run_store::managed_enrollment::MAX_PREPARED_ENROLLMENTS;
+        let (home, store, grant, _) = fixture();
+        let body = |id: &str| -> Option<String> {
+            store
+                .conn
+                .query_row(
+                    "SELECT request_json FROM managed_enrollments WHERE request_id=?",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let (raw, key) = intent(home.path(), &store, &grant, "dropped", 1);
+        store
+            .managed_enrollment_prepare(&key, &grant, &raw)
+            .unwrap();
+        assert!(body("dropped").is_some());
+        // The body may only be cleared, and only by the terminal transition.
+        assert!(
+            store
+                .conn
+                .execute(
+                    "UPDATE managed_enrollments SET request_json='{}' WHERE request_id='dropped'",
+                    []
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .conn
+                .execute(
+                    "UPDATE managed_enrollments SET state='aborted' WHERE request_id='dropped'",
+                    []
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .managed_enrollment_abort(&key, &grant.pool_route)
+                .unwrap()
+                .state,
+            "aborted"
+        );
+        assert!(body("dropped").is_none());
+        assert_eq!(
+            store
+                .managed_enrollment_prepare(&key, &grant, &raw)
+                .unwrap()
+                .state,
+            "aborted"
+        );
+        let mut changed = key.clone();
+        changed.fingerprint = "f".repeat(64);
+        assert!(matches!(
+            store.managed_enrollment_lookup(&changed, &grant.pool_route),
+            Err(Error::Conflict)
+        ));
+        let route = serde_json::to_string(&grant.pool_route).unwrap();
+        let pin = serde_json::to_string(&grant).unwrap();
+        // Many terminal tombstones do not consume prepared capacity.
+        for index in 0..MAX_PREPARED_ENROLLMENTS + 8 {
+            store.conn.execute("INSERT INTO managed_enrollments(pool_route_json,pool_store_id,request_id,fingerprint_version,fingerprint,state) VALUES(?,?,?,1,?,'aborted')",rusqlite::params![route,grant.pool_route.component_store_id,format!("tomb-{index}"),"a".repeat(64)]).unwrap();
+        }
+        for index in 1..MAX_PREPARED_ENROLLMENTS {
+            store.conn.execute("INSERT INTO managed_enrollments(pool_route_json,pool_store_id,request_id,fingerprint_version,fingerprint,state,request_json,grant_json) VALUES(?,?,?,1,?,'prepared','{}',?)",rusqlite::params![route,grant.pool_route.component_store_id,format!("live-{index}"),"a".repeat(64),pin]).unwrap();
+        }
+        let (last, last_key) = intent(home.path(), &store, &grant, "last", 1);
+        store
+            .managed_enrollment_prepare(&last_key, &grant, &last)
+            .unwrap();
+        let headroom = store.attempt_capacity_headroom().unwrap();
+        assert_eq!(
+            (
+                headroom.enrollments_prepared_used,
+                headroom.enrollments_prepared_limit
+            ),
+            (
+                MAX_PREPARED_ENROLLMENTS as u64,
+                MAX_PREPARED_ENROLLMENTS as u64
+            )
+        );
+        assert_eq!(
+            headroom.enrollments_terminal,
+            MAX_PREPARED_ENROLLMENTS as u64 + 9
+        );
+        let (full, full_key) = intent(home.path(), &store, &grant, "full", 1);
+        assert!(
+            matches!(store.managed_enrollment_prepare(&full_key,&grant,&full),Err(Error::Validation(ref text)) if text == "attempt capacity exhausted")
+        );
+        // An abort fence for an absent key is never refused by prepared capacity.
+        let (_, fence) = intent(home.path(), &store, &grant, "absent-fence", 1);
+        assert_eq!(
+            store
+                .managed_enrollment_abort(&fence, &grant.pool_route)
+                .unwrap()
+                .state,
+            "aborted"
+        );
+        store
+            .managed_enrollment_abort(&last_key, &grant.pool_route)
+            .unwrap();
+        assert_eq!(
+            store
+                .managed_enrollment_prepare(&full_key, &grant, &full)
+                .unwrap()
+                .state,
+            "prepared"
+        );
     }
 }
 

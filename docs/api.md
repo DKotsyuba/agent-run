@@ -182,7 +182,9 @@ batch identity. When true, each job receives a distinct `pin_id` in its
 receipt and the pins commit with all jobs and the receipt. All jobs and one
 permanent batch receipt commit together, or no
 job is admitted. The shared key is scoped to this Run home, not to a caller
-identity. Exact replay requires the same durable database; replacing it under
+identity. Keys beginning with `p3_` or `p3c_` are reserved for Run's private
+Pool enrollment namespace; `start_batch` and `batch_receipt` refuse them as
+invalid input, so a public caller can neither pre-claim nor read such a key. Exact replay requires the same durable database; replacing it under
 the same socket or restoring an older copy cannot preserve absent receipts or
 pins. A matching retry returns the original ordered `agent_id`, `sequence`,
 and opaque `execution_ref` receipt; changed intent conflicts. The reference

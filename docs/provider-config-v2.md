@@ -374,6 +374,18 @@ negative hint for that exact launch: retry the same key for `awaiting_root_hook`
 request operator/relaunch action for `relaunch_required`, and fail closed for
 `unavailable`. The hint never supplies actor authority or a current receipt.
 
+The Pool resident that connects to `<run-home>/attempt.sock` must run under a
+service supervisor such as `systemd --user` (a `[Service]` unit of the same
+user), not directly from an interactive login. Run verifies the resident's
+complete same-UID kernel ancestry up to PID 1, including each ancestor's
+environment for a Run launch marker. A non-dumpable ancestor, such as the
+per-session `sshd` child of an SSH login or a process that changed
+credentials, denies that read; the connection then fails closed as
+`peer_not_authorized` before any request is read. Restart the resident through
+its unit after upgrading either component. Exact-key enrollment lookup and abort
+do not read the Bridge reader credential; a missing or mismatched credential
+refuses only Bridge-backed operations with `recovery_required`/`operator`.
+
 `[[managed_attempt_binding.bridge_custody_readers]]` grants effect recovery to
 separately configured same-UID Bridge builds. Each entry pins `reader_id`,
 `worker_uid`, `executable`, `executable_sha256`, `run_route`, `bridge_route`,
@@ -385,9 +397,14 @@ repointing a grant cannot retarget an existing effect or tombstone. Disabling th
 switch refuses new delivery while configured readers retain exact-key recovery.
 Operator-reviewed builds must be actual native components: interpreter names,
 scripts and renamed copies of common installed interpreters are refused.
-Doctor reports active-currentness, admission, retirement, qualification and
-owner-effect headroom without
-exposing identities. Pending/resolved currentness entries count against active
+Doctor reports active-currentness, admission, retirement, qualification,
+owner-effect and prepared-enrollment headroom, plus the count of permanent
+admitted/aborted enrollment keys, without
+exposing identities. A prepared enrollment key retains its complete start
+request (including task text) only until it is admitted or aborted; that same
+transition discards the body while the fingerprint, transport pin and receipt
+or tombstone remain permanent and replayable. Only prepared keys count against
+the enrollment bound. Pending/resolved currentness entries count against active
 capacity only while their exact launch remains owned and active; historical
 entries remain immutable and cannot grant authority. Permanent-key compaction
 is not yet implemented: a future numbered migration must first prove Pool and
