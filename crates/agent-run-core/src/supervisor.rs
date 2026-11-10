@@ -1459,6 +1459,33 @@ fn system_private_home(route: &crate::system_launch::SystemRoute) -> Result<Path
     Ok(route.private_home.clone())
 }
 
+/// Delivery transport is not agent identity: every new launch (fresh start,
+/// resume or account switch) pins the current validated Bridge route and
+/// build, while an already running launch keeps the pin its owner-v2 endpoint
+/// captured at spawn. A system route has no readable per-user configuration
+/// and keeps its root-approved admission transport.
+fn launch_bridge_transport(
+    home: &Path,
+    frozen: &agent_run_config::provider_config::ProviderConfig,
+    system_route: bool,
+) -> Result<agent_run_config::provider_config::ManagedAttemptTransport> {
+    let unavailable = || invalid("managed owner transport unavailable");
+    let current;
+    let config = if system_route {
+        frozen
+    } else {
+        current = agent_run_config::provider_config::ProviderConfig::load(home)
+            .map_err(|_| unavailable())?
+            .0;
+        &current
+    };
+    config
+        .managed_attempt_binding
+        .as_ref()
+        .and_then(|settings| settings.transport.clone())
+        .ok_or_else(unavailable)
+}
+
 /// Runs an admitted provider attempt through fenced process ownership and the terminal outbox.
 /// After the durable outcome, logs only public execution identity and numeric
 /// per-stage completion durations; logging never changes that outcome.
@@ -1885,12 +1912,14 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         );
         // A selected managed launch always gets its own v2 address at exec.
         // Missing local IPC settings fail before the journal's spawn claim.
+        // The Bridge route/build is pinned from the current configuration at
+        // this launch, not from the frozen identity snapshot.
         let managed_owner_v2 = if managed_selection.is_some() {
-            let transport = config
-                .managed_attempt_binding
-                .as_ref()
-                .and_then(|settings| settings.transport.as_ref())
-                .ok_or_else(|| invalid("managed owner transport unavailable"))?;
+            let transport = launch_bridge_transport(
+                home,
+                &identity.provider_config,
+                identity.system_route.is_some(),
+            )?;
             let setting = |name: &str| -> Result<std::path::PathBuf> {
                 planned
                     .launch
@@ -1910,10 +1939,8 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             }
             Some(adapters::native_owner_v2::Config {
                 channel,
-                expected_channel: transport.bridge_socket.clone(),
                 directory: setting(adapters::native_owner::SETTINGS[1])?,
-                bridge_executable: transport.bridge_executable.clone(),
-                bridge_sha256: transport.bridge_executable_sha256.clone(),
+                transport,
             })
         } else {
             None
@@ -3304,5 +3331,67 @@ mod writer_identity_diagnostic_tests {
         assert_eq!(metadata["wait_ms"], 30000);
         assert_eq!(metadata["attempts"], 2);
         assert_eq!(error.public().message, "state persistence operation failed");
+    }
+}
+
+#[cfg(test)]
+mod launch_bridge_transport_tests {
+    use super::*;
+
+    fn config(bridge: char) -> String {
+        format!(
+            r#"schema_version=2
+[managed_attempt_binding]
+enabled=true
+role_name='managed'
+pool_server='pool'
+pool_executable_sha256='{frontend}'
+bridge_hook_sha256='{hook}'
+host_id='host'
+pool_resident_executable='/opt/pool-resident'
+pool_resident_sha256='{resident}'
+[managed_attempt_binding.transport]
+run_route={{component_store_id='store_0123456789abcdef0123456789abcdef',route_id='run',worker_uid=1000}}
+pool_route={{component_store_id='pool-store',route_id='pool',worker_uid=1000}}
+bridge_route={{component_store_id='00000000-0000-4000-8000-000000000001',route_id='bridge',worker_uid=1000}}
+producer='pool'
+pool_socket='/opt/pool.sock'
+bridge_socket='/opt/bridge.sock'
+bridge_executable='/opt/bridge-daemon'
+bridge_executable_sha256='{bridge}'
+bridge_reader_credential_file='/opt/reader'
+bridge_reader_credential_sha256='{credential}'
+"#,
+            frontend = "a".repeat(64),
+            hook = "c".repeat(64),
+            resident = "b".repeat(64),
+            bridge = bridge.to_string().repeat(64),
+            credential = "e".repeat(64),
+        )
+    }
+
+    /// A frozen snapshot names build D; after an in-place Bridge upgrade to F
+    /// every new launch (fresh start or resume) pins F. System routes keep
+    /// their root-approved admission transport; a missing one fails closed.
+    #[test]
+    fn new_launch_pins_current_bridge_build_not_frozen_snapshot() {
+        let home = tempfile::tempdir().unwrap();
+        let frozen =
+            agent_run_config::provider_config::ProviderConfig::parse(&config('d'), home.path())
+                .unwrap();
+        std::fs::write(home.path().join("config.toml"), config('f')).unwrap();
+        let launch = launch_bridge_transport(home.path(), &frozen, false).unwrap();
+        assert_eq!(launch.bridge_executable_sha256, "f".repeat(64));
+        let system = launch_bridge_transport(home.path(), &frozen, true).unwrap();
+        assert_eq!(system.bridge_executable_sha256, "d".repeat(64));
+        std::fs::write(
+            home.path().join("config.toml"),
+            config('f')
+                .split("[managed_attempt_binding.transport]")
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(launch_bridge_transport(home.path(), &frozen, false).is_err());
     }
 }

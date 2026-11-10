@@ -1030,7 +1030,7 @@ async fn run_inner(
             tokio::select! {
                 biased;
                 call = agent_run_adapters::native_owner_v2::Owner::receive(&mut native_owner_v2) => {
-                    let prepared = crate::native_owner::prepare_v2(process,store,logical_record,&call.request,call.deadline,&call.channel,session.as_deref(),native_idle && native_pending.is_none() && native_pending_v2.is_none(),closing_at.is_some()).await;
+                    let prepared = crate::native_owner::prepare_v2(process,store,logical_record,&call.request,call.deadline,&call.transport,session.as_deref(),native_idle && native_pending.is_none() && native_pending_v2.is_none(),closing_at.is_some()).await;
                     let token = match prepared {
                         crate::native_owner::PreparedV2::Reply(reply) => {call.answer(reply);continue;}
                         crate::native_owner::PreparedV2::Invoke(token) => token,

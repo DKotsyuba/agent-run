@@ -434,10 +434,17 @@ Verify the daemon actually holds the configured socket and runs the new inode;
 replacing a file does not upgrade an already running process.
 
 Resume running managed members as new launches under the new configuration.
-Each launch freezes its owner-v2 Bridge build pin; re-pinning Pool or reloading
-Run never changes an old launch's authority. Preserve old delivery keys and
-resolve their outcomes before retiring the original namespace. A new launch
-must not replay an uncertain native effect under a new key.
+Bridge transport (socket, executable, build SHA-256 and routes) is delivery
+configuration, not execution identity: every new launch, whether a fresh
+start, an explicit resume or an account switch, pins the current validated
+`managed_attempt_binding.transport` at spawn, while model, provider, account
+and role keep their frozen resume snapshot. A system route keeps its
+root-approved admission transport. Each launch freezes that pin for its life;
+re-pinning Pool or reloading Run never changes an old launch's authority, and
+its destination fence refuses once the current transport differs. Preserve old
+delivery keys and resolve their outcomes before retiring the original
+namespace. A new launch must not replay an uncertain native effect under a new
+key.
 
 Peer executable proof uses the immutable loaded build, without a wall-clock
 freshness comparison or installation delay. Run opens `/proc/PID/exe`, requires
@@ -451,5 +458,8 @@ closed; overlay's visible type does not prove its upper filesystem's exclusion.
 PID/start-tick incarnation checks remain unchanged. Metadata timestamps and
 clock steps confer no authority; current unsafe permissions still refuse.
 A stale frozen launch build pin remains `attempt_mismatch/none`, requiring a
-correctly pinned relaunch. Other peer authentication failures (including an
+correctly pinned relaunch: on the per-launch owner-v2 endpoint, a live
+configured Bridge that passes every other proof but runs another build than
+the launch pin receives `known_unsent` with reason `attempt_mismatch`, and no
+native input is written. Other peer authentication failures (including an
 unsupported filesystem or replaced inode) are `peer_not_authorized/none`.

@@ -22,22 +22,24 @@ use tokio::{
 
 /// V2 address injected only into a selected managed harness at exec.
 pub const LOCATOR: &str = "BRIDGE_NATIVE_OWNER_SOCKET_V2";
-/// Frozen trusted Bridge channel/build and private per-launch parent directory.
+/// Refusal for a live Bridge whose build differs from this launch's pin.
+const STALE_BUILD: &str = "owner v2 Bridge build differs from launch pin";
+/// Bridge channel/build pinned at this launch and private per-launch parent directory.
 #[derive(Clone)]
 pub struct Config {
     pub channel: PathBuf,
-    /// Bridge socket pinned independently by the frozen Run transport.
-    pub expected_channel: PathBuf,
     pub directory: PathBuf,
-    pub bridge_executable: PathBuf,
-    pub bridge_sha256: String,
+    /// Current validated Run transport at spawn: Bridge socket, executable,
+    /// build and routes. It never changes for the life of this launch.
+    pub transport: agent_run_config::provider_config::ManagedAttemptTransport,
 }
 /// One authenticated handoff, owned by the existing native writer lane.
 pub struct Call {
     pub request: RequestV2,
     pub deadline: Instant,
-    /// The endpoint's checked local trust anchor, never from request JSON.
-    pub channel: PathBuf,
+    /// This launch's pinned transport; its Bridge socket is the endpoint's
+    /// checked local trust anchor, never from request JSON.
+    pub transport: agent_run_config::provider_config::ManagedAttemptTransport,
     reply: oneshot::Sender<ReplyV2>,
 }
 impl Call {
@@ -49,14 +51,14 @@ impl Call {
     pub fn fixture(
         request: RequestV2,
         deadline: Instant,
-        channel: PathBuf,
+        transport: agent_run_config::provider_config::ManagedAttemptTransport,
     ) -> (Self, oneshot::Receiver<ReplyV2>) {
         let (reply, receiver) = oneshot::channel();
         (
             Self {
                 request,
                 deadline,
-                channel,
+                transport,
                 reply,
             },
             receiver,
@@ -84,20 +86,19 @@ pub fn reply(
 }
 
 #[cfg(target_os = "linux")]
+/// A peer that passes every proof except the launch build digest is refused
+/// with the distinct stale-build error after all other checks complete.
 fn verify_build(identity: &agent_run_platform::process::Identity, config: &Config) -> Result<()> {
     use std::{io::Read, os::unix::fs::MetadataExt};
     let fail = || invalid("owner v2 peer unavailable");
+    let bridge_executable = &config.transport.bridge_executable;
+    let bridge_sha256 = &config.transport.bridge_executable_sha256;
     if !agent_run_config::provider_config::loader_preload_safe()
-        || !config.bridge_executable.is_absolute()
-        || agent_run_config::provider_config::forbidden_interpreter(&config.bridge_executable)
-        || config
-            .bridge_executable
-            .canonicalize()
-            .map_err(|_| fail())?
-            != config.bridge_executable
-        || config.bridge_sha256.len() != 64
-        || !config
-            .bridge_sha256
+        || !bridge_executable.is_absolute()
+        || agent_run_config::provider_config::forbidden_interpreter(bridge_executable)
+        || bridge_executable.canonicalize().map_err(|_| fail())? != *bridge_executable
+        || bridge_sha256.len() != 64
+        || !bridge_sha256
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     {
@@ -138,7 +139,7 @@ fn verify_build(identity: &agent_run_platform::process::Identity, config: &Confi
     };
     peer_safe()?;
     let path = agent_run_platform::process::executable(identity.pid).map_err(|_| fail())?;
-    if path != config.bridge_executable {
+    if path != *bridge_executable {
         return Err(fail());
     }
     let mut file =
@@ -171,7 +172,7 @@ fn verify_build(identity: &agent_run_platform::process::Identity, config: &Confi
     if bytes.starts_with(b"#!")
         || agent_run_config::provider_config::forbidden_interpreter_build(
             &path,
-            &config.bridge_sha256,
+            bridge_sha256,
             metadata.len(),
         )
         || metadata.dev() != after.dev()
@@ -183,10 +184,10 @@ fn verify_build(identity: &agent_run_platform::process::Identity, config: &Confi
         || metadata.ctime_nsec() != after.ctime_nsec()
         || metadata.dev() != loaded_after.dev()
         || metadata.ino() != loaded_after.ino()
-        || agent_run_platform::fs::sha256(&bytes) != config.bridge_sha256
     {
         return Err(fail());
     }
+    let stale = agent_run_platform::fs::sha256(&bytes) != *bridge_sha256;
     if agent_run_platform::process::executable(identity.pid).map_err(|_| fail())? != path
         || agent_run_platform::process::kernel_incarnation(identity).map_err(|_| fail())? != before
     {
@@ -196,7 +197,13 @@ fn verify_build(identity: &agent_run_platform::process::Identity, config: &Confi
     if !agent_run_config::provider_config::loader_preload_safe() {
         return Err(fail());
     }
+    if stale {
+        return Err(invalid(STALE_BUILD));
+    }
     Ok(())
+}
+fn stale_build(error: &agent_run_domain::Error) -> bool {
+    matches!(error, agent_run_domain::Error::Validation(message) if message == STALE_BUILD)
 }
 #[cfg(not(target_os = "linux"))]
 fn verify_build(_: &agent_run_platform::process::Identity, _: &Config) -> Result<()> {
@@ -228,6 +235,7 @@ pub struct Owner {
     directory: PathBuf,
     socket: PathBuf,
     identity: ((u64, u64), (u64, u64)),
+    pinned: agent_run_config::provider_config::ManagedAttemptTransport,
 }
 impl Owner {
     /// Create the distinct v2 endpoint; caller has already selected managed role.
@@ -244,8 +252,8 @@ impl Owner {
         {
             environment.remove(name);
         }
-        if config.channel != config.expected_channel
-            || config.channel.canonicalize().ok().as_ref() != Some(&config.expected_channel)
+        if config.channel != config.transport.bridge_socket
+            || config.channel.canonicalize().ok().as_ref() != Some(&config.transport.bridge_socket)
         {
             return Err(invalid("owner v2 channel differs from pinned Bridge route"));
         }
@@ -281,6 +289,7 @@ impl Owner {
         let trust = native_owner::Trust {
             channel: config.channel.clone(),
         };
+        let pinned = config.transport.clone();
         let (send, incoming) = mpsc::channel(1);
         let ready = Arc::new(AtomicBool::new(false));
         let current = ready.clone();
@@ -288,7 +297,13 @@ impl Owner {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let deadline = Instant::now() + OWNER_BUDGET;
                 let input = async {
-                    authenticate(&stream, &trust, &config, deadline).await?;
+                    // The live configured Bridge running another build than
+                    // this launch's pin gets only a definitive typed refusal.
+                    let stale = match authenticate(&stream, &trust, &config, deadline).await {
+                        Ok(()) => false,
+                        Err(error) if stale_build(&error) => true,
+                        Err(error) => return Err(error),
+                    };
                     let length = stream.read_u32_le().await? as usize;
                     if length == 0 || length > FRAME_BYTES {
                         return Err(invalid("owner v2 frame unavailable"));
@@ -296,6 +311,13 @@ impl Owner {
                     let mut bytes = vec![0; length];
                     stream.read_exact(&mut bytes).await?;
                     let request = match decode_request(&bytes) {
+                        Ok(request) if stale => Err(reply(
+                            &request,
+                            "known_unsent",
+                            None,
+                            None,
+                            Some("attempt_mismatch"),
+                        )),
                         Ok(request) => Ok(request),
                         Err(_) => {
                             let (call_id, effect_id, effect_digest) = invalid_request_echo(&bytes)
@@ -308,11 +330,23 @@ impl Owner {
                                 state: "known_unsent".into(),
                                 protocol: None,
                                 native_id: None,
-                                reason: Some("invalid_request".into()),
+                                reason: Some(
+                                    if stale {
+                                        "attempt_mismatch"
+                                    } else {
+                                        "invalid_request"
+                                    }
+                                    .into(),
+                                ),
                             })
                         }
                     };
-                    authenticate(&stream, &trust, &config, deadline).await?;
+                    match authenticate(&stream, &trust, &config, deadline).await {
+                        Ok(()) if !stale => {}
+                        Err(error) if stale && stale_build(&error) => {}
+                        Err(error) => return Err(error),
+                        Ok(()) => return Err(invalid("owner v2 peer unavailable")),
+                    }
                     Ok::<_, agent_run_domain::Error>(request)
                 };
                 let Ok(Ok(request)) = timeout_at(deadline, input).await else {
@@ -339,7 +373,7 @@ impl Owner {
                         let call = Call {
                             request,
                             deadline,
-                            channel: config.channel.clone(),
+                            transport: config.transport.clone(),
                             reply: response,
                         };
                         if !matches!(timeout_at(deadline, send.send(call)).await, Ok(Ok(()))) {
@@ -370,7 +404,12 @@ impl Owner {
             directory,
             socket,
             identity,
+            pinned,
         })
+    }
+    /// The Run transport pinned when this launch was spawned.
+    pub fn transport(&self) -> &agent_run_config::provider_config::ManagedAttemptTransport {
+        &self.pinned
     }
     /// Called only after exact native role qualification is durable.
     pub fn enable(&self) {
@@ -437,7 +476,8 @@ mod tests {
         wait_file(&root.join("locator"));
         let socket = std::fs::read_to_string(root.join("locator")).unwrap();
         let input = std::fs::read(root.join("request")).unwrap();
-        for phase in 1..=3 {
+        let phases = if root.join("single").exists() { 1 } else { 3 };
+        for phase in 1..=phases {
             if phase == 2 {
                 wait_file(&root.join("qualified"));
             }
@@ -456,6 +496,30 @@ mod tests {
             let mut bytes = vec![0; u32::from_le_bytes(length) as usize];
             stream.read_exact(&mut bytes).unwrap();
             std::fs::write(root.join(format!("result-{phase}")), bytes).unwrap();
+        }
+    }
+
+    fn pinned_transport(
+        channel: PathBuf,
+        bridge_executable: PathBuf,
+        bridge_executable_sha256: String,
+    ) -> agent_run_config::provider_config::ManagedAttemptTransport {
+        let route = |id: &str| Route {
+            component_store_id: id.into(),
+            route_id: id.into(),
+            worker_uid: 1000,
+        };
+        agent_run_config::provider_config::ManagedAttemptTransport {
+            run_route: route("run"),
+            pool_route: route("pool"),
+            bridge_route: route("bridge"),
+            producer: "pool".into(),
+            pool_socket: "/opt/pool.sock".into(),
+            bridge_socket: channel,
+            bridge_executable,
+            bridge_executable_sha256,
+            bridge_reader_credential_file: "/opt/reader".into(),
+            bridge_reader_credential_sha256: "e".repeat(64),
         }
     }
 
@@ -507,10 +571,12 @@ mod tests {
                 agent_run_platform::process::inspect(child.id().unwrap() as i32).unwrap();
             let config = Config {
                 channel: root.path().join("bridge.sock"),
-                expected_channel: root.path().join("bridge.sock"),
                 directory: root.path().into(),
-                bridge_executable: executable.clone(),
-                bridge_sha256: digest,
+                transport: pinned_transport(
+                    root.path().join("bridge.sock"),
+                    executable.clone(),
+                    digest,
+                ),
             };
             assert_eq!(verify_build(&identity, &config).is_ok(), !preload);
             if !preload {
@@ -518,15 +584,16 @@ mod tests {
                 std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
                     .unwrap();
                 assert!(verify_build(&identity, &config).is_ok());
+                // Only an otherwise proven live build with another digest is stale.
                 let mut wrong = config.clone();
-                wrong.bridge_sha256 = "0".repeat(64);
-                assert!(verify_build(&identity, &wrong).is_err());
+                wrong.transport.bridge_executable_sha256 = "0".repeat(64);
+                assert!(stale_build(&verify_build(&identity, &wrong).unwrap_err()));
                 wrong = config.clone();
-                wrong.bridge_executable = "/usr/bin/python3".into();
-                assert!(verify_build(&identity, &wrong).is_err());
+                wrong.transport.bridge_executable = "/usr/bin/python3".into();
+                assert!(!stale_build(&verify_build(&identity, &wrong).unwrap_err()));
                 std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o770))
                     .unwrap();
-                assert!(verify_build(&identity, &config).is_err());
+                assert!(!stale_build(&verify_build(&identity, &config).unwrap_err()));
                 std::fs::rename(&executable, root.path().join("old-build")).unwrap();
                 std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
                 std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
@@ -540,6 +607,17 @@ mod tests {
 
     #[tokio::test]
     async fn selected_launch_advertises_v2_before_qualification_but_never_handoffs() {
+        launch_handoff(false).await;
+    }
+
+    /// A launch pinned to an older Bridge build refuses the live upgraded
+    /// Bridge with a definitive typed reply and never hands off.
+    #[tokio::test]
+    async fn stale_launch_build_pin_refuses_live_bridge_with_attempt_mismatch() {
+        launch_handoff(true).await;
+    }
+
+    async fn launch_handoff(stale: bool) {
         let base = std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
@@ -645,10 +723,12 @@ mod tests {
         let mut untrusted = BTreeMap::new();
         let mismatched = Config {
             channel: root.path().join("bridge.sock"),
-            expected_channel: root.path().join("other.sock"),
             directory: root.path().into(),
-            bridge_executable: executable.clone(),
-            bridge_sha256: digest.clone(),
+            transport: pinned_transport(
+                root.path().join("other.sock"),
+                executable.clone(),
+                digest.clone(),
+            ),
         };
         assert!(Owner::prepare(&mut untrusted, mismatched).is_err());
         assert!(!untrusted.contains_key(LOCATOR));
@@ -656,10 +736,12 @@ mod tests {
             &plan,
             Some(Config {
                 channel: root.path().join("bridge.sock"),
-                expected_channel: root.path().join("bridge.sock"),
                 directory: root.path().into(),
-                bridge_executable: executable,
-                bridge_sha256: digest,
+                transport: pinned_transport(
+                    root.path().join("bridge.sock"),
+                    executable,
+                    if stale { "0".repeat(64) } else { digest },
+                ),
             }),
         )
         .unwrap();
@@ -672,11 +754,41 @@ mod tests {
         assert_eq!(environment["v1"], "unset");
         let socket = environment["v2"].as_str().unwrap();
         assert!(socket.ends_with("/v2.sock"));
+        if stale {
+            std::fs::write(root.path().join("single"), b"1").unwrap();
+            // Qualification does not lend an old launch the new build's authority.
+            process.native_owner_v2.as_ref().unwrap().enable();
+        }
         std::fs::write(root.path().join("locator"), socket).unwrap();
         wait_file(&root.path().join("result-1")).await;
         let first: ReplyV2 =
             serde_json::from_slice(&std::fs::read(root.path().join("result-1")).unwrap()).unwrap();
         assert_eq!(first.state, "known_unsent");
+        assert_eq!(first.call_id, request.call_id);
+        assert_eq!(first.effect_id, request.outbox_intent.effect_id);
+        assert_eq!(first.effect_digest, request.effect_digest);
+        if stale {
+            assert_eq!(first.reason.as_deref(), Some("attempt_mismatch"));
+            assert!(bridge.wait().await.unwrap().success());
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(30),
+                    Owner::receive(&mut process.native_owner_v2)
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                process
+                    .owner
+                    .cleanup(Duration::from_secs(2))
+                    .await
+                    .unwrap()
+                    .confirmed
+            );
+            process.reap().await;
+            return;
+        }
         assert_eq!(first.reason.as_deref(), Some("qualification_pending"));
         assert!(
             tokio::time::timeout(
