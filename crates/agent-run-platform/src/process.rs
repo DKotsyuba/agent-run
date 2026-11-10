@@ -143,41 +143,94 @@ pub fn executable(pid: i32) -> std::io::Result<std::path::PathBuf> {
     }
 }
 
-/// Proves executable timestamps predate a Linux process start on the same clock.
+/// Require a filesystem whose Linux executable write exclusion protects the loaded inode.
 ///
-/// `/proc/stat` btime is rounded to seconds and must not be compared with
-/// filesystem wall timestamps. Sample REALTIME before BOOTTIME instead: their
-/// offset plus the kernel's truncated start ticks gives a conservative lower
-/// bound, at nanosecond resolution. Ambiguous starts in the same tick refuse.
-/// The caller must still verify loaded inode, build digest and incarnation.
+/// Resolve the *open file's* mount ID via fdinfo, then its filesystem type in
+/// this process's mountinfo. This avoids path-prefix/bind-mount ambiguity and
+/// needs no unsafe statfs call or new dependency. Hidden/detached mounts and
+/// unknown types fail closed. Overlay is deliberately unsupported: its visible
+/// type alone does not establish the upper filesystem's write exclusion.
+/// The caller must open /proc/PID/exe and also verify inode, digest, mode and
+/// incarnation. No wall clock or file timestamp contributes authority.
 #[cfg(target_os = "linux")]
-pub fn executable_predates_start(
-    start_ticks: u64,
-    metadata: &std::fs::Metadata,
-) -> std::io::Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-    fn clock(id: libc::clockid_t) -> std::io::Result<i128> {
-        let mut spec = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: spec is a valid writable timespec and id is a supported clock.
-        if unsafe { libc::clock_gettime(id, &mut spec) } != 0 {
-            return Err(std::io::Error::last_os_error());
+pub fn executable_write_excluded(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
+    Ok(executable_mount_allowed(&info, &mounts))
+}
+
+#[cfg(target_os = "linux")]
+fn executable_mount_allowed(info: &str, mounts: &str) -> bool {
+    let mut ids = info.lines().filter_map(|line| line.strip_prefix("mnt_id:"));
+    let Some(id) = ids.next().and_then(|s| s.trim().parse::<u64>().ok()) else {
+        return false;
+    };
+    if ids.next().is_some() {
+        return false;
+    }
+    let mut matching = mounts.lines().filter(|line| {
+        line.split_ascii_whitespace()
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            == Some(id)
+    });
+    let Some(line) = matching.next() else {
+        return false;
+    };
+    if matching.next().is_some() {
+        return false;
+    }
+    let kind = line
+        .split_once(" - ")
+        .and_then(|(_, tail)| tail.split_ascii_whitespace().next());
+    // Names are the kernel mountinfo equivalents of statfs f_type magic values.
+    let magic = match kind {
+        Some("ext2" | "ext3" | "ext4") => 0xef53,
+        Some("xfs") => 0x58465342,
+        Some("btrfs") => 0x9123683e,
+        Some("tmpfs") => 0x01021994,
+        _ => return false,
+    };
+    executable_fs_magic_allowed(magic)
+}
+
+#[cfg(target_os = "linux")]
+fn executable_fs_magic_allowed(magic: u64) -> bool {
+    matches!(magic, 0xef53 | 0x58465342 | 0x9123683e | 0x01021994)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod executable_mount_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_filesystems_fail_closed() {
+        for magic in [0xef53, 0x58465342, 0x9123683e, 0x01021994] {
+            assert!(executable_fs_magic_allowed(magic));
         }
-        Ok(i128::from(spec.tv_sec) * 1_000_000_000 + i128::from(spec.tv_nsec))
+        for magic in [0, 0x794c7630, 0x6969, u64::MAX] {
+            assert!(!executable_fs_magic_allowed(magic));
+        }
+        for kind in ["ext2", "ext3", "ext4", "xfs", "btrfs", "tmpfs"] {
+            let mounts = format!("42 1 0:1 / / rw - {kind} source rw\n");
+            assert!(executable_mount_allowed("mnt_id:\t42\n", &mounts));
+        }
+        for (info, mounts) in [
+            ("mnt_id: 42", "42 1 0:1 / / rw - overlay source rw"),
+            ("mnt_id: 42", "42 1 0:1 / / rw - nfs source rw"),
+            ("mnt_id: 42", "43 1 0:1 / / rw - ext4 source rw"),
+            ("mnt_id: 42\nmnt_id: 42", "42 1 0:1 / / rw - ext4 source rw"),
+            (
+                "mnt_id: 42",
+                "42 1 0:1 / / rw - ext4 source rw\n42 1 0:1 / / rw - tmpfs source rw",
+            ),
+            ("mnt_id: invalid", ""),
+            ("", ""),
+        ] {
+            assert!(!executable_mount_allowed(info, mounts));
+        }
     }
-    // SAFETY: sysconf takes no pointers and only reads the kernel tick rate.
-    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if hz <= 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let wall = clock(libc::CLOCK_REALTIME)?;
-    let boot = clock(libc::CLOCK_BOOTTIME)?;
-    let start = wall - boot + i128::from(start_ticks) * 1_000_000_000 / i128::from(hz);
-    let modified = i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec());
-    let changed = i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec());
-    Ok(modified.max(changed) < start)
 }
 
 /// Reads one Linux process identity from procfs without trusting command-name encoding.

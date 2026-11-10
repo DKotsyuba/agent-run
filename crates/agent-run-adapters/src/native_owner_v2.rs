@@ -141,8 +141,10 @@ fn verify_build(identity: &agent_run_platform::process::Identity, config: &Confi
     if path != config.bridge_executable {
         return Err(fail());
     }
-    let metadata = std::fs::metadata(&path).map_err(|_| fail())?;
-    let loaded = std::fs::metadata(format!("/proc/{}/exe", identity.pid)).map_err(|_| fail())?;
+    let mut file =
+        std::fs::File::open(format!("/proc/{}/exe", identity.pid)).map_err(|_| fail())?;
+    let metadata = file.metadata().map_err(|_| fail())?;
+    let loaded = std::fs::metadata(&path).map_err(|_| fail())?;
     // SAFETY: geteuid has no arguments or side effects.
     let uid = unsafe { libc::geteuid() };
     if !metadata.is_file()
@@ -155,12 +157,14 @@ fn verify_build(identity: &agent_run_platform::process::Identity, config: &Confi
     {
         return Err(fail());
     }
-    if !agent_run_platform::process::executable_predates_start(before.start_ticks, &metadata)
-        .map_err(|_| fail())?
-    {
+    if !agent_run_platform::process::executable_write_excluded(&file).map_err(|_| fail())? {
         return Err(fail());
     }
-    let bytes = std::fs::read(&path).map_err(|_| fail())?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(128 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| fail())?;
     let after = std::fs::metadata(&path).map_err(|_| fail())?;
     let loaded_after =
         std::fs::metadata(format!("/proc/{}/exe", identity.pid)).map_err(|_| fail())?;
@@ -510,6 +514,10 @@ mod tests {
             };
             assert_eq!(verify_build(&identity, &config).is_ok(), !preload);
             if !preload {
+                // Changing ctime after exec is harmless with unchanged mode/inode/build.
+                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                assert!(verify_build(&identity, &config).is_ok());
                 let mut wrong = config.clone();
                 wrong.bridge_sha256 = "0".repeat(64);
                 assert!(verify_build(&identity, &wrong).is_err());

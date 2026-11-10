@@ -96,9 +96,9 @@ pub(crate) fn verify_peer(stream: &UnixStream, pin: &PeerPin) -> Result<()> {
     if link != path {
         return Err(reject());
     }
-    let mut file = std::fs::File::open(&path).map_err(|_| reject())?;
+    let mut file = std::fs::File::open(format!("/proc/{pid}/exe")).map_err(|_| reject())?;
     let metadata = file.metadata().map_err(|_| reject())?;
-    let loaded = std::fs::metadata(format!("/proc/{pid}/exe")).map_err(|_| reject())?;
+    let loaded = std::fs::metadata(&path).map_err(|_| reject())?;
     if !metadata.is_file()
         || (metadata.uid() != 0 && metadata.uid() != pin.uid)
         || metadata.mode() & 0o022 != 0
@@ -108,10 +108,8 @@ pub(crate) fn verify_peer(stream: &UnixStream, pin: &PeerPin) -> Result<()> {
     {
         return Err(reject());
     }
-    if !agent_run_platform::process::executable_predates_start(kernel.start_ticks, &metadata)
-        .map_err(|_| reject())?
-    {
-        return Err(invalid("attempt peer executable changed"));
+    if !agent_run_platform::process::executable_write_excluded(&file).map_err(|_| reject())? {
+        return Err(reject());
     }
     let mut hash = Sha256::new();
     let mut buf = [0u8; 65536];
@@ -1171,9 +1169,6 @@ mod tests {
         assert!(verify_peer(&old_stream, &new_pin).is_err());
         drop(old_stream);
         assert!(old.wait().await.unwrap().success());
-        // A few kernel ticks, deliberately less than the old 1-2 second age
-        // workaround, resolves tick truncation without assuming btime accuracy.
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         for launch in ["resumed", "new"] {
             let socket = dir.path().join(format!("{launch}.sock"));
             let ready = dir.path().join(format!("{launch}.ready"));
@@ -1186,13 +1181,27 @@ mod tests {
             super::test_peer::wait_file(&ready).await;
             assert!(verify_peer(&stream, &new_pin).is_ok(), "{launch}");
             assert!(verify_peer(&stream, &old_pin).is_err(), "stale launch pin");
-            // Changing metadata after process start is still rejected with
-            // an explicit attempt mismatch, despite matching inode and hash.
+            // Metadata-only changes after start do not change loaded-build authority.
             std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-            assert!(
-                matches!(verify_peer(&stream, &new_pin), Err(Error::Validation(message))
-                if message == "attempt peer executable changed")
-            );
+            assert!(verify_peer(&stream, &new_pin).is_ok());
+            // Inject wall timestamps on either side of the old inferred start,
+            // including the +60s clock-step counterexample. Neither affects proof.
+            for seconds in [1, 1001, 1060, 4_000_000_000] {
+                std::fs::File::open(&executable)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+                    ))
+                    .unwrap();
+                assert!(
+                    verify_peer(&stream, &new_pin).is_ok(),
+                    "timestamp {seconds}"
+                );
+            }
+            // Current permissions still refuse a post-start group-write grant.
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o770)).unwrap();
+            assert!(verify_peer(&stream, &new_pin).is_err());
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
             drop(stream);
             assert!(child.wait().await.unwrap().success());
             tokio::time::sleep(std::time::Duration::from_millis(30)).await;

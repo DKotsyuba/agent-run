@@ -439,9 +439,17 @@ Run never changes an old launch's authority. Preserve old delivery keys and
 resolve their outcomes before retiring the original namespace. A new launch
 must not replay an uncertain native effect under a new key.
 
-Executable age checks compare nanosecond timestamps on a clock calibrated from
-Linux REALTIME and BOOTTIME. No whole-second installation delay is required.
-A start within the kernel's truncated start tick remains ambiguous and refuses
-closed; restart after that tick. A mismatched build or executable changed after
-start is `attempt_mismatch/none`, requiring a correctly pinned relaunch; other
-peer authentication failures are `peer_not_authorized/none`.
+Peer executable proof uses the immutable loaded build, without a wall-clock
+freshness comparison or installation delay. Run opens `/proc/PID/exe`, requires
+its device/inode to equal the configured path, hashes that open file against
+the pin, and checks current ownership and non-writable group/other mode. The
+open file's `mnt_id` from `/proc/self/fdinfo` is resolved in
+`/proc/self/mountinfo`: only ext2/ext3/ext4 (0xEF53), xfs (0x58465342), btrfs
+(0x9123683E), and tmpfs (0x01021994) qualify for kernel executable write
+exclusion. Missing mount evidence, unknown filesystems, and overlayfs fail
+closed; overlay's visible type does not prove its upper filesystem's exclusion.
+PID/start-tick incarnation checks remain unchanged. Metadata timestamps and
+clock steps confer no authority; current unsafe permissions still refuse.
+A stale frozen launch build pin remains `attempt_mismatch/none`, requiring a
+correctly pinned relaunch. Other peer authentication failures (including an
+unsupported filesystem or replaced inode) are `peer_not_authorized/none`.
