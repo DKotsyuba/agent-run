@@ -431,7 +431,7 @@ administrative boundary.
 omits the store ID and has this shape:
 
 ```json
-{"schema_version":1,"product":"agent-run","version":"0.30.0","source_revision":null,"transports":["cli","mcp","unix_socket"],"limits":{"socket_max_frame_bytes":1048576,"answer_max_bytes":16777216,"answer_chunk_default_bytes":65536,"answer_chunk_max_bytes":131072},"read_methods":[{"name":"answer_chunk","input_schema":{"type":"object"},"result_shape":{"type":"object"}}]}
+{"schema_version":1,"product":"agent-run","version":"0.31.0","source_revision":null,"transports":["cli","mcp","unix_socket"],"limits":{"socket_max_frame_bytes":1048576,"answer_max_bytes":16777216,"answer_chunk_default_bytes":65536,"answer_chunk_max_bytes":131072},"read_methods":[{"name":"answer_chunk","input_schema":{"type":"object"},"result_shape":{"type":"object"}}]}
 ```
 
 The example abbreviates schemas and the method list. The actual list derives
