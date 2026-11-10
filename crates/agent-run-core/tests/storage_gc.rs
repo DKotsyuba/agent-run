@@ -1589,3 +1589,49 @@ fn partial_staging_orphan_drains_after_restart() {
     );
     permit_tree(&store_root);
 }
+
+/// A cached retained proof cannot authorize quarantine after evidence changes.
+#[test]
+fn unpinned_tree_is_reverified_even_after_a_memo_hit() {
+    let root = TempDir::new().unwrap();
+    let app_home = app(root.path());
+    let mut store = agent_run_store::fixture::initialize(&app_home).unwrap();
+    let sealed = seal(root.path(), "memo-home", b"memo payload");
+    share(&mut store, &sealed.home, &app_home, &sealed);
+    converge(&mut store, &app_home, Mode::Apply);
+    let shared = store_root(&app_home);
+    let tree = shared
+        .join("trees")
+        .join(names(&shared, "trees").pop().unwrap());
+    let manifest = tree.join(".agent-run-snapshot.json");
+    stdfs::set_permissions(&manifest, stdfs::Permissions::from_mode(0o600)).unwrap();
+    stdfs::write(&manifest, b"{}").unwrap();
+    // Remove the physical home so the committed row ceases to pin the tree.
+    permit_tree(&sealed.home);
+    stdfs::remove_dir_all(&sealed.home).unwrap();
+    let result = storage_gc::sweep(&mut store, &app_home, Mode::Apply).unwrap();
+    assert!(result.incomplete);
+    assert_eq!(result.trees_removed, 0);
+    assert_eq!(result.blobs_removed, 0);
+    assert!(tree.exists());
+    permit_tree(&shared);
+}
+
+/// An out-of-band removed tree must stop retaining its cached payload names.
+#[test]
+fn completed_scan_forgets_trees_missing_since_previous_pass() {
+    let root = TempDir::new().unwrap();
+    let app_home = app(root.path());
+    let mut store = agent_run_store::fixture::initialize(&app_home).unwrap();
+    let sealed = seal(root.path(), "vanished-home", b"vanished payload");
+    share(&mut store, &sealed.home, &app_home, &sealed);
+    converge(&mut store, &app_home, Mode::Apply);
+    let shared = store_root(&app_home);
+    permit_tree(&sealed.home);
+    stdfs::remove_dir_all(&sealed.home).unwrap();
+    permit_tree(&shared.join("trees"));
+    stdfs::remove_dir_all(shared.join("trees")).unwrap();
+    converge(&mut store, &app_home, Mode::Apply);
+    assert!(names(&shared, "blobs").is_empty());
+    permit_tree(&shared);
+}

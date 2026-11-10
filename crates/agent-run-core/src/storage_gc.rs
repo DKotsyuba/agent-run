@@ -163,6 +163,25 @@ fn memos() -> &'static Mutex<BTreeMap<String, Memo>> {
     MEMOS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+/// Reads or installs a unique root incarnation while holding the publish lock.
+/// Preview never calls this function, so it creates no metadata.
+fn memo_identity(root: &fs::Dir) -> Result<String> {
+    let path = Path::new(".gc-identity");
+    if let Some(bytes) = root.optional(path, 36)? {
+        let value = std::str::from_utf8(&bytes)
+            .map_err(|_| invalid("shared store GC identity is invalid"))?;
+        let identity = uuid::Uuid::parse_str(value)
+            .map_err(|_| invalid("shared store GC identity is invalid"))?;
+        if identity.to_string() != value {
+            return Err(invalid("shared store GC identity is invalid"));
+        }
+        return Ok(value.to_owned());
+    }
+    let identity = uuid::Uuid::new_v4().to_string();
+    root.write(path, identity.as_bytes(), 0o600)?;
+    Ok(identity)
+}
+
 /// Returns the effective user id; collection only ever touches owned entries.
 fn euid() -> u32 {
     // SAFETY: geteuid inspects process identity and takes no pointers.
@@ -300,7 +319,12 @@ pub async fn sweep_on<B: crate::runtime_storage::LayoutBackend>(
     if identity.uid != euid() {
         return Err(invalid("shared store root is not owned by this user"));
     }
-    let memo_key = format!("{}:{}", identity.device, identity.inode);
+    // The root inode can be recycled after removal while this broker lives.
+    // A random, root-local identity cannot alias an earlier store incarnation.
+    let memo_key = match mode {
+        Mode::Apply => Some(memo_identity(&store_dir)?),
+        Mode::Preview => None,
+    };
     // Evidence first, under the lock. Evidence that cannot be collected
     // completely — a corrupt registry row, an oversized snapshot, an
     // unreadable configuration — retains every candidate; the caller retries.
@@ -344,7 +368,7 @@ pub async fn sweep_on<B: crate::runtime_storage::LayoutBackend>(
         Mode::Apply => memos()
             .lock()
             .expect("memo lock is not poisoned")
-            .remove(&memo_key)
+            .remove(memo_key.as_ref().expect("apply identity"))
             .unwrap_or_default(),
         // A preview never mutates remembered scan state; it builds its own.
         Mode::Preview => Memo {
@@ -386,7 +410,7 @@ pub async fn sweep_on<B: crate::runtime_storage::LayoutBackend>(
         memos()
             .lock()
             .expect("memo lock is not poisoned")
-            .insert(memo_key, memo);
+            .insert(memo_key.expect("apply identity"), memo);
     }
     Ok(outcome)
 }
@@ -904,7 +928,11 @@ fn tree_pass(
         Ok(directory) => directory,
         Err(error) => {
             if not_found(&error) {
-                return Ok(references.pinned_trees.is_empty());
+                if references.pinned_trees.is_empty() {
+                    memo.trees.clear();
+                    return Ok(true);
+                }
+                return Ok(false);
             }
             outcome.incomplete = true;
             return Ok(false);
@@ -970,7 +998,11 @@ fn tree_pass(
             // The store's own verifier proves the entry really is one of its
             // published trees before anything is unlinked; anything less
             // would let a foreign directory with a digest name pass.
-            if proved_tree(root, memo, &scope, manifest).is_err() {
+            let reference = shared_assets::SharedTreeRef {
+                scope: scope.clone(),
+                manifest_sha256: manifest.to_owned(),
+            };
+            if shared_assets::verify_shared_tree(root, &reference).is_err() {
                 // Unreadable, corrupt or foreign evidence retains the object.
                 outcome.incomplete = true;
                 outcome.trees_retained += 1;
@@ -1012,6 +1044,9 @@ fn tree_pass(
     if !references.pinned_trees.iter().all(|key| seen.contains(key)) {
         outcome.incomplete = true;
         complete = false;
+    }
+    if complete && !outcome.incomplete {
+        memo.trees.retain(|key, _| seen.contains(key));
     }
     Ok(complete && !outcome.incomplete)
 }
@@ -1295,4 +1330,36 @@ pub fn preview(store: &Store, app_home: &Path) -> Result<Outcome> {
         app_home,
         Mode::Preview,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_identity_survives_passes_but_not_recreation_or_inode_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("root");
+        std::fs::create_dir(&path).unwrap();
+        let root = fs::Dir::open(&path).unwrap();
+        let first = memo_identity(&root).unwrap();
+        assert_eq!(memo_identity(&root).unwrap(), first);
+        // Deterministically force the inode-alias case without depending on
+        // the host filesystem's allocator: reset the incarnation metadata
+        // while retaining the exact same root descriptor and device/inode.
+        let before = root.entry(None).unwrap();
+        root.remove(Path::new(".gc-identity")).unwrap();
+        let alias = memo_identity(&root).unwrap();
+        let after = root.entry(None).unwrap();
+        assert_eq!((before.device, before.inode), (after.device, after.inode));
+        assert_ne!(first, alias);
+        drop(root);
+        std::fs::remove_dir_all(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let second = memo_identity(&fs::Dir::open(&path).unwrap()).unwrap();
+        assert_ne!(
+            first, second,
+            "even a reused device/inode cannot alias identity"
+        );
+    }
 }
