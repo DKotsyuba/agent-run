@@ -232,7 +232,17 @@ fn closed_error(error: &Error, _method: &str, store: &str) -> Value {
         Error::Validation(message) if message == "attempt not ready" => {
             ("attempt_not_ready", "same_key_lookup")
         }
-        Error::Validation(message) if message == "attempt mismatch" => ("attempt_mismatch", "none"),
+        Error::Validation(message)
+            if matches!(
+                message.as_str(),
+                "attempt mismatch" | "attempt peer executable changed"
+            ) =>
+        {
+            ("attempt_mismatch", "none")
+        }
+        Error::Validation(message) if message == "attempt peer verification failed" => {
+            ("peer_not_authorized", "none")
+        }
         Error::Validation(message) if message == "actor mismatch" => ("actor_mismatch", "none"),
         Error::Validation(message) if message == "invalid attempt actor" => {
             ("actor_mismatch", "none")
@@ -1248,6 +1258,16 @@ mod tests {
         for (message, code, recovery) in [
             ("attempt not ready", "attempt_not_ready", "same_key_lookup"),
             ("attempt mismatch", "attempt_mismatch", "none"),
+            (
+                "attempt peer executable changed",
+                "attempt_mismatch",
+                "none",
+            ),
+            (
+                "attempt peer verification failed",
+                "peer_not_authorized",
+                "none",
+            ),
             ("actor mismatch", "actor_mismatch", "none"),
             ("invalid attempt actor", "actor_mismatch", "none"),
             ("route mismatch", "route_mismatch", "none"),

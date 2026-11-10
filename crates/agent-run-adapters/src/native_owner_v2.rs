@@ -152,7 +152,11 @@ fn verify_build(identity: &agent_run_platform::process::Identity, config: &Confi
         || metadata.dev() != loaded.dev()
         || metadata.ino() != loaded.ino()
         || metadata.len() > 128 * 1024 * 1024
-        || metadata.mtime().max(metadata.ctime()) >= identity.birth.floor() as i64
+    {
+        return Err(fail());
+    }
+    if !agent_run_platform::process::executable_predates_start(before.start_ticks, &metadata)
+        .map_err(|_| fail())?
     {
         return Err(fail());
     }
@@ -476,7 +480,8 @@ mod tests {
             std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
             std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
             let digest = agent_run_platform::fs::sha256(&std::fs::read(&executable).unwrap());
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // A newly installed Bridge may start in the same wall second.
+            tokio::time::sleep(Duration::from_millis(30)).await;
             let mut command = tokio::process::Command::new(&executable);
             command
                 .args([

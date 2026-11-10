@@ -143,6 +143,43 @@ pub fn executable(pid: i32) -> std::io::Result<std::path::PathBuf> {
     }
 }
 
+/// Proves executable timestamps predate a Linux process start on the same clock.
+///
+/// `/proc/stat` btime is rounded to seconds and must not be compared with
+/// filesystem wall timestamps. Sample REALTIME before BOOTTIME instead: their
+/// offset plus the kernel's truncated start ticks gives a conservative lower
+/// bound, at nanosecond resolution. Ambiguous starts in the same tick refuse.
+/// The caller must still verify loaded inode, build digest and incarnation.
+#[cfg(target_os = "linux")]
+pub fn executable_predates_start(
+    start_ticks: u64,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    fn clock(id: libc::clockid_t) -> std::io::Result<i128> {
+        let mut spec = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: spec is a valid writable timespec and id is a supported clock.
+        if unsafe { libc::clock_gettime(id, &mut spec) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(i128::from(spec.tv_sec) * 1_000_000_000 + i128::from(spec.tv_nsec))
+    }
+    // SAFETY: sysconf takes no pointers and only reads the kernel tick rate.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz <= 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let wall = clock(libc::CLOCK_REALTIME)?;
+    let boot = clock(libc::CLOCK_BOOTTIME)?;
+    let start = wall - boot + i128::from(start_ticks) * 1_000_000_000 / i128::from(hz);
+    let modified = i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec());
+    let changed = i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec());
+    Ok(modified.max(changed) < start)
+}
+
 /// Reads one Linux process identity from procfs without trusting command-name encoding.
 ///
 /// `pid` must be greater than one. The function returns the underlying procfs,

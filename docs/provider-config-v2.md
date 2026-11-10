@@ -423,3 +423,25 @@ MCP status may omit per-server tool inventories; Run therefore also checks the
 subsequent `system/init` tool list as a mandatory tripwire before
 durable qualification or v2 owner handoff. Mismatch closes stdin and fails the
 run. Actual provider and hook qualification still requires the approved dobi run.
+
+### Upgrading Bridge
+
+Stop Pool delivery and the Bridge daemon before atomically replacing Bridge's
+binary at its pinned path. Start the new Bridge daemon, update Run's transport
+executable SHA-256 and any Bridge reader/custody pins, then restart Run. Update
+Pool's Bridge pin and run `agent-pool repin` before restarting Pool delivery.
+Verify the daemon actually holds the configured socket and runs the new inode;
+replacing a file does not upgrade an already running process.
+
+Resume running managed members as new launches under the new configuration.
+Each launch freezes its owner-v2 Bridge build pin; re-pinning Pool or reloading
+Run never changes an old launch's authority. Preserve old delivery keys and
+resolve their outcomes before retiring the original namespace. A new launch
+must not replay an uncertain native effect under a new key.
+
+Executable age checks compare nanosecond timestamps on a clock calibrated from
+Linux REALTIME and BOOTTIME. No whole-second installation delay is required.
+A start within the kernel's truncated start tick remains ambiguous and refuses
+closed; restart after that tick. A mismatched build or executable changed after
+start is `attempt_mismatch/none`, requiring a correctly pinned relaunch; other
+peer authentication failures are `peer_not_authorized/none`.

@@ -105,9 +105,13 @@ pub(crate) fn verify_peer(stream: &UnixStream, pin: &PeerPin) -> Result<()> {
         || metadata.dev() != loaded.dev()
         || metadata.ino() != loaded.ino()
         || metadata.len() > 512 * 1024 * 1024
-        || metadata.mtime().max(metadata.ctime()) >= before.birth.floor() as i64
     {
         return Err(reject());
+    }
+    if !agent_run_platform::process::executable_predates_start(kernel.start_ticks, &metadata)
+        .map_err(|_| reject())?
+    {
+        return Err(invalid("attempt peer executable changed"));
     }
     let mut hash = Sha256::new();
     let mut buf = [0u8; 65536];
@@ -135,9 +139,11 @@ pub(crate) fn verify_peer(stream: &UnixStream, pin: &PeerPin) -> Result<()> {
         || metadata.dev() != after_loaded.dev()
         || metadata.ino() != after_loaded.ino()
         || after_link != path
-        || agent_run_domain::canonical::hex_digest(&hash.finalize()) != pin.sha256
     {
         return Err(reject());
+    }
+    if agent_run_domain::canonical::hex_digest(&hash.finalize()) != pin.sha256 {
+        return Err(invalid("attempt peer executable changed"));
     }
     let after = agent_run_platform::process::kernel_incarnation(&before).map_err(|_| reject())?;
     read_peer()?;
@@ -1112,6 +1118,84 @@ mod tests {
                     .unwrap();
                 super::test_peer::wait_build_age(&executable).await;
             }
+        }
+    }
+
+    /// An in-place build upgrade must admit immediate new/resumed launches,
+    /// while the old launch's frozen pin and the old loaded inode refuse.
+    #[tokio::test]
+    async fn in_place_bridge_upgrade_preserves_launch_pins_without_second_age_floor() {
+        use std::{io::Write, os::unix::fs::PermissionsExt};
+        let dir = tempfile::Builder::new()
+            .prefix("r2-upgrade-")
+            .tempdir()
+            .unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = super::test_peer::copy_peer(dir.path());
+        // SAFETY: geteuid is read-only with no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let old_pin = PeerPin {
+            uid,
+            executable: executable.clone(),
+            sha256: agent_run_platform::fs::sha256(&std::fs::read(&executable).unwrap()),
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let socket = dir.path().join("old.sock");
+        let ready = dir.path().join("old.ready");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mut old = super::test_peer::child_at(&executable, "hold-client", &socket)
+            .env("RUN_R2_PEER_READY", &ready)
+            .spawn()
+            .unwrap();
+        let (old_stream, _) = listener.accept().await.unwrap();
+        super::test_peer::wait_file(&ready).await;
+        assert!(verify_peer(&old_stream, &old_pin).is_ok());
+        let replacement = dir.path().join("replacement");
+        std::fs::copy(std::env::current_exe().unwrap(), &replacement).unwrap();
+        // A second valid ELF build with a distinct digest; the loader ignores
+        // trailing bytes. Atomically replace the exact pinned executable path.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&replacement)
+            .unwrap()
+            .write_all(b"upgrade-build-2")
+            .unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::rename(&replacement, &executable).unwrap();
+        let new_pin = PeerPin {
+            uid,
+            executable: executable.clone(),
+            sha256: agent_run_platform::fs::sha256(&std::fs::read(&executable).unwrap()),
+        };
+        assert_ne!(new_pin.sha256, old_pin.sha256);
+        assert!(verify_peer(&old_stream, &new_pin).is_err());
+        drop(old_stream);
+        assert!(old.wait().await.unwrap().success());
+        // A few kernel ticks, deliberately less than the old 1-2 second age
+        // workaround, resolves tick truncation without assuming btime accuracy.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        for launch in ["resumed", "new"] {
+            let socket = dir.path().join(format!("{launch}.sock"));
+            let ready = dir.path().join(format!("{launch}.ready"));
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let mut child = super::test_peer::child_at(&executable, "hold-client", &socket)
+                .env("RUN_R2_PEER_READY", &ready)
+                .spawn()
+                .unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            super::test_peer::wait_file(&ready).await;
+            assert!(verify_peer(&stream, &new_pin).is_ok(), "{launch}");
+            assert!(verify_peer(&stream, &old_pin).is_err(), "stale launch pin");
+            // Changing metadata after process start is still rejected with
+            // an explicit attempt mismatch, despite matching inode and hash.
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(
+                matches!(verify_peer(&stream, &new_pin), Err(Error::Validation(message))
+                if message == "attempt peer executable changed")
+            );
+            drop(stream);
+            assert!(child.wait().await.unwrap().success());
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         }
     }
 
