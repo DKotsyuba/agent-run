@@ -55,6 +55,76 @@ fn trusted_binary(path: &std::path::Path, expected: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether the frozen configuration selects `role` as the managed role.
+pub fn selects(
+    config: &agent_run_config::provider_config::ProviderConfig,
+    role: &agent_run_config::role_plan::ResolvedRolePlan,
+) -> bool {
+    config
+        .managed_attempt_binding
+        .as_ref()
+        .is_some_and(|settings| settings.enabled && settings.role_name == role.role_name)
+}
+
+/// Component builds are delivery configuration, not role identity. For one new
+/// launch of a frozen managed role, keep every semantic fact of the frozen
+/// snapshot (selector, Pool server declaration and tool cap, Bridge hook
+/// declaration, host) and take only the component build pins (Pool frontend
+/// and resident, Bridge hook, Run transport) from the current validated
+/// configuration. A semantic difference is refused, never adopted. The role
+/// digest is the frozen role payload's revision and is unaffected.
+pub fn launch_build_pins(
+    frozen: &agent_run_config::provider_config::ProviderConfig,
+    current: &agent_run_config::provider_config::ProviderConfig,
+    harness: agent_run_domain::catalog::HarnessId,
+) -> Result<agent_run_config::provider_config::ProviderConfig> {
+    let changed = || invalid("managed role changed since admission");
+    let (Some(original), Some(live)) = (
+        frozen.managed_attempt_binding.as_ref(),
+        current.managed_attempt_binding.as_ref(),
+    ) else {
+        return Err(changed());
+    };
+    let value = |value: Option<Value>| value.unwrap_or(Value::Null);
+    let hooks = |config: &agent_run_config::provider_config::ProviderConfig| {
+        value(
+            config
+                .harnesses
+                .get(&harness)
+                .and_then(|runtime| serde_json::to_value(&runtime.hooks).ok()),
+        )
+    };
+    let server = |config: &agent_run_config::provider_config::ProviderConfig| {
+        value(
+            config
+                .mcp
+                .get(&original.pool_server)
+                .and_then(|server| serde_json::to_value(server).ok()),
+        )
+    };
+    if !original.enabled
+        || !live.enabled
+        || live.role_name != original.role_name
+        || live.pool_server != original.pool_server
+        || live.host_id != original.host_id
+        || hooks(current) != hooks(frozen)
+        || server(current) != server(frozen)
+    {
+        return Err(changed());
+    }
+    let mut launch = frozen.clone();
+    let settings = launch
+        .managed_attempt_binding
+        .as_mut()
+        .expect("checked above");
+    settings.pool_executable_sha256 = live.pool_executable_sha256.clone();
+    settings.bridge_hook_sha256 = live.bridge_hook_sha256.clone();
+    settings.pool_resident_executable = live.pool_resident_executable.clone();
+    settings.pool_resident_sha256 = live.pool_resident_sha256.clone();
+    settings.transport = live.transport.clone();
+    Ok(launch)
+}
+
 /// Select only the explicitly named restricted role. Every enabled selection
 /// rejects plugins, skills, broad tools, extra MCPs and unpinned executables.
 /// An absent/disabled switch or a different role always stays ordinary.

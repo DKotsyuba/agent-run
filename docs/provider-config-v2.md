@@ -441,7 +441,18 @@ start, an explicit resume or an account switch, pins the current validated
 and role keep their frozen resume snapshot. A system route keeps its
 root-approved admission transport. Each launch freezes that pin for its life;
 re-pinning Pool or reloading Run never changes an old launch's authority, and
-its destination fence refuses once the current transport differs. Preserve old
+its destination fence refuses once the current transport differs. The same
+split applies to managed role selection: a real Bridge or Pool upgrade also
+replaces the Bridge `PreToolUse` hook or the Pool frontend, so update
+`bridge_hook_sha256`, `pool_executable_sha256` and the resident pins with the
+transport. Each new launch verifies the hook and frontend against the current
+pins, while role semantics stay frozen: the role payload (and so the role
+digest Run attests to Pool), harness kind, explicit finish, the selector's
+`role_name`, `pool_server` and `host_id`, the `[mcp.<pool_server>]`
+declaration including `allowed_tools`, and the harness hook declarations. A
+resume whose current configuration changes any of these is refused as
+`managed role changed since admission` rather than adopting it; start a new
+member instead. System routes keep their admission snapshot. Preserve old
 delivery keys and resolve their outcomes before retiring the original
 namespace. A new launch must not replay an uncertain native effect under a new
 key.
