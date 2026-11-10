@@ -6722,6 +6722,286 @@ async fn managed_claude_supervisor_qualifies_with_catalog_complement() {
     broker.kill().await.unwrap();
 }
 
+/// The real resident broker admits a managed Claude member through the P3
+/// resident wire and runs it to its explicit finish. An in-place upgrade then
+/// replaces the Bridge PreToolUse hook and the Bridge daemon executables and
+/// re-pins both digests in the current configuration. `agent-run resume`
+/// through the same broker must launch the resumed execution against the
+/// current builds: its frozen identity keeps the admission pins, and the
+/// launch plan, role selection and owner transport verify the replaced ones.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn managed_resume_after_bridge_upgrade_verifies_current_component_builds() {
+    use agent_run_config::{
+        config::{Environment, Hook},
+        provider_config::{ManagedAttemptBinding, ManagedAttemptTransport},
+    };
+    use agent_run_domain::{HarnessId, attempt_binding::Route};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let base = std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let (_temp, home) = home_in(&base, "", &[]);
+    let ipc = tempfile::Builder::new()
+        .prefix("p3")
+        .tempdir_in(base)
+        .unwrap();
+    fs::set_permissions(ipc.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = ipc.path().canonicalize().unwrap();
+    let channel = dir.join("bridge.sock");
+    let _bridge = std::os::unix::net::UnixListener::bind(&channel).unwrap();
+    fs::set_permissions(&channel, fs::Permissions::from_mode(0o600)).unwrap();
+    let owner = dir.join("o");
+    fs::create_dir(&owner).unwrap();
+    fs::set_permissions(&owner, fs::Permissions::from_mode(0o700)).unwrap();
+    // A real upgrade installs a new inode at the same path.
+    let install = |path: &Path, bytes: &[u8]| {
+        let staged = path.with_extension("new");
+        fs::write(&staged, bytes).unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::rename(staged, path).unwrap();
+        agent_run_platform::fs::sha256(bytes)
+    };
+    let build = |source: &str, tag: &[u8]| {
+        let mut bytes = fs::read(source).unwrap();
+        bytes.extend_from_slice(tag);
+        bytes
+    };
+    let frontend = home.join("pool-frontend");
+    fs::copy(env!("CARGO_BIN_EXE_agent-run-fixture"), &frontend).unwrap();
+    fs::set_permissions(&frontend, fs::Permissions::from_mode(0o700)).unwrap();
+    let frontend_sha = agent_run_platform::fs::sha256(&fs::read(&frontend).unwrap());
+    let hook = dir.join("bridge-hook");
+    let hook_a = install(&hook, &build("/usr/bin/true", b""));
+    let bridge = dir.join("bridge-native-daemon");
+    let bridge_a = install(&bridge, &build("/usr/bin/false", b""));
+    let reader = dir.join("reader");
+    fs::write(&reader, "synthetic-reader\n").unwrap();
+    fs::set_permissions(&reader, fs::Permissions::from_mode(0o600)).unwrap();
+    let sid =
+        agent_run_store::store_identity::read(&agent_run_store::fixture::open(&home).unwrap().conn)
+            .unwrap();
+    // SAFETY: geteuid is read-only.
+    let uid = unsafe { libc::geteuid() };
+    let route = |store: &str, id: &str| Route {
+        component_store_id: store.into(),
+        route_id: id.into(),
+        worker_uid: uid,
+    };
+    let mut config = agent_run_config::provider_config::ProviderConfig::load(&home)
+        .unwrap()
+        .0;
+    let harness = config.harnesses.get_mut(&HarnessId::ClaudeCode).unwrap();
+    harness.hooks = vec![Hook {
+        event: "PreToolUse".into(),
+        command: vec![hook.to_string_lossy().into_owned()],
+        matcher: Some("mcp__pool__.*".into()),
+    }];
+    harness.environment = Some("owner-fixture".into());
+    let mut environment = Environment::default();
+    environment.variables.insert(
+        "BRIDGE_NATIVE_OWNER_CHANNEL".into(),
+        channel.to_string_lossy().into_owned(),
+    );
+    environment.variables.insert(
+        "BRIDGE_NATIVE_OWNER_DIRECTORY".into(),
+        owner.to_string_lossy().into_owned(),
+    );
+    config
+        .environments
+        .insert("owner-fixture".into(), environment);
+    config.mcp.insert("pool".into(),serde_json::from_value(serde_json::json!({"transport":"stdio","command":frontend,"args":["mcp","--config",home.join("pool.toml")],"env_from":[],"approval_mode":"approve","allowed_tools":["pool_get"]})).unwrap());
+    config.managed_attempt_binding = Some(Box::new(ManagedAttemptBinding {
+        enabled: true,
+        role_name: "review".into(),
+        pool_server: "pool".into(),
+        pool_executable_sha256: frontend_sha.clone(),
+        bridge_hook_sha256: hook_a.clone(),
+        host_id: "host".into(),
+        pool_resident_executable: Some(frontend.clone()),
+        pool_resident_sha256: Some(frontend_sha),
+        transport: Some(ManagedAttemptTransport {
+            run_route: route(&sid.to_string(), "run"),
+            pool_route: route("00000000-0000-4000-8000-000000000031", "pool"),
+            bridge_route: route("00000000-0000-4000-8000-000000000032", "bridge"),
+            producer: "pool".into(),
+            pool_socket: dir.join("pool.sock"),
+            bridge_socket: channel,
+            bridge_executable: bridge.clone(),
+            bridge_executable_sha256: bridge_a.clone(),
+            bridge_reader_credential_file: reader,
+            bridge_reader_credential_sha256: agent_run_platform::fs::sha256(b"synthetic-reader"),
+        }),
+        bridge_receipt_readers: vec![],
+        bridge_custody_readers: vec![],
+    }));
+    fs::write(home.join("profiles/review.md"),"+++\nrevision='1'\nwrite=false\nnetwork=false\nallow_external_read_roots=false\nskills=[]\nmcp=['pool']\nrequired_constraints=[]\n+++\nManaged fixture.\n").unwrap();
+    fs::write(home.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
+    let mut broker = resident_broker(&home);
+    broker_ready(&home, &mut broker).await;
+    let mut request = request(&home);
+    request.explicit_finish = true;
+    request.task = "fixture:worker-finish".into();
+    request.orchestrator = None;
+    request.request_id = None;
+    let mut spec = serde_json::to_value(request).unwrap();
+    spec.as_object_mut().unwrap().remove("request_id");
+    let params = serde_json::json!({"version":1,"expected_store_id":sid,"pool_store_id":"00000000-0000-4000-8000-000000000031","pool_id":"pool","request_id":"p3-managed-upgrade","mode":"start","jobs":[{"member_id":"member","selector":{"version":1,"role_name":"review"},"spec":spec}],"preconditions":[]});
+    let request_file = dir.join("request.json");
+    let output_file = dir.join("reply.json");
+    fs::write(
+        &request_file,
+        serde_json::to_vec(
+            &serde_json::json!({"id":"start","method":"_managed_start_batch_v1","params":params}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // The loaded executable must predate the client process, including ctime.
+    let metadata = fs::metadata(&frontend).unwrap();
+    let newest = metadata.mtime().max(metadata.ctime());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    if now <= newest + 2 {
+        tokio::time::sleep(Duration::from_secs((newest + 3 - now) as u64)).await;
+    }
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        isolated_command(&frontend)
+            .env_clear()
+            .env("RUN_P3_FIXTURE", "1")
+            .args(["p3-client", "--socket"])
+            .arg(home.join("attempt.sock"))
+            .arg("--request-file")
+            .arg(&request_file)
+            .arg("--output-file")
+            .arg(&output_file)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        result.status.success(),
+        "synthetic resident failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let response: serde_json::Value =
+        serde_json::from_slice(&fs::read(&output_file).unwrap()).unwrap();
+    assert_eq!(response["result"]["state"], "admitted", "{response}");
+    let id: AgentId =
+        serde_json::from_value(response["result"]["jobs"][0]["execution_id"].clone()).unwrap();
+    let terminal = async |id: &AgentId| {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let row = agent_run_store::fixture::open(&home)
+                .unwrap()
+                .get(id)
+                .unwrap();
+            if row.status.terminal() {
+                return row;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "managed Claude fixture did not finish"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    let parent = terminal(&id).await;
+    assert_eq!(
+        parent.status,
+        Status::Succeeded,
+        "{:?}: {:?}",
+        parent.failure_kind,
+        parent.failure_text
+    );
+    // In-place upgrade of every Bridge executable Run pins; the current
+    // configuration follows, the frozen identity does not.
+    let hook_b = install(&hook, &build("/usr/bin/true", b"\nbridge-hook-B\n"));
+    let bridge_b = install(&bridge, &build("/usr/bin/false", b"\nbridge-daemon-B\n"));
+    assert_ne!(hook_a, hook_b);
+    assert_ne!(bridge_a, bridge_b);
+    let settings = config.managed_attempt_binding.as_mut().unwrap();
+    settings.bridge_hook_sha256 = hook_b.clone();
+    settings
+        .transport
+        .as_mut()
+        .unwrap()
+        .bridge_executable_sha256 = bridge_b.clone();
+    fs::write(home.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
+    let resumed = tokio::time::timeout(
+        Duration::from_secs(30),
+        isolated_command(env!("CARGO_BIN_EXE_agent-run"))
+            .arg("--home")
+            .arg(&home)
+            .args(["resume", id.as_str(), "--task", "fixture:worker-finish"])
+            .args(["--request-id", "resume-after-upgrade"])
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        resumed.status.success(),
+        "resume refused: {} {}",
+        String::from_utf8_lossy(&resumed.stdout),
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let admitted: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(admitted["created"], true, "{admitted}");
+    // The public identity is the lineage; its new execution is the child.
+    assert_eq!(admitted["agent_id"], id.as_str());
+    let child_id: AgentId = agent_run_store::fixture::open(&home)
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT id FROM agents WHERE parent_agent_id=?",
+            [id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+        .parse()
+        .unwrap();
+    let child = terminal(&child_id).await;
+    assert_eq!(
+        child.status,
+        Status::Succeeded,
+        "{:?}: {:?}",
+        child.failure_kind,
+        child.failure_text
+    );
+    assert_eq!((&child.root_agent_id, child.sequence), (&id, 2));
+    // Role semantics and the admission snapshot stay frozen in the identity.
+    let frozen = &child.identity.as_ref().unwrap()["provider_config"]["managed_attempt_binding"];
+    assert_eq!(frozen["bridge_hook_sha256"], hook_a.as_str());
+    assert_eq!(
+        frozen["transport"]["bridge_executable_sha256"],
+        bridge_a.as_str()
+    );
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM attempt_role_qualifications q JOIN attempts t ON t.id=q.attempt_id WHERE t.agent_id=?",
+                [child_id.as_str()],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    drop(store);
+    broker.kill().await.unwrap();
+}
+
 /// A managed Claude home relocates into the shared store and launches its
 /// sealed native executable directly. Offline compaction must still consolidate
 /// it.

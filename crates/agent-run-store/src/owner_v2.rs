@@ -141,6 +141,7 @@ fn reason(value: &str) -> bool {
             | "capacity"
             | "conflict"
             | "attempt_not_ready"
+            | "attempt_mismatch"
             | "qualification_pending"
             | "native_uncertain"
             | "channel_failed"

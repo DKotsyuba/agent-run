@@ -431,6 +431,66 @@ pub(crate) async fn prepare_v2(
     PreparedV2::Invoke(token)
 }
 
+/// Durably record the typed refusal of a live configured Bridge whose build
+/// differs from this launch's pin, for an effect addressed to this exact
+/// attempt, then answer it. Nothing is invoked and no native input is written;
+/// an existing durable outcome is replayed instead. An effect addressed
+/// elsewhere, or a disabled managed binding, is answered without a record.
+pub(crate) async fn stale_v2(
+    process: &mut Process,
+    store: &mut Persist,
+    record: &Record,
+    request: &agent_run_domain::owner_v2::RequestV2,
+    session: Option<&str>,
+) -> agent_run_domain::owner_v2::ReplyV2 {
+    use agent_run_adapters::native_owner_v2::reply;
+    let mismatch = || {
+        reply(
+            request,
+            "known_unsent",
+            None,
+            None,
+            Some("attempt_mismatch"),
+        )
+    };
+    let binding = &request.outbox_intent.target_binding;
+    let attempt = &binding.attempt;
+    let addressed = request.validate().is_ok()
+        && attempt.execution_id == record.id
+        && attempt.lineage_root_id == record.root_agent_id
+        && attempt.sequence == record.sequence
+        && store.bound_attempt() == Some(attempt.attempt_id.as_str())
+        && session == Some(binding.actor.native_id.as_str())
+        && binding.actor.role == "root"
+        && agent_run_store::store_identity::read(&store.conn)
+            .is_ok_and(|identity| identity == attempt.run_store_id);
+    if !addressed {
+        return mismatch();
+    }
+    let reservation = match process
+        .observing(store.reserve_owner_effect(request, true))
+        .await
+    {
+        Ok(value) => value,
+        Err(agent_run_domain::Error::Conflict) => return conflict_reply(store, request),
+        Err(_) => return mismatch(),
+    };
+    let Some(token) = reservation.dispatch_token else {
+        return effect_reply(request, &reservation.view);
+    };
+    finish_v2(
+        process,
+        store,
+        request,
+        &token,
+        "known_unsent",
+        None,
+        None,
+        Some("attempt_mismatch"),
+    )
+    .await
+}
+
 /// An owner reply is constructed only after its matching durable transition.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finish_v2(
@@ -926,6 +986,48 @@ bridge_reader_credential_sha256='{credential}'
                 expected
             );
         }
+        // The still-running launch pinned to D records the live Bridge's
+        // stale-build refusal durably and replays it; nothing is invoked. An
+        // effect addressed to another execution gets the typed answer only.
+        let mut stale = request.clone();
+        stale.outbox_intent.effect_id = "stale-build".into();
+        stale.effect_digest = outbox_digest(&stale.outbox_intent).unwrap();
+        for _ in 0..2 {
+            let reply = stale_v2(&mut process, &mut persist, &record, &stale, Some("native")).await;
+            assert_eq!(
+                (reply.state.as_str(), reply.reason.as_deref()),
+                ("known_unsent", Some("attempt_mismatch"))
+            );
+        }
+        assert_eq!(
+            persist
+                .conn
+                .query_row(
+                    "SELECT state,protocol,native_id,reason FROM owner_effects WHERE effect_id='stale-build'",
+                    [],
+                    |row| Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?
+                    ))
+                )
+                .unwrap(),
+            ("known_unsent".into(), None, None, Some("attempt_mismatch".into()))
+        );
+        let mut elsewhere = stale.clone();
+        elsewhere.outbox_intent.effect_id = "stale-elsewhere".into();
+        elsewhere.outbox_intent.target_binding.attempt.execution_id = AgentId::new();
+        elsewhere.effect_digest = outbox_digest(&elsewhere.outbox_intent).unwrap();
+        let reply = stale_v2(
+            &mut process,
+            &mut persist,
+            &record,
+            &elsewhere,
+            Some("native"),
+        )
+        .await;
+        assert_eq!(reply.reason.as_deref(), Some("attempt_mismatch"));
         std::fs::write(config_path, original_config).unwrap();
         assert!(!marker.exists());
         assert_eq!(
@@ -934,7 +1036,7 @@ bridge_reader_credential_sha256='{credential}'
                 .query_row("SELECT count(*) FROM owner_effects", [], |row| row
                     .get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
         writer
             .broker()
@@ -979,7 +1081,7 @@ bridge_reader_credential_sha256='{credential}'
                 .query_row("SELECT count(*) FROM owner_effects", [], |row| row
                     .get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
         match prepare_v2(
             &mut process,

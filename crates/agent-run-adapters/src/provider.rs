@@ -478,6 +478,11 @@ pub struct LaunchOptions<'a> {
     pub fast: bool,
     /// Claude JSON answer schema.
     pub output_schema: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    /// Current validated configuration whose component build pins (Pool
+    /// frontend and resident, Bridge hook, Run transport) this launch of a
+    /// frozen managed role verifies. Role semantics stay frozen: see
+    /// [`crate::managed_role::launch_build_pins`]. `None` uses the frozen pins.
+    pub managed_builds: Option<&'a ProviderConfig>,
 }
 
 /// [`plan_selected_with`] with no per-request harness options and a strictly
@@ -729,7 +734,20 @@ pub fn plan_selected_with(
                 .into_owned(),
         );
     }
-    let managed = crate::managed_role::select(config, sealed.harness, &role, role.worker_mcp)?;
+    // A new launch of the frozen managed role verifies the current component
+    // builds; any semantic difference in `managed_builds` is refused.
+    let launch_builds = match options.managed_builds {
+        Some(current) if crate::managed_role::selects(config, &role) => Some(
+            crate::managed_role::launch_build_pins(config, current, sealed.harness)?,
+        ),
+        _ => None,
+    };
+    let managed = crate::managed_role::select(
+        launch_builds.as_ref().unwrap_or(config),
+        sealed.harness,
+        &role,
+        role.worker_mcp,
+    )?;
     let args = if sealed.harness == HarnessId::OpenCode {
         crate::opencode::model_ref(&sealed.native_model)?;
         let selected_key = if matches!(

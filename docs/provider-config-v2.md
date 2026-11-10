@@ -446,7 +446,8 @@ split applies to managed role selection: a real Bridge or Pool upgrade also
 replaces the Bridge `PreToolUse` hook or the Pool frontend, so update
 `bridge_hook_sha256`, `pool_executable_sha256` and the resident pins with the
 transport. Each new launch verifies the hook and frontend against the current
-pins, while role semantics stay frozen: the role payload (and so the role
+pins, both when the launch plan is built and when the role is selected, while
+the execution identity keeps its admission snapshot. Role semantics stay frozen: the role payload (and so the role
 digest Run attests to Pool), harness kind, explicit finish, the selector's
 `role_name`, `pool_server` and `host_id`, the `[mcp.<pool_server>]`
 declaration including `allowed_tools`, and the harness hook declarations. A
@@ -472,5 +473,10 @@ A stale frozen launch build pin remains `attempt_mismatch/none`, requiring a
 correctly pinned relaunch: on the per-launch owner-v2 endpoint, a live
 configured Bridge that passes every other proof but runs another build than
 the launch pin receives `known_unsent` with reason `attempt_mismatch`, and no
-native input is written. Other peer authentication failures (including an
-unsupported filesystem or replaced inode) are `peer_not_authorized/none`.
+native input is written. Once the launch is qualified, an effect addressed to
+that exact attempt is also recorded durably in `owner_effects` as
+`known_unsent`/`attempt_mismatch`, and an identical retry replays it. Such a
+launch can no longer be woken, but its explicit finish still settles it: a
+Codex finish result that arrives after its turn went idle is the observed
+receipt. Other peer authentication failures (including an unsupported
+filesystem or replaced inode) are `peer_not_authorized/none`.

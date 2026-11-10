@@ -1147,6 +1147,7 @@ async fn run_inner(
             biased;
             call = agent_run_adapters::native_owner_v2::Owner::receive(&mut native_owner_v2) => {
                 use agent_run_adapters::io::RpcDisposition;
+                if call.stale {let reply=crate::native_owner::stale_v2(process,store,logical_record,&call.request,Some(&tid)).await;call.answer(reply);continue;}
                 let prepared = crate::native_owner::prepare_v2(process,store,logical_record,&call.request,call.deadline,&call.transport,Some(&tid),idle,closing_at.is_some()).await;
                 let token = match prepared {
                     crate::native_owner::PreparedV2::Reply(reply) => {call.answer(reply);continue;}
@@ -1698,6 +1699,22 @@ async fn run_inner(
                 .await?;
             continue;
         }
+        // A worker finish result can arrive after its turn already completed
+        // (the session is idle, or the item names an earlier turn of this
+        // thread). It is still this attempt's observed receipt: the accepted
+        // finish digest binds it. Dropping it would leave the accepted finish
+        // unobserved, so closing would never begin.
+        if record.request.explicit_finish
+            && method == "item/completed"
+            && (idle || event_turn.is_some_and(|id| id != turn_id))
+            && let Some(item) = p.get("item").filter(|item| worker_finish_item(item))
+        {
+            let text = item
+                .pointer("/result/content")
+                .map(Value::to_string)
+                .unwrap_or_default();
+            crate::worker_finish::receipt(process, store, record, &text).await?;
+        }
         if event_turn.is_some_and(|id| id != turn_id) {
             record_native_event(process, store, &record.id, method, p).await?;
             continue;
@@ -1909,12 +1926,7 @@ async fn run_inner(
                             .map(str::to_owned)
                     })
                     .unwrap_or_default();
-                    if item.get("type").and_then(Value::as_str) == Some("mcpToolCall")
-                        && item.get("server").and_then(Value::as_str)
-                            == Some(agent_run_domain::worker::SERVER_NAME)
-                        && item.get("tool").and_then(Value::as_str) == Some("finish")
-                        && tool_error(item).is_none_or(|(error, _)| !error)
-                    {
+                    if worker_finish_item(item) {
                         crate::worker_finish::receipt(process, store, record, &text).await?;
                     }
                     process
@@ -2704,6 +2716,14 @@ async fn native_job_completion(
         ))
         .await?;
     Ok(())
+}
+
+/// A completed, not explicitly failed call of this attempt's worker finish tool.
+fn worker_finish_item(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("mcpToolCall")
+        && item.get("server").and_then(Value::as_str) == Some(agent_run_domain::worker::SERVER_NAME)
+        && item.get("tool").and_then(Value::as_str) == Some("finish")
+        && tool_error(item).is_none_or(|(error, _)| !error)
 }
 
 /// Returns explicit error evidence for a completed native command or MCP item.

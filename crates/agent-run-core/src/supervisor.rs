@@ -1107,6 +1107,7 @@ pub fn native_publication_root(
         adapters::provider::LaunchOptions {
             fast: request.fast,
             output_schema: identity.provider_request.output_schema.as_ref(),
+            managed_builds: None,
         },
         shared.as_ref(),
     )?;
@@ -1223,6 +1224,7 @@ pub async fn relocate_retained_home_on<B: crate::runtime_storage::LayoutBackend>
         adapters::provider::LaunchOptions {
             fast: row.request.fast,
             output_schema: identity.provider_request.output_schema.as_ref(),
+            managed_builds: None,
         },
         None,
     ) {
@@ -1572,6 +1574,16 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             &runtime_home,
             identity.runtime_home.is_some(),
         )?;
+        // Role semantics stay frozen; component build pins come from the
+        // current configuration at this launch, like the Bridge transport.
+        // Planning and the later selection both use this one read.
+        let managed_config = launch_managed_config(
+            home,
+            &config,
+            identity.system_route.is_some(),
+            identity.authority.harness,
+            &ResolvedRolePlan::from_payload(&identity.authority.role_payload)?,
+        )?;
         if identity.runtime_home.is_none() {
             let role = ResolvedRolePlan::from_payload(&identity.authority.role_payload)?;
             let (_, digest) = adapters::provider::materialize_selected(
@@ -1616,6 +1628,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 adapters::provider::LaunchOptions {
                     fast: row.request.fast,
                     output_schema: identity.provider_request.output_schema.as_ref(),
+                    managed_builds: Some(&managed_config),
                 },
                 None,
             )?;
@@ -1737,17 +1750,9 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             adapters::provider::LaunchOptions {
                 fast: row.request.fast,
                 output_schema: identity.provider_request.output_schema.as_ref(),
+                managed_builds: Some(&managed_config),
             },
             Some(&shared_assets),
-        )?;
-        // Role semantics stay frozen; component build pins come from the
-        // current configuration at this launch, like the Bridge transport.
-        let managed_config = launch_managed_config(
-            home,
-            &config,
-            identity.system_route.is_some(),
-            identity.authority.harness,
-            &planned.role,
         )?;
         let managed_selection = adapters::managed_role::select(
             &managed_config,

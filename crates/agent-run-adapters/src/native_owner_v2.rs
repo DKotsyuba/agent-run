@@ -24,6 +24,8 @@ use tokio::{
 pub const LOCATOR: &str = "BRIDGE_NATIVE_OWNER_SOCKET_V2";
 /// Refusal for a live Bridge whose build differs from this launch's pin.
 const STALE_BUILD: &str = "owner v2 Bridge build differs from launch pin";
+/// Longest wait for the owner lane to record a stale-build refusal.
+const STALE_RECORD_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 /// Bridge channel/build pinned at this launch and private per-launch parent directory.
 #[derive(Clone)]
 pub struct Config {
@@ -40,6 +42,10 @@ pub struct Call {
     /// This launch's pinned transport; its Bridge socket is the endpoint's
     /// checked local trust anchor, never from request JSON.
     pub transport: agent_run_config::provider_config::ManagedAttemptTransport,
+    /// The live configured Bridge passed every proof except this launch's
+    /// build pin. The owner records only a durable `known_unsent` with reason
+    /// `attempt_mismatch` and never writes native input.
+    pub stale: bool,
     reply: oneshot::Sender<ReplyV2>,
 }
 impl Call {
@@ -59,6 +65,7 @@ impl Call {
                 request,
                 deadline,
                 transport,
+                stale: false,
                 reply,
             },
             receiver,
@@ -311,13 +318,6 @@ impl Owner {
                     let mut bytes = vec![0; length];
                     stream.read_exact(&mut bytes).await?;
                     let request = match decode_request(&bytes) {
-                        Ok(request) if stale => Err(reply(
-                            &request,
-                            "known_unsent",
-                            None,
-                            None,
-                            Some("attempt_mismatch"),
-                        )),
                         Ok(request) => Ok(request),
                         Err(_) => {
                             let (call_id, effect_id, effect_digest) = invalid_request_echo(&bytes)
@@ -347,41 +347,79 @@ impl Owner {
                         Err(error) => return Err(error),
                         Ok(()) => return Err(invalid("owner v2 peer unavailable")),
                     }
-                    Ok::<_, agent_run_domain::Error>(request)
+                    Ok::<_, agent_run_domain::Error>((request, stale))
                 };
-                let Ok(Ok(request)) = timeout_at(deadline, input).await else {
+                let Ok(Ok((request, stale))) = timeout_at(deadline, input).await else {
                     continue;
                 };
-                let result = if let Err(refusal) = request {
-                    refusal
-                } else {
-                    let request = request.expect("checked valid request");
-                    if !current.load(Ordering::Acquire) {
-                        reply(
+                let result = match request {
+                    Err(refusal) => refusal,
+                    Ok(request) => {
+                        // A stale build never gets native input. A qualified
+                        // owner records the typed refusal durably; any lane
+                        // failure still answers it, since nothing was written.
+                        let mismatch = reply(
                             &request,
                             "known_unsent",
                             None,
                             None,
-                            Some("qualification_pending"),
-                        )
-                    } else {
-                        let fallback =
-                            reply(&request, "unknown", None, None, Some("native_uncertain"));
-                        let unsent =
-                            reply(&request, "known_unsent", None, None, Some("unavailable"));
-                        let (response, receive) = oneshot::channel();
-                        let call = Call {
-                            request,
-                            deadline,
-                            transport: config.transport.clone(),
-                            reply: response,
-                        };
-                        if !matches!(timeout_at(deadline, send.send(call)).await, Ok(Ok(()))) {
-                            unsent
+                            Some("attempt_mismatch"),
+                        );
+                        if !current.load(Ordering::Acquire) {
+                            if stale {
+                                mismatch
+                            } else {
+                                reply(
+                                    &request,
+                                    "known_unsent",
+                                    None,
+                                    None,
+                                    Some("qualification_pending"),
+                                )
+                            }
                         } else {
-                            match timeout_at(deadline, receive).await {
-                                Ok(Ok(result)) => result,
-                                _ => fallback,
+                            let (fallback, unsent) = if stale {
+                                (mismatch.clone(), mismatch)
+                            } else {
+                                (
+                                    reply(
+                                        &request,
+                                        "unknown",
+                                        None,
+                                        None,
+                                        Some("native_uncertain"),
+                                    ),
+                                    reply(
+                                        &request,
+                                        "known_unsent",
+                                        None,
+                                        None,
+                                        Some("unavailable"),
+                                    ),
+                                )
+                            };
+                            // Recording a stale refusal must not delay its
+                            // typed answer behind a busy native lane.
+                            let wait = if stale {
+                                deadline.min(Instant::now() + STALE_RECORD_BUDGET)
+                            } else {
+                                deadline
+                            };
+                            let (response, receive) = oneshot::channel();
+                            let call = Call {
+                                request,
+                                deadline,
+                                transport: config.transport.clone(),
+                                stale,
+                                reply: response,
+                            };
+                            if !matches!(timeout_at(wait, send.send(call)).await, Ok(Ok(()))) {
+                                unsent
+                            } else {
+                                match timeout_at(wait, receive).await {
+                                    Ok(Ok(result)) => result,
+                                    _ => fallback,
+                                }
                             }
                         }
                     }
@@ -611,7 +649,8 @@ mod tests {
     }
 
     /// A launch pinned to an older Bridge build refuses the live upgraded
-    /// Bridge with a definitive typed reply and never hands off.
+    /// Bridge with a definitive typed reply; its owner lane sees only a
+    /// stale-marked call to record, never a native handoff.
     #[tokio::test]
     async fn stale_launch_build_pin_refuses_live_bridge_with_attempt_mismatch() {
         launch_handoff(true).await;
@@ -760,6 +799,19 @@ mod tests {
             process.native_owner_v2.as_ref().unwrap().enable();
         }
         std::fs::write(root.path().join("locator"), socket).unwrap();
+        if stale {
+            // The qualified owner gets only a stale-marked call to record the
+            // typed refusal; a lost lane reply still answers it typed.
+            let call = tokio::time::timeout(
+                Duration::from_secs(15),
+                Owner::receive(&mut process.native_owner_v2),
+            )
+            .await
+            .unwrap();
+            assert!(call.stale);
+            assert_eq!(call.request.effect_digest, request.effect_digest);
+            drop(call);
+        }
         wait_file(&root.path().join("result-1")).await;
         let first: ReplyV2 =
             serde_json::from_slice(&std::fs::read(root.path().join("result-1")).unwrap()).unwrap();

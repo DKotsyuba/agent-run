@@ -807,6 +807,7 @@ fn native_provider_keeps_login_and_model_alias() {
         agent_run_adapters::provider::LaunchOptions {
             fast: true,
             output_schema: None,
+            managed_builds: None,
         },
         None,
     )
@@ -955,6 +956,7 @@ fn native_provider_keeps_login_and_model_alias() {
         agent_run_adapters::provider::LaunchOptions {
             fast: false,
             output_schema: schema.as_object(),
+            managed_builds: None,
         },
         None,
     )

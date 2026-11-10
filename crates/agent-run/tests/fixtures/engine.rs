@@ -718,7 +718,10 @@ fn main() {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+    // A resumed execution carries the supervisor's explicit boundary before
+    // its new task text.
     if task == "fixture:worker-finish"
+        || (is_resumed && task.ends_with("\n\nfixture:worker-finish"))
         || ((resume_path.is_some()
             || (is_resumed && task.contains("Agent Run has finished its restart procedure.")))
             && std::env::var(agent_run_domain::worker::FINISH_ENV).as_deref() == Ok("1"))
