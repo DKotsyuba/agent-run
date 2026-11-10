@@ -1147,7 +1147,7 @@ async fn run_inner(
             biased;
             call = agent_run_adapters::native_owner_v2::Owner::receive(&mut native_owner_v2) => {
                 use agent_run_adapters::io::RpcDisposition;
-                let prepared = crate::native_owner::prepare_v2(process,store,logical_record,&call.request,call.deadline,&call.channel,Some(&tid),idle,closing_at.is_some()).await;
+                let prepared = crate::native_owner::prepare_v2(process,store,logical_record,&call.request,call.deadline,&call.transport,Some(&tid),idle,closing_at.is_some()).await;
                 let token = match prepared {
                     crate::native_owner::PreparedV2::Reply(reply) => {call.answer(reply);continue;}
                     crate::native_owner::PreparedV2::Invoke(token) => token,

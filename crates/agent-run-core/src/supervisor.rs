@@ -1459,6 +1459,54 @@ fn system_private_home(route: &crate::system_launch::SystemRoute) -> Result<Path
     Ok(route.private_home.clone())
 }
 
+/// Delivery transport is not agent identity: every new launch (fresh start,
+/// resume or account switch) pins the current validated Bridge route and
+/// build, while an already running launch keeps the pin its owner-v2 endpoint
+/// captured at spawn. A system route has no readable per-user configuration
+/// and keeps its root-approved admission transport.
+fn launch_bridge_transport(
+    home: &Path,
+    frozen: &agent_run_config::provider_config::ProviderConfig,
+    system_route: bool,
+) -> Result<agent_run_config::provider_config::ManagedAttemptTransport> {
+    let unavailable = || invalid("managed owner transport unavailable");
+    let current;
+    let config = if system_route {
+        frozen
+    } else {
+        current = agent_run_config::provider_config::ProviderConfig::load(home)
+            .map_err(|_| unavailable())?
+            .0;
+        &current
+    };
+    config
+        .managed_attempt_binding
+        .as_ref()
+        .and_then(|settings| settings.transport.clone())
+        .ok_or_else(unavailable)
+}
+
+/// Managed role selection for every new launch (fresh start, resume or account
+/// switch) verifies the Pool frontend and Bridge hook against the builds pinned
+/// by the current validated configuration, while the frozen snapshot keeps the
+/// role and its declarations. Ordinary roles and system routes use the frozen
+/// snapshot unchanged.
+fn launch_managed_config(
+    home: &Path,
+    frozen: &agent_run_config::provider_config::ProviderConfig,
+    system_route: bool,
+    harness: HarnessId,
+    role: &agent_run_config::role_plan::ResolvedRolePlan,
+) -> Result<agent_run_config::provider_config::ProviderConfig> {
+    if system_route || !adapters::managed_role::selects(frozen, role) {
+        return Ok(frozen.clone());
+    }
+    let current = agent_run_config::provider_config::ProviderConfig::load(home)
+        .map_err(|_| invalid("managed role changed since admission"))?
+        .0;
+    adapters::managed_role::launch_build_pins(frozen, &current, harness)
+}
+
 /// Runs an admitted provider attempt through fenced process ownership and the terminal outbox.
 /// After the durable outcome, logs only public execution identity and numeric
 /// per-stage completion durations; logging never changes that outcome.
@@ -1692,8 +1740,17 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             },
             Some(&shared_assets),
         )?;
-        let managed_selection = adapters::managed_role::select(
+        // Role semantics stay frozen; component build pins come from the
+        // current configuration at this launch, like the Bridge transport.
+        let managed_config = launch_managed_config(
+            home,
             &config,
+            identity.system_route.is_some(),
+            identity.authority.harness,
+            &planned.role,
+        )?;
+        let managed_selection = adapters::managed_role::select(
+            &managed_config,
             identity.authority.harness,
             &planned.role,
             row.request.explicit_finish,
@@ -1885,12 +1942,14 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         );
         // A selected managed launch always gets its own v2 address at exec.
         // Missing local IPC settings fail before the journal's spawn claim.
+        // The Bridge route/build is pinned from the current configuration at
+        // this launch, not from the frozen identity snapshot.
         let managed_owner_v2 = if managed_selection.is_some() {
-            let transport = config
-                .managed_attempt_binding
-                .as_ref()
-                .and_then(|settings| settings.transport.as_ref())
-                .ok_or_else(|| invalid("managed owner transport unavailable"))?;
+            let transport = launch_bridge_transport(
+                home,
+                &identity.provider_config,
+                identity.system_route.is_some(),
+            )?;
             let setting = |name: &str| -> Result<std::path::PathBuf> {
                 planned
                     .launch
@@ -1910,10 +1969,8 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
             }
             Some(adapters::native_owner_v2::Config {
                 channel,
-                expected_channel: transport.bridge_socket.clone(),
                 directory: setting(adapters::native_owner::SETTINGS[1])?,
-                bridge_executable: transport.bridge_executable.clone(),
-                bridge_sha256: transport.bridge_executable_sha256.clone(),
+                transport,
             })
         } else {
             None
@@ -3304,5 +3361,220 @@ mod writer_identity_diagnostic_tests {
         assert_eq!(metadata["wait_ms"], 30000);
         assert_eq!(metadata["attempts"], 2);
         assert_eq!(error.public().message, "state persistence operation failed");
+    }
+}
+
+#[cfg(test)]
+mod launch_bridge_transport_tests {
+    use super::*;
+
+    fn config(bridge: char) -> String {
+        format!(
+            r#"schema_version=2
+[managed_attempt_binding]
+enabled=true
+role_name='managed'
+pool_server='pool'
+pool_executable_sha256='{frontend}'
+bridge_hook_sha256='{hook}'
+host_id='host'
+pool_resident_executable='/opt/pool-resident'
+pool_resident_sha256='{resident}'
+[managed_attempt_binding.transport]
+run_route={{component_store_id='store_0123456789abcdef0123456789abcdef',route_id='run',worker_uid=1000}}
+pool_route={{component_store_id='pool-store',route_id='pool',worker_uid=1000}}
+bridge_route={{component_store_id='00000000-0000-4000-8000-000000000001',route_id='bridge',worker_uid=1000}}
+producer='pool'
+pool_socket='/opt/pool.sock'
+bridge_socket='/opt/bridge.sock'
+bridge_executable='/opt/bridge-daemon'
+bridge_executable_sha256='{bridge}'
+bridge_reader_credential_file='/opt/reader'
+bridge_reader_credential_sha256='{credential}'
+"#,
+            frontend = "a".repeat(64),
+            hook = "c".repeat(64),
+            resident = "b".repeat(64),
+            bridge = bridge.to_string().repeat(64),
+            credential = "e".repeat(64),
+        )
+    }
+
+    /// A frozen snapshot names build D; after an in-place Bridge upgrade to F
+    /// every new launch (fresh start or resume) pins F. System routes keep
+    /// their root-approved admission transport; a missing one fails closed.
+    #[test]
+    fn new_launch_pins_current_bridge_build_not_frozen_snapshot() {
+        let home = tempfile::tempdir().unwrap();
+        let frozen =
+            agent_run_config::provider_config::ProviderConfig::parse(&config('d'), home.path())
+                .unwrap();
+        std::fs::write(home.path().join("config.toml"), config('f')).unwrap();
+        let launch = launch_bridge_transport(home.path(), &frozen, false).unwrap();
+        assert_eq!(launch.bridge_executable_sha256, "f".repeat(64));
+        let system = launch_bridge_transport(home.path(), &frozen, true).unwrap();
+        assert_eq!(system.bridge_executable_sha256, "d".repeat(64));
+        std::fs::write(
+            home.path().join("config.toml"),
+            config('f')
+                .split("[managed_attempt_binding.transport]")
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(launch_bridge_transport(home.path(), &frozen, false).is_err());
+    }
+
+    fn managed_config(root: &Path, hook_sha256: &str, role: &str, tools: &str) -> String {
+        format!(
+            r#"schema_version=2
+[harnesses.codex]
+binary='/usr/bin/true'
+home='{root}/codex'
+[harnesses.claude-code]
+binary='/usr/bin/true'
+home='{root}/claude'
+hooks=[{{event='PreToolUse',command=['{root}/bridge-hook'],matcher='mcp__pool__.*'}}]
+[mcp.pool]
+transport='stdio'
+command='{root}/pool-frontend'
+args=['mcp','--config','{root}/pool.toml']
+approval_mode='approve'
+allowed_tools=[{tools}]
+[providers.mock]
+harness='claude-code'
+connection={{kind='custom',endpoint='https://gateway.example/api',protocol='messages'}}
+auth_family='anthropic'
+limits_source='none'
+[[providers.mock.models]]
+id='fixture'
+[[providers.mock.bindings]]
+label='work'
+account='acct-work'
+[managed_attempt_binding]
+enabled=true
+role_name='{role}'
+pool_server='pool'
+pool_executable_sha256='{frontend}'
+bridge_hook_sha256='{hook_sha256}'
+host_id='host'
+"#,
+            root = root.display(),
+            frontend = agent_run_platform::fs::sha256(b"pool-frontend\n"),
+        )
+    }
+
+    fn install(path: &Path, bytes: &[u8]) {
+        use std::os::unix::fs::PermissionsExt;
+        // Atomic replacement, as a real upgrade installs a new inode.
+        let staged = path.with_extension("new");
+        std::fs::write(&staged, bytes).unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::rename(staged, path).unwrap();
+    }
+
+    /// Start under Bridge hook build A, upgrade to B and update the pin, then
+    /// resume: role selection verifies B from the current configuration while
+    /// the frozen role and its digest are unchanged. A changed role semantic
+    /// in the current configuration is refused rather than adopted.
+    #[test]
+    fn resumed_launch_selects_frozen_role_with_current_component_builds() {
+        use agent_run_config::role_plan::{McpSelectionSource, ResolvedMcp, ResolvedRolePlan};
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().canonicalize().unwrap();
+        let (build_a, build_b) = (b"bridge-hook-A\n", b"bridge-hook-B\n");
+        let (sha_a, sha_b) = (
+            agent_run_platform::fs::sha256(build_a),
+            agent_run_platform::fs::sha256(build_b),
+        );
+        install(&root.join("bridge-hook"), build_a);
+        install(&root.join("pool-frontend"), b"pool-frontend\n");
+        let frozen = agent_run_config::provider_config::ProviderConfig::parse(
+            &managed_config(&root, &sha_a, "managed", "'pool_get'"),
+            &root,
+        )
+        .unwrap();
+        let role = ResolvedRolePlan {
+            role_name: "managed".into(),
+            role_revision: "1".into(),
+            prompt: "managed".into(),
+            write: false,
+            network: false,
+            allow_external_read_roots: false,
+            read_roots: vec![],
+            skills: vec![],
+            mcp: vec![ResolvedMcp {
+                id: "pool".into(),
+                transport: "stdio".into(),
+                command: root.join("pool-frontend").to_string_lossy().into_owned(),
+                args: vec![
+                    "mcp".into(),
+                    "--config".into(),
+                    root.join("pool.toml").to_string_lossy().into_owned(),
+                ],
+                env_from: vec![],
+                approval_mode: "approve".into(),
+                allowed_tools: Some(vec!["pool_get".into()]),
+                selection: McpSelectionSource::Profile,
+            }],
+            worker_mcp: true,
+            required_constraints: Default::default(),
+            auth_mode: "native".into(),
+            auth_reference: None,
+            config_revision: "b".repeat(64),
+        };
+        let select = |config: &agent_run_config::provider_config::ProviderConfig| {
+            adapters::managed_role::select(config, HarnessId::ClaudeCode, &role, true)
+        };
+        std::fs::write(
+            root.join("config.toml"),
+            managed_config(&root, &sha_a, "managed", "'pool_get'"),
+        )
+        .unwrap();
+        let launch =
+            launch_managed_config(&root, &frozen, false, HarnessId::ClaudeCode, &role).unwrap();
+        let initial = select(&launch).unwrap().unwrap();
+        // In-place upgrade: the hook binary is replaced and the pin follows.
+        install(&root.join("bridge-hook"), build_b);
+        std::fs::write(
+            root.join("config.toml"),
+            managed_config(&root, &sha_b, "managed", "'pool_get'"),
+        )
+        .unwrap();
+        assert!(select(&frozen).is_err());
+        let launch =
+            launch_managed_config(&root, &frozen, false, HarnessId::ClaudeCode, &role).unwrap();
+        let settings = launch.managed_attempt_binding.as_ref().unwrap();
+        assert_eq!(settings.bridge_hook_sha256, sha_b);
+        let resumed = select(&launch).unwrap().unwrap();
+        assert_eq!(resumed.role_digest, role.config_revision);
+        assert_eq!(resumed.role_digest, initial.role_digest);
+        assert_eq!(resumed.inventory, initial.inventory);
+        // A system route keeps its admission snapshot and so the A pin.
+        let system =
+            launch_managed_config(&root, &frozen, true, HarnessId::ClaudeCode, &role).unwrap();
+        assert!(select(&system).is_err());
+        // Changed role semantics are refused, never adopted on resume.
+        for changed in [
+            managed_config(&root, &sha_b, "managed", "'pool_get','pool_post'"),
+            managed_config(&root, &sha_b, "other", "'pool_get'"),
+            managed_config(&root, &sha_b, "managed", "'pool_get'")
+                .replace("matcher='mcp__pool__.*'", "matcher='mcp__pool__pool_get'"),
+        ] {
+            std::fs::write(root.join("config.toml"), changed).unwrap();
+            assert!(
+                launch_managed_config(&root, &frozen, false, HarnessId::ClaudeCode, &role).is_err()
+            );
+        }
+        // An ordinary role never reads the current configuration.
+        std::fs::remove_file(root.join("config.toml")).unwrap();
+        let mut ordinary = role.clone();
+        ordinary.role_name = "ordinary".into();
+        assert!(
+            launch_managed_config(&root, &frozen, false, HarnessId::ClaudeCode, &ordinary).is_ok()
+        );
+        assert!(
+            launch_managed_config(&root, &frozen, false, HarnessId::ClaudeCode, &role).is_err()
+        );
     }
 }

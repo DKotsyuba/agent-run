@@ -131,9 +131,9 @@ fn refusal_common(
     Ok(None)
 }
 
-/// Extend the shared owner fence with the complete frozen managed destination,
-/// qualified launch and a fresh full kernel incarnation. No peer JSON supplies
-/// a route or build grant.
+/// Extend the shared owner fence with the frozen managed role, this launch's
+/// pinned transport (still equal to the current one), qualified launch and a
+/// fresh full kernel incarnation. No peer JSON supplies a route or build grant.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn refusal_v2(
     process: &Process,
@@ -141,7 +141,7 @@ pub(crate) fn refusal_v2(
     record: &Record,
     request: &agent_run_domain::owner_v2::RequestV2,
     deadline: tokio::time::Instant,
-    channel: &std::path::Path,
+    launch: &agent_run_config::provider_config::ManagedAttemptTransport,
     session: Option<&str>,
     idle: bool,
     closing: bool,
@@ -187,13 +187,15 @@ pub(crate) fn refusal_v2(
     else {
         return Ok(Some("unavailable"));
     };
-    let (Some(current_route), Some(original_route)) = (&current.transport, &original.transport)
-    else {
+    // Transport is pinned per launch, not by the frozen identity: a resumed
+    // execution carries its parent's snapshot but the Bridge build of its own
+    // spawn. A later re-pin still revokes this launch.
+    let Some(current_route) = &current.transport else {
         return Ok(Some("unavailable"));
     };
+    let original_route = launch;
     if serde_json::to_value(current_route)? != serde_json::to_value(original_route)?
-        || channel != original_route.bridge_socket
-        || channel.canonicalize().ok().as_ref() != Some(&original_route.bridge_socket)
+        || launch.bridge_socket.canonicalize().ok().as_ref() != Some(&launch.bridge_socket)
         || current.host_id != original.host_id
         || current.role_name != original.role_name
         || expected.host_id != original.host_id
@@ -301,7 +303,7 @@ pub(crate) async fn prepare_v2(
     record: &Record,
     request: &agent_run_domain::owner_v2::RequestV2,
     deadline: tokio::time::Instant,
-    channel: &std::path::Path,
+    launch: &agent_run_config::provider_config::ManagedAttemptTransport,
     session: Option<&str>,
     idle: bool,
     closing: bool,
@@ -319,7 +321,7 @@ pub(crate) async fn prepare_v2(
     // Deterministic target and route checks run before any reservation. Exact
     // prior outcomes are still replayed; an absent row remains absent.
     if let Some(reason) = refusal_v2(
-        process, store, record, request, deadline, channel, session, idle, closing,
+        process, store, record, request, deadline, launch, session, idle, closing,
     )
     .unwrap_or(Some("unavailable"))
     {
@@ -371,7 +373,7 @@ pub(crate) async fn prepare_v2(
         return PreparedV2::Reply(effect_reply(request, &reservation.view));
     };
     let refused = refusal_v2(
-        process, store, record, request, deadline, channel, session, idle, closing,
+        process, store, record, request, deadline, launch, session, idle, closing,
     )
     .unwrap_or(Some("unavailable"));
     if let Some(reason) = refused {
@@ -408,7 +410,7 @@ pub(crate) async fn prepare_v2(
         }
     }
     if let Some(reason) = refusal_v2(
-        process, store, record, request, deadline, channel, session, idle, closing,
+        process, store, record, request, deadline, launch, session, idle, closing,
     )
     .unwrap_or(Some("unavailable"))
     {
@@ -547,6 +549,13 @@ bridge_reader_credential_sha256='{credential}'
         std::fs::write(root.join("config.toml"), &config).unwrap();
         let config =
             agent_run_config::provider_config::ProviderConfig::parse(&config, &root).unwrap();
+        let pinned = config
+            .managed_attempt_binding
+            .as_ref()
+            .and_then(|settings| settings.transport.clone())
+            .unwrap();
+        let mut wrong_channel = pinned.clone();
+        wrong_channel.bridge_socket = root.clone();
         let provider_request:agent_run_domain::provider_start::ProviderStartRequest = serde_json::from_value(json!({"provider":"fixture","model":"model","profile":"managed","task":"task","workdir":root,"explicit_finish":true})).unwrap();
         let request:StartRequest = serde_json::from_value(json!({"runtime":"fixture","model":"model","profile":"managed","task":"task","workdir":root,"explicit_finish":true})).unwrap();
         let role_digest = "b".repeat(64);
@@ -753,9 +762,9 @@ bridge_reader_credential_sha256='{credential}'
                 &forged,
                 expires,
                 if case == "wrong-channel" {
-                    root.as_path()
+                    &wrong_channel
                 } else {
-                    channel.as_path()
+                    &pinned
                 },
                 Some(if case == "wrong-session" {
                     "other"
@@ -850,7 +859,7 @@ bridge_reader_credential_sha256='{credential}'
                 &record,
                 &post_reserve,
                 deadline,
-                &channel,
+                &pinned,
                 Some("native"),
                 true,
                 false
@@ -879,7 +888,7 @@ bridge_reader_credential_sha256='{credential}'
             &record,
             &disabled,
             deadline,
-            &channel,
+            &pinned,
             Some("native"),
             true,
             false,
@@ -888,6 +897,34 @@ bridge_reader_credential_sha256='{credential}'
         {
             PreparedV2::Reply(reply) => assert_eq!(reply.reason.as_deref(), Some("unavailable")),
             PreparedV2::Invoke(_) => panic!("disabled managed delivery cannot invoke"),
+        }
+        // In-place Bridge upgrade: the frozen identity still names build D.
+        // A launch pinned to the current build F (fresh start or resume) passes
+        // the destination fence; the launch pinned to D is refused.
+        let upgraded = original_config.replace(
+            &format!("bridge_executable_sha256='{}'", "d".repeat(64)),
+            &format!("bridge_executable_sha256='{}'", "f".repeat(64)),
+        );
+        assert_ne!(upgraded, original_config);
+        std::fs::write(&config_path, upgraded).unwrap();
+        let mut repinned = pinned.clone();
+        repinned.bridge_executable_sha256 = "f".repeat(64);
+        for (launch, expected) in [(&pinned, Some("actor_mismatch")), (&repinned, None)] {
+            assert_eq!(
+                refusal_v2(
+                    &process,
+                    &persist,
+                    &record,
+                    &request,
+                    deadline,
+                    launch,
+                    Some("native"),
+                    true,
+                    false
+                )
+                .unwrap(),
+                expected
+            );
         }
         std::fs::write(config_path, original_config).unwrap();
         assert!(!marker.exists());
@@ -921,7 +958,7 @@ bridge_reader_credential_sha256='{credential}'
             &record,
             &cancelled,
             deadline,
-            &channel,
+            &pinned,
             Some("native"),
             true,
             false,
@@ -950,7 +987,7 @@ bridge_reader_credential_sha256='{credential}'
             &record,
             &request,
             deadline,
-            &channel,
+            &pinned,
             Some("native"),
             false,
             false,
@@ -968,7 +1005,7 @@ bridge_reader_credential_sha256='{credential}'
             &record,
             &request,
             deadline,
-            &channel,
+            &pinned,
             Some("native"),
             true,
             false,
@@ -999,7 +1036,7 @@ bridge_reader_credential_sha256='{credential}'
             &record,
             &concurrent,
             deadline,
-            &channel,
+            &pinned,
             Some("native"),
             false,
             false,
@@ -1039,7 +1076,7 @@ bridge_reader_credential_sha256='{credential}'
             &record,
             &request,
             deadline,
-            &channel,
+            &pinned,
             Some("native"),
             true,
             false,
@@ -1062,7 +1099,7 @@ bridge_reader_credential_sha256='{credential}'
             &record,
             &failed_turn,
             deadline,
-            &channel,
+            &pinned,
             Some("native"),
             true,
             false,
@@ -1076,7 +1113,7 @@ bridge_reader_credential_sha256='{credential}'
         let (call, answer) = agent_run_adapters::native_owner_v2::Call::fixture(
             failed_turn.clone(),
             deadline,
-            channel.clone(),
+            pinned.clone(),
         );
         assert!(
             crate::stream::owner_v2_after_write(
@@ -1104,7 +1141,7 @@ bridge_reader_credential_sha256='{credential}'
             &record,
             &expired,
             deadline,
-            &channel,
+            &pinned,
             Some("native"),
             true,
             false,
@@ -1118,7 +1155,7 @@ bridge_reader_credential_sha256='{credential}'
         let (call, answer) = agent_run_adapters::native_owner_v2::Call::fixture(
             expired.clone(),
             tokio::time::Instant::now() - Duration::from_millis(1),
-            channel.clone(),
+            pinned.clone(),
         );
         crate::stream::owner_v2_expire(&mut process, &mut persist, call, &token).await;
         assert_eq!(answer.await.unwrap().state, "unknown");
@@ -1128,7 +1165,7 @@ bridge_reader_credential_sha256='{credential}'
             &record,
             &expired,
             deadline,
-            &channel,
+            &pinned,
             Some("native"),
             true,
             false,
