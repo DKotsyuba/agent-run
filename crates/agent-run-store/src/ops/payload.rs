@@ -200,6 +200,29 @@ pub struct AdmitBatch {
     pub jobs: Vec<BatchMemberSpec>,
 }
 
+/// Prepare the exact Pool request before any external admission I/O.
+#[derive(Clone, Serialize)]
+pub struct PrepareManagedEnrollment {
+    pub key: agent_run_domain::enrollment::Key,
+    pub grant: crate::managed_enrollment::Grant,
+    pub request: Value,
+}
+/// Fence an unadmitted Pool request, serialized with its admission.
+#[derive(Clone, Serialize)]
+pub struct AbortManagedEnrollment {
+    pub key: agent_run_domain::enrollment::Key,
+    pub pool_route: agent_run_domain::attempt_binding::Route,
+}
+/// Commit one prepared external enrollment together with ordinary admissions.
+#[derive(Clone, Serialize)]
+pub struct AdmitManagedEnrollment {
+    pub key: agent_run_domain::enrollment::Key,
+    pub grant: crate::managed_enrollment::Grant,
+    pub config_revision: String,
+    pub role_digests: Vec<String>,
+    pub batch: AdmitBatch,
+}
+
 /// Idempotently release one exact permanent history pin.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReleaseHistoryPin {

@@ -12,6 +12,7 @@ use std::{
 use tokio::net::UnixStream;
 
 /// Protected executable identity, configured out of band, never from a frame.
+#[derive(Clone)]
 pub(crate) struct PeerPin {
     pub uid: u32,
     pub executable: PathBuf,
@@ -147,6 +148,207 @@ pub(crate) fn verify_peer(stream: &UnixStream, pin: &PeerPin) -> Result<()> {
 }
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn verify_peer(_: &UnixStream, _: &PeerPin) -> Result<()> {
+    Err(Error::Unsupported(
+        "attempt transport requires Linux".into(),
+    ))
+}
+
+/// Parent-chain facts are read twice; no argv or environment values are kept.
+#[cfg(target_os = "linux")]
+#[derive(Clone, PartialEq, Eq)]
+struct RoleLink {
+    pid: u32,
+    parent: u32,
+    uid: u32,
+    ticks: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn role_link(pid: u32) -> Result<RoleLink> {
+    let reject = || invalid("Pool resident process context unavailable");
+    let bounded = |name: &str, limit: u64| -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        std::fs::File::open(format!("/proc/{pid}/{name}"))
+            .map_err(|_| reject())?
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| reject())?;
+        if bytes.len() as u64 > limit {
+            return Err(reject());
+        }
+        Ok(bytes)
+    };
+    let status = bounded("status", 65536)?;
+    let text = std::str::from_utf8(&status).map_err(|_| reject())?;
+    let mut lines = text.lines().filter_map(|line| line.strip_prefix("Uid:"));
+    let uids = lines
+        .next()
+        .ok_or_else(reject)?
+        .split_ascii_whitespace()
+        .map(str::parse::<u32>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| reject())?;
+    if uids.len() != 4 || lines.next().is_some() {
+        return Err(reject());
+    }
+    let stat = bounded("stat", 65536)?;
+    let end = stat
+        .iter()
+        .rposition(|byte| *byte == b')')
+        .ok_or_else(reject)?;
+    let open = stat[..end]
+        .iter()
+        .position(|byte| *byte == b'(')
+        .ok_or_else(reject)?;
+    if std::str::from_utf8(&stat[..open])
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        != Some(pid)
+    {
+        return Err(reject());
+    }
+    let fields: Vec<_> = stat[end + 1..]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect();
+    if fields
+        .first()
+        .is_none_or(|state| *state == b"Z" || *state == b"X")
+    {
+        return Err(reject());
+    }
+    let number = |index: usize| {
+        fields
+            .get(index)
+            .and_then(|field| std::str::from_utf8(field).ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(reject)
+    };
+    let parent = u32::try_from(number(1)?).map_err(|_| reject())?;
+    let ticks = number(19)?;
+    if parent == pid || (pid > 1 && ticks == 0) {
+        return Err(reject());
+    }
+    Ok(RoleLink {
+        pid,
+        parent,
+        uid: uids[1],
+        ticks,
+    })
+}
+
+/// A launch marker is negative evidence only. Never return its value.
+#[cfg(target_os = "linux")]
+fn has_launch_marker(pid: u32) -> Result<bool> {
+    let reject = || invalid("Pool resident process context unavailable");
+    let mut bytes = Vec::new();
+    std::fs::File::open(format!("/proc/{pid}/environ"))
+        .map_err(|_| reject())?
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| reject())?;
+    if bytes.is_empty() || bytes.len() > 1024 * 1024 || bytes.last() != Some(&0) {
+        return Err(reject());
+    }
+    Ok(bytes
+        .split(|byte| *byte == 0)
+        .any(|entry| entry.starts_with(b"AGENT_RUN_LAUNCH_ID=")))
+}
+
+/// Verify that a Pool peer is not a Run harness or a descendant of one. The
+/// complete ancestry, inherited negative marker and recorded ownership are all
+/// checked, then the whole chain is reread to reject reparent/PID reuse races.
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_pool_resident(stream: &UnixStream, home: &Path) -> Result<()> {
+    let reject = || invalid("Pool resident process context unavailable");
+    let credentials = stream.peer_cred().map_err(|_| reject())?;
+    let peer_pid = credentials.pid().ok_or_else(reject)?;
+    let peer = agent_run_platform::process::inspect(peer_pid).map_err(|_| reject())?;
+    let incarnation =
+        agent_run_platform::process::kernel_incarnation(&peer).map_err(|_| reject())?;
+    if incarnation.uid != credentials.uid() {
+        return Err(reject());
+    }
+    let mut chain: Vec<(
+        RoleLink,
+        Option<agent_run_platform::process::KernelIncarnation>,
+    )> = Vec::new();
+    let mut next = incarnation.pid;
+    while next != 0 {
+        if chain.len() >= 128 || chain.iter().any(|(link, _)| link.pid == next) {
+            return Err(reject());
+        }
+        let link = role_link(next)?;
+        if chain
+            .last()
+            .is_some_and(|(child, _)| link.ticks > child.ticks)
+        {
+            return Err(reject());
+        }
+        let same = if link.uid == incarnation.uid && link.pid > 1 {
+            let observed = agent_run_platform::process::inspect(
+                i32::try_from(link.pid).map_err(|_| reject())?,
+            )
+            .map_err(|_| reject())?;
+            let exact =
+                agent_run_platform::process::kernel_incarnation(&observed).map_err(|_| reject())?;
+            if exact.boot_id != incarnation.boot_id
+                || exact.pid_namespace_inode != incarnation.pid_namespace_inode
+                || exact.start_ticks != link.ticks
+                || observed.ppid != i32::try_from(link.parent).map_err(|_| reject())?
+                || has_launch_marker(link.pid)?
+            {
+                return Err(reject());
+            }
+            Some(exact)
+        } else {
+            None
+        };
+        next = link.parent;
+        chain.push((link, same));
+    }
+    if chain.first().and_then(|(_, exact)| exact.as_ref()) != Some(&incarnation)
+        || chain.last().is_none_or(|(link, _)| link.pid != 1)
+    {
+        return Err(reject());
+    }
+    let store = agent_run_store::Store::open(home).map_err(|_| reject())?;
+    let snapshot = store.conn.unchecked_transaction().map_err(|_| reject())?;
+    for (_, exact) in &chain {
+        let Some(exact) = exact else {
+            continue;
+        };
+        let namespace = i64::try_from(exact.pid_namespace_inode).map_err(|_| reject())?;
+        let ticks = i64::try_from(exact.start_ticks).map_err(|_| reject())?;
+        let token = format!("linux:{}:{}", exact.boot_id, exact.start_ticks);
+        let owned:bool = snapshot.query_row("SELECT EXISTS(SELECT 1 FROM attempt_launches WHERE state='bound' AND boot_id=?1 AND pid_namespace_inode=?2 AND uid=?3 AND pid=?4 AND start_ticks=?5 UNION ALL SELECT 1 FROM process_members WHERE owner_kind='attempt' AND pid=?4 AND token=?6)",rusqlite::params![exact.boot_id,namespace,exact.uid,exact.pid,ticks,token],|row|row.get(0)).map_err(|_| reject())?;
+        if owned {
+            return Err(reject());
+        }
+    }
+    for (link, exact) in &chain {
+        if role_link(link.pid)? != *link {
+            return Err(reject());
+        }
+        if let Some(exact) = exact {
+            let observed = agent_run_platform::process::inspect(
+                i32::try_from(link.pid).map_err(|_| reject())?,
+            )
+            .map_err(|_| reject())?;
+            if agent_run_platform::process::kernel_incarnation(&observed).map_err(|_| reject())?
+                != *exact
+                || has_launch_marker(link.pid)?
+            {
+                return Err(reject());
+            }
+        }
+    }
+    drop(snapshot);
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn verify_pool_resident(_: &UnixStream, _: &Path) -> Result<()> {
     Err(Error::Unsupported(
         "attempt transport requires Linux".into(),
     ))
@@ -324,7 +526,11 @@ impl Endpoint {
         }
         Ok(Self { socket, pin })
     }
-    async fn exchange(&self, value: &serde_json::Value) -> Result<serde_json::Value> {
+    async fn exchange(
+        &self,
+        value: &serde_json::Value,
+        pool_home: Option<&Path>,
+    ) -> Result<serde_json::Value> {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         const LIMIT: u64 = 1024 * 1024;
         let mut bytes = serde_json::to_vec(value)?;
@@ -342,8 +548,13 @@ impl Endpoint {
                 executable: self.pin.executable.clone(),
                 sha256: self.pin.sha256.clone(),
             };
+            let pool_home = pool_home.map(Path::to_path_buf);
             let mut stream = tokio::task::spawn_blocking(move || {
                 verify_peer(&stream, &pin)?;
+                if let Some(home) = pool_home.as_deref() {
+                    verify_pool_resident(&stream, home)
+                        .map_err(|_| crate::attempt_wire::peer_not_authorized())?;
+                }
                 Ok::<_, Error>(stream)
             })
             .await
@@ -380,6 +591,7 @@ pub(crate) struct AuthenticatedBridge {
 pub(crate) struct AuthenticatedPool {
     endpoint: Endpoint,
     route: agent_run_domain::attempt_binding::Route,
+    home: PathBuf,
 }
 
 impl AuthenticatedBridge {
@@ -444,12 +656,17 @@ impl AuthenticatedPool {
     pub(crate) fn configured(
         endpoint: Endpoint,
         route: agent_run_domain::attempt_binding::Route,
+        home: PathBuf,
     ) -> Result<Self> {
         route.validate()?;
         if route.worker_uid != endpoint.pin.uid {
             return Err(invalid("attempt endpoint configuration invalid"));
         }
-        Ok(Self { endpoint, route })
+        Ok(Self {
+            endpoint,
+            route,
+            home,
+        })
     }
 }
 
@@ -587,7 +804,7 @@ impl AuthenticatedBridge {
             .map(str::to_owned);
         let request = serde_json::json!({"api_version":1,"request_id":id,"credential":self.credential,"op":operation,"params":params});
         bridge_result(
-            self.endpoint.exchange(&request).await?,
+            self.endpoint.exchange(&request, None).await?,
             &id,
             operation,
             expected.as_deref(),
@@ -603,7 +820,7 @@ impl AuthenticatedPool {
             .map(str::to_owned);
         let request = serde_json::json!({"id":id,"method":method,"params":params});
         pool_result(
-            self.endpoint.exchange(&request).await?,
+            self.endpoint.exchange(&request, Some(&self.home)).await?,
             &id,
             expected.as_deref(),
         )
@@ -911,6 +1128,7 @@ mod tests {
             .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        agent_run_store::fixture::initialize(dir.path()).unwrap();
         let socket = dir.path().join("pool.sock");
         let executable = super::test_peer::copy_peer(dir.path());
         let sha = agent_run_platform::fs::sha256(&std::fs::read(&executable).unwrap());
@@ -942,6 +1160,7 @@ mod tests {
         };
         let client = AuthenticatedPool {
             route: request.pool_route.clone(),
+            home: dir.path().to_path_buf(),
             endpoint: Endpoint {
                 socket,
                 pin: PeerPin {
@@ -955,6 +1174,30 @@ mod tests {
         assert!(reply.matches_request(&request));
         assert_eq!(reply.state, "sealed");
         assert!(child.wait().await.unwrap().success());
+
+        // A same-build fake underneath an observed Run harness cannot be used
+        // as the outbound Pool resident even when its socket and hash match.
+        let leader = agent_run_platform::process::inspect(std::process::id() as i32).unwrap();
+        let kernel = agent_run_platform::process::kernel_incarnation(&leader).unwrap();
+        let store = agent_run_store::fixture::open(dir.path()).unwrap();
+        store.conn.execute("INSERT INTO attempt_launches(spawn_key,execution_id,sequence,attempt_id,launch_id,state,boot_id,pid_namespace_inode,uid,pid,start_ticks) VALUES('harness','root',1,'attempt',?,'bound',?,?,?,?,?)",rusqlite::params![uuid::Uuid::new_v4().to_string(),kernel.boot_id,kernel.pid_namespace_inode,kernel.uid,kernel.pid,kernel.start_ticks]).unwrap();
+        drop(store);
+        std::fs::remove_file(&client.endpoint.socket).unwrap();
+        std::fs::remove_file(&ready).unwrap();
+        let mut child = super::test_peer::child_at(
+            &client.endpoint.pin.executable,
+            "pool-server",
+            &client.endpoint.socket,
+        )
+        .env("RUN_R2_PEER_READY", &ready)
+        .spawn()
+        .unwrap();
+        super::test_peer::wait_file(&ready).await;
+        let error = client.seal(&request).await.err().unwrap();
+        assert!(
+            matches!(error,Error::Broker { broker_error_code:Some(ref code), .. } if code == "peer_not_authorized")
+        );
+        let _ = child.kill().await;
     }
 
     #[tokio::test]
@@ -1139,8 +1382,20 @@ pub(crate) mod test_peer {
             std::fs::write(std::env::var_os("RUN_R2_PEER_READY").unwrap(), b"ready").unwrap();
             let mut byte = [0u8; 1];
             let _ = stream.read(&mut byte);
-        } else if mode == "client" {
+        } else if mode == "client" || mode == "delayed-client" {
             let mut stream = UnixStream::connect(socket).unwrap();
+            if mode == "delayed-client" {
+                std::fs::write(std::env::var_os("RUN_R2_PEER_READY").unwrap(), b"ready").unwrap();
+                let release = std::env::var_os("RUN_R2_PEER_RELEASE").unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !Path::new(&release).exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "peer release timed out"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
             let frame = std::env::var("RUN_R2_PEER_FRAME").unwrap();
             writeln!(stream, "{frame}").unwrap();
             let mut bytes = Vec::new();

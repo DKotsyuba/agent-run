@@ -342,6 +342,57 @@ pub fn verify_inventory(
 /// Closed native Claude exclusions for the dedicated managed role.
 pub const CLAUDE_DISALLOWED_TOOLS: &str = "Bash,Agent,Task,Skill";
 
+/// Exact managed deny argument: the fixed native exclusions and the sorted
+/// discovered complement of each pinned Pool MCP allowlist. The worker MCP
+/// is supervisor-owned and has no external catalog-discovery process.
+pub fn claude_disallowed_tools(
+    allowed: &BTreeMap<String, BTreeSet<String>>,
+    catalogs: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<String> {
+    let fail = || invalid("managed Claude catalog did not verify");
+    let mut denied = BTreeSet::new();
+    let mut expected = 0;
+    for (server, allowed_tools) in allowed {
+        if server == agent_run_domain::worker::SERVER_NAME {
+            continue;
+        }
+        expected += 1;
+        let catalog = catalogs.get(server).ok_or_else(fail)?;
+        if allowed_tools.is_empty()
+            || !allowed_tools.is_subset(catalog)
+            || server.is_empty()
+            || server.contains("__")
+            || server.ends_with('_')
+            || !server
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
+            || catalog.iter().any(|name| {
+                name.is_empty()
+                    || !name
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
+            })
+        {
+            return Err(fail());
+        }
+        for tool in catalog.difference(allowed_tools) {
+            denied.insert(format!("mcp__{server}__{tool}"));
+        }
+    }
+    if expected == 0 || catalogs.len() != expected || denied.len() > 4096 {
+        return Err(fail());
+    }
+    let mut result = CLAUDE_DISALLOWED_TOOLS.to_owned();
+    for rule in denied {
+        result.push(',');
+        result.push_str(&rule);
+    }
+    if result.len() > 64 * 1024 {
+        return Err(fail());
+    }
+    Ok(result)
+}
+
 /// Construct the closed native Claude tool arguments from a previously
 /// authenticated exact MCP inventory. No plugin or skill directory is added.
 pub fn claude_tool_arguments(allowed: &BTreeMap<String, BTreeSet<String>>) -> Result<Vec<String>> {

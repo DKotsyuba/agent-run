@@ -242,6 +242,8 @@ impl WriterHandle {
                 OpKindRef::AdmitStart
                     | OpKindRef::AdmitProvider
                     | OpKindRef::AdmitBatch
+                    | OpKindRef::PrepareManagedEnrollment
+                    | OpKindRef::AdmitManagedEnrollment
                     | OpKindRef::AdmitProviderResume
                     | OpKindRef::AdmitPool
                     | OpKindRef::ReplacePoolMember

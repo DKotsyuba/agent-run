@@ -48,16 +48,16 @@ fn cancel_envelope(kind: &str) -> WriteEnvelope {
     .unwrap()
 }
 
-/// The inventory has 123 active rows with stable, unique wire ids and
+/// The inventory has 126 active rows with stable, unique wire ids and
 /// unique snake-case names, and rows 6, 49 and 79 are internal-only.
 #[test]
 fn inventory_is_closed_with_stable_unique_ids() {
     let all = OpKindRef::all();
-    assert_eq!(all.len(), 123);
+    assert_eq!(all.len(), 126);
     for (index, kind) in all.iter().enumerate() {
         assert_eq!(
             kind.wire_id() as usize,
-            (1..=128)
+            (1..=131)
                 .filter(|id| ![54, 55, 58, 103, 104].contains(id))
                 .nth(index)
                 .unwrap()
@@ -65,12 +65,24 @@ fn inventory_is_closed_with_stable_unique_ids() {
         assert_eq!(OpKindRef::from_wire_id(kind.wire_id()), Some(*kind));
     }
     assert_eq!(OpKindRef::from_wire_id(0), None);
-    assert_eq!(OpKindRef::from_wire_id(129), None);
+    assert_eq!(
+        OpKindRef::from_wire_id(129),
+        Some(OpKindRef::PrepareManagedEnrollment)
+    );
+    assert_eq!(
+        OpKindRef::from_wire_id(130),
+        Some(OpKindRef::AbortManagedEnrollment)
+    );
+    assert_eq!(
+        OpKindRef::from_wire_id(131),
+        Some(OpKindRef::AdmitManagedEnrollment)
+    );
+    assert_eq!(OpKindRef::from_wire_id(132), None);
     for retired in [54, 55, 58, 103, 104] {
         assert_eq!(OpKindRef::from_wire_id(retired), None);
     }
     let names: BTreeSet<_> = all.iter().map(|kind| kind.name()).collect();
-    assert_eq!(names.len(), 123);
+    assert_eq!(names.len(), 126);
     assert!(
         names
             .iter()

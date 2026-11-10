@@ -523,8 +523,6 @@ impl ProviderConfig {
                         == Some(&transport.bridge_executable)
                     || managed.pool_resident_sha256.as_ref()
                         == Some(&transport.bridge_executable_sha256)
-                    || managed.pool_resident_sha256.as_ref()
-                        == Some(&managed.pool_executable_sha256)
                     || managed.pool_resident_sha256.as_ref() == Some(&managed.bridge_hook_sha256)
                     || transport.bridge_executable_sha256 == managed.bridge_hook_sha256
                     || transport
@@ -947,6 +945,14 @@ producer_scopes=['scope']
         );
         let parse = |text: &str| ProviderConfig::parse(text, Path::new("/fixture"));
         assert!(parse(&config).is_ok());
+        // The frontend and resident are separate process roles of one build.
+        assert!(
+            parse(&config.replace(
+                &format!("pool_resident_sha256='{}'", "b".repeat(64)),
+                &format!("pool_resident_sha256='{}'", "a".repeat(64)),
+            ))
+            .is_ok()
+        );
         for invalid in [
             config.replacen(
                 &format!("bridge_executable_sha256='{}'", "d".repeat(64)),

@@ -27,7 +27,7 @@ fn schema_initialization_and_reopen() {
     let a = h.store().health().unwrap();
     assert_eq!(a["ok"], true);
     assert_eq!(a["schema_version"], agent_run_store::VERSION);
-    assert_eq!(a["tables"], 58);
+    assert_eq!(a["tables"], 60);
     assert_eq!(h.store().health().unwrap()["integrity"], "ok");
     let store = h.store();
     for name in [
@@ -55,6 +55,8 @@ fn schema_initialization_and_reopen() {
         "owner_effects",
         "attempt_current_receipts",
         "attempt_namespace_retirements",
+        "managed_enrollments",
+        "managed_enrollment_members",
     ] {
         assert!(
             store

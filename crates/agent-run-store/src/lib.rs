@@ -27,6 +27,8 @@ pub mod journal;
 pub mod lineage;
 /// Durable atomic success holds and signature-authorized release tombstones.
 pub mod lineage_holds;
+/// Pool-resident durable identity enrollment and ownership fences.
+pub mod managed_enrollment;
 /// Managed service generation, lease, gate and probe units of the sole writer.
 pub mod managed_services;
 pub mod migrations;

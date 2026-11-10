@@ -250,6 +250,9 @@ inventory! {
     126 AbortOwnerEffect "abort_owner_effect" L C n;
     127 BeginAttemptEgress "begin_attempt_egress" L C n;
     128 FinishAttemptEgress "finish_attempt_egress" L C n;
+    129 PrepareManagedEnrollment "prepare_managed_enrollment" L C n;
+    130 AbortManagedEnrollment "abort_managed_enrollment" L C n;
+    131 AdmitManagedEnrollment "admit_managed_enrollment" L N n;
 }
 
 /// Seals one payload and binds it to its inventory row and typed output.
@@ -277,6 +280,9 @@ op! {
     AdmitStart => AdmitStartOutput;
     AdmitProvider => crate::provider_admission::ProviderAdmission;
     AdmitBatch => agent_run_domain::batch::StartBatchResult;
+    PrepareManagedEnrollment => crate::managed_enrollment::Record;
+    AbortManagedEnrollment => crate::managed_enrollment::Record;
+    AdmitManagedEnrollment => crate::managed_enrollment::Admitted;
     ReleaseHistoryPin => Option<agent_run_domain::batch::HistoryPinRelease>;
     AcquireLineageHold => crate::lineage_holds::LineageHoldAcquireResult;
     ReleaseLineageHold => Option<crate::lineage_holds::LineageHoldRelease>;
@@ -502,6 +508,9 @@ op_enum! {
         AdmitStart,
         AdmitProvider,
         AdmitBatch,
+        PrepareManagedEnrollment,
+        AbortManagedEnrollment,
+        AdmitManagedEnrollment,
         ReleaseHistoryPin,
         AcquireLineageHold,
         ReleaseLineageHold,
@@ -600,6 +609,7 @@ impl OpKindRef {
             Self::AdmitStart
             | Self::AdmitProvider
             | Self::AdmitBatch
+            | Self::AdmitManagedEnrollment
             | Self::AdmitProviderResume
             | Self::AdmitPool
             | Self::ReplacePoolMember => 16 * MIB,

@@ -97,6 +97,9 @@ pub fn implemented(kind: OpKindRef) -> bool {
             | K::AdmitStart
             | K::AdmitProvider
             | K::AdmitBatch
+            | K::PrepareManagedEnrollment
+            | K::AbortManagedEnrollment
+            | K::AdmitManagedEnrollment
             | K::ReleaseHistoryPin
             | K::AcquireLineageHold
             | K::ReleaseLineageHold
@@ -675,6 +678,38 @@ pub(crate) fn run_local(store: &mut Store, op: LocalOp) -> Result<Value> {
                 catalog: &op.catalog,
                 jobs,
             })?)
+        }
+        L::PrepareManagedEnrollment(op) => {
+            out(store.managed_enrollment_prepare(&op.key, &op.grant, &op.request)?)
+        }
+        L::AbortManagedEnrollment(op) => {
+            out(store.managed_enrollment_abort(&op.key, &op.pool_route)?)
+        }
+        L::AdmitManagedEnrollment(op) => {
+            let jobs = op
+                .batch
+                .jobs
+                .iter()
+                .map(|job| crate::batch_admission::BatchMember {
+                    id: job.id.clone(),
+                    inputs: inputs(&job.inputs),
+                })
+                .collect();
+            out(store.managed_enrollment_admit(
+                &op.key,
+                &op.grant,
+                &op.config_revision,
+                &op.role_digests,
+                crate::batch_admission::BatchAdmission {
+                    request_id: &op.batch.request_id,
+                    fingerprint: &op.batch.fingerprint,
+                    retain_history: op.batch.retain_history,
+                    expected_store_id: op.batch.expected_store_id.as_ref(),
+                    preconditions: op.batch.preconditions.as_deref(),
+                    catalog: &op.batch.catalog,
+                    jobs,
+                },
+            )?)
         }
         L::ReleaseHistoryPin(op) => {
             out(store.release_history_pin_scoped(&op.pin_id, op.expected_store_id.as_ref())?)

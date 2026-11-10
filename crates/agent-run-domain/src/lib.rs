@@ -8,6 +8,8 @@ pub mod canonical;
 pub mod catalog;
 pub mod credential_ref;
 pub mod domain;
+/// Private Pool-resident managed enrollment contracts.
+pub mod enrollment;
 pub mod error;
 pub mod fsm;
 /// Frozen ping policy and private model response contracts.

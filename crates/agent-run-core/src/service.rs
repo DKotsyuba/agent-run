@@ -1044,6 +1044,243 @@ impl Service {
         }
     }
 
+    /// Admit one private Pool enrollment through the same provider preparation,
+    /// quota snapshot and batch writer as ordinary starts.
+    pub(crate) async fn start_managed_enrollment(
+        &self,
+        grant: &crate::attempt_binding::PeerGrant,
+        request: agent_run_domain::enrollment::Start,
+        raw: Value,
+        fingerprint: String,
+    ) -> Result<agent_run_domain::enrollment::Receipt> {
+        use agent_run_domain::{batch::StartBatchRequest, enrollment::Key};
+        use agent_run_store::ops::{AdmitManagedEnrollment, PrepareManagedEnrollment};
+        let key = Key {
+            version: 1,
+            expected_store_id: request.expected_store_id.clone(),
+            pool_store_id: request.pool_store_id.clone(),
+            request_id: request.request_id.clone(),
+            fingerprint,
+        };
+        let route = self.managed_enrollment_grant(grant)?;
+        key.validate(&route.pool_route)?;
+        let lookup_key = key.clone();
+        let lookup_route = route.pool_route.clone();
+        if let Some(existing) = self
+            .read(move |store| store.managed_enrollment_lookup(&lookup_key, &lookup_route))
+            .await?
+        {
+            if existing
+                .grant
+                .as_ref()
+                .is_some_and(|original| original != &route)
+            {
+                return Err(invalid("enrollment transport changed"));
+            }
+            if let Some(receipt) = existing.receipt {
+                return Ok(receipt);
+            }
+            if existing.state == "aborted" {
+                return Err(invalid("enrollment aborted"));
+            }
+        }
+        self.attempt_enabled(grant)?;
+        let prepared_key = key.clone();
+        let prepared_route = route.clone();
+        let stage = self
+            .lane("admission")?
+            .local(
+                PrepareManagedEnrollment {
+                    key: prepared_key,
+                    grant: prepared_route,
+                    request: raw,
+                },
+                crate::broker_writer::BROKER_BUDGET,
+            )
+            .await?;
+        if let Some(receipt) = stage.receipt {
+            return Ok(receipt);
+        }
+        if stage.state == "aborted" {
+            return Err(invalid("enrollment aborted"));
+        }
+        let (config, revision) = self.current_provider_config()?;
+        let settings = config
+            .managed_attempt_binding
+            .as_ref()
+            .filter(|settings| settings.enabled)
+            .ok_or_else(|| Error::Unsupported("managed attempt binding disabled".into()))?;
+        if request
+            .jobs
+            .iter()
+            .any(|job| job.selector.role_name != settings.role_name)
+        {
+            return Err(invalid("enrollment role mismatch"));
+        }
+        let accounts = Store::open(&self.home)?.list_accounts()?;
+        let catalog = config.resolve_catalog(accounts)?;
+        let mut jobs = Vec::with_capacity(request.jobs.len());
+        let mut role_digests = Vec::with_capacity(request.jobs.len());
+        let mut normalized = Vec::with_capacity(request.jobs.len());
+        for member in &request.jobs {
+            let mut spec: ProviderStartRequest = serde_json::from_value(member.spec.clone())
+                .map_err(|_| invalid("enrollment request invalid"))?;
+            spec.validate_intent()?;
+            normalized.push(spec.clone());
+            spec.validate()?;
+            let mut prepared = prepare_provider(&config, &revision, &catalog, spec)?;
+            let role = role_plan::ResolvedRolePlan::from_payload(&prepared.authority.role_payload)
+                .map_err(|_| invalid("enrollment role unqualified"))?;
+            let selected = adapters::managed_role::select(
+                &config,
+                prepared.authority.harness,
+                &role,
+                prepared.request.explicit_finish,
+            )
+            .map_err(|_| invalid("enrollment role unqualified"))?
+            .ok_or_else(|| invalid("enrollment role unqualified"))?;
+            if role.role_name != member.selector.role_name
+                || prepared.request.write
+                || prepared.effective.write
+            {
+                return Err(invalid("enrollment role mismatch"));
+            }
+            role_digests.push(selected.role_digest);
+            self.bind_system_route(&mut prepared)?;
+            jobs.push(prepared);
+        }
+        // Namespace the existing batch replay key by the authenticated Pool route.
+        let internal = format!(
+            "p3_{}",
+            agent_run_domain::canonical::sha256_hex(
+                &json!([route.pool_route, key.pool_store_id, key.request_id]),
+                true
+            )
+        );
+        let mut batch = StartBatchRequest {
+            request_id: internal,
+            jobs: normalized,
+            retain_history: true,
+            expected_store_id: Some(request.expected_store_id.clone()),
+            preconditions: (!request.preconditions.is_empty())
+                .then_some(request.preconditions.clone()),
+        };
+        batch.validate_intent()?;
+        batch.validate_new_lookup_frame()?;
+        let batch_fingerprint = batch.fingerprint()?;
+        let ids: Vec<_> = jobs.iter().map(|_| AgentId::new()).collect();
+        let mut submission = 0;
+        let mut decisions = crate::capacity::quota_adapter::DecisionSnapshots::default();
+        let outcome = loop {
+            let snapshot = decisions.read(config.capacity.quota.as_ref()).await;
+            let requests: Vec<_> = jobs.iter().map(|job| job.request.clone()).collect();
+            let rank_catalog = catalog.clone();
+            let sets = self
+                .read(move |store| {
+                    let read = store.conn.unchecked_transaction()?;
+                    let decision_time = now();
+                    let mut sets = Vec::with_capacity(requests.len());
+                    for request in &requests {
+                        let pin = request.account.as_ref().map(|label| label.as_str());
+                        sets.push(
+                            crate::capacity::quota_adapter::candidates_at(
+                                store,
+                                &rank_catalog,
+                                &request.provider,
+                                &request.model,
+                                pin,
+                                &std::collections::BTreeSet::new(),
+                                snapshot.as_deref(),
+                                decision_time,
+                            )?
+                            .candidates,
+                        );
+                    }
+                    drop(read);
+                    Ok(sets)
+                })
+                .await?;
+            let mut members = Vec::with_capacity(jobs.len());
+            for ((id, job), candidates) in ids.iter().zip(&jobs).zip(&sets) {
+                members.push(agent_run_store::ops::BatchMemberSpec {
+                    id: id.clone(),
+                    inputs: AdmissionInputs {
+                        request: &job.request,
+                        effective: &job.effective,
+                        authority: &job.authority,
+                        candidates,
+                        identity: &job.identity,
+                        global_cap: config.core.max_active_agents,
+                        harness_cap: job.cap,
+                        pinned: job.pinned.as_ref(),
+                    }
+                    .into(),
+                });
+            }
+            let attempt = self
+                .lane("admission")?
+                .local(
+                    AdmitManagedEnrollment {
+                        key: key.clone(),
+                        grant: route.clone(),
+                        config_revision: revision.clone(),
+                        role_digests: role_digests.clone(),
+                        batch: agent_run_store::ops::AdmitBatch {
+                            request_id: batch.request_id.clone(),
+                            fingerprint: batch_fingerprint.clone(),
+                            retain_history: true,
+                            expected_store_id: batch.expected_store_id.clone(),
+                            preconditions: batch.preconditions.clone(),
+                            catalog: catalog.clone(),
+                            jobs: members,
+                        },
+                    },
+                    crate::broker_writer::BROKER_BUDGET,
+                )
+                .await;
+            match attempt {
+                Err(Error::QuotaAdmission(
+                    QuotaAdmissionError::QuotaClockRollback
+                    | QuotaAdmissionError::QuotaDecisionInvalid,
+                )) if decisions.retry_invalidated(&mut submission, PROVIDER_STALE_RETRIES) => {}
+                Err(Error::QuotaAdmission(QuotaAdmissionError::QuotaDecisionStale))
+                    if decisions.retry_expired(&mut submission, PROVIDER_STALE_RETRIES) => {}
+                Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. }))
+                    if submission < PROVIDER_STALE_RETRIES =>
+                {
+                    submission += 1;
+                    decisions.require_fresh();
+                }
+                Err(Error::QuotaAdmission(QuotaAdmissionError::SelectionStale { .. })) => {
+                    return Err(QuotaAdmissionError::SelectionBusy {
+                        stale_retries: PROVIDER_STALE_RETRIES,
+                    }
+                    .into());
+                }
+                Err(error) if batch_admission_unknown(&error) => {
+                    return Err(Error::BatchOutcomeUnknown {
+                        source: Box::new(error),
+                    });
+                }
+                other => break other?,
+            }
+        };
+        if !outcome.replayed {
+            for job in &outcome.receipt.jobs {
+                let service = self.clone();
+                let id = job.execution_id.clone();
+                let handoff = tokio::spawn(async move {
+                    let mut single = json!({"created":true,"agent_id":id});
+                    service.hand_off_provider(&mut single).await
+                });
+                if let Ok(Err(error)) = handoff.await {
+                    batch_handoff_log(&job.execution_id, error.public().kind);
+                }
+            }
+        }
+        Ok(outcome.receipt)
+    }
+
     /// Admits a batch, then hands off only newly admitted jobs to supervisors.
     /// The transport owns this future across client timeout; the receipt does
     /// not promise that any process has started.

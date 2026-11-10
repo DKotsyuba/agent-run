@@ -277,6 +277,110 @@ impl Service {
         }
         Ok(())
     }
+
+    /// Resolve the current local pin and compare its routes with the already
+    /// authenticated connection before preparing or attesting enrollment.
+    pub(crate) fn managed_enrollment_grant(
+        &self,
+        peer: &PeerGrant,
+    ) -> Result<agent_run_store::managed_enrollment::Grant> {
+        peer.validate()?;
+        let (config, _) = self.current_provider_config()?;
+        let grant = agent_run_store::managed_enrollment::Grant::from_config(&config)?;
+        if grant.pool_route != peer.pool_route
+            || grant.run_route != peer.run_route
+            || grant.bridge_route != peer.bridge_route
+            || grant.producer != peer.producer
+            || grant.host_id != peer.host_id
+        {
+            return Err(invalid("enrollment transport changed"));
+        }
+        Ok(grant)
+    }
+
+    /// Resolve a member through its original Pool enrollment, then reuse the
+    /// durable R2 egress observation for the same immutable lineage.
+    pub(crate) async fn managed_enrollment_current(
+        &self,
+        grant: &PeerGrant,
+        bridge: &dyn BridgeReader,
+        key: agent_run_domain::enrollment::Key,
+        member_id: String,
+        current_request_id: String,
+    ) -> Result<serde_json::Value> {
+        grant.validate()?;
+        key.validate(&grant.pool_route)?;
+        wire::validate_id(&member_id)?;
+        wire::validate_id(&current_request_id)?;
+        let lookup_key = key.clone();
+        let lookup_route = grant.pool_route.clone();
+        let lookup_member = member_id.clone();
+        let (admission, member, original_grant) = self
+            .read(move |store| {
+                store.managed_enrollment_member(&lookup_key, &lookup_route, &lookup_member)
+            })
+            .await?;
+        if self.managed_enrollment_grant(grant)? != original_grant {
+            return Err(invalid("enrollment transport changed"));
+        }
+        let request_id = format!(
+            "p3c_{}",
+            agent_run_domain::canonical::sha256_hex(
+                &serde_json::json!([
+                    grant.pool_route,
+                    key.pool_store_id,
+                    key.request_id,
+                    member_id,
+                    current_request_id
+                ]),
+                true
+            )
+        );
+        let request = EgressCurrent {
+            expected_store_id: key.expected_store_id.clone(),
+            request_id,
+            lineage_root_id: member.lineage_root_id.clone(),
+            bound_execution_id: member.execution_id.clone(),
+            pool_route: grant.pool_route.clone(),
+            run_route: grant.run_route.clone(),
+            bridge_route: grant.bridge_route.clone(),
+            producer: grant.producer.clone(),
+            host_id: grant.host_id.clone(),
+        };
+        let receipt = self
+            .attempt_current_egress_v1(grant, bridge, request)
+            .await
+            .map_err(|error| match error {
+                Error::Validation(message)
+                    if matches!(
+                        message.as_str(),
+                        "egress binding unavailable"
+                            | "attempt peer unavailable"
+                            | "binding unavailable"
+                    ) =>
+                {
+                    invalid("attempt not ready")
+                }
+                other => other,
+            })?;
+        // Bridge I/O is outside SQLite. A re-pin while that lookup is in flight
+        // must not let the old transport's result escape as P3 authority.
+        if self.managed_enrollment_grant(grant)? != original_grant {
+            return Err(invalid("enrollment transport changed"));
+        }
+        if receipt.lineage_root_id != member.lineage_root_id
+            || receipt.attempt.lineage_root_id != member.lineage_root_id
+        {
+            return Err(invalid("attempt mismatch"));
+        }
+        let lookup_receipt = receipt.clone();
+        let qualification = self
+            .read(move |store| store.managed_enrollment_qualification(&lookup_receipt))
+            .await?;
+        Ok(
+            serde_json::json!({"version":1,"store_id":key.expected_store_id,"request_id":key.request_id,"member_id":member_id,"state":"current","admission_receipt_id":admission.receipt_id,"receipt":receipt,"qualification":qualification}),
+        )
+    }
     /// Query Bridge independently of ingress after freezing the current launch.
     pub(crate) async fn attempt_current_egress_v1(
         &self,
@@ -956,12 +1060,37 @@ mod tests {
         assert_eq!(done.retired_count, Some(4));
         assert_eq!(
             service
-                .attempt_retire_namespace_v1(&grant, &bridge, &pool, request)
+                .attempt_retire_namespace_v1(&grant, &bridge, &pool, request.clone())
                 .await
                 .unwrap(),
             done
         );
         assert_eq!(bridge.retire_calls.load(Ordering::SeqCst), 2);
+        let mut params = serde_json::to_value(request).unwrap();
+        params["version"] = json!(1);
+        let reply = crate::attempt_wire::dispatch(
+            &service,
+            &grant,
+            &bridge,
+            &pool,
+            "_attempt_retire_namespace_v1",
+            params,
+        )
+        .await
+        .unwrap();
+        crate::attempt_wire::assert_reply_keys(
+            &reply,
+            &[
+                "version",
+                "store_id",
+                "state",
+                "bridge_route",
+                "producer",
+                "issuer_epoch",
+                "retirement_key",
+                "retired_count",
+            ],
+        );
     }
 
     struct RecoveryBridge {
@@ -1061,6 +1190,48 @@ mod tests {
         calls: AtomicUsize,
         context_calls: AtomicUsize,
     }
+
+    struct DelayedActorBridge {
+        actor: wire::Actor,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    impl BridgeReader for DelayedActorBridge {
+        fn context<'a>(&'a self, _: &'a IngressCurrent) -> PeerFuture<'a, BridgeContext> {
+            Box::pin(async { Err(Error::Conflict) })
+        }
+        fn consume<'a>(&'a self, _: &'a AdmissionRequest) -> PeerFuture<'a, BridgeConsume> {
+            Box::pin(async { Err(Error::Conflict) })
+        }
+        fn issuer<'a>(&'a self, _: &'a NamespaceRequest) -> PeerFuture<'a, BridgeIssuer> {
+            Box::pin(async { Err(Error::Conflict) })
+        }
+        fn retire<'a>(&'a self, _: &'a NamespaceRequest) -> PeerFuture<'a, BridgeRetired> {
+            Box::pin(async { Err(Error::Conflict) })
+        }
+        fn actor<'a>(
+            &'a self,
+            route: &'a Route,
+            producer: &'a str,
+            incarnation: &'a Incarnation,
+            launch_id: &'a str,
+        ) -> PeerFuture<'a, BridgeActor> {
+            Box::pin(async move {
+                self.started.notify_one();
+                self.release.notified().await;
+                Ok(BridgeActor {
+                    version: 1,
+                    store_id: route.component_store_id.clone(),
+                    producer: producer.into(),
+                    incarnation: incarnation.clone(),
+                    launch_id: launch_id.into(),
+                    state: "current".into(),
+                    actor: Some(self.actor.clone()),
+                    issuer_epoch: Some("issuer".into()),
+                })
+            })
+        }
+    }
     impl BridgeReader for ObservationBridge {
         fn actor<'a>(
             &'a self,
@@ -1142,6 +1313,625 @@ mod tests {
         fn seal<'a>(&'a self, _: &'a NamespaceRequest) -> PeerFuture<'a, PoolSeal> {
             Box::pin(async { Err(Error::Conflict) })
         }
+    }
+
+    /// The first protected hook and the owner observation resolve the same
+    /// externally enrolled root; neither may manufacture a missing actor.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn p3_rootless_first_hook_and_qualified_current() {
+        use agent_run_domain::{
+            attempt_binding::{Actor, Observation, RoleQualification},
+            batch::{ExecutionRef, PinId},
+            enrollment::{Admission, Key, Receipt},
+        };
+        let home = tempfile::tempdir().unwrap();
+        let store = agent_run_store::fixture::initialize(home.path()).unwrap();
+        let sid = agent_run_store::store_identity::read(&store.conn).unwrap();
+        let id = AgentId::new();
+        let attempt = format!("att_{}", uuid::Uuid::new_v4().simple());
+        let launch = uuid::Uuid::new_v4().to_string();
+        let leader = agent_run_platform::process::inspect(std::process::id() as i32).unwrap();
+        let k = agent_run_platform::process::kernel_incarnation(&leader).unwrap();
+        let incarnation = Incarnation {
+            host_id: "host".into(),
+            boot_id: k.boot_id,
+            pid_namespace_inode: k.pid_namespace_inode,
+            uid: k.uid,
+            pid: k.pid,
+            start_ticks: k.start_ticks,
+        };
+        let identity = json!({"provider_identity_version":2,"provider_config":{"managed_attempt_binding":{"enabled":true,"role_name":"managed","host_id":"host"}},"authority":{"profile":"managed","harness":"codex","role_payload":{"config_revision":"b".repeat(64)}}});
+        store.conn.execute("INSERT INTO agents(id,runtime,model,profile,task,task_summary,workdir,request_json,status,created_at,config_revision,root_agent_id,sequence,runtime_session_id,identity_json,pool_membership_ever) VALUES(?,'codex','model','managed','task','task','/fixture','{}','running',1,'cfg',?,1,'native',?,1)",rusqlite::params![id.as_str(),id.as_str(),identity.to_string()]).unwrap();
+        store.conn.execute("INSERT INTO attempts(id,agent_id,number,state,adapter_state_json,created_at,phase,ownership_active,process_identity,process_birth_time) VALUES(?,?,1,'running','{}',1,'spawning',1,?,?)",rusqlite::params![attempt,id.as_str(),leader.token,leader.birth]).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO worker_capabilities(attempt_id,token_sha256,created_at) VALUES(?,?,1)",
+                rusqlite::params![attempt, "f".repeat(64)],
+            )
+            .unwrap();
+        store.conn.execute("INSERT INTO worker_lifecycle(attempt_id,phase,transition_at) VALUES(?,'running',1)",[&attempt]).unwrap();
+        store.conn.execute("INSERT INTO attempt_launches(spawn_key,execution_id,sequence,attempt_id,launch_id,state,boot_id,pid_namespace_inode,uid,pid,start_ticks) VALUES(?,?,1,?,?,'bound',?,?,?,?,?)",rusqlite::params![attempt,id.as_str(),attempt,launch,incarnation.boot_id,incarnation.pid_namespace_inode,incarnation.uid,incarnation.pid,incarnation.start_ticks]).unwrap();
+        let pool = Route {
+            component_store_id: "00000000-0000-4000-8000-000000000011".into(),
+            route_id: "pool".into(),
+            worker_uid: incarnation.uid,
+        };
+        let run = Route {
+            component_store_id: sid.to_string(),
+            route_id: "run".into(),
+            worker_uid: incarnation.uid,
+        };
+        let bridge_route = Route {
+            component_store_id: "00000000-0000-4000-8000-000000000012".into(),
+            route_id: "bridge".into(),
+            worker_uid: incarnation.uid,
+        };
+        let grant = PeerGrant {
+            enabled: true,
+            pool_route: pool.clone(),
+            run_route: run,
+            bridge_route: bridge_route.clone(),
+            producer: "pool".into(),
+            host_id: "host".into(),
+        };
+        let key = Key {
+            version: 1,
+            expected_store_id: sid.clone(),
+            pool_store_id: pool.component_store_id.clone(),
+            request_id: "enroll".into(),
+            fingerprint: "a".repeat(64),
+        };
+        let receipt = Receipt {
+            version: 1,
+            store_id: sid.clone(),
+            request_id: key.request_id.clone(),
+            receipt_id: uuid::Uuid::new_v4().to_string(),
+            fingerprint: key.fingerprint.clone(),
+            state: "admitted".into(),
+            jobs: vec![Admission {
+                index: 0,
+                member_id: "member".into(),
+                lineage_root_id: id.clone(),
+                execution_id: id.clone(),
+                sequence: 1,
+                execution_ref: ExecutionRef::from_first_provider_attempt(&id, &attempt).unwrap(),
+                pin_id: PinId::new(),
+                managed_role_name: "managed".into(),
+                role_digest: "b".repeat(64),
+            }],
+        };
+        let route_json = serde_json::to_string(&pool).unwrap();
+        let config = format!(
+            "schema_version=2\n[managed_attempt_binding]\nenabled=true\nrole_name='managed'\npool_server='pool'\npool_executable_sha256='{}'\nbridge_hook_sha256='{}'\nhost_id='host'\npool_resident_executable='/usr/bin/false'\npool_resident_sha256='{}'\n[managed_attempt_binding.transport]\nrun_route={{component_store_id='{sid}',route_id='run',worker_uid={uid}}}\npool_route={{component_store_id='{}',route_id='pool',worker_uid={uid}}}\nbridge_route={{component_store_id='{}',route_id='bridge',worker_uid={uid}}}\nproducer='pool'\npool_socket='{}/pool.sock'\nbridge_socket='{}/bridge.sock'\nbridge_executable='/usr/bin/true'\nbridge_executable_sha256='{}'\nbridge_reader_credential_file='{}/reader'\nbridge_reader_credential_sha256='{}'\n",
+            "a".repeat(64),
+            "c".repeat(64),
+            "b".repeat(64),
+            pool.component_store_id,
+            grant.bridge_route.component_store_id,
+            home.path().display(),
+            home.path().display(),
+            "d".repeat(64),
+            home.path().display(),
+            "e".repeat(64),
+            uid = incarnation.uid
+        );
+        std::fs::write(home.path().join("config.toml"), &config).unwrap();
+        let pinned = agent_run_store::managed_enrollment::Grant::from_config(
+            &agent_run_config::provider_config::ProviderConfig::load(home.path())
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+        store.conn.execute("INSERT INTO managed_enrollments(pool_route_json,pool_store_id,request_id,fingerprint_version,fingerprint,state,request_json,grant_json,receipt_id,receipt_json) VALUES(?,?,?,1,?,'admitted','{}',?,?,?)",rusqlite::params![route_json,key.pool_store_id,key.request_id,key.fingerprint,serde_json::to_string(&pinned).unwrap(),receipt.receipt_id,serde_json::to_string(&receipt).unwrap()]).unwrap();
+        store.conn.execute("INSERT INTO managed_enrollment_members(lineage_root_id,pool_route_json,pool_store_id,pool_id,request_id,member_id,member_index) VALUES(?,?,?,'pool',?,'member',0)",rusqlite::params![id.as_str(),route_json,key.pool_store_id,key.request_id]).unwrap();
+        drop(store);
+        let writer = crate::writer_test_harness::Harness::start(home.path());
+        let service = Service::new(home.path().into()).with_writer(writer.broker());
+        let actor = Actor {
+            address: "host/codex/native".into(),
+            role: "root".into(),
+            native_id: "native".into(),
+            epoch: 1,
+        };
+        let observation = Observation {
+            incarnation: incarnation.clone(),
+            launch_id: launch.clone(),
+            actor: actor.clone(),
+            native_call_id: "first-call".into(),
+            tool_name: "mcp__pool__pool_get".into(),
+            observed_at_ms: 1,
+            expires_at_ms: 2,
+        };
+        let bridge = ObservationBridge {
+            receipt: ConsumeReceipt {
+                producer: "pool".into(),
+                consume_request_id: "consume".into(),
+                invocation_key: "first-hook".into(),
+                security_digest: "a".repeat(64),
+                observation,
+                issuer_epoch: "issuer".into(),
+                consumed_at_ms: 2,
+            },
+            calls: AtomicUsize::new(0),
+            context_calls: AtomicUsize::new(0),
+        };
+        let current = || {
+            service.managed_enrollment_current(
+                &grant,
+                &bridge,
+                key.clone(),
+                "member".into(),
+                "observation-1".into(),
+            )
+        };
+        assert!(
+            matches!(current().await,Err(Error::Validation(ref message)) if message == "attempt not ready")
+        );
+        let store = agent_run_store::fixture::open(home.path()).unwrap();
+        store
+            .attempt_qualify_role(
+                &id,
+                &RoleQualification {
+                    launch_id: launch.clone(),
+                    attempt_id: attempt.clone(),
+                    harness: "codex".into(),
+                    role_digest: "b".repeat(64),
+                    config_digest: "c".repeat(64),
+                    inventory_digest: "d".repeat(64),
+                    incarnation: incarnation.clone(),
+                },
+            )
+            .unwrap();
+        drop(store);
+        let delayed = std::sync::Arc::new(DelayedActorBridge {
+            actor: actor.clone(),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let pending = tokio::spawn({
+            let service = service.clone();
+            let grant = grant.clone();
+            let key = key.clone();
+            let delayed = delayed.clone();
+            async move {
+                service
+                    .managed_enrollment_current(
+                        &grant,
+                        delayed.as_ref(),
+                        key,
+                        "member".into(),
+                        "during-upgrade".into(),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            delayed.started.notified(),
+        )
+        .await
+        .unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            config
+                .replace("producer='pool'", "producer='pool2'")
+                .replace("bridge.sock", "bridge-new.sock"),
+        )
+        .unwrap();
+        delayed.release.notify_one();
+        assert!(
+            matches!(pending.await.unwrap(),Err(Error::Validation(ref message)) if message == "enrollment transport changed")
+        );
+        std::fs::write(home.path().join("config.toml"), &config).unwrap();
+        let unavailable = RecoveryBridge {
+            actor: actor.clone(),
+            state: ActorRecoveryState::AwaitingRootHook,
+            actor_calls: AtomicUsize::new(0),
+            recovery_calls: AtomicUsize::new(0),
+            fail_actor: false,
+            fail_recovery: false,
+            mismatch: false,
+            current_on_retry: false,
+            foreign_on_retry: false,
+        };
+        assert!(
+            matches!(service.managed_enrollment_current(&grant,&unavailable,key.clone(),"member".into(),"observation-1".into()).await,Err(Error::Validation(ref message)) if message == "attempt not ready")
+        );
+        let ingress = service
+            .attempt_current_ingress_v1(
+                &grant,
+                &bridge,
+                IngressCurrent {
+                    expected_store_id: sid.clone(),
+                    request_id: "first-ingress".into(),
+                    bridge_route,
+                    pool_route: pool.clone(),
+                    run_route: grant.run_route.clone(),
+                    producer: "pool".into(),
+                    bridge_context_ref: "context".into(),
+                    invocation_key: "first-hook".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(ingress.lineage_root_id, id);
+        let result = current().await.unwrap();
+        crate::attempt_wire::assert_reply_keys(
+            &result,
+            &[
+                "version",
+                "store_id",
+                "request_id",
+                "member_id",
+                "state",
+                "admission_receipt_id",
+                "receipt",
+                "qualification",
+            ],
+        );
+        crate::attempt_wire::assert_reply_keys(
+            &result["qualification"],
+            &[
+                "launch_id",
+                "role_digest",
+                "config_digest",
+                "inventory_digest",
+            ],
+        );
+        assert_eq!(result["receipt"]["lineage_root_id"], json!(id));
+        assert_eq!(result["receipt"]["attempt"]["launch_id"], launch);
+        assert_eq!(result["qualification"]["inventory_digest"], "d".repeat(64));
+        let wire_result = crate::attempt_wire::dispatch(&service,&grant,&bridge,&OutcomePool,"_managed_enrollment_current_v1",json!({"version":1,"expected_store_id":sid,"pool_store_id":key.pool_store_id,"request_id":key.request_id,"fingerprint":key.fingerprint,"member_id":"member","current_request_id":"observation-1"})).await.unwrap();
+        assert_eq!(wire_result, result);
+        let replay = service
+            .managed_enrollment_current(
+                &grant,
+                &unavailable,
+                key.clone(),
+                "member".into(),
+                "observation-1".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay, result);
+        std::fs::write(
+            home.path().join("config.toml"),
+            config
+                .replace("producer='pool'", "producer='pool2'")
+                .replace("bridge.sock", "bridge-new.sock"),
+        )
+        .unwrap();
+        let mut repinned = grant.clone();
+        repinned.producer = "pool2".into();
+        let old_current = crate::attempt_wire::dispatch(&service,&repinned,&bridge,&OutcomePool,"_managed_enrollment_current_v1",json!({"version":1,"expected_store_id":sid,"pool_store_id":key.pool_store_id,"request_id":key.request_id,"fingerprint":key.fingerprint,"member_id":"member","current_request_id":"after-upgrade"})).await.unwrap_err();
+        assert_eq!(
+            crate::attempt_wire::dispatch_error(
+                &old_current,
+                "_managed_enrollment_current_v1",
+                &sid.to_string()
+            )["code"],
+            "recovery_required"
+        );
+        let recovery_key = json!({"version":1,"expected_store_id":sid,"pool_store_id":key.pool_store_id,"request_id":key.request_id,"fingerprint":key.fingerprint});
+        let recovered = crate::attempt_wire::dispatch(
+            &service,
+            &repinned,
+            &bridge,
+            &OutcomePool,
+            "_managed_start_lookup_v1",
+            recovery_key.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered["state"], "admitted");
+        let aborted = crate::attempt_wire::dispatch(
+            &service,
+            &repinned,
+            &bridge,
+            &OutcomePool,
+            "_managed_start_abort_v1",
+            recovery_key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(aborted["state"], "admitted");
+        assert!(
+            service
+                .managed_enrollment_current(
+                    &grant,
+                    &bridge,
+                    key,
+                    "foreign".into(),
+                    "observation-1".into()
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    /// Exercise exact selector, real writer replay and a synthetic pre-spawn
+    /// refusal; no native provider or Bridge service is started.
+    #[cfg(all(target_os = "linux", feature = "test-fixtures"))]
+    #[tokio::test]
+    async fn p3_owner_only_exact_selector_and_single_enrollment() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("profiles")).unwrap();
+        std::fs::create_dir(root.join("work")).unwrap();
+        std::fs::write(root.join("profiles/managed.md"),"+++\nrevision='1'\nwrite=false\nnetwork=false\nallow_external_read_roots=false\nskills=[]\nmcp=['pool']\nrequired_constraints=[]\n+++\nManaged.\n").unwrap();
+        std::fs::write(root.join("fixture-supervisor-spawn-error"), "").unwrap();
+        let frontend = root.join("pool-frontend");
+        let hook = root.join("bridge-hook");
+        std::fs::copy("/usr/bin/true", &frontend).unwrap();
+        std::fs::copy("/usr/bin/false", &hook).unwrap();
+        std::fs::set_permissions(&frontend, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let frontend_sha = agent_run_platform::fs::sha256(&std::fs::read(&frontend).unwrap());
+        let hook_sha = agent_run_platform::fs::sha256(&std::fs::read(&hook).unwrap());
+        let mut store = agent_run_store::fixture::initialize(&root).unwrap();
+        let sid = agent_run_store::store_identity::read(&store.conn).unwrap();
+        store
+            .register_account(&agent_run_domain::AccountRecord {
+                account_id: "acct".parse().unwrap(),
+                auth_family: "openai".parse().unwrap(),
+                secret_ref: "native:codex".parse().unwrap(),
+                status: agent_run_domain::AccountStatus::Enabled,
+            })
+            .unwrap();
+        // SAFETY: geteuid is read-only.
+        let uid = unsafe { libc::geteuid() };
+        let pool = Route {
+            component_store_id: "00000000-0000-4000-8000-000000000021".into(),
+            route_id: "pool".into(),
+            worker_uid: uid,
+        };
+        let run = Route {
+            component_store_id: sid.to_string(),
+            route_id: "run".into(),
+            worker_uid: uid,
+        };
+        let bridge_route = Route {
+            component_store_id: "00000000-0000-4000-8000-000000000022".into(),
+            route_id: "bridge".into(),
+            worker_uid: uid,
+        };
+        let grant = PeerGrant {
+            enabled: true,
+            pool_route: pool.clone(),
+            run_route: run,
+            bridge_route,
+            producer: "pool".into(),
+            host_id: "host".into(),
+        };
+        let config = |enabled: bool, tool: &str| {
+            format!(
+                "schema_version=2\n[core]\nmax_active_agents=4\n[managed_attempt_binding]\nenabled={enabled}\nrole_name='managed'\npool_server='pool'\npool_executable_sha256='{frontend_sha}'\nbridge_hook_sha256='{hook_sha}'\nhost_id='host'\npool_resident_executable='/usr/bin/printf'\npool_resident_sha256='{}'\n[managed_attempt_binding.transport]\nrun_route={{component_store_id='{sid}',route_id='run',worker_uid={uid}}}\npool_route={{component_store_id='{}',route_id='pool',worker_uid={uid}}}\nbridge_route={{component_store_id='{}',route_id='bridge',worker_uid={uid}}}\nproducer='pool'\npool_socket='{}/pool.sock'\nbridge_socket='{}/bridge.sock'\nbridge_executable='/usr/bin/cat'\nbridge_executable_sha256='{}'\nbridge_reader_credential_file='{}/reader'\nbridge_reader_credential_sha256='{}'\n[harnesses.codex]\nbinary='/usr/bin/true'\nhome='{}/codex'\nhooks=[{{event='PreToolUse',command=['{}'],matcher='mcp__pool__.*'}}]\n[mcp.pool]\ntransport='stdio'\ncommand='{}'\nargs=['mcp','--config','{}/pool.toml']\nenv_from=[]\napproval_mode='approve'\nallowed_tools=['{tool}']\n[providers.codex]\nharness='codex'\nconnection={{kind='native'}}\nauth_family='openai'\nlimits_source='none'\n[[providers.codex.models]]\nid='m'\n[[providers.codex.bindings]]\nlabel='test'\naccount='acct'\n",
+                "b".repeat(64),
+                pool.component_store_id,
+                grant.bridge_route.component_store_id,
+                root.display(),
+                root.display(),
+                "c".repeat(64),
+                root.display(),
+                "d".repeat(64),
+                root.display(),
+                hook.display(),
+                frontend.display(),
+                root.display()
+            ).replace("[mcp.pool]", &format!("[harnesses.claude-code]\nbinary='/usr/bin/true'\nhome='{}/claude'\n[mcp.pool]", root.display()))
+        };
+        std::fs::write(root.join("config.toml"), config(false, "pool_get")).unwrap();
+        agent_run_config::provider_config::ProviderConfig::load(&root).unwrap();
+        drop(store);
+        let writer = crate::writer_test_harness::Harness::start(&root);
+        let service = Service::new(root.clone()).with_writer(writer.broker());
+        let bridge = FakeBridge {
+            retire_calls: AtomicUsize::new(0),
+        };
+        let request = |id: &str| json!({"version":1,"expected_store_id":sid,"pool_store_id":pool.component_store_id,"pool_id":"pool","request_id":id,"mode":"start","jobs":[{"member_id":format!("member-{id}"),"selector":{"version":1,"role_name":"managed"},"spec":{"provider":"codex","model":"m","profile":"managed","task":"fixture","workdir":root.join("work"),"write":false,"explicit_finish":true}}],"preconditions":[]});
+        let error = crate::attempt_wire::dispatch(
+            &service,
+            &grant,
+            &bridge,
+            &OutcomePool,
+            "_managed_start_batch_v1",
+            request("disabled"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            crate::attempt_wire::dispatch_error(
+                &error,
+                "_managed_start_batch_v1",
+                &sid.to_string()
+            )["code"],
+            "capability_missing"
+        );
+        std::fs::write(root.join("config.toml"), config(true, "pool_start_agent")).unwrap();
+        let unsafe_request = request("unsafe");
+        let error = crate::attempt_wire::dispatch(
+            &service,
+            &grant,
+            &bridge,
+            &OutcomePool,
+            "_managed_start_batch_v1",
+            unsafe_request.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            crate::attempt_wire::dispatch_error(
+                &error,
+                "_managed_start_batch_v1",
+                &sid.to_string()
+            )["code"],
+            "role_unqualified"
+        );
+        let digest = wire::enrollment_start_fingerprint(&unsafe_request).unwrap();
+        let key = json!({"version":1,"expected_store_id":sid,"pool_store_id":pool.component_store_id,"request_id":"unsafe","fingerprint":digest});
+        let error = crate::attempt_wire::dispatch(
+            &service,
+            &grant,
+            &bridge,
+            &OutcomePool,
+            "_managed_start_lookup_v1",
+            key.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            crate::attempt_wire::dispatch_error(
+                &error,
+                "_managed_start_lookup_v1",
+                &sid.to_string()
+            )["code"],
+            "request_in_progress"
+        );
+        let aborted = crate::attempt_wire::dispatch(
+            &service,
+            &grant,
+            &bridge,
+            &OutcomePool,
+            "_managed_start_abort_v1",
+            key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(aborted["state"], "aborted");
+        crate::attempt_wire::assert_reply_keys(
+            &aborted,
+            &[
+                "version",
+                "store_id",
+                "request_id",
+                "fingerprint",
+                "state",
+                "receipt",
+                "jobs_state",
+            ],
+        );
+        std::fs::write(root.join("config.toml"), config(true, "pool_get")).unwrap();
+        let good = request("good");
+        let (first, second) = tokio::join!(
+            crate::attempt_wire::dispatch(
+                &service,
+                &grant,
+                &bridge,
+                &OutcomePool,
+                "_managed_start_batch_v1",
+                good.clone()
+            ),
+            crate::attempt_wire::dispatch(
+                &service,
+                &grant,
+                &bridge,
+                &OutcomePool,
+                "_managed_start_batch_v1",
+                good.clone()
+            )
+        );
+        let first = first.unwrap();
+        crate::attempt_wire::assert_reply_keys(
+            &first,
+            &[
+                "version",
+                "store_id",
+                "request_id",
+                "receipt_id",
+                "fingerprint",
+                "state",
+                "jobs",
+            ],
+        );
+        crate::attempt_wire::assert_reply_keys(
+            &first["jobs"][0],
+            &[
+                "index",
+                "member_id",
+                "lineage_root_id",
+                "execution_id",
+                "sequence",
+                "execution_ref",
+                "pin_id",
+                "managed_role_name",
+                "role_digest",
+            ],
+        );
+        assert_eq!(first, second.unwrap());
+        assert_eq!(first["state"], "admitted");
+        assert_eq!(first["jobs"].as_array().unwrap().len(), 1);
+        assert!(first["jobs"][0].get("attempt_id").is_none());
+        let lookup = crate::attempt_wire::dispatch(&service,&grant,&bridge,&OutcomePool,"_managed_start_lookup_v1",json!({"version":1,"expected_store_id":sid,"pool_store_id":pool.component_store_id,"request_id":"good","fingerprint":first["fingerprint"]})).await.unwrap();
+        crate::attempt_wire::assert_reply_keys(
+            &lookup,
+            &[
+                "version",
+                "store_id",
+                "request_id",
+                "fingerprint",
+                "state",
+                "receipt",
+                "jobs_state",
+            ],
+        );
+        crate::attempt_wire::assert_reply_keys(
+            &lookup["jobs_state"][0],
+            &[
+                "index",
+                "member_id",
+                "state",
+                "failure_code",
+                "last_attempt",
+                "incarnation",
+                "qualification",
+            ],
+        );
+        assert_eq!(lookup["receipt"], first);
+        let stored = agent_run_store::fixture::open(&root).unwrap();
+        assert_eq!(
+            stored
+                .conn
+                .query_row("SELECT count(*) FROM agents", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            stored
+                .conn
+                .query_row("SELECT count(*) FROM history_pins", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            stored
+                .conn
+                .query_row("SELECT count(*) FROM managed_enrollment_members", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(stored);
+        std::fs::write(root.join("config.toml"), config(false, "pool_get")).unwrap();
+        let replay = crate::attempt_wire::dispatch(
+            &service,
+            &grant,
+            &bridge,
+            &OutcomePool,
+            "_managed_start_batch_v1",
+            good,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay, first);
+        assert!(
+            !agent_run_domain::tools::worker_registry()
+                .iter()
+                .any(|tool| tool.name.starts_with("_managed_start"))
+        );
     }
 
     struct DelayedBridge {
@@ -1374,6 +2164,20 @@ mod tests {
                 "_attempt_current_v1",
                 &sid.to_string(),
             );
+            crate::attempt_wire::assert_reply_keys(
+                &response,
+                &[
+                    "version",
+                    "store_id",
+                    "code",
+                    "recovery",
+                    "request_id",
+                    "actor_recovery_version",
+                    "actor_recovery",
+                    "incarnation",
+                    "launch_id",
+                ],
+            );
             assert_eq!(response["code"], "binding_unavailable");
             assert_eq!(response["actor_recovery"], label);
             assert_eq!(response["actor_recovery_version"], 1);
@@ -1399,6 +2203,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(recovered["state"], "current");
+        crate::attempt_wire::assert_reply_keys(
+            &recovered,
+            &["version", "store_id", "state", "receipt"],
+        );
         let mut unavailable = make_recovery(ActorRecoveryState::Unavailable);
         unavailable.fail_actor = true;
         let replayed = crate::attempt_wire::dispatch(
@@ -1514,6 +2322,76 @@ mod tests {
         )
         .await
         .unwrap();
+        crate::attempt_wire::assert_reply_keys(
+            &wire_receipt,
+            &["version", "store_id", "state", "receipt"],
+        );
+        crate::attempt_wire::assert_reply_keys(
+            &wire_receipt["receipt"],
+            &[
+                "receipt_id",
+                "purpose",
+                "lineage_root_id",
+                "bound_execution_id",
+                "attempt",
+                "incarnation",
+                "actor",
+                "successor_proof",
+            ],
+        );
+        crate::attempt_wire::assert_reply_keys(
+            &wire_receipt["receipt"]["attempt"],
+            &[
+                "run_store_id",
+                "lineage_root_id",
+                "execution_id",
+                "sequence",
+                "attempt_id",
+                "launch_id",
+            ],
+        );
+        crate::attempt_wire::assert_reply_keys(
+            &wire_receipt["receipt"]["incarnation"],
+            &[
+                "host_id",
+                "boot_id",
+                "pid_namespace_inode",
+                "uid",
+                "pid",
+                "start_ticks",
+            ],
+        );
+        crate::attempt_wire::assert_reply_keys(
+            &wire_receipt["receipt"]["actor"],
+            &["address", "role", "native_id", "epoch"],
+        );
+        crate::attempt_wire::assert_reply_keys(
+            &wire_receipt["receipt"]["successor_proof"],
+            &[
+                "lineage_root_id",
+                "bound_execution_id",
+                "current_execution_id",
+                "chain",
+            ],
+        );
+        crate::attempt_wire::assert_reply_keys(
+            &wire_receipt["receipt"]["successor_proof"]["chain"][0],
+            &["execution_id", "parent_execution_id", "sequence"],
+        );
+        let by_id = crate::attempt_wire::dispatch(&service,&grant,&bridge,&OutcomePool,"_attempt_current_receipt_v1",json!({"version":1,"expected_store_id":sid,"receipt_id":wire_receipt["receipt"]["receipt_id"]})).await.unwrap();
+        crate::attempt_wire::assert_reply_keys(&by_id, &["version", "store_id", "receipt"]);
+        let consensus = crate::attempt_wire::dispatch(&service,&grant,&bridge,&OutcomePool,"_attempt_current_v1",json!({"version":1,"expected_store_id":sid,"request_id":"consensus-wire","purpose":"consensus","lineage_root_id":id,"bound_execution_id":id,"expected_attempt":binding.attempt,"expected_incarnation":inc})).await.unwrap();
+        crate::attempt_wire::assert_reply_keys(
+            &consensus,
+            &[
+                "version",
+                "store_id",
+                "state",
+                "last_attempt",
+                "last_incarnation",
+                "successor_proof",
+            ],
+        );
         assert_eq!(wire_receipt["receipt"]["lineage_root_id"], id.as_str());
         assert_eq!(
             wire_receipt["receipt"]["attempt"]["launch_id"],
@@ -1602,6 +2480,59 @@ mod tests {
             .attempt_admit_v1(&grant, &bridge, request.clone())
             .await
             .unwrap();
+        let mut admit_params = serde_json::to_value(&request).unwrap();
+        admit_params.as_object_mut().unwrap().remove("pool_route");
+        let wire_admit = crate::attempt_wire::dispatch(
+            &service,
+            &grant,
+            &bridge,
+            &OutcomePool,
+            "_attempt_admit_v1",
+            admit_params.clone(),
+        )
+        .await
+        .unwrap();
+        crate::attempt_wire::assert_reply_keys(
+            &wire_admit,
+            &["version", "store_id", "state", "admission"],
+        );
+        crate::attempt_wire::assert_reply_keys(
+            &wire_admit["admission"],
+            &[
+                "admission_id",
+                "intent_id",
+                "security_digest",
+                "policy",
+                "binding",
+                "incarnation",
+                "successor_proof",
+                "consumed_ref",
+            ],
+        );
+        assert_eq!(wire_admit["state"], "admitted");
+        let lookup = crate::attempt_wire::dispatch(&service,&grant,&bridge,&OutcomePool,"_attempt_admission_lookup_v1",json!({"version":1,"expected_store_id":sid,"intent_id":request.intent_id,"security_digest":request.security_digest})).await.unwrap();
+        crate::attempt_wire::assert_reply_keys(
+            &lookup,
+            &[
+                "version",
+                "store_id",
+                "state",
+                "admission",
+                "outcome_digest",
+            ],
+        );
+        let wire_abort = crate::attempt_wire::dispatch(&service,&grant,&bridge,&OutcomePool,"_attempt_admission_abort_v1",json!({"version":1,"expected_store_id":sid,"request_id":"shape-abort","intent_id":"shape-abort","security_digest":"f".repeat(64),"pool_route":grant.pool_route,"pool_outcome_digest":null})).await.unwrap();
+        crate::attempt_wire::assert_reply_keys(
+            &wire_abort,
+            &[
+                "version",
+                "store_id",
+                "state",
+                "admission",
+                "outcome_digest",
+            ],
+        );
+        assert_eq!(wire_abort["state"], "aborted_before_admit");
         assert_eq!(
             service
                 .attempt_admit_v1(&grant, &bridge, request.clone())
@@ -1758,14 +2689,39 @@ mod tests {
             .attempt_settle_v1(
                 &grant,
                 &OutcomePool,
-                sid,
-                admitted.admission.unwrap().admission_id,
-                request.intent_id,
-                request.security_digest,
-                outcome,
+                sid.clone(),
+                admitted.admission.clone().unwrap().admission_id,
+                request.intent_id.clone(),
+                request.security_digest.clone(),
+                outcome.clone(),
             )
             .await
             .unwrap();
         assert_eq!(settled.state, "settled_committed");
+        let settled_wire = crate::attempt_wire::dispatch(&service,&grant,&bridge,&OutcomePool,"_attempt_settle_v1",json!({"version":1,"expected_store_id":sid,"admission_id":admitted.admission.unwrap().admission_id,"intent_id":request.intent_id,"security_digest":request.security_digest,"pool_outcome_digest":outcome})).await.unwrap();
+        crate::attempt_wire::assert_reply_keys(
+            &settled_wire,
+            &[
+                "version",
+                "store_id",
+                "state",
+                "admission",
+                "outcome_digest",
+            ],
+        );
+        let replay = crate::attempt_wire::dispatch(
+            &service,
+            &grant,
+            &bridge,
+            &OutcomePool,
+            "_attempt_admit_v1",
+            admit_params,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            replay, wire_admit,
+            "admit replay remains the original admitted DTO after settlement"
+        );
     }
 }

@@ -1336,7 +1336,23 @@ fn operator_config(
 )> {
     match agent_run_config::provider_config::ProviderConfig::load(home) {
         Ok((v2, _)) => Ok((v2.shared(), Some(v2))),
-        Err(_) => Ok((Config::load(home)?, None)),
+        Err(v2_error) => {
+            let bytes = fs::Dir::open(home)?.read(Path::new("config.toml"), 1024 * 1024)?;
+            let is_v2 = std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|text| toml::from_str::<toml::Value>(text).ok())
+                .and_then(|value| {
+                    value
+                        .get("schema_version")
+                        .and_then(toml::Value::as_integer)
+                })
+                == Some(2);
+            if is_v2 {
+                Err(v2_error)
+            } else {
+                Ok((Config::load(home)?, None))
+            }
+        }
     }
 }
 pub fn doc(topic: &str) -> Result<&'static str> {
@@ -3400,6 +3416,26 @@ mod login_selection_tests {
     use super::provider_login_target;
     use agent_run_config::provider_config::ProviderConfig;
     use agent_run_domain::catalog::{AccountRecord, AccountStatus};
+
+    #[test]
+    fn operator_config_preserves_schema_two_validation_error() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"),format!("schema_version=2\n[managed_attempt_binding]\nenabled=true\nrole_name='managed'\npool_server='pool'\npool_executable_sha256='{}'\nbridge_hook_sha256='{}'\nhost_id='host'\npool_resident_sha256='{}'\n","a".repeat(64),"b".repeat(64),"b".repeat(64))).unwrap();
+        let error = super::operator_config(home.path()).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("managed component identity is ambiguous"),
+            "{error}"
+        );
+        std::fs::write(
+            home.path().join("config.toml"),
+            "schema_version=1\n[runtimes.invalid]\nadapter='bogus'\n",
+        )
+        .unwrap();
+        let error = super::operator_config(home.path()).err().unwrap();
+        assert!(error.to_string().contains("invalid config"), "{error}");
+    }
 
     /// Forward only the host identity and restart receipt from a blocked start.
     #[test]

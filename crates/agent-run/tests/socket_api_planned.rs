@@ -953,7 +953,7 @@ pool_resident_executable="{python}"
 pool_resident_sha256="{pool_hash}"
 [managed_attempt_binding.transport]
 run_route={{component_store_id="{sid}",route_id="run",worker_uid={uid}}}
-pool_route={{component_store_id="pool-store",route_id="pool",worker_uid={uid}}}
+pool_route={{component_store_id="00000000-0000-4000-8000-000000000010",route_id="pool",worker_uid={uid}}}
 bridge_route={{component_store_id="00000000-0000-4000-8000-000000000001",route_id="bridge",worker_uid={uid}}}
 producer="pool"
 pool_socket="{pool_socket}"
@@ -963,7 +963,7 @@ bridge_executable_sha256="{bridge_hash}"
 bridge_reader_credential_file="{token}"
 bridge_reader_credential_sha256="{token_hash}"
 "#,
-        frontend_hash = "a".repeat(64),
+        frontend_hash = pool_hash,
         hook_hash = "c".repeat(64),
         python = executable.display(),
         bridge = bridge.display(),
@@ -994,7 +994,8 @@ bridge_reader_credential_sha256="{token_hash}"
             "attempt_egress_actor_recovery_v1",
             "attempt_consensus_v1",
             "attempt_admission_v1",
-            "attempt_namespace_retirement_v1"
+            "attempt_namespace_retirement_v1",
+            "managed_enrollment_v1"
         ])
     );
     let id = agent_run::domain::AgentId::new();
@@ -1007,6 +1008,48 @@ bridge_reader_credential_sha256="{token_hash}"
         serde_json::from_str(&r2_fake_peer(&executable, &private, &frame, &output).await).unwrap();
     assert_eq!(result["error"]["code"], "binding_unavailable");
     assert!(result["error"].get("actor_recovery").is_none());
+    let enrollment = json!({"version":1,"expected_store_id":sid,"pool_store_id":"00000000-0000-4000-8000-000000000010","pool_id":"pool","request_id":"socket-abort","mode":"start","jobs":[{"member_id":"member","selector":{"version":1,"role_name":"managed"},"spec":{"provider":"codex","model":"m","profile":"managed","task":"fixture","workdir":home.path(),"write":false,"explicit_finish":true}}],"preconditions":[]});
+    let fingerprint =
+        agent_run_domain::attempt_binding::enrollment_start_fingerprint(&enrollment).unwrap();
+    let key = json!({"version":1,"expected_store_id":sid,"pool_store_id":"00000000-0000-4000-8000-000000000010","request_id":"socket-abort","fingerprint":fingerprint});
+    for (method, state) in [
+        ("_managed_start_lookup_v1", "absent"),
+        ("_managed_start_abort_v1", "aborted"),
+        ("_managed_start_lookup_v1", "aborted"),
+    ] {
+        let frame = json!({"id":"p3","method":method,"params":key}).to_string();
+        let response: Value =
+            serde_json::from_str(&r2_fake_peer(&executable, &private, &frame, &output).await)
+                .unwrap();
+        assert_eq!(response["result"]["state"], state);
+    }
+    let frame = json!({"id":"p3-submit","method":"_managed_start_batch_v1","params":enrollment})
+        .to_string();
+    let response: Value =
+        serde_json::from_str(&r2_fake_peer(&executable, &private, &frame, &output).await).unwrap();
+    assert_eq!(response["error"]["code"], "enrollment_aborted");
+    let public = request(
+        &api,
+        json!({"jsonrpc":"2.0","id":"p3-public","method":"_managed_start_batch_v1","params":{}}),
+    )
+    .await;
+    assert_eq!(public["error"]["code"], -32601);
+    // The same native build is allowed for a detached resident, but the
+    // identical peer build beneath a recorded harness is never a resident.
+    let leader = agent_run_platform::process::inspect(std::process::id() as i32).unwrap();
+    let kernel = agent_run_platform::process::kernel_incarnation(&leader).unwrap();
+    let store = agent_run_store::fixture::open(home.path()).unwrap();
+    store.conn.execute("INSERT INTO attempt_launches(spawn_key,execution_id,sequence,attempt_id,launch_id,state,boot_id,pid_namespace_inode,uid,pid,start_ticks) VALUES('synthetic-harness','synthetic-root',1,'synthetic-attempt',?,'bound',?,?,?,?,?)",rusqlite::params![uuid::Uuid::new_v4().to_string(),kernel.boot_id,kernel.pid_namespace_inode,kernel.uid,kernel.pid,kernel.start_ticks]).unwrap();
+    drop(store);
+    let frame =
+        json!({"id":"under-harness","method":"_attempt_capabilities_v1","params":{"version":1}})
+            .to_string();
+    let response: Value =
+        serde_json::from_str(&r2_fake_peer(&executable, &private, &frame, &output).await).unwrap();
+    assert_eq!(response["id"], "under-harness");
+    assert_eq!(response["error"]["code"], "peer_not_authorized");
+    assert_eq!(response["error"]["store_id"], sid.to_string());
+    assert_eq!(response["error"].as_object().unwrap().len(), 4);
     broker.abort();
     let _ = broker.await;
 }

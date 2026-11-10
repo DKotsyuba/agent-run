@@ -14,6 +14,48 @@ fn argument(args: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
+/// Offline Pool frontend catalog used by the real supervisor discovery path.
+fn pool_catalog() {
+    for line in io::stdin().lock().lines() {
+        let line = line.expect("fixture MCP input");
+        let frame: Value = serde_json::from_str(&line).expect("fixture MCP JSON");
+        let Some(id) = frame.get("id") else {
+            continue;
+        };
+        let result = match frame["method"].as_str().unwrap_or("") {
+            "initialize" => {
+                json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"pool-fixture","version":"1"}})
+            }
+            "tools/list" => {
+                let tools = ["pool_get", "pool_join", "pool_start_batch", "get_status"]
+                    .into_iter()
+                    .map(|name| json!({"name":name,"inputSchema":{"type":"object"}}))
+                    .collect::<Vec<_>>();
+                json!({"tools":tools})
+            }
+            _ => panic!("unexpected fixture MCP operation"),
+        };
+        emit(json!({"jsonrpc":"2.0","id":id,"result":result}));
+    }
+}
+
+/// One private Pool-resident request to a disposable Run test socket.
+fn pool_resident_request(args: &[String]) {
+    use std::io::{Read, Write};
+    let socket = argument(args, "--socket").expect("fixture socket");
+    let request = argument(args, "--request-file").expect("fixture request");
+    let output = argument(args, "--output-file").expect("fixture output");
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(socket).expect("fixture Run connection");
+    stream
+        .write_all(&std::fs::read(request).expect("fixture request bytes"))
+        .expect("fixture request write");
+    stream.write_all(b"\n").unwrap();
+    let mut reply = Vec::new();
+    stream.read_to_end(&mut reply).expect("fixture Run reply");
+    std::fs::write(output, reply).expect("fixture response file");
+}
+
 /// Completes a synthetic attempt through the real worker MCP and emits the
 /// matching native tool-use and receipt frames for supervisor observation.
 fn worker_finish(args: &[String], session: &str, summary: &str) {
@@ -50,7 +92,7 @@ fn worker_finish(args: &[String], session: &str, summary: &str) {
             frame::write(&mut input, &json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
                 "params":{"name":"finish","arguments":{"summary":summary,"status":"done"}}}), socket::MAX_FRAME).await.unwrap();
             let reply: Value = serde_json::from_slice(&frame::read(&mut output, socket::MAX_FRAME).await.unwrap().unwrap()).unwrap();
-            assert_ne!(reply["result"]["isError"], true, "fixture worker refused finish");
+            assert_ne!(reply["result"]["isError"], true, "fixture worker refused finish: {:?}", reply["result"]["content"]);
             reply["result"]["content"][0]["text"].as_str().expect("finish receipt").to_owned()
         }).await.expect("bounded finish callback");
         drop(input);
@@ -285,6 +327,14 @@ fn control_input() -> Value {
 /// no provider endpoint is contacted and task text is never executed.
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("mcp") {
+        pool_catalog();
+        return;
+    }
+    if args.first().map(String::as_str) == Some("p3-client") {
+        pool_resident_request(&args);
+        return;
+    }
     // A detached helper mode used only by `fixture:descendant`: sleep past the
     // leader's own lifetime so the supervisor must reap it separately.
     if let Some(seconds) = argument(&args, "--child-sleep") {
@@ -427,6 +477,21 @@ fn main() {
     if args.iter().any(|arg| arg == "--disable-slash-commands")
         && argument(&args, "--tools").as_deref() == Some("")
     {
+        let denied = argument(&args, "--disallowedTools").unwrap_or_default();
+        std::fs::write("fixture-managed-denied.txt", &denied).expect("fixture managed deny rules");
+        if let Some(settings) = argument(&args, "--settings") {
+            let catalogs = json!({"pool":["get_status","pool_get","pool_join","pool_start_batch"]});
+            let digest = agent_run_domain::canonical::sha256_hex(
+                &json!({
+                    "settings_sha256":agent_run_platform::fs::sha256(&std::fs::read(settings).unwrap()),
+                    "args":args,
+                    "disallowed_tools":denied,
+                    "mcp_catalog_sha256":agent_run_domain::canonical::sha256_hex(&catalogs,true),
+                }),
+                true,
+            );
+            std::fs::write("fixture-managed-config-digest.txt", digest).unwrap();
+        }
         let tools = argument(&args, "--allowedTools")
             .unwrap_or_default()
             .split(',')

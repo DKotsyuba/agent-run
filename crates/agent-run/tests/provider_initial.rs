@@ -6448,6 +6448,277 @@ async fn managed_codex_home_consolidates_through_its_registry_mapping() {
     );
 }
 
+/// The real supervisor qualifies a managed Claude fixture after discovering
+/// additional Pool tools and computing their exact native deny complement.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn managed_claude_supervisor_qualifies_with_catalog_complement() {
+    use agent_run_config::{
+        config::{Environment, Hook},
+        provider_config::{ManagedAttemptBinding, ManagedAttemptTransport},
+    };
+    use agent_run_domain::{HarnessId, attempt_binding::Route};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        os::unix::fs::{MetadataExt, PermissionsExt},
+    };
+    let base = std::env::var_os("AGENT_RUN_TEST_SOCKET_TMP")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let (_temp, home) = home_in(&base, "", &[]);
+    let ipc = tempfile::Builder::new()
+        .prefix("p3-claude-")
+        .tempdir_in(base)
+        .unwrap();
+    fs::set_permissions(ipc.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let channel = ipc.path().join("bridge.sock");
+    let _bridge = std::os::unix::net::UnixListener::bind(&channel).unwrap();
+    fs::set_permissions(&channel, fs::Permissions::from_mode(0o600)).unwrap();
+    let owner = ipc.path().join("owner");
+    fs::create_dir(&owner).unwrap();
+    fs::set_permissions(&owner, fs::Permissions::from_mode(0o700)).unwrap();
+    let frontend = home.join("pool-frontend");
+    fs::copy(env!("CARGO_BIN_EXE_agent-run-fixture"), &frontend).unwrap();
+    fs::set_permissions(&frontend, fs::Permissions::from_mode(0o700)).unwrap();
+    let frontend_sha = agent_run_platform::fs::sha256(&fs::read(&frontend).unwrap());
+    let hook = std::fs::canonicalize("/usr/bin/true").unwrap();
+    let hook_sha = agent_run_platform::fs::sha256(&fs::read(&hook).unwrap());
+    let bridge = std::fs::canonicalize("/usr/bin/false").unwrap();
+    let bridge_sha = agent_run_platform::fs::sha256(&fs::read(&bridge).unwrap());
+    let reader = ipc.path().join("reader");
+    fs::write(&reader, "synthetic-reader\n").unwrap();
+    fs::set_permissions(&reader, fs::Permissions::from_mode(0o600)).unwrap();
+    let sid =
+        agent_run_store::store_identity::read(&agent_run_store::fixture::open(&home).unwrap().conn)
+            .unwrap();
+    // SAFETY: geteuid is read-only.
+    let uid = unsafe { libc::geteuid() };
+    let route = |store: &str, id: &str| Route {
+        component_store_id: store.into(),
+        route_id: id.into(),
+        worker_uid: uid,
+    };
+    let mut config = agent_run_config::provider_config::ProviderConfig::load(&home)
+        .unwrap()
+        .0;
+    let harness = config.harnesses.get_mut(&HarnessId::ClaudeCode).unwrap();
+    harness.hooks = vec![Hook {
+        event: "PreToolUse".into(),
+        command: vec![hook.to_string_lossy().into_owned()],
+        matcher: Some("mcp__pool__.*".into()),
+    }];
+    harness.environment = Some("owner-fixture".into());
+    let mut environment = Environment::default();
+    environment.variables.insert(
+        "BRIDGE_NATIVE_OWNER_CHANNEL".into(),
+        channel.to_string_lossy().into_owned(),
+    );
+    environment.variables.insert(
+        "BRIDGE_NATIVE_OWNER_DIRECTORY".into(),
+        owner.to_string_lossy().into_owned(),
+    );
+    config
+        .environments
+        .insert("owner-fixture".into(), environment);
+    config.mcp.insert("pool".into(),serde_json::from_value(serde_json::json!({"transport":"stdio","command":frontend,"args":["mcp","--config",home.join("pool.toml")],"env_from":[],"approval_mode":"approve","allowed_tools":["pool_get"]})).unwrap());
+    config.managed_attempt_binding = Some(Box::new(ManagedAttemptBinding {
+        enabled: true,
+        role_name: "review".into(),
+        pool_server: "pool".into(),
+        pool_executable_sha256: frontend_sha.clone(),
+        bridge_hook_sha256: hook_sha,
+        host_id: "host".into(),
+        pool_resident_executable: Some(frontend.clone()),
+        pool_resident_sha256: Some(frontend_sha),
+        transport: Some(ManagedAttemptTransport {
+            run_route: route(&sid.to_string(), "run"),
+            pool_route: route("00000000-0000-4000-8000-000000000031", "pool"),
+            bridge_route: route("00000000-0000-4000-8000-000000000032", "bridge"),
+            producer: "pool".into(),
+            pool_socket: ipc.path().join("pool.sock"),
+            bridge_socket: channel,
+            bridge_executable: bridge,
+            bridge_executable_sha256: bridge_sha,
+            bridge_reader_credential_file: reader,
+            bridge_reader_credential_sha256: agent_run_platform::fs::sha256(b"synthetic-reader"),
+        }),
+        bridge_receipt_readers: vec![],
+        bridge_custody_readers: vec![],
+    }));
+    fs::write(home.join("profiles/review.md"),"+++\nrevision='1'\nwrite=false\nnetwork=false\nallow_external_read_roots=false\nskills=[]\nmcp=['pool']\nrequired_constraints=[]\n+++\nManaged fixture.\n").unwrap();
+    fs::write(home.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
+    let mut broker = resident_broker(&home);
+    broker_ready(&home, &mut broker).await;
+    let mut request = request(&home);
+    request.explicit_finish = true;
+    request.task = "fixture:worker-finish".into();
+    request.orchestrator = None;
+    request.request_id = None;
+    let mut spec = serde_json::to_value(request).unwrap();
+    spec.as_object_mut().unwrap().remove("request_id");
+    let params = serde_json::json!({"version":1,"expected_store_id":sid,"pool_store_id":"00000000-0000-4000-8000-000000000031","pool_id":"pool","request_id":"p3-managed-claude","mode":"start","jobs":[{"member_id":"member","selector":{"version":1,"role_name":"review"},"spec":spec}],"preconditions":[]});
+    let request_file = ipc.path().join("request.json");
+    let output_file = ipc.path().join("reply.json");
+    fs::write(
+        &request_file,
+        serde_json::to_vec(
+            &serde_json::json!({"id":"start","method":"_managed_start_batch_v1","params":params}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // The loaded executable must predate the client process, including ctime.
+    let metadata = fs::metadata(&frontend).unwrap();
+    let newest = metadata.mtime().max(metadata.ctime());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    // Kernel birth timestamps use a boot-time origin with coarser rounding
+    // than the wall clock; leave a full two-second margin after copy/ctime.
+    if now <= newest + 2 {
+        tokio::time::sleep(Duration::from_secs((newest + 3 - now) as u64)).await;
+    }
+    async fn resident_call(
+        executable: &Path,
+        home: &Path,
+        request: &Path,
+        output: &Path,
+    ) -> serde_json::Value {
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            isolated_command(executable)
+                .env_clear()
+                .env("RUN_P3_FIXTURE", "1")
+                .args(["p3-client", "--socket"])
+                .arg(home.join("attempt.sock"))
+                .arg("--request-file")
+                .arg(request)
+                .arg("--output-file")
+                .arg(output)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            result.status.success(),
+            "synthetic resident failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        serde_json::from_slice(&fs::read(output).unwrap()).unwrap()
+    }
+    let response = resident_call(&frontend, &home, &request_file, &output_file).await;
+    assert_eq!(response["result"]["state"], "admitted", "{response}");
+    let admitted = response["result"].clone();
+    let id: AgentId = serde_json::from_value(admitted["jobs"][0]["execution_id"].clone()).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let row = agent_run_store::fixture::open(&home)
+            .unwrap()
+            .get(&id)
+            .unwrap();
+        if row.status.terminal() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "managed Claude fixture did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    let row = store.get(&id).unwrap();
+    assert_eq!(
+        row.status,
+        Status::Succeeded,
+        "{:?}: {:?}",
+        row.failure_kind,
+        row.failure_text
+    );
+    let (config_digest,inventory_digest):(String,String) = store.conn.query_row("SELECT q.config_digest,q.inventory_digest FROM attempt_role_qualifications q JOIN attempts t ON t.id=q.attempt_id WHERE t.agent_id=?",[id.as_str()],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!(config_digest.len(), 64);
+    assert_eq!(
+        config_digest,
+        fs::read_to_string(home.join("fixture-managed-config-digest.txt")).unwrap()
+    );
+    assert_eq!(inventory_digest.len(), 64);
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT pool_membership_ever FROM agents WHERE id=?",
+                [id.as_str()],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM history_pins WHERE root_agent_id=?",
+                [id.as_str()],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM attempt_launches WHERE execution_id=?",
+                [id.as_str()],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    let allowed = BTreeMap::from([("pool".into(), BTreeSet::from(["pool_get".into()]))]);
+    let catalogs = BTreeMap::from([(
+        "pool".into(),
+        BTreeSet::from([
+            "pool_get".into(),
+            "pool_join".into(),
+            "pool_start_batch".into(),
+            "get_status".into(),
+        ]),
+    )]);
+    let expected =
+        agent_run_adapters::managed_role::claude_disallowed_tools(&allowed, &catalogs).unwrap();
+    assert_eq!(
+        fs::read_to_string(home.join("fixture-managed-denied.txt")).unwrap(),
+        expected
+    );
+    assert!(expected.contains("mcp__pool__pool_start_batch"));
+    drop(store);
+    let replay = resident_call(&frontend, &home, &request_file, &output_file).await;
+    assert_eq!(replay["result"], admitted);
+    let store = agent_run_store::fixture::open(&home).unwrap();
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT count(*) FROM agents", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT count(*) FROM attempt_launches", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    drop(store);
+    broker.kill().await.unwrap();
+}
+
 /// A managed Claude home relocates into the shared store and launches its
 /// sealed native executable directly. Offline compaction must still consolidate
 /// it.

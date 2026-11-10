@@ -683,6 +683,26 @@ bridge_reader_credential_sha256='{credential}'
             text: "hello".into(),
             wake_only: true,
         };
+        let reply = agent_run_adapters::native_owner_v2::reply(
+            &request,
+            "known_unsent",
+            None,
+            None,
+            Some("qualification_pending"),
+        );
+        crate::attempt_wire::assert_reply_keys(
+            &serde_json::to_value(reply).unwrap(),
+            &[
+                "version",
+                "call_id",
+                "effect_id",
+                "effect_digest",
+                "state",
+                "protocol",
+                "native_id",
+                "reason",
+            ],
+        );
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         for case in [
             "foreign-incarnation",

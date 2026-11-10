@@ -578,6 +578,43 @@ fn current_binary_fixture_matches_fresh_schema() {
     );
 }
 
+/// P3 keys upgrade without changing historical rows and cannot be deleted or
+/// rewritten; newer schemas are never treated as a downgrade opportunity.
+#[test]
+fn p3_historical_migration_and_permanent_enrollment_fence() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("state.db");
+    let old = build_fixture(&path, 40);
+    let old_agents = agent_count(&old);
+    assert!(
+        !schema_objects(&old)
+            .iter()
+            .any(|(_, name, _)| name == "managed_enrollments")
+    );
+    drop(old);
+    assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(agent_count(&conn), old_agents);
+    assert_eq!(schema_objects(&conn), fresh_schema_objects());
+    conn.execute("INSERT INTO managed_enrollments(pool_route_json,pool_store_id,request_id,fingerprint_version,fingerprint,state) VALUES('{}','pool','key',1,?,'aborted')", ["a".repeat(64)]).unwrap();
+    assert!(conn.execute("DELETE FROM managed_enrollments", []).is_err());
+    assert!(
+        conn.execute(
+            "UPDATE managed_enrollments SET fingerprint=?",
+            ["b".repeat(64)]
+        )
+        .is_err()
+    );
+    drop(conn);
+    assert_eq!(migrations::migrate(&path).unwrap(), VERSION);
+    let conn = Connection::open(&path).unwrap();
+    conn.pragma_update(None, "user_version", VERSION + 1)
+        .unwrap();
+    drop(conn);
+    assert!(migrations::migrate(&path).is_err());
+    assert_eq!(user_version(&open_ro(&path)), VERSION + 1);
+}
+
 /// Separate legacy databases receive independent stable IDs on migration.
 #[test]
 fn migration_assigns_independent_persistent_store_ids() {

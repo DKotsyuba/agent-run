@@ -1939,6 +1939,37 @@ fn managed_selector_is_opt_in_and_materializes_both_profiles() {
             );
             assert!(native["hooks"].get("PreToolUse").is_some());
             assert!(native["hooks"].get("PermissionRequest").is_some());
+            assert_eq!(
+                native["mcp_servers"]["pool"]["enabled_tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                vec!["pool_get"]
+            );
+            assert_eq!(
+                native["mcp_servers"][agent_run_domain::worker::SERVER_NAME]["enabled_tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                vec!["finish", "health_reply"]
+            );
+            let selected =
+                agent_run_adapters::managed_role::select(&config, HarnessId::Codex, &role, true)
+                    .unwrap()
+                    .unwrap();
+            let status = serde_json::json!({"data":[{"name":"pool","runtimeStatus":"connected","tools":{"pool_get":{}}},{"name":agent_run_domain::worker::SERVER_NAME,"runtimeStatus":"connected","tools":{"finish":{},"health_reply":{}}}],"nextCursor":null});
+            agent_run_adapters::managed_role::verify_inventory(&status, &selected.inventory)
+                .unwrap();
+            let mut widened = status;
+            widened["data"][0]["tools"]["pool_start_batch"] = serde_json::json!({});
+            assert!(
+                agent_run_adapters::managed_role::verify_inventory(&widened, &selected.inventory)
+                    .is_err()
+            );
         } else {
             let position = plan
                 .launch

@@ -451,6 +451,11 @@ fn tagged_digest(domain: &[u8], value: &serde_json::Value) -> Result<String> {
     Ok(crate::canonical::hex_digest(&hash.finalize()))
 }
 
+/// P3 fingerprint of the exact normalized private enrollment parameter tree.
+pub fn enrollment_start_fingerprint(value: &serde_json::Value) -> Result<String> {
+    tagged_digest(b"agent-mcp/enrollment/start/v1\0", value)
+}
+
 /// Immutable admission fingerprint under the frozen admission domain.
 pub fn admission_fingerprint(request: &AdmissionRequest) -> Result<String> {
     tagged_digest(

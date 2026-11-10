@@ -138,6 +138,18 @@ struct Retire {
     pool_seal_request_id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnrollmentCurrent {
+    version: u32,
+    expected_store_id: StoreId,
+    pool_store_id: String,
+    request_id: String,
+    fingerprint: String,
+    member_id: String,
+    current_request_id: String,
+}
+
 fn parse<T: serde::de::DeserializeOwned>(value: Value) -> Result<T> {
     if !value.is_object() {
         return Err(invalid("attempt request invalid"));
@@ -207,6 +219,8 @@ fn closed_error(error: &Error, _method: &str, store: &str) -> Value {
         Error::WriterFailure(agent_run_domain::storage::WriterFailure::Unknown(_)) => {
             ("outcome_unknown", "same_key_lookup")
         }
+        Error::BatchOutcomeUnknown { .. } => ("outcome_unknown", "same_key_lookup"),
+        Error::PreconditionFailed { .. } => ("precondition_failed", "none"),
         Error::Validation(message) if message == "attempt peer unavailable" => {
             ("outcome_unknown", "same_key_lookup")
         }
@@ -235,6 +249,21 @@ fn closed_error(error: &Error, _method: &str, store: &str) -> Value {
         }
         Error::Validation(message) if message == "actor recovery in progress" => {
             ("request_in_progress", "same_key_lookup")
+        }
+        Error::Validation(message) if message == "enrollment in progress" => {
+            ("request_in_progress", "same_key_lookup")
+        }
+        Error::Validation(message) if message == "enrollment aborted" => {
+            ("enrollment_aborted", "none")
+        }
+        Error::Validation(message) if message == "enrollment role mismatch" => {
+            ("role_mismatch", "none")
+        }
+        Error::Validation(message) if message == "enrollment role unqualified" => {
+            ("role_unqualified", "none")
+        }
+        Error::Validation(message) if message == "enrollment transport changed" => {
+            ("recovery_required", "operator")
         }
         Error::Validation(message) if message == "namespace recovery incomplete" => {
             ("recovery_required", "operator")
@@ -306,6 +335,7 @@ pub(crate) async fn dispatch(
                     "attempt_consensus_v1",
                     "attempt_admission_v1",
                     "attempt_namespace_retirement_v1",
+                    "managed_enrollment_v1",
                 ]
             } else {
                 Vec::new()
@@ -418,6 +448,74 @@ pub(crate) async fn dispatch(
                 }
             }
         }
+        "_managed_start_batch_v1" => {
+            let (request, fingerprint) = agent_run_domain::enrollment::Start::parse(&params)?;
+            let receipt = service
+                .start_managed_enrollment(grant, request, params, fingerprint)
+                .await?;
+            Ok(serde_json::to_value(receipt).map_err(Error::from)?)
+        }
+        "_managed_start_lookup_v1" | "_managed_start_abort_v1" => {
+            let key: agent_run_domain::enrollment::Key = parse(params)?;
+            key.validate(&grant.pool_route)?;
+            let stored = if method == "_managed_start_abort_v1" {
+                Some(
+                    service
+                        .lane("admission")?
+                        .local(
+                            agent_run_store::ops::AbortManagedEnrollment {
+                                key: key.clone(),
+                                pool_route: grant.pool_route.clone(),
+                            },
+                            crate::broker_writer::BROKER_BUDGET,
+                        )
+                        .await?,
+                )
+            } else {
+                let lookup_key = key.clone();
+                let route = grant.pool_route.clone();
+                service
+                    .read(move |store| store.managed_enrollment_lookup(&lookup_key, &route))
+                    .await?
+            };
+            if stored.as_ref().is_some_and(|row| row.state == "prepared") {
+                return Err(invalid("enrollment in progress").into());
+            }
+            let state = stored
+                .as_ref()
+                .map_or_else(|| "absent".to_owned(), |row| row.state.clone());
+            let receipt = stored.and_then(|row| row.receipt);
+            let jobs_state = if let Some(receipt) = &receipt {
+                let source = receipt.clone();
+                service
+                    .read(move |store| store.managed_enrollment_jobs_state(&source))
+                    .await?
+            } else {
+                Vec::new()
+            };
+            Ok(
+                json!({"version":1,"store_id":key.expected_store_id,"request_id":key.request_id,"fingerprint":key.fingerprint,"state":state,"receipt":receipt,"jobs_state":jobs_state}),
+            )
+        }
+        "_managed_enrollment_current_v1" => {
+            let req: EnrollmentCurrent = parse(params)?;
+            let key = agent_run_domain::enrollment::Key {
+                version: req.version,
+                expected_store_id: req.expected_store_id,
+                pool_store_id: req.pool_store_id,
+                request_id: req.request_id,
+                fingerprint: req.fingerprint,
+            };
+            Ok(service
+                .managed_enrollment_current(
+                    grant,
+                    bridge,
+                    key,
+                    req.member_id,
+                    req.current_request_id,
+                )
+                .await?)
+        }
         "_attempt_current_receipt_v1" => {
             let req: CurrentLookup = parse(params)?;
             version(req.version)?;
@@ -456,8 +554,11 @@ pub(crate) async fn dispatch(
                 pool_route: grant.pool_route.clone(),
             };
             let record = service.attempt_admit_v1(grant, bridge, request).await?;
+            let admission = record
+                .admission
+                .ok_or_else(|| invalid("binding unavailable"))?;
             Ok(
-                json!({"version":1,"store_id":req.expected_store_id,"state":record.state,"admission":record.admission,"outcome_digest":record.outcome_digest}),
+                json!({"version":1,"store_id":req.expected_store_id,"state":"admitted","admission":admission}),
             )
         }
         "_attempt_admission_lookup_v1" => {
@@ -549,6 +650,21 @@ fn wire_id(value: &str) -> Result<()> {
     agent_run_domain::attempt_binding::validate_id(value)
 }
 
+/// Compare the bytes actually emitted by a reply with a closed wire shape.
+#[cfg(test)]
+pub(crate) fn assert_reply_keys(value: &Value, expected: &[&str]) {
+    let bytes = serde_json::to_vec(value).unwrap();
+    let decoded: Value = serde_json::from_slice(&bytes).unwrap();
+    let actual: std::collections::BTreeSet<_> = decoded
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let expected: std::collections::BTreeSet<_> = expected.iter().copied().collect();
+    assert_eq!(actual, expected, "wire reply keys");
+}
+
 /// Serve one bounded frame after same-UID and executable/build authentication.
 /// The caller owns endpoint lifecycle and must not pass request-selected pins.
 pub(crate) async fn serve_one(
@@ -556,15 +672,22 @@ pub(crate) async fn serve_one(
     pin: PeerPin,
     service: &Service,
     grant: &PeerGrant,
+    expected_transport_pin: &str,
     bridge: &dyn BridgeReader,
     pool: &dyn PoolReader,
 ) -> Result<()> {
-    let stream = tokio::task::spawn_blocking(move || {
-        verify_peer(&stream, &pin)?;
-        Ok::<_, Error>(stream)
+    let admitted_pin = pin.clone();
+    let home = service.home.clone();
+    let (stream, verified) = tokio::task::spawn_blocking(move || {
+        let result = verify_peer(&stream, &pin)
+            .and_then(|()| crate::attempt_transport::verify_pool_resident(&stream, &home));
+        (stream, result)
     })
     .await
-    .map_err(|_| invalid("attempt peer unavailable"))??;
+    .map_err(|_| invalid("attempt peer unavailable"))?;
+    if verified.is_err() {
+        return reject_pool_peer(stream, service).await;
+    }
     let (read, mut write) = stream.into_split();
     let mut bytes = Vec::new();
     tokio::time::timeout(
@@ -585,16 +708,51 @@ pub(crate) async fn serve_one(
         .read(|reader| agent_run_store::store_identity::read(&reader.conn))
         .await?
         .to_string();
-    let reply = match dispatch(
-        service,
-        grant,
-        bridge,
-        pool,
-        &request.method,
-        request.params,
-    )
-    .await
-    {
+    // A client can connect and then hold a frame while the operator re-pins
+    // Pool or Bridge. Re-read the live pin after the full frame, before any
+    // dispatch, so a stale pre-upgrade connection cannot create new authority.
+    let current = service.current_provider_config().and_then(|(config, _)| {
+        let current_pin = agent_run_store::managed_enrollment::Grant::from_config(&config)
+            .map_err(|_| peer_not_authorized())?;
+        if current_pin.transport_pin_sha256 != expected_transport_pin {
+            return Err(peer_not_authorized());
+        }
+        let selected = config
+            .managed_attempt_binding
+            .as_ref()
+            .ok_or_else(peer_not_authorized)?;
+        let transport = selected
+            .transport
+            .as_ref()
+            .ok_or_else(peer_not_authorized)?;
+        if selected.pool_resident_executable.as_ref() != Some(&admitted_pin.executable)
+            || selected.pool_resident_sha256.as_ref() != Some(&admitted_pin.sha256)
+            || transport.run_route.worker_uid != admitted_pin.uid
+            || transport.run_route != grant.run_route
+            || transport.pool_route != grant.pool_route
+            || transport.bridge_route != grant.bridge_route
+            || transport.producer != grant.producer
+            || selected.host_id != grant.host_id
+        {
+            return Err(peer_not_authorized());
+        }
+        Ok(())
+    });
+    let response = match current {
+        Ok(()) => {
+            dispatch(
+                service,
+                grant,
+                bridge,
+                pool,
+                &request.method,
+                request.params,
+            )
+            .await
+        }
+        Err(_) => Err(DispatchFailure::from(peer_not_authorized())),
+    };
+    let reply = match response {
         Ok(result) => json!({"id":request.id,"result":result}),
         Err(error) => {
             json!({"id":request.id,"error":dispatch_error(&error,&request.method,&store)})
@@ -769,12 +927,47 @@ async fn serve_bridge_private_one(
     Ok(())
 }
 
-fn peer_not_authorized() -> Error {
+pub(crate) fn peer_not_authorized() -> Error {
     Error::Broker {
         message: "attempt peer refused".into(),
         broker_error_code: Some("peer_not_authorized".into()),
         broker_error_data: Some(json!({"recovery":"none"})),
     }
+}
+
+/// A rejected same-UID peer receives only a bounded, typed denial. The request
+/// ID is echoed when the submitted frame itself is well formed; no store or
+/// credential is opened and no request can reach dispatch.
+async fn reject_pool_peer(stream: UnixStream, service: &Service) -> Result<()> {
+    let (read, mut write) = stream.into_split();
+    let mut bytes = Vec::new();
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        BufReader::new(read)
+            .take(1024 * 1024 + 1)
+            .read_until(b'\n', &mut bytes),
+    )
+    .await;
+    let id = if read.is_ok() && bytes.len() <= 1024 * 1024 && bytes.pop() == Some(b'\n') {
+        strict(&bytes)
+            .ok()
+            .and_then(|value| value.get("id").cloned())
+            .filter(|id| id.as_str().is_some_and(|s| wire_id(s).is_ok()))
+            .unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    let mut error = json!({"version":1,"code":"peer_not_authorized","recovery":"none"});
+    if let Ok(store) = service
+        .read(|reader| agent_run_store::store_identity::read(&reader.conn))
+        .await
+    {
+        error["store_id"] = json!(store);
+    }
+    let mut reply = serde_json::to_vec(&json!({"id":id,"error":error}))?;
+    reply.push(b'\n');
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), write.write_all(&reply)).await;
+    Err(peer_not_authorized())
 }
 
 /// Serve one configured same-UID Bridge reader; equal receipt and custody pins
@@ -830,6 +1023,8 @@ pub async fn serve_bridge_receipt(stream: UnixStream, service: &Service) -> Resu
 pub async fn serve_pool_attempt(stream: UnixStream, service: &Service) -> Result<()> {
     use crate::attempt_transport::{AuthenticatedBridge, AuthenticatedPool, Endpoint};
     let (config, _) = service.current_provider_config()?;
+    let transport_pin =
+        agent_run_store::managed_enrollment::Grant::from_config(&config)?.transport_pin_sha256;
     let settings = config
         .managed_attempt_binding
         .ok_or_else(|| Error::Unsupported("managed attempt binding unavailable".into()))?;
@@ -866,12 +1061,17 @@ pub async fn serve_pool_attempt(stream: UnixStream, service: &Service) -> Result
         executable: peer_pin.executable.clone(),
         sha256: peer_pin.sha256.clone(),
     };
-    let stream = tokio::task::spawn_blocking(move || {
-        verify_peer(&stream, &auth_pin)?;
-        Ok::<_, Error>(stream)
+    let home = service.home.clone();
+    let (stream, verified) = tokio::task::spawn_blocking(move || {
+        let result = verify_peer(&stream, &auth_pin)
+            .and_then(|()| crate::attempt_transport::verify_pool_resident(&stream, &home));
+        (stream, result)
     })
     .await
-    .map_err(|_| invalid("attempt peer unavailable"))??;
+    .map_err(|_| invalid("attempt peer unavailable"))?;
+    if verified.is_err() {
+        return reject_pool_peer(stream, service).await;
+    }
     let store = service
         .read(|reader| agent_run_store::store_identity::read(&reader.conn))
         .await?;
@@ -881,6 +1081,7 @@ pub async fn serve_pool_attempt(stream: UnixStream, service: &Service) -> Result
     let pool = AuthenticatedPool::configured(
         Endpoint::configured(transport.pool_socket.clone(), pool_pin)?,
         transport.pool_route.clone(),
+        service.home.clone(),
     )?;
     let bridge = AuthenticatedBridge::from_pinned_file(
         Endpoint::configured(transport.bridge_socket.clone(), bridge_pin)?,
@@ -896,7 +1097,16 @@ pub async fn serve_pool_attempt(stream: UnixStream, service: &Service) -> Result
         producer: transport.producer.clone(),
         host_id: settings.host_id.clone(),
     };
-    serve_one(stream, peer_pin, service, &grant, &bridge, &pool).await
+    serve_one(
+        stream,
+        peer_pin,
+        service,
+        &grant,
+        &transport_pin,
+        &bridge,
+        &pool,
+    )
+    .await
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -923,6 +1133,7 @@ mod tests {
             ),
         ] {
             let result = closed_error(&invalid(message), "_attempt_admit_v1", "store");
+            assert_reply_keys(&result, &["version", "store_id", "code", "recovery"]);
             assert_eq!(result["code"], code);
             assert_eq!(result["recovery"], recovery);
         }
@@ -1003,7 +1214,7 @@ mod tests {
             enabled: false,
             pool_route: route("pool", "pool"),
             run_route: route(&sid.to_string(), "run"),
-            bridge_route: route("bridge", "bridge"),
+            bridge_route: route("00000000-0000-4000-8000-000000000001", "bridge"),
             producer: "pool".into(),
             host_id: "host".into(),
         };
@@ -1012,14 +1223,105 @@ mod tests {
             executable,
             sha256: digest,
         };
-        serve_one(stream, pin, &service, &grant, &Fake, &Fake)
-            .await
-            .unwrap();
+        let config = format!(
+            "schema_version=2\n[managed_attempt_binding]\nenabled=false\nrole_name='managed'\npool_server='pool'\npool_executable_sha256='{}'\nbridge_hook_sha256='{}'\nhost_id='host'\npool_resident_executable='{}'\npool_resident_sha256='{}'\n[managed_attempt_binding.transport]\nrun_route={{component_store_id='{sid}',route_id='run',worker_uid={uid}}}\npool_route={{component_store_id='pool',route_id='pool',worker_uid={uid}}}\nbridge_route={{component_store_id='00000000-0000-4000-8000-000000000001',route_id='bridge',worker_uid={uid}}}\nproducer='pool'\npool_socket='{}/pool.sock'\nbridge_socket='{}/bridge.sock'\nbridge_executable='/usr/bin/false'\nbridge_executable_sha256='{}'\nbridge_reader_credential_file='{}/reader'\nbridge_reader_credential_sha256='{}'\n",
+            "a".repeat(64),
+            "c".repeat(64),
+            pin.executable.display(),
+            pin.sha256,
+            dir.path().display(),
+            dir.path().display(),
+            "d".repeat(64),
+            dir.path().display(),
+            "e".repeat(64)
+        );
+        std::fs::write(store_home.path().join("config.toml"), &config).unwrap();
+        let transport_pin = agent_run_store::managed_enrollment::Grant::from_config(
+            &agent_run_config::provider_config::ProviderConfig::load(store_home.path())
+                .unwrap()
+                .0,
+        )
+        .unwrap()
+        .transport_pin_sha256;
+        serve_one(
+            stream,
+            pin.clone(),
+            &service,
+            &grant,
+            &transport_pin,
+            &Fake,
+            &Fake,
+        )
+        .await
+        .unwrap();
         assert!(child.wait().await.unwrap().success());
         let reply: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
         assert_eq!(reply["id"], "one");
         assert_eq!(reply["result"]["store_id"], sid.to_string());
         assert_eq!(reply["result"]["capabilities"], json!([]));
+        assert_reply_keys(
+            &reply["result"],
+            &["version", "store_id", "capabilities", "policy"],
+        );
+
+        // A connected old build cannot wait out an operator re-pin and then
+        // submit a frame under the newly configured resident identity.
+        for (suffix, changed) in [
+            (
+                "resident",
+                config.replace(
+                    &format!("pool_resident_sha256='{}'", pin.sha256),
+                    &format!("pool_resident_sha256='{}'", "f".repeat(64)),
+                ),
+            ),
+            ("bridge", config.replace("bridge.sock", "bridge-new.sock")),
+        ] {
+            std::fs::write(store_home.path().join("config.toml"), &config).unwrap();
+            let ready = dir.path().join(format!("{suffix}-ready"));
+            let release = dir.path().join(format!("{suffix}-release"));
+            let output = dir.path().join(format!("{suffix}-reply"));
+            let mut delayed = crate::attempt_transport::test_peer::child_at(
+                &pin.executable,
+                "delayed-client",
+                &socket,
+            )
+            .env("RUN_R2_PEER_READY", &ready)
+            .env("RUN_R2_PEER_RELEASE", &release)
+            .env(
+                "RUN_R2_PEER_FRAME",
+                json!({"id":"stale","method":"_attempt_capabilities_v1","params":{"version":1}})
+                    .to_string(),
+            )
+            .env("RUN_R2_PEER_OUTPUT", &output)
+            .spawn()
+            .unwrap();
+            let (stream, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            crate::attempt_transport::test_peer::wait_file(&ready).await;
+            let runner = tokio::spawn({
+                let service = service.clone();
+                let grant = grant.clone();
+                let pin = pin.clone();
+                let transport_pin = transport_pin.clone();
+                async move {
+                    serve_one(stream, pin, &service, &grant, &transport_pin, &Fake, &Fake).await
+                }
+            });
+            assert_ne!(changed, config);
+            std::fs::write(store_home.path().join("config.toml"), changed).unwrap();
+            std::fs::write(release, b"release").unwrap();
+            runner.await.unwrap().unwrap();
+            assert!(delayed.wait().await.unwrap().success());
+            let reply: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+            assert_eq!(reply["error"]["code"], "peer_not_authorized");
+            assert_reply_keys(
+                &reply["error"],
+                &["version", "store_id", "code", "recovery"],
+            );
+        }
     }
 
     /// Bridge has a distinct read-only grant, and the route comes from that
@@ -1100,6 +1402,7 @@ pool_route={{component_store_id="pool-store",route_id="pool-route",worker_uid={u
         assert!(child.wait().await.unwrap().success());
         let value: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
         assert_eq!(value["result"]["receipt"], receipt);
+        assert_reply_keys(&value["result"], &["version", "store_id", "receipt"]);
     }
 
     /// A separately pinned Bridge principal can recover only its configured
@@ -1219,6 +1522,20 @@ pool_route={{component_store_id="pool-store",route_id="pool-route",worker_uid={u
             } else {
                 assert_eq!(reply["result"]["state"], expected);
                 assert_eq!(reply["result"]["version"], 2);
+                assert_reply_keys(
+                    &reply["result"],
+                    &[
+                        "version",
+                        "store_id",
+                        "producer_scope",
+                        "effect_id",
+                        "effect_digest",
+                        "state",
+                        "protocol",
+                        "native_id",
+                        "reason",
+                    ],
+                );
             }
         }
         // Bridge's post-retirement compaction confirms this original accepted

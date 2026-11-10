@@ -650,6 +650,7 @@ pub(crate) async fn run_managed(
     selection: &agent_run_adapters::managed_role::Selection,
     config_digest: &str,
     launch_args: &[String],
+    catalogs: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
 ) -> Result<EngineResult> {
     run_inner(
         process,
@@ -657,7 +658,7 @@ pub(crate) async fn run_managed(
         record,
         logical_record,
         initial_input,
-        Some((selection, config_digest, launch_args)),
+        Some((selection, config_digest, launch_args, catalogs)),
     )
     .await
 }
@@ -699,6 +700,7 @@ async fn managed_initial_inventory(
 fn managed_claude_session(
     args: &[String],
     selection: &agent_run_adapters::managed_role::Selection,
+    catalogs: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
 ) -> Result<String> {
     let invalid_args = || invalid("native managed launch controls did not verify");
     let value = |flag: &str| -> Result<&str> {
@@ -715,7 +717,7 @@ fn managed_claude_session(
             .ok_or_else(invalid_args)
     };
     let expected = agent_run_adapters::managed_role::claude_tool_arguments(&selection.inventory)?;
-    for flag in ["--tools", "--allowedTools", "--disallowedTools"] {
+    for flag in ["--tools", "--allowedTools"] {
         let index = expected
             .iter()
             .position(|arg| arg == flag)
@@ -723,6 +725,11 @@ fn managed_claude_session(
         if value(flag)? != expected[index + 1] {
             return Err(invalid_args());
         }
+    }
+    let denied =
+        agent_run_adapters::managed_role::claude_disallowed_tools(&selection.inventory, catalogs)?;
+    if value("--disallowedTools")? != denied {
+        return Err(invalid_args());
     }
     if !value("--setting-sources")?.is_empty()
         || !std::path::Path::new(value("--mcp-config")?).is_absolute()
@@ -809,17 +816,20 @@ async fn managed_claude_control(
     }
 }
 
+type ManagedClaudeInputs<'a> = (
+    &'a agent_run_adapters::managed_role::Selection,
+    &'a str,
+    &'a [String],
+    &'a std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+);
+
 async fn run_inner(
     process: &mut Process,
     store: &mut Persist,
     record: &Record,
     logical_record: &Record,
     initial_input: Option<&str>,
-    managed: Option<(
-        &agent_run_adapters::managed_role::Selection,
-        &str,
-        &[String],
-    )>,
+    managed: Option<ManagedClaudeInputs<'_>>,
 ) -> Result<EngineResult> {
     if record.id != logical_record.id
         || record.sequence != logical_record.sequence
@@ -827,10 +837,10 @@ async fn run_inner(
     {
         return Err(invalid("native input and logical authority do not match"));
     }
-    let managed_preflight = if let Some((selection, config_digest, args)) = managed {
+    let managed_preflight = if let Some((selection, config_digest, args, catalogs)) = managed {
         let preflight = async {
             if initial_input.is_none() { return Err(invalid("native managed input unavailable")); }
-            let expected_session = managed_claude_session(args,selection)?;
+            let expected_session = managed_claude_session(args,selection,catalogs)?;
             if record.resume_of_runtime_session_id.as_ref().is_some_and(|id| id != &expected_session) {
                 return Err(invalid("native managed session did not verify"));
             }
@@ -2027,6 +2037,21 @@ print(json.dumps({{'type':'system','subtype':'init','session_id':'session','tool
         };
         let mut args =
             agent_run_adapters::managed_role::claude_tool_arguments(&selection.inventory).unwrap();
+        let catalogs = BTreeMap::from([(
+            "pool".into(),
+            BTreeSet::from(["pool_get".into(), "pool_start_batch".into()]),
+        )]);
+        let denied = agent_run_adapters::managed_role::claude_disallowed_tools(
+            &selection.inventory,
+            &catalogs,
+        )
+        .unwrap();
+        let index = args
+            .iter()
+            .position(|arg| arg == "--disallowedTools")
+            .unwrap()
+            + 1;
+        args[index] = denied;
         args.extend([
             "--setting-sources".into(),
             "".into(),
@@ -2036,15 +2061,18 @@ print(json.dumps({{'type':'system','subtype':'init','session_id':'session','tool
             "native-session".into(),
         ]);
         assert_eq!(
-            super::managed_claude_session(&args, &selection).unwrap(),
+            super::managed_claude_session(&args, &selection, &catalogs).unwrap(),
             "native-session"
         );
         let mut unsafe_args = args.clone();
         unsafe_args.push("--tools=Bash".into());
-        assert!(super::managed_claude_session(&unsafe_args, &selection).is_err());
+        assert!(super::managed_claude_session(&unsafe_args, &selection, &catalogs).is_err());
         unsafe_args = args.clone();
         unsafe_args.push("--bare".into());
-        assert!(super::managed_claude_session(&unsafe_args, &selection).is_err());
+        assert!(super::managed_claude_session(&unsafe_args, &selection, &catalogs).is_err());
+        unsafe_args = args.clone();
+        unsafe_args[index] = agent_run_adapters::managed_role::CLAUDE_DISALLOWED_TOOLS.into();
+        assert!(super::managed_claude_session(&unsafe_args, &selection, &catalogs).is_err());
     }
 
     /// Exercise the actual managed runner and writer against a fake CLI that
@@ -2075,6 +2103,7 @@ if line:
                 role_digest: "b".repeat(64),
                 inventory: BTreeMap::from([("pool".into(), BTreeSet::from(["pool_get".into()]))]),
             };
+            let catalogs = BTreeMap::from([("pool".into(), BTreeSet::from(["pool_get".into()]))]);
             let mut args = vec!["-u".into(), "-c".into(), script.into(), mode.into()];
             args.extend(
                 agent_run_adapters::managed_role::claude_tool_arguments(&selection.inventory)
@@ -2134,6 +2163,7 @@ if line:
                     &selection,
                     &"c".repeat(64),
                     &args,
+                    &catalogs,
                 ),
             )
             .await

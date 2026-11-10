@@ -1835,6 +1835,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
         }
         let service_gate = crate::managed_services::wait_for_gate(home, id).await;
         service_gate?;
+        let mut managed_claude_catalog = None;
         if identity.authority.harness == HarnessId::ClaudeCode && !store.cancel_pending(id)? {
             // Discovery children are owned by this attempt: each snapshot is one
             // journal event submitted through the same ordered lane, so the
@@ -1847,7 +1848,28 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 adapters::mcp_catalog::apply_claude_tool_filters(&mut planned, move |snapshot| {
                     discovery_ownership(&producer, &ownership_agent, &ownership_attempt, snapshot)
                 });
-            discovery.await?;
+            let catalogs = discovery.await?;
+            if let Some(selection) = &managed_selection {
+                let expected = adapters::managed_role::claude_disallowed_tools(
+                    &selection.inventory,
+                    &catalogs,
+                )?;
+                let positions: Vec<_> = planned
+                    .launch
+                    .args
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, arg)| (arg == "--disallowedTools").then_some(index + 1))
+                    .collect();
+                if positions.len() != 1 || planned.launch.args.get(positions[0]) != Some(&expected)
+                {
+                    return Err(invalid("managed Claude deny controls did not verify"));
+                }
+                // The same deterministic function is used again by the native
+                // runner before its first control frame or model input.
+                planned.launch.args[positions[0]] = expected;
+                managed_claude_catalog = Some(catalogs);
+            }
         }
         let owner_supported = matches!(
             planned.runtime.kind()?,
@@ -2129,6 +2151,13 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                 }
             } else {
                 if let Some(selection) = &managed_selection {
+                    let catalogs = managed_claude_catalog
+                        .as_ref()
+                        .ok_or_else(|| invalid("managed Claude catalog unavailable"))?;
+                    let disallowed = adapters::managed_role::claude_disallowed_tools(
+                        &selection.inventory,
+                        catalogs,
+                    )?;
                     let expected_mcp = runtime_home.join("mcp/mcp-config.json");
                     let mcp_args: Vec<_> = planned
                         .launch
@@ -2145,7 +2174,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                         return Err(invalid("managed config unavailable"));
                     }
                     let config_digest = agent_run_domain::canonical::sha256_hex(
-                        &json!({"settings_sha256":fs::sha256(&settings),"args":planned.launch.args}),
+                        &json!({"settings_sha256":fs::sha256(&settings),"args":planned.launch.args,"disallowed_tools":disallowed,"mcp_catalog_sha256":agent_run_domain::canonical::sha256_hex(&serde_json::to_value(catalogs)?,true)}),
                         true,
                     );
                     crate::stream::run_managed(
@@ -2157,6 +2186,7 @@ async fn execute_provider(home: &Path, id: &AgentId, store: &mut Persist) -> Res
                         selection,
                         &config_digest,
                         &planned.launch.args,
+                        catalogs,
                     )
                     .await
                 } else {

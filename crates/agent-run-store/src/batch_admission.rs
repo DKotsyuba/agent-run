@@ -199,7 +199,7 @@ impl Store<'_> {
     /// Commits every ordinary admission and its permanent receipt, or none.
     /// Replays run before restart/capacity checks and never authorize a launch.
     /// Every new member's quota clock fence is rechecked before the shared commit.
-    pub fn admit_batch(&mut self, batch: BatchAdmission<'_>) -> Result<StartBatchResult> {
+    pub fn admit_batch(&self, batch: BatchAdmission<'_>) -> Result<StartBatchResult> {
         external_id("request_id", batch.request_id)?;
         if !(1..=MAX_BATCH_JOBS).contains(&batch.jobs.len())
             || batch
