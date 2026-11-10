@@ -1043,6 +1043,94 @@ fn custom_claude_auth_clears_conflicting_host_credentials() {
     }
 }
 
+/// Plans the custom Claude gateway with `headers` sealed into its connection
+/// and a host that already carries a stale `ANTHROPIC_CUSTOM_HEADERS`.
+fn plan_custom_headers(
+    headers: &[(&str, &str)],
+) -> agent_run_adapters::provider::ProviderLaunchPlan {
+    use agent_run_domain::catalog::ProviderConnection;
+
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path();
+    let mut config = config(root, &fake_engine(root));
+    let provider: ProviderId = "glm-any".parse().unwrap();
+    let ProviderConnection::Custom {
+        headers: configured,
+        ..
+    } = &mut config.providers.get_mut(&provider).unwrap().connection
+    else {
+        panic!("fixture must use a custom connection");
+    };
+    *configured = headers
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+    let catalog = catalog(&config);
+    let role = role(root, false);
+    let account = "acct-glm".parse().unwrap();
+    let run_home = root.join("gateway-run");
+    let (_, digest) = materialize_selected(
+        &config, &catalog, &provider, "glm", &account, &role, root, &run_home, root,
+    )
+    .unwrap();
+    let authority = make_authority(&catalog, &provider, "glm", &role, root, digest, "acct-glm");
+    let host = BTreeMap::from([
+        ("HOME".into(), root.to_string_lossy().into_owned()),
+        (
+            "ANTHROPIC_CUSTOM_HEADERS".into(),
+            "x-host-leak: stale".into(),
+        ),
+    ]);
+    plan_selected(
+        &config,
+        &catalog,
+        &authority,
+        &account,
+        &run_home,
+        root,
+        &host,
+        &FakeReader,
+        "task",
+        None,
+    )
+    .unwrap()
+}
+
+/// Fixed custom headers are rendered sorted with a per-launch `{launch}` id;
+/// without them a host-provided header variable is removed, never inherited.
+#[test]
+fn custom_claude_headers_render_per_launch_and_absence_removes_host_value() {
+    let configured = [
+        ("x-opencode-session", "{launch}"),
+        ("x-client", "agent-run/{launch}"),
+    ];
+    let first = plan_custom_headers(&configured);
+    let second = plan_custom_headers(&configured);
+    let render = |plan: &agent_run_adapters::provider::ProviderLaunchPlan| {
+        plan.launch.environment["ANTHROPIC_CUSTOM_HEADERS"].clone()
+    };
+    let (a, b) = (render(&first), render(&second));
+    assert_ne!(a, b, "{{launch}} must differ per launch");
+    for rendered in [&a, &b] {
+        assert!(!rendered.contains('{') && !rendered.contains("x-host-leak"));
+        let lines: Vec<_> = rendered.split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        let (name, id) = lines[1].split_once(": ").unwrap();
+        assert_eq!(name, "x-opencode-session");
+        assert_eq!(id.len(), 32);
+        assert_eq!(lines[0], format!("x-client: agent-run/{id}"));
+    }
+    assert!(!a.contains("synthetic-secret"));
+
+    let none = plan_custom_headers(&[]);
+    assert!(
+        !none
+            .launch
+            .environment
+            .contains_key("ANTHROPIC_CUSTOM_HEADERS")
+    );
+}
+
 /// Arbitrary custom providers use configured models and gateways; drift in
 /// authority, account scope, or sealed files fails before native execution.
 #[test]

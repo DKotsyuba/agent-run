@@ -104,6 +104,49 @@ adapter consumer; this config parser does not launch either CLI. See the
 and [Claude gateway configuration](https://code.claude.com/docs/en/llm-gateway-connect)
 for the native wire settings.
 
+### Fixed gateway headers
+
+A custom Claude Code connection may send fixed, non-secret HTTP headers with
+every request through an optional `headers` table inside `connection`. This
+supports gateways that require a request-correlation header, such as OpenCode
+Go:
+
+```toml
+[providers.opencode-go]
+harness = "claude-code"
+connection = { kind = "custom", endpoint = "https://opencode.ai/inference/go/anthropic", protocol = "messages", headers = { "x-opencode-session" = "{launch}" } }
+auth_family = "anthropic"
+limits_source = "none"
+
+[[providers.opencode-go.models]]
+id = "example-model"
+
+[[providers.opencode-go.bindings]]
+label = "work"
+account = "acct-opencode-go"
+```
+
+The launch sets `ANTHROPIC_CUSTOM_HEADERS` from the sorted `Name: Value`
+lines; when no headers are configured the variable is removed, so a host value
+is never inherited. The only substitution is the exact token `{launch}`, replaced
+at each launch by a fresh non-secret identifier; any other `{` or `}` is
+rejected. Configuration loading fails closed unless:
+
+- the connection is `custom` and the harness is `claude-code` (Codex custom
+  headers are unsupported, and `native` connections accept no headers);
+- there are at most 8 headers, names are RFC 7230 tokens of at most 64
+  characters and unique ignoring case;
+- no name is, case-insensitively, `authorization`, `proxy-authorization`,
+  `x-api-key`, `cookie`, `host`, `content-length`, `content-type`,
+  `transfer-encoding` or `connection`, starts with `anthropic-` or
+  `x-stainless-`, or contains `token`, `secret`, `password`, `key`,
+  `credential` or `auth`; credentials belong in the account registry;
+- each value is non-empty printable ASCII of at most 256 characters, with no
+  CR, LF or NUL and no leading or trailing space.
+
+Headers are part of the sealed provider configuration, so changing them
+changes its digest; configurations without headers keep their existing digest.
+
 Historical model aliases such as `fable` → `claude-fable-5-1` and
 `glm-5.3` → `glm-5.3[1m]` become explicit `native_model` entries when
 migrated. Any model-specific hard policy belongs in typed `restrictions`;

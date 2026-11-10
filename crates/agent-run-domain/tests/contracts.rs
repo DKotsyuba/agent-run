@@ -418,6 +418,7 @@ fn codex_appserver_source_requires_a_probeable_native_codex_login() {
         protocol: ProviderProtocol::Responses,
         auth_header: Default::default(),
         allow_loopback_http: false,
+        headers: Default::default(),
     };
     assert!(custom.validate().is_err());
     let mut claude = provider.clone();
@@ -512,6 +513,7 @@ fn catalog_wire_and_endpoint_reject_invalid_registration() {
             protocol: ProviderProtocol::Responses,
             auth_header: Default::default(),
             allow_loopback_http: false,
+            headers: Default::default(),
         };
         assert!(provider.validate().is_err(), "{endpoint}");
     }
@@ -520,6 +522,7 @@ fn catalog_wire_and_endpoint_reject_invalid_registration() {
         protocol: ProviderProtocol::Responses,
         auth_header: Default::default(),
         allow_loopback_http: false,
+        headers: Default::default(),
     };
     assert!(provider.validate().is_err());
     provider.connection = ProviderConnection::Custom {
@@ -527,6 +530,7 @@ fn catalog_wire_and_endpoint_reject_invalid_registration() {
         protocol: ProviderProtocol::Responses,
         auth_header: Default::default(),
         allow_loopback_http: true,
+        headers: Default::default(),
     };
     provider.validate().unwrap();
     provider.connection = ProviderConnection::Custom {
@@ -534,6 +538,7 @@ fn catalog_wire_and_endpoint_reject_invalid_registration() {
         protocol: ProviderProtocol::Responses,
         auth_header: Default::default(),
         allow_loopback_http: true,
+        headers: Default::default(),
     };
     provider.validate().unwrap();
     provider.connection = ProviderConnection::Custom {
@@ -541,6 +546,7 @@ fn catalog_wire_and_endpoint_reject_invalid_registration() {
         protocol: ProviderProtocol::Responses,
         auth_header: Default::default(),
         allow_loopback_http: true,
+        headers: Default::default(),
     };
     assert!(provider.validate().is_err());
     provider.connection = ProviderConnection::Native;
