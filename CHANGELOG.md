@@ -4,9 +4,26 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.31.0
+
+Released 2026-11-10.
+
 - feat(release): report CI job progress while observing an exact release.
+- feat(core): add attempt-bound managed launches and the `initial_task` read.
+- feat(core): add managed enrollment for Pool members (P3) and report egress
+  actor recovery; accept custody scope prefixes.
+- feat(quotas): extract quota collection into Agent Quota and add batch,
+  status and lineage holds.
+- feat(config): allow fixed headers on custom Claude Code provider connections.
 - fix(batch): reserve `p3_` and `p3c_` batch keys for private Pool enrollment;
   public `start_batch` and `batch_receipt` refuse them.
+- fix(core): pin the current Bridge build for each new managed execution, verify
+  current component builds when resuming a managed role, and settle, resume and
+  type stale managed launches after a Bridge upgrade.
+- fix(platform): prove peer executables by immutable loaded build and compare
+  pinned executable age on calibrated clocks.
+- fix(adapters): suppress native owner state during catalog discovery.
+- fix(core): isolate the GC memo by store incarnation.
 - build(deps): pin Bridge SDK to Agent Bridge v0.7.0.
 
 ## 0.30.0
