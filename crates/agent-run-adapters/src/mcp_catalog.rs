@@ -214,7 +214,10 @@ where
         initial_input: None,
     };
     let mut child = CatalogChild {
-        process: Process::spawn(&probe).map_err(|_| failure("server could not be started"))?,
+        // Discovery is not a native harness and must never install owner
+        // sockets (including a managed launch's suppressed v1 endpoint).
+        process: Process::spawn_managed(&probe, None)
+            .map_err(|_| failure("server could not be started"))?,
         armed: true,
     };
     child
@@ -416,6 +419,8 @@ if [ "$MODE" = hang ]; then
   /bin/sleep 8 &
   printf '%s\n' "$!" >> "$PID_FILE"
 fi
+[ -z "${BRIDGE_NATIVE_OWNER_SOCKET+x}" ] || exit 19
+[ -z "${BRIDGE_NATIVE_OWNER_SOCKET_V2+x}" ] || exit 20
 initialized=0
 pages=0
 while [ "$SECONDS" -lt 10 ] && IFS= read -r -t 8 line; do
@@ -521,6 +526,22 @@ done
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let mut plan = fixture(&root, "ping");
+        // If discovery installs the ordinary owner socket this invalid
+        // directory makes the spawn fail before the fixture handshake.
+        plan.launch.environment.insert(
+            "BRIDGE_NATIVE_OWNER_CHANNEL".into(),
+            "/invalid/channel".into(),
+        );
+        plan.launch.environment.insert(
+            "BRIDGE_NATIVE_OWNER_DIRECTORY".into(),
+            "/invalid/directory".into(),
+        );
+        plan.launch
+            .environment
+            .insert("BRIDGE_NATIVE_OWNER_SOCKET".into(), "forged-v1".into());
+        plan.launch
+            .environment
+            .insert("BRIDGE_NATIVE_OWNER_SOCKET_V2".into(), "forged-v2".into());
         apply_claude_tool_filters(&mut plan, |_| -> PersistFuture {
             Box::pin(async { Ok(()) })
         })
