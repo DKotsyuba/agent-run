@@ -208,13 +208,7 @@ pub(crate) fn refusal_v2(
     let Some(leader) = process.owner.leader.as_ref() else {
         return Ok(Some("unavailable"));
     };
-    let kernel = process::kernel_incarnation(leader)?;
-    if kernel.boot_id != expected.boot_id
-        || kernel.pid_namespace_inode != expected.pid_namespace_inode
-        || kernel.uid != expected.uid
-        || kernel.pid != expected.pid
-        || kernel.start_ticks != expected.start_ticks
-    {
+    if !leader_matches_incarnation(leader, expected)? {
         return Ok(Some("actor_mismatch"));
     }
     let qualified: bool = store.conn.query_row(
@@ -239,6 +233,30 @@ pub(crate) fn refusal_v2(
 pub(crate) enum PreparedV2 {
     Invoke(String),
     Reply(agent_run_domain::owner_v2::ReplyV2),
+}
+
+/// Whether the live leader still has the full kernel incarnation the peer
+/// expects. Kernel identity facts exist only on Linux; elsewhere nothing matches.
+#[cfg(target_os = "linux")]
+fn leader_matches_incarnation(
+    leader: &process::Identity,
+    expected: &agent_run_domain::attempt_binding::Incarnation,
+) -> Result<bool> {
+    let kernel = process::kernel_incarnation(leader)?;
+    Ok(kernel.boot_id == expected.boot_id
+        && kernel.pid_namespace_inode == expected.pid_namespace_inode
+        && kernel.uid == expected.uid
+        && kernel.pid == expected.pid
+        && kernel.start_ticks == expected.start_ticks)
+}
+
+/// Kernel identity facts exist only on Linux; elsewhere nothing matches.
+#[cfg(not(target_os = "linux"))]
+fn leader_matches_incarnation(
+    _: &process::Identity,
+    _: &agent_run_domain::attempt_binding::Incarnation,
+) -> Result<bool> {
+    Ok(false)
 }
 
 fn effect_reply(

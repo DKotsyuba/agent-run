@@ -1,5 +1,7 @@
 //! Supervisor-only durable qualification after managed native checks.
-use crate::{Result, error::invalid, persist::Persist, state::Record};
+#[cfg(target_os = "linux")]
+use crate::error::invalid;
+use crate::{Result, persist::Persist, state::Record};
 use agent_run_adapters::{io::Process, managed_role::Selection};
 #[cfg(target_os = "linux")]
 use agent_run_domain::attempt_binding::{Incarnation, RoleQualification};

@@ -2078,6 +2078,7 @@ print(json.dumps({{'type':'system','subtype':'init','session_id':'session','tool
 
     /// Exercise the actual managed runner and writer against a fake CLI that
     /// emits init only after user input. No external provider is contacted.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn managed_claude_runner_qualifies_only_after_control_and_init_tripwire() {
         use agent_run_domain::{attempt_binding::Incarnation, domain::AgentId};
