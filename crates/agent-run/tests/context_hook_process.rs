@@ -501,7 +501,7 @@ fn terminal(home: &Path) -> String {
 /// custody is deliberately asserted separately from native receiver acceptance.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn context_failure_does_not_break_binding_or_result_delivery_for_either_client() {
-    use bridge_sdk::bridge_protocol::{Destination, Host, NativeAddress};
+    use bridge_sdk::bridge_protocol::{Destination, HarnessName, Host, NativeAddress};
     for (transport, host) in [
         ("codex_queue", Host::Codex),
         ("claude_uds", Host::ClaudeCode),
@@ -538,7 +538,7 @@ async fn context_failure_does_not_break_binding_or_result_delivery_for_either_cl
                 panic!("native address expected")
             };
             let address = NativeAddress::parse(address).unwrap();
-            assert_eq!(address.harness, host);
+            assert_eq!(address.harness, HarnessName::from(host));
             assert_eq!(address.session, "context-probe");
         }
         assert_eq!(
@@ -569,16 +569,16 @@ async fn native_context_result_delivery_probe() {
     )
     .unwrap();
     assert_eq!(address.host, config.host_id);
-    let transport = match address.harness {
-        Host::Codex => {
+    let transport = match address.harness.host() {
+        Some(Host::Codex) => {
             assert_eq!(config.codex_store.as_ref(), Some(&address.store));
             "codex_queue"
         }
-        Host::ClaudeCode => {
+        Some(Host::ClaudeCode) => {
             assert_eq!(config.claude_store.as_ref(), Some(&address.store));
             "claude_uds"
         }
-        Host::OpenCode => panic!("this native control supports only Codex and Claude Code"),
+        _ => panic!("this native control supports only Codex and Claude Code"),
     };
     let home = home().await.keep();
     println!("native probe sender retained at {}", home.display());

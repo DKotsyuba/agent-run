@@ -13,7 +13,7 @@ use agent_run_domain::integration::{
 use bridge_sdk::{
     ClientError,
     bridge_protocol::{
-        ErrorClass, Host, NativeAddress, RecipientResolution, ResolveRecipientParams,
+        ErrorClass, HarnessName, Host, NativeAddress, RecipientResolution, ResolveRecipientParams,
     },
 };
 use rusqlite::OptionalExtension;
@@ -284,7 +284,7 @@ impl Service {
                                 && result.sampled_at_ms <= i64::MAX as u64
                                 && NativeAddress::parse(&address).is_ok_and(|parsed| {
                                     parsed.host == bridge.host_id
-                                        && parsed.harness == host
+                                        && parsed.harness == HarnessName::from(host)
                                         && Some(&parsed.session) == before.native.session.as_ref()
                                         && parsed.canonical() == address
                                 }) =>

@@ -7,6 +7,7 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 - feat(release): report CI job progress while observing an exact release.
 - fix(batch): reserve `p3_` and `p3c_` batch keys for private Pool enrollment;
   public `start_batch` and `batch_receipt` refuse them.
+- build(deps): pin Bridge SDK to Agent Bridge v0.7.0.
 
 ## 0.30.0
 

@@ -21,7 +21,8 @@ rust-version = "1.98.1"
 publish = false
 
 [workspace.dependencies]
-bridge-sdk = { git = "https://github.com/DKotsyuba/agent-bridge.git", rev = "ae32d1c3c012cc1e40c6d60c9adcad7005298688" }
+# Agent Bridge v0.7.0
+bridge-sdk = { git = "https://github.com/DKotsyuba/agent-bridge.git", rev = "c12376fe8a89fd18dd4bb21e0c55aec1308e1e5f" }
 jsonschema = { version = "=0.33.0", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.5", features = ["derive", "env"] }

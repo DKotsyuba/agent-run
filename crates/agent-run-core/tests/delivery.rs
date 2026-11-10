@@ -188,10 +188,10 @@ async fn bridge_live_outbox_probe() {
     )
     .unwrap();
     assert_eq!(address.host, config.host_id);
-    let (transport, store) = match address.harness {
-        Host::Codex => ("codex_queue", config.codex_store.as_ref()),
-        Host::ClaudeCode => ("claude_uds", config.claude_store.as_ref()),
-        Host::OpenCode => panic!("live outbox probe supports Codex and Claude recipients only"),
+    let (transport, store) = match address.harness.host() {
+        Some(Host::Codex) => ("codex_queue", config.codex_store.as_ref()),
+        Some(Host::ClaudeCode) => ("claude_uds", config.claude_store.as_ref()),
+        _ => panic!("live outbox probe supports Codex and Claude recipients only"),
     };
     assert_eq!(store, Some(&address.store));
     let home = common::Home::new();
