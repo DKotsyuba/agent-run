@@ -28,9 +28,9 @@ pub(crate) async fn record(
             config_digest,
             inventory_digest,
         );
-        return Err(agent_run_domain::Error::Unsupported(
+        Err(agent_run_domain::Error::Unsupported(
             "managed qualification requires Linux".into(),
-        ));
+        ))
     }
     #[cfg(target_os = "linux")]
     {

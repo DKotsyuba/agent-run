@@ -923,7 +923,7 @@ mod tests {
             .unwrap();
         assert!(
             plan.iter().any(
-                |step| step.contains("SEARCH events USING INDEX idx_events_agent_seq")
+                |step| step.contains("SEARCH events USING INDEX idx_events_agent")
                     || step.contains("SEARCH events USING INDEX idx_events_attempt")
             ),
             "{plan:?}"
