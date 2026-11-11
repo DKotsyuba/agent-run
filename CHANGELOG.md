@@ -4,6 +4,13 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- fix(transport): reap finished API connection handlers in the broker accept
+  loop. Completed handler tasks were retained until shutdown, so a long-running
+  shared service leaked about 14 KiB per connection (tens of thousands of
+  blocks after a week); the retained set is now bounded by the connection cap.
+
 ## 0.31.0
 
 Released 2026-11-11.

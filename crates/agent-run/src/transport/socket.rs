@@ -684,6 +684,10 @@ pub struct ServeOptions {
     pub request_timeout: Duration,
     /// Absolute deadline for receiving the next ordinary frame.
     pub idle_timeout: Duration,
+    /// Optional diagnostics gauge of connection-handler tasks still retained by
+    /// the main accept loop (running or finished but not yet reaped). It never
+    /// affects admission or shutdown.
+    pub retained_handlers: Option<tokio::sync::watch::Sender<usize>>,
 }
 
 /// Explicit system-only writer and launcher configuration supplied by the
@@ -705,6 +709,7 @@ impl Default for ServeOptions {
             max_pending_requests: MAX_PENDING_REQUESTS,
             request_timeout: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(30),
+            retained_handlers: None,
         }
     }
 }
@@ -2204,6 +2209,9 @@ async fn serve_endpoints(
     let mut drain_tick = tokio::time::interval(Duration::from_secs(1));
     let drain_home = service.home.clone();
     loop {
+        if let Some(gauge) = &options.retained_handlers {
+            gauge.send_replace(handlers.len());
+        }
         tokio::select! {
             _=tokio::signal::ctrl_c()=>{
                 if !system_group { break; }
@@ -2257,6 +2265,10 @@ async fn serve_endpoints(
                 let options = options.clone();
                 handlers.spawn(async move { let _permit=permit; let _=connection(stream,service,lanes,control_only,options,access).await; });
             }
+            // Reap finished handlers as they end: a JoinSet retains every
+            // completed task's output and allocation until joined, so a
+            // long-lived broker would otherwise grow with each connection.
+            Some(_)=handlers.join_next(), if !handlers.is_empty() => {}
         }
     }
     workers.abort_all();

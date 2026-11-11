@@ -322,6 +322,57 @@ async fn python_control_lane_survives_regular_connection_pressure() {
     let _ = task.await;
 }
 
+/// Finished API connection handlers are reaped by the accept loop, so many
+/// sequential short connections never accumulate retained handler entries.
+///
+/// The broker publishes its retained-handler count through a watch gauge, so
+/// the check is event-driven: no sleeps and no sampling races.
+#[tokio::test]
+async fn finished_api_handlers_are_reaped_and_stay_bounded() {
+    const CONNECTIONS: usize = 200;
+    const CAP: usize = 32;
+    let temp = tempfile::tempdir().expect("temporary home");
+    cli::init(temp.path()).expect("initialize temporary home");
+    let path = temp.path().join("broker.sock");
+    let (gauge, mut retained) = tokio::sync::watch::channel(0usize);
+    let task = tokio::spawn({
+        let home = temp.path().to_owned();
+        let path = path.clone();
+        async move {
+            socket::serve_at_with_options(
+                &home,
+                &path,
+                socket::ServeOptions {
+                    retained_handlers: Some(gauge),
+                    ..Default::default()
+                },
+            )
+            .await
+        }
+    });
+    wait_for_socket(&path).await;
+    let mut highest = 0;
+    for _ in 0..CONNECTIONS {
+        let response = request(&path, json!({"jsonrpc":"2.0","id":1,"method":"ping"})).await;
+        assert_eq!(response["result"], json!({"ok":true}));
+        highest = highest.max(*retained.borrow_and_update());
+    }
+    assert!(
+        highest <= CAP,
+        "{highest} retained handlers after {CONNECTIONS} sequential connections exceeds the cap {CAP}"
+    );
+    // The last client has closed: its handler is reaped and the set drains to empty.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        retained.wait_for(|count| *count == 0),
+    )
+    .await
+    .expect("retained handlers drain")
+    .expect("gauge stays open while serving");
+    task.abort();
+    let _ = task.await;
+}
+
 /// Sends one JSON-RPC request and decodes its response within five seconds.
 ///
 /// The bound accommodates the one-second long polls in this suite while making
