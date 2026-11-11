@@ -88,8 +88,6 @@ pub fn forbidden_interpreter(path: &Path) -> bool {
 
 /// Entries one bounded scan may visit before it fails closed.
 const SCAN_ENTRY_CAP: usize = 200_000;
-/// Directory levels below a recursive root that the scan descends through.
-const SCAN_MAX_DEPTH: usize = 6;
 /// A cached scan is rebuilt after this long even when no scanned directory changed.
 const SCAN_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
@@ -110,20 +108,20 @@ struct InterpreterScan {
     directories: Vec<PathBuf>,
 }
 
-/// Flat roots list their own files; recursive roots descend at most
-/// `SCAN_MAX_DEPTH` levels and list files only inside `bin`/`sbin`/`libexec`.
-fn scan_interpreters(roots: &[(PathBuf, bool)], cap: usize) -> Option<InterpreterScan> {
+/// A root with depth 0 lists its own files; a deeper root descends at most that
+/// many directory levels and lists files only inside `bin`/`sbin`/`libexec`.
+fn scan_interpreters(roots: &[(PathBuf, usize)], cap: usize) -> Option<InterpreterScan> {
     let mut scan = InterpreterScan {
         files: Vec::new(),
         directories: Vec::new(),
     };
     let mut visited = 0usize;
-    let mut pending: Vec<(PathBuf, bool, usize)> = roots
+    let mut pending: Vec<(PathBuf, usize, usize)> = roots
         .iter()
-        .map(|(path, recursive)| (path.clone(), *recursive, 0))
+        .map(|(path, max_depth)| (path.clone(), *max_depth, 0))
         .collect();
-    while let Some((directory, recursive, depth)) = pending.pop() {
-        let listed = !recursive || executable_directory(&directory);
+    while let Some((directory, max_depth, depth)) = pending.pop() {
+        let listed = max_depth == 0 || executable_directory(&directory);
         let Ok(entries) = std::fs::read_dir(&directory) else {
             continue;
         };
@@ -136,11 +134,8 @@ fn scan_interpreters(roots: &[(PathBuf, bool)], cap: usize) -> Option<Interprete
                 return None;
             }
             let candidate = entry.path();
-            if recursive
-                && depth < SCAN_MAX_DEPTH
-                && entry.file_type().is_ok_and(|kind| kind.is_dir())
-            {
-                pending.push((candidate.clone(), true, depth + 1));
+            if depth < max_depth && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push((candidate.clone(), max_depth, depth + 1));
             }
             if !listed || !forbidden_interpreter(&candidate) {
                 continue;
@@ -181,7 +176,7 @@ fn directory_stamp(path: &Path) -> DirectoryStamp {
 }
 
 struct CachedScan {
-    roots: Vec<(PathBuf, bool)>,
+    roots: Vec<(PathBuf, usize)>,
     stamps: Vec<(PathBuf, DirectoryStamp)>,
     built: std::time::Instant,
     scan: Option<std::sync::Arc<InterpreterScan>>,
@@ -190,7 +185,7 @@ struct CachedScan {
 impl CachedScan {
     /// A scan stays valid while its roots and every listed directory keep the
     /// same identity and mtime and it is younger than `SCAN_TTL`.
-    fn current(&self, roots: &[(PathBuf, bool)]) -> bool {
+    fn current(&self, roots: &[(PathBuf, usize)]) -> bool {
         self.roots == roots
             && self.built.elapsed() < SCAN_TTL
             && self
@@ -204,7 +199,7 @@ static SCAN_CACHE: std::sync::Mutex<Option<CachedScan>> = std::sync::Mutex::new(
 
 /// The installed-interpreter index for `roots`, built once and reused until a
 /// scanned directory changes. `None` is a cached exhausted scan (refusal).
-fn cached_scan(roots: &[(PathBuf, bool)]) -> Option<std::sync::Arc<InterpreterScan>> {
+fn cached_scan(roots: &[(PathBuf, usize)]) -> Option<std::sync::Arc<InterpreterScan>> {
     let mut cache = SCAN_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -240,13 +235,15 @@ pub fn forbidden_interpreter_build(path: &Path, digest: &str, size: u64) -> bool
     if forbidden_interpreter(path) {
         return true;
     }
-    let mut roots: Vec<(PathBuf, bool)> = ["/bin", "/usr/bin", "/usr/local/bin"]
+    // Depths cover /opt/<tool>/<name>/<version>/<arch>/bin toolchains,
+    // /usr/lib/<jvm>/<home>/bin and ~/.nvm/versions/node/<version>/bin.
+    let mut roots: Vec<(PathBuf, usize)> = ["/bin", "/usr/bin", "/usr/local/bin"]
         .into_iter()
-        .map(|path| (path.into(), false))
+        .map(|path| (path.into(), 0))
         .collect();
-    roots.extend([("/opt".into(), true), ("/usr/lib".into(), true)]);
+    roots.extend([("/opt".into(), 5), ("/usr/lib".into(), 3)]);
     if let Some(home) = std::env::var_os("HOME") {
-        roots.push((PathBuf::from(home).join(".nvm"), true));
+        roots.push((PathBuf::from(home).join(".nvm"), 4));
     }
     match cached_scan(&roots) {
         Some(scan) => scan_matches(&scan, digest, size),
@@ -257,7 +254,7 @@ pub fn forbidden_interpreter_build(path: &Path, digest: &str, size: u64) -> bool
 /// Uncached scan of `roots` for an interpreter build with this size and digest;
 /// an exhausted scan counts as a match so the caller refuses.
 #[cfg(test)]
-fn interpreter_in_roots(roots: Vec<(PathBuf, bool)>, digest: &str, size: u64) -> bool {
+fn interpreter_in_roots(roots: Vec<(PathBuf, usize)>, digest: &str, size: u64) -> bool {
     match scan_interpreters(&roots, SCAN_ENTRY_CAP) {
         Some(scan) => scan_matches(&scan, digest, size),
         None => true,
@@ -1200,12 +1197,12 @@ producer_scopes=['scope']
         let bytes = b"synthetic interpreter build";
         std::fs::write(nested.join("node"), bytes).unwrap();
         assert!(interpreter_in_roots(
-            vec![(root.path().into(), true)],
+            vec![(root.path().into(), 5)],
             &fs::sha256(bytes),
             bytes.len() as u64
         ));
         assert!(!interpreter_in_roots(
-            vec![(root.path().into(), true)],
+            vec![(root.path().into(), 5)],
             &"0".repeat(64),
             bytes.len() as u64
         ));
@@ -1232,7 +1229,7 @@ producer_scopes=['scope']
         let interpreter = b"synthetic interpreter build";
         std::fs::write(bin.join("python3"), interpreter).unwrap();
         let peer = b"legitimate peer executable";
-        let roots = vec![(root.path().to_path_buf(), true)];
+        let roots = vec![(root.path().to_path_buf(), 5)];
         assert!(!interpreter_in_roots(
             roots.clone(),
             &fs::sha256(peer),
@@ -1252,7 +1249,7 @@ producer_scopes=['scope']
         for index in 0..20 {
             std::fs::File::create(root.path().join(index.to_string())).unwrap();
         }
-        let roots = vec![(root.path().to_path_buf(), false)];
+        let roots = vec![(root.path().to_path_buf(), 0)];
         assert!(scan_interpreters(&roots, 20).is_some());
         assert!(scan_interpreters(&roots, 19).is_none());
     }
@@ -1261,7 +1258,7 @@ producer_scopes=['scope']
     #[test]
     fn cached_scan_follows_directory_changes() {
         let root = tempfile::tempdir().unwrap();
-        let roots = vec![(root.path().to_path_buf(), true)];
+        let roots = vec![(root.path().to_path_buf(), 5)];
         let first = cached_scan(&roots).unwrap();
         assert!(first.files.is_empty());
         assert!(std::sync::Arc::ptr_eq(
