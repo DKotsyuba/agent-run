@@ -578,6 +578,12 @@ impl Endpoint {
             }
             strict(&response)
         };
+        // The first verification in a process builds the interpreter index; a
+        // cold disk can make that slower than the exchange budget, so build it
+        // before the deadline starts. Later calls reuse the cached index.
+        let _ =
+            tokio::task::spawn_blocking(agent_run_config::provider_config::warm_interpreter_index)
+                .await;
         tokio::time::timeout(std::time::Duration::from_secs(5), work)
             .await
             .map_err(|_| invalid("attempt peer unavailable"))?

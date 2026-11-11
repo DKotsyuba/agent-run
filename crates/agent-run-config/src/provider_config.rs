@@ -227,14 +227,8 @@ fn cached_scan(roots: &[(PathBuf, usize)]) -> Option<std::sync::Arc<InterpreterS
     scan
 }
 
-/// Reject renamed copies of installed common interpreters as well as their
-/// ordinary names. The operator still pins and reviews the actual native build.
-/// Interpreters are found in `bin`-style directories of the installed roots;
-/// the index is cached because every peer verification asks this question.
-pub fn forbidden_interpreter_build(path: &Path, digest: &str, size: u64) -> bool {
-    if forbidden_interpreter(path) {
-        return true;
-    }
+/// Installed-interpreter roots with the directory depth each one is scanned to.
+fn interpreter_roots() -> Vec<(PathBuf, usize)> {
     // Depths cover /opt/<tool>/<name>/<version>/<arch>/bin toolchains,
     // /usr/lib/<jvm>/<home>/bin and ~/.nvm/versions/node/<version>/bin.
     let mut roots: Vec<(PathBuf, usize)> = ["/bin", "/usr/bin", "/usr/local/bin"]
@@ -245,7 +239,25 @@ pub fn forbidden_interpreter_build(path: &Path, digest: &str, size: u64) -> bool
     if let Some(home) = std::env::var_os("HOME") {
         roots.push((PathBuf::from(home).join(".nvm"), 4));
     }
-    match cached_scan(&roots) {
+    roots
+}
+
+/// Build (or refresh) the installed-interpreter index now. A cold scan can take
+/// seconds on a slow disk, so callers that bound peer verification by a
+/// deadline run this first, outside that deadline.
+pub fn warm_interpreter_index() {
+    let _ = cached_scan(&interpreter_roots());
+}
+
+/// Reject renamed copies of installed common interpreters as well as their
+/// ordinary names. The operator still pins and reviews the actual native build.
+/// Interpreters are found in `bin`-style directories of the installed roots;
+/// the index is cached because every peer verification asks this question.
+pub fn forbidden_interpreter_build(path: &Path, digest: &str, size: u64) -> bool {
+    if forbidden_interpreter(path) {
+        return true;
+    }
+    match cached_scan(&interpreter_roots()) {
         Some(scan) => scan_matches(&scan, digest, size),
         None => true,
     }

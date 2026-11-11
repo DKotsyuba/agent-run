@@ -1998,6 +1998,11 @@ async fn serve_endpoints(
     // JoinSet aborts maintenance on every exit path, including cancellation of
     // serve_at itself; dropping a bare JoinHandle would detach these loops.
     let mut workers = JoinSet::new();
+    // Peer verification consults the installed-interpreter index; build it now
+    // so the first managed peer does not pay a cold-disk scan inside its budget.
+    drop(tokio::task::spawn_blocking(
+        agent_run_config::provider_config::warm_interpreter_index,
+    ));
     if let Some((listener, guard)) = pool_attempt_endpoint {
         let attempt_service = service.clone();
         workers.spawn(async move {
