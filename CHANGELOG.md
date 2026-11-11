@@ -4,6 +4,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## 0.31.1
+
+Released 2026-11-11.
+
 ### Fixed
 
 - fix(transport): reap finished API connection handlers in the broker accept
