@@ -31,8 +31,9 @@ pub mod lifecycle;
 /// Generic writer-backed lineage holds and read-only recovery.
 pub mod lineage_holds;
 pub mod logging;
-/// Setup for the ignored live probes of the real managed launch path.
-#[cfg(test)]
+/// Setup for the ignored live probes of the real managed launch path, which
+/// exist on Linux only; elsewhere nothing uses it.
+#[cfg(all(test, target_os = "linux"))]
 mod managed_live_probe;
 mod managed_qualification;
 pub mod managed_services;
