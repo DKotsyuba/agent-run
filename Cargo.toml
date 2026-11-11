@@ -49,6 +49,18 @@ uuid = { version = "1.16", features = ["v4"] }
 url = "2.5.8"
 rmcp = { version = "=3.9.0", default-features = false, features = ["server", "transport-io"] }
 
+# Peer verification hashes the whole pinned executable inside a five-second
+# budget; an unoptimized SHA-256 needs about 3s for a 115MB test binary, which a
+# loaded CI runner turns into a timeout. Optimize only the digest crates.
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.digest]
+opt-level = 3
+[profile.dev.package.block-buffer]
+opt-level = 3
+[profile.dev.package.cpufeatures]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
